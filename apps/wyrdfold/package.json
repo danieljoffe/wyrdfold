@@ -9,8 +9,9 @@
     "start": "next start"
   },
   "dependencies": {
-    "@danieljoffe/shared-ui": "workspace:*",
+    "@danieljoffe/shared-ui": "^0.1.0",
     "@supabase/ssr": "^0.10.2",
+    "lucide-react": "0.577.0",
     "@tiptap/core": "^3.24.0",
     "@tiptap/extension-link": "^3.24.0",
     "@tiptap/pm": "^3.24.0",

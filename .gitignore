@@ -1,0 +1,102 @@
+# See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# compiled output
+dist
+tmp
+out-tsc
+
+# dependencies
+node_modules
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# misc
+/.sass-cache
+/connect.lock
+coverage
+.coverage
+/libpeerconnection.log
+npm-debug.log
+yarn-error.log
+testem.log
+/typings
+
+# System Files
+.DS_Store
+Thumbs.db
+
+.nx/cache
+.nx/workspace-data
+.cursor/rules/nx-rules.mdc
+.github/instructions/nx.instructions.md
+.claude/worktrees/
+.claude/sessions/archive/
+.claude-flow/
+.swarm/
+.claude/memory.db
+.claude/*.lock
+ruvector.db
+.tmp/
+
+# Next.js
+.next
+out
+next-env.d.ts
+
+test-output
+.env*
+!.env.example
+*.pem
+
+storybook-static
+*.tsbuildinfo
+*-example-*
+
+playwright-report-json
+test-results*
+trace.zip
+.lighthouseci
+vite.config.*.timestamp*
+vitest.config.*.timestamp*
+.playwright-mcp
+.sentryclirc
+
+# Supabase
+supabase/.temp/
+.vercel
+.env*.local
+apps/root/src/data/generated/
+
+.claude/worktrees
+.claude/settings.local.json
+
+.nx/key/
+
+# Playwright auth fixture — session cookies for the e2e test user.
+# Written by apps/wyrdfold-e2e/src/auth.setup.ts on first run; this
+# file contains a live Supabase JWT and must not be committed.
+apps/wyrdfold-e2e/src/.auth/
