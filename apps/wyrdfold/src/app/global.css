@@ -2,4 +2,4 @@
 @import '@danieljoffe/shared-ui/styles/pyre-theme.css';
 
 @source "../**/*.{ts,tsx,js,jsx}";
-@source "../../../../libs/shared/ui/src";
+@source "../../../../node_modules/@danieljoffe/shared-ui/dist";

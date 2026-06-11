@@ -25,6 +25,10 @@ const supabaseHost = (() => {
  **/
 const nextConfig = {
   nx: {},
+  // shared-ui ships ESM-only (dist/lib/*.js). Transpile it so both the Next
+  // build and next/jest transform it — node_modules is otherwise left
+  // untransformed, which breaks jest with "Cannot use import statement".
+  transpilePackages: ['@danieljoffe/shared-ui'],
   pageExtensions: ['js', 'jsx', 'ts', 'tsx'],
   devIndicators: false,
   // Next 16 blocks cross-origin requests to internal dev endpoints
@@ -130,21 +134,10 @@ const nextConfig = {
     ];
   },
 
-  /** @param {import('webpack').Configuration} config */
-  webpack: config => {
-    config.resolve = config.resolve || {};
-    config.resolve.conditionNames = [
-      '@danieljoffe.com/source',
-      ...(config.resolve.conditionNames || ['import', 'require', 'default']),
-    ];
-    return config;
-  },
-  // Turbopack uses the package.json `exports` field directly, so workspace
-  // resolution works via the `default` condition (the built dist) rather
-  // than the custom `@danieljoffe.com/source` condition wired up in the
-  // webpack block above. No SVG-as-component loader rules are needed since
-  // wyrdfold imports SVG icons via lucide-react components, not file imports.
-  // Block is here for parity with apps/root/next.config.mjs.
+  // shared-ui is consumed as a published npm package; its exports map resolves
+  // subpaths to dist via the default condition — no custom resolve condition
+  // needed. wyrdfold imports SVG icons via lucide-react components, not file
+  // imports, so no SVG loader rules are required.
   turbopack: {},
 
   productionBrowserSourceMaps: false,
