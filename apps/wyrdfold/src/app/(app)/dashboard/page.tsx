@@ -56,7 +56,7 @@ export default async function WyrdfoldDashboard() {
   // A naive ``proseRes?.prose != null`` check matched only the empty
   // case and silently treated every populated response as ``no profile``,
   // sending users back to the onboarding CTA after they'd onboarded.
-  const [topRes, proseRes, targetsRes, ...countResponses] = await Promise.all([
+  const [topRes, proseRes, targetsRes, countsRes] = await Promise.all([
     fetchJsonFromWyrdfoldAPI<JobsListResponse>('/jobs', {
       searchParams: new URLSearchParams({
         status: 'new',
@@ -69,11 +69,7 @@ export default async function WyrdfoldDashboard() {
     fetchJsonFromWyrdfoldAPI<{ targets: UserTargetWithSummary[] }>(
       '/targets/mine'
     ),
-    ...PIPELINE_STATUSES.map(status =>
-      fetchJsonFromWyrdfoldAPI<JobsListResponse>('/jobs', {
-        searchParams: new URLSearchParams({ status, page_size: '1' }),
-      })
-    ),
+    fetchJsonFromWyrdfoldAPI<Record<string, number>>('/jobs/pipeline-counts'),
   ]);
 
   // Flag is set but prose isn't there. Causes: a Path A/B user who
@@ -94,10 +90,9 @@ export default async function WyrdfoldDashboard() {
   }
 
   const counts: Record<string, number> = {};
-  countResponses.forEach((res, i) => {
-    const status = PIPELINE_STATUSES[i];
-    if (status) counts[status] = res?.total ?? 0;
-  });
+  for (const status of PIPELINE_STATUSES) {
+    counts[status] = countsRes?.[status] ?? 0;
+  }
 
   const initial: DashboardInitial = {
     topMatches: topRes?.postings ?? [],

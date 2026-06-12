@@ -936,6 +936,120 @@ def list_jobs(
     return operator_result
 
 
+_JOB_STATUSES = (
+    "new",
+    "saved",
+    "resume_draft",
+    "resume_ready",
+    "applied",
+    "interviewing",
+    "offer",
+    "rejected",
+    "archived",
+)
+
+
+def _pipeline_counts_python(
+    supabase: Client,
+    *,
+    target_ids: set[str],
+    min_score: int | None,
+) -> dict[str, int]:
+    """Fallback used when the ``pipeline_counts`` RPC is unavailable
+    (e.g. mid-deploy before the migration lands). Mirrors the JWT list
+    path: scores rows for the user's targets (excluded=False, optional
+    score floor), deduplicated by job, then grouped by job status."""
+    score_query = (
+        supabase.table("scores")
+        .select("job_posting_id")
+        .in_("target_id", list(target_ids))
+        .eq("excluded", False)
+    )
+    if min_score is not None:
+        score_query = score_query.gte("score", min_score)
+    score_resp = score_query.execute()
+    job_ids = sorted(
+        {
+            cast(str, r["job_posting_id"])
+            for r in cast(list[dict[str, Any]], score_resp.data or [])
+        }
+    )
+    counts: dict[str, int] = {}
+    for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
+        chunk = job_ids[i : i + _IN_CHUNK_SIZE]
+        resp = supabase.table("jobs").select("status").in_("id", chunk).execute()
+        for row in cast(list[dict[str, Any]], resp.data or []):
+            st = cast(str, row["status"])
+            counts[st] = counts.get(st, 0) + 1
+    return counts
+
+
+def _pipeline_counts_grouped(
+    supabase: Client,
+    *,
+    target_ids: set[str],
+    min_score: int | None,
+) -> dict[str, int]:
+    """Single grouped count via the ``pipeline_counts`` RPC; falls back
+    to the client-side two-query variant if the RPC isn't deployed yet."""
+    try:
+        resp = supabase.rpc(
+            "pipeline_counts",
+            {
+                "p_target_ids": sorted(target_ids),
+                "p_min_score": min_score,
+            },
+        ).execute()
+    except Exception:
+        logger.debug(
+            "pipeline_counts RPC unavailable, falling back to client-side count"
+        )
+        return _pipeline_counts_python(
+            supabase, target_ids=target_ids, min_score=min_score
+        )
+    return {
+        cast(str, row["status"]): int(row["count"])
+        for row in cast(list[dict[str, Any]], resp.data or [])
+    }
+
+
+@router.get("/pipeline-counts")
+def pipeline_counts(
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> dict[str, int]:
+    """Per-status job counts for the calling user's pipeline.
+
+    Projection endpoint for the dashboard — replaces seven
+    ``/jobs?status=X&page_size=1`` round-trips that each ran the full
+    list query just to read ``total``. Semantics match the untargeted
+    JWT list view: union of jobs scored against any of the user's
+    targets (``excluded=False``), with the user's ``list_min_score``
+    default applied as the score floor.
+    """
+    cache_key = make_cache_key(
+        jobs_cache_prefix(target_id=None),
+        projection="pipeline_counts",
+        user_id=user_id,
+    )
+    cached: dict[str, int] | None = job_list_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    counts: dict[str, int] = dict.fromkeys(_JOB_STATUSES, 0)
+    target_ids = get_user_target_ids(supabase, user_id)
+    if target_ids:
+        min_score = _default_min_score_for_user(supabase, user_id)
+        grouped = _pipeline_counts_grouped(
+            supabase, target_ids=target_ids, min_score=min_score
+        )
+        for status_key, n in grouped.items():
+            if status_key in counts:
+                counts[status_key] = n
+    job_list_cache.set(cache_key, counts)
+    return counts
+
+
 @router.post("/validate-url")
 @limiter.limit("20/minute")
 async def validate_url(
