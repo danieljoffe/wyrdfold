@@ -18,6 +18,21 @@ keys.
 - **Resume & cover-letter tailoring** — grounded in your own experience
   profile, exported to DOCX.
 
+![Dashboard — top matches and pipeline counts](./docs/screenshots/dashboard.png)
+
+<details>
+<summary>More screenshots</summary>
+
+**Jobs** — every polled posting, scored against your active targets:
+
+![Jobs list with fit scores](./docs/screenshots/jobs.png)
+
+**Targets** — the role profiles new jobs are scored against:
+
+![Targets](./docs/screenshots/targets.png)
+
+</details>
+
 ## License
 
 WyrdFold is source-available under the
