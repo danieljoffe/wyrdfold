@@ -1,0 +1,23 @@
+# Self-host quickstart for the WyrdFold API. The database lives in your
+# Supabase project (hosted or self-hosted Supabase) — see README.md.
+#
+#   cp apps/wyrdfold-api/.env.example apps/wyrdfold-api/.env   # fill it in
+#   docker compose up --build api
+#
+# The Next.js app is best run with `pnpm nx dev wyrdfold` (or deployed to
+# Vercel); point its WYRDFOLD_API_URL at http://localhost:8001.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/wyrdfold-api/Dockerfile
+    env_file: apps/wyrdfold-api/.env
+    environment:
+      # Container-internal; the host port mapping below is what you call.
+      PORT: 8001
+      # Self-hosting without Vercel cron? Uncomment to run the in-process
+      # poll scheduler instead (see .env.example for details).
+      # POLL_SCHEDULER_ENABLED: "true"
+    ports:
+      - '8001:8001'
+    restart: unless-stopped
