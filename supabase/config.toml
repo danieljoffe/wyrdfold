@@ -2,25 +2,16 @@
 # https://supabase.com/docs/guides/local-development/cli/config
 #
 # ============================================================================
-# WYRDFOLD-ONLY Supabase workdir
+# WyrdFold Supabase project
 # ============================================================================
-# This is the SECOND Supabase project root in the monorepo. It backs the
-# wyrdfold product ONLY (apps/wyrdfold + apps/wyrdfold-api). The audit tool /
-# portfolio live in the root ``supabase/`` workdir against a different project.
-#
-# Drive every CLI command for this project with the ``--workdir`` flag, e.g.:
-#   supabase --workdir apps/wyrdfold-api db push
-#   supabase --workdir apps/wyrdfold-api db pull
-# The repo exposes these as ``pnpm db:wf:*`` scripts.
-#
-# Local-dev ports are offset from the root workdir's defaults so both stacks
-# can run ``supabase start`` simultaneously without colliding.
+# This is the only Supabase project root in the wyrdfold repo. It backs the
+# wyrdfold product (apps/wyrdfold + apps/wyrdfold-api). Driven with the plain
+# CLI from the repo root, e.g. `pnpm supabase db push` / `pnpm db:gen-types`.
 project_id = "wyrdfold"
 
 [api]
 enabled = true
-# Offset +100 from the root workdir (54321) so both local stacks coexist.
-port = 54421
+port = 54321
 schemas = ["public", "graphql_public"]
 extra_search_path = ["public", "extensions"]
 max_rows = 1000
@@ -29,15 +20,15 @@ max_rows = 1000
 enabled = false
 
 [db]
-port = 54422
-shadow_port = 54420
+port = 54322
+shadow_port = 54320
 health_timeout = "2m"
-# Must match the remote major version. The shared project runs 17.
+# Must match the remote major version. Supabase projects run Postgres 17.
 major_version = 17
 
 [db.pooler]
 enabled = false
-port = 54429
+port = 54329
 pool_mode = "transaction"
 default_pool_size = 20
 max_client_conn = 100
@@ -60,19 +51,19 @@ enabled = true
 
 [studio]
 enabled = true
-port = 54423
+port = 54323
 api_url = "http://127.0.0.1"
 openai_api_key = "env(OPENAI_API_KEY)"
 
 [inbucket]
 enabled = true
-port = 54424
+port = 54324
 
 [storage]
 enabled = true
 file_size_limit = "50MiB"
 
-# Resume uploads. If the shared project stores uploaded resumes in a Storage
+# Resume uploads. If the source project stores uploaded resumes in a Storage
 # bucket (not just the ``uploaded_resumes`` table), declare it here and migrate
 # the objects. Confirm at cutover — uncomment + adjust as needed.
 # [storage.buckets.resumes]
@@ -98,8 +89,9 @@ max_indexes = 5
 enabled = true
 # !!! LOCAL-ONLY !!! site_url is for ``supabase start`` (local dev). The
 # production value is pinned under ``[remotes.production.auth]`` below — always
-# push with ``--linked-to production`` so the localhost default never leaks
-# into prod (see the root supabase/config.toml for the full incident history).
+# push with ``--linked-to production`` so the localhost default never leaks into
+# prod. (Supabase silently rewrites unmatched ``emailRedirectTo`` to site_url,
+# so a bare ``config push`` would point every emailed magic link at localhost.)
 site_url = "http://localhost:3100"
 # Supabase silently substitutes ``site_url`` when ``emailRedirectTo`` is not an
 # EXACT match here. List every dev variant wyrdfold is served from.
@@ -200,12 +192,12 @@ allow_dynamic_registration = false
 [edge_runtime]
 enabled = true
 policy = "per_worker"
-inspector_port = 8183
+inspector_port = 8083
 deno_version = 2
 
 [analytics]
 enabled = true
-port = 54427
+port = 54327
 backend = "postgres"
 
 [experimental]
@@ -220,14 +212,11 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 # ============================================================================
 # Everything above is LOCAL-DEV config. Push auth config to the hosted wyrdfold
 # project ONLY via ``supabase config push --linked-to production`` so the
-# localhost site_url/redirects never overwrite prod. See root
-# supabase/config.toml for the outage that motivated this pattern.
+# localhost site_url/redirects never overwrite prod.
 
 [remotes.production]
-# !!! REPLACE_ME !!! Set this to the NEW wyrdfold project ref once you create
-# the project in the Supabase dashboard (Project Settings → Reference ID).
-# Until it's set, `--linked-to production` pushes will not target wyrdfold.
-project_id = "REPLACE_WITH_NEW_WYRDFOLD_PROJECT_REF"
+# wyrdfold project ref (Supabase dashboard → Project Settings → Reference ID).
+project_id = "swxiuutaikxbirauivjg"
 
 [remotes.production.auth]
 site_url = "https://wyrdfold.com"
@@ -241,8 +230,8 @@ additional_redirect_urls = [
 ]
 
 # Email templates — production-only (free-tier preview projects reject template
-# API calls). content_path is resolved relative to the workdir
-# (apps/wyrdfold-api), so ``./supabase/templates/...`` points at this dir.
+# API calls). content_path is resolved relative to the repo root, so
+# ``./supabase/templates/...`` points at this dir.
 
 # Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
 [remotes.production.auth.email.template.invite]
