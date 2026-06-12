@@ -12,29 +12,21 @@ concurrency:
 permissions:
   contents: read
 
-# Nx self-hosted remote cache (Cloudflare R2 via @nx/s3-cache). Cache reads/writes
-# are namespaced under the `wyrdfold` prefix configured in nx.json. NOTE: when
-# NX_KEY is set the s3 plugin activates and HARD-FAILS the run if it can't auth,
-# so the AWS_* creds must be present and valid (the bucket lives in R2).
-env:
-  NX_KEY: ${{ secrets.NX_KEY }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
 jobs:
   js:
     name: JS — lint, typecheck, test, build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           filter: tree:0
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -42,9 +34,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # run-many (not affected) — only 3 projects, and the R2 cache makes
-      # unchanged-project targets near-instant cache hits. wyrdfold-api is
-      # Python; it runs in the `python` job below.
+      # Fails on any known advisory in the production dependency tree.
+      # Dev-chain advisories are handled via pnpm overrides (see #21);
+      # production must stay at zero.
+      - name: Audit production dependencies
+        run: pnpm audit --prod
+
+      # run-many (not affected) — only 3 projects; local Nx cache plus the
+      # pnpm store cache keep this fast. wyrdfold-api is Python; it runs
+      # in the `python` job below.
       - name: Lint, typecheck, test, build
         run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
 
@@ -53,17 +51,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           filter: tree:0
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      # 3.11 to match the production Dockerfile (python:3.11-slim) — test
+      # what we ship.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
