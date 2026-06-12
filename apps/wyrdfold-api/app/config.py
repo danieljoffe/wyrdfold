@@ -5,7 +5,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # extra="ignore": unknown keys in the dotenv file must not crash boot —
+    # self-hosters commonly keep unrelated vars (PORT, tooling keys) in .env.
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     supabase_url: str = ""
     supabase_service_role_key: str = Field(default="", repr=False)
