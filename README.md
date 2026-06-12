@@ -172,9 +172,8 @@ pnpm knip                              # unused files / deps / exports
 ```
 
 Per-project targets are inferred by Nx — run `pnpm nx show project wyrdfold`
-to list them. Remote build caching uses a Cloudflare R2 bucket via
-`@nx/s3-cache` (set the R2 credentials in the environment to enable it;
-falls back to local cache otherwise).
+to list them. Build caching is local-only (no remote cache, no credentials
+needed).
 
 ## Database (Supabase)
 
