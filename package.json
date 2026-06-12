@@ -93,7 +93,7 @@
     "knip": "^6.4.1",
     "lint-staged": "16.4.0",
     "nx": "22.6.5",
-    "playwright": "^1.59.1",
+    "playwright": "1.59.1",
     "postcss": "8.5.15",
     "prettier": "^3.8.2",
     "sharp": "^0.34.5",
