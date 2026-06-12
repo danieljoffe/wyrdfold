@@ -13,12 +13,13 @@ permissions:
   contents: read
 
 # Nx self-hosted remote cache (Cloudflare R2 via @nx/s3-cache). Cache reads/writes
-# are namespaced under the `wyrdfold` prefix configured in nx.json. Absent these
-# secrets the build still runs — it just falls back to local cache.
+# are namespaced under the `wyrdfold` prefix configured in nx.json. NOTE: when
+# NX_KEY is set the s3 plugin activates and HARD-FAILS the run if it can't auth,
+# so the AWS_* creds must be present and valid (the bucket lives in R2).
 env:
   NX_KEY: ${{ secrets.NX_KEY }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 jobs:
   js:
