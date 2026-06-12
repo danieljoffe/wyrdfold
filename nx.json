@@ -114,13 +114,5 @@
   "sync": {
     "applyChanges": true
   },
-  "analytics": false,
-  "s3": {
-    "endpoint": "https://00d080d3b26b7d6eba1fa5571b75b459.r2.cloudflarestorage.com",
-    "region": "auto",
-    "bucket": "danieljoffe-nx-cache",
-    "prefix": "wyrdfold",
-    "forcePathStyle": true,
-    "localMode": "read-write"
-  }
+  "analytics": false
 }

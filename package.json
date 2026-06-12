@@ -58,7 +58,6 @@
     "@nx/js": "22.6.5",
     "@nx/next": "22.6.5",
     "@nx/playwright": "22.6.5",
-    "@nx/s3-cache": "^5.0.4",
     "@playwright/test": "1.59.1",
     "@swc-node/register": "1.11.1",
     "@swc/cli": "~0.8.0",
@@ -105,11 +104,12 @@
     "tslib": "^2.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "typescript-eslint": "8.58.2"
+    "typescript-eslint": "8.58.2",
+    "vite": "7.3.5"
   },
   "pnpm": {
     "overrides": {
-      "axios": "1.13.6",
+      "axios": "^1.16.0",
       "tmp": "^0.2.4",
       "@opentelemetry/core": "2.6.0",
       "@opentelemetry/resources": "2.6.0",
@@ -123,7 +123,11 @@
       "@typescript-eslint/visitor-keys": "8.58.2",
       "@typescript-eslint/scope-manager": "8.58.2",
       "next>postcss": "8.5.15",
-      "svix>uuid": "^11.1.1"
+      "svix>uuid": "^11.1.1",
+      "vite": "7.3.5",
+      "@vitest/browser": ">=4.1.6",
+      "sockjs>uuid": "^11.1.1",
+      "esbuild": "^0.28.1"
     },
     "onlyBuiltDependencies": [
       "@parcel/watcher",
