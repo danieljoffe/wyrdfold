@@ -229,16 +229,21 @@ additional_redirect_urls = [
   "http://localhost:3100/auth/callback",
 ]
 
-# Email templates — production-only (free-tier preview projects reject template
-# API calls). content_path is resolved relative to the repo root, so
-# ``./supabase/templates/...`` points at this dir.
-
-# Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
-[remotes.production.auth.email.template.invite]
-subject = "You're in — welcome to the WyrdFold beta"
-content_path = "./supabase/templates/invite.html"
-
-# Sent by ``signInWithOtp`` from apps/wyrdfold/src/app/login/MagicLinkForm.tsx.
-[remotes.production.auth.email.template.magic_link]
-subject = "Your WyrdFold sign-in link"
-content_path = "./supabase/templates/magic-link.html"
+# Email templates — DISABLED until the project is on a paid plan (or a custom
+# SMTP provider is configured). Supabase's free tier with the default email
+# provider rejects ANY email-template API call with HTTP 400, which fails
+# `supabase config push`. Magic-link/invite emails still send via Supabase's
+# default templates — this only affects WyrdFold branding. The HTML lives in
+# supabase/templates/. To re-enable: upgrade the plan (or set [auth.email.smtp]),
+# then uncomment the two blocks below and re-run `supabase config push`.
+# content_path is resolved relative to the repo root.
+#
+# # Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
+# [remotes.production.auth.email.template.invite]
+# subject = "You're in — welcome to the WyrdFold beta"
+# content_path = "./supabase/templates/invite.html"
+#
+# # Sent by ``signInWithOtp`` from apps/wyrdfold/src/app/login/MagicLinkForm.tsx.
+# [remotes.production.auth.email.template.magic_link]
+# subject = "Your WyrdFold sign-in link"
+# content_path = "./supabase/templates/magic-link.html"
