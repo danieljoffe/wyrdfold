@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Nx self-hosted remote cache (Cloudflare R2 via @nx/s3-cache). Cache reads/writes
+# are namespaced under the `wyrdfold` prefix configured in nx.json. Absent these
+# secrets the build still runs — it just falls back to local cache.
+env:
+  NX_KEY: ${{ secrets.NX_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+jobs:
+  js:
+    name: JS — lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          filter: tree:0
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # run-many (not affected) — only 3 projects, and the R2 cache makes
+      # unchanged-project targets near-instant cache hits. wyrdfold-api is
+      # Python; it runs in the `python` job below.
+      - name: Lint, typecheck, test, build
+        run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
+
+  python:
+    name: Python — wyrdfold-api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          filter: tree:0
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      # python-docx resume/cover-letter rendering tests shell out to pandoc.
+      - name: Install pandoc
+        run: sudo apt-get update && sudo apt-get install -y pandoc
+
+      - name: Lint, typecheck, test
+        working-directory: apps/wyrdfold-api
+        run: |
+          uv run --package wyrdfold-api ruff check .
+          uv run --package wyrdfold-api mypy app/
+          uv run --package wyrdfold-api pytest -v
