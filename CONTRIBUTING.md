@@ -76,6 +76,25 @@ and attach a before/after summary to the PR. The eval scripts live in
 that directory; pick the one closest to the prompt you touched.
 Reviewers will ask for this if you don't volunteer it.
 
+## Typography (system fonts only)
+
+WyrdFold uses the platform's system font stack — no `next/font`, no
+webfont CDN. Tailwind v4's default `font-sans` (`ui-sans-serif`,
+`system-ui`, …) is what every text style resolves to. Reasons it stays
+that way:
+
+- **CWV:** no extra request, no font-swap layout shift. The site
+  renders with whatever font the OS already loaded.
+- **Self-hoster simplicity:** no Google Fonts opt-in, no GDPR concerns,
+  no CDN account to fund.
+- **Look and feel:** the brand accents are colour + spacing + the
+  WyrdFold mark, not a custom face. SF Pro on macOS / Segoe UI on
+  Windows / Roboto on Android all read well at the sizes we use.
+
+If you have a strong reason to introduce a webfont, open an issue
+first — we'd want to see the CWV trade-off and the licensing path
+spelled out before adding a font dependency to a self-hostable app.
+
 ## License + DCO
 
 By contributing you agree that your contribution is licensed under
