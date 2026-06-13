@@ -1,5 +1,11 @@
 import os
 
+# Tell Settings to skip the dev .env file (see app/config.py). Without this,
+# experimental flags in the developer's local .env (RECENCY_DECAY_ENABLED,
+# PHASE1_TRIAGE_ENABLED, etc.) switch unmocked code paths during pytest and
+# cause spurious failures that don't reproduce in CI. Issue #28.
+os.environ["WYRDFOLD_API_TESTING"] = "1"
+
 # Set required env vars BEFORE importing the app so Settings picks them up.
 os.environ.setdefault("SUPABASE_URL", "https://test-project.supabase.co")
 os.environ.setdefault("WYRDFOLD_API_KEY", "testkey")
@@ -27,6 +33,25 @@ def _clear_caches():
     job_list_cache.invalidate()
     yield
     job_list_cache.invalidate()
+
+
+@pytest.fixture(autouse=True)
+def _reset_http_client():
+    """Reset the module-level cached httpx client between tests.
+
+    `app.http_client.get_http_client()` lazily caches an `AsyncClient`
+    bound to whichever event loop first triggered creation. With
+    pytest-asyncio's default function-scope loop, that client outlives
+    its loop — the next async test reuses the cached handle and fails
+    with `RuntimeError: Event loop is closed`. Clearing the reference
+    on entry makes each test create a fresh client on its own loop.
+    See #28.
+    """
+    import app.http_client as http_mod
+
+    http_mod._client = None
+    yield
+    http_mod._client = None
 
 
 @pytest.fixture(autouse=True)

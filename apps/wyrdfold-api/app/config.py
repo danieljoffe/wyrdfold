@@ -1,14 +1,23 @@
+import os
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Tests set WYRDFOLD_API_TESTING=1 in conftest before importing the app
+# so the developer's real `.env` (with experimental flags like
+# RECENCY_DECAY_ENABLED / PHASE1_TRIAGE_ENABLED) can't leak into the
+# test process and silently switch code paths. See #28.
+_TEST_ENV_FILE: str | None = (
+    None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
+)
 
 
 class Settings(BaseSettings):
     # extra="ignore": unknown keys in the dotenv file must not crash boot —
     # self-hosters commonly keep unrelated vars (PORT, tooling keys) in .env.
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=_TEST_ENV_FILE, env_file_encoding="utf-8", extra="ignore"
     )
 
     supabase_url: str = ""
