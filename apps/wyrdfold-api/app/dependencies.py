@@ -194,6 +194,12 @@ def _try_decode_jwt_sub(request: Request, s: Settings) -> str | None:
 
     Decode failures are logged at WARNING — see `verify_api_key_or_jwt`
     for rationale.
+
+    On success, stamps the user id onto the current Sentry scope so any
+    event captured later in the request carries the user (#26 F1). Without
+    this, 500s on authenticated routes land in Sentry with no way to
+    correlate to who hit them. The Sentry SDK no-ops when uninitialized,
+    so this is cheap when no DSN is configured.
     """
     if not s.supabase_url:
         return None
@@ -209,7 +215,14 @@ def _try_decode_jwt_sub(request: Request, s: Settings) -> str | None:
             exc.detail,
         )
         return None
-    return str(payload["sub"])
+    sub = str(payload["sub"])
+    try:
+        import sentry_sdk
+
+        sentry_sdk.set_user({"id": sub})
+    except ImportError:  # pragma: no cover
+        pass
+    return sub
 
 
 # Last write per user (time.monotonic seconds). In-process is fine on the
