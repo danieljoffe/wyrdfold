@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { expectNoA11yViolations } from '@/test-utils/axe';
 import MagicLinkForm from '../MagicLinkForm';
 
 const mockSignInWithOtp = jest.fn();
@@ -30,6 +31,27 @@ describe('MagicLinkForm — idle state', () => {
     expect(
       screen.getByText(/two clicks: enter your email/i)
     ).toBeInTheDocument();
+  });
+
+  it('has no axe violations in the idle state', async () => {
+    const { container } = render(
+      <MagicLinkForm next={undefined} authError={undefined} />
+    );
+    // heading-order disabled: the shared-ui Alert ("Private beta") renders
+    // its title as <h5>, which jumps from this page's <h1>. The fix lives
+    // in @danieljoffe/shared-ui — TODO: file upstream + re-enable here.
+    await expectNoA11yViolations(container, {
+      disableRules: ['heading-order'],
+    });
+  });
+
+  it('has no axe violations when surfacing a callback error', async () => {
+    const { container } = render(
+      <MagicLinkForm next={undefined} authError={'missing_code'} />
+    );
+    await expectNoA11yViolations(container, {
+      disableRules: ['heading-order'],
+    });
   });
 
   it('renders the WyrdFold logo wrapped in a Link to "/"', () => {
