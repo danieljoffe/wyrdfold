@@ -1,0 +1,15 @@
+# Trivy ignore list — explicit acceptance of known low-risk CVEs in
+# transitively-installed build tooling. Each entry has an expiry date
+# so it gets re-evaluated rather than rotting forever.
+
+# wheel / jaraco.context land in /app/.venv because `uv sync` uses them
+# as build helpers when installing source distributions. The runtime app
+# never invokes either tool (no setup.py runs, no wheel files processed
+# inside the container). Real exploit path would require running
+# `pip install` / `wheel install` against attacker-controlled input
+# inside the production container — we don't.
+# They aren't in uv.lock (build-system deps, not project deps), so the
+# fix has to come from uv pulling in newer versions transitively — track
+# upstream and remove this entry on next bump.
+CVE-2026-24049 exp:2027-03-31
+CVE-2026-23949 exp:2027-03-31
