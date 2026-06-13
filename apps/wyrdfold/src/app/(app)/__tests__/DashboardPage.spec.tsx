@@ -1,6 +1,7 @@
 import React from 'react';
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
+import { expectNoA11yViolations } from '@/test-utils/axe';
 import DashboardPage from '../DashboardPage';
 import type { JobPosting } from '../jobs/types';
 
@@ -96,6 +97,37 @@ describe('DashboardPage', () => {
       />
     );
     expect(screen.getByText(/No new matches right now/i)).toBeInTheDocument();
+  });
+
+  it('has no axe violations in the populated state', async () => {
+    const { container } = render(
+      <DashboardPage
+        initial={{
+          topMatches: [
+            makeJob({ id: 'a', title: 'Engineer A' }),
+            makeJob({ id: 'b', title: 'Engineer B', score: 65 }),
+          ],
+          counts: { new: 7, saved: 3, resume_draft: 1, applied: 2 },
+          hasProfile: true,
+          hasActiveTargets: true,
+        }}
+      />
+    );
+    await expectNoA11yViolations(container);
+  });
+
+  it('has no axe violations in the build-profile zero state', async () => {
+    const { container } = render(
+      <DashboardPage
+        initial={{
+          topMatches: [],
+          counts: {},
+          hasProfile: false,
+          hasActiveTargets: false,
+        }}
+      />
+    );
+    await expectNoA11yViolations(container);
   });
 
   it('renders one card per top match with the score badge', () => {

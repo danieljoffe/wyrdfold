@@ -1,6 +1,7 @@
 import React from 'react';
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
+import { expectNoA11yViolations } from '@/test-utils/axe';
 import ProfileIdentityCard from '../ProfileIdentityCard';
 
 const mockToast = jest.fn();
@@ -45,6 +46,14 @@ describe('ProfileIdentityCard', () => {
     expect(
       await screen.findByDisplayValue('me@example.com')
     ).toBeInTheDocument();
+  });
+
+  it('has no axe violations once the identity fields are loaded', async () => {
+    const { container } = render(<ProfileIdentityCard />);
+    // Wait for hydration to settle so axe sees the loaded form, not the
+    // intermediate empty-input state.
+    await screen.findByDisplayValue('Daniel');
+    await expectNoA11yViolations(container);
   });
 
   it('marks PII inputs with data-sentry-mask', async () => {
