@@ -254,6 +254,19 @@ the actual draw so you can tune the caps to real usage.
   also logs slow requests at WARNING above
   `SLOW_REQUEST_THRESHOLD_MS` (default 500).
 
+**Application logs** — text (the default) is readable in local dev; set
+`LOG_FORMAT=json` in production so a log-aggregator (Better Stack,
+Datadog, etc.) can index by field. Each record becomes a JSON line with
+`ts / level / logger / message` plus any `extra={...}` fields the code
+attached. App loggers route through this; uvicorn's own loggers
+(`uvicorn.access`, `uvicorn.error`) keep their stock format — pass
+`--log-config <path.json>` to uvicorn for fully unified output.
+
+The operator-facing **`GET /admin/cost-summary`** endpoint
+(api-key gated) returns the same UTC-midnight totals the global circuit
+breaker reads, plus per-purpose breakdowns for today and the last 30
+days — the right surface to drill into when a Sentry cost alert fires.
+
 ## Conventions
 
 - A husky pre-commit hook runs `lint-staged` (ESLint + Prettier) and, when TS

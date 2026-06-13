@@ -14,6 +14,7 @@ from starlette.types import Receive, Scope, Send
 
 from app.config import Settings, settings
 from app.http_client import close_http_client
+from app.logging_config import init_logging
 from app.observability import init_sentry
 from app.rate_limit import limiter
 from app.routers import (
@@ -38,6 +39,9 @@ from app.supabase_pool import close_supabase, get_supabase_pool, init_supabase
 
 _log = logging.getLogger("app")
 
+# Wire JSON logging before Sentry init so any boot-time errors land in
+# the configured format. No-op when LOG_FORMAT=text (the default).
+init_logging(settings.log_format)
 init_sentry()
 
 
