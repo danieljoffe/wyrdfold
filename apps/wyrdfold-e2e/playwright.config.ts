@@ -35,7 +35,15 @@ export default defineConfig({
     trace: 'on-first-retry',
   },
   webServer: {
-    command: `PORT=${PORT} pnpm exec nx run wyrdfold:dev`,
+    // CI runs the built production server so each route hit isn't a
+    // first-touch dev compile — middleware.spec alone visits 11 unique
+    // URLs, each previously incurring a multi-second `next dev` compile
+    // that dominated the e2e job (~12+ min). The CI workflow's
+    // "Build wyrdfold" step produces `.next/`; this just serves it.
+    // Local dev keeps `next dev` for HMR + zero rebuild between edits.
+    command: process.env['CI']
+      ? `PORT=${PORT} pnpm exec nx run wyrdfold:start`
+      : `PORT=${PORT} pnpm exec nx run wyrdfold:dev`,
     url: baseURL,
     reuseExistingServer: !process.env['CI'],
     cwd: workspaceRoot,

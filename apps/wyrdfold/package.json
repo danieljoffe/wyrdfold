@@ -10,19 +10,19 @@
   },
   "dependencies": {
     "@danieljoffe/shared-ui": "^0.1.0",
-    "@supabase/ssr": "^0.10.2",
+    "@supabase/ssr": "^0.12.0",
     "@tiptap/core": "^3.24.0",
     "@tiptap/extension-link": "^3.24.0",
     "@tiptap/pm": "^3.24.0",
     "@tiptap/react": "^3.24.0",
     "@tiptap/starter-kit": "^3.24.0",
     "isomorphic-dompurify": "3.16.0",
-    "lucide-react": "0.577.0",
+    "lucide-react": "1.18.0",
     "next": "16.2.9",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "recharts": "^3.8.1",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.1",
     "tiptap-markdown": "^0.9.0"
   }
 }
