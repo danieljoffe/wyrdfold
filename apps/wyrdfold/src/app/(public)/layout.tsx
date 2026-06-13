@@ -113,7 +113,7 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
               WyrdFold
             </span>
             <span
-              className='ml-1 inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-brand-300'
+              className='ml-1 inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-brand-950 dark:text-brand-300'
               aria-label='Private beta'
             >
               Beta
@@ -141,7 +141,7 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
               href={PORTFOLIO_URL}
               target='_blank'
               rel='noopener noreferrer'
-              className='rounded-sm text-text-secondary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
+              className='rounded-sm text-text-secondary underline underline-offset-2 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
             >
               Daniel Joffe
             </a>{' '}

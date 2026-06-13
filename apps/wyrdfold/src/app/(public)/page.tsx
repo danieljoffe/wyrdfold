@@ -94,7 +94,7 @@ export default function WyrdfoldLandingPage() {
       {/* Hero */}
       <section className='py-16 md:py-24'>
         <div className='max-w-3xl'>
-          <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-300'>
+          <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-950 dark:text-brand-300'>
             Private beta · invite-only
           </span>
           <Heading
@@ -238,7 +238,7 @@ export default function WyrdfoldLandingPage() {
                   <div className='flex flex-col items-center'>
                     <span
                       aria-hidden='true'
-                      className='font-mono text-sm md:text-base text-brand-300 tabular-nums leading-none pt-1'
+                      className='font-mono text-sm md:text-base text-brand-700 tabular-nums leading-none pt-1 dark:text-brand-300'
                     >
                       {step.number}
                     </span>
