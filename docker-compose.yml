@@ -21,3 +21,24 @@ services:
     ports:
       - '8001:8001'
     restart: unless-stopped
+
+    # --- Hardening (#30 F3) --------------------------------------------------
+    # The app writes only to stdout/stderr at runtime — no files, no
+    # local cache. Mounting the rootfs read-only blocks an exploit that
+    # tries to drop a binary. /tmp stays writable via tmpfs because
+    # uvicorn + pandoc occasionally use it.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    # The container runs as a non-root user (uid 1001) per the Dockerfile,
+    # so dropping ALL Linux capabilities is safe; nothing in the app
+    # needs CAP_NET_BIND_SERVICE or similar.
+    cap_drop:
+      - ALL
+    # Modest defaults that fit a typical self-host VPS. Raise these if
+    # you see real cost from LLM-heavy paths.
+    mem_limit: 1g
+    mem_reservation: 256m
+    pids_limit: 256

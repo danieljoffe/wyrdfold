@@ -56,6 +56,16 @@ def _validate_settings(s: Settings) -> None:
             "ALLOWED_HOSTS must be set (comma-separated host allowlist). Use '*' only in local dev."
         )
 
+    # Without Supabase wiring, every authenticated request 503s with no
+    # signal that the misconfig is the cause — the healthcheck stays
+    # green (it doesn't touch the DB). Fail the lifespan instead so a
+    # self-hoster's deploy log makes the cause obvious. #30 F2.
+    if not s.supabase_url or not s.supabase_service_role_key:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must both be set. "
+            "Get them from the Supabase dashboard → Settings → API."
+        )
+
     # If the operator selected the real Anthropic provider but didn't
     # configure a key, every LLM-backed request will 500 mid-call with
     # an opaque SDK ``TypeError`` ("Could not resolve authentication
