@@ -224,6 +224,27 @@ def _spend_by_purpose_python(
     return {k: round(v, 6) for k, v in totals.items()}
 
 
+def spend_by_purpose_all(
+    supabase: Client,
+    since: datetime | None = None,
+) -> dict[str, float]:
+    """Per-purpose spend across ALL users over the window.
+
+    Powers the operator cost-summary endpoint (#26 F4). No RPC variant
+    — the operator surface is queried infrequently, and the table is
+    bounded by retention, so a client-side group is fine.
+    """
+    query = supabase.table(TABLE).select("purpose, cost_usd")
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    totals: dict[str, float] = {}
+    for r in rows:
+        totals[r["purpose"]] = totals.get(r["purpose"], 0.0) + float(r["cost_usd"])
+    return {k: round(v, 6) for k, v in totals.items()}
+
+
 def spend_by_purpose(
     supabase: Client,
     user_id: str | None,
