@@ -45,6 +45,11 @@ select = [
   "B", "S", "SIM", "RUF", "T20",
   "PTH",    # flake8-use-pathlib — Path over os.path
   "ASYNC",  # async anti-patterns (blocking calls in coroutines)
+  "C4",     # comprehensions (dict(generator) → dict comprehension, etc.)
+  "PIE",    # misc lints (unnecessary dict-kwargs, no-op patterns)
+  "ISC",    # implicit string concat — catches missing commas in lists
+  "LOG",    # logging best practices (no f-strings/string-add in logger calls)
+  "DTZ",    # naive datetime — every datetime must be tz-aware
 ]
 ignore = [
   "B008",   # Depends() in FastAPI arg defaults is idiomatic
