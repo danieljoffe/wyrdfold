@@ -166,7 +166,7 @@ def _histogram(
 
 
 def _user_context(
-    supabase: Client, target_id: str, default_floor: int
+    supabase: Client, target_id: str
 ) -> list[FunnelUserContext]:
     """One entry per user with an active link to this target."""
     ut_resp = (
@@ -285,7 +285,7 @@ def compute_target_funnel(
 
     stages = _stage_counts(supabase, target_id)
     # User context first — we need their floor for the histogram view.
-    users = _user_context(supabase, target_id, default_floor=0)
+    users = _user_context(supabase, target_id)
     floor = _default_floor_from_users(users)
     histogram = _histogram(supabase, target_id, floor=floor)
     sources = _sources(supabase)
