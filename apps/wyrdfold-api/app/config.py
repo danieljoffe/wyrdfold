@@ -142,6 +142,12 @@ class Settings(BaseSettings):
     # at WARNING with method/path/duration. Set to 0 to log every request.
     slow_request_threshold_ms: int = Field(default=500, ge=0, le=60_000)
 
+    # Application log format (#26 F5). `text` keeps stdlib/uvicorn
+    # defaults for local DX; `json` attaches a JSON formatter to the
+    # root logger so log-aggregation tools can index each field. See
+    # app/logging_config.py.
+    log_format: Literal["text", "json"] = "text"
+
     # CORS — comma-separated allowlist of origins permitted to call the API
     # from a browser. Empty disables CORS (server-to-server only). Production
     # should be the Next.js app URL; local dev typically `http://localhost:3000,http://localhost:3100`.
