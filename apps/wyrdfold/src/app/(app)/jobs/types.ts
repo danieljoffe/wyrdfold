@@ -70,14 +70,14 @@ export interface JobsFilterState {
 
 export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';
 
-export interface SkillMatch {
+interface SkillMatch {
   name: string;
   matched: boolean;
   confidence: 'high' | 'medium' | 'low';
   evidence: string | null;
 }
 
-export interface Scorecard {
+interface Scorecard {
   skills_matched: SkillMatch[];
   skills_missing: string[];
   nice_to_haves: string[];
@@ -102,12 +102,12 @@ export interface JobAnalysis {
 // Resume lifecycle types (#505)
 // ---------------------------------------------------------------------------
 
-export interface TailoredBullet {
+interface TailoredBullet {
   text: string;
   source_outcome_ref: string | null;
 }
 
-export interface TailoredRole {
+interface TailoredRole {
   company: string;
   title: string;
   location: string | null;
@@ -117,13 +117,13 @@ export interface TailoredRole {
   source_role_ref: string;
 }
 
-export interface TailoredEducation {
+interface TailoredEducation {
   school: string;
   degree: string | null;
   dates: string | null;
 }
 
-export interface ContactInfo {
+interface ContactInfo {
   name: string;
   email: string | null;
   phone: string | null;
@@ -132,7 +132,7 @@ export interface ContactInfo {
   linkedin: string | null;
 }
 
-export interface TailoredResumePayload {
+interface TailoredResumePayload {
   summary: string;
   contact: ContactInfo;
   experience: TailoredRole[];
@@ -173,11 +173,11 @@ export interface TailoredResumeRecord {
   source_resume_id: string | null;
 }
 
-export interface CoverLetterParagraph {
+interface CoverLetterParagraph {
   text: string;
 }
 
-export interface CoverLetterPayload {
+interface CoverLetterPayload {
   contact: ContactInfo;
   recipient_company: string;
   recipient_role: string | null;
@@ -205,7 +205,7 @@ export interface StatusLogEntry {
   created_at: string;
 }
 
-export type ResumeVersionSource = 'initial' | 'user_edit' | 'llm_adapt';
+type ResumeVersionSource = 'initial' | 'user_edit' | 'llm_adapt';
 
 export interface ResumeVersion {
   id: string;

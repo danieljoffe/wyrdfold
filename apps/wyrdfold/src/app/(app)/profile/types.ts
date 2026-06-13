@@ -47,7 +47,7 @@ export function hasProse(value: ProseResponse): value is ProseDoc {
   return 'id' in value;
 }
 
-export type OptimizedDocSource = 'llm' | 'user_edit';
+type OptimizedDocSource = 'llm' | 'user_edit';
 
 export interface OptimizedDoc {
   id: string;

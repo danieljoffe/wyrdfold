@@ -158,7 +158,7 @@ export interface TargetReferenceJD {
   created_at: string;
 }
 
-export interface TargetSuggestion {
+interface TargetSuggestion {
   label: string;
   description: string;
   core_skills: string[];
