@@ -130,6 +130,39 @@ async def test_breaker_disabled_when_cap_is_zero(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_breaker_warns_at_80_percent_under_cap(monkeypatch) -> None:
+    """At ≥80% of the global cap (under the trip threshold) the breaker
+    emits a Sentry warning so the operator sees the run-up before LLM
+    work actually defers (#26 F3)."""
+    monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+    monkeypatch.setattr(live_settings, "sentry_dsn", "https://x@sentry/1")
+    # 8.5 / 10 = 85% — over the 80% threshold, under the cap.
+    monkeypatch.setattr(
+        poller_mod, "total_llm_spend_all", MagicMock(return_value=8.5)
+    )
+    # Reset the per-day dedup so the warning can fire this test.
+    monkeypatch.setattr(poller_mod, "_GLOBAL_APPROACHING_DAY", None)
+
+    import sentry_sdk
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None: captured.append((msg, level)),
+    )
+
+    tripped = poller_mod._global_circuit_breaker_tripped(MagicMock())
+
+    assert tripped is False
+    assert len(captured) == 1
+    msg, level = captured[0]
+    assert level == "warning"
+    assert "approaching" in msg.lower()
+    assert "85%" in msg
+
+
+@pytest.mark.asyncio
 async def test_breaker_query_failure_never_crashes_the_poll(monkeypatch) -> None:
     """A spend-meter read failure falls into the existing fail-closed
     arm: empty gate, has_active=True, no exception escapes."""

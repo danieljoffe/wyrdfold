@@ -1383,6 +1383,13 @@ async def _record_source_failure(
         )
 
 
+# Per-process dedup so the "approaching cap" warning fires once per UTC
+# day rather than once per cycle (#26 F3). Keyed on the UTC date so a
+# day rollover re-arms it; restart re-arms it (acceptable — one extra
+# warning per restart per day is fine).
+_GLOBAL_APPROACHING_DAY: str | None = None
+
+
 def _global_circuit_breaker_tripped(supabase: Client) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``.
@@ -1390,13 +1397,46 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
     Defense-in-depth above the per-payer monthly gates: a runaway cycle
     (bad prompt, bad batch math, many users at once) stops bleeding
     within one poll tick instead of within one user-month. 0 disables.
+
+    Also emits an "approaching cap" Sentry warning at 80% so the operator
+    sees the run-up before the breaker actually trips — by the time the
+    trip event fires, the cycle has already deferred all LLM work (#26
+    F3).
     """
     cap = settings.global_llm_daily_budget_usd
     if cap <= 0:
         return False
-    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now(UTC)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     spent = total_llm_spend_all(supabase, since=midnight)
     if spent < cap:
+        # Approaching-cap warning (#26 F3) — once per UTC day.
+        if spent >= cap * 0.8:
+            global _GLOBAL_APPROACHING_DAY
+            day_key = now.date().isoformat()
+            if day_key != _GLOBAL_APPROACHING_DAY:
+                _GLOBAL_APPROACHING_DAY = day_key
+                logger.warning(
+                    "global LLM spend approaching cap: $%.4f / $%.2f "
+                    "(%.0f%%)",
+                    spent,
+                    cap,
+                    spent / cap * 100,
+                )
+                if settings.sentry_dsn:
+                    try:
+                        import sentry_sdk
+
+                        sentry_sdk.capture_message(
+                            f"global LLM spend approaching daily cap: "
+                            f"${spent:.4f} / ${cap:.2f} "
+                            f"({spent / cap * 100:.0f}%)",
+                            level="warning",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to report approaching-cap warning to Sentry"
+                        )
         return False
     logger.error(
         "global LLM circuit breaker tripped: $%.4f spent today >= $%.2f cap — "
