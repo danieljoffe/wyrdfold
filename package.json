@@ -18,6 +18,8 @@
     "typecheck": "nx run-many --target=typecheck --all",
     "knip": "knip",
     "knip:fix": "knip --fix",
+    "analyze": "nx run wyrdfold:analyze",
+    "lhci": "lhci autorun",
     "pom": "pnpm typecheck && pnpm lint:fix && pnpm format && pnpm test && pnpm test:python && pnpm test:coverage && pnpm test:e2e",
     "pom:affected": "nx affected -t typecheck && nx affected -t lint --fix && pnpm format && nx affected -t test --coverage && nx affected -t e2e",
     "affected": "nx affected -t lint test build typecheck e2e",
@@ -49,6 +51,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@lhci/cli": "^0.15.1",
     "@next/eslint-plugin-next": "^16.1.6",
     "@nx/devkit": "22.7.5",
     "@nx/docker": "22.7.5",

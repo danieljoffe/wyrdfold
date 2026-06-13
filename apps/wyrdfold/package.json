@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
+    "analyze": "next experimental-analyze",
     "build": "next build",
     "dev": "next dev -p 3100",
     "invite-beta": "tsx scripts/invite-beta-tester.ts",
