@@ -17,19 +17,11 @@ import { test, expect } from '@playwright/test';
 //   @danieljoffe/shared-ui — re-enable once that ships.
 const SHARED_DISABLES = ['heading-order'];
 
-// Landing-page-specific disables (TODO: tackle as a focused PR):
-// - `color-contrast` — the chartreuse brand-300 used for the "Beta"
-//   badge + similar soft pills has 1.71:1 contrast on near-white
-//   backgrounds (needs 4.5:1 for AA). Real launch-blocker; tracked as
-//   a follow-up so this spec can still guard against new violations.
-// - `link-in-text-block` — one "Built by Daniel Joffe" link in the
-//   public footer carries no underline distinct from surrounding text.
-//   Fix: add underline-on-hover-only OR a 3:1+ contrast difference.
-const LANDING_DISABLES = [
-  ...SHARED_DISABLES,
-  'color-contrast',
-  'link-in-text-block',
-];
+// Landing-page disables now match SHARED_DISABLES — the previous
+// `color-contrast` and `link-in-text-block` violations were fixed
+// (Beta badges flipped to `text-brand-950`; footer "Built by" link
+// picked up `underline underline-offset-2`).
+const LANDING_DISABLES = SHARED_DISABLES;
 
 test.describe('Accessibility (public pages)', () => {
   test('/login has no serious or critical axe violations', async ({ page }) => {
