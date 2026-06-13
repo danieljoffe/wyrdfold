@@ -1,0 +1,61 @@
+name: Bug report
+description: Something doesn't work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please don't use this template for
+        security issues — see [`SECURITY.md`](../blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you see, what did you expect?
+      placeholder: |
+        Steps to reproduce:
+        1. …
+        2. …
+
+        Expected: …
+        Actual: …
+    validations:
+      required: true
+
+  - type: textarea
+    id: self-host-env
+    attributes:
+      label: Self-host environment
+      description: |
+        The details that usually pin down a reproduction. Skip what
+        doesn't apply.
+      value: |
+        - Deployment: <Vercel + Railway / docker-compose / local dev>
+        - Supabase: <hosted / self-hosted>
+        - LLM provider: <openrouter / anthropic / mock>
+        - Feature flags set (PHASE1_TRIAGE_ENABLED, RECENCY_DECAY_ENABLED, etc.):
+        - WyrdFold commit / tag:
+        - Node version:
+        - Python version:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Anything from the API, the BFF, or the browser console that
+        looks relevant. Triple-backtick code blocks render nicely.
+      render: text
+
+  - type: checkboxes
+    id: search
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues for duplicates
+          required: true
+        - label: This isn't a security issue (those go through `SECURITY.md`)
+          required: true

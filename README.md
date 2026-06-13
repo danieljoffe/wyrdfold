@@ -1,5 +1,8 @@
 # WyrdFold
 
+[![CI](https://github.com/danieljoffe/wyrdfold/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/danieljoffe/wyrdfold/actions/workflows/ci.yml)
+[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](./LICENSE.md)
+
 **Self-hostable, bring-your-own-key job-search automation.** WyrdFold polls
 job boards (Greenhouse, Lever, Ashby, and more) against the roles you're
 targeting, triages and grades every posting for fit with a two-phase LLM
