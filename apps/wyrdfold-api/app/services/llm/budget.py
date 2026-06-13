@@ -11,6 +11,7 @@ The guard is advisory: a single in-flight call can still push spend
 hourly window bounds the worst-case overshoot.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -19,7 +20,14 @@ from supabase import Client
 
 from app.services.llm import cost_log
 
+logger = logging.getLogger(__name__)
+
 MONTHLY_WINDOW_DAYS = 30
+
+# Threshold at which we emit "approaching the cap" warnings (#26 F3).
+# Below this we stay quiet; once a user crosses it we want a Sentry trail
+# so operators see the run-up BEFORE the 429 spike, not after.
+_APPROACHING_CAP_FRACTION = 0.8
 """Rolling window for the monthly allowance. Rolling beats calendar-month:
 no first-of-month reset stampede, and it matches how Claude's own usage
 limits behave."""
@@ -66,7 +74,31 @@ def raise_if_llm_disabled(enabled: bool) -> None:
         )
 
 
-def _raise_budget_429(scope: str, limit_usd: float, spent_usd: float) -> None:
+def _raise_budget_429(
+    scope: str, limit_usd: float, spent_usd: float, *, user_id: str
+) -> None:
+    """Raise the 429 *and* capture a Sentry warning so per-user budget
+    hits are observable (#26 F2). The 429 response is the user signal;
+    the Sentry breadcrumb is the operator signal — a spike of cap hits
+    across many users (prompt regression, cost shift) is invisible
+    without it.
+    """
+    logger.warning(
+        "llm_budget_exceeded user=%s scope=%s spent=%.4f limit=%.2f",
+        user_id,
+        scope,
+        spent_usd,
+        limit_usd,
+    )
+    try:
+        import sentry_sdk
+
+        sentry_sdk.capture_message(
+            f"LLM budget exceeded ({scope}): ${spent_usd:.4f} >= ${limit_usd:.2f}",
+            level="warning",
+        )
+    except ImportError:  # pragma: no cover
+        pass
     raise HTTPException(
         status_code=429,
         detail={
@@ -76,6 +108,53 @@ def _raise_budget_429(scope: str, limit_usd: float, spent_usd: float) -> None:
             "spent_usd": spent_usd,
         },
     )
+
+
+# Per-process dedup so a chatty user doesn't fire a Sentry warning on
+# every request once they cross 80% — first crossing per (user, scope)
+# per process restart is enough signal.
+_APPROACHING_FIRED: set[tuple[str, str]] = set()
+
+
+def _maybe_warn_approaching(
+    *, user_id: str, scope: str, limit_usd: float, spent_usd: float
+) -> None:
+    """Emit a Sentry warning when spend crosses 80% of a window (#26 F3).
+
+    The trip itself is the wrong signal to react to — by then the user is
+    already 429'd. The 80% breadcrumb is the actionable layer: operator
+    has a window to investigate (bad prompt? batch loop? legitimate
+    growth?) before the cap actually bites.
+    """
+    if limit_usd <= 0:
+        return
+    if spent_usd < limit_usd * _APPROACHING_CAP_FRACTION:
+        return
+    if spent_usd >= limit_usd:
+        # Cap already exceeded — the 429 path handles its own telemetry.
+        return
+    key = (user_id, scope)
+    if key in _APPROACHING_FIRED:
+        return
+    _APPROACHING_FIRED.add(key)
+    logger.info(
+        "llm_budget_approaching user=%s scope=%s spent=%.4f limit=%.2f",
+        user_id,
+        scope,
+        spent_usd,
+        limit_usd,
+    )
+    try:
+        import sentry_sdk
+
+        sentry_sdk.capture_message(
+            f"LLM budget approaching cap ({scope}): "
+            f"${spent_usd:.4f} / ${limit_usd:.2f} "
+            f"({spent_usd / limit_usd * 100:.0f}%)",
+            level="warning",
+        )
+    except ImportError:  # pragma: no cover
+        pass
 
 
 def check_user_budget(
@@ -99,14 +178,30 @@ def check_user_budget(
             supabase, user_id=user_id, since=now - timedelta(hours=1)
         )
         if spent_hour >= hourly_limit_usd:
-            _raise_budget_429("hourly", hourly_limit_usd, spent_hour)
+            _raise_budget_429(
+                "hourly", hourly_limit_usd, spent_hour, user_id=user_id
+            )
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="hourly",
+            limit_usd=hourly_limit_usd,
+            spent_usd=spent_hour,
+        )
 
     if daily_limit_usd > 0:
         spent_day = cost_log.total_spend(
             supabase, user_id=user_id, since=now - timedelta(hours=24)
         )
         if spent_day >= daily_limit_usd:
-            _raise_budget_429("daily", daily_limit_usd, spent_day)
+            _raise_budget_429(
+                "daily", daily_limit_usd, spent_day, user_id=user_id
+            )
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="daily",
+            limit_usd=daily_limit_usd,
+            spent_usd=spent_day,
+        )
 
     if monthly_limit_usd > 0:
         spent_month = cost_log.total_spend(
@@ -115,7 +210,15 @@ def check_user_budget(
             since=now - timedelta(days=MONTHLY_WINDOW_DAYS),
         )
         if spent_month >= monthly_limit_usd:
-            _raise_budget_429("monthly", monthly_limit_usd, spent_month)
+            _raise_budget_429(
+                "monthly", monthly_limit_usd, spent_month, user_id=user_id
+            )
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="monthly",
+            limit_usd=monthly_limit_usd,
+            spent_usd=spent_month,
+        )
 
 
 def check_daily_count(
