@@ -21,7 +21,12 @@ from typing import Any, cast
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from supabase import Client
 
-from app.dependencies import get_current_user_id, get_llm_client, get_supabase
+from app.dependencies import (
+    enforce_llm_budget,
+    get_current_user_id,
+    get_llm_client,
+    get_supabase,
+)
 from app.models.feedback import (
     FeedbackCreate,
     FeedbackCreateResponse,
@@ -150,6 +155,7 @@ async def run_learner_now(
 @router.post(
     "/targets/{target_id}/learn-llm",
     response_model=LearningRunResult | None,
+    dependencies=[Depends(enforce_llm_budget)],
 )
 async def run_llm_learner_now(
     target_id: str,

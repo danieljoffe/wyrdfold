@@ -1255,7 +1255,7 @@ async def delete_reference_jd(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    deleted = crud.delete_reference_jd(supabase, ref_jd_id)
+    deleted = crud.delete_reference_jd(supabase, ref_jd_id, target_id=target_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
