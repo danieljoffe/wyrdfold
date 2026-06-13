@@ -78,7 +78,7 @@ jobs:
       # The build cost (~30-60s) plus near-zero per-route latency wins by
       # several minutes over `next dev`.
       - name: Build wyrdfold (for e2e production server)
-        run: pnpm nx build wyrdfold
+        run: pnpm nx build wyrdfold --prod
 
       # Zero-secret by design: with no Supabase env, the playwright config
       # registers only the `public-chromium` project (login form, middleware
