@@ -18,7 +18,14 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY apps/wyrdfold-api/pyproject.toml ./apps/wyrdfold-api/pyproject.toml
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+# Cache mount keyed by an explicit ID (not the BuildKit default of
+# hashing the target path). Railway's builder rejects the shorthand
+# `--mount=type=cache,target=...` with "missing an id argument"; the
+# canonical BuildKit spec allows omitting it but stricter parsers
+# don't. A stable literal id keeps the Dockerfile portable — any
+# operator's builder reuses the same cache between rebuilds without
+# the file embedding anyone's account/service UUID.
+RUN --mount=type=cache,id=wyrdfold-uv-cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-dev --no-editable --package wyrdfold-api
 
 # ---- runtime ----------------------------------------------------------------
