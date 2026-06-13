@@ -40,7 +40,7 @@ def resolve_target_payers(
         .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
-    payers: dict[str, str | None] = {tid: None for tid in target_ids}
+    payers: dict[str, str | None] = dict.fromkeys(target_ids)
     for row in rows:
         tid = row["target_id"]
         if payers.get(tid) is None:

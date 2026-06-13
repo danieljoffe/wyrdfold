@@ -572,7 +572,7 @@ async def test_derive_url_target_bg_new_does_not_bump_version(
         "add_reference_jd",
         lambda _s, **kw: (
             add_ref_calls.append(kw)
-            or _ref_jd(**{"target_id": kw["target_id"], "jd_url": kw["jd_url"]})
+            or _ref_jd(target_id=kw["target_id"], jd_url=kw["jd_url"])
         ),  # type: ignore[func-returns-value]
     )
     monkeypatch.setattr(crud, "list_reference_jds", lambda _s, _t: [_ref_jd(target_id="new")])

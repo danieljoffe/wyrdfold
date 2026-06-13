@@ -183,7 +183,7 @@ def _scripted_response(target: JobTarget) -> Any:
             )
 
         if table == "scores":
-            fmap = dict((f[1], f[2]) for f in filters)
+            fmap = {f[1]: f[2] for f in filters}
             # Histogram path returns rows of scores.
             if count is None:
                 return SimpleNamespace(
