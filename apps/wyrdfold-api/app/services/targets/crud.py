@@ -705,8 +705,17 @@ def list_reference_jds(
     return [_parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def delete_reference_jd(supabase: Client, ref_jd_id: str) -> bool:
+def delete_reference_jd(
+    supabase: Client, ref_jd_id: str, *, target_id: str
+) -> bool:
+    # target_id constrains the delete to the target the route already
+    # ownership-checked — without it, any ref_jd_id across any target
+    # would be deletable (IDOR, audit #24 F1).
     resp = (
-        supabase.table(REF_JDS_TABLE).delete().eq("id", ref_jd_id).execute()
+        supabase.table(REF_JDS_TABLE)
+        .delete()
+        .eq("id", ref_jd_id)
+        .eq("target_id", target_id)
+        .execute()
     )
     return bool(resp.data)

@@ -48,6 +48,16 @@ async def create_analysis(
     user_id: str | None = Depends(get_current_user_id_optional),
     s: Settings = Depends(get_settings),
 ) -> JobAnalysisRecord:
+    # 0. Ownership: the blend below WRITES to the shared (job, target)
+    # scores row, so a JWT caller must be linked to target_id — otherwise
+    # any user could re-rank another target's list (audit #24 F2). 404 not
+    # 403 so non-owners can't enumerate target existence. api-key callers
+    # (user_id None) are operators and bypass, matching the targets router.
+    if user_id is not None and target_id not in targets_crud.get_user_target_ids(
+        supabase, user_id
+    ):
+        raise HTTPException(status_code=404, detail="Target not found.")
+
     # 1. Fetch optimized doc (needed for cache key)
     current_optimized = optimized.get_latest(supabase, user_id=user_id)
     if current_optimized is None:
