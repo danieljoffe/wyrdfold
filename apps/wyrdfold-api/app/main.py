@@ -17,6 +17,7 @@ from app.http_client import close_http_client
 from app.observability import init_sentry
 from app.rate_limit import limiter
 from app.routers import (
+    admin,
     analysis,
     discovery,
     experience,
@@ -256,6 +257,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     return JSONResponse(status_code=500, content=body)
 
 
+app.include_router(admin.router)
 app.include_router(analysis.router)
 app.include_router(discovery.router)
 app.include_router(experience.router)
