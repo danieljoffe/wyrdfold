@@ -198,6 +198,62 @@ The reference deployment (any equivalent host works):
   Docker host via `docker-compose.yml`. Set `ALLOWED_HOSTS` to your public
   domain(s) and `SENTRY_ENVIRONMENT=production` if using Sentry.
 
+## Operations
+
+The minimal "is WyrdFold healthy?" setup for a self-hosted instance:
+
+**Liveness endpoints** (no auth, no DB call — safe to poll every 30 s):
+
+| URL                        | What it covers                                   |
+| -------------------------- | ------------------------------------------------ |
+| `https://<web>/api/health` | Next.js BFF process is serving                   |
+| `https://<api>/health`     | FastAPI process is serving (used by Railway too) |
+
+Point [UptimeRobot](https://uptimerobot.com),
+[BetterUptime](https://betteruptime.com), or your platform's built-in
+probe at **both**. The BFF can be up while the API is down (proxies will
+503), so monitoring just one will miss half the failure modes.
+
+**Error tracking — Sentry** (recommended, optional). Two projects, one
+per process:
+
+- **Web** — set `NEXT_PUBLIC_SENTRY_CONFIG_ID` (DSN); release tagging
+  and source-map upload run automatically via
+  `withSentryConfig` on every non-CI build. Vercel cron failures wire
+  into Sentry check-ins through `automaticVercelMonitors: true` — set up
+  a Sentry alert on the monitor failing so you find out the day's poll
+  silently 5xx'd before users do.
+- **API** — set `SENTRY_DSN` + `SENTRY_ENVIRONMENT`. The poller emits
+  warning-level events at the LLM-cost run-ups (80% of the daily/global
+  cap) and an error when the circuit breaker actually trips; add Sentry
+  alerts on both severity levels.
+
+**LLM cost** — the budget system has three layers:
+
+1. **Per-user windows** (hourly / daily / monthly) — configured via
+   `USER_LLM_HOURLY_BUDGET_USD`, `USER_LLM_DAILY_BUDGET_USD`,
+   `USER_LLM_MONTHLY_BUDGET_USD`. The `/profile/llm-usage` endpoint
+   surfaces each user's own state.
+2. **Global daily circuit breaker** —
+   `GLOBAL_LLM_DAILY_BUDGET_USD` is the per-process kill switch. The
+   poll cycle defers ALL LLM work for the day once it trips; jobs still
+   ingest.
+3. **Provider-side spend caps** (OpenRouter / Anthropic dashboards) are
+   the final backstop. Set them slightly above the global daily cap so
+   you find out via Sentry, not via the provider 429ing the next
+   request.
+
+In the dashboard, the in-app **Insights → Cost over time** chart shows
+the actual draw so you can tune the caps to real usage.
+
+**Database — Supabase**:
+
+- Daily backups are on by default in the dashboard; verify the
+  retention window matches your tolerance.
+- The dashboard's **Reports → API** view shows slow queries; the API
+  also logs slow requests at WARNING above
+  `SLOW_REQUEST_THRESHOLD_MS` (default 500).
+
 ## Conventions
 
 - A husky pre-commit hook runs `lint-staged` (ESLint + Prettier) and, when TS
