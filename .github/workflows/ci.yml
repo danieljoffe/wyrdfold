@@ -193,19 +193,27 @@ jobs:
       - name: Build wyrdfold-api image
         run: docker build -f apps/wyrdfold-api/Dockerfile -t wyrdfold-api:ci .
 
+      # Scan via `docker run` against a pinned Trivy image rather than
+      # `aquasecurity/trivy-action`. The action wraps a binary install
+      # step (download from GitHub releases) that has been flaking with
+      # exit 1 on the runner without surfacing a useful reason — running
+      # the official Trivy container directly removes that hop entirely
+      # and pins the scanner version we audit against.
+      #
+      # `os,library` covers Debian packages from the slim base AND the
+      # Python deps resolved into /app/.venv by the builder stage.
+      # `ignore-unfixed` keeps the gate firing only on actionable
+      # findings. `.trivyignore` documents the accepted-risk transitive
+      # build-tool CVEs with expiry dates.
       - name: Scan with Trivy
-        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # v0.34.0
-        with:
-          image-ref: wyrdfold-api:ci
-          format: table
-          severity: HIGH,CRITICAL
-          # `os,library` covers Debian packages from the slim base AND
-          # Python deps resolved into /app/.venv by the builder stage.
-          vuln-type: os,library
-          # Unfixed CVEs in the base distro can't be actioned in this PR —
-          # ignore them so the gate fires only on actionable findings.
-          ignore-unfixed: true
-          # Repo-root .trivyignore declares explicit risk acceptance for
-          # known low-impact transitive build-tool CVEs with expiry dates.
-          trivyignores: .trivyignore
-          exit-code: '1'
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/.trivyignore:/.trivyignore:ro" \
+            aquasec/trivy:0.69.1 image \
+              --severity HIGH,CRITICAL \
+              --vuln-type os,library \
+              --ignore-unfixed \
+              --ignorefile /.trivyignore \
+              --exit-code 1 \
+              wyrdfold-api:ci
