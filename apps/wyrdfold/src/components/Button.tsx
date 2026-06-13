@@ -88,10 +88,15 @@ const sizeButtonStyles: Record<string, string> = {
   lg: 'px-6 py-3 text-lg hover:scale-[1.025]',
 };
 
+// Icon-only buttons enforce a 44×44 minimum hit area (WCAG 2.5.5,
+// Apple HIG, Material) via `min-h-11 min-w-11`. The padding values
+// stay tuned to visual density — the min-* utilities only kick in when
+// the inner icon would otherwise produce a target smaller than 44px,
+// so layouts with chunkier icons (size='lg') are unaffected. #25 F2.
 const iconOnlySizeStyles: Record<string, string> = {
-  sm: 'p-1.5 text-sm hover:scale-[1.1]',
-  md: 'p-2.5 hover:scale-[1.05]',
-  lg: 'p-3 text-lg hover:scale-[1.025]',
+  sm: 'p-1.5 text-sm min-h-11 min-w-11 hover:scale-[1.1]',
+  md: 'p-2.5 min-h-11 min-w-11 hover:scale-[1.05]',
+  lg: 'p-3 text-lg min-h-11 min-w-11 hover:scale-[1.025]',
 };
 
 const variantLinkOutline: Record<string, string> = {

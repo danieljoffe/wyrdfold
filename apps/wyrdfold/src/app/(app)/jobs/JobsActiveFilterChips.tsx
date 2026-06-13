@@ -18,8 +18,12 @@ const SCORE_LABEL: Record<string, string> = {
 const CHIP_CLASS =
   'inline-flex items-center gap-1 rounded-full border border-brand-500/40 bg-brand-500/10 py-0.5 pl-2.5 pr-1 text-xs text-text-primary';
 
+// The visible chip stays compact, but the actual hit area is expanded
+// via a 14px-wide pseudo-element ring so a tap on any edge of the
+// chip's vicinity registers. 16px + (14 × 2) = 44px → WCAG 2.5.5
+// compliant without distorting the visual chip. #25 F2.
 const REMOVE_BTN_CLASS =
-  'flex size-4 items-center justify-center rounded-full text-text-tertiary hover:bg-brand-500/20 hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500';
+  'relative flex size-4 items-center justify-center rounded-full text-text-tertiary hover:bg-brand-500/20 hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 before:absolute before:-inset-[14px] before:content-[""]';
 
 interface JobsActiveFilterChipsProps {
   filters: JobsFilterState;
