@@ -1270,14 +1270,20 @@ async def add_manual_job(
         # (the negative penalty stays in the breakdown so the badge color
         # still tells the user this isn't a great fit) but make the row
         # visible so the user can act on it.
-        try:
-            supabase.table("scores").update({"excluded": False}).eq(
-                "job_posting_id", posting_id
-            ).execute()
-        except Exception:
-            logger.exception(
-                "Force-include update failed for manual job %s", posting_id
-            )
+        # Scoped to the targets scored above: when the posting already
+        # existed (poller ingest or another user's paste), an unscoped
+        # update would also flip rows under OTHER users' targets,
+        # overriding their negative-keyword exclusions (audit #24 F4).
+        scored_target_ids = [t.id for t in active_targets]
+        if scored_target_ids:
+            try:
+                supabase.table("scores").update({"excluded": False}).eq(
+                    "job_posting_id", posting_id
+                ).in_("target_id", scored_target_ids).execute()
+            except Exception:
+                logger.exception(
+                    "Force-include update failed for manual job %s", posting_id
+                )
 
     # Invalidate job list cache after adding a new posting
     job_list_cache.invalidate()
