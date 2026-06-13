@@ -172,6 +172,8 @@ pnpm nx e2e wyrdfold-e2e               # Playwright E2E
 pnpm test:python                       # API lint + typecheck + tests (ruff/mypy/pytest)
 pnpm nx affected -t lint test build    # only what changed (base: main)
 pnpm knip                              # unused files / deps / exports
+pnpm analyze                           # next experimental-analyze → interactive bundle UI on :4000
+pnpm lhci                              # Lighthouse CI vs. the prod server (lighthouserc.json)
 ```
 
 Per-project targets are inferred by Nx — run `pnpm nx show project wyrdfold`
