@@ -132,3 +132,38 @@ jobs:
           uv run --package wyrdfold-api ruff check .
           uv run --package wyrdfold-api mypy app/
           uv run --package wyrdfold-api pytest -v
+
+  # Image scan (#30 F5). Builds the same Dockerfile the deploy uses and
+  # scans the result with Trivy. Fails on HIGH/CRITICAL OS or library
+  # CVEs in the runtime layer. Complements `pnpm audit --prod` (JS tree)
+  # by covering the python:3.11-slim base + transitive Python deps.
+  image-scan:
+    name: Image scan — Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          filter: tree:0
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build wyrdfold-api image
+        run: docker build -f apps/wyrdfold-api/Dockerfile -t wyrdfold-api:ci .
+
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # v0.34.0
+        with:
+          image-ref: wyrdfold-api:ci
+          format: table
+          severity: HIGH,CRITICAL
+          # `os,library` covers Debian packages from the slim base AND
+          # Python deps resolved into /app/.venv by the builder stage.
+          vuln-type: os,library
+          # Unfixed CVEs in the base distro can't be actioned in this PR —
+          # ignore them so the gate fires only on actionable findings.
+          ignore-unfixed: true
+          # Repo-root .trivyignore declares explicit risk acceptance for
+          # known low-impact transitive build-tool CVEs with expiry dates.
+          trivyignores: .trivyignore
+          exit-code: '1'
