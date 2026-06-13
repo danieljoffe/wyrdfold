@@ -70,6 +70,16 @@ jobs:
       - name: Install Playwright chromium
         run: pnpm exec playwright install chromium --with-deps
 
+      # Build once up front so the e2e webServer can boot a production
+      # `next start` instead of `next dev`. The previous setup served via
+      # `next dev`, which compiles each route on first hit — the
+      # middleware spec alone visits 11 unique URLs, each a cold
+      # multi-second compile, which dominated the job's wall-clock time.
+      # The build cost (~30-60s) plus near-zero per-route latency wins by
+      # several minutes over `next dev`.
+      - name: Build wyrdfold (for e2e production server)
+        run: pnpm nx build wyrdfold --prod
+
       # Zero-secret by design: with no Supabase env, the playwright config
       # registers only the `public-chromium` project (login form, middleware
       # redirects, security headers). The `setup`/`authed-chromium` projects
