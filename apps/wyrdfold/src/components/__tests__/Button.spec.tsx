@@ -195,4 +195,21 @@ describe('Button component', () => {
     const { container } = render(<Button name='test'>Click</Button>);
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  // #25 F2 — icon-only buttons must meet the 44×44 minimum hit area
+  // regardless of size. Pins the contract so a future "tighten the
+  // sizing" PR can't silently drop below the WCAG target.
+  test.each<['sm' | 'md' | 'lg']>([['sm'], ['md'], ['lg']])(
+    'iconOnly size %s enforces a 44×44 minimum hit area',
+    size => {
+      render(
+        <Button name='close' iconOnly size={size} aria-label='Close'>
+          <span aria-hidden>×</span>
+        </Button>
+      );
+      const button = screen.getByRole('button', { name: /close/i });
+      expect(button.className).toMatch(/\bmin-h-11\b/);
+      expect(button.className).toMatch(/\bmin-w-11\b/);
+    }
+  );
 });
