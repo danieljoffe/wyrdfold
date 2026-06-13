@@ -174,3 +174,46 @@ jobs:
           uv run --package wyrdfold-api ruff check .
           uv run --package wyrdfold-api mypy app/
           uv run --package wyrdfold-api pytest -v
+
+  # Image scan (#30 F5). Builds the same Dockerfile the deploy uses and
+  # scans the result with Trivy. Fails on HIGH/CRITICAL OS or library
+  # CVEs in the runtime layer. Complements `pnpm audit --prod` (JS tree)
+  # by covering the python:3.11-slim base + transitive Python deps.
+  image-scan:
+    name: Image scan — Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          filter: tree:0
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build wyrdfold-api image
+        run: docker build -f apps/wyrdfold-api/Dockerfile -t wyrdfold-api:ci .
+
+      # Scan via `docker run` against a pinned Trivy image rather than
+      # `aquasecurity/trivy-action`. The action wraps a binary install
+      # step (download from GitHub releases) that has been flaking with
+      # exit 1 on the runner without surfacing a useful reason — running
+      # the official Trivy container directly removes that hop entirely
+      # and pins the scanner version we audit against.
+      #
+      # `os,library` covers Debian packages from the slim base AND the
+      # Python deps resolved into /app/.venv by the builder stage.
+      # `ignore-unfixed` keeps the gate firing only on actionable
+      # findings. `.trivyignore` documents the accepted-risk transitive
+      # build-tool CVEs with expiry dates.
+      - name: Scan with Trivy
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/.trivyignore:/.trivyignore:ro" \
+            aquasec/trivy:0.69.1 image \
+              --severity HIGH,CRITICAL \
+              --vuln-type os,library \
+              --ignore-unfixed \
+              --ignorefile /.trivyignore \
+              --exit-code 1 \
+              wyrdfold-api:ci
