@@ -36,9 +36,6 @@ const config: KnipConfig = {
         'babel-jest',
         // jest-util is a transitive Jest internal pulled in by next/jest
         'jest-util',
-        // @nx/s3-cache is loaded at runtime via the `s3` block in nx.json
-        // (Cloudflare R2 remote cache), not via a static import.
-        '@nx/s3-cache',
         // eslint-config-next + these plugins are required by name by the
         // @nx/eslint-plugin flat/react-typescript preset, not imported directly.
         'eslint-config-next',
@@ -49,10 +46,6 @@ const config: KnipConfig = {
         '@swc/jest',
         // jsdom is the engine behind jest-environment-jsdom (testEnvironment)
         'jsdom',
-        // playwright provides the browser binaries CLI alongside @playwright/test
-        'playwright',
-        // lint-staged is invoked by the husky pre-commit hook + its own config block
-        'lint-staged',
         // sharp is used by next/image at runtime (root devDep mirrors apps/wyrdfold)
         'sharp',
       ],

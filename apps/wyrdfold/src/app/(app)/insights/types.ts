@@ -13,7 +13,7 @@ export interface FunnelStage {
   count: number;
 }
 
-export interface PipelinePeriodKpis {
+interface PipelinePeriodKpis {
   total_applications: number;
   total_interviews: number;
   total_offers: number;
@@ -49,7 +49,7 @@ export interface ScoreBucket {
   count: number;
 }
 
-export interface ScoreTrendPoint {
+interface ScoreTrendPoint {
   week_start: string;
   avg_score: number;
 }
@@ -82,7 +82,7 @@ export interface CostBucket {
   resume_count: number;
 }
 
-export interface PurposeCost {
+interface PurposeCost {
   purpose: string;
   total_cost: number;
   call_count: number;
