@@ -317,3 +317,138 @@ def test_build_gate_override_raises_cap(monkeypatch):
 
     gate = build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False  # 20 < 50 override
+
+
+# ---- Observability: budget telemetry (#26 F2/F3) ----------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_approaching_dedup():
+    """The approaching-cap dedup is module-state; reset per test."""
+    budget._APPROACHING_FIRED.clear()
+    yield
+    budget._APPROACHING_FIRED.clear()
+
+
+def test_budget_exceeded_captures_sentry_warning(monkeypatch):
+    """A 429 must come with a Sentry breadcrumb so operators see
+    per-user budget hits, not just the FE-facing response (#26 F2)."""
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.0)
+    )
+
+    import sentry_sdk
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None: captured.append((msg, level)),
+    )
+
+    with pytest.raises(HTTPException):
+        budget.check_user_budget(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=0,
+            hourly_limit_usd=0,
+            monthly_limit_usd=5.0,
+        )
+
+    assert len(captured) == 1
+    msg, level = captured[0]
+    assert level == "warning"
+    assert "monthly" in msg
+    assert "5.00" in msg
+
+
+def test_approaching_cap_emits_warning_once(monkeypatch):
+    """Crossing 80% triggers a one-shot Sentry warning per (user, scope)
+    so the operator sees the run-up before the 429 spike (#26 F3)."""
+    # 4.5 / 5.0 = 90% — over the 80% threshold, under the cap.
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 4.5)
+    )
+
+    import sentry_sdk
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None: captured.append((msg, level)),
+    )
+
+    # First call fires the warning; second call dedups (same user+scope).
+    for _ in range(2):
+        budget.check_user_budget(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=0,
+            hourly_limit_usd=0,
+            monthly_limit_usd=5.0,
+        )
+
+    assert len(captured) == 1
+    msg, level = captured[0]
+    assert level == "warning"
+    assert "approaching cap" in msg.lower()
+    assert "90%" in msg
+
+
+def test_approaching_cap_silent_under_threshold(monkeypatch):
+    """Under 80%, no telemetry — we don't want to page on healthy spend."""
+    # 3.0 / 5.0 = 60% — well under the threshold.
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 3.0)
+    )
+
+    import sentry_sdk
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None: captured.append((msg, level)),
+    )
+
+    budget.check_user_budget(
+        MagicMock(),
+        user_id="u-1",
+        daily_limit_usd=0,
+        hourly_limit_usd=0,
+        monthly_limit_usd=5.0,
+    )
+
+    assert captured == []
+
+
+def test_approaching_cap_silent_when_already_over(monkeypatch):
+    """When spend has already crossed the cap, the 429 path owns the
+    telemetry — don't double-warn here."""
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.5)
+    )
+
+    import sentry_sdk
+
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None: captured.append((msg, level)),
+    )
+
+    with pytest.raises(HTTPException):
+        budget.check_user_budget(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=0,
+            hourly_limit_usd=0,
+            monthly_limit_usd=5.0,
+        )
+
+    # Exactly one capture — the 429 breadcrumb. No double-warn from the
+    # approaching path.
+    assert len(captured) == 1
+    assert "exceeded" in captured[0][0].lower()
