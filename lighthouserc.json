@@ -2,8 +2,8 @@
   "ci": {
     "collect": {
       "url": ["http://localhost:3100/", "http://localhost:3100/login"],
-      "startServerCommand": "PORT=3100 pnpm nx run wyrdfold:start",
-      "startServerReadyPattern": "ready in",
+      "startServerCommand": "PORT=3100 NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:0 NEXT_PUBLIC_SUPABASE_ANON_ID=lhci-placeholder pnpm nx run wyrdfold:start",
+      "startServerReadyPattern": "[Rr]eady in",
       "startServerReadyTimeout": 60000,
       "numberOfRuns": 3,
       "settings": {
