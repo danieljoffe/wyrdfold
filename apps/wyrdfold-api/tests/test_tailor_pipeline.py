@@ -40,7 +40,7 @@ from app.services.tailor.tailor import DEFAULT_PURPOSE
 def _optimized_doc() -> OptimizedDoc:
     return OptimizedDoc(
         id="opt-1",
-        user_id=None,
+        user_id="test-user",
         prose_doc_id=None,
         version=1,
         payload=OptimizedPayload(
@@ -147,7 +147,7 @@ async def test_success_returns_record_and_persists(
     result = await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="We want a senior FE",
         contact=_contact(),
@@ -171,7 +171,7 @@ async def test_success_cost_logs_under_tailor_purpose(
     await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         contact=_contact(),
@@ -201,7 +201,7 @@ async def test_preferences_are_passed_through(
     await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         contact=_contact(),
@@ -240,7 +240,7 @@ async def test_lint_failure_does_not_persist(
     result = await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         contact=_contact(),
@@ -266,7 +266,7 @@ async def test_storage_upload_failure_does_not_raise(
     result = await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         contact=_contact(),
@@ -299,7 +299,7 @@ async def test_rendered_output_opens_as_valid_docx(
     await run_tailor_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         contact=_contact(),

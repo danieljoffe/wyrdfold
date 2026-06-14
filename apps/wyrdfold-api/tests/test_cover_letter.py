@@ -81,7 +81,7 @@ def _optimized_payload() -> OptimizedPayload:
 def _optimized_doc() -> OptimizedDoc:
     return OptimizedDoc(
         id="opt-1",
-        user_id=None,
+        user_id="test-user",
         prose_doc_id=None,
         version=1,
         payload=_optimized_payload(),
@@ -405,7 +405,7 @@ async def test_pipeline_success_returns_record_and_uploads(
     result = await run_cover_letter_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         company_name="Acme",
@@ -427,7 +427,7 @@ async def test_pipeline_cost_logs_under_tailor_cover_letter(
     await run_cover_letter_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         company_name="Acme",
@@ -460,7 +460,7 @@ async def test_pipeline_preferences_are_passed_through(
     await run_cover_letter_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         company_name="Acme",
@@ -495,7 +495,7 @@ async def test_pipeline_lint_failure_does_not_persist(
     result = await run_cover_letter_pipeline(
         supabase,
         llm,
-        user_id=None,
+        user_id="test-user",
         optimized=_optimized_doc(),
         job_description="jd",
         company_name="Acme",

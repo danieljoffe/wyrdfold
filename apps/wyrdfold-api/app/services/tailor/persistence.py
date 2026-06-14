@@ -47,18 +47,22 @@ def jd_hash(job_description: str) -> str:
     return hashlib.sha256(job_description.encode("utf-8")).hexdigest()
 
 
-def _storage_path(user_id: str | None, resume_id: str) -> str:
-    return f"{user_id or 'anon'}/{resume_id}.docx"
+def _storage_path(user_id: str, resume_id: str) -> str:
+    return f"{user_id}/{resume_id}.docx"
 
 
 def upload_docx(
     supabase: Client,
     *,
-    user_id: str | None,
+    user_id: str,
     resume_id: str,
     docx_bytes: bytes,
 ) -> str:
-    """Upload to Supabase Storage. Returns the storage path."""
+    """Upload to Supabase Storage. Returns the storage path.
+
+    ``supabase`` must be the JWT-bound user client and ``user_id`` the
+    caller's id: storage RLS keys access on the ``<user_id>/`` path prefix.
+    """
     path = _storage_path(user_id, resume_id)
     supabase.storage.from_(STORAGE_BUCKET).upload(
         path=path,
