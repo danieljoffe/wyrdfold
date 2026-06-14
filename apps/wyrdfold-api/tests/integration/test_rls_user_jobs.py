@@ -50,7 +50,6 @@ def seeded_user_jobs(
                     "source_id": source_id,
                     "title": "Job A",
                     "company_name": "Acme",
-                    "status": "new",
                 },
                 {
                     "id": posting_b,
@@ -58,7 +57,6 @@ def seeded_user_jobs(
                     "source_id": source_id,
                     "title": "Job B",
                     "company_name": "Acme",
-                    "status": "new",
                 },
             ]
         ).execute()

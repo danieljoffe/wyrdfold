@@ -43,6 +43,22 @@ def _mock_supabase(tables: dict[str, list[dict]]) -> MagicMock:
     return client
 
 
+def _user_jobs(postings: list[dict]) -> list[dict]:
+    """#75 C4: per-user pipeline status moved off ``jobs.status`` into
+    ``user_jobs``. Derive the ``user_jobs`` rows the compute functions read
+    from the per-posting ``status`` the test seeds (postings stay status-less
+    in the ``jobs`` table). Omit 'new' rows — absent reads back as 'new'."""
+    return [
+        {"job_posting_id": p["id"], "status": p["status"]}
+        for p in postings
+        if p.get("status") and p["status"] != "new"
+    ]
+
+
+# All per-user-status insights tests run as this synthetic user.
+_USER = "u1"
+
+
 # ===========================================================================
 # Pipeline
 # ===========================================================================
@@ -57,8 +73,8 @@ class TestComputePipeline:
             {"id": "4", "status": "interviewing", "created_at": _ts(_NOW)},
             {"id": "5", "status": "offer", "created_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase({"jobs": postings})
-        result = compute_pipeline(sb, since=None)
+        sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
+        result = compute_pipeline(sb, since=None, user_id=_USER)
 
         assert result.total_applications == 3  # applied + interviewing + offer
         assert result.total_interviews == 2  # interviewing + offer
@@ -77,8 +93,8 @@ class TestComputePipeline:
             {"id": "3", "status": "interviewing", "created_at": _ts(_NOW)},
             {"id": "4", "status": "offer", "created_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase({"jobs": postings})
-        result = compute_pipeline(sb, since=None)
+        sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
+        result = compute_pipeline(sb, since=None, user_id=_USER)
 
         # 4 applied-or-beyond, 2 interviewing-or-beyond → 0.5
         assert result.response_rate == 0.5
@@ -140,11 +156,14 @@ class TestComputePipeline:
             {"id": "1", "status": "applied", "created_at": _ts(_NOW)},
             {"id": "2", "status": "interviewing", "created_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase({"jobs": postings})
+        sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
         prior_until = _NOW - timedelta(days=30)
         prior_since = _NOW - timedelta(days=60)
         result = compute_pipeline(
-            sb, since=_NOW - timedelta(days=30), prior_window=(prior_since, prior_until)
+            sb,
+            since=_NOW - timedelta(days=30),
+            prior_window=(prior_since, prior_until),
+            user_id=_USER,
         )
         assert result.previous is not None
         assert result.previous.total_applications == 2
@@ -169,8 +188,10 @@ class TestComputeTargets:
             {"id": "2", "target_id": "t1", "score": 60, "status": "new", "created_at": _ts(_NOW)},
             {"id": "3", "target_id": "t2", "score": 90, "status": "interviewing", "created_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase({"targets": targets, "jobs": postings})
-        result = compute_targets(sb, since=None)
+        sb = _mock_supabase(
+            {"targets": targets, "jobs": postings, "user_jobs": _user_jobs(postings)}
+        )
+        result = compute_targets(sb, since=None, user_id=_USER)
 
         assert len(result.targets) == 2
         fe = next(t for t in result.targets if t.target_label == "Frontend")
@@ -314,9 +335,16 @@ class TestComputeTargets:
             {"job_posting_id": "3", "target_id": "t2", "score": 90},
         ]
         sb = _mock_supabase(
-            {"targets": targets, "jobs": postings, "scores": scores}
+            {
+                "targets": targets,
+                "jobs": postings,
+                "scores": scores,
+                "user_jobs": _user_jobs(postings),
+            }
         )
-        result = compute_targets(sb, since=None, target_ids={"t1", "t2"})
+        result = compute_targets(
+            sb, since=None, target_ids={"t1", "t2"}, user_id=_USER
+        )
 
         assert len(result.targets) == 2
         fe = next(t for t in result.targets if t.target_label == "Frontend")

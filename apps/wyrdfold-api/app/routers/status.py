@@ -36,10 +36,12 @@ def _assert_user_owns_posting(
     a vestigial pre-shared-targets column — so checking it as the source
     of truth always 404s on real postings.
     """
-    # 1. Confirm the posting exists.
+    # 1. Confirm the posting exists. ``jobs.status`` was dropped in #75 C4
+    # (per-user status now lives in ``user_jobs``); select ``id`` purely as
+    # an existence probe.
     posting_resp = (
         supabase.table("jobs")
-        .select("status")
+        .select("id")
         .eq("id", posting_id)
         .single()
         .execute()
@@ -109,8 +111,22 @@ async def update_status(
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
     posting = _assert_user_owns_posting(supabase, posting_id, user_id)
-    old_status = posting["status"]
     target_id = posting["target_id"]
+
+    # ``jobs.status`` was dropped in #75 C4 — the prior status for the audit
+    # log is the caller's own per-user state in ``user_jobs`` (absent = 'new').
+    old_status_resp = (
+        supabase.table("user_jobs")
+        .select("status")
+        .eq("user_id", user_id)
+        .eq("job_posting_id", posting_id)
+        .limit(1)
+        .execute()
+    )
+    old_status_rows = cast(list[dict[str, Any]], old_status_resp.data or [])
+    old_status = (
+        cast(str, old_status_rows[0]["status"]) if old_status_rows else "new"
+    )
 
     supabase.table("status_log").insert(
         {
