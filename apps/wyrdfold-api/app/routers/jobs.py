@@ -187,7 +187,15 @@ def _fetch_jobs_chunked(
     out: list[dict[str, Any]] = []
     for i in range(0, len(page_ids), _IN_CHUNK_SIZE):
         chunk = page_ids[i : i + _IN_CHUNK_SIZE]
-        q = supabase.table("jobs").select(_JP_SELECT_COLS).in_("id", chunk)
+        q = (
+            supabase.table("jobs")
+            .select(_JP_SELECT_COLS)
+            .in_("id", chunk)
+            # Global liveness gate (#75 C3): exclude globally-archived/dead
+            # jobs (url-health/poller set jobs.archived_at) regardless of the
+            # caller's per-user status.
+            .is_("archived_at", "null")
+        )
         if company:
             q = q.eq("company_name", company)
         q = _apply_title_search(q, search)
@@ -1032,6 +1040,20 @@ def _pipeline_counts_python(
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
+        # Global liveness gate (#75 C3): only count jobs that are still
+        # live (archived_at IS NULL). Globally-archived/dead jobs are
+        # excluded regardless of the caller's per-user status.
+        live_resp = (
+            supabase.table("jobs")
+            .select("id")
+            .in_("id", chunk)
+            .is_("archived_at", "null")
+            .execute()
+        )
+        live_ids = [
+            cast(str, r["id"])
+            for r in cast(list[dict[str, Any]], live_resp.data or [])
+        ]
         # Resolve per-user status for the chunk; jobs with no user_jobs
         # row — and every job when there's no user identity — count as
         # 'new' (#75 "absent = new" rule).
@@ -1048,7 +1070,7 @@ def _pipeline_counts_python(
                 cast(str, r["job_posting_id"]): cast(str, r["status"])
                 for r in cast(list[dict[str, Any]], uj_resp.data or [])
             }
-        for jid in chunk:
+        for jid in live_ids:
             st = status_map.get(jid, "new")
             counts[st] = counts.get(st, 0) + 1
     return counts

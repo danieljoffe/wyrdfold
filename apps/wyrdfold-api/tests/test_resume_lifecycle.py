@@ -213,31 +213,27 @@ class TestPersistenceHelpers:
         assert ("job_posting_id", "job-1") in all_eq_args
         assert ("document_type", "cover_letter") in all_eq_args
 
-    def test_mark_job_resume_draft_updates_status(self) -> None:
+    def test_mark_job_resume_draft_does_not_touch_jobs_status(self) -> None:
+        """#75 C3: per-user pipeline state lives in user_jobs; the helper no
+        longer writes the global jobs.status. With no user_id it's a no-op."""
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
         mark_job_resume_draft(supabase, "job-42", user_id=None)
 
-        # The jobs.status write is unconditional.
-        assert any(
-            c.args == ("jobs",) for c in supabase.table.call_args_list
-        )
-        jobs_update = supabase.table.return_value.update.call_args
-        payload = jobs_update[0][0]
-        assert payload["status"] == "resume_draft"
-        assert "updated_at" in payload
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "jobs" not in tables
 
-    def test_mark_job_resume_draft_dual_writes_user_jobs(self) -> None:
-        """With a known user_id (#75 C1) the helper mirrors into user_jobs
-        alongside the jobs.status write."""
+    def test_mark_job_resume_draft_writes_user_jobs(self) -> None:
+        """With a known user_id (#75 C3) the helper mirrors into user_jobs
+        only (no global jobs.status write)."""
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
         mark_job_resume_draft(supabase, "job-42", user_id="user-7")
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
-        assert "jobs" in tables
+        assert "jobs" not in tables
         assert "user_jobs" in tables
         upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
         assert upsert_payload["user_id"] == "user-7"
@@ -561,8 +557,10 @@ class TestApproveResume:
             )
 
         assert result.approved_at is not None
-        # Verify job status was updated to resume_ready
-        supabase.table.assert_any_call("jobs")
+        # #75 C3: with no JWT user_id there's no per-user pipeline to write,
+        # and the global jobs.status is no longer touched.
+        for call in supabase.table.call_args_list:
+            assert call.args[0] != "jobs"
 
     @pytest.mark.asyncio
     async def test_approve_idempotent(self) -> None:
@@ -630,9 +628,9 @@ class TestApproveResume:
             assert call.args[0] != "jobs"
 
     @pytest.mark.asyncio
-    async def test_approve_dual_writes_user_jobs(self) -> None:
-        """#75 C1: approving a resume with a JWT user_id mirrors the
-        resume_ready status into user_jobs alongside the jobs.status write."""
+    async def test_approve_writes_user_jobs(self) -> None:
+        """#75 C3: approving a resume with a JWT user_id writes the
+        resume_ready status into user_jobs only (no global jobs.status)."""
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
@@ -653,7 +651,7 @@ class TestApproveResume:
             )
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
-        assert "jobs" in tables
+        assert "jobs" not in tables
         assert "user_jobs" in tables
         upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
         assert upsert_payload["user_id"] == "user-7"
@@ -661,7 +659,8 @@ class TestApproveResume:
 
     @pytest.mark.asyncio
     async def test_approve_skips_user_jobs_for_api_key(self) -> None:
-        """api-key callers (user_id None) skip the user_jobs mirror in C1."""
+        """api-key callers (user_id None) have no per-user pipeline, so they
+        write neither user_jobs nor the (now-untouched) global jobs.status."""
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
@@ -682,13 +681,13 @@ class TestApproveResume:
             )
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
-        assert "jobs" in tables
+        assert "jobs" not in tables
         assert "user_jobs" not in tables
 
     @pytest.mark.asyncio
-    async def test_unapprove_dual_writes_user_jobs(self) -> None:
-        """#75 C1: unapproving a resume with a JWT user_id mirrors the
-        resume_draft status into user_jobs alongside the jobs.status write."""
+    async def test_unapprove_writes_user_jobs(self) -> None:
+        """#75 C3: unapproving a resume with a JWT user_id writes the
+        resume_draft status into user_jobs only (no global jobs.status)."""
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
@@ -709,7 +708,7 @@ class TestApproveResume:
             )
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
-        assert "jobs" in tables
+        assert "jobs" not in tables
         assert "user_jobs" in tables
         upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
         assert upsert_payload["user_id"] == "user-7"

@@ -150,8 +150,9 @@ def test_status_200_on_valid_update(client_factory):
 
 
 def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory):
-    """#75 C1: a status update mirrors into user_jobs and stamps the
-    status_log row with user_id, alongside the unchanged jobs.status write."""
+    """#75 C3: a status update writes the per-user status into user_jobs and
+    stamps the status_log row with user_id; the global jobs.status is no
+    longer touched."""
     seen: dict[str, Any] = {}
 
     def _build() -> MagicMock:
