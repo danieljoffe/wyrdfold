@@ -62,6 +62,48 @@ def get_user_supabase(
     return get_user_client(token)
 
 
+def get_supabase_for_caller(
+    request: Request,
+    key: str | None = Security(api_key_header),
+    s: Settings = Depends(get_settings),
+) -> Client:
+    """Pick the right Supabase client for a dual-auth route (#79 Phase 2).
+
+    Mirrors the auth decision in ``get_current_user_id_optional`` so the
+    client and the resolved user id always agree:
+
+    * Valid JWT  -> per-request RLS-enforced user client (queries scoped
+      by ``auth.uid() = user_id`` at Postgres, not just in Python).
+    * API key    -> service-role client for the legacy single-tenant rows
+      (``user_id IS NULL``); cron/poller/batch have no user token.
+
+    A bearer token that fails verification falls through to the api-key
+    check (and 401s if that also fails), matching the optional-user dep.
+    """
+    if s.supabase_url:
+        token = _extract_bearer_token(request)
+        if token:
+            try:
+                _decode_supabase_jwt(token, s)
+            except HTTPException:
+                logger.warning(
+                    "auth_jwt_decode_failed path=%s reason=client_select",
+                    request.url.path,
+                )
+            else:
+                if not s.supabase_anon_key:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Supabase user client not configured",
+                    )
+                from app.supabase_pool import get_user_client
+
+                return get_user_client(token)
+    if _api_key_matches(key, s.wyrdfold_api_key):
+        return get_supabase()
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def get_embeddings_client() -> "EmbeddingsClient":
     """Embeddings client factory. Returns the default (mock today,
     Voyage when the real implementation lands).
