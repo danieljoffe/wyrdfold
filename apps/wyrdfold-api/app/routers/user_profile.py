@@ -1,8 +1,11 @@
 """User profile router — notification preferences + identity (contact) fields.
 
-All endpoints scope to the JWT subject. The service-role Supabase client
-bypasses RLS, so explicit `.eq("user_id", user_id)` is the only thing
-preventing cross-tenant reads/writes.
+All endpoints scope to the JWT subject. Read paths (GET) go through the
+per-request JWT-bound client (`get_user_supabase`), so Postgres RLS is the
+control: the `user_profiles`/`llm_costs` policies (`auth.uid() = user_id`)
+enforce isolation even if the explicit `.eq("user_id", ...)` filter were
+dropped (#79 Phase 2). Write paths (PATCH/POST) still use the service-role
+client and rely on the `.eq("user_id", ...)` filter until #79 Phase 3.
 """
 
 import asyncio
@@ -17,6 +20,7 @@ from app.dependencies import (
     get_current_user_email,
     get_current_user_id,
     get_supabase,
+    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.user_profile import (
@@ -126,7 +130,7 @@ async def _get_or_create_profile(
 async def get_notification_preferences(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> NotificationPreferences:
     row = await _get_or_create_profile(
         supabase, user_id, _PREFS_COLUMNS, seed_email=user_email
@@ -194,7 +198,7 @@ async def update_notification_preferences(
 async def get_identity(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> IdentityFields:
     row = await _get_or_create_profile(
         supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email
@@ -254,7 +258,7 @@ def _read_style(row: dict[str, Any]) -> ResumeStyleSettings:
 async def get_resume_style(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> ResumeStyleSettings:
     row = await _get_or_create_profile(
         supabase, user_id, _RESUME_STYLE_COLUMNS, seed_email=user_email
@@ -330,7 +334,7 @@ def _read_onboarding(row: dict[str, Any]) -> OnboardingStatus:
 async def get_onboarding_status(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> OnboardingStatus:
     """Return the user's onboarding progress.
 
@@ -469,7 +473,7 @@ async def reset_onboarding(
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)
 async def get_llm_usage(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> LlmUsageResponse:
     """The user's allowance state across all budget windows.
