@@ -22,6 +22,7 @@ from app.dependencies import (
     get_embeddings_client,
     get_llm_client,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.models.conversation import (
@@ -77,7 +78,7 @@ router = APIRouter(
 
 @router.get("/prose")
 async def get_prose(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ProseDoc | dict[str, None]:
     doc = prose.get_latest(supabase, user_id=user_id)
@@ -302,7 +303,7 @@ async def upload_resume(
 
 @router.get("/optimized")
 def get_optimized(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> OptimizedDoc | dict[str, None]:
     doc = optimized.get_latest(supabase, user_id=user_id)
@@ -542,7 +543,7 @@ async def derive_optimized_stream(
 
 @router.get("/gap-health")
 def get_gap_health(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> GapHealthResult:
     doc = optimized.get_latest(supabase, user_id=user_id)
@@ -556,7 +557,7 @@ def get_gap_health(
 
 @router.get("/preferences")
 async def get_preferences(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> Preferences | dict[str, None]:
     row = preferences.get(supabase, user_id=user_id)
@@ -590,7 +591,7 @@ async def reset_preferences(
 async def list_turns(
     conversation_type: ConversationType | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, Any]:
     rows = turns.list_turns(
