@@ -201,7 +201,7 @@ async def create_tailored_resume(
                             user_id=user_id,
                         )
                         persistence.mark_job_resume_draft(
-                            supabase, body.job_posting_id
+                            supabase, body.job_posting_id, user_id=user_id
                         )
                         return TailorResponse(
                             record=cloned,
@@ -239,7 +239,9 @@ async def create_tailored_resume(
     if not isinstance(result, PipelineSuccess):
         raise HTTPException(status_code=500, detail="Unexpected pipeline result")
     if body.job_posting_id:
-        persistence.mark_job_resume_draft(supabase, body.job_posting_id)
+        persistence.mark_job_resume_draft(
+            supabase, body.job_posting_id, user_id=user_id
+        )
     return TailorResponse(
         record=result.record,
         lint_warnings=result.lint.warnings,
@@ -537,6 +539,15 @@ async def approve_tailored_resume(
         supabase.table("jobs").update(
             {"status": "resume_ready"}
         ).eq("id", row.job_posting_id).execute()
+        # Dual-write (#75 C1): mirror into user_jobs when the caller is a JWT
+        # user. Api-key callers (user_id None) skip the mirror — fine for C1.
+        if user_id:
+            persistence.upsert_user_job(
+                supabase,
+                user_id=user_id,
+                job_posting_id=row.job_posting_id,
+                status="resume_ready",
+            )
 
     return record
 
@@ -563,6 +574,14 @@ async def unapprove_tailored_resume(
         supabase.table("jobs").update(
             {"status": "resume_draft"}
         ).eq("id", row.job_posting_id).execute()
+        # Dual-write (#75 C1): see approve_tailored_resume.
+        if user_id:
+            persistence.upsert_user_job(
+                supabase,
+                user_id=user_id,
+                job_posting_id=row.job_posting_id,
+                status="resume_draft",
+            )
 
     return record
 

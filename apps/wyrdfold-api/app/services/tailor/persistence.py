@@ -315,13 +315,36 @@ def mark_docx_rendered(
     _scope_to_user(query, user_id).execute()
 
 
-def mark_job_resume_draft(supabase: Client, job_posting_id: str) -> None:
+def upsert_user_job(
+    supabase: Client, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Mirror a jobs.status write into the per-user user_jobs table (#75 C1).
+    Service-role client; the row is keyed by (user_id, job_posting_id)."""
+    supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
+
+
+def mark_job_resume_draft(
+    supabase: Client, job_posting_id: str, *, user_id: str | None
+) -> None:
     """Advance a job posting to status='resume_draft'.
 
     Called after a tailored resume is persisted (single, batch, or reuse
     clone). Idempotent — re-running with an already-draft job is a no-op
     update. We unconditionally set the status because re-generation
     supersedes any prior draft/approval.
+
+    Dual-write (#75 C1): when ``user_id`` is known (JWT caller), also mirror
+    the status into the per-user ``user_jobs`` table. The api-key/cron paths
+    (``user_id=None``) skip the mirror — that's fine for C1, which keeps
+    ``jobs.status`` as the source of truth.
     """
     supabase.table("jobs").update(
         {
@@ -329,6 +352,13 @@ def mark_job_resume_draft(supabase: Client, job_posting_id: str) -> None:
             "updated_at": datetime.now(UTC).isoformat(),
         }
     ).eq("id", job_posting_id).execute()
+    if user_id is not None:
+        upsert_user_job(
+            supabase,
+            user_id=user_id,
+            job_posting_id=job_posting_id,
+            status="resume_draft",
+        )
 
 
 def approve(
