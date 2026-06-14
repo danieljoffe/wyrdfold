@@ -40,6 +40,9 @@ class _Chain:
     def in_(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
+    def is_(self, *_a: Any, **_kw: Any) -> "_Chain":
+        return self
+
     def gte(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 

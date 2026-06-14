@@ -38,6 +38,9 @@ class _Chain:
     def in_(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
+    def is_(self, *_a: Any, **_kw: Any) -> "_Chain":
+        return self
+
     def gte(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
@@ -57,10 +60,18 @@ def test_python_fallback_dedups_jobs_across_targets() -> None:
     user_job_rows = [
         {"job_posting_id": "j2", "status": "saved"},
     ]
+    # Global liveness gate (#75 C3): both jobs are live (archived_at IS NULL).
+    live_job_rows = [{"id": "j1"}, {"id": "j2"}]
+
+    def _table(name: str) -> _Chain:
+        if name == "scores":
+            return _Chain(_Resp(score_rows))
+        if name == "jobs":
+            return _Chain(_Resp(live_job_rows))
+        return _Chain(_Resp(user_job_rows))
+
     sb = MagicMock()
-    sb.table.side_effect = lambda name: _Chain(
-        _Resp(score_rows if name == "scores" else user_job_rows)
-    )
+    sb.table.side_effect = _table
 
     counts = _pipeline_counts_python(
         sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
@@ -89,13 +100,16 @@ def test_grouped_uses_rpc_result() -> None:
 def test_grouped_falls_back_when_rpc_missing() -> None:
     sb = MagicMock()
     sb.rpc.return_value.execute.side_effect = Exception("function not found")
-    sb.table.side_effect = lambda name: _Chain(
-        _Resp(
-            [{"job_posting_id": "j1"}]
-            if name == "scores"
-            else [{"job_posting_id": "j1", "status": "interviewing"}]
-        )
-    )
+
+    def _table(name: str) -> _Chain:
+        if name == "scores":
+            return _Chain(_Resp([{"job_posting_id": "j1"}]))
+        if name == "jobs":
+            # Global liveness gate (#75 C3): j1 is live.
+            return _Chain(_Resp([{"id": "j1"}]))
+        return _Chain(_Resp([{"job_posting_id": "j1", "status": "interviewing"}]))
+
+    sb.table.side_effect = _table
     counts = _pipeline_counts_grouped(
         sb, target_ids={"t1"}, min_score=None, user_id="u1"
     )

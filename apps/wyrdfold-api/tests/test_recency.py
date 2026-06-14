@@ -191,6 +191,9 @@ class _ListChain:
     def in_(self, *_a: Any, **_kw: Any) -> _ListChain:
         return self
 
+    def is_(self, *_a: Any, **_kw: Any) -> _ListChain:
+        return self
+
     def gte(self, *_a: Any, **_kw: Any) -> _ListChain:
         return self
 

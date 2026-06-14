@@ -131,14 +131,42 @@ def _select_due_jobs(
     before ones we've checked but a while ago.
     """
     cutoff = (datetime.now(UTC) - timedelta(hours=age_threshold_hours)).isoformat()
-    # Pull rows where status is NOT one of the persistent states, AND
-    # last_url_check_at is either NULL or older than the cutoff.
-    # Supabase doesn't support OR composition over a NULL well, so we
+    # Per-user translation of the old saved/applied skip (#75 C3): the old
+    # candidate filter excluded jobs in the global jobs.status states
+    # 'saved'/'applied' to avoid health-checking user-engaged jobs. Pipeline
+    # state is now per-user in user_jobs, so we instead skip any job that ANY
+    # user has engaged with (a user_jobs row with status != 'new'). The
+    # 'archived' skip is replaced by the global archived_at liveness gate.
+    engaged_resp = (
+        supabase.table("user_jobs")
+        .select("job_posting_id")
+        .neq("status", "new")
+        .execute()
+    )
+    engaged_ids = sorted(
+        {
+            cast(str, r["job_posting_id"])
+            for r in cast(list[dict[str, Any]], engaged_resp.data or [])
+        }
+    )
+
+    def _candidate_query() -> Any:
+        q = (
+            supabase.table("jobs")
+            .select("id, absolute_url, url_check_failure_count")
+            # Skip already-globally-dead jobs (#75 C3).
+            .is_("archived_at", "null")
+        )
+        # Skip jobs any user has engaged with (per-user saved/applied skip).
+        if engaged_ids:
+            q = q.not_.in_("id", engaged_ids)
+        return q
+
+    # Pull rows where last_url_check_at is either NULL or older than the
+    # cutoff. Supabase doesn't support OR composition over a NULL well, so we
     # split into two queries and merge.
     null_first = (
-        supabase.table("jobs")
-        .select("id, absolute_url, url_check_failure_count")
-        .not_.in_("status", ["archived", "saved", "applied"])
+        _candidate_query()
         .is_("last_url_check_at", "null")
         .limit(batch_size)
         .execute()
@@ -147,9 +175,7 @@ def _select_due_jobs(
     if len(rows) < batch_size:
         remaining = batch_size - len(rows)
         old = (
-            supabase.table("jobs")
-            .select("id, absolute_url, url_check_failure_count")
-            .not_.in_("status", ["archived", "saved", "applied"])
+            _candidate_query()
             .lte("last_url_check_at", cutoff)
             .order("last_url_check_at", desc=False)
             .limit(remaining)
@@ -211,9 +237,10 @@ def _archive_with_data_drop(supabase: Client, job_ids: list[str]) -> int:
     if not job_ids:
         return 0
     now_iso = datetime.now(UTC).isoformat()
-    # 1. Flip job status + drop the heavy HTML.
+    # 1. Flag jobs globally-dead via archived_at (#75 C3 — global liveness,
+    # distinct from per-user jobs.status) + drop the heavy HTML.
     supabase.table("jobs").update({
-        "status": "archived",
+        "archived_at": now_iso,
         "description_html": None,
         "updated_at": now_iso,
     }).in_("id", job_ids).execute()
