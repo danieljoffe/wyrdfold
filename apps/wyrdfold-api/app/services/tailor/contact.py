@@ -21,22 +21,30 @@ _IDENTITY_COLUMNS = "name, email, phone_number, location, linkedin_url, website_
 
 async def resolve_contact(
     supabase: Client,
+    user_id: str | None,
     override: ContactInfo | None = None,
 ) -> ContactInfo:
     """Return contact info to use for generation.
 
     Precedence: explicit override -> profile row. Raises 400 if no name is
     available anywhere — without a name there's nothing to put on the resume.
+
+    The profile read MUST be scoped to ``user_id``: ``supabase`` is the
+    service-role client and bypasses Postgres RLS, so an unscoped
+    ``.limit(1)`` would return an arbitrary row and leak another user's
+    name/email/phone/location/links onto the output. When ``user_id`` is
+    ``None`` (legacy api-key / cron caller) the row lives with a NULL
+    ``user_id``.
     """
     if override is not None and override.name:
         return override
 
-    resp = await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .select(_IDENTITY_COLUMNS)
-        .limit(1)
-        .execute()
-    )
+    def _query() -> Any:
+        q = supabase.table("user_profiles").select(_IDENTITY_COLUMNS)
+        q = q.eq("user_id", user_id) if user_id else q.is_("user_id", "null")
+        return q.limit(1).execute()
+
+    resp = await asyncio.to_thread(_query)
     rows = cast(list[dict[str, Any]], resp.data or [])
     row = rows[0] if rows else {}
     name = row.get("name")
