@@ -18,15 +18,15 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY apps/wyrdfold-api/pyproject.toml ./apps/wyrdfold-api/pyproject.toml
 
-# Cache mount keyed by an explicit ID (not the BuildKit default of
-# hashing the target path). Railway's builder rejects the shorthand
-# `--mount=type=cache,target=...` with "missing an id argument"; the
-# canonical BuildKit spec allows omitting it but stricter parsers
-# don't. A stable literal id keeps the Dockerfile portable — any
-# operator's builder reuses the same cache between rebuilds without
-# the file embedding anyone's account/service UUID.
-RUN --mount=type=cache,id=wyrdfold-uv-cache,target=/root/.cache/uv,sharing=locked \
-    uv sync --frozen --no-dev --no-editable --package wyrdfold-api
+# No BuildKit cache mount here, deliberately. Railway's builder keeps
+# moving the goalposts on cache-mount ids: it rejected the shorthand
+# `--mount=type=cache,target=...` ("missing an id argument"), then rejected
+# an explicit literal id ("missing the cacheKey prefix from its id" — it
+# wants a service-scoped prefix we can't hardcode without embedding an
+# account/service UUID). A cache mount is only a rebuild-speed optimization
+# (uv re-fetches wheels each build otherwise, and uv is fast), so we drop it
+# entirely to keep the Dockerfile valid on Railway, locally, and any builder.
+RUN uv sync --frozen --no-dev --no-editable --package wyrdfold-api
 
 # ---- runtime ----------------------------------------------------------------
 FROM python:3.11-slim AS runtime
