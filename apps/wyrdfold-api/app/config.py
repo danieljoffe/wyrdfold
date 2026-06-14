@@ -22,6 +22,11 @@ class Settings(BaseSettings):
 
     supabase_url: str = ""
     supabase_service_role_key: str = Field(default="", repr=False)
+    # Anon (publishable) key — the base for the per-request, JWT-bound
+    # client that RLS enforcement runs through (#79). Distinct from the
+    # service-role key (which bypasses RLS). Only required once per-user
+    # data access migrates onto the user client; unset is fine until then.
+    supabase_anon_key: str = Field(default="", repr=False)
     wyrdfold_api_key: str = Field(default="", repr=False)
     # JWT verification uses Supabase's JWKS endpoint at
     # `<supabase_url>/auth/v1/.well-known/jwks.json` — public-key verification
