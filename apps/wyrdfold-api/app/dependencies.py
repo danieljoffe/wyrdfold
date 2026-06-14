@@ -37,6 +37,31 @@ def get_supabase() -> Client:
     return client
 
 
+def get_user_supabase(
+    request: Request,
+    s: Settings = Depends(get_settings),
+) -> Client:
+    """Per-request Supabase client bound to the caller's JWT (#79).
+
+    Unlike ``get_supabase`` (service-role, bypasses RLS), this routes
+    queries through the user's token so Postgres RLS enforces per-user
+    access. JWT-only: api-key/cron callers have no user token and must
+    use ``get_supabase``. Not wired into any route yet — the per-user
+    data paths migrate onto it table-by-table in later #79 phases.
+    """
+    if not s.supabase_url or not s.supabase_anon_key:
+        raise HTTPException(
+            status_code=503, detail="Supabase user client not configured"
+        )
+    token = _extract_bearer_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+
+    from app.supabase_pool import get_user_client
+
+    return get_user_client(token)
+
+
 def get_embeddings_client() -> "EmbeddingsClient":
     """Embeddings client factory. Returns the default (mock today,
     Voyage when the real implementation lands).
