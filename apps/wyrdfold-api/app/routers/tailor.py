@@ -29,9 +29,11 @@ from supabase import Client
 
 from app.dependencies import (
     enforce_llm_budget,
+    get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
+    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.models.batch import BatchJob, BatchRequest, BatchResponse
@@ -136,7 +138,9 @@ async def create_tailored_resume(
     body: TailorRequest,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    # JWT-required: the generated .docx is stored under the caller's
+    # <user_id>/ Storage folder, so anonymous generation is no longer allowed.
+    user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
     current_optimized = optimized.get_latest(supabase, user_id=user_id)
     if current_optimized is None:
@@ -253,7 +257,8 @@ async def create_tailored_cover_letter(
     body: CoverLetterRequest,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    # JWT-required: see create_tailored_resume (per-user Storage folder).
+    user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
     current_optimized = optimized.get_latest(supabase, user_id=user_id)
     if current_optimized is None:
@@ -383,9 +388,14 @@ async def get_cover_letter_by_job(
 async def export_resumes_zip(
     body: BulkExportRequest,
     supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Response:
-    """Download approved resumes as a single .zip archive."""
+    """Download approved resumes as a single .zip archive.
+
+    JWT-required: file bytes come from per-user Storage (RLS) via
+    ``user_supabase``; DB lookups stay on the service-role ``supabase``.
+    """
     records: list[TailoredResumeRecord] = []
     unapproved: list[str] = []
     for rid in body.resume_ids:
@@ -407,7 +417,7 @@ async def export_resumes_zip(
         for rec in records:
             if not rec.storage_path:
                 continue
-            docx_bytes = persistence.download_docx(supabase, rec.storage_path)
+            docx_bytes = persistence.download_docx(user_supabase, rec.storage_path)
             resume = rec.as_resume()
             # Build a descriptive filename from the first experience entry
             company = "unknown"
@@ -630,8 +640,11 @@ def _resolve_render_style(
 async def download_tailored_resume(
     resume_id: str,
     supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Response:
+    # JWT-required: docx bytes are read/written through per-user Storage
+    # (RLS) via user_supabase; DB lookups stay on the service-role client.
     row = persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored resume not found")
@@ -654,7 +667,7 @@ async def download_tailored_resume(
                 )
             # Legacy row with cached docx but no markdown — serve cached bytes.
             try:
-                data = persistence.download_docx(supabase, row.storage_path)
+                data = persistence.download_docx(user_supabase, row.storage_path)
             except Exception as exc:
                 raise HTTPException(
                     status_code=502, detail=f"storage fetch failed: {exc}"
@@ -678,7 +691,7 @@ async def download_tailored_resume(
         try:
             storage_path = persistence.upload_docx(
                 supabase,
-                user_id=row.user_id,
+                user_id=user_id,
                 resume_id=resume_id,
                 docx_bytes=data,
             )
@@ -700,7 +713,7 @@ async def download_tailored_resume(
             )
     else:
         try:
-            data = persistence.download_docx(supabase, row.storage_path)  # type: ignore[arg-type]
+            data = persistence.download_docx(user_supabase, row.storage_path)  # type: ignore[arg-type]
         except Exception as exc:
             raise HTTPException(
                 status_code=502, detail=f"storage fetch failed: {exc}"
@@ -725,7 +738,10 @@ async def create_batch_resumes(
     background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    # JWT-required: batch generation stores each .docx under the caller's
+    # <user_id>/ Storage folder (the background task uploads via service-role
+    # to that verified folder).
+    user_id: str = Depends(get_current_user_id),
 ) -> BatchResponse:
     """Kick off batch resume generation for multiple job postings.
 
