@@ -57,6 +57,14 @@
     "docker:build": {
       "// dependsOn": "Override @nx/docker plugin's inferred dependsOn:['build','^build']. This is a Python app — no JS build target — so the inferred deps would error 'Cannot find configuration for task wyrdfold-api:build' on invocation.",
       "dependsOn": []
+    },
+    "docker:smoke": {
+      "executor": "nx:run-commands",
+      "// ": "Local pre-ship check — build the image as Railway does, boot it, probe /health. Boot step needs a running local Supabase ('supabase start'); skipped (build-only) if absent.",
+      "options": {
+        "command": "bash apps/wyrdfold-api/scripts/docker-smoke.sh",
+        "cwd": "{workspaceRoot}"
+      }
     }
   }
 }
