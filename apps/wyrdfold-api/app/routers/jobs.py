@@ -156,19 +156,30 @@ def _fetch_jobs_chunked(
     supabase: Client,
     page_ids: list[str],
     *,
+    user_id: str | None,
     status: str | None,
     company: str | None,
     search: str | None,
 ) -> list[dict[str, Any]]:
-    """Fetch ``jobs`` rows for many IDs in chunks, applying the
-    status/company/title filters per request. Caller is responsible for
-    re-sorting by score after the merge (chunk order is not preserved).
+    """Fetch ``jobs`` rows for many IDs in chunks, resolving each row's
+    status from the caller's ``user_jobs`` row (absent → ``'new'``) and
+    applying the status/company/title filters per request. Caller is
+    responsible for re-sorting by score after the merge (chunk order is
+    not preserved).
+
+    **Per-user status (#75 C2):** the displayed ``status`` is the
+    caller's per-user status, not the global ``jobs.status``. For each
+    chunk we fetch the ``jobs`` rows WITHOUT a status filter, then look
+    up the caller's ``user_jobs`` statuses for the same ids and overlay
+    them (``'new'`` for any job the user hasn't touched, and for every
+    job when ``user_id is None``). The status filter is then applied on
+    that per-user value, mirroring the old semantics.
 
     **Archived exclusion:** when ``status`` is not explicitly supplied
-    (i.e. the user is browsing the default mixed view), rows with
-    ``status='archived'`` are filtered out. URL-health-check archived
-    jobs would otherwise float to the top of the score-sorted list
-    even though the user can no longer apply to them. Users who want
+    (i.e. the user is browsing the default mixed view), rows whose
+    per-user status is ``'archived'`` are filtered out. URL-health-check
+    archived jobs would otherwise float to the top of the score-sorted
+    list even though the user can no longer apply to them. Users who want
     to see archived rows can pass ``status='archived'`` explicitly.
     """
     if not page_ids:
@@ -177,15 +188,39 @@ def _fetch_jobs_chunked(
     for i in range(0, len(page_ids), _IN_CHUNK_SIZE):
         chunk = page_ids[i : i + _IN_CHUNK_SIZE]
         q = supabase.table("jobs").select(_JP_SELECT_COLS).in_("id", chunk)
-        if status:
-            q = q.eq("status", status)
-        else:
-            q = q.neq("status", "archived")
         if company:
             q = q.eq("company_name", company)
         q = _apply_title_search(q, search)
         resp = q.execute()
-        out.extend(cast(list[dict[str, Any]], resp.data or []))
+        rows = cast(list[dict[str, Any]], resp.data or [])
+
+        # Resolve per-user status: jobs the user hasn't touched (no
+        # user_jobs row) — and every job when there's no user identity —
+        # read as 'new' (#75 "absent = new" rule).
+        status_map: dict[str, str] = {}
+        if user_id is not None and rows:
+            uj_resp = (
+                supabase.table("user_jobs")
+                .select("job_posting_id,status")
+                .eq("user_id", user_id)
+                .in_("job_posting_id", chunk)
+                .execute()
+            )
+            status_map = {
+                cast(str, r["job_posting_id"]): cast(str, r["status"])
+                for r in cast(list[dict[str, Any]], uj_resp.data or [])
+            }
+        for row in rows:
+            row["status"] = status_map.get(cast(str, row["id"]), "new")
+
+        # Apply the status filter on the per-user value, mirroring the old
+        # global-status semantics: explicit status keeps only matches;
+        # default view drops archived.
+        if status:
+            rows = [r for r in rows if r["status"] == status]
+        else:
+            rows = [r for r in rows if r["status"] != "archived"]
+        out.extend(rows)
     return out
 
 
@@ -234,6 +269,7 @@ def _list_jobs_for_target_rpc(
     search: str | None,
     exclude_terms: list[str],
     only_terms: list[str],
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     # The RPC paginates server-side with no knowledge of the location
     # filter, so its ``total`` would be the pre-filter count and pages
@@ -265,6 +301,7 @@ def _list_jobs_for_target_rpc(
             "p_ascending": ascending,
             "p_limit": page_size,
             "p_offset": offset,
+            "p_user_id": user_id,
         },
     ).execute()
     if not isinstance(resp.data, list):
@@ -292,6 +329,7 @@ def _list_jobs_for_target_two_query(
     exclude_terms: list[str],
     only_terms: list[str],
     axis_weights: AxisWeights | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
 
@@ -368,7 +406,12 @@ def _list_jobs_for_target_two_query(
         total = None  # will be computed after posting-level filters
 
     postings: list[dict[str, Any]] = _fetch_jobs_chunked(
-        supabase, page_ids, status=status, company=company, search=search
+        supabase,
+        page_ids,
+        user_id=user_id,
+        status=status,
+        company=company,
+        search=search,
     )
 
     # Overlay target scores. When axis_weights are set for this
@@ -442,6 +485,7 @@ def _list_jobs_for_target(
     exclude_terms: list[str],
     only_terms: list[str],
     axis_weights: AxisWeights | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
 
@@ -468,6 +512,7 @@ def _list_jobs_for_target(
         "search": search,
         "exclude_terms": exclude_terms,
         "only_terms": only_terms,
+        "user_id": user_id,
     }
     if axis_weights is not None:
         return _list_jobs_for_target_two_query(
@@ -496,6 +541,7 @@ def _list_jobs_across_user_targets(
     exclude_terms: list[str],
     only_terms: list[str],
     weights_by_target: dict[str, AxisWeights] | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -578,7 +624,12 @@ def _list_jobs_across_user_targets(
         return {"postings": [], "total": total or 0, "page": page, "page_size": page_size}
 
     postings: list[dict[str, Any]] = _fetch_jobs_chunked(
-        supabase, page_ids, status=status, company=company, search=search
+        supabase,
+        page_ids,
+        user_id=user_id,
+        status=status,
+        company=company,
+        search=search,
     )
 
     weights_by_target = weights_by_target or {}
@@ -847,6 +898,7 @@ def list_jobs(
             exclude_terms=exclude_terms,
             only_terms=only_terms,
             axis_weights=axis_weights,
+            user_id=user_id,
         )
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
@@ -878,6 +930,7 @@ def list_jobs(
             exclude_terms=exclude_terms,
             only_terms=only_terms,
             weights_by_target=weights_by_target or None,
+            user_id=user_id,
         )
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
@@ -954,11 +1007,13 @@ def _pipeline_counts_python(
     *,
     target_ids: set[str],
     min_score: int | None,
+    user_id: str | None,
 ) -> dict[str, int]:
     """Fallback used when the ``pipeline_counts`` RPC is unavailable
     (e.g. mid-deploy before the migration lands). Mirrors the JWT list
     path: scores rows for the user's targets (excluded=False, optional
-    score floor), deduplicated by job, then grouped by job status."""
+    score floor), deduplicated by job, then grouped by the caller's
+    per-user status (``user_jobs`` row; absent → ``'new'``)."""
     score_query = (
         supabase.table("scores")
         .select("job_posting_id")
@@ -977,9 +1032,24 @@ def _pipeline_counts_python(
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        resp = supabase.table("jobs").select("status").in_("id", chunk).execute()
-        for row in cast(list[dict[str, Any]], resp.data or []):
-            st = cast(str, row["status"])
+        # Resolve per-user status for the chunk; jobs with no user_jobs
+        # row — and every job when there's no user identity — count as
+        # 'new' (#75 "absent = new" rule).
+        status_map: dict[str, str] = {}
+        if user_id is not None:
+            uj_resp = (
+                supabase.table("user_jobs")
+                .select("job_posting_id,status")
+                .eq("user_id", user_id)
+                .in_("job_posting_id", chunk)
+                .execute()
+            )
+            status_map = {
+                cast(str, r["job_posting_id"]): cast(str, r["status"])
+                for r in cast(list[dict[str, Any]], uj_resp.data or [])
+            }
+        for jid in chunk:
+            st = status_map.get(jid, "new")
             counts[st] = counts.get(st, 0) + 1
     return counts
 
@@ -989,6 +1059,7 @@ def _pipeline_counts_grouped(
     *,
     target_ids: set[str],
     min_score: int | None,
+    user_id: str | None,
 ) -> dict[str, int]:
     """Single grouped count via the ``pipeline_counts`` RPC; falls back
     to the client-side two-query variant if the RPC isn't deployed yet."""
@@ -998,6 +1069,7 @@ def _pipeline_counts_grouped(
             {
                 "p_target_ids": sorted(target_ids),
                 "p_min_score": min_score,
+                "p_user_id": user_id,
             },
         ).execute()
     except Exception:
@@ -1005,7 +1077,7 @@ def _pipeline_counts_grouped(
             "pipeline_counts RPC unavailable, falling back to client-side count"
         )
         return _pipeline_counts_python(
-            supabase, target_ids=target_ids, min_score=min_score
+            supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
     return {
         cast(str, row["status"]): int(row["count"])
@@ -1041,7 +1113,7 @@ def pipeline_counts(
     if target_ids:
         min_score = _default_min_score_for_user(supabase, user_id)
         grouped = _pipeline_counts_grouped(
-            supabase, target_ids=target_ids, min_score=min_score
+            supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
         for status_key, n in grouped.items():
             if status_key in counts:
