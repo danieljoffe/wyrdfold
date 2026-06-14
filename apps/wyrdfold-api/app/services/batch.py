@@ -187,7 +187,9 @@ async def process_batch(
                     items[i]["reused_from"] = reusable.id
                     completed += 1
 
-                    persistence.mark_job_resume_draft(supabase, job_posting_id)
+                    persistence.mark_job_resume_draft(
+                        supabase, job_posting_id, user_id=user_id
+                    )
 
                     _update_batch(
                         supabase,
@@ -217,7 +219,9 @@ async def process_batch(
                 items[i]["resume_record_id"] = result.record.id
                 completed += 1
 
-                persistence.mark_job_resume_draft(supabase, job_posting_id)
+                persistence.mark_job_resume_draft(
+                    supabase, job_posting_id, user_id=user_id
+                )
             else:
                 # Lint failure
                 violations = [v.message for v in result.lint.violations]

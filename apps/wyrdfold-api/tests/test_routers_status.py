@@ -100,6 +100,9 @@ def _build_supabase(
             )
         elif name == "status_log":
             t.insert.return_value.execute.return_value = _Resp(None)
+        elif name == "user_jobs":
+            # Dual-write target (#75 C1): upsert(...).execute().
+            t.upsert.return_value.execute.return_value = _Resp(None)
         return t
 
     sb.table.side_effect = _table
@@ -144,6 +147,64 @@ def test_status_200_on_valid_update(client_factory):
     assert body["success"] is True
     assert body["old_status"] == "saved"
     assert body["new_status"] == "applied"
+
+
+def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory):
+    """#75 C1: a status update mirrors into user_jobs and stamps the
+    status_log row with user_id, alongside the unchanged jobs.status write."""
+    seen: dict[str, Any] = {}
+
+    def _build() -> MagicMock:
+        sb = MagicMock()
+
+        def _table(name: str):
+            t = MagicMock()
+            if name == "jobs":
+                t.select.return_value.eq.return_value.single.return_value.execute.return_value = _Resp(
+                    {"status": "saved", "id": "abc"}
+                )
+                t.update.return_value.eq.return_value.execute.return_value = _Resp(
+                    None
+                )
+            elif name == "user_targets":
+                t.select.return_value.eq.return_value.execute.return_value = _Resp(
+                    [{"target_id": _TEST_TARGET_ID}]
+                )
+            elif name == "scores":
+                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
+                    [{"target_id": _TEST_TARGET_ID}]
+                )
+            elif name == "status_log":
+
+                def _insert(payload: Any):
+                    seen["status_log"] = payload
+                    return MagicMock(execute=lambda: _Resp(None))
+
+                t.insert.side_effect = _insert
+            elif name == "user_jobs":
+
+                def _upsert(payload: Any, **kwargs: Any):
+                    seen["user_jobs"] = payload
+                    seen["user_jobs_kwargs"] = kwargs
+                    return MagicMock(execute=lambda: _Resp(None))
+
+                t.upsert.side_effect = _upsert
+            return t
+
+        sb.table.side_effect = _table
+        return sb
+
+    client = client_factory(_build())
+    r = client.post("/jobs/abc/status", json={"status": "applied", "note": "x"})
+    assert r.status_code == 200
+
+    # status_log carries the user_id now.
+    assert seen["status_log"]["user_id"] == _TEST_USER_ID
+    # user_jobs mirrors the new status keyed by (user_id, posting).
+    assert seen["user_jobs"]["user_id"] == _TEST_USER_ID
+    assert seen["user_jobs"]["job_posting_id"] == "abc"
+    assert seen["user_jobs"]["status"] == "applied"
+    assert seen["user_jobs_kwargs"]["on_conflict"] == "user_id,job_posting_id"
 
 
 def test_status_update_only_evicts_owning_target_and_global_views(client_factory):

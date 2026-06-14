@@ -11,6 +11,7 @@ from app.dependencies import (
     verify_supabase_jwt,
 )
 from app.models.schemas import StatusUpdate
+from app.services.tailor import persistence
 
 # `verify_supabase_jwt` (not `_or_jwt`): status mutations are user actions,
 # never invoked by cron. Keeping the api-key fallback would let a leaked
@@ -118,6 +119,7 @@ async def update_status(
             "old_status": old_status,
             "new_status": body.status,
             "note": body.note,
+            "user_id": user_id,
         }
     ).execute()
 
@@ -127,6 +129,12 @@ async def update_status(
             "updated_at": datetime.now(UTC).isoformat(),
         }
     ).eq("id", posting_id).execute()
+
+    # Dual-write (#75 C1): mirror the per-user status into user_jobs. Reads
+    # still come off jobs.status until a later phase cuts over.
+    persistence.upsert_user_job(
+        supabase, user_id=user_id, job_posting_id=posting_id, status=body.status
+    )
 
     # Scoped invalidation: a single posting status change only affects the
     # owning target's cached pages and the global view. Sibling targets'

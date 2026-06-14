@@ -414,7 +414,8 @@ class TestBatchProcessing:
                 page_budget=2,
             )
 
-        mock_mark.assert_called_once_with(supabase, "job-1")
+        # Dual-write threads the batch's user_id through (#75 C1).
+        mock_mark.assert_called_once_with(supabase, "job-1", user_id=None)
 
 
 # ---------------------------------------------------------------------------
