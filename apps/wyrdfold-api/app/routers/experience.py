@@ -90,7 +90,7 @@ async def get_prose(
 @router.post("/prose")
 async def create_prose(
     body: ProseDocCreate,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ProseDoc:
     return prose.create_version(supabase, user_id=user_id, content=body.content)
@@ -569,7 +569,7 @@ async def get_preferences(
 @router.put("/preferences")
 async def upsert_preferences(
     body: PreferencesUpsert,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> Preferences:
     return preferences.upsert(supabase, user_id=user_id, payload=body.payload)
@@ -577,7 +577,7 @@ async def upsert_preferences(
 
 @router.delete("/preferences")
 async def reset_preferences(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, bool]:
     preferences.reset(supabase, user_id=user_id)
@@ -606,7 +606,7 @@ async def list_turns(
 @router.post("/turns")
 async def append_turn(
     body: TurnAppend,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, Any]:
     if body.skipped and body.role != "user":
