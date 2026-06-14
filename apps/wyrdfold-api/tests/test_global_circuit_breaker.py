@@ -23,8 +23,41 @@ class _Resp:
 # ---- cost_log.total_spend_all ----------------------------------------------
 
 
-def test_total_spend_all_sums_across_all_users() -> None:
+def test_total_spend_all_uses_rpc_when_available() -> None:
     sb = MagicMock()
+    sb.rpc.return_value.execute.return_value = _Resp(0.85)
+
+    result = cost_log.total_spend_all(sb, since=datetime.now(UTC))
+
+    assert result == pytest.approx(0.85)
+    args, _ = sb.rpc.call_args
+    assert args[0] == "total_spend_all_since"
+    # No per-user filter — the RPC sums across ALL users.
+    assert "p_user_id" not in args[1]
+    # The select-table API should NOT be touched on the RPC path.
+    sb.table.assert_not_called()
+
+
+def test_total_spend_all_passes_none_since_through() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute.return_value = _Resp(1.0)
+
+    assert cost_log.total_spend_all(sb) == pytest.approx(1.0)
+    args, _ = sb.rpc.call_args
+    assert args[1]["p_since"] is None
+
+
+def test_total_spend_all_zero_when_rpc_returns_none() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute.return_value = _Resp(None)
+
+    assert cost_log.total_spend_all(sb, since=datetime.now(UTC)) == 0.0
+
+
+def test_total_spend_all_falls_back_to_python_when_rpc_unavailable() -> None:
+    sb = MagicMock()
+    sb.rpc.side_effect = Exception("function does not exist")
+
     sel = sb.table.return_value.select.return_value
     sel.gte.return_value.execute.return_value = _Resp(
         [{"cost_usd": 0.50}, {"cost_usd": 0.25}, {"cost_usd": 0.10}]
@@ -34,26 +67,9 @@ def test_total_spend_all_sums_across_all_users() -> None:
 
     assert result == pytest.approx(0.85)
     sb.table.assert_called_once_with("llm_costs")
-    # The whole point: NO per-user partition — neither .eq nor .is_.
+    # Fallback still sums across ALL users — no per-user partition.
     sel.eq.assert_not_called()
     sel.is_.assert_not_called()
-
-
-def test_total_spend_all_without_since_selects_everything() -> None:
-    sb = MagicMock()
-    sel = sb.table.return_value.select.return_value
-    sel.execute.return_value = _Resp([{"cost_usd": 1.0}])
-
-    assert cost_log.total_spend_all(sb) == pytest.approx(1.0)
-    sel.gte.assert_not_called()
-
-
-def test_total_spend_all_empty_window_is_zero() -> None:
-    sb = MagicMock()
-    sel = sb.table.return_value.select.return_value
-    sel.gte.return_value.execute.return_value = _Resp([])
-
-    assert cost_log.total_spend_all(sb, since=datetime.now(UTC)) == 0.0
 
 
 # ---- _cycle_budget_gate breaker integration ---------------------------------
