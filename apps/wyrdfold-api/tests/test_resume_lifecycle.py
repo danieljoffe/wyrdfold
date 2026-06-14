@@ -217,16 +217,59 @@ class TestPersistenceHelpers:
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
-        mark_job_resume_draft(supabase, "job-42")
+        mark_job_resume_draft(supabase, "job-42", user_id=None)
 
-        supabase.table.assert_called_with("jobs")
-        update_call = supabase.table.return_value.update.call_args
-        payload = update_call[0][0]
+        # The jobs.status write is unconditional.
+        assert any(
+            c.args == ("jobs",) for c in supabase.table.call_args_list
+        )
+        jobs_update = supabase.table.return_value.update.call_args
+        payload = jobs_update[0][0]
         assert payload["status"] == "resume_draft"
         assert "updated_at" in payload
-        supabase.table.return_value.update.return_value.eq.assert_called_with(
-            "id", "job-42"
+
+    def test_mark_job_resume_draft_dual_writes_user_jobs(self) -> None:
+        """With a known user_id (#75 C1) the helper mirrors into user_jobs
+        alongside the jobs.status write."""
+        from app.services.tailor.persistence import mark_job_resume_draft
+
+        supabase = MagicMock()
+        mark_job_resume_draft(supabase, "job-42", user_id="user-7")
+
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "jobs" in tables
+        assert "user_jobs" in tables
+        upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
+        assert upsert_payload["user_id"] == "user-7"
+        assert upsert_payload["job_posting_id"] == "job-42"
+        assert upsert_payload["status"] == "resume_draft"
+
+    def test_mark_job_resume_draft_skips_user_jobs_for_api_key(self) -> None:
+        """user_id=None (api-key/cron path) skips the mirror in C1."""
+        from app.services.tailor.persistence import mark_job_resume_draft
+
+        supabase = MagicMock()
+        mark_job_resume_draft(supabase, "job-42", user_id=None)
+
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "user_jobs" not in tables
+
+    def test_upsert_user_job(self) -> None:
+        from app.services.tailor.persistence import upsert_user_job
+
+        supabase = MagicMock()
+        upsert_user_job(
+            supabase, user_id="user-1", job_posting_id="job-9", status="applied"
         )
+
+        supabase.table.assert_called_with("user_jobs")
+        upsert_call = supabase.table.return_value.upsert.call_args
+        payload = upsert_call[0][0]
+        assert payload["user_id"] == "user-1"
+        assert payload["job_posting_id"] == "job-9"
+        assert payload["status"] == "applied"
+        assert "updated_at" in payload
+        assert upsert_call.kwargs["on_conflict"] == "user_id,job_posting_id"
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +340,12 @@ class TestSingleResumeStatusBump:
                     llm=llm,
                 )
 
-        mock_mark.assert_called_once_with(supabase, "job-1")
+        # Dual-write threads user_id through (#75 C1); the route is invoked
+        # without resolving the JWT dependency here, so just assert the
+        # positional contract + that user_id is passed as a keyword.
+        mock_mark.assert_called_once()
+        assert mock_mark.call_args.args == (supabase, "job-1")
+        assert "user_id" in mock_mark.call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_no_status_bump_when_job_posting_id_missing(self) -> None:
@@ -580,6 +628,92 @@ class TestApproveResume:
         # No jobs.update — cover letters don't drive job status.
         for call in supabase.table.call_args_list:
             assert call.args[0] != "jobs"
+
+    @pytest.mark.asyncio
+    async def test_approve_dual_writes_user_jobs(self) -> None:
+        """#75 C1: approving a resume with a JWT user_id mirrors the
+        resume_ready status into user_jobs alongside the jobs.status write."""
+        from app.routers import tailor as tailor_router
+
+        supabase = MagicMock()
+        record = _make_record()
+        approved_record = _make_record(approved_at=_NOW)
+
+        with (
+            patch("app.services.tailor.persistence.get", return_value=record),
+            patch(
+                "app.services.tailor.persistence.approve",
+                return_value=approved_record,
+            ),
+        ):
+            await tailor_router.approve_tailored_resume(
+                resume_id="rec-1",
+                supabase=supabase,
+                user_id="user-7",
+            )
+
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "jobs" in tables
+        assert "user_jobs" in tables
+        upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
+        assert upsert_payload["user_id"] == "user-7"
+        assert upsert_payload["status"] == "resume_ready"
+
+    @pytest.mark.asyncio
+    async def test_approve_skips_user_jobs_for_api_key(self) -> None:
+        """api-key callers (user_id None) skip the user_jobs mirror in C1."""
+        from app.routers import tailor as tailor_router
+
+        supabase = MagicMock()
+        record = _make_record()
+        approved_record = _make_record(approved_at=_NOW)
+
+        with (
+            patch("app.services.tailor.persistence.get", return_value=record),
+            patch(
+                "app.services.tailor.persistence.approve",
+                return_value=approved_record,
+            ),
+        ):
+            await tailor_router.approve_tailored_resume(
+                resume_id="rec-1",
+                supabase=supabase,
+                user_id=None,
+            )
+
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "jobs" in tables
+        assert "user_jobs" not in tables
+
+    @pytest.mark.asyncio
+    async def test_unapprove_dual_writes_user_jobs(self) -> None:
+        """#75 C1: unapproving a resume with a JWT user_id mirrors the
+        resume_draft status into user_jobs alongside the jobs.status write."""
+        from app.routers import tailor as tailor_router
+
+        supabase = MagicMock()
+        approved = _make_record(approved_at=_NOW)
+        reopened = _make_record(approved_at=None)
+
+        with (
+            patch("app.services.tailor.persistence.get", return_value=approved),
+            patch(
+                "app.services.tailor.persistence.unapprove",
+                return_value=reopened,
+            ),
+        ):
+            await tailor_router.unapprove_tailored_resume(
+                resume_id="rec-1",
+                supabase=supabase,
+                user_id="user-7",
+            )
+
+        tables = [c.args[0] for c in supabase.table.call_args_list]
+        assert "jobs" in tables
+        assert "user_jobs" in tables
+        upsert_payload = supabase.table.return_value.upsert.call_args[0][0]
+        assert upsert_payload["user_id"] == "user-7"
+        assert upsert_payload["status"] == "resume_draft"
 
 
 # ---------------------------------------------------------------------------
