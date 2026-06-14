@@ -18,9 +18,11 @@ class _ExecuteStub:
 
 
 def _profile_supabase(profile_row: dict[str, Any] | None) -> MagicMock:
-    """Mock that answers `table('user_profiles').select(...).limit(1).execute()`."""
+    """Mock answering `table(...).select(...).eq(...)/.is_(...).limit(1).execute()`."""
     chain = MagicMock()
     chain.select.return_value = chain
+    chain.eq.return_value = chain
+    chain.is_.return_value = chain
     chain.limit.return_value = chain
     chain.execute.return_value = _ExecuteStub([profile_row] if profile_row else [])
 
@@ -33,7 +35,7 @@ async def test_override_with_name_takes_precedence() -> None:
     supabase = _profile_supabase({"name": "From Profile"})
     override = ContactInfo(name="From Override", email="o@example.com")
 
-    result = await resolve_contact(supabase, override)
+    result = await resolve_contact(supabase, "user-1", override)
 
     assert result.name == "From Override"
     assert result.email == "o@example.com"
@@ -53,7 +55,7 @@ async def test_resolves_from_profile_when_no_override() -> None:
         }
     )
 
-    result = await resolve_contact(supabase, override=None)
+    result = await resolve_contact(supabase, "user-1", override=None)
 
     assert result.name == "Daniel Joffe"
     assert result.email == "d@example.com"
@@ -68,7 +70,7 @@ async def test_override_without_name_falls_through_to_profile() -> None:
     supabase = _profile_supabase({"name": "Daniel Joffe", "email": "d@example.com"})
     override = ContactInfo(name="")  # Pydantic allows empty string
 
-    result = await resolve_contact(supabase, override)
+    result = await resolve_contact(supabase, "user-1", override)
 
     assert result.name == "Daniel Joffe"
 
@@ -77,7 +79,7 @@ async def test_raises_400_when_no_name_anywhere() -> None:
     supabase = _profile_supabase({"name": None, "email": "d@example.com"})
 
     with pytest.raises(HTTPException) as exc_info:
-        await resolve_contact(supabase, override=None)
+        await resolve_contact(supabase, "user-1", override=None)
 
     assert exc_info.value.status_code == 400
     assert "Settings" in exc_info.value.detail
@@ -87,6 +89,29 @@ async def test_raises_400_when_profile_row_missing() -> None:
     supabase = _profile_supabase(None)  # No rows at all
 
     with pytest.raises(HTTPException) as exc_info:
-        await resolve_contact(supabase, override=None)
+        await resolve_contact(supabase, "user-1", override=None)
 
     assert exc_info.value.status_code == 400
+
+
+async def test_profile_query_scoped_to_user_id() -> None:
+    """Regression for the cross-tenant PII leak: the service-role read must be
+    filtered by the caller's user_id, never an unscoped `.limit(1)`."""
+    supabase = _profile_supabase({"name": "Daniel Joffe"})
+
+    await resolve_contact(supabase, "user-123", override=None)
+
+    chain = supabase.table.return_value
+    chain.eq.assert_called_once_with("user_id", "user-123")
+    chain.is_.assert_not_called()
+
+
+async def test_profile_query_scoped_to_null_user_id_for_legacy_caller() -> None:
+    """Legacy api-key / cron caller (user_id=None) reads the NULL-owned row."""
+    supabase = _profile_supabase({"name": "Legacy User"})
+
+    await resolve_contact(supabase, None, override=None)
+
+    chain = supabase.table.return_value
+    chain.is_.assert_called_once_with("user_id", "null")
+    chain.eq.assert_not_called()
