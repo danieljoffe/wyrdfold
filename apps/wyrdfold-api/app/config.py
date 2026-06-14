@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: float = Field(default=600.0, ge=1.0, le=3600.0)
     openrouter_max_retries: int = Field(default=3, ge=0, le=10)
 
+    # BYOK (#5). Master key for AES-256-GCM envelope encryption of
+    # per-user provider API keys at rest in `user_api_keys`. Base64 of
+    # exactly 32 random bytes (`openssl rand -base64 32`). Empty disables
+    # BYOK storage entirely — the keys service refuses to encrypt/decrypt,
+    # so single-tenant self-hosters who never set it are unaffected (they
+    # use the operator env keys above). NOT interchangeable with the
+    # Supabase service-role key; rotating it orphans all stored ciphertext.
+    byok_master_key: str = Field(default="", repr=False)
+
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 
