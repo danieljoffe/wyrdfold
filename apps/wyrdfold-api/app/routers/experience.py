@@ -18,6 +18,7 @@ from supabase import Client
 
 from app.dependencies import (
     enforce_llm_budget,
+    get_current_user_id,
     get_current_user_id_optional,
     get_embeddings_client,
     get_llm_client,
@@ -170,9 +171,16 @@ async def upload_resume(
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> ResumeUploadResponse:
-    """Upload a resume file (PDF/DOCX), extract text, merge into prose doc."""
+    """Upload a resume file (PDF/DOCX), extract text, merge into prose doc.
+
+    JWT-required so the file lands under the caller's ``<user_id>/`` Storage
+    folder (no more ``anon/``). The write itself goes through the service-role
+    client to the verified user's folder — uploads also run from background
+    contexts (batch) where a per-request user client wouldn't be valid; read
+    access is what storage RLS enforces, on the user client.
+    """
     content_type = file.content_type or ""
     filename = file.filename or "unknown"
 

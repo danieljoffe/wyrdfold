@@ -84,16 +84,16 @@ def test_upload_path_is_user_namespaced() -> None:
     assert path in sb.storage.buckets[persistence.STORAGE_BUCKET]
 
 
-def test_anon_user_falls_back_to_anon_prefix() -> None:
-    """`user_id=None` (legacy single-tenant / api-key path) namespaces
-    under `anon/`, never collides with a real user's folder."""
+def test_storage_path_is_namespaced_under_user_id() -> None:
+    """Every object is filed under the owner's `<user_id>/` folder — the
+    legacy `anon/` fallback is gone, and storage RLS keys on this prefix."""
     sb = _supabase_with_fake_storage()
 
     path = persistence.upload_docx(
-        sb, user_id=None, resume_id="r-1", docx_bytes=b"y"
+        sb, user_id="user-1", resume_id="r-1", docx_bytes=b"y"
     )
 
-    assert path == "anon/r-1.docx"
+    assert path == "user-1/r-1.docx"
 
 
 def test_two_users_same_resume_id_do_not_collide() -> None:
