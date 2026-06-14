@@ -3,7 +3,8 @@
 Replaces the dashboard's seven ``/jobs?status=X&page_size=1`` round-trips.
 Counts must match the untargeted JWT list view: scores rows for the
 user's targets (excluded=False, optional ``list_min_score`` floor),
-deduplicated by job, grouped by job status.
+deduplicated by job, grouped by the caller's per-user status
+(``user_jobs`` row; absent → ``'new'``).
 """
 
 from typing import Any
@@ -45,23 +46,24 @@ class _Chain:
 
 
 def test_python_fallback_dedups_jobs_across_targets() -> None:
-    # j1 scored against two targets — must count once.
+    # j1 scored against two targets — must count once. Status now comes
+    # from per-user user_jobs rows: j2 is 'saved'; j1 has no user_jobs
+    # row, so it resolves to 'new'.
     score_rows = [
         {"job_posting_id": "j1"},
         {"job_posting_id": "j1"},
         {"job_posting_id": "j2"},
     ]
-    job_rows = [
-        {"status": "new"},
-        {"status": "saved"},
+    user_job_rows = [
+        {"job_posting_id": "j2", "status": "saved"},
     ]
     sb = MagicMock()
     sb.table.side_effect = lambda name: _Chain(
-        _Resp(score_rows if name == "scores" else job_rows)
+        _Resp(score_rows if name == "scores" else user_job_rows)
     )
 
     counts = _pipeline_counts_python(
-        sb, target_ids={"t1", "t2"}, min_score=None
+        sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
     )
     assert counts == {"new": 1, "saved": 1}
 
@@ -74,10 +76,13 @@ def test_grouped_uses_rpc_result() -> None:
             {"status": "applied", "count": 5},
         ]
     )
-    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=70)
+    counts = _pipeline_counts_grouped(
+        sb, target_ids={"t1"}, min_score=70, user_id="u1"
+    )
     assert counts == {"new": 12, "applied": 5}
     sb.rpc.assert_called_once_with(
-        "pipeline_counts", {"p_target_ids": ["t1"], "p_min_score": 70}
+        "pipeline_counts",
+        {"p_target_ids": ["t1"], "p_min_score": 70, "p_user_id": "u1"},
     )
 
 
@@ -88,10 +93,12 @@ def test_grouped_falls_back_when_rpc_missing() -> None:
         _Resp(
             [{"job_posting_id": "j1"}]
             if name == "scores"
-            else [{"status": "interviewing"}]
+            else [{"job_posting_id": "j1", "status": "interviewing"}]
         )
     )
-    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None)
+    counts = _pipeline_counts_grouped(
+        sb, target_ids={"t1"}, min_score=None, user_id="u1"
+    )
     assert counts == {"interviewing": 1}
 
 
@@ -107,7 +114,7 @@ def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
     monkeypatch.setattr(
         jobs_mod,
         "_pipeline_counts_grouped",
-        lambda _sb, *, target_ids, min_score: {"new": 3, "offer": 1},
+        lambda _sb, *, target_ids, min_score, user_id: {"new": 3, "offer": 1},
     )
 
     counts = pipeline_counts(supabase=MagicMock(), user_id="u1")
