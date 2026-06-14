@@ -462,8 +462,23 @@ async def suggest_lateral(
 @router.get("/active", response_model=TargetsListResponse)
 def get_active_targets(
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> TargetsListResponse:
-    targets = crud.get_active(supabase)
+    """Active targets for the caller.
+
+    JWT callers get only their own active targets — the bare
+    ``crud.get_active`` returns the global union of every user's active
+    targets (the shared ``targets.is_active`` flag is OR'd across users
+    by the user_targets trigger), which would leak every other user's
+    roles + scoring profiles to any authenticated caller. api-key /
+    operator callers (user_id is None) keep the instance-wide view for
+    tooling. Mirrors the scoping the rest of the targets router applies.
+    """
+    targets = (
+        crud.get_active_for_user(supabase, user_id)
+        if user_id is not None
+        else crud.get_active(supabase)
+    )
     return TargetsListResponse(targets=targets)
 
 
