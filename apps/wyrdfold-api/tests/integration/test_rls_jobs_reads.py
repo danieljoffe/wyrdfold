@@ -49,7 +49,6 @@ def seeded_shared_job(
                 "source_id": source_id,
                 "title": "Shared Job",
                 "company_name": "Acme",
-                "status": "new",
             }
         ).execute()
         service_client.table("targets").insert(
