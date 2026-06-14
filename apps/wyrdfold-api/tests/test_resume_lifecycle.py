@@ -948,13 +948,17 @@ class TestDownloadCache:
                 "app.services.tailor.persistence.mark_docx_rendered"
             ) as mock_mark,
         ):
+            user_supabase = MagicMock()
             response = await tailor_router.download_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
+                user_supabase=user_supabase,
+                user_id="test-user",
             )
 
         assert response.body == b"PKcached-bytes"
-        mock_download.assert_called_once_with(supabase, "anon/rec-1.docx")
+        # Downloads go through the JWT-bound user client (storage RLS).
+        mock_download.assert_called_once_with(user_supabase, "anon/rec-1.docx")
         mock_render.assert_not_called()
         mock_mark.assert_not_called()
 
@@ -1055,13 +1059,16 @@ class TestDownloadCache:
             ) as mock_download,
             patch("app.routers.tailor.md_to_docx") as mock_render,
         ):
+            user_supabase = MagicMock()
             response = await tailor_router.download_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
+                user_supabase=user_supabase,
+                user_id="test-user",
             )
 
         assert response.body == b"PKlegacy-bytes"
-        mock_download.assert_called_once_with(supabase, "anon/rec-1.docx")
+        mock_download.assert_called_once_with(user_supabase, "anon/rec-1.docx")
         mock_render.assert_not_called()
 
     @pytest.mark.asyncio

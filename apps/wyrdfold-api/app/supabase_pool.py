@@ -58,9 +58,16 @@ def get_user_client(access_token: str) -> Client:
     client = create_client(
         settings.supabase_url, settings.supabase_anon_key, options
     )
-    # Set the bearer on this per-request client only. Safe vs. the
+    # Bind the bearer on this per-request client only. Safe vs. the
     # service-role singleton's bleed risk because nothing else holds a
-    # reference to this client.
+    # reference to this client (each call builds a fresh one).
+    #
+    # postgrest.auth() covers DB queries. Storage (and any other sub-client)
+    # is created lazily from `client.options.headers`, so we also set the
+    # Authorization there — otherwise storage would keep the anon key and
+    # RLS-protected buckets would deny the user their own objects. apikey
+    # stays the anon key.
+    client.options.headers["Authorization"] = f"Bearer {access_token}"
     client.postgrest.auth(access_token)
     return client
 

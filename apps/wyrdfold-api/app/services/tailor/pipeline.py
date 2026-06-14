@@ -92,6 +92,10 @@ async def run_tailor_pipeline(
     persisted and no `.docx` is uploaded — the caller should surface the
     violations and retry with a critique.
     """
+    if user_id is None:
+        # Generated .docx is stored under the caller's <user_id>/ Storage
+        # folder — there is no anonymous tailoring path anymore.
+        raise ValueError("tailored generation requires an authenticated user")
     # Resolve annotations for the target (#499)
     emphasize, exclude, de_emph = resolve_for_target(
         optimized.payload.annotations, target_label
@@ -227,6 +231,9 @@ async def run_cover_letter_pipeline(
     persisted and no `.docx` is uploaded — the caller should surface the
     violations and retry with a critique.
     """
+    if user_id is None:
+        # Stored under the caller's <user_id>/ Storage folder — no anonymous path.
+        raise ValueError("cover-letter generation requires an authenticated user")
     # Resolve annotations for the target (#499)
     emphasize, exclude, de_emph = resolve_for_target(
         optimized.payload.annotations, target_label
