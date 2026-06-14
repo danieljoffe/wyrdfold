@@ -24,6 +24,7 @@ from app.dependencies import (
     get_current_user_email,
     get_current_user_id,
     get_supabase,
+    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.main import app
@@ -41,6 +42,7 @@ _TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
 def client_factory():
     def _make(supabase: MagicMock) -> TestClient:
         app.dependency_overrides[get_supabase] = lambda: supabase
+        app.dependency_overrides[get_user_supabase] = lambda: supabase
         app.dependency_overrides[verify_supabase_jwt] = lambda: _TEST_USER_ID
         app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
         app.dependency_overrides[get_current_user_email] = lambda: None
