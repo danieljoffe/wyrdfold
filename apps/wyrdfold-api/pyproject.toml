@@ -88,4 +88,11 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=app --cov-report=term-missing --no-cov-on-fail"
+# Integration tests (RLS gates, #79) need a live local Supabase and are
+# deselected by default — the standard suite stays hermetic. Opt in with
+# `pytest -m integration` (after `supabase start`). They also self-skip
+# when the local stack isn't reachable.
+addopts = "--cov=app --cov-report=term-missing --no-cov-on-fail -m 'not integration'"
+markers = [
+  "integration: requires a live local Supabase stack (deselected by default)",
+]
