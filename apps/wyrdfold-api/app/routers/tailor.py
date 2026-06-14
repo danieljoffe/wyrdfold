@@ -206,7 +206,7 @@ async def create_tailored_resume(
 
     prefs_row = preferences.get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
-    contact = await resolve_contact(supabase, body.contact)
+    contact = await resolve_contact(supabase, user_id, body.contact)
 
     result = await run_tailor_pipeline(
         supabase,
@@ -279,7 +279,7 @@ async def create_tailored_cover_letter(
 
     prefs_row = preferences.get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
-    contact = await resolve_contact(supabase, body.contact)
+    contact = await resolve_contact(supabase, user_id, body.contact)
 
     result = await run_cover_letter_pipeline(
         supabase,
@@ -777,7 +777,7 @@ async def create_batch_resumes(
 
     prefs_row = preferences.get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
-    contact = await resolve_contact(supabase, body.contact)
+    contact = await resolve_contact(supabase, user_id, body.contact)
 
     batch = create_batch(
         supabase,
