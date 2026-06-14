@@ -1,11 +1,13 @@
 """User profile router — notification preferences + identity (contact) fields.
 
-All endpoints scope to the JWT subject. Read paths (GET) go through the
-per-request JWT-bound client (`get_user_supabase`), so Postgres RLS is the
-control: the `user_profiles`/`llm_costs` policies (`auth.uid() = user_id`)
-enforce isolation even if the explicit `.eq("user_id", ...)` filter were
-dropped (#79 Phase 2). Write paths (PATCH/POST) still use the service-role
-client and rely on the `.eq("user_id", ...)` filter until #79 Phase 3.
+All endpoints scope to the JWT subject. Both read (GET) and write
+(PATCH/POST) paths go through the per-request JWT-bound client
+(`get_user_supabase`), so Postgres RLS is the control: the
+`user_profiles`/`llm_costs` policies (`auth.uid() = user_id`) enforce
+isolation even if the explicit `.eq("user_id", ...)` filter were dropped.
+Writes are covered by the `user_profiles` `ALL` policy, which permits the
+INSERT-if-missing + UPDATE that `_get_or_create_profile` performs for the
+row owner (#79 Phases 2 reads / 3 writes).
 """
 
 import asyncio
@@ -19,7 +21,6 @@ from app.config import settings
 from app.dependencies import (
     get_current_user_email,
     get_current_user_id,
-    get_supabase,
     get_user_supabase,
     verify_supabase_jwt,
 )
@@ -147,7 +148,7 @@ async def update_notification_preferences(
     body: NotificationPreferencesUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> NotificationPreferences:
     if body.job_notifications_enabled is True and not _email_channel_available():
         raise HTTPException(
@@ -211,7 +212,7 @@ async def update_identity(
     body: IdentityFieldsUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> IdentityFields:
     profile = await _get_or_create_profile(
         supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email
@@ -271,7 +272,7 @@ async def update_resume_style(
     body: ResumeStyleSettingsUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> ResumeStyleSettings:
     profile = await _get_or_create_profile(
         supabase, user_id, _RESUME_STYLE_COLUMNS, seed_email=user_email
@@ -353,7 +354,7 @@ async def update_onboarding_step(
     body: OnboardingStepUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> OnboardingStatus:
     """Update the user's current onboarding step (and optionally path).
 
@@ -389,7 +390,7 @@ async def update_onboarding_step(
 async def complete_onboarding(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> OnboardingStatus:
     """Mark the user's onboarding as complete.
 
@@ -431,7 +432,7 @@ async def complete_onboarding(
 async def reset_onboarding(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
 ) -> OnboardingStatus:
     """Clear the user's onboarding completion + step state so the wizard
     treats them as fresh.
