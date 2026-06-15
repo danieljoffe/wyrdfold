@@ -24,7 +24,7 @@ from app.dependencies import (
     verify_api_key,
     verify_api_key_or_jwt,
 )
-from app.http_client import ResponseTooLargeError, get_with_size_cap
+from app.http_client import ResponseTooLargeError, UnsafeURLError, get_with_size_cap
 from app.models.diagnostics import TargetFunnelResponse
 from app.models.schemas import PollResult
 from app.models.targets import (
@@ -1102,12 +1102,20 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
     # pointing to a huge payload could OOM the API (the shared
     # client's 15s timeout doesn't help against fast CDNs).
     try:
-        resp, body_bytes = await get_with_size_cap(url)
+        # validate_host gates every redirect hop (not just the first/final
+        # URL) before connecting — closes the SSRF redirect gap (#110).
+        resp, body_bytes = await get_with_size_cap(
+            url, validate_host=assert_safe_host
+        )
         final_url = str(resp.url)
     except ResponseTooLargeError as exc:
         raise HTTPException(
             status_code=413,
             detail=f"JD page too large to fetch ({exc.size} bytes > {exc.limit}).",
+        ) from exc
+    except UnsafeURLError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Refusing to fetch JD URL after redirect: {exc}"
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail="Failed to fetch JD URL") from exc
