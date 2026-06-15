@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from typing import Any, cast
 
 import httpx
@@ -70,8 +71,56 @@ class ResponseTooLargeError(Exception):
         self.limit = limit
 
 
+class UnsafeURLError(Exception):
+    """Raised by ``get_with_size_cap`` when the initial URL or any redirect
+    hop fails the supplied ``validate_host`` check (an SSRF guard).
+
+    Distinct from ``httpx.HTTPError`` so callers can map it to a 4xx
+    ("refused for safety") rather than a generic fetch failure.
+    """
+
+
+# 3xx statuses that carry a ``Location`` we would otherwise auto-follow.
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+async def _read_body_capped(resp: httpx.Response, max_bytes: int) -> bytes:
+    """Stream ``resp``'s body, enforcing ``max_bytes``.
+
+    Pre-checks ``Content-Length`` when present (cheap fail-fast), then
+    enforces the cap against the actually-streamed byte count (catches
+    missing or lying ``Content-Length`` headers). Raises
+    ``ResponseTooLargeError`` if either trips.
+    """
+    advertised = resp.headers.get("content-length")
+    if advertised is not None and advertised.isdigit():
+        n = int(advertised)
+        if n > max_bytes:
+            raise ResponseTooLargeError(
+                f"Content-Length {n} exceeds cap {max_bytes}",
+                size=n,
+                limit=max_bytes,
+            )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise ResponseTooLargeError(
+                f"Streamed {total} bytes exceeds cap {max_bytes}",
+                size=total,
+                limit=max_bytes,
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def get_with_size_cap(
-    url: str, *, max_bytes: int = MAX_USER_FETCH_BYTES
+    url: str,
+    *,
+    max_bytes: int = MAX_USER_FETCH_BYTES,
+    validate_host: Callable[[str], None] | None = None,
+    max_redirects: int = 10,
 ) -> tuple[httpx.Response, bytes]:
     """GET ``url`` reading at most ``max_bytes`` of the body.
 
@@ -80,43 +129,56 @@ async def get_with_size_cap(
     OOM the API the way ``client.get()`` would — its default behavior
     is to buffer the entire body before returning.
 
-    Pre-checks ``Content-Length`` when the server provides it (cheap
-    fail-fast), then enforces the cap against the actually-streamed
-    byte count (catches missing or lying ``Content-Length`` headers).
+    SSRF (#110): when ``validate_host`` is given, redirects are followed
+    **manually** with ``follow_redirects=False`` and ``validate_host`` is
+    invoked against every hop's host *before* we connect — including each
+    redirect target. This closes the gap left by httpx's built-in redirect
+    following, which connects to an internal redirect target before any
+    post-fetch host check can run. ``validate_host`` should raise on a
+    disallowed host (e.g. ``app.services.validate.assert_safe_host``); the
+    raise is surfaced as ``UnsafeURLError``, and a redirect to a non-http(s)
+    scheme is rejected the same way. Without ``validate_host`` the behaviour
+    is unchanged: a single request, redirects handled by the shared client.
 
-    Raises ``ResponseTooLargeError`` if either check trips. Caller
-    should map to a 400 / 422. Network failures propagate as the
-    underlying ``httpx.HTTPError``.
+    Raises ``ResponseTooLargeError`` past the size cap, ``UnsafeURLError``
+    on a rejected host/scheme, and ``httpx.TooManyRedirects`` past
+    ``max_redirects``. Network failures propagate as ``httpx.HTTPError``.
 
-    Returns ``(response, body_bytes)``. The response object's
-    ``.text`` / ``.content`` will be empty because the stream was
-    consumed manually — use ``body_bytes`` (or decode it) for the
-    body. ``.status_code``, ``.url``, and ``.headers`` remain valid
-    after the stream context closes.
+    Returns ``(response, body_bytes)``; the response's ``.text`` /
+    ``.content`` are empty (stream consumed manually) — use ``body_bytes``.
+    ``.status_code``, ``.url``, and ``.headers`` remain valid.
     """
     client = get_http_client()
-    async with client.stream("GET", url) as resp:
-        advertised = resp.headers.get("content-length")
-        if advertised is not None and advertised.isdigit():
-            n = int(advertised)
-            if n > max_bytes:
-                raise ResponseTooLargeError(
-                    f"Content-Length {n} exceeds cap {max_bytes}",
-                    size=n,
-                    limit=max_bytes,
-                )
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.aiter_bytes():
-            total += len(chunk)
-            if total > max_bytes:
-                raise ResponseTooLargeError(
-                    f"Streamed {total} bytes exceeds cap {max_bytes}",
-                    size=total,
-                    limit=max_bytes,
-                )
-            chunks.append(chunk)
-        return resp, b"".join(chunks)
+
+    if validate_host is None:
+        # Back-compat path: no SSRF gating requested (e.g. fixed internal
+        # hosts). Single request; the shared client follows redirects.
+        async with client.stream("GET", url) as resp:
+            return resp, await _read_body_capped(resp, max_bytes)
+
+    current = httpx.URL(url)
+    for _ in range(max_redirects + 1):
+        # Gate each hop BEFORE connecting. With follow_redirects=False httpx
+        # connects only to ``current``, so validating current.host here
+        # covers redirect targets too — not just the first/final URL.
+        try:
+            validate_host(current.host or "")
+        except ValueError as exc:
+            raise UnsafeURLError(str(exc)) from exc
+        async with client.stream("GET", current, follow_redirects=False) as resp:
+            if resp.status_code in _REDIRECT_CODES and "location" in resp.headers:
+                current = current.join(resp.headers["location"])
+                if current.scheme not in ("http", "https"):
+                    raise UnsafeURLError(
+                        f"redirect to non-http(s) scheme: {current.scheme!r}"
+                    )
+                continue
+            return resp, await _read_body_capped(resp, max_bytes)
+
+    raise httpx.TooManyRedirects(
+        f"exceeded {max_redirects} redirects fetching {url}",
+        request=httpx.Request("GET", url),
+    )
 
 
 # ---- Retry helper ----------------------------------------------------------

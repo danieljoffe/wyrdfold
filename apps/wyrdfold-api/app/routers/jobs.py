@@ -22,6 +22,7 @@ from app.dependencies import (
 )
 from app.http_client import (
     ResponseTooLargeError,
+    UnsafeURLError,
     get_with_size_cap,
 )
 from app.models.schemas import (
@@ -1218,12 +1219,20 @@ async def add_manual_job(
     # whole body before returning. ``get_with_size_cap`` streams and
     # aborts past ``MAX_USER_FETCH_BYTES``.
     try:
-        resp, body_bytes = await get_with_size_cap(cleaned)
+        # validate_host gates every redirect hop (not just the first/final
+        # URL) before connecting — closes the SSRF redirect gap (#110).
+        resp, body_bytes = await get_with_size_cap(
+            cleaned, validate_host=assert_safe_host
+        )
         final_url = str(resp.url)
     except ResponseTooLargeError as exc:
         raise HTTPException(
             status_code=413,
             detail=f"Page too large to fetch ({exc.size} bytes > {exc.limit}).",
+        ) from exc
+    except UnsafeURLError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Redirect target rejected: {exc}"
         ) from exc
     except httpx.HTTPError:
         raise HTTPException(status_code=400, detail="Failed to fetch URL") from None
