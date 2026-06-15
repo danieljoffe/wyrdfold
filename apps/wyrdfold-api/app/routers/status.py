@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -123,15 +122,9 @@ async def update_status(
         }
     ).execute()
 
-    supabase.table("jobs").update(
-        {
-            "status": body.status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", posting_id).execute()
-
-    # Dual-write (#75 C1): mirror the per-user status into user_jobs. Reads
-    # still come off jobs.status until a later phase cuts over.
+    # Per-user pipeline state lives in user_jobs (#75 C3): this writer no
+    # longer touches the global jobs.status. The list/counts read per-user
+    # status from user_jobs and gate global liveness on jobs.archived_at.
     persistence.upsert_user_job(
         supabase, user_id=user_id, job_posting_id=posting_id, status=body.status
     )

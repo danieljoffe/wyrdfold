@@ -334,24 +334,17 @@ def upsert_user_job(
 def mark_job_resume_draft(
     supabase: Client, job_posting_id: str, *, user_id: str | None
 ) -> None:
-    """Advance a job posting to status='resume_draft'.
+    """Advance a job posting to status='resume_draft' for the caller.
 
     Called after a tailored resume is persisted (single, batch, or reuse
     clone). Idempotent — re-running with an already-draft job is a no-op
-    update. We unconditionally set the status because re-generation
-    supersedes any prior draft/approval.
+    upsert.
 
-    Dual-write (#75 C1): when ``user_id`` is known (JWT caller), also mirror
-    the status into the per-user ``user_jobs`` table. The api-key/cron paths
-    (``user_id=None``) skip the mirror — that's fine for C1, which keeps
-    ``jobs.status`` as the source of truth.
+    Per-user pipeline state lives in ``user_jobs`` (#75 C3): this no longer
+    touches the global ``jobs.status``. When ``user_id`` is known (JWT
+    caller) it mirrors the status into ``user_jobs``; the api-key/cron paths
+    (``user_id=None``) have no per-user pipeline, so they're a no-op.
     """
-    supabase.table("jobs").update(
-        {
-            "status": "resume_draft",
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", job_posting_id).execute()
     if user_id is not None:
         upsert_user_job(
             supabase,
