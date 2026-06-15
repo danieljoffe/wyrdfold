@@ -68,15 +68,10 @@ from app.services.workday import fetch_workday_jobs
 
 logger = logging.getLogger(__name__)
 
-# PostgREST encodes every id of an ``id=in.(...)`` filter into the request
-# URL (~38 chars per UUID). A source's job feed (and the upsert/score
-# id lists derived from it) can run into the thousands, building 100s of
-# KB of URL that PostgREST silently truncates / rejects. Chunk every such
-# large ``.in_()`` at 200 — the same sizing used by the jobs router
-# (``_IN_CHUNK_SIZE``), recency, and insights. The union of per-batch rows
-# equals the single-``.in_()`` result, so callers folding into dicts/lists
-# order-independently see identical output.
-_IN_CHUNK_SIZE = 200
+# Large id lists derived from a source's job feed (re-read of newly-inserted
+# rows, Stage 3 score lookups, stale-archive) never go through a request URL:
+# they ride in a ``p_ids`` jsonb body on a server-side RPC (#93), so there's
+# no PostgREST URL-length limit to chunk around.
 
 Fetcher = Callable[[str], Coroutine[Any, Any, list[StandardJob]]]
 
@@ -472,26 +467,25 @@ async def _batch_fetch_job_scores(
 
     Callers in the poller fan out Stage 3 over N rows; without this batch
     helper each call did its own ``.eq("id", jid).single()`` lookup — N
-    sequential queries to read scores that Stage 2 just wrote. One
-    ``.in_()`` lookup replaces all of them.
+    sequential queries to read scores that Stage 2 just wrote. One RPC
+    call replaces all of them.
 
     ``job_ids`` scales with a source's job feed (every upsertable row), so
-    the lookup is chunked at ``_IN_CHUNK_SIZE`` to stay under PostgREST's
-    request-URL limit. The result dict is the union of all batches —
-    identical to a single ``.in_()`` since callers read it by key.
+    they ride in the ``get_job_scores_by_ids`` RPC's ``p_ids`` jsonb body —
+    no id list in the request URL, no URL-length limit, one round-trip
+    (#93). The result dict is keyed by id, identical to the old ``.in_()``
+    read.
     """
     if not job_ids:
         return {}
+    resp = await asyncio.to_thread(
+        supabase.rpc("get_job_scores_by_ids", {"p_ids": job_ids}).execute
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
     out: dict[str, int] = {}
-    for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
-        chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        resp = await asyncio.to_thread(
-            supabase.table("jobs").select("id, score").in_("id", chunk).execute
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        for r in rows:
-            if r.get("id") is not None:
-                out[cast(str, r["id"])] = int(r.get("score") or 0)
+    for r in rows:
+        if r.get("id") is not None:
+            out[cast(str, r["id"])] = int(r.get("score") or 0)
     return out
 
 
@@ -511,19 +505,20 @@ async def _load_alert_rows(
     new_ids = [r["id"] for r in new_rows if r.get("id")]
     if not new_ids:
         return new_rows
-    # ``new_ids`` is every newly-inserted row this cycle and scales with a
-    # source's feed, so chunk the re-read at ``_IN_CHUNK_SIZE`` to stay
-    # under PostgREST's request-URL limit. The refreshed list is the union
-    # of all batches — alert dispatch iterates per-row, so chunk order
-    # doesn't change which alerts fire.
+    # The upsert's RETURNING rows can't be threaded through here: they carry
+    # the upsert-time ``score`` (column default 0) — the scoring stages write
+    # final scores to the DB afterwards without mutating those dicts — which
+    # is the exact staleness this re-read exists to fix. So we re-read the
+    # post-scoring state, but via the ``get_jobs_by_ids`` RPC: ``new_ids``
+    # scales with a source's feed and rides in the ``p_ids`` jsonb body
+    # instead of the request URL (no URL-length limit, one round-trip, #93).
+    # The RPC returns SETOF jobs — the same column shape the old
+    # ``select("*")`` returned, so alert dispatch reads identical rows.
     try:
-        refreshed: list[dict[str, Any]] = []
-        for i in range(0, len(new_ids), _IN_CHUNK_SIZE):
-            chunk = new_ids[i : i + _IN_CHUNK_SIZE]
-            resp = await asyncio.to_thread(
-                supabase.table("jobs").select("*").in_("id", chunk).execute
-            )
-            refreshed.extend(cast(list[dict[str, Any]], resp.data or []))
+        resp = await asyncio.to_thread(
+            supabase.rpc("get_jobs_by_ids", {"p_ids": new_ids}).execute
+        )
+        refreshed = cast(list[dict[str, Any]], resp.data or [])
         if refreshed:
             return refreshed
     except Exception:
@@ -1305,31 +1300,24 @@ async def _poll_one_source(
         if stale_ids:
             # Flag stale/delisted jobs globally-dead via archived_at (#75 C3
             # — global liveness, distinct from per-user jobs.status).
-            # ``stale_ids`` scales with a source's active-row count, so the
-            # UPDATE is applied per ``_IN_CHUNK_SIZE`` batch to keep the
-            # ``id=in.(...)`` filter under PostgREST's request-URL limit.
-            # One shared timestamp across all batches matches the single
-            # big-UPDATE semantics (every archived row gets the same value).
-            archive_ts = datetime.now(UTC).isoformat()
-            archive_payload = {
-                "archived_at": archive_ts,
-                "updated_at": archive_ts,
-            }
-            archive_tasks = [
-                asyncio.to_thread(
-                    execute_with_retry_sync,
-                    supabase.table("jobs")
-                    .update(archive_payload)
-                    .in_("id", stale_ids[i : i + _IN_CHUNK_SIZE])
-                    .execute,
-                    label=f"poll archive {company_name}",
-                )
-                for i in range(0, len(stale_ids), _IN_CHUNK_SIZE)
-            ]
+            # ``stale_ids`` scales with a source's active-row count, so they
+            # ride in the ``archive_jobs_by_ids`` RPC's ``p_ids`` jsonb body
+            # rather than an ``id=in.(...)`` URL filter — no URL-length limit,
+            # one set-based UPDATE instead of N chunks (#93). The RPC stamps a
+            # single ``now()`` across every id (matching the single big-UPDATE
+            # semantics: one shared timestamp for all archived rows) and writes
+            # the same ``archived_at`` + ``updated_at`` the chunked path wrote.
+            #
             # Both writes are idempotent (UPDATE with stable WHERE), so a
             # retry after a stream drop is safe.
             await asyncio.gather(
-                *archive_tasks,
+                asyncio.to_thread(
+                    execute_with_retry_sync,
+                    supabase.rpc(
+                        "archive_jobs_by_ids", {"p_ids": stale_ids}
+                    ).execute,
+                    label=f"poll archive {company_name}",
+                ),
                 asyncio.to_thread(
                     execute_with_retry_sync,
                     last_polled_query.execute,
