@@ -15,7 +15,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from postgrest.types import CountMethod
 from supabase import Client
 
 from app.models.diagnostics import (
@@ -55,79 +54,68 @@ def _bucketize(scores: list[int]) -> dict[str, int]:
     return out
 
 
-def _count(query: Any) -> int:
-    """``count='exact'`` returns it on the response, not in data."""
-    return int(getattr(query.execute(), "count", 0) or 0)
+def _fetch_score_rows(supabase: Client, target_id: str) -> list[dict[str, Any]]:
+    """One scan of ``scores`` for this target, serving both the stage
+    counts and the histogram.
+
+    Replaces the old 11 ``count='exact'`` queries (one per stage field)
+    plus a 12th full ``select score`` scan with a single fetch of the
+    four columns those derivations need: ``promising``, ``scoring_status``,
+    ``excluded`` (for the counts) and ``score`` (for the histogram).
+    """
+    resp = (
+        supabase.table("scores")
+        .select("promising, scoring_status, excluded, score")
+        .eq("target_id", target_id)
+        .execute()
+    )
+    return cast(list[dict[str, Any]], resp.data or [])
 
 
-def _stage_counts(supabase: Client, target_id: str) -> FunnelStageCounts:
-    base = supabase.table("scores").select("id", count=CountMethod.exact)
+def _stage_counts(rows: list[dict[str, Any]]) -> FunnelStageCounts:
+    """Derive every ``FunnelStageCounts`` field from the fetched rows.
 
-    scores_total = _count(base.eq("target_id", target_id).limit(1))
-    promising_true = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("promising", True)
-        .limit(1)
-    )
-    promising_false = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("promising", False)
-        .limit(1)
-    )
-    promising_null = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .is_("promising", "null")
-        .limit(1)
-    )
+    Byte-identical to the old per-count implementation: tri-state
+    ``promising`` (True / False / NULL→None), ``by_status`` restricted to
+    the three known statuses, ``graded`` = promising AND status != stage1,
+    ``stuck_in_stage1`` = promising AND status == stage1, ``complete`` =
+    ``by_status['complete']``.
+    """
+    scores_total = len(rows)
+    promising_true = 0
+    promising_false = 0
+    promising_null = 0
+    excluded_true = 0
+    excluded_false = 0
+    graded = 0
+    stuck_in_stage1 = 0
+    by_status: dict[str, int] = {"stage1": 0, "stage2": 0, "complete": 0}
 
-    by_status: dict[str, int] = {}
-    for status in ("stage1", "stage2", "complete"):
-        by_status[status] = _count(
-            supabase.table("scores")
-            .select("id", count=CountMethod.exact)
-            .eq("target_id", target_id)
-            .eq("scoring_status", status)
-            .limit(1)
-        )
+    for row in rows:
+        promising = row.get("promising")
+        status = row.get("scoring_status")
+        excluded = row.get("excluded")
 
-    excluded_true = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("excluded", True)
-        .limit(1)
-    )
-    excluded_false = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("excluded", False)
-        .limit(1)
-    )
+        if promising is True:
+            promising_true += 1
+        elif promising is False:
+            promising_false += 1
+        elif promising is None:
+            promising_null += 1
 
-    graded = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("promising", True)
-        .neq("scoring_status", "stage1")
-        .limit(1)
-    )
-    complete = by_status["complete"]
-    stuck_in_stage1 = _count(
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact)
-        .eq("target_id", target_id)
-        .eq("promising", True)
-        .eq("scoring_status", "stage1")
-        .limit(1)
-    )
+        if status in by_status:
+            by_status[status] += 1
+
+        if excluded is True:
+            excluded_true += 1
+        elif excluded is False:
+            excluded_false += 1
+
+        if promising is True:
+            if status == "stage1":
+                stuck_in_stage1 += 1
+            else:
+                graded += 1
 
     return FunnelStageCounts(
         scores_total=scores_total,
@@ -138,23 +126,22 @@ def _stage_counts(supabase: Client, target_id: str) -> FunnelStageCounts:
         excluded_true=excluded_true,
         excluded_false=excluded_false,
         graded=graded,
-        complete=complete,
+        complete=by_status["complete"],
         stuck_in_stage1=stuck_in_stage1,
     )
 
 
-def _histogram(
-    supabase: Client, target_id: str, floor: int
-) -> FunnelScoreBuckets:
-    resp = (
-        supabase.table("scores")
-        .select("score")
-        .eq("target_id", target_id)
-        .eq("excluded", False)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    scores = [int(r["score"]) for r in rows if r.get("score") is not None]
+def _histogram(rows: list[dict[str, Any]], floor: int) -> FunnelScoreBuckets:
+    """Histogram of not-excluded scores, computed from the shared rows.
+
+    Filters ``excluded == False`` in Python (matching the old
+    ``.eq("excluded", False)`` server-side filter) before bucketizing.
+    """
+    scores = [
+        int(r["score"])
+        for r in rows
+        if r.get("excluded") is False and r.get("score") is not None
+    ]
     above = sum(1 for s in scores if s >= floor)
     return FunnelScoreBuckets(
         buckets=_bucketize(scores),
@@ -168,7 +155,14 @@ def _histogram(
 def _user_context(
     supabase: Client, target_id: str
 ) -> list[FunnelUserContext]:
-    """One entry per user with an active link to this target."""
+    """One entry per user with an active link to this target.
+
+    Batched: the per-user ``user_profiles`` N+1 is collapsed into a
+    single ``.in_("user_id", ids)`` read mapped in Python, and the
+    target-scoped quota (identical for every user on this target) is
+    fetched once and reused — preserving the original ``user_targets``
+    row order.
+    """
     ut_resp = (
         supabase.table("user_targets")
         .select("user_id, is_active")
@@ -177,29 +171,43 @@ def _user_context(
     )
     user_rows = cast(list[dict[str, Any]], ut_resp.data or [])
 
-    out: list[FunnelUserContext] = []
+    # Collect user_ids first (deduped for the IN filter, order-preserving),
+    # then a single batched profile read mapped by user_id.
+    user_ids: list[str] = []
+    seen: set[str] = set()
     for row in user_rows:
-        user_id = row["user_id"]
+        uid = row["user_id"]
+        if uid not in seen:
+            seen.add(uid)
+            user_ids.append(uid)
+
+    floor_by_user: dict[str, Any] = {}
+    if user_ids:
         prof_resp = (
             supabase.table("user_profiles")
-            .select("list_min_score")
-            .eq("user_id", user_id)
-            .limit(1)
+            .select("user_id, list_min_score")
+            .in_("user_id", user_ids)
             .execute()
         )
         prof_rows = cast(list[dict[str, Any]], prof_resp.data or [])
-        list_min_score = (
-            prof_rows[0].get("list_min_score") if prof_rows else None
-        )
+        for prof in prof_rows:
+            floor_by_user[prof["user_id"]] = prof.get("list_min_score")
+
+    # Quota is target-scoped (independent of user), so the old loop's
+    # per-user call always returned the same value — fetch it once.
+    quota = phase2_quota_remaining(supabase, target_id) if user_rows else 0
+
+    out: list[FunnelUserContext] = []
+    for row in user_rows:
+        user_id = row["user_id"]
+        list_min_score = floor_by_user.get(user_id)
         out.append(
             FunnelUserContext(
                 user_id=user_id,
                 list_min_score=(
                     int(list_min_score) if list_min_score is not None else None
                 ),
-                phase2_quota_remaining=phase2_quota_remaining(
-                    supabase, target_id
-                ),
+                phase2_quota_remaining=quota,
             )
         )
     # No active users: still return the empty list so the operator sees
@@ -283,11 +291,13 @@ def compute_target_funnel(
         scoring_profile=target.scoring_profile.model_dump(),
     )
 
-    stages = _stage_counts(supabase, target_id)
+    # One scan of `scores` feeds both the stage counts and the histogram.
+    score_rows = _fetch_score_rows(supabase, target_id)
+    stages = _stage_counts(score_rows)
     # User context first — we need their floor for the histogram view.
     users = _user_context(supabase, target_id)
     floor = _default_floor_from_users(users)
-    histogram = _histogram(supabase, target_id, floor=floor)
+    histogram = _histogram(score_rows, floor=floor)
     sources = _sources(supabase)
 
     return TargetFunnelResponse(

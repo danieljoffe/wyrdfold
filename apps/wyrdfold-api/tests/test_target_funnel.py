@@ -15,7 +15,11 @@ from typing import Any
 
 import pytest
 
-from app.models.diagnostics import FunnelUserContext
+from app.models.diagnostics import (
+    FunnelScoreBuckets,
+    FunnelStageCounts,
+    FunnelUserContext,
+)
 from app.models.targets import (
     CategoryProfile,
     JobTarget,
@@ -25,7 +29,9 @@ from app.models.targets import (
 from app.services.diagnostics.funnel import (
     _bucketize,
     _default_floor_from_users,
+    _histogram,
     _hours_since,
+    _stage_counts,
     compute_target_funnel,
 )
 
@@ -83,6 +89,157 @@ def test_default_floor_no_floors_set_falls_to_zero() -> None:
     assert _default_floor_from_users(users) == 0
 
 
+# ---- Regression: single-fetch counts/histogram == old per-query ------
+
+
+def _reference_stage_counts(
+    rows: list[dict[str, Any]],
+) -> FunnelStageCounts:
+    """Reference impl mirroring the *old* 11 ``count='exact'`` queries.
+
+    Each clause below is exactly what the corresponding old SQL filter
+    returned (e.g. ``.eq("promising", True)`` → rows where promising is
+    True). If the batched ``_stage_counts`` ever diverges from this, the
+    assertion below fails — this is the byte-identity guard.
+    """
+    return FunnelStageCounts(
+        scores_total=len(rows),  # all rows for target_id
+        promising_true=sum(1 for r in rows if r.get("promising") is True),
+        promising_false=sum(1 for r in rows if r.get("promising") is False),
+        promising_null=sum(1 for r in rows if r.get("promising") is None),
+        by_status={
+            status: sum(
+                1 for r in rows if r.get("scoring_status") == status
+            )
+            for status in ("stage1", "stage2", "complete")
+        },
+        excluded_true=sum(1 for r in rows if r.get("excluded") is True),
+        excluded_false=sum(1 for r in rows if r.get("excluded") is False),
+        graded=sum(
+            1
+            for r in rows
+            if r.get("promising") is True
+            and r.get("scoring_status") != "stage1"
+        ),
+        complete=sum(
+            1 for r in rows if r.get("scoring_status") == "complete"
+        ),
+        stuck_in_stage1=sum(
+            1
+            for r in rows
+            if r.get("promising") is True
+            and r.get("scoring_status") == "stage1"
+        ),
+    )
+
+
+def _reference_histogram(
+    rows: list[dict[str, Any]], floor: int
+) -> FunnelScoreBuckets:
+    """Reference impl mirroring the old ``select score where excluded=false``
+    scan: only ``excluded = false`` rows reach the histogram (NULL and True
+    are dropped, matching SQL ``= false`` semantics)."""
+    scores = [
+        int(r["score"])
+        for r in rows
+        if r.get("excluded") is False and r.get("score") is not None
+    ]
+    return FunnelScoreBuckets(
+        buckets=_bucketize(scores),
+        total=len(scores),
+        max_score=max(scores) if scores else None,
+        floor=floor,
+        above_floor=sum(1 for s in scores if s >= floor),
+    )
+
+
+def _representative_score_rows() -> list[dict[str, Any]]:
+    """Mix of promising True/False/None × status stage1/stage2/complete ×
+    excluded True/False, plus a range of scores and a couple of edge rows
+    (unknown status, NULL score, NULL excluded)."""
+    rows: list[dict[str, Any]] = []
+    score = 0
+    for promising in (True, False, None):
+        for status in ("stage1", "stage2", "complete"):
+            for excluded in (True, False):
+                rows.append(
+                    {
+                        "promising": promising,
+                        "scoring_status": status,
+                        "excluded": excluded,
+                        "score": score % 101,
+                    }
+                )
+                score += 17
+    # Edge rows that the explicit loops must tolerate:
+    #  - a status outside the three known buckets (ignored by by_status)
+    #  - a NULL score (dropped from the histogram)
+    #  - a NULL excluded (dropped from the histogram, counted nowhere
+    #    in excluded_true/false)
+    rows.append(
+        {"promising": True, "scoring_status": "archived",
+         "excluded": False, "score": 88}
+    )
+    rows.append(
+        {"promising": True, "scoring_status": "complete",
+         "excluded": False, "score": None}
+    )
+    rows.append(
+        {"promising": True, "scoring_status": "complete",
+         "excluded": None, "score": 73}
+    )
+    return rows
+
+
+def test_stage_counts_match_reference_per_query_logic() -> None:
+    """The single-fetch ``_stage_counts`` is byte-identical to the old
+    per-``count('exact')`` derivation across a representative dataset."""
+    rows = _representative_score_rows()
+    assert _stage_counts(rows) == _reference_stage_counts(rows)
+
+
+def test_histogram_matches_reference_excluded_filter() -> None:
+    """The folded ``_histogram`` (computed from the shared rows) matches
+    the old ``select score where excluded=false`` scan, for several
+    floors including 0 and a mid-range cut."""
+    rows = _representative_score_rows()
+    for floor in (0, 40, 90, 101):
+        assert _histogram(rows, floor) == _reference_histogram(rows, floor)
+
+
+def test_stage_counts_hardcoded_expected_values() -> None:
+    """A small hand-counted dataset, asserting exact field values (not just
+    equality to the reference) so a bug in *both* impls can't pass."""
+    rows = [
+        {"promising": True, "scoring_status": "stage1",
+         "excluded": False, "score": 10},
+        {"promising": True, "scoring_status": "stage2",
+         "excluded": False, "score": 20},
+        {"promising": True, "scoring_status": "complete",
+         "excluded": True, "score": 30},
+        {"promising": False, "scoring_status": "stage1",
+         "excluded": False, "score": 40},
+        {"promising": None, "scoring_status": "stage1",
+         "excluded": True, "score": 50},
+        # status outside the known three — counted in total only.
+        {"promising": True, "scoring_status": "weird",
+         "excluded": False, "score": 60},
+    ]
+    counts = _stage_counts(rows)
+    assert counts.scores_total == 6
+    assert counts.promising_true == 4
+    assert counts.promising_false == 1
+    assert counts.promising_null == 1
+    assert counts.by_status == {"stage1": 3, "stage2": 1, "complete": 1}
+    assert counts.excluded_true == 2
+    assert counts.excluded_false == 4
+    # promising True AND status != stage1: stage2, complete, weird → 3.
+    assert counts.graded == 3
+    assert counts.complete == 1
+    # promising True AND status == stage1 → 1.
+    assert counts.stuck_in_stage1 == 1
+
+
 # ---- Fake Supabase for the end-to-end smoke test --------------------
 
 
@@ -131,6 +288,10 @@ class _FakeQuery:
 
     def is_(self, col: str, val: Any) -> _FakeQuery:
         self._filters.append(("is", col, val))
+        return self
+
+    def in_(self, col: str, vals: Any) -> _FakeQuery:
+        self._filters.append(("in", col, vals))
         return self
 
     def order(self, *_a: Any, **_kw: Any) -> _FakeQuery:
@@ -183,38 +344,30 @@ def _scripted_response(target: JobTarget) -> Any:
             )
 
         if table == "scores":
-            fmap = {f[1]: f[2] for f in filters}
-            # Histogram path returns rows of scores.
-            if count is None:
-                return SimpleNamespace(
-                    data=[{"score": s} for s in [45, 55, 65, 75, 85, 95]],
-                    count=None,
-                )
-            # Counts.
-            if fmap.get("scoring_status") == "stage1":
-                return SimpleNamespace(data=[], count=20)
-            if fmap.get("scoring_status") == "stage2":
-                return SimpleNamespace(data=[], count=5)
-            if fmap.get("scoring_status") == "complete":
-                return SimpleNamespace(data=[], count=2)
-            if fmap.get("promising") is True and fmap.get("scoring_status") == "stage1":
-                return SimpleNamespace(data=[], count=15)
-            if fmap.get("promising") is True and any(
-                f[0] == "neq" and f[1] == "scoring_status" for f in filters
-            ):
-                # graded = promising True AND status != stage1
-                return SimpleNamespace(data=[], count=7)
-            if fmap.get("promising") is True:
-                return SimpleNamespace(data=[], count=22)
-            if fmap.get("promising") is False:
-                return SimpleNamespace(data=[], count=3)
-            if any(f[0] == "is" and f[1] == "promising" for f in filters):
-                return SimpleNamespace(data=[], count=2)
-            if fmap.get("excluded") is True:
-                return SimpleNamespace(data=[], count=4)
-            if fmap.get("excluded") is False:
-                return SimpleNamespace(data=[], count=23)
-            return SimpleNamespace(data=[], count=27)
+            # Single batched fetch: every stage count + the histogram are
+            # derived in Python from these rows. The six not-excluded
+            # scored rows reproduce the histogram [45,55,65,75,85,95].
+            return SimpleNamespace(
+                data=[
+                    {"promising": True, "scoring_status": "complete",
+                     "excluded": False, "score": 95},
+                    {"promising": True, "scoring_status": "stage2",
+                     "excluded": False, "score": 85},
+                    {"promising": True, "scoring_status": "stage1",
+                     "excluded": False, "score": 75},
+                    {"promising": False, "scoring_status": "stage1",
+                     "excluded": False, "score": 65},
+                    {"promising": None, "scoring_status": "stage1",
+                     "excluded": False, "score": 55},
+                    {"promising": True, "scoring_status": "stage1",
+                     "excluded": False, "score": 45},
+                    # Excluded row — counts toward excluded_true but is
+                    # filtered out of the histogram.
+                    {"promising": True, "scoring_status": "complete",
+                     "excluded": True, "score": 99},
+                ],
+                count=None,
+            )
 
         if table == "user_targets":
             return SimpleNamespace(
@@ -223,7 +376,7 @@ def _scripted_response(target: JobTarget) -> Any:
 
         if table == "user_profiles":
             return SimpleNamespace(
-                data=[{"list_min_score": 60}], count=None
+                data=[{"user_id": "u-1", "list_min_score": 60}], count=None
             )
 
         if table == "sources":
