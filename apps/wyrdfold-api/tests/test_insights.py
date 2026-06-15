@@ -47,6 +47,11 @@ def _mock_supabase(tables: dict[str, list[dict]]) -> MagicMock:
         return tbl
 
     client.table.side_effect = table_side_effect
+    # This bare mock doesn't simulate any RPC; make every .rpc(...) raise so
+    # the compute functions exercise their client-side Python fallback (the
+    # path these legacy unit tests assert on). The faithful RPC behaviour is
+    # covered by the dedicated GROUP-BY regression suites below.
+    client.rpc.side_effect = Exception("rpc not simulated by _mock_supabase")
     return client
 
 
@@ -638,6 +643,9 @@ class TestComputeTargets:
         tbl.limit.return_value = tbl
         tbl.execute.return_value.data = []
         sb.table.return_value = tbl
+        # Force the client-side fallback so the scores query (which carries the
+        # excluded=False filter under test) is actually issued.
+        sb.rpc.side_effect = Exception("rpc not simulated")
 
         compute_targets(sb, since=None, target_ids={"t1"})
 
@@ -690,6 +698,504 @@ class TestComputeTargets:
         be = next(t for t in result.targets if t.target_label == "Backend")
         assert be.avg_score == 90.0
         assert be.interview_count == 1
+
+
+# ===========================================================================
+# #101 regression: GROUP BY RPC for compute_targets is byte-identical
+# ===========================================================================
+#
+# compute_targets' scoped path (the only one the /insights/targets router
+# takes) now derives its per-target metrics, score distribution, score trend
+# and unscored count from the `insights_targets_groupby` GROUP BY RPC instead
+# of fetching every posting + every user_jobs row + the scores set TWICE and
+# folding it in Python. These tests build a representative dataset, run a
+# FAITHFUL Supabase mock that simulates the RPC's SQL against the same seeded
+# rows the way Postgres would, and assert:
+#   1. the RPC-backed TargetInsights == an INDEPENDENT Python recompute of the
+#      OLD fetch+aggregate path (the byte-identity contract), and
+#   2. the RPC-backed output == the client-side fallback output (mid-deploy).
+# A dedicated case proves the AVERAGE is rounded in Python (banker's, half-to-
+# even) — diverging from Postgres round() (half-away-from-zero) — which is why
+# the RPC returns RAW SUM/COUNT and Python does the rounding.
+
+_APPLIED = {"applied", "interviewing", "offer"}
+_INTERVIEW = {"interviewing", "offer"}
+
+
+def _rpc_targets_groupby(seed: dict[str, list[dict]], params: dict) -> dict:
+    """Simulate the `insights_targets_groupby` SQL exactly: scores (non-
+    excluded, target in p_target_ids, job in window) is the membership; per-
+    target metrics + distribution + unscored are over rows whose target EXISTS
+    in `targets`; the trend's per-posting MAX uses the RAW membership (no
+    targets-existence filter). Returns RAW SUM/COUNT — no rounding."""
+    target_ids = set(params["p_target_ids"])
+    since = params["p_since"]
+    user_id = params["p_user_id"]
+    jobs_by_id = {j["id"]: j for j in seed.get("jobs", [])}
+    label_by_target = {t["id"]: t["label"] for t in seed.get("targets", [])}
+    uj_status = {
+        uj["job_posting_id"]: uj["status"]
+        for uj in seed.get("user_jobs", [])
+        if uj.get("user_id") == user_id
+    }
+
+    # member: raw (posting, target) membership in window (no targets join).
+    member: list[dict] = []
+    for s in seed.get("scores", []):
+        if s["target_id"] not in target_ids or s.get("excluded"):
+            continue
+        job = jobs_by_id.get(s["job_posting_id"])
+        if job is None:
+            continue
+        created = job.get("created_at")
+        if since is not None and not (created is not None and created >= since):
+            continue
+        member.append(
+            {
+                "posting_id": s["job_posting_id"],
+                "target_id": s["target_id"],
+                "score": int(s.get("score") or 0),
+                "created_at": created,
+            }
+        )
+
+    # base: target_labels-filtered, with status overlaid.
+    base = [
+        {**m, "status": uj_status.get(m["posting_id"], "new")}
+        for m in member
+        if m["target_id"] in label_by_target
+    ]
+
+    # per_target aggregates (raw).
+    pt: dict[str, dict] = {}
+    for r in base:
+        tid = r["target_id"]
+        agg = pt.setdefault(
+            tid,
+            {
+                "target_id": tid,
+                "label": label_by_target[tid],
+                "job_count": 0,
+                "score_sum": 0,
+                "score_n": 0,
+                "applied_count": 0,
+                "interview_count": 0,
+            },
+        )
+        agg["job_count"] += 1
+        agg["score_n"] += 1
+        agg["score_sum"] += r["score"]
+        if r["status"] in _APPLIED:
+            agg["applied_count"] += 1
+        if r["status"] in _INTERVIEW:
+            agg["interview_count"] += 1
+
+    # distribution (nonzero scores only, integer bucketing).
+    dist: dict[int, int] = {}
+    for r in base:
+        if r["score"] == 0:
+            continue
+        idx = min(max(0, min(r["score"], 100)) // 10, 9)
+        dist[idx] = dist.get(idx, 0) + 1
+
+    # unscored postings (target_labels-filtered): saw no nonzero score.
+    seen_nonzero: dict[str, bool] = {}
+    for r in base:
+        seen_nonzero[r["posting_id"]] = seen_nonzero.get(
+            r["posting_id"], False
+        ) or (r["score"] != 0)
+    unscored = sum(1 for v in seen_nonzero.values() if not v)
+
+    # trend: per posting best RAW-membership score; group by ISO week.
+    best_by_posting: dict[str, dict] = {}
+    for m in member:
+        b = best_by_posting.setdefault(
+            m["posting_id"], {"best": 0, "created_at": m["created_at"]}
+        )
+        b["best"] = max(b["best"], m["score"])
+    week_sum: dict[str, int] = {}
+    week_n: dict[str, int] = {}
+    for b in best_by_posting.values():
+        if b["best"] <= 0:
+            continue
+        # date_trunc('week', created_at)::date in the session tz == Python's
+        # _iso_week_start(_parse_dt(created_at)). The seed uses UTC timestamps.
+        d = datetime.fromisoformat(b["created_at"]).date()
+        week = (d - timedelta(days=d.weekday())).isoformat()
+        week_sum[week] = week_sum.get(week, 0) + b["best"]
+        week_n[week] = week_n.get(week, 0) + 1
+
+    return {
+        "targets": list(pt.values()),
+        "distribution": [
+            {"bucket_idx": k, "count": v} for k, v in dist.items()
+        ],
+        "trend": [
+            {"week_start": w, "score_sum": week_sum[w], "score_n": week_n[w]}
+            for w in week_sum
+        ],
+        "unscored": unscored,
+    }
+
+
+def _faithful_targets_supabase(seed: dict[str, list[dict]]) -> MagicMock:
+    """Mock that applies real filters per table AND answers the
+    insights_targets_groupby RPC by running its GROUP BY against the seed."""
+    client = MagicMock()
+    client.table.side_effect = lambda name: _FaithfulQuery(seed.get(name, []))
+
+    def rpc_side_effect(fn: str, params: dict) -> MagicMock:
+        assert fn == "insights_targets_groupby"
+        resp = MagicMock()
+        resp.data = _rpc_targets_groupby(seed, params)
+        call = MagicMock()
+        call.execute.return_value = resp
+        return call
+
+    client.rpc.side_effect = rpc_side_effect
+    return client
+
+
+def _reference_target_insights(
+    seed: dict[str, list[dict]],
+    *,
+    since,
+    target_ids: set[str],
+    user_id: str,
+):
+    """Independent re-implementation of the OLD scoped fetch+Python-aggregate
+    path in compute_targets — built fresh here so a regression in the
+    production code can't hide. Mirrors the pre-#101 logic line-for-line."""
+    from app.models.insights import (
+        ScoreBucket,
+        ScoreTrendPoint,
+        TargetComparison,
+        TargetInsights,
+    )
+
+    label_by_target = {
+        t["id"]: t["label"]
+        for t in seed.get("targets", [])
+        if t["id"] in target_ids
+    }
+    since_iso = since.isoformat() if since else None
+
+    # membership from non-excluded scores in target_ids (no window).
+    membership: dict[str, set[str]] = {}
+    score_lookup: dict[tuple[str, str], int] = {}
+    for s in seed.get("scores", []):
+        if s["target_id"] not in target_ids or s.get("excluded"):
+            continue
+        membership.setdefault(s["job_posting_id"], set()).add(s["target_id"])
+        score_lookup[(s["job_posting_id"], s["target_id"])] = int(
+            s.get("score") or 0
+        )
+    posting_ids = set(membership.keys())
+
+    # postings in window.
+    jobs_by_id = {j["id"]: j for j in seed.get("jobs", [])}
+    postings = []
+    for pid in posting_ids:
+        job = jobs_by_id.get(pid)
+        if job is None:
+            continue
+        created = job.get("created_at")
+        if since_iso is not None and not (
+            created is not None and created >= since_iso
+        ):
+            continue
+        postings.append(job)
+
+    uj_status = {
+        uj["job_posting_id"]: uj["status"]
+        for uj in seed.get("user_jobs", [])
+        if uj.get("user_id") == user_id
+    }
+    for p in postings:
+        p["status"] = uj_status.get(str(p["id"]), "new")
+
+    target_jobs: dict[str, list[tuple[dict, int]]] = {}
+    scored_values: list[int] = []
+    unscored_count = 0
+    for p in postings:
+        pid = str(p["id"])
+        tids = membership.get(pid, set())
+        seen_any_score = False
+        for tid in tids:
+            if tid not in label_by_target:
+                continue
+            score = score_lookup.get((pid, tid), 0)
+            if score:
+                seen_any_score = True
+                scored_values.append(score)
+                target_jobs.setdefault(tid, []).append((p, score))
+            else:
+                target_jobs.setdefault(tid, []).append((p, 0))
+        if not seen_any_score:
+            unscored_count += 1
+
+    comparisons = []
+    for tid, label in label_by_target.items():
+        rows = target_jobs.get(tid, [])
+        if not rows:
+            continue
+        scores = [s for _, s in rows]
+        statuses = [r["status"] for r, _ in rows]
+        applied = sum(1 for s in statuses if s in _APPLIED)
+        interviews = sum(1 for s in statuses if s in _INTERVIEW)
+        comparisons.append(
+            TargetComparison(
+                target_id=tid,
+                target_label=label,
+                job_count=len(rows),
+                avg_score=round(sum(scores) / len(scores), 1),
+                applied_count=applied,
+                interview_count=interviews,
+                conversion_rate=round(interviews / applied, 3)
+                if applied > 0
+                else None,
+            )
+        )
+
+    bucket_counts: Counter[str] = Counter()
+    for s in scored_values:
+        clamped = max(0, min(s, 100))
+        idx = min(clamped // 10, 9)
+        lo = idx * 10
+        hi = lo + 10 if lo < 90 else 100
+        bucket_counts[f"{lo}-{hi}"] += 1
+    buckets = [
+        ScoreBucket(
+            bucket=f"{lo}-{lo + 10 if lo < 90 else 100}",
+            count=bucket_counts.get(f"{lo}-{lo + 10 if lo < 90 else 100}", 0),
+        )
+        for lo in range(0, 100, 10)
+    ]
+
+    week_scores: dict[str, list[int]] = {}
+    for p in postings:
+        pid = str(p["id"])
+        tids = membership.get(pid, set())
+        best = max((score_lookup.get((pid, t), 0) for t in tids), default=0)
+        if best <= 0:
+            continue
+        d = datetime.fromisoformat(p["created_at"]).date()
+        week = d - timedelta(days=d.weekday())
+        week_scores.setdefault(week, []).append(best)
+    score_trend = sorted(
+        [
+            ScoreTrendPoint(week_start=w, avg_score=round(sum(ss) / len(ss), 1))
+            for w, ss in week_scores.items()
+        ],
+        key=lambda x: x.week_start,
+    )
+
+    return TargetInsights(
+        targets=comparisons,
+        score_distribution=buckets,
+        score_trend=score_trend,
+        unscored_count=unscored_count,
+    )
+
+
+class TestTargetsGroupByRpcByteIdentical:
+    def _seed(self) -> dict[str, list[dict]]:
+        # Representative dataset: 3 targets (one with no postings → dropped),
+        # postings across the bucket range and statuses, a posting scored vs
+        # BOTH targets (per-target rollup + best-of for trend), an excluded
+        # score (must not count), a posting outside the window, a posting whose
+        # only score is 0 (→ unscored, not the 0-10 bucket), and two postings
+        # in DIFFERENT weeks for the trend.
+        recent = _ts(_NOW)
+        last_week = _ts(_NOW - timedelta(days=8))
+        old = _ts(_NOW - timedelta(days=120))
+        jobs = [
+            {"id": "p1", "created_at": recent},   # t1 score 15
+            {"id": "p2", "created_at": recent},   # t1 score 85, applied
+            {"id": "p3", "created_at": recent},   # t2 score 90, interviewing
+            {"id": "p4", "created_at": recent},   # t1=40 t2=80 (best 80), offer
+            {"id": "p5", "created_at": recent},   # t1 score 0 → unscored
+            {"id": "p6", "created_at": last_week},  # t2 score 60, new
+            {"id": "p7", "created_at": old},      # out of window → dropped
+            {"id": "p8", "created_at": recent},   # only excluded score → drop
+        ]
+        scores = [
+            {"job_posting_id": "p1", "target_id": "t1", "score": 15, "excluded": False},
+            {"job_posting_id": "p2", "target_id": "t1", "score": 85, "excluded": False},
+            {"job_posting_id": "p3", "target_id": "t2", "score": 90, "excluded": False},
+            {"job_posting_id": "p4", "target_id": "t1", "score": 40, "excluded": False},
+            {"job_posting_id": "p4", "target_id": "t2", "score": 80, "excluded": False},
+            {"job_posting_id": "p5", "target_id": "t1", "score": 0, "excluded": False},
+            {"job_posting_id": "p6", "target_id": "t2", "score": 60, "excluded": False},
+            {"job_posting_id": "p7", "target_id": "t1", "score": 50, "excluded": False},
+            {"job_posting_id": "p8", "target_id": "t1", "score": 70, "excluded": True},
+        ]
+        targets = [
+            {"id": "t1", "label": "Frontend"},
+            {"id": "t2", "label": "Backend"},
+            {"id": "t3", "label": "DevOps"},  # no postings → dropped
+        ]
+        user_jobs = [
+            {"job_posting_id": "p2", "user_id": _USER, "status": "applied"},
+            {"job_posting_id": "p3", "user_id": _USER, "status": "interviewing"},
+            {"job_posting_id": "p4", "user_id": _USER, "status": "offer"},
+            # a different user's row must be ignored by the per-user join
+            {"job_posting_id": "p1", "user_id": "other", "status": "offer"},
+        ]
+        return {
+            "jobs": jobs,
+            "scores": scores,
+            "targets": targets,
+            "user_jobs": user_jobs,
+        }
+
+    def test_rpc_backed_matches_python_reference(self):
+        seed = self._seed()
+        since = _NOW - timedelta(days=30)
+        targets = {"t1", "t2", "t3"}
+
+        result = compute_targets(
+            _faithful_targets_supabase(seed),
+            since,
+            target_ids=targets,
+            user_id=_USER,
+        )
+        ref = _reference_target_insights(
+            seed, since=since, target_ids=targets, user_id=_USER
+        )
+
+        # Byte-identical to the independent Python recompute, field for field.
+        assert result == ref
+
+        # And hand-computed values, so the reference itself is pinned:
+        by_label = {t.target_label: t for t in result.targets}
+        assert set(by_label) == {"Frontend", "Backend"}  # DevOps dropped
+        # Frontend (t1): p1=15(new), p2=85(applied), p4=40(offer), p5=0(new).
+        #   job_count 4; avg = (15+85+40+0)/4 = 35.0; applied = p2,p4 = 2;
+        #   interview = p4 = 1; conversion = 1/2 = 0.5.
+        fe = by_label["Frontend"]
+        assert fe.job_count == 4
+        assert fe.avg_score == 35.0
+        assert fe.applied_count == 2
+        assert fe.interview_count == 1
+        assert fe.conversion_rate == 0.5
+        # Backend (t2): p3=90(interviewing), p4=80(offer), p6=60(new).
+        #   job_count 3; avg = (90+80+60)/3 = 76.666… → round(…,1)=76.7;
+        #   applied = p3,p4 = 2; interview = p3,p4 = 2; conversion = 2/2 = 1.0.
+        be = by_label["Backend"]
+        assert be.job_count == 3
+        assert be.avg_score == 76.7
+        assert be.applied_count == 2
+        assert be.interview_count == 2
+        assert be.conversion_rate == 1.0
+
+        # Distribution: nonzero scores 15,85,90,40,80,60 (p5's 0 excluded).
+        #   10-20:1 (15); 40-50:1 (40); 60-70:1 (60); 80-90:2 (85,80);
+        #   90-100:1 (90).
+        dist = {b.bucket: b.count for b in result.score_distribution}
+        assert dist["10-20"] == 1
+        assert dist["40-50"] == 1
+        assert dist["60-70"] == 1
+        assert dist["80-90"] == 2
+        assert dist["90-100"] == 1
+        assert dist["0-10"] == 0
+        assert sum(b.count for b in result.score_distribution) == 6
+
+        # unscored: p5 (only a 0 score) → 1.
+        assert result.unscored_count == 1
+
+        # Trend: per posting best score, by week.
+        #   recent week: p1=15, p2=85, p3=90, p4=max(40,80)=80, p5=0(skip)
+        #     → (15+85+90+80)/4 = 67.5; last week: p6=60 → 60.0.
+        trend = {p.week_start: p.avg_score for p in result.score_trend}
+        assert len(result.score_trend) == 2
+        assert sorted(trend.values()) == [60.0, 67.5]
+
+    def test_average_is_rounded_in_python_not_sql(self):
+        """The byte-identity linchpin: avg_score must use Python's banker's
+        round (half-to-even), NOT Postgres round() (half-away-from-zero). A
+        target whose avg lands EXACTLY on a tenths half-way value (0.25) proves
+        the RPC returns RAW sum/count and Python does the rounding:
+            Python round(0.25, 1) == 0.2  (2 is even)
+            Postgres round(0.25, 1) == 0.3 (half away from zero)
+        0.25 is exactly representable in binary, so this is a true half-way
+        case — if rounding had been pushed into SQL this would read 0.3."""
+        # t1: one posting scored 1 (nonzero) + three scored 0 → sum=1, n=4 →
+        # avg 0.25.
+        recent = _ts(_NOW)
+        seed = {
+            "jobs": [
+                {"id": "p1", "created_at": recent},
+                {"id": "p2", "created_at": recent},
+                {"id": "p3", "created_at": recent},
+                {"id": "p4", "created_at": recent},
+            ],
+            "scores": [
+                {"job_posting_id": "p1", "target_id": "t1", "score": 1, "excluded": False},
+                {"job_posting_id": "p2", "target_id": "t1", "score": 0, "excluded": False},
+                {"job_posting_id": "p3", "target_id": "t1", "score": 0, "excluded": False},
+                {"job_posting_id": "p4", "target_id": "t1", "score": 0, "excluded": False},
+            ],
+            "targets": [{"id": "t1", "label": "Frontend"}],
+            "user_jobs": [],
+        }
+        result = compute_targets(
+            _faithful_targets_supabase(seed),
+            since=None,
+            target_ids={"t1"},
+            user_id=_USER,
+        )
+        fe = next(t for t in result.targets if t.target_label == "Frontend")
+        assert fe.job_count == 4
+        # Banker's rounding → 0.2 (NOT 0.3 that Postgres round() would give).
+        assert fe.avg_score == 0.2
+        assert round(0.25, 1) == 0.2  # the Python semantics we rely on
+        # Confirm the divergence is real: half-away-from-zero would be 0.3.
+        from decimal import ROUND_HALF_UP, Decimal
+        assert Decimal("0.25").quantize(
+            Decimal("0.1"), rounding=ROUND_HALF_UP
+        ) == Decimal("0.3")
+
+    def test_rpc_equals_python_fallback(self):
+        """RPC-backed output == client-side fallback output (mid-deploy safety:
+        before the migration lands the RPC raises and the Python fallback must
+        produce the identical TargetInsights)."""
+        seed = self._seed()
+        since = _NOW - timedelta(days=30)
+        targets = {"t1", "t2", "t3"}
+
+        rpc_result = compute_targets(
+            _faithful_targets_supabase(seed),
+            since,
+            target_ids=targets,
+            user_id=_USER,
+        )
+
+        # Same faithful table behaviour, but the RPC raises (not deployed).
+        sb = _faithful_targets_supabase(seed)
+        sb.rpc.side_effect = Exception("function not found")
+        fallback_result = compute_targets(
+            sb, since, target_ids=targets, user_id=_USER
+        )
+
+        assert fallback_result == rpc_result
+
+    def test_rpc_path_uses_the_rpc_not_a_posting_scan(self):
+        """The RPC must actually be invoked for the scoped tally — proving the
+        ~11k posting / user_jobs / 2×scores scan is gone in the deployed path
+        (only the membership probe via the `scores` table remains)."""
+        seed = self._seed()
+        sb = _faithful_targets_supabase(seed)
+        compute_targets(
+            sb, _NOW - timedelta(days=30), target_ids={"t1", "t2"}, user_id=_USER
+        )
+        called = [c.args[0] for c in sb.rpc.call_args_list]
+        assert "insights_targets_groupby" in called
+        # The RPC path must NOT re-read jobs/user_jobs (only `targets` for
+        # labels and `scores` for the membership probe).
+        read_tables = [c.args[0] for c in sb.table.call_args_list]
+        assert "jobs" not in read_tables
+        assert "user_jobs" not in read_tables
 
 
 # ===========================================================================
@@ -970,6 +1476,9 @@ def _chunk_tracking_supabase(
         return tbl
 
     client.table.side_effect = table_side_effect
+    # Force the client-side fallback (this mock records table .in_() batches,
+    # not RPC calls) so the chunked posting-id queries are actually issued.
+    client.rpc.side_effect = Exception("rpc not simulated")
     return client
 
 
