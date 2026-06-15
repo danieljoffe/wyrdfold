@@ -76,7 +76,7 @@ router = APIRouter(
 
 _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, department, "
-    "absolute_url, score, score_breakdown, status, salary_text, "
+    "absolute_url, score, score_breakdown, salary_text, "
     "greenhouse_updated_at, first_seen_at, created_at"
 )
 
@@ -945,21 +945,40 @@ def list_jobs(
         return result
 
     # Operator path (api-key, no JWT): full table view, no target scoping.
+    # The operator/global view only distinguishes live vs archived; per-user
+    # statuses (saved/applied/…) don't apply without a user, so we derive a
+    # ``status`` of "archived"/"new" from ``archived_at`` for the response.
     query = supabase.table("jobs").select(
-        _JP_SELECT_COLS,
+        _JP_SELECT_COLS + ", archived_at",
         count=CountMethod.exact,
     )
     if min_score is not None:
         query = query.gte("score", min_score)
-    if status:
-        query = query.eq("status", status)
+    if status == "archived":
+        # Operators wanting an archive audit pass status='archived' to see
+        # globally-dead jobs.
+        query = query.not_.is_("archived_at", "null")
     else:
-        # Default: hide archived. Operators wanting an archive audit
-        # can pass status='archived' explicitly.
-        query = query.neq("status", "archived")
+        # Default (status is None or any per-user value, which the operator
+        # has no notion of): show only live jobs.
+        query = query.is_("archived_at", "null")
     if company:
         query = query.eq("company_name", company)
     query = _apply_title_search(query, search)
+
+    # Per-user status isn't sortable on the global view (column gone); fall
+    # back to a safe default if a caller asks to sort by it.
+    operator_sort = "created_at" if sort == "status" else sort
+
+    def _finalize_operator_rows(
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # Derive the response ``status`` from global liveness and drop the
+        # helper column so the response shape is unchanged.
+        for row in rows:
+            row["status"] = "archived" if row.get("archived_at") else "new"
+            row.pop("archived_at", None)
+        return rows
 
     has_location_filter = bool(exclude_terms or only_terms)
     if has_location_filter:
@@ -967,7 +986,7 @@ def list_jobs(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(sort, desc=not ascending)
+        query = query.order(operator_sort, desc=not ascending)
         resp = query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         filtered = _apply_location_filter(
@@ -976,18 +995,22 @@ def list_jobs(
             only_terms=only_terms,
         )
         operator_result: dict[str, Any] = {
-            "postings": filtered[offset : offset + page_size],
+            "postings": _finalize_operator_rows(
+                filtered[offset : offset + page_size]
+            ),
             "total": len(filtered),
             "page": page,
             "page_size": page_size,
         }
     else:
-        query = query.order(sort, desc=not ascending).range(
+        query = query.order(operator_sort, desc=not ascending).range(
             offset, offset + page_size - 1
         )
         resp = query.execute()
         operator_result = {
-            "postings": cast(list[dict[str, Any]], list(resp.data or [])),
+            "postings": _finalize_operator_rows(
+                cast(list[dict[str, Any]], list(resp.data or []))
+            ),
             "total": resp.count or 0,
             "page": page,
             "page_size": page_size,
@@ -1578,6 +1601,18 @@ async def get_job(
         row["score_breakdown"] = target_breakdown
     # Drop the helper target_id column we only fetched for ownership.
     row.pop("target_id", None)
+    # Overlay the per-user pipeline status (#75 C4: jobs.status was dropped).
+    # Postings the user never touched have no user_jobs row and read as 'new'.
+    uj_resp = (
+        supabase.table("user_jobs")
+        .select("status")
+        .eq("user_id", user_id)
+        .eq("job_posting_id", posting_id)
+        .limit(1)
+        .execute()
+    )
+    uj_rows = cast(list[dict[str, Any]], uj_resp.data or [])
+    row["status"] = cast(str, uj_rows[0]["status"]) if uj_rows else "new"
     return row
 
 

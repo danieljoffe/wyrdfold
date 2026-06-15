@@ -30,9 +30,13 @@ def _build_supabase(
     """Mock supabase chain for status + delete routes.
 
     Status uses ``_assert_user_owns_posting`` which:
-      1. ``table("jobs").select("status").eq("id", id).single().execute()``
+      1. ``table("jobs").select("id").eq("id", id).single().execute()``
       2. ``table("user_targets").select("target_id").eq("user_id", uid).execute()``
       3. ``table("scores").select("target_id").eq("job_posting_id", id).in_("target_id", [...]).limit(1).execute()``
+
+    ``update_status`` then reads the prior per-user status from
+    ``user_jobs`` (#75 C4: jobs.status was dropped):
+      ``table("user_jobs").select("status").eq("user_id", uid).eq("job_posting_id", id).limit(1).execute()``
 
     The old shape went via ``jobs.target_id`` directly; this version
     routes ownership through the ``scores`` table since the poller
@@ -43,15 +47,12 @@ def _build_supabase(
     Mock both.
     """
     sb = MagicMock()
-    # Status route returns ``{status}`` from the jobs query. Delete route
-    # still uses the legacy shape with ``jobs.target_id`` inline.
-    posting_status_only = (
-        # The status route only reads ``status`` off the row. Default to
-        # ``"new"`` when callers don't supply one (e.g. delete-path tests
-        # that don't care about status semantics).
-        {"status": posting_data.get("status", "new"), "id": "abc"}
-        if posting_data is not None
-        else None
+    # Status route's existence probe selects only ``id`` (#75 C4: jobs.status
+    # gone). The prior per-user status comes from user_jobs (below). Delete
+    # route still uses the legacy shape with ``jobs.target_id`` inline.
+    prior_status = posting_data.get("status", "new") if posting_data else "new"
+    posting_id_only = (
+        {"id": "abc"} if posting_data is not None else None
     )
     posting_with_target = (
         {**posting_data, "target_id": _TEST_TARGET_ID, "id": "abc"}
@@ -63,9 +64,9 @@ def _build_supabase(
         t = MagicMock()
         if name == "jobs":
             sel = t.select.return_value
-            # status.py uses .single().execute() — selects just ``status``
+            # status.py uses .single().execute() — selects just ``id``
             sel.eq.return_value.single.return_value.execute.return_value = _Resp(
-                posting_status_only
+                posting_id_only
             )
             # jobs.py delete/get use .limit(1).execute() — still selects target_id
             sel.eq.return_value.limit.return_value.execute.return_value = _Resp(
@@ -101,6 +102,11 @@ def _build_supabase(
         elif name == "status_log":
             t.insert.return_value.execute.return_value = _Resp(None)
         elif name == "user_jobs":
+            # Prior per-user status read (#75 C4):
+            # ``.select("status").eq(...).eq(...).limit(1).execute()``.
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
+                [{"status": prior_status}] if posting_data is not None else []
+            )
             # Dual-write target (#75 C1): upsert(...).execute().
             t.upsert.return_value.execute.return_value = _Resp(None)
         return t
@@ -162,7 +168,7 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
             t = MagicMock()
             if name == "jobs":
                 t.select.return_value.eq.return_value.single.return_value.execute.return_value = _Resp(
-                    {"status": "saved", "id": "abc"}
+                    {"id": "abc"}
                 )
                 t.update.return_value.eq.return_value.execute.return_value = _Resp(
                     None
@@ -183,6 +189,10 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
 
                 t.insert.side_effect = _insert
             elif name == "user_jobs":
+                # Prior per-user status read (#75 C4).
+                t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
+                    [{"status": "saved"}]
+                )
 
                 def _upsert(payload: Any, **kwargs: Any):
                     seen["user_jobs"] = payload

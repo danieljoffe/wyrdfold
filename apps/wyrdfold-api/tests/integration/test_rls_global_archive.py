@@ -56,7 +56,6 @@ def seeded_target_job(
                 "source_id": source_id,
                 "title": "Live Job",
                 "company_name": "Acme",
-                "status": "new",
                 # archived_at left NULL -> globally live.
             }
         ).execute()
