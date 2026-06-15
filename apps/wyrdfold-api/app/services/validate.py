@@ -241,6 +241,9 @@ def _verify_content(html: str) -> tuple[bool, list[str]]:
 
 _VALIDATE_TIMEOUT = 10.0
 _MAX_REDIRECTS = 10
+# 3xx statuses carrying a Location header; followed manually so each hop is
+# host-checked before we connect (see validate_job_url).
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 from pydantic import BaseModel  # noqa: E402
@@ -289,51 +292,85 @@ async def validate_job_url(url: str) -> ValidationResult:
     html = ""
 
     try:
-        async with httpx.AsyncClient(
-            timeout=_VALIDATE_TIMEOUT,
-            follow_redirects=True,
-            max_redirects=_MAX_REDIRECTS,
-        ) as client:
-            resp = await client.get(cleaned)
-
-            final_url = str(resp.url)
-
-            # Detect domain change via redirect
-            final_hostname = urlparse(final_url).hostname or ""
-            if registrable_domain(hostname) != registrable_domain(final_hostname):
-                warnings.append(
-                    f"redirect_domain_change:"
-                    f"{registrable_domain(hostname)}->"
-                    f"{registrable_domain(final_hostname)}"
-                )
-
-            # Layer 2 again: banned check post-redirect
-            if is_banned_domain(final_hostname):
-                return ValidationResult(
-                    is_valid=False,
-                    final_url=final_url,
-                    rejection_reason=(
-                        f"banned_domain_after_redirect:"
-                        f"{registrable_domain(final_hostname)}"
-                    ),
-                )
-
-            # SSRF re-check after redirects — catches Location: headers
-            # that point at metadata IPs even when the origin host was
-            # public.
-            try:
-                assert_safe_host(final_hostname)
-            except ValueError as exc:
-                return ValidationResult(
-                    is_valid=False,
-                    final_url=final_url,
-                    rejection_reason=f"unsafe_host_after_redirect:{exc}",
-                )
-
-            if resp.status_code != 200:
-                warnings.append(f"http_status:{resp.status_code}")
+        async with httpx.AsyncClient(timeout=_VALIDATE_TIMEOUT) as client:
+            # Follow redirects manually (follow_redirects=False) so every hop —
+            # including each redirect target — is SSRF/banned-checked BEFORE we
+            # connect to it. httpx's built-in following would open a connection
+            # to an internal redirect target before any post-fetch host check
+            # ran (the old gap: only the first + final URL were validated). (#110)
+            current = httpx.URL(cleaned)
+            resp: httpx.Response | None = None
+            for _ in range(_MAX_REDIRECTS + 1):
+                hop_host = current.host or ""
+                if is_banned_domain(hop_host):
+                    return ValidationResult(
+                        is_valid=False,
+                        final_url=str(current),
+                        rejection_reason=(
+                            f"banned_domain_after_redirect:"
+                            f"{registrable_domain(hop_host)}"
+                        ),
+                    )
+                try:
+                    assert_safe_host(hop_host)
+                except ValueError as exc:
+                    return ValidationResult(
+                        is_valid=False,
+                        final_url=str(current),
+                        rejection_reason=f"unsafe_host_after_redirect:{exc}",
+                    )
+                resp = await client.get(current, follow_redirects=False)
+                if resp.status_code in _REDIRECT_CODES and "location" in resp.headers:
+                    current = current.join(resp.headers["location"])
+                    if current.scheme not in ("http", "https"):
+                        return ValidationResult(
+                            is_valid=False,
+                            final_url=str(current),
+                            rejection_reason=f"unsafe_redirect_scheme:{current.scheme}",
+                        )
+                    continue
+                break
             else:
-                html = resp.text
+                warnings.append("too_many_redirects")
+                resp = None
+
+            if resp is not None:
+                final_url = str(resp.url)
+
+                # Detect domain change via redirect
+                final_hostname = urlparse(final_url).hostname or ""
+                if registrable_domain(hostname) != registrable_domain(final_hostname):
+                    warnings.append(
+                        f"redirect_domain_change:"
+                        f"{registrable_domain(hostname)}->"
+                        f"{registrable_domain(final_hostname)}"
+                    )
+
+                # Layer 2 again: banned check on the final host.
+                if is_banned_domain(final_hostname):
+                    return ValidationResult(
+                        is_valid=False,
+                        final_url=final_url,
+                        rejection_reason=(
+                            f"banned_domain_after_redirect:"
+                            f"{registrable_domain(final_hostname)}"
+                        ),
+                    )
+
+                # Defense-in-depth SSRF re-check on the final host.
+                try:
+                    assert_safe_host(final_hostname)
+                except ValueError as exc:
+                    return ValidationResult(
+                        is_valid=False,
+                        final_url=final_url,
+                        rejection_reason=f"unsafe_host_after_redirect:{exc}",
+                    )
+
+                if resp.status_code != 200:
+                    warnings.append(f"http_status:{resp.status_code}")
+                else:
+                    html = resp.text
 
     except httpx.TooManyRedirects:
         warnings.append("too_many_redirects")

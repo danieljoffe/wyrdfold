@@ -467,6 +467,38 @@ class TestValidateJobUrl:
         assert result.final_url == "https://example.com/jobs/canonical-123"
 
     @pytest.mark.asyncio
+    async def test_redirect_to_internal_host_blocked(self, monkeypatch):
+        """A redirect whose target resolves to an internal IP is rejected
+        per-hop, before we connect to it (#110)."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        def fake_resolve(host):
+            if host == "internal.evil":
+                return [ipaddress.ip_address("10.0.0.5")]
+            return [ipaddress.ip_address("1.1.1.1")]
+
+        monkeypatch.setattr(v, "_resolve_addresses", fake_resolve)
+
+        redirect = MagicMock(spec=httpx.Response)
+        redirect.status_code = 302
+        redirect.headers = {"location": "http://internal.evil/path"}
+        redirect.url = httpx.URL("https://legit-company.com/jobs/123")
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=redirect)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("app.services.validate.httpx.AsyncClient", return_value=mock_client):
+            result = await validate_job_url("https://legit-company.com/jobs/123")
+
+        assert result.is_valid is False
+        assert result.rejection_reason is not None
+        assert "unsafe_host_after_redirect" in result.rejection_reason
+
+    @pytest.mark.asyncio
     async def test_empty_url(self):
         result = await validate_job_url("")
         assert result.is_valid is False
