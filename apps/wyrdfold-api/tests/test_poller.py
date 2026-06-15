@@ -354,12 +354,27 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
         "sources": sources_table,
     }[name]
 
-    # #93: existing live, unengaged rows are fetched via the server-side
-    # NOT EXISTS anti-join RPC (``source_live_unengaged_jobs``) instead of a
-    # ``.table("jobs").select().eq().is_()`` query plus a ``user_jobs`` engaged
-    # fetch + client-side ``.not_.in_("id", …)``. The engaged set never leaves
-    # Postgres now, so there's no user_jobs round-trip to mock.
-    supabase.rpc.return_value.execute.return_value.data = existing_rows
+    # #93: both the existing-rows read and the stale-archive write are
+    # server-side RPCs now, so route ``supabase.rpc(name, ...)`` by name:
+    #   - ``source_live_unengaged_jobs`` (read): live, unengaged rows for the
+    #     source via a NOT EXISTS anti-join — replaces the old
+    #     ``.table("jobs").select().eq().is_()`` + ``user_jobs`` engaged fetch
+    #     + client-side ``.not_.in_("id", …)``. The engaged set never leaves
+    #     Postgres, so there's no user_jobs round-trip to mock.
+    #   - ``archive_jobs_by_ids`` (write): one set-based UPDATE stamping
+    #     archived_at/updated_at — replaces the chunked
+    #     ``.table("jobs").update().in_("id", chunk)``.
+    rpc_handles: dict[str, MagicMock] = {}
+
+    def _rpc(name: str, *_args: object, **_kwargs: object) -> MagicMock:
+        handle = rpc_handles.setdefault(name, MagicMock())
+        if name == "source_live_unengaged_jobs":
+            handle.execute.return_value.data = existing_rows
+        else:
+            handle.execute.return_value.data = []
+        return handle
+
+    supabase.rpc.side_effect = _rpc
     return supabase, jobs_table, sources_table
 
 
@@ -432,23 +447,26 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
     assert summary["archived"] == 1
-    update_payload = jobs_table.update.call_args.args[0]
-    # #75 C3: stale jobs are flagged globally-dead via archived_at, not the
-    # per-user jobs.status.
-    assert update_payload["archived_at"] is not None
-    assert "status" not in update_payload
-    jobs_table.update.return_value.in_.assert_called_once_with("id", ["job-1"])
+    # #75 C3 / #93: stale jobs are flagged globally-dead via the
+    # ``archive_jobs_by_ids`` RPC (ids in the jsonb body, archived_at stamped
+    # server-side), not a per-user jobs.status UPDATE.
+    jobs_table.update.assert_not_called()
+    archive_calls = [
+        c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"
+    ]
+    assert len(archive_calls) == 1
+    assert archive_calls[0].args[1] == {"p_ids": ["job-1"]}
 
 
 @pytest.mark.asyncio
-async def test_stale_archive_update_chunks_at_200(monkeypatch):
-    """A stale-archive set larger than one batch must apply the UPDATE per
-    200-id chunk (so the ``id=in.(...)`` filter never overflows the request
-    URL), covering every stale id exactly once with one shared timestamp."""
+async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
+    """A large stale-archive set is ONE ``archive_jobs_by_ids`` RPC carrying
+    every id in the jsonb body — no ``id=in.(...)`` URL filter to overflow,
+    no chunking — covering every stale id exactly once (#93). The RPC stamps
+    one shared archived_at server-side, so single-UPDATE semantics hold."""
     from app.services import poller as poller_mod
 
-    # 250 existing rows, all delisted (none appears in the live fetch) →
-    # 250 stale ids → 2 archive batches (200 + 50).
+    # 250 existing rows, all delisted (none appears in the live fetch).
     existing = [
         {
             "id": f"job-{i}",
@@ -482,15 +500,15 @@ async def test_stale_archive_update_chunks_at_200(monkeypatch):
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
     assert summary["archived"] == 250
-    # 250 stale ids → 2 batches of 200 + 50.
-    in_calls = jobs_table.update.return_value.in_.call_args_list
-    assert [len(c.args[1]) for c in in_calls] == [200, 50]
-    # Union of the per-batch id lists = every stale id, no duplicates.
-    archived_ids = [jid for c in in_calls for jid in c.args[1]]
+    # No client-side jobs UPDATE at all — the archive is the RPC.
+    jobs_table.update.assert_not_called()
+    archive_calls = [
+        c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"
+    ]
+    # Exactly one RPC carrying every stale id in the body, no duplicates.
+    assert len(archive_calls) == 1
+    archived_ids = archive_calls[0].args[1]["p_ids"]
     assert sorted(archived_ids) == sorted(r["id"] for r in existing)
-    # All batches share one archived_at timestamp (single-UPDATE semantics).
-    payloads = [c.args[0] for c in jobs_table.update.call_args_list]
-    assert len({p["archived_at"] for p in payloads}) == 1
 
 
 # ---- Phase 1 triage: known jobs are not re-triaged --------------------------
@@ -579,23 +597,21 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
 async def test_load_alert_rows_returns_post_scoring_state():
     """Regression: alerts dispatched with the upsert-time rows, where
     ``score`` is the column default 0 — so no alert ever cleared the
-    threshold. The refresh must return the DB rows written by scoring."""
+    threshold. The refresh must return the DB rows written by scoring,
+    re-read via the ``get_jobs_by_ids`` RPC (#93: ids in the jsonb body,
+    not the request URL)."""
     from app.services.poller import _load_alert_rows
 
     stale = [{"id": "job-1", "title": "T1", "score": 0}]
     refreshed_row = {"id": "job-1", "title": "T1", "score": 88}
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        refreshed_row
-    ]
+    supabase.rpc.return_value.execute.return_value.data = [refreshed_row]
 
     rows = await _load_alert_rows(supabase, stale)
 
     assert rows == [refreshed_row]
-    supabase.table.return_value.select.return_value.in_.assert_called_once_with(
-        "id", ["job-1"]
-    )
+    supabase.rpc.assert_called_once_with("get_jobs_by_ids", {"p_ids": ["job-1"]})
 
 
 @pytest.mark.asyncio
@@ -604,7 +620,7 @@ async def test_load_alert_rows_falls_back_to_stale_rows_on_error():
 
     stale = [{"id": "job-1", "score": 0}]
     supabase = MagicMock()
-    supabase.table.side_effect = RuntimeError("db down")
+    supabase.rpc.side_effect = RuntimeError("db down")
 
     rows = await _load_alert_rows(supabase, stale)
 
@@ -619,77 +635,54 @@ async def test_load_alert_rows_no_ids_short_circuits():
     rows = await _load_alert_rows(supabase, [{"title": "no id"}])
 
     assert rows == [{"title": "no id"}]
-    supabase.table.assert_not_called()
+    supabase.rpc.assert_not_called()
 
 
-# ---- IN-list chunking (#93): URL-truncation hardening -----------------------
-
-
-def _chunked_select_mock(rows_by_chunk: dict[str, list[dict]]) -> MagicMock:
-    """Supabase mock whose ``select().in_(col, chunk)`` returns the rows
-    keyed by the first id of ``chunk`` — lets a test assert one query per
-    batch and that the per-batch rows are concatenated/merged identically.
-    """
-    supabase = MagicMock()
-    select = supabase.table.return_value.select.return_value
-
-    def _in(_col: str, chunk: list[str]) -> MagicMock:
-        resp = MagicMock()
-        resp.execute.return_value.data = rows_by_chunk.get(chunk[0], [])
-        return resp
-
-    select.in_.side_effect = _in
-    return supabase, select
+# ---- id lists ride the RPC jsonb body, not the request URL (#93) ------------
 
 
 @pytest.mark.asyncio
-async def test_batch_fetch_job_scores_chunks_at_200() -> None:
-    """A >200-id score lookup issues one ``.in_()`` per 200-id batch and
-    merges the per-batch rows into one dict identical to a single query."""
-    from app.services.poller import _IN_CHUNK_SIZE, _batch_fetch_job_scores
+async def test_batch_fetch_job_scores_uses_rpc_body() -> None:
+    """A large score lookup is ONE ``get_job_scores_by_ids`` RPC with the
+    full id list in the jsonb body (no URL ``.in_()`` chunking), folded into
+    the same ``{id: score}`` dict the chunked read produced."""
+    from app.services.poller import _batch_fetch_job_scores
 
     job_ids = [f"job-{i}" for i in range(450)]
-    # Return one row per id, keyed by the chunk's first id.
-    rows_by_chunk = {
-        job_ids[start]: [
-            {"id": jid, "score": idx}
-            for idx, jid in enumerate(job_ids[start : start + _IN_CHUNK_SIZE])
-        ]
-        for start in range(0, len(job_ids), _IN_CHUNK_SIZE)
-    }
-    supabase, select = _chunked_select_mock(rows_by_chunk)
+    rpc_rows = [{"id": jid, "score": idx} for idx, jid in enumerate(job_ids)]
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute.return_value.data = rpc_rows
 
     scores = await _batch_fetch_job_scores(supabase, job_ids)
 
-    # 450 ids → ceil(450/200) = 3 batches.
-    assert select.in_.call_count == 3
-    assert [len(c.args[1]) for c in select.in_.call_args_list] == [200, 200, 50]
-    # Every id present, union identical to a single .in_() result.
+    supabase.rpc.assert_called_once_with(
+        "get_job_scores_by_ids", {"p_ids": job_ids}
+    )
+    # Every id keyed once, identical to the old single-query result.
     assert len(scores) == 450
     assert scores["job-0"] == 0
-    assert scores["job-449"] == 49
+    assert scores["job-449"] == 449
 
 
 @pytest.mark.asyncio
-async def test_load_alert_rows_chunks_at_200() -> None:
-    """A >200-row alert refresh issues one ``.in_()`` per 200-id batch and
-    concatenates the per-batch rows into one list."""
-    from app.services.poller import _IN_CHUNK_SIZE, _load_alert_rows
+async def test_load_alert_rows_uses_rpc_body() -> None:
+    """A large alert refresh is ONE ``get_jobs_by_ids`` RPC with the full id
+    list in the jsonb body (no URL ``.in_()`` chunking); the returned rows
+    pass through unchanged."""
+    from app.services.poller import _load_alert_rows
 
     new_rows = [{"id": f"job-{i}"} for i in range(450)]
     ids = [r["id"] for r in new_rows]
-    rows_by_chunk = {
-        ids[start]: [
-            {"id": jid, "score": 90} for jid in ids[start : start + _IN_CHUNK_SIZE]
-        ]
-        for start in range(0, len(ids), _IN_CHUNK_SIZE)
-    }
-    supabase, select = _chunked_select_mock(rows_by_chunk)
+    rpc_rows = [{"id": jid, "score": 90} for jid in ids]
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute.return_value.data = rpc_rows
 
     refreshed = await _load_alert_rows(supabase, new_rows)
 
-    assert select.in_.call_count == 3
-    assert len(refreshed) == 450
+    supabase.rpc.assert_called_once_with("get_jobs_by_ids", {"p_ids": ids})
+    assert refreshed == rpc_rows
     assert {r["id"] for r in refreshed} == set(ids)
 
 
@@ -847,6 +840,10 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
         "sources": sources_table,
         "user_targets": user_targets_table,
     }[name]
+    # #93: the legacy Stage 3 score pre-fetch (``_batch_fetch_job_scores``)
+    # is the ``get_job_scores_by_ids`` RPC now, not ``jobs.select().in_()``.
+    # Default it to an empty score set; tests override as needed.
+    supabase.rpc.return_value.execute.return_value.data = []
     return supabase, jobs_table, user_targets_table
 
 
@@ -914,10 +911,9 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
 
     supabase, jobs_table, user_targets = _make_targeted_poll_supabase()
     jobs_table.upsert.return_value.execute.return_value.data = [_upserted_row()]
-    # Legacy Stage 3's pre-fetch of stage-2 scores.
-    (
-        jobs_table.select.return_value.in_.return_value.execute.return_value.data
-    ) = []
+    # Legacy Stage 3's pre-fetch of stage-2 scores is the
+    # ``get_job_scores_by_ids`` RPC now (#93); the harness defaults it to an
+    # empty score set in ``_make_targeted_poll_supabase``.
     (
         user_targets.select.return_value.eq.return_value.in_.return_value
         .execute.return_value.data

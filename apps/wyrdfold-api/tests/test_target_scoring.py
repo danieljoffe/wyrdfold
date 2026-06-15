@@ -101,6 +101,10 @@ def _make_supabase_mock(
     supabase.table.return_value.select.return_value.range.return_value.execute.return_value.data = (
         select_data or []
     )
+    # #93: get_target_scores' explicit-id-list branch is the
+    # ``get_target_scores_by_ids`` RPC now (ids in the jsonb body, not the
+    # URL) instead of ``scores.select().eq().in_()``.
+    supabase.rpc.return_value.execute.return_value.data = select_data or []
     return supabase
 
 
@@ -390,36 +394,25 @@ def test_get_target_scores_empty_id_list_skips_query() -> None:
     supabase.table.assert_not_called()
 
 
-def test_get_target_scores_chunks_at_200() -> None:
-    """A >200-id score lookup issues one ``.in_()`` per 200-id batch and
-    merges the per-batch rows into one dict identical to a single query."""
-    from app.services.target_scoring import _IN_CHUNK_SIZE
-
+def test_get_target_scores_uses_rpc_body() -> None:
+    """A large id-list score lookup is ONE ``get_target_scores_by_ids`` RPC
+    carrying the target id + every job id in the jsonb body (no URL
+    ``.in_()`` chunking), folded into the same {job_id: score} dict (#93)."""
     job_ids = [f"job-{i}" for i in range(450)]
-    rows_by_chunk = {
-        job_ids[start]: [
-            _upserted_score_row(job_posting_id=jid)
-            for jid in job_ids[start : start + _IN_CHUNK_SIZE]
-        ]
-        for start in range(0, len(job_ids), _IN_CHUNK_SIZE)
-    }
+    rpc_rows = [_upserted_score_row(job_posting_id=jid) for jid in job_ids]
 
     supabase = MagicMock()
-    in_chain = supabase.table.return_value.select.return_value.eq.return_value.in_
-
-    def _in(_col: str, chunk: list[str]) -> MagicMock:
-        resp = MagicMock()
-        resp.execute.return_value.data = rows_by_chunk.get(chunk[0], [])
-        return resp
-
-    in_chain.side_effect = _in
+    supabase.rpc.return_value.execute.return_value.data = rpc_rows
 
     scores = get_target_scores(supabase, "target-1", job_ids)
 
-    # 450 ids → ceil(450/200) = 3 batches.
-    assert in_chain.call_count == 3
-    assert [len(c.args[1]) for c in in_chain.call_args_list] == [200, 200, 50]
-    # Union identical to a single .in_() result: every id keyed once.
+    supabase.rpc.assert_called_once_with(
+        "get_target_scores_by_ids",
+        {"p_target_id": "target-1", "p_ids": job_ids},
+    )
+    # No table-level read at all — the lookup is the RPC.
+    supabase.table.assert_not_called()
+    # Every id keyed once, identical to the old single-query result.
     assert len(scores) == 450
     assert set(scores.keys()) == set(job_ids)
 
