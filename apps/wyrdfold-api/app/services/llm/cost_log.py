@@ -189,22 +189,49 @@ def total_spend(
     return round(float(cast(Any, raw)), 6)
 
 
-def total_spend_all(
+def _total_spend_all_python(
     supabase: Client,
-    since: datetime | None = None,
+    since: datetime | None,
 ) -> float:
-    """Sum of ``cost_usd`` across ALL users over the window.
-
-    Powers the global LLM circuit breaker, which only ever asks for a
-    one-day window — so a client-side select+sum (same style as
-    ``_total_spend_python``) is plenty; no dedicated RPC needed.
-    """
+    """Fallback for ``total_spend_all`` when the RPC is unavailable (e.g.
+    mid-deploy before the migration lands). Selects every row in the window
+    and sums in Python — O(rows) on the wire."""
     query = supabase.table(TABLE).select("cost_usd")
     if since is not None:
         query = query.gte("created_at", since.isoformat())
     resp = query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return round(sum(float(r["cost_usd"]) for r in rows), 6)
+
+
+def total_spend_all(
+    supabase: Client,
+    since: datetime | None = None,
+) -> float:
+    """Sum of ``cost_usd`` across ALL users over the window.
+
+    Powers the global LLM circuit breaker, called once per poll cycle.
+    Tries the ``total_spend_all_since`` RPC first — Postgres returns a single
+    ``numeric`` regardless of the day's call volume, instead of transferring
+    every row. Falls back to a client-side select+sum if the RPC isn't
+    deployed yet, so the breaker never fails during a partial deploy
+    (mirrors ``total_spend``).
+    """
+    try:
+        resp = supabase.rpc(
+            "total_spend_all_since",
+            {"p_since": since.isoformat() if since is not None else None},
+        ).execute()
+    except Exception:
+        _log.debug(
+            "total_spend_all_since RPC unavailable, falling back to client-side sum"
+        )
+        return _total_spend_all_python(supabase, since)
+
+    raw = resp.data
+    if raw is None:
+        return 0.0
+    return round(float(cast(Any, raw)), 6)
 
 
 def _spend_by_purpose_python(
