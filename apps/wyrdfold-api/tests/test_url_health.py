@@ -218,87 +218,46 @@ def test_archive_with_data_drop_noop_on_empty() -> None:
 # ---- _select_due_jobs candidate selection ---------------------------------
 
 
-def test_select_due_jobs_gates_on_archived_at_and_engaged() -> None:
-    """#75 C3: candidates are gated on global liveness (archived_at IS NULL)
-    and the per-user saved/applied skip (exclude jobs ANY user engaged with,
-    i.e. has a user_jobs row with status != 'new')."""
+def test_select_due_jobs_calls_anti_join_rpc() -> None:
+    """#93: candidate selection is a server-side NOT EXISTS anti-join. The old
+    null-first + older-than-cutoff two-query merge (which also pulled the full
+    engaged-id set into Python for a `.not_.in_` exclusion) is replaced by a
+    single `due_url_health_jobs(cutoff, batch_size)` RPC. The global liveness
+    (archived_at IS NULL), engaged skip, NULL-first ordering and limit all live
+    in SQL now — here we assert the RPC is called with the right params."""
     from app.services.url_health import _select_due_jobs
 
     sb = MagicMock()
-
-    # Capture the candidate query so we can assert the filters applied.
-    captured: dict[str, Any] = {}
-
-    def table(name: str) -> Any:
-        if name == "user_jobs":
-            uj = MagicMock()
-            uj.select.return_value.neq.return_value.execute.return_value = (
-                MagicMock(data=[{"job_posting_id": "engaged-1"}])
-            )
-            return uj
-        # jobs candidate query — record the filter chain via a recording mock.
-        jobs = MagicMock()
-        sel = jobs.select.return_value
-
-        def is_(col: str, val: str) -> Any:
-            captured.setdefault("is_cols", []).append(col)
-            return sel
-
-        def not_in(col: str, ids: list[str]) -> Any:
-            captured["not_in"] = (col, ids)
-            return sel
-
-        sel.is_.side_effect = is_
-        sel.not_.in_.side_effect = not_in
-        sel.limit.return_value.execute.return_value = MagicMock(data=[])
-        sel.order.return_value.limit.return_value.execute.return_value = (
-            MagicMock(data=[])
-        )
-        return jobs
-
-    sb.table.side_effect = table
+    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
 
     _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
 
-    # archived_at IS NULL gate applied; engaged jobs excluded.
-    assert "archived_at" in captured["is_cols"]
-    assert captured["not_in"] == ("id", ["engaged-1"])
+    # No engaged-id fetch / no client-side NOT IN: the table() helper isn't
+    # touched at all for candidate selection now.
+    sb.table.assert_not_called()
+    # Exactly one anti-join RPC, batch_size passed through, cutoff supplied.
+    sb.rpc.assert_called_once()
+    name, params = sb.rpc.call_args.args
+    assert name == "due_url_health_jobs"
+    assert params["p_batch_size"] == 5
+    assert "p_cutoff" in params
 
 
-def test_select_due_jobs_skips_engaged_exclusion_when_none() -> None:
-    """No engaged jobs → no .not_.in_ exclusion (would otherwise filter
-    everything out on an empty set)."""
+def test_select_due_jobs_returns_rpc_rows_unchanged() -> None:
+    """Rows from the anti-join RPC flow through `_select_due_jobs` untouched,
+    in the same (id, absolute_url, url_check_failure_count) shape the rest of
+    url_health expects."""
     from app.services.url_health import _select_due_jobs
 
+    rows = [
+        {"id": "j1", "absolute_url": "https://x/1", "url_check_failure_count": 0},
+        {"id": "j2", "absolute_url": "https://x/2", "url_check_failure_count": 2},
+    ]
     sb = MagicMock()
-    captured: dict[str, Any] = {"not_in_called": False}
+    sb.rpc.return_value.execute.return_value = MagicMock(data=rows)
 
-    def table(name: str) -> Any:
-        if name == "user_jobs":
-            uj = MagicMock()
-            uj.select.return_value.neq.return_value.execute.return_value = (
-                MagicMock(data=[])
-            )
-            return uj
-        jobs = MagicMock()
-        sel = jobs.select.return_value
-        sel.is_.return_value = sel
-
-        def not_in(col: str, ids: list[str]) -> Any:
-            captured["not_in_called"] = True
-            return sel
-
-        sel.not_.in_.side_effect = not_in
-        sel.limit.return_value.execute.return_value = MagicMock(data=[])
-        sel.order.return_value.limit.return_value.execute.return_value = (
-            MagicMock(data=[])
-        )
-        return jobs
-
-    sb.table.side_effect = table
-
-    _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
-    assert captured["not_in_called"] is False
+    out = _select_due_jobs(sb, batch_size=10, age_threshold_hours=24)
+    assert out == rows
 
 
 # ---- run_url_health_check end-to-end --------------------------------------
@@ -307,7 +266,7 @@ def test_select_due_jobs_skips_engaged_exclusion_when_none() -> None:
 @pytest.mark.asyncio
 async def test_run_url_health_check_empty_input_returns_zero_summary() -> None:
     sb = MagicMock()
-    sb.table.return_value.select.return_value.not_.in_.return_value.is_.return_value.limit.return_value.execute.return_value = MagicMock(data=[])
+    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
     summary = await run_url_health_check(sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3)
     assert summary == {
         "checked": 0,
