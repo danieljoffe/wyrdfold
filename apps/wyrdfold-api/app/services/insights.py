@@ -521,6 +521,273 @@ def compute_pipeline(
 # ── Targets ──────────────────────────────────────────────────────────────────
 
 
+# Raw (un-rounded) per-target aggregates from the GROUP BY pass. Averages and
+# conversion rates are deliberately NOT rolled up here — they're rounded in
+# Python (see _assemble_target_insights) so Postgres' half-away-from-zero
+# round() can never diverge from Python's banker's round().
+#   per_target: target_id -> (job_count, score_sum, score_n, applied, interview)
+#   distribution: bucket_idx (0..9) -> count   (nonzero scores only)
+#   trend: list of (week_start, score_sum, score_n)  best-per-posting scores
+#   unscored: postings under the caller's targets that never saw a nonzero score
+_TargetAgg = tuple[int, int, int, int, int]
+
+
+class _TargetGroupBy:
+    __slots__ = ("distribution", "per_target", "trend", "unscored")
+
+    def __init__(
+        self,
+        per_target: dict[str, _TargetAgg],
+        distribution: dict[int, int],
+        trend: list[tuple[date, int, int]],
+        unscored: int,
+    ) -> None:
+        self.per_target = per_target
+        self.distribution = distribution
+        self.trend = trend
+        self.unscored = unscored
+
+
+def _targets_groupby_python(
+    supabase: Client,
+    since: datetime | None,
+    target_ids: set[str],
+    target_labels: dict[str, str],
+    membership: dict[str, set[str]],
+    posting_ids: set[str],
+    user_id: str | None,
+) -> _TargetGroupBy:
+    """Client-side fallback for ``_targets_groupby`` (mid-deploy, before the
+    ``insights_targets_groupby`` migration lands — mirrors
+    ``_pipeline_status_counts_python``).
+
+    Reproduces the OLD scoped fetch+aggregate exactly: postings under the
+    caller's targets within the window, with per-target scores from the
+    ``scores`` table and the per-user status overlaid from ``user_jobs``. It
+    returns the SAME raw aggregates the RPC returns so both feed
+    ``_assemble_target_insights`` — guaranteeing the RPC and fallback produce
+    byte-identical output (the rounding all happens downstream, in Python)."""
+    # Postings within the window, hydrated with created_at + per-user status.
+    def _postings_base() -> Any:
+        q = supabase.table("jobs").select("id, created_at")
+        if since:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    if posting_ids:
+        # Chunk the id filter so the PostgREST URL stays under safe limits
+        # at multi-thousand-posting scale (#93).
+        postings = _fetch_in_chunks(
+            lambda batch: _postings_base().in_("id", batch),
+            list(posting_ids),
+            label="insights/targets_postings",
+        )
+    else:
+        postings = []
+    status_map = _user_status_map(
+        supabase, user_id, [str(p["id"]) for p in postings]
+    )
+    for p in postings:
+        p["status"] = status_map.get(str(p["id"]), "new")
+
+    # Per-target score lookup: ``(posting_id, target_id) → score``.
+    score_lookup: dict[tuple[str, str], int] = {}
+    if posting_ids:
+        def _scores_base() -> Any:
+            return (
+                supabase.table("scores")
+                .select("job_posting_id, target_id, score")
+                .eq("excluded", False)
+                .in_("target_id", list(target_ids))
+            )
+
+        # Chunk the job_posting_id filter so the PostgREST URL stays under
+        # safe limits at multi-thousand-posting scale (#93).
+        score_rows = _fetch_in_chunks(
+            lambda batch: _scores_base().in_("job_posting_id", batch),
+            list(posting_ids),
+            label="insights/targets_scores",
+        )
+        for r in score_rows:
+            score_lookup[(r["job_posting_id"], r["target_id"])] = int(
+                r.get("score") or 0
+            )
+
+    # --- Per-target aggregation (target_labels-filtered) ---
+    target_sum: defaultdict[str, int] = defaultdict(int)
+    target_n: Counter[str] = Counter()
+    target_applied: Counter[str] = Counter()
+    target_interview: Counter[str] = Counter()
+    distribution: Counter[int] = Counter()
+    unscored = 0
+    for p in postings:
+        pid = str(p["id"])
+        status = p["status"]
+        tids = membership.get(pid, set())
+        seen_any_score = False
+        for tid in tids:
+            if tid not in target_labels:
+                continue
+            score = score_lookup.get((pid, tid), 0)
+            target_n[tid] += 1
+            target_sum[tid] += score
+            if status in APPLIED_STATUSES:
+                target_applied[tid] += 1
+            if status in {"interviewing", "offer"}:
+                target_interview[tid] += 1
+            if score:
+                seen_any_score = True
+                clamped = max(0, min(score, 100))
+                distribution[min(clamped // 10, 9)] += 1
+        if not seen_any_score:
+            unscored += 1
+
+    per_target: dict[str, _TargetAgg] = {
+        tid: (
+            target_n[tid],
+            target_sum[tid],
+            target_n[tid],
+            target_applied[tid],
+            target_interview[tid],
+        )
+        for tid in target_n
+    }
+
+    # --- Score trend (raw membership, best per posting) ---
+    week_sum: defaultdict[date, int] = defaultdict(int)
+    week_n: Counter[date] = Counter()
+    for p in postings:
+        pid = str(p["id"])
+        tids = membership.get(pid, set())
+        best = max((score_lookup.get((pid, t), 0) for t in tids), default=0)
+        if best <= 0:
+            continue
+        w = _iso_week_start(_parse_dt(p["created_at"]))
+        week_sum[w] += best
+        week_n[w] += 1
+    trend = [(w, week_sum[w], week_n[w]) for w in week_sum]
+
+    return _TargetGroupBy(per_target, dict(distribution), trend, unscored)
+
+
+def _targets_groupby(
+    supabase: Client,
+    since: datetime | None,
+    target_ids: set[str],
+    target_labels: dict[str, str],
+    membership: dict[str, set[str]],
+    posting_ids: set[str],
+    user_id: str | None,
+) -> _TargetGroupBy:
+    """Per-target metrics + score distribution + score trend + unscored count
+    for the caller's targets in the window, computed by the
+    ``insights_targets_groupby`` GROUP BY RPC so the ~11k posting / ~11k
+    user_jobs / ~11k×2 scores rows never leave Postgres (#101).
+
+    Returns RAW aggregates (counts + SUM/COUNT, no rounding) — the byte-
+    identity contract: Postgres ``round()`` is half-away-from-zero while
+    Python ``round()`` is banker's, so all rounding stays in
+    ``_assemble_target_insights``. Falls back to the client-side aggregate
+    when the RPC isn't deployed yet (mirrors ``_pipeline_status_counts``)."""
+    try:
+        resp = execute_with_retry_sync(
+            lambda: supabase.rpc(
+                "insights_targets_groupby",
+                {
+                    "p_target_ids": sorted(target_ids),
+                    "p_since": since.isoformat() if since else None,
+                    "p_user_id": user_id,
+                },
+            ).execute(),
+            label="insights/targets_groupby",
+        )
+    except Exception:
+        return _targets_groupby_python(
+            supabase, since, target_ids, target_labels, membership,
+            posting_ids, user_id,
+        )
+
+    payload = cast(dict[str, Any], resp.data or {})
+    per_target: dict[str, _TargetAgg] = {}
+    for row in cast(list[Row], payload.get("targets") or []):
+        per_target[str(row["target_id"])] = (
+            int(row["job_count"]),
+            int(row["score_sum"]),
+            int(row["score_n"]),
+            int(row["applied_count"]),
+            int(row["interview_count"]),
+        )
+    distribution: dict[int, int] = {
+        int(row["bucket_idx"]): int(row["count"])
+        for row in cast(list[Row], payload.get("distribution") or [])
+    }
+    trend: list[tuple[date, int, int]] = [
+        (
+            date.fromisoformat(cast(str, row["week_start"])),
+            int(row["score_sum"]),
+            int(row["score_n"]),
+        )
+        for row in cast(list[Row], payload.get("trend") or [])
+    ]
+    unscored = int(payload.get("unscored") or 0)
+    return _TargetGroupBy(per_target, distribution, trend, unscored)
+
+
+def _assemble_target_insights(
+    target_labels: dict[str, str], agg: _TargetGroupBy
+) -> TargetInsights:
+    """Build the ``TargetInsights`` response from the raw GROUP BY aggregates.
+
+    This is the ONLY place rounding happens — keeping it in Python (banker's
+    round) preserves byte-identity with the pre-#101 implementation regardless
+    of whether *agg* came from the RPC or the client-side fallback. The
+    comparison list is emitted in ``target_labels`` fetch order (skipping
+    targets with no rows in the window), exactly like the old
+    ``for tid, label in target_labels.items()`` loop."""
+    comparisons: list[TargetComparison] = []
+    for tid, label in target_labels.items():
+        row = agg.per_target.get(tid)
+        if row is None:
+            continue
+        job_count, score_sum, score_n, applied, interviews = row
+        comparisons.append(
+            TargetComparison(
+                target_id=tid,
+                target_label=label,
+                job_count=job_count,
+                avg_score=round(score_sum / score_n, 1),
+                applied_count=applied,
+                interview_count=interviews,
+                conversion_rate=round(interviews / applied, 3)
+                if applied > 0
+                else None,
+            )
+        )
+
+    buckets = [
+        ScoreBucket(
+            bucket=f"{lo}-{lo + 10 if lo < 90 else 100}",
+            count=agg.distribution.get(lo // 10, 0),
+        )
+        for lo in range(0, 100, 10)
+    ]
+
+    score_trend = sorted(
+        [
+            ScoreTrendPoint(week_start=w, avg_score=round(s / n, 1))
+            for w, s, n in agg.trend
+        ],
+        key=lambda x: x.week_start,
+    )
+
+    return TargetInsights(
+        targets=comparisons,
+        score_distribution=buckets,
+        score_trend=score_trend,
+        unscored_count=agg.unscored,
+    )
+
+
 def compute_targets(
     supabase: Client,
     since: datetime | None,
@@ -557,71 +824,44 @@ def compute_targets(
             unscored_count=0,
         )
 
-    # Fetch postings within the user's target set, hydrating with
-    # created_at; per-target scores come from the ``scores`` table
-    # (jobs.score is the global blended score, not the per-target one).
-    # ``jobs.status`` was dropped in #75 C4 — the per-user status is
-    # overlaid from ``user_jobs`` below. In the unscoped / admin path
-    # (``target_ids=None``) we also need the legacy inline ``target_id`` +
-    # ``score`` columns so callers that didn't pass per-user scoping still
-    # get a meaningful answer.
-    select_cols = (
-        "id, created_at"
-        if target_ids is not None
-        else "id, target_id, score, created_at"
-    )
+    # --- Scoped path (the only path the /insights/targets router takes) ---
+    # The per-target metrics + score distribution + score trend + unscored
+    # count are computed in one server-side GROUP BY pass (#101) — the ~11k
+    # posting / ~11k user_jobs / two ~11k scores reads never leave Postgres.
+    # The RPC returns RAW aggregates; all rounding stays in Python (banker's
+    # vs Postgres half-away-from-zero) so the output is byte-identical.
+    if target_ids is not None:
+        # membership / posting_ids are non-None here (target_ids is not None
+        # and the empty case returned above).
+        agg = _targets_groupby(
+            supabase,
+            since,
+            target_ids,
+            target_labels,
+            membership or {},
+            posting_ids or set(),
+            user_id,
+        )
+        return _assemble_target_insights(target_labels, agg)
 
+    # --- Global / admin path (target_ids is None — tests only) ---
+    # Read the legacy inline ``target_id`` + ``score`` columns straight off
+    # the postings row (``jobs.target_id`` is vestigial / NULL in production,
+    # so this path mainly surfaces the unscored count + score distribution
+    # from the inline ``score`` column). This path stays in Python — it's the
+    # unbounded admin view, not the per-user hot path the RPC optimizes.
     def _postings_base() -> Any:
-        q = supabase.table("jobs").select(select_cols)
+        q = supabase.table("jobs").select("id, target_id, score, created_at")
         if since:
             q = q.gte("created_at", since.isoformat())
         return q
 
-    if posting_ids is not None:
-        # Chunk the id filter so the PostgREST URL stays under safe limits
-        # at multi-thousand-posting scale (#93).
-        postings = _fetch_in_chunks(
-            lambda batch: _postings_base().in_("id", batch),
-            list(posting_ids),
-            label="insights/targets_postings",
-        )
-    else:
-        postings = _rows(_postings_base(), label="insights/targets_postings")
+    postings = _rows(_postings_base(), label="insights/targets_postings")
     status_map = _user_status_map(
         supabase, user_id, [str(p["id"]) for p in postings]
     )
     for p in postings:
         p["status"] = status_map.get(str(p["id"]), "new")
-
-    # Per-target score lookup: ``(posting_id, target_id) → score``. Fetched
-    # once so the aggregation below stays O(n) over postings x their
-    # targets without repeated table queries.
-    score_lookup: dict[tuple[str, str], int] = {}
-    if posting_ids:
-        def _scores_base() -> Any:
-            sq = (
-                supabase.table("scores")
-                .select("job_posting_id, target_id, score")
-                .eq("excluded", False)
-            )
-            if target_ids is not None:
-                # target_ids is bounded by the user's target count (a
-                # handful), so it stays a single filter; only the large
-                # job_posting_id dimension is chunked below.
-                sq = sq.in_("target_id", list(target_ids))
-            return sq
-
-        # Chunk the job_posting_id filter so the PostgREST URL stays under
-        # safe limits at multi-thousand-posting scale (#93).
-        score_rows = _fetch_in_chunks(
-            lambda batch: _scores_base().in_("job_posting_id", batch),
-            list(posting_ids),
-            label="insights/targets_scores",
-        )
-        for r in score_rows:
-            score_lookup[(r["job_posting_id"], r["target_id"])] = int(
-                r.get("score") or 0
-            )
 
     # --- Per-target aggregation ---
     # Targets with no jobs in the window are dropped from the response
@@ -634,45 +874,16 @@ def compute_targets(
     scored_values: list[int] = []
     unscored_count = 0
     for p in postings:
-        pid = str(p["id"])
-        if target_ids is None:
-            # Admin / global path — historically the only path. Read
-            # ``target_id`` and ``score`` straight off the posting row.
-            # ``jobs.target_id`` is NULL in production today (vestigial
-            # column) so this path mainly surfaces the unscored count
-            # + score distribution from the inline ``score`` column.
-            inline_score = p.get("score")
-            if inline_score is None or inline_score == 0:
-                unscored_count += 1
-            else:
-                scored_values.append(int(inline_score))
-            inline_tid = p.get("target_id")
-            if inline_tid and inline_tid in target_labels:
-                target_jobs[inline_tid].append((p, int(inline_score or 0)))
-            continue
-
-        tids = (membership.get(pid, set()) if membership else set()) or set()
-        if not tids:
-            # Posting outside the user's target set — skip (shouldn't
-            # happen because we filtered postings by posting_ids above,
-            # but defensive).
-            continue
-        # A posting can be scored against multiple targets; surface the
-        # best per-target score in that target's distribution rather
-        # than collapsing across targets.
-        seen_any_score = False
-        for tid in tids:
-            if tid not in target_labels:
-                continue
-            score = score_lookup.get((pid, tid), 0)
-            if score:
-                seen_any_score = True
-                scored_values.append(score)
-                target_jobs[tid].append((p, score))
-            else:
-                target_jobs[tid].append((p, 0))
-        if not seen_any_score:
+        # Admin / global path — read ``target_id`` and ``score`` straight off
+        # the posting row.
+        inline_score = p.get("score")
+        if inline_score is None or inline_score == 0:
             unscored_count += 1
+        else:
+            scored_values.append(int(inline_score))
+        inline_tid = p.get("target_id")
+        if inline_tid and inline_tid in target_labels:
+            target_jobs[inline_tid].append((p, int(inline_score or 0)))
 
     comparisons: list[TargetComparison] = []
     for tid, label in target_labels.items():
@@ -715,27 +926,15 @@ def compute_targets(
     ]
 
     # --- Score trend by week (scored postings only) ---
-    # Per-user path: use the highest per-target score across the user's
-    # targets so a posting that's a great fit for one target and a
-    # poor fit for another contributes its strength signal. Global
-    # path: fall back to the inline ``jobs.score`` column.
+    # Global path: fall back to the inline ``jobs.score`` column.
     week_scores: defaultdict[date, list[int]] = defaultdict(list)
     for p in postings:
-        pid = str(p["id"])
-        if target_ids is None:
-            inline = p.get("score")
-            if inline is None:
-                continue
-            week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(
-                int(inline)
-            )
+        inline = p.get("score")
+        if inline is None:
             continue
-        tids = (membership.get(pid, set()) if membership else set()) or set()
-        per_target = [score_lookup.get((pid, t), 0) for t in tids]
-        best = max(per_target, default=0)
-        if best <= 0:
-            continue
-        week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(best)
+        week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(
+            int(inline)
+        )
 
     score_trend = sorted(
         [
