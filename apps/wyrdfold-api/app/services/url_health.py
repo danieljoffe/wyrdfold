@@ -197,8 +197,13 @@ def _merge_check_results(
       - 4xx (400-499) or network error (0): increment counter
       - 5xx (500-599) or anything else: leave counter alone (server-side
         hiccup, not job-dead)
+
+    Writes every checked job in ONE ``bulk_update_url_health`` RPC instead
+    of one UPDATE round-trip per job (perf #93). Mirrors
+    ``bulk_update_scores``: a single jsonb payload, one set-based UPDATE.
     """
     now_iso = datetime.now(UTC).isoformat()
+    updates: list[dict[str, Any]] = []
     for r in rows:
         jid = r["id"]
         if jid not in status_by_job:
@@ -211,11 +216,15 @@ def _merge_check_results(
             new_count = prev_count + 1
         else:
             new_count = prev_count  # don't penalise on 5xx
-        supabase.table("jobs").update({
+        updates.append({
+            "id": jid,
             "last_url_check_at": now_iso,
             "url_check_status": code,
             "url_check_failure_count": new_count,
-        }).eq("id", jid).execute()
+        })
+    if not updates:
+        return
+    supabase.rpc("bulk_update_url_health", {"p_updates": updates}).execute()
 
 
 def _archive_with_data_drop(supabase: Client, job_ids: list[str]) -> int:
