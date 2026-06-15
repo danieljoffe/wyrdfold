@@ -5,6 +5,7 @@ analysis for a job posting against a specific target. Cache key is
 (job_posting_id, target_id, optimized_doc_id).
 """
 
+import asyncio
 import logging
 from typing import Any, cast
 
@@ -53,13 +54,15 @@ async def create_analysis(
     # any user could re-rank another target's list (audit #24 F2). 404 not
     # 403 so non-owners can't enumerate target existence. api-key callers
     # (user_id None) are operators and bypass, matching the targets router.
-    if user_id is not None and target_id not in targets_crud.get_user_target_ids(
-        supabase, user_id
+    if user_id is not None and target_id not in await asyncio.to_thread(
+        targets_crud.get_user_target_ids, supabase, user_id
     ):
         raise HTTPException(status_code=404, detail="Target not found.")
 
     # 1. Fetch optimized doc (needed for cache key)
-    current_optimized = optimized.get_latest(supabase, user_id=user_id)
+    current_optimized = await asyncio.to_thread(
+        optimized.get_latest, supabase, user_id=user_id
+    )
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -67,7 +70,8 @@ async def create_analysis(
         )
 
     # 2. Check cache — keyed on (job, target, optimized version)
-    cached = persistence.get_cached(
+    cached = await asyncio.to_thread(
+        persistence.get_cached,
         supabase,
         job_id,
         target_id=target_id,
@@ -84,7 +88,8 @@ async def create_analysis(
         # idempotent (same blend math, same target, same scorecard),
         # so re-running it on every cache hit is a cheap no-op once
         # the row already has the blended score.
-        _apply_llm_blend(
+        await asyncio.to_thread(
+            _apply_llm_blend,
             supabase,
             job_posting_id=job_id,
             target_id=target_id,
@@ -97,7 +102,8 @@ async def create_analysis(
     # after the cache check, so re-viewing a cached analysis is always
     # free and never 429s (cache hits write no llm_costs row).
     if user_id is not None:
-        budget.check_daily_count(
+        await asyncio.to_thread(
+            budget.check_daily_count,
             supabase,
             user_id=user_id,
             purpose=DEFAULT_PURPOSE,
@@ -105,13 +111,13 @@ async def create_analysis(
         )
 
     # 3. Fetch target (existence check + context for the LLM)
-    target = targets_crud.get(supabase, target_id)
+    target = await asyncio.to_thread(targets_crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found.")
 
     # 4. Fetch job posting (existence + description in one round-trip)
-    resp = (
-        supabase.table("jobs")
+    resp = await asyncio.to_thread(
+        lambda: supabase.table("jobs")
         .select("id, description_html")
         .eq("id", job_id)
         .limit(1)
@@ -153,7 +159,8 @@ async def create_analysis(
     )
 
     # 7. Persist
-    record = persistence.persist(
+    record = await asyncio.to_thread(
+        persistence.persist,
         supabase,
         job_posting_id=job_id,
         target_id=target_id,
@@ -170,7 +177,8 @@ async def create_analysis(
     # stage2/keyword-only, so e.g. a posting with a 61 keyword score that
     # the LLM rated "Skip" (domain mismatch) stayed ranked at 61 in
     # ``/jobs?target_id=...`` ordering.
-    _apply_llm_blend(
+    await asyncio.to_thread(
+        _apply_llm_blend,
         supabase,
         job_posting_id=job_id,
         target_id=target_id,

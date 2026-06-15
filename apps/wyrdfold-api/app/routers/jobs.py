@@ -1321,8 +1321,8 @@ async def add_manual_job(
         "salary_text": salary,
     }
 
-    resp_db = (
-        supabase.table("jobs")
+    resp_db = await asyncio.to_thread(
+        lambda: supabase.table("jobs")
         .upsert(row, on_conflict="source_id,external_id")
         .execute()
     )
@@ -1342,11 +1342,12 @@ async def add_manual_job(
     # SDK is sync, so we hand each one to the threadpool and gather). For 10
     # active targets this turns ~10 sequential round-trips into ~1 wall-time.
     if posting_id and title:
-        active_targets = (
-            get_active_for_user(supabase, user_id)
-            if user_id is not None
-            else get_active_target(supabase)
-        )
+        if user_id is not None:
+            active_targets = await asyncio.to_thread(
+                get_active_for_user, supabase, user_id
+            )
+        else:
+            active_targets = await asyncio.to_thread(get_active_target, supabase)
         parsed = parse_jd(description_html)
         results = await asyncio.gather(
             *[
@@ -1372,7 +1373,7 @@ async def add_manual_job(
                     exc_info=result,
                 )
         try:
-            update_global_score(supabase, posting_id)
+            await asyncio.to_thread(update_global_score, supabase, posting_id)
         except Exception:
             logger.exception("Global score update failed for manual job %s", posting_id)
 
@@ -1394,9 +1395,13 @@ async def add_manual_job(
         scored_target_ids = [t.id for t in active_targets]
         if scored_target_ids:
             try:
-                supabase.table("scores").update({"excluded": False}).eq(
-                    "job_posting_id", posting_id
-                ).in_("target_id", scored_target_ids).execute()
+                await asyncio.to_thread(
+                    lambda: supabase.table("scores")
+                    .update({"excluded": False})
+                    .eq("job_posting_id", posting_id)
+                    .in_("target_id", scored_target_ids)
+                    .execute()
+                )
             except Exception:
                 logger.exception(
                     "Force-include update failed for manual job %s", posting_id
@@ -1438,7 +1443,7 @@ async def rescore_for_target(
 
 
 @router.post("/backfill-salary", dependencies=[Depends(verify_api_key)])
-async def backfill_salary(
+def backfill_salary(
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
     """One-off: extract salary from description_html for jobs missing salary_text.
@@ -1575,7 +1580,7 @@ def _assert_user_owns_posting(
 
 
 @router.get("/{posting_id}")
-async def get_job(
+def get_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
@@ -1617,7 +1622,7 @@ async def get_job(
 
 
 @router.delete("/{posting_id}")
-async def delete_job(
+def delete_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
