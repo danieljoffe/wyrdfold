@@ -133,23 +133,57 @@ def _flatten_posting_ids(
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 
+def _user_status_map(
+    supabase: Client,
+    user_id: str | None,
+    posting_ids: list[str],
+) -> dict[str, str]:
+    """Per-user pipeline status (#75 C4): ``jobs.status`` was dropped, so
+    pipeline state now lives in ``user_jobs`` keyed by ``(user_id,
+    job_posting_id)``. Return a ``posting_id -> status`` map; postings the
+    user never touched are absent and read as ``'new'`` by the callers
+    (the "absent = new" rule). Empty when there's no user identity."""
+    if user_id is None or not posting_ids:
+        return {}
+    out: dict[str, str] = {}
+    for i in range(0, len(posting_ids), 200):
+        chunk = posting_ids[i : i + 200]
+        rows = _rows(
+            supabase.table("user_jobs")
+            .select("job_posting_id, status")
+            .eq("user_id", user_id)
+            .in_("job_posting_id", chunk),
+            label="insights/user_jobs_status",
+        )
+        for r in rows:
+            out[str(r["job_posting_id"])] = cast(str, r["status"])
+    return out
+
+
 def _fetch_postings_window(
     supabase: Client,
     since: datetime | None,
     until: datetime | None,
     target_ids: set[str] | None,
+    user_id: str | None,
 ) -> list[Row]:
     posting_ids = _flatten_posting_ids(_posting_target_map(supabase, target_ids))
     if posting_ids is not None and not posting_ids:
         return []
-    q = supabase.table("jobs").select("id, status, created_at")
+    # ``jobs.status`` was dropped in #75 C4 — fetch liveness + creation, then
+    # overlay the per-user status from ``user_jobs`` below.
+    q = supabase.table("jobs").select("id, created_at")
     if since:
         q = q.gte("created_at", since.isoformat())
     if until:
         q = q.lt("created_at", until.isoformat())
     if posting_ids is not None:
         q = q.in_("id", list(posting_ids))
-    return _rows(q, label="insights/postings_window")
+    rows = _rows(q, label="insights/postings_window")
+    status_map = _user_status_map(supabase, user_id, [str(r["id"]) for r in rows])
+    for r in rows:
+        r["status"] = status_map.get(str(r["id"]), "new")
+    return rows
 
 
 def _fetch_status_logs_window(
@@ -217,6 +251,7 @@ def compute_pipeline(
     since: datetime | None,
     prior_window: tuple[datetime, datetime] | None = None,
     target_ids: set[str] | None = None,
+    user_id: str | None = None,
 ) -> PipelineInsights:
     """Compute pipeline insights for the current window. When *prior_window*
     is supplied as ``(prior_since, prior_until)``, also compute the same KPIs
@@ -225,9 +260,10 @@ def compute_pipeline(
 
     When *target_ids* is supplied, all queries are bounded to the user's
     target set — required for multi-tenant safety since wyrdfold-api uses
-    service-role and bypasses RLS.
+    service-role and bypasses RLS. *user_id* resolves the per-user pipeline
+    status from ``user_jobs`` (#75 C4: ``jobs.status`` was dropped).
     """
-    postings = _fetch_postings_window(supabase, since, None, target_ids)
+    postings = _fetch_postings_window(supabase, since, None, target_ids, user_id)
     posting_ids = {str(p["id"]) for p in postings}
     status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids)
 
@@ -264,7 +300,7 @@ def compute_pipeline(
     if prior_window is not None:
         prior_since, prior_until = prior_window
         prior_postings = _fetch_postings_window(
-            supabase, prior_since, prior_until, target_ids
+            supabase, prior_since, prior_until, target_ids, user_id
         )
         prior_posting_ids = {str(p["id"]) for p in prior_postings}
         prior_logs = _fetch_status_logs_window(
@@ -311,9 +347,12 @@ def compute_targets(
     supabase: Client,
     since: datetime | None,
     target_ids: set[str] | None = None,
+    user_id: str | None = None,
 ) -> TargetInsights:
     """Compute target insights. When *target_ids* is supplied, only those
-    targets and their postings are aggregated."""
+    targets and their postings are aggregated. *user_id* resolves the
+    per-user pipeline status from ``user_jobs`` (#75 C4: ``jobs.status`` was
+    dropped) for the applied/interview comparisons."""
     # Fetch only the user's targets for labels
     tq = supabase.table("targets").select("id, label")
     if target_ids is not None:
@@ -340,16 +379,18 @@ def compute_targets(
             unscored_count=0,
         )
 
-    # Fetch postings within the user's target set, hydrating with status
-    # + created_at; per-target scores come from the ``scores`` table
+    # Fetch postings within the user's target set, hydrating with
+    # created_at; per-target scores come from the ``scores`` table
     # (jobs.score is the global blended score, not the per-target one).
-    # In the unscoped / admin path (``target_ids=None``) we also need
-    # the legacy inline ``target_id`` + ``score`` columns so callers
-    # that didn't pass per-user scoping still get a meaningful answer.
+    # ``jobs.status`` was dropped in #75 C4 — the per-user status is
+    # overlaid from ``user_jobs`` below. In the unscoped / admin path
+    # (``target_ids=None``) we also need the legacy inline ``target_id`` +
+    # ``score`` columns so callers that didn't pass per-user scoping still
+    # get a meaningful answer.
     select_cols = (
-        "id, status, created_at"
+        "id, created_at"
         if target_ids is not None
-        else "id, target_id, score, status, created_at"
+        else "id, target_id, score, created_at"
     )
     q = supabase.table("jobs").select(select_cols)
     if since:
@@ -357,6 +398,11 @@ def compute_targets(
     if posting_ids is not None:
         q = q.in_("id", list(posting_ids))
     postings = _rows(q, label="insights/targets_postings")
+    status_map = _user_status_map(
+        supabase, user_id, [str(p["id"]) for p in postings]
+    )
+    for p in postings:
+        p["status"] = status_map.get(str(p["id"]), "new")
 
     # Per-target score lookup: ``(posting_id, target_id) → score``. Fetched
     # once so the aggregation below stays O(n) over postings x their

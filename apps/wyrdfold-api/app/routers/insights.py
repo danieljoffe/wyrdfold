@@ -107,7 +107,11 @@ def pipeline_insights(
     if not target_ids:
         return _empty_pipeline()
     return compute_pipeline(
-        supabase, _since(period), _prior_window(period), target_ids=target_ids
+        supabase,
+        _since(period),
+        _prior_window(period),
+        target_ids=target_ids,
+        user_id=user_id,
     )
 
 
@@ -120,7 +124,9 @@ def target_insights(
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_targets()
-    return compute_targets(supabase, _since(period), target_ids=target_ids)
+    return compute_targets(
+        supabase, _since(period), target_ids=target_ids, user_id=user_id
+    )
 
 
 @router.get("/skills-cost")

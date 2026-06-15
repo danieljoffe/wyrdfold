@@ -768,12 +768,35 @@ async def _poll_one_source(
         # Existing rows are needed in three places: skipping Phase 1
         # triage for already-known jobs, the (company, title) dedupe, and
         # stale-row archiving. Fetch once, up front.
+        #
+        # Per-user translation of the old saved/applied/archived skip (#75
+        # C4: jobs.status was dropped). The old filter excluded user-engaged
+        # ('saved'/'applied') and already-dead ('archived') jobs from the
+        # stale-archive pass. Now: 'archived' is the global archived_at gate,
+        # and 'saved'/'applied' become "any user engaged with it" — a
+        # user_jobs row with status != 'new" — mirroring url_health.
+        engaged_resp = await asyncio.to_thread(
+            execute_with_retry_sync,
+            supabase.table("user_jobs")
+            .select("job_posting_id")
+            .neq("status", "new")
+            .execute,
+            label=f"poll engaged {company_name}",
+        )
+        engaged_ids = sorted(
+            {
+                cast(str, r["job_posting_id"])
+                for r in cast(list[dict[str, Any]], engaged_resp.data or [])
+            }
+        )
         existing_query = (
             supabase.table("jobs")
             .select("id, external_id, title, company_name")
             .eq("source_id", source_id)
-            .not_.in_("status", ["saved", "applied", "archived"])
+            .is_("archived_at", "null")
         )
+        if engaged_ids:
+            existing_query = existing_query.not_.in_("id", engaged_ids)
         existing_resp = await asyncio.to_thread(
             execute_with_retry_sync,
             existing_query.execute,
