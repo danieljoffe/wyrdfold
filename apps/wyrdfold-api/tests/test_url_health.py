@@ -92,39 +92,93 @@ def _mock_supabase(updates_sink: list[dict[str, Any]]) -> MagicMock:
     return sb
 
 
+def _merge_supabase() -> tuple[MagicMock, MagicMock]:
+    """Supabase mock recording the single ``rpc(...)`` call _merge issues.
+
+    Returns ``(sb, rpc_mock)`` where ``rpc_mock`` is ``sb.rpc`` — assert on
+    its call args to inspect the bulk-update payload (perf #93: one RPC, no
+    per-row UPDATE loop)."""
+    sb = MagicMock()
+    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+    return sb, sb.rpc
+
+
+def _payload_by_id(rpc_mock: MagicMock) -> dict[str, dict[str, Any]]:
+    """Pull the {p_updates: [...]} payload from the one rpc call, keyed by id."""
+    rpc_mock.assert_called_once()
+    name, args = rpc_mock.call_args.args
+    assert name == "bulk_update_url_health"
+    return {u["id"]: u for u in args["p_updates"]}
+
+
 def test_merge_check_results_resets_counter_on_2xx() -> None:
-    sink: list[dict[str, Any]] = []
-    sb = _mock_supabase(sink)
+    sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 2}]
     _merge_check_results(sb, rows, {"j1": 200})
-    assert sink[0]["payload"]["url_check_status"] == 200
-    assert sink[0]["payload"]["url_check_failure_count"] == 0
+    sb.table.assert_not_called()  # no per-row UPDATE loop anymore
+    u = _payload_by_id(rpc)["j1"]
+    assert u["url_check_status"] == 200
+    assert u["url_check_failure_count"] == 0
+    assert u["last_url_check_at"] is not None
 
 
 def test_merge_check_results_increments_on_404() -> None:
-    sink: list[dict[str, Any]] = []
-    sb = _mock_supabase(sink)
+    sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 1}]
     _merge_check_results(sb, rows, {"j1": 404})
-    assert sink[0]["payload"]["url_check_status"] == 404
-    assert sink[0]["payload"]["url_check_failure_count"] == 2
+    u = _payload_by_id(rpc)["j1"]
+    assert u["url_check_status"] == 404
+    assert u["url_check_failure_count"] == 2
 
 
 def test_merge_check_results_increments_on_network_error() -> None:
-    sink: list[dict[str, Any]] = []
-    sb = _mock_supabase(sink)
+    sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 0}]
     _merge_check_results(sb, rows, {"j1": _STATUS_NETWORK_ERROR})
-    assert sink[0]["payload"]["url_check_failure_count"] == 1
+    assert _payload_by_id(rpc)["j1"]["url_check_failure_count"] == 1
 
 
 def test_merge_check_results_leaves_counter_on_5xx() -> None:
     """Server hiccups should NOT count against the job — not the job's fault."""
-    sink: list[dict[str, Any]] = []
-    sb = _mock_supabase(sink)
+    sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 1}]
     _merge_check_results(sb, rows, {"j1": 503})
-    assert sink[0]["payload"]["url_check_failure_count"] == 1
+    assert _payload_by_id(rpc)["j1"]["url_check_failure_count"] == 1
+
+
+def test_merge_check_results_one_rpc_for_whole_batch() -> None:
+    """The per-row UPDATE loop is gone: a multi-job batch issues exactly ONE
+    bulk_update_url_health RPC carrying every job's computed values."""
+    sb, rpc = _merge_supabase()
+    rows = [
+        {"id": "ok", "url_check_failure_count": 5},
+        {"id": "dead", "url_check_failure_count": 2},
+        {"id": "blip", "url_check_failure_count": 0},
+        {"id": "hiccup", "url_check_failure_count": 1},
+        # Not in status_by_job → must be skipped entirely.
+        {"id": "unchecked", "url_check_failure_count": 0},
+    ]
+    _merge_check_results(
+        sb,
+        rows,
+        {"ok": 200, "dead": 404, "blip": _STATUS_NETWORK_ERROR, "hiccup": 503},
+    )
+    by_id = _payload_by_id(rpc)
+    assert set(by_id) == {"ok", "dead", "blip", "hiccup"}  # unchecked excluded
+    assert by_id["ok"]["url_check_failure_count"] == 0  # 2xx reset
+    assert by_id["dead"]["url_check_failure_count"] == 3  # 4xx bump
+    assert by_id["blip"]["url_check_failure_count"] == 1  # net err bump
+    assert by_id["hiccup"]["url_check_failure_count"] == 1  # 5xx unchanged
+    # All rows share the single tick timestamp.
+    assert len({u["last_url_check_at"] for u in by_id.values()}) == 1
+
+
+def test_merge_check_results_noop_when_no_matches() -> None:
+    """No checked rows → no RPC call at all (don't ship an empty payload)."""
+    sb, rpc = _merge_supabase()
+    rows = [{"id": "j1", "url_check_failure_count": 0}]
+    _merge_check_results(sb, rows, {})  # nothing was HEAD'd
+    rpc.assert_not_called()
 
 
 # ---- _archive_with_data_drop ----------------------------------------------
