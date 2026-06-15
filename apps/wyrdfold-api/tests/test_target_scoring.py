@@ -378,6 +378,52 @@ def test_get_target_scores_returns_empty_dict_when_no_scores() -> None:
     assert scores == {}
 
 
+def test_get_target_scores_empty_id_list_skips_query() -> None:
+    """An empty ``job_posting_ids`` must NOT relax to an unbounded SELECT —
+    ``.in_("…", [])`` returns all target scores in PostgREST. The guard
+    short-circuits to an empty dict with zero queries."""
+    supabase = MagicMock()
+
+    scores = get_target_scores(supabase, "target-1", [])
+
+    assert scores == {}
+    supabase.table.assert_not_called()
+
+
+def test_get_target_scores_chunks_at_200() -> None:
+    """A >200-id score lookup issues one ``.in_()`` per 200-id batch and
+    merges the per-batch rows into one dict identical to a single query."""
+    from app.services.target_scoring import _IN_CHUNK_SIZE
+
+    job_ids = [f"job-{i}" for i in range(450)]
+    rows_by_chunk = {
+        job_ids[start]: [
+            _upserted_score_row(job_posting_id=jid)
+            for jid in job_ids[start : start + _IN_CHUNK_SIZE]
+        ]
+        for start in range(0, len(job_ids), _IN_CHUNK_SIZE)
+    }
+
+    supabase = MagicMock()
+    in_chain = supabase.table.return_value.select.return_value.eq.return_value.in_
+
+    def _in(_col: str, chunk: list[str]) -> MagicMock:
+        resp = MagicMock()
+        resp.execute.return_value.data = rows_by_chunk.get(chunk[0], [])
+        return resp
+
+    in_chain.side_effect = _in
+
+    scores = get_target_scores(supabase, "target-1", job_ids)
+
+    # 450 ids → ceil(450/200) = 3 batches.
+    assert in_chain.call_count == 3
+    assert [len(c.args[1]) for c in in_chain.call_args_list] == [200, 200, 50]
+    # Union identical to a single .in_() result: every id keyed once.
+    assert len(scores) == 450
+    assert set(scores.keys()) == set(job_ids)
+
+
 # ---------------------------------------------------------------------------
 # Router: list endpoint with target_id overlay
 # ---------------------------------------------------------------------------

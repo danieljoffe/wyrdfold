@@ -444,6 +444,59 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
     jobs_table.update.return_value.in_.assert_called_once_with("id", ["job-1"])
 
 
+@pytest.mark.asyncio
+async def test_stale_archive_update_chunks_at_200(monkeypatch):
+    """A stale-archive set larger than one batch must apply the UPDATE per
+    200-id chunk (so the ``id=in.(...)`` filter never overflows the request
+    URL), covering every stale id exactly once with one shared timestamp."""
+    from app.services import poller as poller_mod
+
+    # 250 existing rows, all delisted (none appears in the live fetch) →
+    # 250 stale ids → 2 archive batches (200 + 50).
+    existing = [
+        {
+            "id": f"job-{i}",
+            "external_id": f"gone-{i}",
+            "title": f"T{i}",
+            "company_name": "Acme",
+        }
+        for i in range(250)
+    ]
+    supabase, jobs_table, _sources_table = _make_poll_supabase(existing)
+
+    async def one_job_fetch(_token: str) -> list[StandardJob]:
+        # Non-US location → dropped pre-upsert (no-upsert archive path),
+        # while the fetch itself is non-empty so the mass-archive guard
+        # doesn't skip the stale pass.
+        return [
+            StandardJob(
+                external_id="live-1",
+                title="Director of CX",
+                location_name="London, United Kingdom",
+                department=None,
+                content="",
+                updated_at="2026-01-01",
+                absolute_url="https://example.com/j/1",
+            )
+        ]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_job_fetch)
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
+
+    assert summary["archived"] == 250
+    # 250 stale ids → 2 batches of 200 + 50.
+    in_calls = jobs_table.update.return_value.in_.call_args_list
+    assert [len(c.args[1]) for c in in_calls] == [200, 50]
+    # Union of the per-batch id lists = every stale id, no duplicates.
+    archived_ids = [jid for c in in_calls for jid in c.args[1]]
+    assert sorted(archived_ids) == sorted(r["id"] for r in existing)
+    # All batches share one archived_at timestamp (single-UPDATE semantics).
+    payloads = [c.args[0] for c in jobs_table.update.call_args_list]
+    assert len({p["archived_at"] for p in payloads}) == 1
+
+
 # ---- Phase 1 triage: known jobs are not re-triaged --------------------------
 
 
@@ -571,6 +624,77 @@ async def test_load_alert_rows_no_ids_short_circuits():
 
     assert rows == [{"title": "no id"}]
     supabase.table.assert_not_called()
+
+
+# ---- IN-list chunking (#93): URL-truncation hardening -----------------------
+
+
+def _chunked_select_mock(rows_by_chunk: dict[str, list[dict]]) -> MagicMock:
+    """Supabase mock whose ``select().in_(col, chunk)`` returns the rows
+    keyed by the first id of ``chunk`` — lets a test assert one query per
+    batch and that the per-batch rows are concatenated/merged identically.
+    """
+    supabase = MagicMock()
+    select = supabase.table.return_value.select.return_value
+
+    def _in(_col: str, chunk: list[str]) -> MagicMock:
+        resp = MagicMock()
+        resp.execute.return_value.data = rows_by_chunk.get(chunk[0], [])
+        return resp
+
+    select.in_.side_effect = _in
+    return supabase, select
+
+
+@pytest.mark.asyncio
+async def test_batch_fetch_job_scores_chunks_at_200() -> None:
+    """A >200-id score lookup issues one ``.in_()`` per 200-id batch and
+    merges the per-batch rows into one dict identical to a single query."""
+    from app.services.poller import _IN_CHUNK_SIZE, _batch_fetch_job_scores
+
+    job_ids = [f"job-{i}" for i in range(450)]
+    # Return one row per id, keyed by the chunk's first id.
+    rows_by_chunk = {
+        job_ids[start]: [
+            {"id": jid, "score": idx}
+            for idx, jid in enumerate(job_ids[start : start + _IN_CHUNK_SIZE])
+        ]
+        for start in range(0, len(job_ids), _IN_CHUNK_SIZE)
+    }
+    supabase, select = _chunked_select_mock(rows_by_chunk)
+
+    scores = await _batch_fetch_job_scores(supabase, job_ids)
+
+    # 450 ids → ceil(450/200) = 3 batches.
+    assert select.in_.call_count == 3
+    assert [len(c.args[1]) for c in select.in_.call_args_list] == [200, 200, 50]
+    # Every id present, union identical to a single .in_() result.
+    assert len(scores) == 450
+    assert scores["job-0"] == 0
+    assert scores["job-449"] == 49
+
+
+@pytest.mark.asyncio
+async def test_load_alert_rows_chunks_at_200() -> None:
+    """A >200-row alert refresh issues one ``.in_()`` per 200-id batch and
+    concatenates the per-batch rows into one list."""
+    from app.services.poller import _IN_CHUNK_SIZE, _load_alert_rows
+
+    new_rows = [{"id": f"job-{i}"} for i in range(450)]
+    ids = [r["id"] for r in new_rows]
+    rows_by_chunk = {
+        ids[start]: [
+            {"id": jid, "score": 90} for jid in ids[start : start + _IN_CHUNK_SIZE]
+        ]
+        for start in range(0, len(ids), _IN_CHUNK_SIZE)
+    }
+    supabase, select = _chunked_select_mock(rows_by_chunk)
+
+    refreshed = await _load_alert_rows(supabase, new_rows)
+
+    assert select.in_.call_count == 3
+    assert len(refreshed) == 450
+    assert {r["id"] for r in refreshed} == set(ids)
 
 
 # ---- free gates run before Phase 1 triage (cost ordering) -------------------
