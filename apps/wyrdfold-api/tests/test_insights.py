@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
-from app.services.insights import compute_pipeline, compute_skills_cost, compute_targets
+from app.services.insights import (
+    _fetch_in_chunks,
+    compute_pipeline,
+    compute_skills_cost,
+    compute_targets,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -519,3 +524,213 @@ class TestComputeSkillsCost:
         assert result.cost_over_time == []
         assert result.total_cost == 0.0
         assert result.avg_cost_per_resume is None
+
+
+# ===========================================================================
+# IN-list chunking (#93)
+# ===========================================================================
+#
+# A real beta user has ~11,300 postings under their targets. Passing all
+# of them into a single ``.in_("id", [...])`` builds a ~400KB PostgREST URL
+# that gets truncated/rejected — silently dropping rows. ``_fetch_in_chunks``
+# splits the id filter into batches of 200 and concatenates the rows so the
+# union equals the single-query result (callers fold into order-independent
+# Counters/dicts).
+
+
+class TestFetchInChunks:
+    def test_batches_at_200_and_concatenates(self):
+        """A >200-id list is split into 200-id batches; ``make_query`` is
+        called once per batch and the rows are concatenated in order."""
+        ids = [f"id-{i}" for i in range(450)]  # 200 + 200 + 50 → 3 batches
+
+        seen_batches: list[list[str]] = []
+
+        def make_query(batch: list[str]) -> MagicMock:
+            seen_batches.append(batch)
+            q = MagicMock()
+            # Each chunk returns one row per id so we can verify the union.
+            q.execute.return_value.data = [{"id": i} for i in batch]
+            return q
+
+        rows = _fetch_in_chunks(make_query, ids, label="test")
+
+        # One call per 200-id chunk: 200, 200, 50.
+        assert [len(b) for b in seen_batches] == [200, 200, 50]
+        # Batches partition the input with no overlap or gaps.
+        assert [i for b in seen_batches for i in b] == ids
+        # Union of chunk rows == what a single ``.in_(all_ids)`` would return.
+        assert [r["id"] for r in rows] == ids
+
+    def test_single_batch_when_under_chunk_size(self):
+        ids = [f"id-{i}" for i in range(5)]
+        calls = 0
+
+        def make_query(batch: list[str]) -> MagicMock:
+            nonlocal calls
+            calls += 1
+            q = MagicMock()
+            q.execute.return_value.data = [{"id": i} for i in batch]
+            return q
+
+        rows = _fetch_in_chunks(make_query, ids, label="test")
+
+        assert calls == 1
+        assert [r["id"] for r in rows] == ids
+
+    def test_exact_multiple_of_chunk_size(self):
+        ids = [f"id-{i}" for i in range(400)]  # exactly 2 batches
+        batch_sizes: list[int] = []
+
+        def make_query(batch: list[str]) -> MagicMock:
+            batch_sizes.append(len(batch))
+            q = MagicMock()
+            q.execute.return_value.data = [{"id": i} for i in batch]
+            return q
+
+        rows = _fetch_in_chunks(make_query, ids, label="test")
+
+        assert batch_sizes == [200, 200]
+        assert len(rows) == 400
+
+    def test_custom_chunk_size(self):
+        ids = [f"id-{i}" for i in range(5)]
+        batch_sizes: list[int] = []
+
+        def make_query(batch: list[str]) -> MagicMock:
+            batch_sizes.append(len(batch))
+            q = MagicMock()
+            q.execute.return_value.data = []
+            return q
+
+        _fetch_in_chunks(make_query, ids, label="test", chunk=2)
+
+        assert batch_sizes == [2, 2, 1]
+
+
+def _chunk_tracking_supabase(
+    tables: dict[str, list[dict]],
+    in_batches: dict[str, list[list]],
+) -> MagicMock:
+    """Like ``_mock_supabase`` but records the ids passed to each
+    ``.in_(col, ids)`` call, keyed by table name, into *in_batches*.
+
+    Each table mock returns its seeded ``tables`` rows on ``.execute()``
+    regardless of the batch — the test asserts on the recorded batch sizes,
+    not on per-batch row filtering (the production helper concatenates, so
+    returning the full set per batch is fine for the call-count assertion).
+    """
+    client = MagicMock()
+
+    def table_side_effect(name: str) -> MagicMock:
+        tbl = MagicMock()
+        result = MagicMock()
+        result.data = tables.get(name, [])
+
+        for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq"):
+            getattr(tbl, method).return_value = tbl
+
+        def in_recorder(col: str, ids: list, _name: str = name) -> MagicMock:
+            in_batches.setdefault(_name, []).append(list(ids))
+            return tbl
+
+        tbl.in_.side_effect = in_recorder
+        tbl.execute.return_value = result
+        return tbl
+
+    client.table.side_effect = table_side_effect
+    return client
+
+
+class TestComputeChunksLargeIdLists:
+    """End-to-end: a target-scoped compute over >200 postings issues the
+    posting-id ``.in_(...)`` filters in 200-id batches (#93)."""
+
+    def test_compute_pipeline_chunks_posting_id_filters(self):
+        # 250 postings → 2 batches (200 + 50) for every posting-id .in_().
+        n = 250
+        scores = [
+            {"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)
+        ]
+        postings = [
+            {"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)
+        ]
+        in_batches: dict[str, list[list]] = {}
+        sb = _chunk_tracking_supabase(
+            {"scores": scores, "jobs": postings, "user_jobs": [], "documents": []},
+            in_batches,
+        )
+
+        compute_pipeline(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+
+        # jobs (postings window), status_log, documents (resumes), and
+        # user_jobs all filter by the resolved posting-id set in 200-id
+        # batches. The mock returns the full posting set for every table,
+        # so each of those resolves a 250-id list → [200, 50].
+        for table in ("jobs", "status_log", "documents"):
+            sizes = [len(b) for b in in_batches.get(table, [])]
+            assert sizes and all(s <= 200 for s in sizes), (
+                f"{table} not chunked at 200: {sizes}"
+            )
+            assert sizes[0] == 200
+
+    def test_compute_targets_chunks_posting_id_filters(self):
+        n = 250
+        targets = [{"id": "t1", "label": "Frontend"}]
+        scores = [
+            {"job_posting_id": f"p{i}", "target_id": "t1", "score": 50}
+            for i in range(n)
+        ]
+        postings = [{"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)]
+        in_batches: dict[str, list[list]] = {}
+        sb = _chunk_tracking_supabase(
+            {
+                "targets": targets,
+                "scores": scores,
+                "jobs": postings,
+                "user_jobs": [],
+            },
+            in_batches,
+        )
+
+        compute_targets(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+
+        # jobs (postings) chunked by id; scores chunked by job_posting_id.
+        for table in ("jobs", "scores"):
+            sizes = [len(b) for b in in_batches.get(table, [])]
+            big = [s for s in sizes if s > 1]  # ignore the small target_id in_()
+            assert big and all(s <= 200 for s in big), (
+                f"{table} not chunked at 200: {sizes}"
+            )
+
+    def test_compute_skills_cost_chunks_posting_id_filters(self):
+        n = 250
+        scores = [
+            {"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)
+        ]
+        postings = [
+            {"id": f"p{i}", "llm_score": 50.0, "created_at": _ts(_NOW)}
+            for i in range(n)
+        ]
+        in_batches: dict[str, list[list]] = {}
+        sb = _chunk_tracking_supabase(
+            {
+                "scores": scores,
+                "jobs": postings,
+                "analyses": [],
+                "llm_costs": [],
+                "documents": [],
+            },
+            in_batches,
+        )
+
+        compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+
+        # jobs (id), analyses (job_posting_id), documents (job_posting_id)
+        # all chunked at 200.
+        for table in ("jobs", "analyses", "documents"):
+            sizes = [len(b) for b in in_batches.get(table, [])]
+            assert sizes and all(s <= 200 for s in sizes), (
+                f"{table} not chunked at 200: {sizes}"
+            )
+            assert sizes[0] == 200

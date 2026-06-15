@@ -50,6 +50,42 @@ def _rows(query: Any, label: str) -> list[Row]:
     resp = execute_with_retry_sync(lambda: query.execute(), label=label)
     return cast(list[Row], resp.data or [])
 
+
+# Max ids per ``.in_(...)`` filter. PostgREST encodes the list into the
+# request URL, so one ``.in_("id", [...])`` with N ids produces roughly
+# ``N * 38`` chars (a UUID + its url-escaped comma). A real beta user has
+# ~11,300 postings under their targets — a single un-chunked ``.in_()``
+# there builds a ~400KB URL that the server truncates/rejects, silently
+# dropping rows (a latent correctness bug, #93). 200 keeps each URL well
+# under safe limits and matches the existing ``_user_status_map`` chunking.
+_IN_CHUNK = 200
+
+
+def _fetch_in_chunks(
+    make_query: Any,
+    ids: list[str],
+    label: str,
+    chunk: int = _IN_CHUNK,
+) -> list[Row]:
+    """Run an ``.in_(...)``-bounded query over *ids* in batches of *chunk*
+    and concatenate the result rows.
+
+    *make_query* takes one batch of ids and returns the fully-built query
+    (it must apply the ``.in_(...)`` for that batch plus every other filter
+    — since/until/eq — so each batch carries the same predicate). The union
+    of per-batch rows equals what a single ``.in_(all_ids)`` would return;
+    callers fold these into order-independent Counters/dicts, so plain
+    concatenation preserves output identity.
+
+    *ids* is assumed non-empty (callers guard the empty case, since an
+    empty ``.in_([])`` must NOT relax to an unbounded SELECT).
+    """
+    out: list[Row] = []
+    for i in range(0, len(ids), chunk):
+        batch = ids[i : i + chunk]
+        out.extend(_rows(make_query(batch), label=label))
+    return out
+
 # Funnel stage ordering (used for consistent display)
 FUNNEL_ORDER = [
     "new",
@@ -172,14 +208,24 @@ def _fetch_postings_window(
         return []
     # ``jobs.status`` was dropped in #75 C4 — fetch liveness + creation, then
     # overlay the per-user status from ``user_jobs`` below.
-    q = supabase.table("jobs").select("id, created_at")
-    if since:
-        q = q.gte("created_at", since.isoformat())
-    if until:
-        q = q.lt("created_at", until.isoformat())
+    def _base() -> Any:
+        q = supabase.table("jobs").select("id, created_at")
+        if since:
+            q = q.gte("created_at", since.isoformat())
+        if until:
+            q = q.lt("created_at", until.isoformat())
+        return q
+
     if posting_ids is not None:
-        q = q.in_("id", list(posting_ids))
-    rows = _rows(q, label="insights/postings_window")
+        # Chunk the id filter so the PostgREST URL stays under safe limits
+        # at multi-thousand-posting scale (#93).
+        rows = _fetch_in_chunks(
+            lambda batch: _base().in_("id", batch),
+            list(posting_ids),
+            label="insights/postings_window",
+        )
+    else:
+        rows = _rows(_base(), label="insights/postings_window")
     status_map = _user_status_map(supabase, user_id, [str(r["id"]) for r in rows])
     for r in rows:
         r["status"] = status_map.get(str(r["id"]), "new")
@@ -194,16 +240,26 @@ def _fetch_status_logs_window(
 ) -> list[Row]:
     if posting_ids is not None and not posting_ids:
         return []
-    sq = supabase.table("status_log").select(
-        "posting_id, old_status, new_status, created_at"
-    )
-    if since:
-        sq = sq.gte("created_at", since.isoformat())
-    if until:
-        sq = sq.lt("created_at", until.isoformat())
+
+    def _base() -> Any:
+        sq = supabase.table("status_log").select(
+            "posting_id, old_status, new_status, created_at"
+        )
+        if since:
+            sq = sq.gte("created_at", since.isoformat())
+        if until:
+            sq = sq.lt("created_at", until.isoformat())
+        return sq
+
     if posting_ids is not None:
-        sq = sq.in_("posting_id", list(posting_ids))
-    return _rows(sq, label="insights/status_logs_window")
+        # Chunk the id filter so the PostgREST URL stays under safe limits
+        # at multi-thousand-posting scale (#93).
+        return _fetch_in_chunks(
+            lambda batch: _base().in_("posting_id", batch),
+            list(posting_ids),
+            label="insights/status_logs_window",
+        )
+    return _rows(_base(), label="insights/status_logs_window")
 
 
 def _kpis_from(postings: list[Row], status_logs: list[Row]) -> PipelinePeriodKpis:
@@ -278,13 +334,22 @@ def compute_pipeline(
     if target_ids is not None and not posting_ids:
         resumes: list[Row] = []
     else:
-        rq = supabase.table("documents").select("job_posting_id, created_at")
-        if since:
-            rq = rq.gte("created_at", since.isoformat())
-        rq = rq.eq("document_type", "resume")
+        def _resume_base() -> Any:
+            rq = supabase.table("documents").select("job_posting_id, created_at")
+            if since:
+                rq = rq.gte("created_at", since.isoformat())
+            return rq.eq("document_type", "resume")
+
         if target_ids is not None:
-            rq = rq.in_("job_posting_id", list(posting_ids))
-        resumes = _rows(rq, label="insights/pipeline_resumes")
+            # Chunk the id filter so the PostgREST URL stays under safe
+            # limits at multi-thousand-posting scale (#93).
+            resumes = _fetch_in_chunks(
+                lambda batch: _resume_base().in_("job_posting_id", batch),
+                list(posting_ids),
+                label="insights/pipeline_resumes",
+            )
+        else:
+            resumes = _rows(_resume_base(), label="insights/pipeline_resumes")
 
     # --- Funnel counts ---
     status_counts: Counter[str] = Counter()
@@ -392,12 +457,23 @@ def compute_targets(
         if target_ids is not None
         else "id, target_id, score, created_at"
     )
-    q = supabase.table("jobs").select(select_cols)
-    if since:
-        q = q.gte("created_at", since.isoformat())
+
+    def _postings_base() -> Any:
+        q = supabase.table("jobs").select(select_cols)
+        if since:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
     if posting_ids is not None:
-        q = q.in_("id", list(posting_ids))
-    postings = _rows(q, label="insights/targets_postings")
+        # Chunk the id filter so the PostgREST URL stays under safe limits
+        # at multi-thousand-posting scale (#93).
+        postings = _fetch_in_chunks(
+            lambda batch: _postings_base().in_("id", batch),
+            list(posting_ids),
+            label="insights/targets_postings",
+        )
+    else:
+        postings = _rows(_postings_base(), label="insights/targets_postings")
     status_map = _user_status_map(
         supabase, user_id, [str(p["id"]) for p in postings]
     )
@@ -409,15 +485,27 @@ def compute_targets(
     # targets without repeated table queries.
     score_lookup: dict[tuple[str, str], int] = {}
     if posting_ids:
-        sq = (
-            supabase.table("scores")
-            .select("job_posting_id, target_id, score")
-            .eq("excluded", False)
+        def _scores_base() -> Any:
+            sq = (
+                supabase.table("scores")
+                .select("job_posting_id, target_id, score")
+                .eq("excluded", False)
+            )
+            if target_ids is not None:
+                # target_ids is bounded by the user's target count (a
+                # handful), so it stays a single filter; only the large
+                # job_posting_id dimension is chunked below.
+                sq = sq.in_("target_id", list(target_ids))
+            return sq
+
+        # Chunk the job_posting_id filter so the PostgREST URL stays under
+        # safe limits at multi-thousand-posting scale (#93).
+        score_rows = _fetch_in_chunks(
+            lambda batch: _scores_base().in_("job_posting_id", batch),
+            list(posting_ids),
+            label="insights/targets_scores",
         )
-        if target_ids is not None:
-            sq = sq.in_("target_id", list(target_ids))
-        sq = sq.in_("job_posting_id", list(posting_ids))
-        for r in _rows(sq, label="insights/targets_scores"):
+        for r in score_rows:
             score_lookup[(r["job_posting_id"], r["target_id"])] = int(
                 r.get("score") or 0
             )
@@ -577,17 +665,25 @@ def compute_skills_cost(
     # LLM score the poller writes back to ``jobs`` after analysis —
     # fine to read directly off the postings row for the missing-skill
     # priority calculation below.
-    pq = supabase.table("jobs").select("id, llm_score")
-    if since:
-        pq = pq.gte("created_at", since.isoformat())
+    def _postings_base() -> Any:
+        pq = supabase.table("jobs").select("id, llm_score")
+        if since:
+            pq = pq.gte("created_at", since.isoformat())
+        return pq
+
     if target_scoped_posting_ids is not None:
         if not target_scoped_posting_ids:
             posting_rows: list[Row] = []
         else:
-            pq = pq.in_("id", list(target_scoped_posting_ids))
-            posting_rows = _rows(pq, label="insights/skills_cost_postings")
+            # Chunk the id filter so the PostgREST URL stays under safe
+            # limits at multi-thousand-posting scale (#93).
+            posting_rows = _fetch_in_chunks(
+                lambda batch: _postings_base().in_("id", batch),
+                list(target_scoped_posting_ids),
+                label="insights/skills_cost_postings",
+            )
     else:
-        posting_rows = _rows(pq, label="insights/skills_cost_postings")
+        posting_rows = _rows(_postings_base(), label="insights/skills_cost_postings")
     posting_scores: dict[str, float] = {}
     visible_posting_ids: set[str] = set()
     for p in posting_rows:
@@ -598,9 +694,14 @@ def compute_skills_cost(
             posting_scores[pid] = float(score)
 
     # Fetch analyses for skill extraction
-    aq = supabase.table("analyses").select("job_posting_id, scorecard, created_at")
-    if since:
-        aq = aq.gte("created_at", since.isoformat())
+    def _analyses_base() -> Any:
+        aq = supabase.table("analyses").select(
+            "job_posting_id, scorecard, created_at"
+        )
+        if since:
+            aq = aq.gte("created_at", since.isoformat())
+        return aq
+
     if target_ids is not None:
         # Target-scope via posting_id so we don't surface analyses for
         # postings the caller can't see. (analyses.target_id was added
@@ -608,10 +709,15 @@ def compute_skills_cost(
         if not visible_posting_ids:
             analyses: list[Row] = []
         else:
-            aq = aq.in_("job_posting_id", list(visible_posting_ids))
-            analyses = _rows(aq, label="insights/skills_cost_analyses")
+            # Chunk the id filter so the PostgREST URL stays under safe
+            # limits at multi-thousand-posting scale (#93).
+            analyses = _fetch_in_chunks(
+                lambda batch: _analyses_base().in_("job_posting_id", batch),
+                list(visible_posting_ids),
+                label="insights/skills_cost_analyses",
+            )
     else:
-        analyses = _rows(aq, label="insights/skills_cost_analyses")
+        analyses = _rows(_analyses_base(), label="insights/skills_cost_analyses")
 
     # Fetch LLM cost log — has a direct user_id column.
     cq = supabase.table("llm_costs").select("purpose, cost_usd, created_at")
@@ -628,13 +734,22 @@ def compute_skills_cost(
     if target_ids is not None and not visible_posting_ids:
         resume_costs: list[Row] = []
     else:
-        rq = supabase.table("documents").select("cost_usd, created_at")
-        if since:
-            rq = rq.gte("created_at", since.isoformat())
-        rq = rq.eq("document_type", "resume")
+        def _resume_base() -> Any:
+            rq = supabase.table("documents").select("cost_usd, created_at")
+            if since:
+                rq = rq.gte("created_at", since.isoformat())
+            return rq.eq("document_type", "resume")
+
         if target_ids is not None:
-            rq = rq.in_("job_posting_id", list(visible_posting_ids))
-        resume_costs = _rows(rq, label="insights/skills_cost_resumes")
+            # Chunk the id filter so the PostgREST URL stays under safe
+            # limits at multi-thousand-posting scale (#93).
+            resume_costs = _fetch_in_chunks(
+                lambda batch: _resume_base().in_("job_posting_id", batch),
+                list(visible_posting_ids),
+                label="insights/skills_cost_resumes",
+            )
+        else:
+            resume_costs = _rows(_resume_base(), label="insights/skills_cost_resumes")
 
     # --- Skill frequencies ---
     matched_counts: Counter[str] = Counter()
