@@ -1,8 +1,12 @@
 """Aggregation logic for the insights dashboard (#512).
 
-Each compute function fetches filtered rows from Supabase and aggregates
-in Python.  Supabase REST has no GROUP BY, but at personal-tool scale
-(hundreds to low thousands of rows) this is efficient.
+Most compute functions fetch filtered rows from Supabase and aggregate in
+Python. The large per-status pipeline tally (funnel + KPI status
+distribution) is pushed into the ``insights_pipeline_status_counts`` GROUP
+BY RPC so the ~11k posting + ~11k user_jobs rows never leave Postgres
+(#101). The intricate ``status_log`` time-series (applied→interview
+response-time pairing, weekly velocity) stays in Python — it runs on ~1 row
+at beta scale, so a byte-identical SQL rewrite is risk without payoff (#101).
 """
 
 from __future__ import annotations
@@ -196,18 +200,70 @@ def _user_status_map(
     return out
 
 
-def _fetch_postings_window(
+def _fetch_window_posting_ids(
+    supabase: Client,
+    since: datetime | None,
+    until: datetime | None,
+    target_ids: set[str] | None,
+) -> set[str]:
+    """Resolve the SET of posting ids in the window under the caller's targets.
+
+    Returns the concrete window posting-id set for both the scoped and the
+    unscoped (admin / ``target_ids is None``) paths, and an empty set when the
+    user has targets but no postings in the window. This is exactly the set
+    the old ``{str(p["id"]) for p in postings}`` produced from
+    ``_fetch_postings_window`` — preserved byte-for-byte so the downstream
+    ``status_log`` / resume scoping is unchanged.
+
+    Used only to bound the velocity / response-time follow-up queries
+    (``status_log`` + resume ``documents``), which stay in Python (#101). The
+    per-status FUNNEL/KPI tallies no longer ride on these rows — they come
+    from the ``insights_pipeline_status_counts`` GROUP BY RPC — so this fetch
+    drops the per-posting ``user_jobs`` status overlay the old
+    ``_fetch_postings_window`` carried."""
+    posting_ids = _flatten_posting_ids(_posting_target_map(supabase, target_ids))
+    if posting_ids is not None and not posting_ids:
+        return set()
+
+    def _base() -> Any:
+        q = supabase.table("jobs").select("id")
+        if since:
+            q = q.gte("created_at", since.isoformat())
+        if until:
+            q = q.lt("created_at", until.isoformat())
+        return q
+
+    if posting_ids is not None:
+        # Chunk the id filter so the PostgREST URL stays under safe limits
+        # at multi-thousand-posting scale (#93).
+        rows = _fetch_in_chunks(
+            lambda batch: _base().in_("id", batch),
+            list(posting_ids),
+            label="insights/window_posting_ids",
+        )
+    else:
+        rows = _rows(_base(), label="insights/window_posting_ids")
+    return {str(r["id"]) for r in rows}
+
+
+def _pipeline_status_counts_python(
     supabase: Client,
     since: datetime | None,
     until: datetime | None,
     target_ids: set[str] | None,
     user_id: str | None,
-) -> list[Row]:
+) -> Counter[str]:
+    """Fallback for ``_pipeline_status_counts`` when the RPC is unavailable
+    (e.g. mid-deploy before the migration lands).
+
+    Reproduces exactly what the old ``_fetch_postings_window`` + Python status
+    Counter did: postings under the caller's targets (``excluded = false``)
+    within the window, deduplicated by posting id, grouped by the caller's
+    per-user status (``user_jobs`` row; absent → ``'new'``)."""
     posting_ids = _flatten_posting_ids(_posting_target_map(supabase, target_ids))
     if posting_ids is not None and not posting_ids:
-        return []
-    # ``jobs.status`` was dropped in #75 C4 — fetch liveness + creation, then
-    # overlay the per-user status from ``user_jobs`` below.
+        return Counter()
+
     def _base() -> Any:
         q = supabase.table("jobs").select("id, created_at")
         if since:
@@ -222,14 +278,63 @@ def _fetch_postings_window(
         rows = _fetch_in_chunks(
             lambda batch: _base().in_("id", batch),
             list(posting_ids),
-            label="insights/postings_window",
+            label="insights/pipeline_status_counts_fallback",
         )
     else:
-        rows = _rows(_base(), label="insights/postings_window")
+        rows = _rows(_base(), label="insights/pipeline_status_counts_fallback")
     status_map = _user_status_map(supabase, user_id, [str(r["id"]) for r in rows])
+    counts: Counter[str] = Counter()
     for r in rows:
-        r["status"] = status_map.get(str(r["id"]), "new")
-    return rows
+        counts[status_map.get(str(r["id"]), "new")] += 1
+    return counts
+
+
+def _pipeline_status_counts(
+    supabase: Client,
+    since: datetime | None,
+    until: datetime | None,
+    target_ids: set[str] | None,
+    user_id: str | None,
+) -> Counter[str]:
+    """Per-(per-user-)status counts of the caller's postings in the window,
+    computed by the ``insights_pipeline_status_counts`` GROUP BY RPC so the
+    ~11k posting + ~11k user_jobs rows never leave Postgres (#101). Feeds BOTH
+    the funnel and the ``_kpis_from`` status distribution.
+
+    The RPC needs a bounded target set; the unscoped global path
+    (``target_ids is None``) — admin/tests only, the router always passes the
+    caller's targets — keeps the client-side fallback. Falls back to the
+    client-side count if the RPC isn't deployed yet (mirrors
+    ``_pipeline_counts_grouped`` in routers/jobs.py)."""
+    if target_ids is None:
+        return _pipeline_status_counts_python(
+            supabase, since, until, target_ids, user_id
+        )
+    if not target_ids:
+        return Counter()
+    try:
+        resp = execute_with_retry_sync(
+            lambda: supabase.rpc(
+                "insights_pipeline_status_counts",
+                {
+                    "p_target_ids": sorted(target_ids),
+                    "p_since": since.isoformat() if since else None,
+                    "p_until": until.isoformat() if until else None,
+                    "p_user_id": user_id,
+                },
+            ).execute(),
+            label="insights/pipeline_status_counts",
+        )
+    except Exception:
+        return _pipeline_status_counts_python(
+            supabase, since, until, target_ids, user_id
+        )
+    return Counter(
+        {
+            cast(str, row["status"]): int(row["count"])
+            for row in cast(list[Row], resp.data or [])
+        }
+    )
 
 
 def _fetch_status_logs_window(
@@ -262,14 +367,15 @@ def _fetch_status_logs_window(
     return _rows(_base(), label="insights/status_logs_window")
 
 
-def _kpis_from(postings: list[Row], status_logs: list[Row]) -> PipelinePeriodKpis:
-    """Pure aggregation: derive the 5 top-line KPIs from already-fetched
-    postings + status logs for one window. Used for both the current and
-    prior periods so the math stays in one place."""
-    status_counts: Counter[str] = Counter()
-    for p in postings:
-        status_counts[p["status"]] += 1
-
+def _kpis_from(
+    status_counts: Counter[str], status_logs: list[Row]
+) -> PipelinePeriodKpis:
+    """Pure aggregation: derive the 5 top-line KPIs from the per-status counts
+    (computed server-side by ``_pipeline_status_counts``, #101) + the
+    already-fetched status logs for one window. Used for both the current and
+    prior periods so the math stays in one place. The applied→interview
+    response-time pairing stays in Python — it runs on ``status_log``, which
+    is ~1 row at beta scale (#101 deferral)."""
     total_applications = sum(status_counts.get(s, 0) for s in APPLIED_STATUSES)
     total_interviews = status_counts.get("interviewing", 0) + status_counts.get("offer", 0)
     total_offers = status_counts.get("offer", 0)
@@ -319,9 +425,17 @@ def compute_pipeline(
     service-role and bypasses RLS. *user_id* resolves the per-user pipeline
     status from ``user_jobs`` (#75 C4: ``jobs.status`` was dropped).
     """
-    postings = _fetch_postings_window(supabase, since, None, target_ids, user_id)
-    posting_ids = {str(p["id"]) for p in postings}
+    # Per-status funnel/KPI tallies come from the server-side GROUP BY RPC
+    # (#101) — the ~11k posting + ~11k user_jobs rows never leave Postgres.
+    # The windowed posting-id SET is still resolved client-side to bound the
+    # velocity / response-time follow-ups (status_log + resume documents),
+    # whose time-series logic stays in Python (status_log is ~1 row at beta
+    # scale — moving it is risk without payoff, #101).
+    posting_ids = _fetch_window_posting_ids(supabase, since, None, target_ids)
     status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids)
+    status_counts = _pipeline_status_counts(
+        supabase, since, None, target_ids, user_id
+    )
 
     # Fetch tailored resumes for velocity (current window only). The
     # ``documents`` table has no ``target_id`` column (it was renamed
@@ -351,27 +465,26 @@ def compute_pipeline(
         else:
             resumes = _rows(_resume_base(), label="insights/pipeline_resumes")
 
-    # --- Funnel counts ---
-    status_counts: Counter[str] = Counter()
-    for p in postings:
-        status_counts[p["status"]] += 1
+    # --- Funnel counts (from the GROUP BY RPC, #101) ---
     funnel = [FunnelStage(stage=s, count=status_counts.get(s, 0)) for s in FUNNEL_ORDER]
 
     # --- Top-line KPIs (current window) ---
-    current = _kpis_from(postings, status_logs)
+    current = _kpis_from(status_counts, status_logs)
 
     # --- Prior-period KPIs (only when caller asked for a comparison) ---
     previous: PipelinePeriodKpis | None = None
     if prior_window is not None:
         prior_since, prior_until = prior_window
-        prior_postings = _fetch_postings_window(
-            supabase, prior_since, prior_until, target_ids, user_id
+        prior_posting_ids = _fetch_window_posting_ids(
+            supabase, prior_since, prior_until, target_ids
         )
-        prior_posting_ids = {str(p["id"]) for p in prior_postings}
         prior_logs = _fetch_status_logs_window(
             supabase, prior_since, prior_until, prior_posting_ids
         )
-        previous = _kpis_from(prior_postings, prior_logs)
+        prior_counts = _pipeline_status_counts(
+            supabase, prior_since, prior_until, target_ids, user_id
+        )
+        previous = _kpis_from(prior_counts, prior_logs)
 
     # --- Weekly velocity ---
     week_resumes: Counter[date] = Counter()
