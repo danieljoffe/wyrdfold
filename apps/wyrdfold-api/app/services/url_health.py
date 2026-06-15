@@ -137,52 +137,23 @@ def _select_due_jobs(
     # state is now per-user in user_jobs, so we instead skip any job that ANY
     # user has engaged with (a user_jobs row with status != 'new'). The
     # 'archived' skip is replaced by the global archived_at liveness gate.
-    engaged_resp = (
-        supabase.table("user_jobs")
-        .select("job_posting_id")
-        .neq("status", "new")
-        .execute()
-    )
-    engaged_ids = sorted(
-        {
-            cast(str, r["job_posting_id"])
-            for r in cast(list[dict[str, Any]], engaged_resp.data or [])
-        }
-    )
-
-    def _candidate_query() -> Any:
-        q = (
-            supabase.table("jobs")
-            .select("id, absolute_url, url_check_failure_count")
-            # Skip already-globally-dead jobs (#75 C3).
-            .is_("archived_at", "null")
-        )
-        # Skip jobs any user has engaged with (per-user saved/applied skip).
-        if engaged_ids:
-            q = q.not_.in_("id", engaged_ids)
-        return q
-
-    # Pull rows where last_url_check_at is either NULL or older than the
-    # cutoff. Supabase doesn't support OR composition over a NULL well, so we
-    # split into two queries and merge.
-    null_first = (
-        _candidate_query()
-        .is_("last_url_check_at", "null")
-        .limit(batch_size)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], null_first.data or [])
-    if len(rows) < batch_size:
-        remaining = batch_size - len(rows)
-        old = (
-            _candidate_query()
-            .lte("last_url_check_at", cutoff)
-            .order("last_url_check_at", desc=False)
-            .limit(remaining)
-            .execute()
-        )
-        rows.extend(cast(list[dict[str, Any]], old.data or []))
-    return rows
+    #
+    # The engaged-id exclusion is a server-side NOT EXISTS anti-join (#93):
+    # we no longer fetch the full engaged-id set into Python and exclude it via
+    # `.not_.in_`, which built an ever-growing request URL that PostgREST
+    # silently truncates as user_jobs fills. The engaged set now never leaves
+    # Postgres. `due_url_health_jobs` also collapses the old null-first +
+    # older-than-cutoff two-query merge into one ordered query: it returns live
+    # (archived_at IS NULL), unengaged jobs whose last_url_check_at IS NULL or
+    # <= cutoff, ORDER BY last_url_check_at ASC NULLS FIRST, LIMIT batch_size.
+    # NULLS FIRST puts every never-checked job ahead of every checked-but-stale
+    # job, so the first batch_size rows are the same set in the same order the
+    # two-query merge produced (all NULLs, then oldest non-NULLs).
+    due_resp = supabase.rpc(
+        "due_url_health_jobs",
+        {"p_cutoff": cutoff, "p_batch_size": batch_size},
+    ).execute()
+    return cast(list[dict[str, Any]], due_resp.data or [])
 
 
 def _merge_check_results(
