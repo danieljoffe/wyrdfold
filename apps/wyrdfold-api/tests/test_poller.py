@@ -428,7 +428,10 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
 
     assert summary["archived"] == 1
     update_payload = jobs_table.update.call_args.args[0]
-    assert update_payload["status"] == "archived"
+    # #75 C3: stale jobs are flagged globally-dead via archived_at, not the
+    # per-user jobs.status.
+    assert update_payload["archived_at"] is not None
+    assert "status" not in update_payload
     jobs_table.update.return_value.in_.assert_called_once_with("id", ["job-1"])
 
 

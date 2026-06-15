@@ -535,19 +535,16 @@ async def approve_tailored_resume(
 
     # Resume approval also advances the linked job posting to resume_ready;
     # cover letters don't drive job status.
-    if row.document_type == "resume" and row.job_posting_id:
-        supabase.table("jobs").update(
-            {"status": "resume_ready"}
-        ).eq("id", row.job_posting_id).execute()
-        # Dual-write (#75 C1): mirror into user_jobs when the caller is a JWT
-        # user. Api-key callers (user_id None) skip the mirror — fine for C1.
-        if user_id:
-            persistence.upsert_user_job(
-                supabase,
-                user_id=user_id,
-                job_posting_id=row.job_posting_id,
-                status="resume_ready",
-            )
+    # Per-user pipeline state lives in user_jobs (#75 C3): no longer touch
+    # the global jobs.status. Api-key callers (user_id None) have no per-user
+    # pipeline, so they skip the mirror; cover letters don't drive job status.
+    if row.document_type == "resume" and row.job_posting_id and user_id:
+        persistence.upsert_user_job(
+            supabase,
+            user_id=user_id,
+            job_posting_id=row.job_posting_id,
+            status="resume_ready",
+        )
 
     return record
 
@@ -570,18 +567,15 @@ async def unapprove_tailored_resume(
 
     # Mirror the approve side: resume unlock walks the linked job back to
     # resume_draft so the lifecycle stays in sync.
-    if row.document_type == "resume" and row.job_posting_id:
-        supabase.table("jobs").update(
-            {"status": "resume_draft"}
-        ).eq("id", row.job_posting_id).execute()
-        # Dual-write (#75 C1): see approve_tailored_resume.
-        if user_id:
-            persistence.upsert_user_job(
-                supabase,
-                user_id=user_id,
-                job_posting_id=row.job_posting_id,
-                status="resume_draft",
-            )
+    # Per-user pipeline state lives in user_jobs (#75 C3): see
+    # approve_tailored_resume.
+    if row.document_type == "resume" and row.job_posting_id and user_id:
+        persistence.upsert_user_job(
+            supabase,
+            user_id=user_id,
+            job_posting_id=row.job_posting_id,
+            status="resume_draft",
+        )
 
     return record
 

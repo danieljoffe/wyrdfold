@@ -1267,9 +1267,16 @@ async def _poll_one_source(
         )
 
         if stale_ids:
+            # Flag stale/delisted jobs globally-dead via archived_at (#75 C3
+            # — global liveness, distinct from per-user jobs.status).
             archive_query = (
                 supabase.table("jobs")
-                .update({"status": "archived", "updated_at": datetime.now(UTC).isoformat()})
+                .update(
+                    {
+                        "archived_at": datetime.now(UTC).isoformat(),
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                )
                 .in_("id", stale_ids)
             )
             # Both writes are idempotent (UPDATE with stable WHERE), so a

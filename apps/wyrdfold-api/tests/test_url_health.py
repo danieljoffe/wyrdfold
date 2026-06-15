@@ -137,9 +137,11 @@ def test_archive_with_data_drop_nulls_heavy_fields() -> None:
     sb = _mock_supabase(sink)
     n = _archive_with_data_drop(sb, ["j1", "j2"])
     assert n == 2
-    # First update: jobs table — status + description_html=null.
+    # First update: jobs table — global archived_at + description_html=null
+    # (#75 C3: global liveness, not the per-user jobs.status).
     jobs_payload = sink[0]["payload"]
-    assert jobs_payload["status"] == "archived"
+    assert jobs_payload["archived_at"] is not None
+    assert "status" not in jobs_payload
     assert jobs_payload["description_html"] is None
     assert "updated_at" in jobs_payload
     # Second update: scores table — heavy fields NULL'd.
@@ -157,6 +159,92 @@ def test_archive_with_data_drop_noop_on_empty() -> None:
     n = _archive_with_data_drop(sb, [])
     assert n == 0
     sb.table.assert_not_called()
+
+
+# ---- _select_due_jobs candidate selection ---------------------------------
+
+
+def test_select_due_jobs_gates_on_archived_at_and_engaged() -> None:
+    """#75 C3: candidates are gated on global liveness (archived_at IS NULL)
+    and the per-user saved/applied skip (exclude jobs ANY user engaged with,
+    i.e. has a user_jobs row with status != 'new')."""
+    from app.services.url_health import _select_due_jobs
+
+    sb = MagicMock()
+
+    # Capture the candidate query so we can assert the filters applied.
+    captured: dict[str, Any] = {}
+
+    def table(name: str) -> Any:
+        if name == "user_jobs":
+            uj = MagicMock()
+            uj.select.return_value.neq.return_value.execute.return_value = (
+                MagicMock(data=[{"job_posting_id": "engaged-1"}])
+            )
+            return uj
+        # jobs candidate query — record the filter chain via a recording mock.
+        jobs = MagicMock()
+        sel = jobs.select.return_value
+
+        def is_(col: str, val: str) -> Any:
+            captured.setdefault("is_cols", []).append(col)
+            return sel
+
+        def not_in(col: str, ids: list[str]) -> Any:
+            captured["not_in"] = (col, ids)
+            return sel
+
+        sel.is_.side_effect = is_
+        sel.not_.in_.side_effect = not_in
+        sel.limit.return_value.execute.return_value = MagicMock(data=[])
+        sel.order.return_value.limit.return_value.execute.return_value = (
+            MagicMock(data=[])
+        )
+        return jobs
+
+    sb.table.side_effect = table
+
+    _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
+
+    # archived_at IS NULL gate applied; engaged jobs excluded.
+    assert "archived_at" in captured["is_cols"]
+    assert captured["not_in"] == ("id", ["engaged-1"])
+
+
+def test_select_due_jobs_skips_engaged_exclusion_when_none() -> None:
+    """No engaged jobs → no .not_.in_ exclusion (would otherwise filter
+    everything out on an empty set)."""
+    from app.services.url_health import _select_due_jobs
+
+    sb = MagicMock()
+    captured: dict[str, Any] = {"not_in_called": False}
+
+    def table(name: str) -> Any:
+        if name == "user_jobs":
+            uj = MagicMock()
+            uj.select.return_value.neq.return_value.execute.return_value = (
+                MagicMock(data=[])
+            )
+            return uj
+        jobs = MagicMock()
+        sel = jobs.select.return_value
+        sel.is_.return_value = sel
+
+        def not_in(col: str, ids: list[str]) -> Any:
+            captured["not_in_called"] = True
+            return sel
+
+        sel.not_.in_.side_effect = not_in
+        sel.limit.return_value.execute.return_value = MagicMock(data=[])
+        sel.order.return_value.limit.return_value.execute.return_value = (
+            MagicMock(data=[])
+        )
+        return jobs
+
+    sb.table.side_effect = table
+
+    _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
+    assert captured["not_in_called"] is False
 
 
 # ---- run_url_health_check end-to-end --------------------------------------
