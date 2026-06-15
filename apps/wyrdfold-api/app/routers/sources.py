@@ -40,8 +40,11 @@ router = APIRouter(
 _SOURCE_LIST_COLS = "id, board_token, company_name, provider, enabled, job_count"
 
 
+# Sync `def` (not `async def`): the supabase-py client is synchronous, so
+# FastAPI runs these handlers in its threadpool — keeping the blocking
+# `.execute()` round-trips off the event loop. See #107.
 @router.get("")
-async def list_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
+def list_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
     resp = (
         supabase.table("sources")
         .select(_SOURCE_LIST_COLS)
@@ -52,7 +55,7 @@ async def list_sources(supabase: Client = Depends(get_supabase)) -> dict[str, An
 
 
 @router.post("", dependencies=[Depends(verify_api_key)])
-async def manage_source(
+def manage_source(
     body: SourceAction,
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
@@ -135,7 +138,7 @@ async def detect_provider(
 
 
 @router.post("/seed", dependencies=[Depends(verify_api_key)])
-async def seed_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
+def seed_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
     supabase.table("sources").upsert(
         list(COMPANY_SEED), on_conflict="board_token"
     ).execute()

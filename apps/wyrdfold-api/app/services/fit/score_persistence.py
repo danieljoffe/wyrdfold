@@ -19,6 +19,7 @@ the UI, retro-backfill scripts).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -125,9 +126,15 @@ async def score_with_phase2_and_persist(
         # rather than blowing away historical logistics data.
         if fit.logistics is not None:
             update_payload["logistics_filters"] = fit.logistics.model_dump()
-        supabase.table("scores").update(update_payload).eq(
-            "job_posting_id", job_posting_id
-        ).eq("target_id", target.id).execute()
+        # Offload the blocking supabase round-trip so the persist step
+        # doesn't stall the event loop the Phase-2 fan-out runs on (#107).
+        await asyncio.to_thread(
+            lambda: supabase.table("scores")
+            .update(update_payload)
+            .eq("job_posting_id", job_posting_id)
+            .eq("target_id", target.id)
+            .execute()
+        )
     except Exception:
         logger.exception(
             "Phase 2 persist failed for job %s / target %s",
