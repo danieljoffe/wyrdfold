@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 TABLE = "scores"
 
+# PostgREST encodes every id of an ``id=in.(...)`` filter into the request
+# URL (~38 chars per UUID). ``get_target_scores`` takes a caller-supplied
+# id list that can scale with a source's job feed (e.g. a full page of the
+# list-view overlay), so the lookup is chunked at this size to stay under
+# PostgREST's request-URL limit — the same sizing as the jobs router,
+# recency, and insights.
+_IN_CHUNK_SIZE = 200
+
 
 def _parse_score(row: dict[str, Any]) -> JobTargetScore:
     return JobTargetScore(
@@ -344,13 +352,36 @@ def get_target_scores(
     target_id: str,
     job_posting_ids: list[str] | None = None,
 ) -> dict[str, JobTargetScore]:
-    """Return target scores keyed by job_posting_id."""
-    query = supabase.table(TABLE).select("*").eq("target_id", target_id)
-    if job_posting_ids is not None:
-        query = query.in_("job_posting_id", job_posting_ids)
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    return {r["job_posting_id"]: _parse_score(r) for r in rows}
+    """Return target scores keyed by job_posting_id.
+
+    When ``job_posting_ids`` is supplied it can be large (a caller may pass
+    a full page of the list-view overlay), so the ``.in_()`` filter is
+    chunked at ``_IN_CHUNK_SIZE`` to stay under PostgREST's request-URL
+    limit. The merged dict is the union of all batches — identical to a
+    single ``.in_()`` since rows are keyed by ``job_posting_id``. ``None``
+    keeps the unfiltered all-targets-scores read. An empty list returns an
+    empty dict without relaxing to an unbounded SELECT.
+    """
+    if job_posting_ids is None:
+        resp = (
+            supabase.table(TABLE).select("*").eq("target_id", target_id).execute()
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        return {r["job_posting_id"]: _parse_score(r) for r in rows}
+
+    out: dict[str, JobTargetScore] = {}
+    for i in range(0, len(job_posting_ids), _IN_CHUNK_SIZE):
+        chunk = job_posting_ids[i : i + _IN_CHUNK_SIZE]
+        resp = (
+            supabase.table(TABLE)
+            .select("*")
+            .eq("target_id", target_id)
+            .in_("job_posting_id", chunk)
+            .execute()
+        )
+        for r in cast(list[dict[str, Any]], resp.data or []):
+            out[r["job_posting_id"]] = _parse_score(r)
+    return out
 
 
 # ---- Global score aggregation ----------------------------------------------
