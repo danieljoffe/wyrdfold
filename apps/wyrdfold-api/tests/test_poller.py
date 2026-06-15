@@ -346,24 +346,20 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
     ``last_polled_at`` stamp (sources table).
     """
     jobs_table = MagicMock()
-    # #75 C4: existing rows are fetched live-only via ``.is_("archived_at",
-    # "null")`` (engaged_ids from user_jobs is empty here, so no extra
-    # ``.not_.in_("id", …)`` link).
-    existing_query = jobs_table.select.return_value.eq.return_value.is_.return_value
-    existing_query.execute.return_value.data = existing_rows
-
-    # Per-user engagement skip (#75 C4): user_jobs query returns no engaged
-    # jobs in these tests.
-    user_jobs_table = MagicMock()
-    user_jobs_table.select.return_value.neq.return_value.execute.return_value.data = []
 
     sources_table = MagicMock()
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
-        "user_jobs": user_jobs_table,
     }[name]
+
+    # #93: existing live, unengaged rows are fetched via the server-side
+    # NOT EXISTS anti-join RPC (``source_live_unengaged_jobs``) instead of a
+    # ``.table("jobs").select().eq().is_()`` query plus a ``user_jobs`` engaged
+    # fetch + client-side ``.not_.in_("id", …)``. The engaged set never leaves
+    # Postgres now, so there's no user_jobs round-trip to mock.
+    supabase.rpc.return_value.execute.return_value.data = existing_rows
     return supabase, jobs_table, sources_table
 
 

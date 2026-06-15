@@ -800,31 +800,19 @@ async def _poll_one_source(
         # stale-archive pass. Now: 'archived' is the global archived_at gate,
         # and 'saved'/'applied' become "any user engaged with it" — a
         # user_jobs row with status != 'new" — mirroring url_health.
-        engaged_resp = await asyncio.to_thread(
-            execute_with_retry_sync,
-            supabase.table("user_jobs")
-            .select("job_posting_id")
-            .neq("status", "new")
-            .execute,
-            label=f"poll engaged {company_name}",
-        )
-        engaged_ids = sorted(
-            {
-                cast(str, r["job_posting_id"])
-                for r in cast(list[dict[str, Any]], engaged_resp.data or [])
-            }
-        )
-        existing_query = (
-            supabase.table("jobs")
-            .select("id, external_id, title, company_name")
-            .eq("source_id", source_id)
-            .is_("archived_at", "null")
-        )
-        if engaged_ids:
-            existing_query = existing_query.not_.in_("id", engaged_ids)
+        #
+        # The engaged-id exclusion is a server-side NOT EXISTS anti-join (#93):
+        # we no longer pull the full engaged-id set into Python and exclude it
+        # via `.not_.in_`, which built an ever-growing request URL that
+        # PostgREST silently truncates as user_jobs fills. The engaged set now
+        # never leaves Postgres. `source_live_unengaged_jobs` returns exactly
+        # the live (archived_at IS NULL), unengaged jobs for this source with
+        # the same columns existing_rows is read for below.
         existing_resp = await asyncio.to_thread(
             execute_with_retry_sync,
-            existing_query.execute,
+            supabase.rpc(
+                "source_live_unengaged_jobs", {"p_source_id": source_id}
+            ).execute,
             label=f"poll existing {company_name}",
         )
         existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
