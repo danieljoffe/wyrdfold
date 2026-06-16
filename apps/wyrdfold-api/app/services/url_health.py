@@ -311,8 +311,8 @@ async def run_url_health_check(
     # re-querying keeps this idempotent across crashes mid-batch.)
     checked_ids = list(status_by_job.keys())
     try:
-        refreshed = (
-            supabase.table("jobs")
+        refreshed = await asyncio.to_thread(
+            lambda: supabase.table("jobs")
             .select("id, url_check_failure_count")
             .in_("id", checked_ids)
             .gte("url_check_failure_count", threshold)

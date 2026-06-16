@@ -255,7 +255,9 @@ async def upload_resume(
         "file_size_bytes": len(file_bytes),
         "warnings": warnings,
     }
-    supabase.table("uploaded_resumes").insert(upload_row).execute()
+    await asyncio.to_thread(
+        lambda: supabase.table("uploaded_resumes").insert(upload_row).execute()
+    )
 
     # Optional: auto-derive
     optimized_doc_id: str | None = None
@@ -447,11 +449,15 @@ async def derive_optimized_stream(
     have already been sent. Pre-flight errors (missing prose) still come
     back as HTTP 404 before any SSE frame is written.
     """
-    prose_doc = prose.get_latest(supabase, user_id=user_id)
+    prose_doc = await asyncio.to_thread(
+        lambda: prose.get_latest(supabase, user_id=user_id)
+    )
     if prose_doc is None:
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
-    previous = optimized.get_latest(supabase, user_id=user_id)
+    previous = await asyncio.to_thread(
+        lambda: optimized.get_latest(supabase, user_id=user_id)
+    )
 
     async def generate() -> AsyncIterator[bytes]:
         if (
@@ -495,16 +501,18 @@ async def derive_optimized_stream(
             yield _sse_event("error", {"detail": f"invalid payload: {exc}"})
             return
 
-        cost_log.record(
-            supabase,
-            user_id=user_id,
-            purpose=derive.DEFAULT_PURPOSE,
-            result=result,
-            metadata={
-                "prose_doc_id": prose_doc.id,
-                "prose_version": prose_doc.version,
-                "streamed": True,
-            },
+        await asyncio.to_thread(
+            lambda: cost_log.record(
+                supabase,
+                user_id=user_id,
+                purpose=derive.DEFAULT_PURPOSE,
+                result=result,
+                metadata={
+                    "prose_doc_id": prose_doc.id,
+                    "prose_version": prose_doc.version,
+                    "streamed": True,
+                },
+            )
         )
 
         carried = (
@@ -517,12 +525,14 @@ async def derive_optimized_stream(
         merged = annotations.merge_annotations(carried, payload.annotations)
         payload = payload.model_copy(update={"annotations": merged})
 
-        doc = optimized.create_version(
-            supabase,
-            user_id=user_id,
-            payload=payload,
-            prose_doc_id=prose_doc.id,
-            source="llm",
+        doc = await asyncio.to_thread(
+            lambda: optimized.create_version(
+                supabase,
+                user_id=user_id,
+                payload=payload,
+                prose_doc_id=prose_doc.id,
+                source="llm",
+            )
         )
         await chunks.upsert_for_optimized(
             supabase,

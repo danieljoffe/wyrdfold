@@ -10,6 +10,7 @@ the target already has a similar-enough resume that can be cloned.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -145,8 +146,8 @@ async def process_batch(
     # Load target scoring keywords for reuse checks (#504)
     scoring_keywords: set[str] | None = None
     if target_id and not force_fresh:
-        target_resp = (
-            supabase.table("targets")
+        target_resp = await asyncio.to_thread(
+            lambda: supabase.table("targets")
             .select("scoring_profile")
             .eq("id", target_id)
             .execute()
