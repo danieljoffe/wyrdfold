@@ -15,6 +15,7 @@ is cacheable so repeated runs on the same target only pay variable-tokens.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -264,8 +265,8 @@ async def run_llm_learner(
     if len(feedback) < _MIN_FEEDBACK_FOR_LEARN:
         return None
 
-    target_resp = (
-        supabase.table("targets")
+    target_resp = await asyncio.to_thread(
+        lambda: supabase.table("targets")
         .select("*")
         .eq("id", target_id)
         .single()
@@ -334,13 +335,18 @@ async def run_llm_learner(
 
     # Apply
     new_version = cast(int, target_row.get("profile_version") or 1) + 1
-    supabase.table("targets").update(
-        {
-            "scoring_profile": next_profile,
-            "profile_version": new_version,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", target_id).execute()
+    await asyncio.to_thread(
+        lambda: supabase.table("targets")
+        .update(
+            {
+                "scoring_profile": next_profile,
+                "profile_version": new_version,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("id", target_id)
+        .execute()
+    )
 
     log = _insert_log(
         supabase,
