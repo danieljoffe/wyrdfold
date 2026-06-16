@@ -2,7 +2,7 @@ import type { ComponentType, ReactNode, SVGProps } from 'react';
 import Link from 'next/link';
 import { Mail } from 'lucide-react';
 import Button from '@/components/Button';
-import WyrdfoldLogo from '@/components/WyrdfoldLogo';
+import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';
 
 // lucide-react 1.x removed its deprecated brand icons; these are the same
 // stroke paths the 0.x Github/Linkedin icons used, inlined.
@@ -108,10 +108,7 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
             aria-label='WyrdFold home'
             className='flex items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
           >
-            <WyrdfoldLogo aria-label='WyrdFold' className='h-5 w-6' />
-            <span className='text-base text-text-tertiary uppercase tracking-[6px]'>
-              WyrdFold
-            </span>
+            <WyrdfoldWordmark aria-hidden className='h-6 w-auto' />
             <span
               className='ml-1 inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-brand-950 dark:text-brand-300'
               aria-label='Private beta'
