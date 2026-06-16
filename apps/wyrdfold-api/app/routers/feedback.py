@@ -176,11 +176,14 @@ async def run_llm_learner_now(
     )
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.get(
     "/targets/{target_id}/learning-log",
     response_model=list[TargetLearningLogRow],
 )
-async def list_learning_log(
+def list_learning_log(
     target_id: str,
     status: str | None = Query(
         default=None, pattern="^(applied|staged|rejected)$"

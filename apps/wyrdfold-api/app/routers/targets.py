@@ -885,8 +885,11 @@ async def poll_jobs_for_target(
     return await poll_sources_for_target(supabase, target)
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.get("/{target_id}/status", response_model=TargetStatusResponse)
-async def get_target_status(
+def get_target_status(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> TargetStatusResponse:
@@ -972,8 +975,8 @@ async def create_target_from_posting(
     scoring profile from the description via LLM, stores the JD as a
     reference, and activates the target.
     """
-    resp = (
-        supabase.table("jobs")
+    resp = await asyncio.to_thread(
+        lambda: supabase.table("jobs")
         .select("id, title, description_html, absolute_url")
         .eq("id", posting_id)
         .execute()
