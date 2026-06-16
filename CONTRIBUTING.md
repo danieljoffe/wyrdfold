@@ -48,6 +48,28 @@ CI will run:
 Authed Playwright specs stay local-only — they need real Supabase
 service-role creds.
 
+## Database migrations
+
+Migrations live in `supabase/migrations/` and are **forward-only** — never
+edit one after it merges; add a new migration instead.
+
+**Destructive DDL is guarded ([#109]).** `DROP COLUMN`, `DROP TABLE`, and
+`TRUNCATE` are irreversible: if the backfill they depend on is wrong, the
+row data is gone with no recovery path. A pytest check
+(`apps/wyrdfold-api/tests/test_migration_safety.py`) fails CI on any _new_
+migration that introduces one without a deliberate guard. To add a
+destructive migration:
+
+1. **Snapshot first**, in the same migration —
+   `CREATE TABLE _jobs_status_backup AS SELECT id, status FROM jobs;`
+2. **Verify the backfill row-counts match** before the drop.
+3. Keep the drop in its **own clearly-labeled migration**, decoupled from
+   the backfill it depends on.
+4. Add a `-- guarded-destructive: <why it's safe / where the snapshot is>`
+   comment so the check passes and reviewers see the acknowledgement.
+
+[#109]: https://github.com/danieljoffe/wyrdfold/issues/109
+
 ## PR conventions
 
 - **Title**: imperative, scope-prefixed, under ~70 chars
