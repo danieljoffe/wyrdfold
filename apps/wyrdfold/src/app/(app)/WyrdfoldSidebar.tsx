@@ -17,7 +17,7 @@ import {
 import Button from '@/components/Button';
 import { cn } from '@/lib/cn';
 import DarkModeToggle from '@/components/Nav/DarkModeToggle';
-import WyrdfoldLogo from '@/components/WyrdfoldLogo';
+import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';
 
 // Mobile sheet ships its own JSX, useFocusTrap, and the secondary nav.
 // `dynamic({ ssr: false })` keeps it out of the eager bundle on every
@@ -112,16 +112,11 @@ export default function WyrdfoldSidebar() {
             aria-label='WyrdFold home'
             className='flex items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
           >
-            {/* Decorative — the visible "WyrdFold" text and the link's
-                aria-label "WyrdFold home" already name this control.
-                The SVG having its own aria-label produced "WyrdFold
-                WyrdFold" in the accessible name, which Lighthouse's
-                ``label-content-name-mismatch`` flagged against the
-                outer "WyrdFold home" override. */}
-            <WyrdfoldLogo aria-hidden className='h-4 w-5' />
-            <span className='text-sm font-semibold text-text-primary'>
-              WyrdFold
-            </span>
+            {/* Decorative — the link's aria-label "WyrdFold home" already
+                names this control. Giving the wordmark its own aria-label
+                produced "WyrdFold WyrdFold home" in the accessible name,
+                which Lighthouse's ``label-content-name-mismatch`` flagged. */}
+            <WyrdfoldWordmark aria-hidden className='h-5 w-auto' />
           </Link>
         </div>
         <nav className='flex-1 overflow-y-auto p-2 space-y-0.5'>
