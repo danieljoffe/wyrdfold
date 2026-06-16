@@ -47,7 +47,7 @@ export default defineConfig({
     url: baseURL,
     reuseExistingServer: !process.env['CI'],
     cwd: workspaceRoot,
-    // proxy.ts hard-401s when these are absent. The smoke specs run with no
+    // proxy.ts returns 503 when these are absent. The smoke specs run with no
     // auth cookie, so getUser() returns null without ever calling out to the
     // dummy URL — the values just need to be present strings. Real Supabase
     // creds stay in Vercel/CI secrets for environments that exercise auth.
