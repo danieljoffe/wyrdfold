@@ -68,7 +68,24 @@ destructive migration:
 4. Add a `-- guarded-destructive: <why it's safe / where the snapshot is>`
    comment so the check passes and reviewers see the acknowledgement.
 
+**Index builds on hot tables are guarded ([#112]).** A plain `CREATE INDEX`
+takes a SHARE lock that blocks writes for the whole build — on continuously
+written tables (`jobs`, `scores`, `llm_costs`, `status_log`,
+`source_discoveries`, `user_jobs`) that stalls the poller/scoring/cost
+writers. The same check fails CI on a _new_ index on one of those tables
+unless you either:
+
+- build it **`CONCURRENTLY`** in its own single-statement migration —
+  `CONCURRENTLY` can't run inside the transaction `supabase db push` wraps
+  each file in, so it needs its own file; or
+- add a `-- index-lock-ok: <reason>` comment if the table is still small
+  enough that a brief write lock is acceptable at current scale.
+
+Indexes on other (cold/small) tables are unguarded — a quick build lock
+there is fine.
+
 [#109]: https://github.com/danieljoffe/wyrdfold/issues/109
+[#112]: https://github.com/danieljoffe/wyrdfold/issues/112
 
 ## PR conventions
 
