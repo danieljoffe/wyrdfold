@@ -50,7 +50,21 @@ export async function proxy(request: NextRequest) {
   const cspValue = buildCspValue(request, nonce);
 
   if (!supabaseUrl || !anonKey) {
-    return new NextResponse('Supabase configuration missing', { status: 401 });
+    // Missing anon URL/key is a server-side misconfiguration, not a failed
+    // auth challenge — 503 is the honest status (no client credential fixes
+    // it). In development we name the absent vars and the remedy; in
+    // production we stay terse so a misconfigured deploy doesn't advertise
+    // its internals to the public internet.
+    const missing = [
+      !supabaseUrl && 'NEXT_PUBLIC_SUPABASE_URL',
+      !anonKey && 'NEXT_PUBLIC_SUPABASE_ANON_ID',
+    ]
+      .filter(Boolean)
+      .join(', ');
+    const body = isProduction()
+      ? 'Service unavailable'
+      : `Supabase configuration missing: ${missing}. Copy apps/wyrdfold/.env.example to apps/wyrdfold/.env.local and fill these in (see apps/wyrdfold/SETUP.md).`;
+    return new NextResponse(body, { status: 503 });
   }
 
   request.headers.set('x-nonce', nonce);
