@@ -170,8 +170,8 @@ async def create_tailored_resume(
             supabase, user_id=user_id, job_posting_id=body.job_posting_id
         )
         if target_id:
-            target_resp = (
-                supabase.table("targets")
+            target_resp = await asyncio.to_thread(
+                lambda: supabase.table("targets")
                 .select("scoring_profile")
                 .eq("id", target_id)
                 .execute()
@@ -772,8 +772,8 @@ async def create_batch_resumes(
     # Single .in_() round-trip; .in_() does not guarantee row order, so re-map
     # by id to preserve the input ordering (downstream processes jobs in
     # request order).
-    resp = (
-        supabase.table("jobs")
+    resp = await asyncio.to_thread(
+        lambda: supabase.table("jobs")
         .select("id, title, description_html")
         .in_("id", body.job_posting_ids)
         .execute()

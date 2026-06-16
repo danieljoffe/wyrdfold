@@ -170,9 +170,12 @@ async def run_tailor_pipeline(
     except Exception:
         storage_path = None
     if storage_path:
-        supabase.table(persistence.TABLE).update({"storage_path": storage_path}).eq(
-            "id", record.id
-        ).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table(persistence.TABLE)
+            .update({"storage_path": storage_path})
+            .eq("id", record.id)
+            .execute()
+        )
         record = record.model_copy(update={"storage_path": storage_path})
 
     return PipelineSuccess(
@@ -307,9 +310,12 @@ async def run_cover_letter_pipeline(
     except Exception:
         storage_path = None
     if storage_path:
-        supabase.table(persistence.TABLE).update({"storage_path": storage_path}).eq(
-            "id", record.id
-        ).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table(persistence.TABLE)
+            .update({"storage_path": storage_path})
+            .eq("id", record.id)
+            .execute()
+        )
         record = record.model_copy(update={"storage_path": storage_path})
 
     return CoverLetterPipelineSuccess(

@@ -11,6 +11,7 @@ unit-tested without a DB or embedding client.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import Any, cast
 
@@ -150,6 +151,8 @@ async def upsert_for_optimized(
         }
         for c, vector in zip(inputs, result.embeddings, strict=True)
     ]
-    resp = supabase.table(TABLE).insert(rows).execute()
+    resp = await asyncio.to_thread(
+        lambda: supabase.table(TABLE).insert(rows).execute()
+    )
     inserted = cast(list[dict[str, Any]], resp.data or [])
     return [Chunk.model_validate(r) for r in inserted]

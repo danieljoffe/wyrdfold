@@ -85,8 +85,11 @@ def _assert_user_owns_posting(
     return posting
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.get("/{posting_id}/status-history")
-async def get_status_history(
+def get_status_history(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
@@ -103,8 +106,11 @@ async def get_status_history(
     return {"entries": result.data or []}
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.post("/{posting_id}/status")
-async def update_status(
+def update_status(
     posting_id: str,
     body: StatusUpdate,
     user_id: str = Depends(get_current_user_id),
