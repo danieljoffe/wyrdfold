@@ -256,6 +256,80 @@ def test_validate_keeps_bullets_matching_role_summary_substring() -> None:
     assert len(cleaned.experience[0].bullets) == 1
 
 
+def test_validate_pins_company_from_source_role() -> None:
+    # The LLM labels the role with a company the user never worked at; the
+    # source_role_ref still points at a real role (#87 employer misattribution).
+    resume = TailoredResume(
+        summary="x",
+        contact=_contact(),
+        experience=[
+            TailoredRole(
+                company="HubSpot",
+                title="Senior Frontend Engineer",
+                start="2021-11",
+                end="2024-04",
+                bullets=[],
+                source_role_ref="fc",
+            )
+        ],
+        skills=[],
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.experience[0].company == "FightCamp"
+    assert any("Corrected employer" in w and "HubSpot" in w for w in warnings)
+
+
+def test_validate_pins_dates_from_source_role() -> None:
+    # Invented dates (impossible overlap) are overwritten from the source
+    # Role's stored timeline (#87 date fabrication).
+    resume = TailoredResume(
+        summary="x",
+        contact=_contact(),
+        experience=[
+            TailoredRole(
+                company="FightCamp",
+                title="Senior Frontend Engineer",
+                start="2099-01",
+                end="2099-12",
+                bullets=[],
+                source_role_ref="fc",
+            )
+        ],
+        skills=[],
+    )
+    cleaned, _ = validate_trace_refs(resume, _optimized())
+    assert cleaned.experience[0].start == "2021-11"
+    assert cleaned.experience[0].end == "2024-04"
+
+
+def test_validate_drops_cross_employer_bullet() -> None:
+    # The "Cut mobile load times" outcome belongs to role "fc" but is placed
+    # under "winc" — a cross-employer accomplishment leak (#87).
+    resume = TailoredResume(
+        summary="x",
+        contact=_contact(),
+        experience=[
+            TailoredRole(
+                company="Winc",
+                title="Frontend Engineer",
+                start="2018-01",
+                end="2021-10",
+                bullets=[
+                    TailoredBullet(
+                        text="Cut mobile LCP from 10s to 2s.",
+                        source_outcome_ref="Cut mobile load times from 10s to 2s",
+                    ),
+                ],
+                source_role_ref="winc",
+            )
+        ],
+        skills=[],
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.experience[0].bullets == []
+    assert any("wrong employer" in w for w in warnings)
+
+
 # ---- tailor_resume end-to-end --------------------------------------------
 
 
