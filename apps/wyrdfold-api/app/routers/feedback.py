@@ -26,6 +26,7 @@ from app.dependencies import (
     get_current_user_id,
     get_llm_client,
     get_supabase,
+    get_user_supabase,
 )
 from app.models.feedback import (
     FeedbackCreate,
@@ -124,7 +125,10 @@ async def list_feedback(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #79 Phase 2 (job_feedback slice): read through the caller's JWT so
+    # Postgres RLS (job_feedback_self_select) is the backstop. The user_id
+    # filter in list_for_target stays as belt-and-suspenders + 404 UX.
+    supabase: Client = Depends(get_user_supabase),
 ) -> FeedbackList:
     if not _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
