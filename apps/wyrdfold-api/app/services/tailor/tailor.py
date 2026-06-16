@@ -66,12 +66,28 @@ def validate_trace_refs(
     resume: TailoredResume,
     optimized: OptimizedPayload,
 ) -> tuple[TailoredResume, list[str]]:
-    """Drop bullets and raise on roles that don't trace back to the
-    OptimizedPayload. Returns the cleaned resume + a list of warning
-    strings about dropped bullets.
+    """Repair and validate a tailored resume against the OptimizedPayload.
+
+    Every pass is keyed off the source ``Role.id`` the LLM must echo as
+    ``source_role_ref``:
+
+    1. Unknown ``source_role_ref`` -> raise (the role is untraceable).
+    2. Pin ``company``/``start``/``end`` from the source Role. These are
+       facts, not tailored copy — trusting the LLM's free text let it
+       label a role with a company the user never worked at and invent
+       overlapping dates (#87). Pinning makes the displayed employer and
+       timeline always match the stored profile; a changed company is
+       surfaced as a warning.
+    3. Drop a bullet whose source outcome belongs to a *different* role
+       (``Outcome.role_ref`` != this role's ref) — a cross-employer
+       accomplishment leak (#87). Bullets that don't trace to any
+       outcome or the role summary are dropped as before.
+
+    Returns the repaired resume + warnings about every correction/drop.
     """
-    role_ids = {r.id for r in optimized.roles}
-    outcome_descriptions = {o.description for o in optimized.outcomes}
+    roles_by_id = {r.id: r for r in optimized.roles}
+    outcomes_by_desc = {o.description: o for o in optimized.outcomes}
+    outcome_descriptions = set(outcomes_by_desc)
     # Role summaries are also valid bullet sources — the prompt allows
     # "a literal clause from role.summary". We accept any non-empty summary
     # string as a valid ref (LLM can echo a sentence fragment).
@@ -83,7 +99,8 @@ def validate_trace_refs(
     cleaned_experience: list[TailoredRole] = []
 
     for role in resume.experience:
-        if role.source_role_ref not in role_ids:
+        source = roles_by_id.get(role.source_role_ref)
+        if source is None:
             raise ValueError(
                 f"TailoredRole references unknown role id: {role.source_role_ref!r}"
             )
@@ -102,8 +119,36 @@ def validate_trace_refs(
                     f"{bullet.text[:80]!r}"
                 )
                 continue
+            if traces_to_outcome:
+                outcome = outcomes_by_desc.get(ref)
+                if (
+                    outcome is not None
+                    and outcome.role_ref
+                    and outcome.role_ref != role.source_role_ref
+                ):
+                    warnings.append(
+                        "Dropped bullet attributed to the wrong employer "
+                        f"(outcome belongs to role {outcome.role_ref!r}, placed "
+                        f"under {role.source_role_ref!r}): {bullet.text[:80]!r}"
+                    )
+                    continue
             kept_bullets.append(bullet)
-        cleaned_role = role.model_copy(update={"bullets": kept_bullets})
+
+        if role.company != source.company:
+            warnings.append(
+                f"Corrected employer {role.company!r} -> {source.company!r} "
+                f"for role {source.id!r}"
+            )
+        # Company + dates are authoritative from the source Role, never the
+        # LLM's free text. Title is left to the tailoring step.
+        cleaned_role = role.model_copy(
+            update={
+                "bullets": kept_bullets,
+                "company": source.company,
+                "start": source.start,
+                "end": source.end,
+            }
+        )
         cleaned_experience.append(cleaned_role)
 
     return (
