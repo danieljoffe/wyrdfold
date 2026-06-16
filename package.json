@@ -113,6 +113,8 @@
     "overrides": {
       "axios": "^1.16.0",
       "tmp": "^0.2.4",
+      "form-data": "^4.0.6",
+      "js-yaml": "^4.2.0",
       "@opentelemetry/core": "2.8.0",
       "@opentelemetry/resources": "2.8.0",
       "@opentelemetry/sdk-trace-base": "2.8.0",
@@ -125,10 +127,9 @@
       "@typescript-eslint/visitor-keys": "8.58.2",
       "@typescript-eslint/scope-manager": "8.58.2",
       "next>postcss": "8.5.15",
-      "svix>uuid": "^11.1.1",
+      "uuid": "^11.1.1",
       "vite": "7.3.5",
       "@vitest/browser": ">=4.1.6",
-      "sockjs>uuid": "^11.1.1",
       "esbuild": "^0.28.1"
     },
     "onlyBuiltDependencies": [
