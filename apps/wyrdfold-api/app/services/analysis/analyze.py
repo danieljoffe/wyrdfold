@@ -16,6 +16,18 @@ DEFAULT_MODEL: ModelId = "claude-sonnet-4-6"
 DEFAULT_PURPOSE = "job_analysis"
 
 
+def _optimized_section(optimized: OptimizedPayload) -> str:
+    """The ``[OptimizedPayload]`` section — the user's master experience doc.
+
+    Emitted first and byte-identical across every analysis call in a session,
+    so ``analyze_job`` sets a ``cache_prefix_chars`` breakpoint at its end
+    (#73): the heavy master-doc prefix is cached and only the trailing
+    job-specific content is re-billed at full input price on a cache hit.
+    Mirrors the tailor path's helper of the same name.
+    """
+    return f"[OptimizedPayload]\n{optimized.model_dump_json(indent=2)}"
+
+
 def build_user_message(
     *,
     optimized: OptimizedPayload,
@@ -28,7 +40,7 @@ def build_user_message(
     per call lives here.
     """
     sections: list[str] = []
-    sections.append(f"[OptimizedPayload]\n{optimized.model_dump_json(indent=2)}")
+    sections.append(_optimized_section(optimized))
     if target_context:
         sections.append(f"[TargetContext]\n{target_context}")
     sections.append(f"[JobDescription]\n{job_description}")
@@ -59,7 +71,18 @@ async def analyze_job(
         llm,
         model=model,
         system=ANALYSIS_SYSTEM,
-        messages=[Message(role="user", content=user_message)],
+        # ``cache_prefix_chars`` marks the master-doc prefix as a
+        # prompt-cache breakpoint — the second cacheable prefix after the
+        # system prompt. Byte-identical split, see Message model. The
+        # ``\n\n`` section separator lives after the prefix so the cached
+        # bytes never vary with the job description.
+        messages=[
+            Message(
+                role="user",
+                content=user_message,
+                cache_prefix_chars=len(_optimized_section(optimized)),
+            )
+        ],
         schema=JobAnalysis,
         purpose=purpose,
         cache_system=True,

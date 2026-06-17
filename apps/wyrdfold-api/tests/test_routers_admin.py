@@ -58,8 +58,19 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
             return {"phase1_triage": 1.0, "phase2_fit": 0.5}
         return {"phase1_triage": 8.0, "phase2_fit": 4.0}
 
+    def _fake_cache_metrics_all(
+        _sb: Any, *, since: datetime | None = None
+    ) -> dict[str, int]:
+        assert since is not None  # endpoint always sets a window
+        if since >= datetime.now(UTC) - timedelta(hours=25):
+            # today: 800 read of 1000 total input tokens → 80% hit rate
+            return {"cache_read": 800, "cache_creation": 100, "uncached_input": 100}
+        # 30d: 8000 read of 10000 total → 80%
+        return {"cache_read": 8000, "cache_creation": 1000, "uncached_input": 1000}
+
     monkeypatch.setattr(cost_log, "total_spend_all", _fake_total_spend_all)
     monkeypatch.setattr(cost_log, "spend_by_purpose_all", _fake_spend_by_purpose_all)
+    monkeypatch.setattr(cost_log, "cache_metrics_all", _fake_cache_metrics_all)
     monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
 
     try:
@@ -77,6 +88,13 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
     assert body["today_usage_pct"] == 15.0  # 1.5 / 10 * 100
     assert body["by_purpose_today"] == {"phase1_triage": 1.0, "phase2_fit": 0.5}
     assert body["by_purpose_30d"] == {"phase1_triage": 8.0, "phase2_fit": 4.0}
+    assert body["cache_today"] == {
+        "cache_read_tokens": 800,
+        "cache_creation_tokens": 100,
+        "uncached_input_tokens": 100,
+        "hit_rate_pct": 80.0,  # 800 / (800 + 100 + 100) * 100
+    }
+    assert body["cache_30d"]["hit_rate_pct"] == 80.0  # 8000 / 10000 * 100
 
 
 def test_cost_summary_usage_pct_none_when_cap_disabled(
@@ -89,6 +107,11 @@ def test_cost_summary_usage_pct_none_when_cap_disabled(
     monkeypatch.setattr(
         cost_log, "spend_by_purpose_all", lambda _s, **_kw: {}
     )
+    monkeypatch.setattr(
+        cost_log,
+        "cache_metrics_all",
+        lambda _s, **_kw: {"cache_read": 0, "cache_creation": 0, "uncached_input": 0},
+    )
     monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
 
     try:
@@ -100,6 +123,8 @@ def test_cost_summary_usage_pct_none_when_cap_disabled(
     body = resp.json()
     assert body["global_daily_cap_usd"] == 0.0
     assert body["today_usage_pct"] is None
+    # No recorded input → hit rate is undefined, not a division error.
+    assert body["cache_today"]["hit_rate_pct"] is None
 
 
 def test_cost_summary_requires_api_key(client: TestClient) -> None:
