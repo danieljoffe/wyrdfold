@@ -133,6 +133,41 @@ class TestComputePipeline:
 
         assert result.avg_days_to_response == 6.0
 
+    def test_status_logs_window_scopes_to_user(self):
+        """#113: a shared posting can carry transitions from several users; the
+        window fetch returns only the caller's rows, and the admin/global path
+        (user_id=None) sees everyone's."""
+        from app.services.insights import _fetch_status_logs_window
+
+        seed = {
+            "status_log": [
+                {
+                    "posting_id": "p1",
+                    "user_id": _USER,
+                    "old_status": "applied",
+                    "new_status": "interviewing",
+                    "created_at": _ts(_NOW),
+                },
+                {
+                    "posting_id": "p1",
+                    "user_id": "other",
+                    "old_status": "applied",
+                    "new_status": "interviewing",
+                    "created_at": _ts(_NOW),
+                },
+            ]
+        }
+        mine = _fetch_status_logs_window(
+            _faithful_supabase(seed), None, None, {"p1"}, _USER
+        )
+        assert [r["posting_id"] for r in mine] == ["p1"]
+        assert len(mine) == 1
+
+        everyone = _fetch_status_logs_window(
+            _faithful_supabase(seed), None, None, {"p1"}, None
+        )
+        assert len(everyone) == 2
+
     def test_empty_data(self):
         sb = _mock_supabase({})
         result = compute_pipeline(sb, since=None)
@@ -373,12 +408,14 @@ class TestPipelineGroupByRpcByteIdentical:
         status_log = [
             {
                 "posting_id": "p4",
+                "user_id": _USER,
                 "old_status": "applied",
                 "new_status": "interviewing",
                 "created_at": _ts(_NOW - timedelta(days=2)),
             },
             {
                 "posting_id": "p4",
+                "user_id": _USER,
                 "old_status": "resume_ready",
                 "new_status": "applied",
                 "created_at": _ts(_NOW - timedelta(days=8)),
@@ -437,7 +474,7 @@ class TestPipelineGroupByRpcByteIdentical:
             if jobs_by_id[pid]["created_at"] >= since.isoformat()
         }
         ref_logs = _fetch_status_logs_window(
-            _faithful_supabase(seed), since, None, win_pids
+            _faithful_supabase(seed), since, None, win_pids, _USER
         )
         ref_current = _kpis_from(ref_counts, ref_logs)
 

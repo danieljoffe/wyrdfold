@@ -218,6 +218,63 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
     assert seen["user_jobs_kwargs"]["on_conflict"] == "user_id,job_posting_id"
 
 
+def test_status_history_scopes_to_caller(client_factory):
+    """#113: a shared posting can carry other users' transitions, so the
+    history query must filter status_log by the caller's user_id, not just the
+    posting."""
+    captured: dict[str, Any] = {}
+
+    def _build() -> MagicMock:
+        sb = MagicMock()
+
+        def _table(name: str):
+            t = MagicMock()
+            if name == "jobs":
+                t.select.return_value.eq.return_value.single.return_value.execute.return_value = _Resp(
+                    {"id": "abc"}
+                )
+            elif name == "user_targets":
+                t.select.return_value.eq.return_value.execute.return_value = _Resp(
+                    [{"target_id": _TEST_TARGET_ID}]
+                )
+            elif name == "scores":
+                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
+                    [{"target_id": _TEST_TARGET_ID}]
+                )
+            elif name == "status_log":
+                q = MagicMock()
+
+                def _eq(col: str, val: Any):
+                    captured[col] = val
+                    return q
+
+                q.eq.side_effect = _eq
+                q.order.return_value.limit.return_value.execute.return_value = _Resp(
+                    [
+                        {
+                            "id": "l1",
+                            "old_status": "saved",
+                            "new_status": "applied",
+                            "note": None,
+                            "created_at": "2026-01-01T00:00:00Z",
+                        }
+                    ]
+                )
+                t.select.return_value = q
+            return t
+
+        sb.table.side_effect = _table
+        return sb
+
+    client = client_factory(_build())
+    r = client.get("/jobs/abc/status-history")
+    assert r.status_code == 200
+    assert r.json()["entries"][0]["new_status"] == "applied"
+    # The query was scoped to BOTH the posting and the caller.
+    assert captured["posting_id"] == "abc"
+    assert captured["user_id"] == _TEST_USER_ID
+
+
 def test_status_update_only_evicts_owning_target_and_global_views(client_factory):
     """Sibling targets' cached pages must survive a status mutation."""
     from app.cache import job_list_cache, jobs_cache_prefix, make_cache_key
