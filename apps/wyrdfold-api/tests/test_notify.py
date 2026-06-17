@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,52 +16,100 @@ class _ExecuteStub:
         self.count = count
 
 
+class _Chain:
+    """A query chain whose builder methods all return self and whose
+    `.execute()` yields a fixed stub. Covers select/eq/is_/or_/in_/gte/
+    order/limit/upsert/update used across notify's queries."""
+
+    def __init__(self, stub: _ExecuteStub):
+        self._stub = stub
+
+    def __getattr__(self, _name: str):  # type: ignore[no-untyped-def]
+        def _return_self(*_a: Any, **_k: Any) -> _Chain:
+            return self
+
+        return _return_self
+
+    def execute(self) -> _ExecuteStub:
+        return self._stub
+
+
+def _synth_user_targets(profiles: list[dict]) -> list[dict]:
+    """One active target per profile (`t-<id>`), so each user is relevant to
+    their own jobs by default."""
+    return [
+        {"user_id": p["user_id"], "target_id": f"t-{p['id']}"} for p in profiles
+    ]
+
+
+def _synth_scores(profiles: list[dict], jobs: list[dict]) -> list[dict]:
+    """A scores row per (job × profile) at the job's own score — so the
+    per-target best score equals the legacy global job score, preserving
+    every threshold test's intent."""
+    rows: list[dict] = []
+    for job in jobs:
+        score = job.get("score")
+        if not isinstance(score, int):
+            continue
+        for p in profiles:
+            rows.append(
+                {
+                    "job_posting_id": job["id"],
+                    "target_id": f"t-{p['id']}",
+                    "score": score,
+                }
+            )
+    return rows
+
+
+def _prep_profiles(profiles: list[dict]) -> list[dict]:
+    """Give each profile a user_id if the test didn't (relevance keys off it)."""
+    for p in profiles:
+        p.setdefault("user_id", f"u-{p['id']}")
+    return profiles
+
+
 def _build_supabase_mock(
     profiles: list[dict],
+    jobs: list[dict] | None = None,
     claim_response: list[dict] | None = None,
+    scores_rows: list[dict] | None = None,
+    user_targets_rows: list[dict] | None = None,
 ) -> MagicMock:
-    """Returns a MagicMock that answers:
-    - table('user_profiles').select(...).eq(...).is_(...).execute()  → profiles
-    - table('notifications_sent').upsert(...).execute()           → claim_response
-    - table('notifications_sent').update(...).eq(...).execute()   → ok
-    - table('notifications_sent').select(..., count=...).eq(...)  → count stub
+    """Mock answering the email fan-out's reads:
+    - user_profiles  → profiles
+    - scores         → scores_rows (default: synthesized at each job's score)
+    - user_targets   → user_targets_rows (default: one target per profile)
+    - notifications_sent: 1st call = claim (upsert), 2nd = update
     """
-    profiles_chain = MagicMock()
-    profiles_chain.select.return_value = profiles_chain
-    profiles_chain.eq.return_value = profiles_chain
-    profiles_chain.is_.return_value = profiles_chain
-    profiles_chain.or_.return_value = profiles_chain
-    profiles_chain.execute.return_value = _ExecuteStub(profiles)
+    profiles = _prep_profiles(profiles)
+    jobs = jobs or []
+    scores = scores_rows if scores_rows is not None else _synth_scores(profiles, jobs)
+    targets = (
+        user_targets_rows
+        if user_targets_rows is not None
+        else _synth_user_targets(profiles)
+    )
 
-    claim_chain = MagicMock()
-    claim_chain.upsert.return_value = claim_chain
-    claim_chain.execute.return_value = _ExecuteStub(claim_response)
+    claim_chain = _Chain(_ExecuteStub(claim_response))
+    update_chain = _Chain(_ExecuteStub([]))
+    notif_calls = {"n": 0}
 
-    update_chain = MagicMock()
-    update_chain.update.return_value = update_chain
-    update_chain.eq.return_value = update_chain
-    update_chain.execute.return_value = _ExecuteStub([])
-
-    count_chain = MagicMock()
-    count_chain.select.return_value = count_chain
-    count_chain.eq.return_value = count_chain
-    count_chain.gte.return_value = count_chain
-    count_chain.execute.return_value = _ExecuteStub([], count=0)
-
-    # Track calls to notifications_sent to route between claim/update/count
-    notif_calls: dict[str, int] = {"n": 0}
-
-    def _notif_table(_name: str) -> MagicMock:
+    def _notif_table() -> _Chain:
         notif_calls["n"] += 1
         return claim_chain if notif_calls["n"] == 1 else update_chain
 
     supabase = MagicMock()
 
-    def _table(name: str) -> MagicMock:
+    def _table(name: str) -> Any:
         if name == "user_profiles":
-            return profiles_chain
+            return _Chain(_ExecuteStub(profiles))
+        if name == "scores":
+            return _Chain(_ExecuteStub(scores))
+        if name == "user_targets":
+            return _Chain(_ExecuteStub(targets))
         if name == "notifications_sent":
-            return _notif_table(name)
+            return _notif_table()
         raise AssertionError(f"Unexpected table: {name}")
 
     supabase.table.side_effect = _table
@@ -69,36 +118,28 @@ def _build_supabase_mock(
 
 def _build_sms_supabase_mock(
     profiles: list[dict],
+    jobs: list[dict] | None = None,
     sms_count_today: int = 0,
     claim_response: list[dict] | None = None,
+    scores_rows: list[dict] | None = None,
+    user_targets_rows: list[dict] | None = None,
 ) -> MagicMock:
-    """Supabase mock for SMS tests — handles count query + claim + update."""
-    profiles_chain = MagicMock()
-    profiles_chain.select.return_value = profiles_chain
-    profiles_chain.eq.return_value = profiles_chain
-    profiles_chain.is_.return_value = profiles_chain
-    profiles_chain.or_.return_value = profiles_chain
-    profiles_chain.execute.return_value = _ExecuteStub(profiles)
+    """SMS variant — notifications_sent flow is count → claim → update."""
+    profiles = _prep_profiles(profiles)
+    jobs = jobs or []
+    scores = scores_rows if scores_rows is not None else _synth_scores(profiles, jobs)
+    targets = (
+        user_targets_rows
+        if user_targets_rows is not None
+        else _synth_user_targets(profiles)
+    )
 
-    count_chain = MagicMock()
-    count_chain.select.return_value = count_chain
-    count_chain.eq.return_value = count_chain
-    count_chain.gte.return_value = count_chain
-    count_chain.execute.return_value = _ExecuteStub([], count=sms_count_today)
+    count_chain = _Chain(_ExecuteStub([], count=sms_count_today))
+    claim_chain = _Chain(_ExecuteStub(claim_response))
+    update_chain = _Chain(_ExecuteStub([]))
+    notif_calls = {"n": 0}
 
-    claim_chain = MagicMock()
-    claim_chain.upsert.return_value = claim_chain
-    claim_chain.execute.return_value = _ExecuteStub(claim_response)
-
-    update_chain = MagicMock()
-    update_chain.update.return_value = update_chain
-    update_chain.eq.return_value = update_chain
-    update_chain.execute.return_value = _ExecuteStub([])
-
-    # SMS flow: 1st call=count, 2nd call=claim, 3rd call=update
-    notif_calls: dict[str, int] = {"n": 0}
-
-    def _notif_table(_name: str) -> MagicMock:
+    def _notif_table() -> _Chain:
         notif_calls["n"] += 1
         if notif_calls["n"] == 1:
             return count_chain
@@ -108,11 +149,15 @@ def _build_sms_supabase_mock(
 
     supabase = MagicMock()
 
-    def _table(name: str) -> MagicMock:
+    def _table(name: str) -> Any:
         if name == "user_profiles":
-            return profiles_chain
+            return _Chain(_ExecuteStub(profiles))
+        if name == "scores":
+            return _Chain(_ExecuteStub(scores))
+        if name == "user_targets":
+            return _Chain(_ExecuteStub(targets))
         if name == "notifications_sent":
-            return _notif_table(name)
+            return _notif_table()
         raise AssertionError(f"Unexpected table: {name}")
 
     supabase.table.side_effect = _table
@@ -130,7 +175,7 @@ def _reset_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email alert tests (#510)
+# Email alert tests (#510, #76)
 # ---------------------------------------------------------------------------
 
 
@@ -155,20 +200,19 @@ async def test_returns_zero_when_no_active_profiles() -> None:
 
 
 async def test_skips_jobs_below_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Profile wants score >= 70; job is 50 — must not send.
+    # Profile wants score >= 70; the job scored 50 against their target — no send.
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 50, "title": "x", "company_name": "y"},
+    ]
     supabase = _build_supabase_mock(
-        profiles=[
-            {"id": "p1", "email": "me@test", "job_score_threshold": 70},
-        ],
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
         claim_response=[{"id": "sent-1"}],
     )
     http_client = MagicMock()
     http_client.post = AsyncMock()
     monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
 
-    jobs: list[dict[str, object]] = [
-        {"id": "j1", "score": 50, "title": "x", "company_name": "y"},
-    ]
     sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0
@@ -178,19 +222,6 @@ async def test_skips_jobs_below_threshold(monkeypatch: pytest.MonkeyPatch) -> No
 async def test_happy_path_sends_and_patches_external_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    supabase = _build_supabase_mock(
-        profiles=[
-            {"id": "p1", "email": "me@test", "job_score_threshold": 70},
-        ],
-        claim_response=[{"id": "sent-1"}],
-    )
-    response = MagicMock()
-    response.status_code = 200
-    response.json.return_value = {"ok": True, "resendId": "resend-abc"}
-    http_client = MagicMock()
-    http_client.post = AsyncMock(return_value=response)
-    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
-
     jobs: list[dict[str, object]] = [
         {
             "id": "j1",
@@ -201,6 +232,17 @@ async def test_happy_path_sends_and_patches_external_id(
             "absolute_url": "https://acme.com/jobs/1",
         }
     ]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+    )
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"ok": True, "resendId": "resend-abc"}
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=response)
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
 
     sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
 
@@ -217,21 +259,82 @@ async def test_happy_path_sends_and_patches_external_id(
     assert payload["score"] == 85
 
 
-async def test_dedup_hit_does_not_send(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Upsert returns empty data → claim lost, do not send.
+async def test_only_alerts_for_own_target_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#76 acceptance: a job that scored only against user A's target must not
+    alert user B, even though the global job score clears B's threshold."""
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 90, "title": "x", "company_name": "y"},
+    ]
     supabase = _build_supabase_mock(
         profiles=[
-            {"id": "p1", "email": "me@test", "job_score_threshold": 70},
+            {"id": "pA", "user_id": "uA", "email": "a@test", "job_score_threshold": 70},
+            {"id": "pB", "user_id": "uB", "email": "b@test", "job_score_threshold": 70},
         ],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[
+            {"user_id": "uA", "target_id": "tA"},
+            {"user_id": "uB", "target_id": "tB"},
+        ],
+        # j1 only scored against A's target tA.
+        scores_rows=[{"job_posting_id": "j1", "target_id": "tA", "score": 90}],
+    )
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"resendId": "r1"}
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=response)
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
+
+    sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
+
+    assert sent == 1
+    http_client.post.assert_awaited_once()
+    # The single alert went to A, never B.
+    assert http_client.post.await_args.kwargs["json"]["to"] == "a@test"
+
+
+async def test_no_alert_when_user_has_no_active_target_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A high global score with no scores row for any of the user's targets
+    produces no alert."""
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 99, "title": "x", "company_name": "y"},
+    ]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[{"user_id": "u-p1", "target_id": "t-p1"}],
+        scores_rows=[],  # nothing scored for this user's target
+    )
+    http_client = MagicMock()
+    http_client.post = AsyncMock()
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
+
+    sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
+
+    assert sent == 0
+    http_client.post.assert_not_awaited()
+
+
+async def test_dedup_hit_does_not_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Upsert returns empty data → claim lost, do not send.
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 95, "title": "x", "company_name": "y"},
+    ]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
         claim_response=[],
     )
     http_client = MagicMock()
     http_client.post = AsyncMock()
     monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
 
-    jobs: list[dict[str, object]] = [
-        {"id": "j1", "score": 95, "title": "x", "company_name": "y"},
-    ]
     sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0
@@ -239,10 +342,12 @@ async def test_dedup_hit_does_not_send(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_upstream_failure_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 95, "title": "x", "company_name": "y"},
+    ]
     supabase = _build_supabase_mock(
-        profiles=[
-            {"id": "p1", "email": "me@test", "job_score_threshold": 70},
-        ],
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
         claim_response=[{"id": "sent-1"}],
     )
     response = MagicMock()
@@ -252,9 +357,6 @@ async def test_upstream_failure_returns_zero(monkeypatch: pytest.MonkeyPatch) ->
     http_client.post = AsyncMock(return_value=response)
     monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
 
-    jobs: list[dict[str, object]] = [
-        {"id": "j1", "score": 95, "title": "x", "company_name": "y"},
-    ]
     sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0
@@ -262,11 +364,12 @@ async def test_upstream_failure_returns_zero(monkeypatch: pytest.MonkeyPatch) ->
 
 
 # ---------------------------------------------------------------------------
-# SMS alert tests (#511)
+# SMS alert tests (#511, #76)
 # ---------------------------------------------------------------------------
 
 _SMS_PROFILE: dict[str, object] = {
     "id": "p1",
+    "user_id": "uA",
     "email": "me@test",
     "job_score_threshold": 70,
     "phone_number": "+15551234567",
@@ -296,43 +399,45 @@ async def test_sms_skipped_when_disabled(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
     disabled_profile = {**_SMS_PROFILE, "sms_notifications_enabled": False}
-    supabase = _build_sms_supabase_mock(profiles=[disabled_profile])
-
     jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
+    supabase = _build_sms_supabase_mock(profiles=[disabled_profile], jobs=jobs)
+
     assert await notify.send_sms_alerts_for_new_jobs(supabase, jobs) == 0
 
 
 async def test_sms_skipped_below_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
-    supabase = _build_sms_supabase_mock(profiles=[_SMS_PROFILE])
-
     low_job: dict[str, object] = {**_HIGH_SCORE_JOB, "score": 80}
+    supabase = _build_sms_supabase_mock(profiles=[_SMS_PROFILE], jobs=[low_job])
+
     assert await notify.send_sms_alerts_for_new_jobs(supabase, [low_job]) == 0
 
 
 async def test_sms_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
+    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     supabase = _build_sms_supabase_mock(
         profiles=[_SMS_PROFILE],
+        jobs=jobs,
         sms_count_today=5,  # at limit
     )
 
-    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     assert await notify.send_sms_alerts_for_new_jobs(supabase, jobs) == 0
 
 
 async def test_sms_dedup_hit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
+    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     supabase = _build_sms_supabase_mock(
         profiles=[_SMS_PROFILE],
+        jobs=jobs,
         sms_count_today=0,
         claim_response=[],  # claim lost
     )
 
-    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     assert await notify.send_sms_alerts_for_new_jobs(supabase, jobs) == 0
 
 
@@ -340,19 +445,18 @@ async def test_sms_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
     monkeypatch.setattr(notify.settings, "twilio_phone_number", "+15559999999")
+    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     supabase = _build_sms_supabase_mock(
         profiles=[_SMS_PROFILE],
+        jobs=jobs,
         sms_count_today=2,
         claim_response=[{"id": "sent-1"}],
     )
 
-    mock_message = MagicMock()
-    mock_message.sid = "SM123abc"
-    mock_create = MagicMock(return_value=mock_message)
-
-    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
+    with patch(
+        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
+    ) as mock_send:
         mock_send.return_value = "SM123abc"
-        jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
         sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 1
@@ -365,18 +469,51 @@ async def test_sms_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "92" in call_args.args[1]
 
 
+async def test_sms_only_alerts_for_own_target_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#76 acceptance (SMS): user B isn't texted about A's role-specific match."""
+    monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
+    monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
+    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
+    profile_b = {
+        **_SMS_PROFILE,
+        "id": "pB",
+        "user_id": "uB",
+        "phone_number": "+15550000000",
+    }
+    supabase = _build_sms_supabase_mock(
+        profiles=[profile_b],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[{"user_id": "uB", "target_id": "tB"}],
+        scores_rows=[{"job_posting_id": "j1", "target_id": "tA", "score": 92}],
+    )
+
+    with patch(
+        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
+    ) as mock_send:
+        sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
+
+    assert sent == 0
+    mock_send.assert_not_awaited()
+
+
 async def test_sms_twilio_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
     monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
+    jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
     supabase = _build_sms_supabase_mock(
         profiles=[_SMS_PROFILE],
+        jobs=jobs,
         sms_count_today=0,
         claim_response=[{"id": "sent-1"}],
     )
 
-    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
+    with patch(
+        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
+    ) as mock_send:
         mock_send.side_effect = RuntimeError("Twilio down")
-        jobs: list[dict[str, object]] = [_HIGH_SCORE_JOB]
         sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0

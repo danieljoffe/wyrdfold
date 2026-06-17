@@ -44,8 +44,14 @@ logger = logging.getLogger(__name__)
 async def send_alerts_for_new_jobs(
     supabase: Client, new_job_rows: list[dict[str, Any]]
 ) -> int:
-    """Fan out email alerts for each (profile × new-job) pair that clears the
-    per-profile threshold. Returns the count of alerts actually sent.
+    """Fan out email alerts for each (profile × new-job) pair where the job
+    scored above the profile's threshold *against one of that user's own
+    targets* (#76).
+
+    Relevance is driven by ``scores ⋈ user_targets``, never the vestigial
+    global ``jobs.score`` — so on a shared instance a user is never alerted
+    about a posting that only matched *another* user's role. Returns the
+    count of alerts actually sent.
     """
     if not new_job_rows:
         return 0
@@ -59,24 +65,99 @@ async def send_alerts_for_new_jobs(
     if not profiles:
         return 0
 
+    job_ids = [j["id"] for j in new_job_rows if isinstance(j.get("id"), str)]
+    scores_by_job = await _load_scores_by_job(supabase, job_ids)
+    target_ids_by_user = await _active_target_ids_by_user(
+        supabase, [p["user_id"] for p in profiles if p.get("user_id")]
+    )
+
     sent = 0
     for job in new_job_rows:
-        score = job.get("score")
-        if not isinstance(score, int):
+        job_id = job.get("id")
+        if not isinstance(job_id, str):
             continue
         for profile in profiles:
-            if score < int(profile.get("job_score_threshold", 100)):
+            targets = target_ids_by_user.get(profile.get("user_id") or "", set())
+            score = _best_target_score(job_id, targets, scores_by_job)
+            if score is None or score < int(profile.get("job_score_threshold", 100)):
                 continue
             if await _try_send_one(supabase, profile, job, score):
                 sent += 1
     return sent
 
 
+async def _load_scores_by_job(
+    supabase: Client, job_ids: list[str]
+) -> dict[str, list[tuple[str, int]]]:
+    """Per-job ``(target_id, score)`` pairs for the given jobs, dropping rows
+    the scorer flagged ``excluded``. Drives per-recipient relevance (#76)."""
+    if not job_ids:
+        return {}
+    resp = await asyncio.to_thread(
+        lambda: supabase.table("scores")
+        .select("job_posting_id, target_id, score")
+        .in_("job_posting_id", job_ids)
+        .eq("excluded", False)
+        .execute()
+    )
+    by_job: dict[str, list[tuple[str, int]]] = {}
+    for row in cast(list[dict[str, Any]], resp.data or []):
+        job_id = row.get("job_posting_id")
+        target_id = row.get("target_id")
+        score = row.get("score")
+        if (
+            isinstance(job_id, str)
+            and isinstance(target_id, str)
+            and isinstance(score, int)
+        ):
+            by_job.setdefault(job_id, []).append((target_id, score))
+    return by_job
+
+
+async def _active_target_ids_by_user(
+    supabase: Client, user_ids: list[str]
+) -> dict[str, set[str]]:
+    """Active ``target_id`` set per user, via the ``user_targets`` junction."""
+    if not user_ids:
+        return {}
+    resp = await asyncio.to_thread(
+        lambda: supabase.table("user_targets")
+        .select("user_id, target_id")
+        .in_("user_id", user_ids)
+        .eq("is_active", True)
+        .execute()
+    )
+    by_user: dict[str, set[str]] = {}
+    for row in cast(list[dict[str, Any]], resp.data or []):
+        user_id = row.get("user_id")
+        target_id = row.get("target_id")
+        if isinstance(user_id, str) and isinstance(target_id, str):
+            by_user.setdefault(user_id, set()).add(target_id)
+    return by_user
+
+
+def _best_target_score(
+    job_id: str,
+    user_target_ids: set[str],
+    scores_by_job: dict[str, list[tuple[str, int]]],
+) -> int | None:
+    """Highest score the job earned against any of the user's active targets,
+    or ``None`` when it scored for none of them (i.e. not relevant to them)."""
+    if not user_target_ids:
+        return None
+    relevant = [
+        score
+        for target_id, score in scores_by_job.get(job_id, [])
+        if target_id in user_target_ids
+    ]
+    return max(relevant) if relevant else None
+
+
 async def _fetch_active_profiles(supabase: Client) -> list[dict[str, Any]]:
     query = (
         supabase.table("user_profiles")
         .select(
-            "id, email, job_score_threshold,"
+            "id, user_id, email, job_score_threshold,"
             " phone_number, sms_notifications_enabled,"
             " sms_score_threshold, sms_daily_limit"
         )
@@ -265,13 +346,21 @@ async def send_sms_alerts_for_new_jobs(
     if not sms_profiles:
         return 0
 
+    job_ids = [j["id"] for j in new_job_rows if isinstance(j.get("id"), str)]
+    scores_by_job = await _load_scores_by_job(supabase, job_ids)
+    target_ids_by_user = await _active_target_ids_by_user(
+        supabase, [p["user_id"] for p in sms_profiles if p.get("user_id")]
+    )
+
     sent = 0
     for job in new_job_rows:
-        score = job.get("score")
-        if not isinstance(score, int):
+        job_id = job.get("id")
+        if not isinstance(job_id, str):
             continue
         for profile in sms_profiles:
-            if score < int(profile.get("sms_score_threshold", 100)):
+            targets = target_ids_by_user.get(profile.get("user_id") or "", set())
+            score = _best_target_score(job_id, targets, scores_by_job)
+            if score is None or score < int(profile.get("sms_score_threshold", 100)):
                 continue
             if await _try_send_sms(supabase, profile, job, score):
                 sent += 1
