@@ -66,6 +66,19 @@ def _validate_settings(s: Settings) -> None:
             "Get them from the Supabase dashboard → Settings → API."
         )
 
+    # The per-user RLS routes (experience, feedback, tailor, profile — #79)
+    # build a request-scoped client from the caller's JWT + the anon key. With
+    # it unset, every authenticated request 503s ("Supabase user client not
+    # configured") while the healthcheck stays green — a prod outage that boots
+    # clean and fails silently per request. Fail the lifespan instead so the
+    # deploy log names the cause.
+    if not s.supabase_anon_key:
+        raise RuntimeError(
+            "SUPABASE_ANON_KEY must be set (the anon/publishable key). The "
+            "per-user RLS routes build a JWT-bound client from it; without it "
+            "every authenticated request 503s. Supabase dashboard → Settings → API."
+        )
+
     # If the operator selected the real Anthropic provider but didn't
     # configure a key, every LLM-backed request will 500 mid-call with
     # an opaque SDK ``TypeError`` ("Could not resolve authentication
