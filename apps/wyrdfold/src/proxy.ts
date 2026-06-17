@@ -67,10 +67,26 @@ export async function proxy(request: NextRequest) {
     return new NextResponse(body, { status: 503 });
   }
 
-  request.headers.set('x-nonce', nonce);
-  request.headers.set('Content-Security-Policy', cspValue);
+  // Forward the nonce + CSP on the *request* headers (not just the response)
+  // so Next's renderer can read the nonce and stamp it onto every <script> it
+  // emits — bootstrap, RSC flight, and chunk loaders. Without this the
+  // `'strict-dynamic'` policy blocks every script, because that keyword
+  // disables the `'self'`/`https:` host allow-list. It only takes effect when
+  // the route renders per-request; the root layout reads `headers()` to force
+  // that (a statically prerendered/CDN-cached page bakes its scripts with no
+  // nonce). The browser-enforced CSP is still set on each response below.
+  //
+  // Rebuild from `request.headers` on each call (rather than mutating in
+  // place) so the copy also picks up any auth cookies Supabase refreshes in
+  // `setAll` — `request.cookies.set` writes through to the Cookie header.
+  const forwardHeaders = () => {
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('x-nonce', nonce);
+    requestHeaders.set('Content-Security-Policy', cspValue);
+    return NextResponse.next({ request: { headers: requestHeaders } });
+  };
 
-  let supabaseResponse = NextResponse.next({ request });
+  let supabaseResponse = forwardHeaders();
 
   const supabase = createServerClient(supabaseUrl, anonKey, {
     cookies: {
@@ -81,7 +97,9 @@ export async function proxy(request: NextRequest) {
         for (const { name, value } of cookiesToSet) {
           request.cookies.set(name, value);
         }
-        supabaseResponse = NextResponse.next({ request });
+        // Re-create after mutating request.cookies so the rebuilt request
+        // headers carry the refreshed auth cookies *and* the nonce/CSP.
+        supabaseResponse = forwardHeaders();
         for (const { name, value, options } of cookiesToSet) {
           supabaseResponse.cookies.set(name, value, options);
         }
