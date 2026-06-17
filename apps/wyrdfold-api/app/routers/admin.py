@@ -25,6 +25,40 @@ router = APIRouter(
 )
 
 
+class CacheStats(BaseModel):
+    """Prompt-cache token usage over a window (#73).
+
+    The three buckets are Anthropic's input-token accounting:
+    ``uncached_input_tokens`` is billed at the normal rate,
+    ``cache_creation_tokens`` at ~1.25×, ``cache_read_tokens`` at ~0.1×.
+    ``hit_rate_pct`` is the share of all input tokens served from cache —
+    the number to watch so caching regressions are visible.
+    """
+
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    uncached_input_tokens: int
+    hit_rate_pct: float | None = Field(
+        description=(
+            "cache_read / (cache_read + cache_creation + uncached_input) × "
+            "100. None when no input tokens were recorded in the window."
+        )
+    )
+
+    @classmethod
+    def from_buckets(cls, buckets: dict[str, int]) -> CacheStats:
+        read = buckets["cache_read"]
+        creation = buckets["cache_creation"]
+        uncached = buckets["uncached_input"]
+        total = read + creation + uncached
+        return cls(
+            cache_read_tokens=read,
+            cache_creation_tokens=creation,
+            uncached_input_tokens=uncached,
+            hit_rate_pct=round(read / total * 100.0, 1) if total > 0 else None,
+        )
+
+
 class CostSummaryResponse(BaseModel):
     """Snapshot of LLM spend at the moment the request was served.
 
@@ -55,6 +89,12 @@ class CostSummaryResponse(BaseModel):
     last_30d_usd: float
     by_purpose_today: dict[str, float]
     by_purpose_30d: dict[str, float]
+    cache_today: CacheStats = Field(
+        description="Prompt-cache hit rate + token buckets since UTC midnight."
+    )
+    cache_30d: CacheStats = Field(
+        description="Prompt-cache hit rate + token buckets over the last 30 days."
+    )
 
 
 @router.get("/cost-summary", response_model=CostSummaryResponse)
@@ -83,6 +123,13 @@ def get_cost_summary(
         supabase, since=now - timedelta(days=30)
     )
 
+    cache_today = CacheStats.from_buckets(
+        cost_log.cache_metrics_all(supabase, since=midnight)
+    )
+    cache_30d = CacheStats.from_buckets(
+        cost_log.cache_metrics_all(supabase, since=now - timedelta(days=30))
+    )
+
     cap = settings.global_llm_daily_budget_usd
     usage_pct: float | None
     if cap > 0:
@@ -100,4 +147,6 @@ def get_cost_summary(
         last_30d_usd=last_30d,
         by_purpose_today=by_purpose_today,
         by_purpose_30d=by_purpose_30d,
+        cache_today=cache_today,
+        cache_30d=cache_30d,
     )

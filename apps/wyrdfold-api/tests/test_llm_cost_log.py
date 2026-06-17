@@ -131,6 +131,39 @@ def test_spend_by_purpose_falls_back_when_rpc_unavailable() -> None:
     assert result == {"job_analysis": pytest.approx(0.30), "tailor": pytest.approx(0.05)}
 
 
+# ---- cache_metrics_all -----------------------------------------------------
+
+
+def test_cache_metrics_all_sums_token_buckets() -> None:
+    sb = MagicMock()
+    sel = sb.table.return_value.select.return_value
+    sel.execute.return_value = _Resp(
+        [
+            {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 0,
+            },
+            {
+                "input_tokens": 50,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 200,
+            },
+        ]
+    )
+
+    result = cost_log.cache_metrics_all(sb)
+    assert result == {"cache_read": 800, "cache_creation": 200, "uncached_input": 150}
+
+
+def test_cache_metrics_all_zero_when_no_rows() -> None:
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.execute.return_value = _Resp([])
+
+    result = cost_log.cache_metrics_all(sb)
+    assert result == {"cache_read": 0, "cache_creation": 0, "uncached_input": 0}
+
+
 # ---- enqueue helper --------------------------------------------------------
 
 
