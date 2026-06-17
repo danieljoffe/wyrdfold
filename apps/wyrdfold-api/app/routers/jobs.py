@@ -69,6 +69,11 @@ from app.services.validate import (
 
 logger = logging.getLogger(__name__)
 
+# Operator location-filter path fetches pre-filter rows into Python (location
+# can't be filtered server-side), so cap the scan to keep it bounded as `jobs`
+# grows (#113). A hit is logged, never silently truncated.
+_OPERATOR_LOCATION_SCAN_CAP = 10_000
+
 router = APIRouter(
     prefix="/jobs",
     tags=["jobs"],
@@ -987,9 +992,17 @@ def list_jobs(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(operator_sort, desc=not ascending)
+        query = query.order(operator_sort, desc=not ascending).limit(
+            _OPERATOR_LOCATION_SCAN_CAP
+        )
         resp = query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
+        if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
+            logger.warning(
+                "Operator location filter hit the %d-row scan cap; postings "
+                "beyond it were not searched.",
+                _OPERATOR_LOCATION_SCAN_CAP,
+            )
         filtered = _apply_location_filter(
             all_rows,
             exclude_terms=exclude_terms,
