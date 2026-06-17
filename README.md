@@ -269,6 +269,12 @@ The operator-facing **`GET /admin/cost-summary`** endpoint
 breaker reads, plus per-purpose breakdowns for today and the last 30
 days — the right surface to drill into when a Sentry cost alert fires.
 
+**Data handling** — what WyrdFold stores, where it lives, and what leaves
+your instance (OpenRouter, Sentry, email/SMS) is documented in
+[PRIVACY.md](./PRIVACY.md), along with the current state of data deletion
+and export. As a self-hoster you are the data controller for your
+deployment.
+
 ## Conventions
 
 - A husky pre-commit hook runs `lint-staged` (ESLint + Prettier) and, when TS
