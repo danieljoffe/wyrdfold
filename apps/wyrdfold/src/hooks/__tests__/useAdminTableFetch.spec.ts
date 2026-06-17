@@ -1,12 +1,17 @@
 import { renderHook, waitFor, act } from '@testing-library/react';
 import { useAdminTableFetch } from '../useAdminTableFetch';
 
-const mockResponse = {
+const firstPage = {
   items: [
     { id: '1', name: 'Item 1' },
     { id: '2', name: 'Item 2' },
   ],
-  total: 42,
+  next_cursor: 'cursor-2',
+};
+
+const secondPage = {
+  items: [{ id: '3', name: 'Item 3' }],
+  next_cursor: null,
 };
 
 const mockFetch = jest.fn();
@@ -15,7 +20,7 @@ const originalFetch = global.fetch;
 beforeEach(() => {
   mockFetch.mockResolvedValue({
     ok: true,
-    json: async () => mockResponse,
+    json: async () => firstPage,
   } as Response);
   global.fetch = mockFetch;
 });
@@ -32,20 +37,22 @@ describe('useAdminTableFetch', () => {
     dataKey: 'items',
   };
 
-  it('fetches data on mount', async () => {
+  it('fetches the first page on mount', async () => {
     const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
 
     await waitFor(() => {
       expect(result.current.loading).toBe(false);
     });
 
-    expect(result.current.data).toEqual(mockResponse.items);
+    expect(result.current.data).toEqual(firstPage.items);
+    // A non-null next_cursor means there's another page.
+    expect(result.current.hasMore).toBe(true);
     expect(mockFetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/test?')
     );
   });
 
-  it('sends correct query parameters', async () => {
+  it('sends pageSize/sort/order and no cursor on the first page', async () => {
     const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
 
     await waitFor(() => {
@@ -54,32 +61,11 @@ describe('useAdminTableFetch', () => {
 
     const url = mockFetch.mock.calls[0][0] as string;
     const params = new URLSearchParams(url.split('?')[1]);
-    expect(params.get('page')).toBe('1');
     expect(params.get('pageSize')).toBe('20');
     expect(params.get('sort')).toBe('created_at');
     expect(params.get('order')).toBe('desc');
-  });
-
-  it('calculates totalPages from total and pageSize', async () => {
-    const { result } = renderHook(() =>
-      useAdminTableFetch({ ...defaultOptions, pageSize: 10 })
-    );
-
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
-    });
-
-    expect(result.current.totalPages).toBe(5); // ceil(42/10)
-  });
-
-  it('uses default pageSize of 20', async () => {
-    const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
-
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
-    });
-
-    expect(result.current.totalPages).toBe(3); // ceil(42/20)
+    expect(params.has('cursor')).toBe(false);
+    expect(params.has('page')).toBe(false);
   });
 
   it('starts in loading state', () => {
@@ -100,50 +86,75 @@ describe('useAdminTableFetch', () => {
     });
 
     expect(result.current.data).toEqual([]);
-    expect(result.current.totalPages).toBe(0);
+    expect(result.current.hasMore).toBe(false);
   });
 
-  it('refetches when page changes', async () => {
+  it('loadMore appends the next page and sends the cursor', async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => firstPage,
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => secondPage,
+      } as Response);
+
     const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
+    await waitFor(() => expect(result.current.loading).toBe(false));
 
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
+    await act(async () => {
+      await result.current.loadMore();
     });
 
-    act(() => {
-      result.current.setPage(2);
-    });
-
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
-    });
+    // Rows are appended, not replaced.
+    expect(result.current.data).toEqual([
+      ...firstPage.items,
+      ...secondPage.items,
+    ]);
+    // next_cursor went null → no more pages.
+    expect(result.current.hasMore).toBe(false);
 
     const calls = mockFetch.mock.calls;
     const lastUrl = calls[calls.length - 1][0] as string;
     const params = new URLSearchParams(lastUrl.split('?')[1]);
-    expect(params.get('page')).toBe('2');
+    expect(params.get('cursor')).toBe('cursor-2');
   });
 
-  it('resets page to 1 when sort changes', async () => {
+  it('loadMore is a no-op when there is no next page', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => secondPage, // next_cursor: null
+    } as Response);
+
     const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.hasMore).toBe(false);
+
+    const callsBefore = mockFetch.mock.calls.length;
+    await act(async () => {
+      await result.current.loadMore();
+    });
+    expect(mockFetch.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('re-fetches the first page (resetting the list) when sort changes', async () => {
+    const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const callsBefore = mockFetch.mock.calls.length;
+    act(() => {
+      result.current.handleSort('created_at'); // flips order desc → asc
+    });
 
     await waitFor(() => {
-      expect(result.current.loading).toBe(false);
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(callsBefore);
     });
-
-    act(() => {
-      result.current.setPage(3);
-    });
-
-    await waitFor(() => {
-      expect(result.current.loading).toBe(false);
-    });
-
-    act(() => {
-      result.current.handleSort('created_at');
-    });
-
-    expect(result.current.page).toBe(1);
+    const calls = mockFetch.mock.calls;
+    const lastUrl = calls[calls.length - 1][0] as string;
+    const params = new URLSearchParams(lastUrl.split('?')[1]);
+    expect(params.get('order')).toBe('asc');
+    expect(params.has('cursor')).toBe(false); // first page, no cursor
   });
 
   it('exposes refetch function', async () => {

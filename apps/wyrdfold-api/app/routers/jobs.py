@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import binascii
 import hashlib
+import json
 import logging
 import re
 from datetime import UTC, datetime
@@ -268,12 +271,55 @@ def _escape_or_token(t: str) -> str:
     return t.replace(",", "").replace("(", "").replace(")", "")
 
 
+# ── Cursor (keyset / offset) pagination helpers ─────────────────────────────
+# The jobs list pages with an OPAQUE cursor (load-more), not page numbers.
+# The RPC path uses a keyset cursor ``{"v": <sort_value>, "id": <job_id>}``; the
+# Python fallback/union/operator paths (which already materialise + sort the
+# full candidate set) use an offset cursor ``{"o": <next_offset>}``. Both are
+# base64url-encoded JSON so the frontend never inspects them, and a given
+# (filters, sort) query routes deterministically to one path, so a cursor is
+# always consumed by the path that produced it.
+
+
+def _encode_cursor(payload: dict[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _decode_cursor(cursor: str | None) -> dict[str, Any]:
+    """Opaque cursor → dict. Malformed/None → empty (first page)."""
+    if not cursor:
+        return {}
+    try:
+        data = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+    except (ValueError, binascii.Error):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any]:
+    """Keyset cursor for the next page: the last row's sort value + id."""
+    return {"v": row.get(sort), "id": row["id"]}
+
+
+def _offset_from_cursor(cursor: dict[str, Any]) -> int:
+    """Offset for the Python-paginated paths. Non-int/negative → 0."""
+    raw = cursor.get("o", 0)
+    return raw if isinstance(raw, int) and raw >= 0 else 0
+
+
+def _offset_next_cursor(offset: int, page_size: int, total: int) -> str | None:
+    """Encode the next offset cursor, or None when the page was the last."""
+    nxt = offset + page_size
+    return _encode_cursor({"o": nxt}) if nxt < total else None
+
+
 def _list_jobs_for_target_rpc(
     supabase: Client,
     *,
     target_id: str,
-    offset: int,
-    page: int,
     page_size: int,
     sort: str,
     ascending: bool,
@@ -283,13 +329,12 @@ def _list_jobs_for_target_rpc(
     search: str | None,
     exclude_terms: list[str],
     only_terms: list[str],
+    cursor: dict[str, Any],
     user_id: str | None = None,
 ) -> dict[str, Any]:
-    # The RPC paginates server-side with no knowledge of the location
-    # filter, so its ``total`` would be the pre-filter count and pages
-    # would render half-empty (or empty) once the filter trims rows.
-    # Force the fallback two-query path which can fetch the full set
-    # and paginate from the post-filter list.
+    # The RPC can't apply the post-fetch location filter, so its keyset would
+    # walk pre-filter rows and pages would render half-empty. Force the
+    # two-query fallback, which filters the full set then paginates.
     if exclude_terms or only_terms:
         raise RuntimeError("RPC path skipped: location filter requires post-fetch pagination")
     # Multi-word search ("customer director") should OR each token across
@@ -297,12 +342,12 @@ def _list_jobs_for_target_rpc(
     # whenever the user typed more than one word.
     if search and len(_tokenize_search(search)) > 1:
         raise RuntimeError("RPC path skipped: multi-word search uses OR semantics")
-    # Recency decay sorts by ``scores.recency_score``, which the deployed
-    # RPC doesn't return or order by. The two-query fallback handles that
-    # column directly, so force it when the flag is on.
+    # Recency decay sorts by ``scores.recency_score``, which the RPC doesn't
+    # return or order by. The two-query fallback handles that column directly.
     if settings.recency_decay_enabled and sort == "score":
         raise RuntimeError("RPC path skipped: recency-decay sort handled in two-query path")
-    """List jobs via server-side join RPC (single round-trip)."""
+    """List jobs via server-side keyset RPC (single round-trip)."""
+    after_value = cursor.get("v")
     resp = supabase.rpc(
         "get_target_jobs",
         {
@@ -313,26 +358,31 @@ def _list_jobs_for_target_rpc(
             "p_search": search,
             "p_sort": sort,
             "p_ascending": ascending,
-            "p_limit": page_size,
-            "p_offset": offset,
+            # Fetch one extra row to detect "has more" without a COUNT.
+            "p_limit": page_size + 1,
+            "p_after_value": None if after_value is None else str(after_value),
+            "p_after_id": cursor.get("id"),
             "p_user_id": user_id,
         },
     ).execute()
     if not isinstance(resp.data, list):
         raise TypeError("RPC get_target_jobs returned non-list response")
     rows = cast(list[dict[str, Any]], resp.data)
-    total = rows[0]["total_count"] if rows else 0
-    # Strip the total_count helper column from each row
-    postings = [{k: v for k, v in r.items() if k != "total_count"} for r in rows]
-    return {"postings": postings, "total": total, "page": page, "page_size": page_size}
+    has_more = len(rows) > page_size
+    postings = rows[:page_size]
+    next_cursor = (
+        _encode_cursor(_keyset_cursor_from_row(postings[-1], sort))
+        if has_more and postings
+        else None
+    )
+    # total is not computed on the keyset path (no COUNT) — None is best-effort.
+    return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
 def _list_jobs_for_target_two_query(
     supabase: Client,
     *,
     target_id: str,
-    offset: int,
-    page: int,
     page_size: int,
     sort: str,
     ascending: bool,
@@ -342,6 +392,7 @@ def _list_jobs_for_target_two_query(
     search: str | None,
     exclude_terms: list[str],
     only_terms: list[str],
+    cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -357,6 +408,7 @@ def _list_jobs_for_target_two_query(
     defaults. See plan-wyrdfold-streamlined-target.md "User-tunable axis
     weights".
     """
+    offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
     # When recency decay is on, the logical "score" sort orders by the
     # decayed ``recency_score`` column instead of the raw fit score.
@@ -396,7 +448,7 @@ def _list_jobs_for_target_two_query(
     ts_rows = cast(list[dict[str, Any]], ts_resp.data or [])
 
     if not ts_rows:
-        return {"postings": [], "total": 0, "page": page, "page_size": page_size}
+        return {"postings": [], "next_cursor": None, "total": 0}
 
     score_lookup = {r["job_posting_id"]: r for r in ts_rows}
 
@@ -480,15 +532,14 @@ def _list_jobs_for_target_two_query(
             )
         )
 
-    return {"postings": postings, "total": total, "page": page, "page_size": page_size}
+    next_cursor = _offset_next_cursor(offset, page_size, total or 0)
+    return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
 def _list_jobs_for_target(
     supabase: Client,
     *,
     target_id: str,
-    offset: int,
-    page: int,
     page_size: int,
     sort: str,
     ascending: bool,
@@ -498,6 +549,7 @@ def _list_jobs_for_target(
     search: str | None,
     exclude_terms: list[str],
     only_terms: list[str],
+    cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -515,8 +567,6 @@ def _list_jobs_for_target(
     """
     kwargs: dict[str, Any] = {
         "target_id": target_id,
-        "offset": offset,
-        "page": page,
         "page_size": page_size,
         "sort": sort,
         "ascending": ascending,
@@ -526,6 +576,7 @@ def _list_jobs_for_target(
         "search": search,
         "exclude_terms": exclude_terms,
         "only_terms": only_terms,
+        "cursor": cursor,
         "user_id": user_id,
     }
     if axis_weights is not None:
@@ -543,8 +594,6 @@ def _list_jobs_across_user_targets(
     supabase: Client,
     *,
     user_target_ids: set[str],
-    offset: int,
-    page: int,
     page_size: int,
     sort: str,
     ascending: bool,
@@ -554,6 +603,7 @@ def _list_jobs_across_user_targets(
     search: str | None,
     exclude_terms: list[str],
     only_terms: list[str],
+    cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
@@ -571,6 +621,7 @@ def _list_jobs_across_user_targets(
     "best representative target" picked per job is stable across users
     with different weights (only the displayed number differs).
     """
+    offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
     # See ``_list_jobs_for_target_two_query``: the "score" sort orders by
     # the decayed ``recency_score`` when the flag is on; min_score still
@@ -596,7 +647,7 @@ def _list_jobs_across_user_targets(
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
 
     if not score_rows:
-        return {"postings": [], "total": 0, "page": page, "page_size": page_size}
+        return {"postings": [], "next_cursor": None, "total": 0}
 
     # Per-job: take the highest score across this user's targets.
     best: dict[str, dict[str, Any]] = {}
@@ -635,7 +686,7 @@ def _list_jobs_across_user_targets(
         total = None  # recomputed after posting-level filters
 
     if not page_ids:
-        return {"postings": [], "total": total or 0, "page": page, "page_size": page_size}
+        return {"postings": [], "next_cursor": None, "total": total or 0}
 
     postings: list[dict[str, Any]] = _fetch_jobs_chunked(
         supabase,
@@ -695,7 +746,8 @@ def _list_jobs_across_user_targets(
             )
         )
 
-    return {"postings": postings, "total": total, "page": page, "page_size": page_size}
+    next_cursor = _offset_next_cursor(offset, page_size, total or 0)
+    return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
 # Sync `def` so FastAPI runs each request in a threadpool worker. The body
@@ -804,7 +856,7 @@ def _apply_location_filter(
 
 @router.get("")
 def list_jobs(
-    page: int = Query(1, ge=1),
+    cursor: str | None = Query(None),
     page_size: int = Query(20, ge=1, le=100),
     sort: str = Query("score", pattern="^(score|created_at|company_name|title)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
@@ -823,7 +875,7 @@ def list_jobs(
 ) -> dict[str, Any]:
     exclude_terms = _parse_location_list(exclude_locations)
     only_terms = _parse_location_list(only_locations)
-    offset = (page - 1) * page_size
+    cursor_data = _decode_cursor(cursor)
     ascending = order == "asc"
 
     # Check cache (60s TTL — data only changes on poll/manual-add cycles).
@@ -831,7 +883,7 @@ def list_jobs(
     # future filtering) never cross-leak between accounts.
     cache_key = make_cache_key(
         jobs_cache_prefix(target_id=target_id),
-        page=page,
+        cursor=cursor,
         page_size=page_size,
         sort=sort,
         order=order,
@@ -859,9 +911,8 @@ def list_jobs(
         if not user_target_ids:
             empty: dict[str, Any] = {
                 "postings": [],
+                "next_cursor": None,
                 "total": 0,
-                "page": page,
-                "page_size": page_size,
                 "applied_min_score": min_score,
             }
             job_list_cache.set(cache_key, empty)
@@ -869,9 +920,8 @@ def list_jobs(
         if target_id and target_id not in user_target_ids:
             empty = {
                 "postings": [],
+                "next_cursor": None,
                 "total": 0,
-                "page": page,
-                "page_size": page_size,
                 "applied_min_score": min_score,
             }
             job_list_cache.set(cache_key, empty)
@@ -900,8 +950,6 @@ def list_jobs(
         result = _list_jobs_for_target(
             supabase,
             target_id=target_id,
-            offset=offset,
-            page=page,
             page_size=page_size,
             sort=sort,
             ascending=ascending,
@@ -911,6 +959,7 @@ def list_jobs(
             search=search,
             exclude_terms=exclude_terms,
             only_terms=only_terms,
+            cursor=cursor_data,
             axis_weights=axis_weights,
             user_id=user_id,
         )
@@ -932,8 +981,6 @@ def list_jobs(
         result = _list_jobs_across_user_targets(
             supabase,
             user_target_ids=user_target_ids,
-            offset=offset,
-            page=page,
             page_size=page_size,
             sort=sort,
             ascending=ascending,
@@ -943,6 +990,7 @@ def list_jobs(
             search=search,
             exclude_terms=exclude_terms,
             only_terms=only_terms,
+            cursor=cursor_data,
             weights_by_target=weights_by_target or None,
             user_id=user_id,
         )
@@ -975,6 +1023,10 @@ def list_jobs(
     # Per-user status isn't sortable on the global view (column gone); fall
     # back to a safe default if a caller asks to sort by it.
     operator_sort = "created_at" if sort == "status" else sort
+
+    # Operator view keeps offset pagination under an opaque cursor (it's a
+    # bounded table scan, not the keyset hot path).
+    operator_offset = _offset_from_cursor(cursor_data)
 
     def _finalize_operator_rows(
         rows: list[dict[str, Any]],
@@ -1010,24 +1062,28 @@ def list_jobs(
         )
         operator_result: dict[str, Any] = {
             "postings": _finalize_operator_rows(
-                filtered[offset : offset + page_size]
+                filtered[operator_offset : operator_offset + page_size]
+            ),
+            "next_cursor": _offset_next_cursor(
+                operator_offset, page_size, len(filtered)
             ),
             "total": len(filtered),
-            "page": page,
-            "page_size": page_size,
+            "applied_min_score": min_score,
         }
     else:
         query = query.order(operator_sort, desc=not ascending).range(
-            offset, offset + page_size - 1
+            operator_offset, operator_offset + page_size - 1
         )
         resp = query.execute()
+        operator_total = resp.count or 0
         operator_result = {
             "postings": _finalize_operator_rows(
                 cast(list[dict[str, Any]], list(resp.data or []))
             ),
-            "total": resp.count or 0,
-            "page": page,
-            "page_size": page_size,
+            "next_cursor": _offset_next_cursor(
+                operator_offset, page_size, operator_total
+            ),
+            "total": operator_total,
             "applied_min_score": min_score,
         }
     job_list_cache.set(cache_key, operator_result)

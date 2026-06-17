@@ -27,7 +27,6 @@ const KEYS = {
   onlyLocations: 'only',
   sort: 'sort',
   order: 'order',
-  page: 'page',
   target: 'target',
 } as const;
 
@@ -41,7 +40,6 @@ interface JobsUrlState {
   onlyLocations: string;
   sort: string;
   order: JobsUrlOrder;
-  page: number;
   targetId: string | undefined;
 }
 
@@ -60,11 +58,6 @@ interface UseJobsUrlStateOptions {
    *  ``/jobs`` lands on the user's first active target rather than the
    *  empty "All Jobs" view (which the poller doesn't populate). */
   defaultTargetId?: string | undefined | null;
-}
-
-function parsePage(raw: string | null): number {
-  const n = Number.parseInt(raw ?? '', 10);
-  return Number.isFinite(n) && n >= 1 ? n : 1;
 }
 
 function parseOrder(raw: string | null): JobsUrlOrder {
@@ -99,7 +92,6 @@ export function useJobsUrlState({
       onlyLocations: searchParams.get(KEYS.onlyLocations) ?? '',
       sort: searchParams.get(KEYS.sort) ?? defaultSort,
       order: parseOrder(searchParams.get(KEYS.order)) ?? defaultOrder,
-      page: parsePage(searchParams.get(KEYS.page)),
       targetId: target ?? defaultTargetId ?? undefined,
     };
   }, [searchParams, defaultSort, defaultOrder, defaultTargetId]);
@@ -123,15 +115,6 @@ export function useJobsUrlState({
         apply(KEYS.onlyLocations, patch.onlyLocations);
       if ('sort' in patch) apply(KEYS.sort, patch.sort);
       if ('order' in patch) apply(KEYS.order, patch.order);
-      if ('page' in patch) {
-        // Page 1 is the implicit default — drop it from the URL so the
-        // canonical "no filters" URL is just ``/jobs``.
-        if (patch.page === 1 || patch.page === null) {
-          next.delete(KEYS.page);
-        } else if (typeof patch.page === 'number') {
-          next.set(KEYS.page, String(patch.page));
-        }
-      }
       if ('targetId' in patch) apply(KEYS.target, patch.targetId);
 
       const qs = next.toString();

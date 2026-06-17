@@ -19,9 +19,10 @@ export const metadata: Metadata = {
 
 interface JobsListResponse {
   postings: JobPosting[];
-  total: number;
-  page: number;
-  page_size: number;
+  // Cursor pagination (#113): total is best-effort (null on the keyset path),
+  // next_cursor drives "load more". The dashboard only reads ``postings``.
+  total: number | null;
+  next_cursor: string | null;
 }
 
 // Mirrors ``PIPELINE_STATS`` in ``DashboardPage.tsx`` — keep in sync so

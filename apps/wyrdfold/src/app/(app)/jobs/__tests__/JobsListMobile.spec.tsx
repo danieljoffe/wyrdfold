@@ -46,9 +46,9 @@ describe('JobsListMobile', () => {
       <JobsListMobile
         postings={[]}
         loading
-        page={1}
-        setPage={() => undefined}
-        totalPages={1}
+        hasMore={false}
+        loadingMore={false}
+        onLoadMore={() => undefined}
         selectedIds={new Set()}
         onSelectionChange={() => undefined}
         onRefetch={() => undefined}
@@ -62,9 +62,9 @@ describe('JobsListMobile', () => {
       <JobsListMobile
         postings={[]}
         loading={false}
-        page={1}
-        setPage={() => undefined}
-        totalPages={1}
+        hasMore={false}
+        loadingMore={false}
+        onLoadMore={() => undefined}
         selectedIds={new Set()}
         onSelectionChange={() => undefined}
         onRefetch={() => undefined}
@@ -80,9 +80,9 @@ describe('JobsListMobile', () => {
       <JobsListMobile
         postings={[makeJob(), makeJob({ id: 'j-2', title: 'Backend Dev' })]}
         loading={false}
-        page={1}
-        setPage={() => undefined}
-        totalPages={1}
+        hasMore={false}
+        loadingMore={false}
+        onLoadMore={() => undefined}
         selectedIds={new Set()}
         onSelectionChange={onSelectionChange}
         onRefetch={() => undefined}
@@ -101,21 +101,40 @@ describe('JobsListMobile', () => {
     expect(onSelectionChange).toHaveBeenCalled();
   });
 
-  it('hides pagination when totalPages <= 1', () => {
+  it('hides the load-more button when there are no more pages', () => {
     render(
       <JobsListMobile
         postings={[makeJob()]}
         loading={false}
-        page={1}
-        setPage={() => undefined}
-        totalPages={1}
+        hasMore={false}
+        loadingMore={false}
+        onLoadMore={() => undefined}
         selectedIds={new Set()}
         onSelectionChange={() => undefined}
         onRefetch={() => undefined}
       />
     );
     expect(
-      screen.queryByRole('navigation', { name: /pagination/i })
+      screen.queryByRole('button', { name: /load more/i })
     ).not.toBeInTheDocument();
+  });
+
+  it('shows the load-more button and fires onLoadMore when there is a next page', async () => {
+    const onLoadMore = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobsListMobile
+        postings={[makeJob()]}
+        loading={false}
+        hasMore
+        loadingMore={false}
+        onLoadMore={onLoadMore}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+        onRefetch={() => undefined}
+      />
+    );
+    await user.click(screen.getByRole('button', { name: /load more/i }));
+    expect(onLoadMore).toHaveBeenCalled();
   });
 });
