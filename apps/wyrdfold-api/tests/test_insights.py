@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from app.models.insights import FunnelStage
 from app.services.insights import (
+    _cost_by_purpose,
     _fetch_in_chunks,
     compute_pipeline,
     compute_skills_cost,
@@ -1574,3 +1575,56 @@ class TestComputeChunksLargeIdLists:
                 f"{table} not chunked at 200: {sizes}"
             )
             assert sizes[0] == 200
+
+
+# ===========================================================================
+# _cost_by_purpose — server-side aggregation + fallback (#105)
+# ===========================================================================
+
+
+class TestCostByPurpose:
+    def test_uses_rpc_when_user_scoped(self):
+        sb = MagicMock()
+        sb.rpc.return_value.execute.return_value.data = {
+            "tailor.resume": {"sum": 0.5, "count": 3},
+            "analysis": {"sum": 0.25, "count": 2},
+        }
+        totals, counts = _cost_by_purpose(sb, user_id="u1", since=None)
+        assert totals == {"tailor.resume": 0.5, "analysis": 0.25}
+        assert counts == {"tailor.resume": 3, "analysis": 2}
+        # RPC path resolved it; no per-row table fetch.
+        sb.table.assert_not_called()
+        args = sb.rpc.call_args
+        assert args.args[0] == "cost_by_purpose_since"
+        assert args.args[1] == {"p_user_id": "u1", "p_since": None}
+
+    def test_falls_back_to_client_group_when_rpc_unavailable(self):
+        # _mock_supabase makes .rpc raise -> exercises the client-side group.
+        sb = _mock_supabase(
+            {
+                "llm_costs": [
+                    {"purpose": "tailor.resume", "cost_usd": 0.10},
+                    {"purpose": "tailor.resume", "cost_usd": 0.05},
+                    {"purpose": "analysis", "cost_usd": 0.20},
+                ]
+            }
+        )
+        totals, counts = _cost_by_purpose(sb, user_id="u1", since=None)
+        assert totals["analysis"] == 0.20
+        assert abs(totals["tailor.resume"] - 0.15) < 1e-9
+        assert counts == {"tailor.resume": 2, "analysis": 1}
+
+    def test_user_id_none_sums_all_rows_via_python(self):
+        # user_id=None must not call the per-user RPC (it sums every row).
+        sb = _mock_supabase(
+            {
+                "llm_costs": [
+                    {"purpose": "analysis", "cost_usd": 0.20},
+                    {"purpose": "analysis", "cost_usd": 0.30},
+                ]
+            }
+        )
+        totals, counts = _cost_by_purpose(sb, user_id=None, since=None)
+        sb.rpc.assert_not_called()
+        assert abs(totals["analysis"] - 0.50) < 1e-9
+        assert counts == {"analysis": 2}
