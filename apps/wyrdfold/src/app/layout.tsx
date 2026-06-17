@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
+import { headers } from 'next/headers';
 import { ToastProvider } from '@/state/Toast/ToastProvider';
 import { ThemeProvider } from '@/state/Theme/ThemeProvider';
 import './global.css';
@@ -20,7 +21,20 @@ export const viewport: Viewport = {
   themeColor: '#8FC900',
 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  // Reading a request header opts this layout — and therefore every route
+  // beneath it — into per-request dynamic rendering. That's a hard
+  // requirement for the nonce-based CSP set in proxy.ts: Next only stamps the
+  // per-request nonce onto the scripts it emits when the page renders per
+  // request, and the inline theme script below needs that same nonce to be
+  // authorized. A statically prerendered / CDN-cached page would ship HTML
+  // whose scripts carry no nonce, so `'strict-dynamic'` would block every one.
+  const nonce = (await headers()).get('x-nonce') ?? undefined;
+
   return (
     // ``pyre`` namespaces the design-token reset; ``ThemeProvider``
     // toggles ``dark`` on the html element based on the stored theme
@@ -31,6 +45,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html lang='en' className='pyre'>
       <head>
         <script
+          nonce={nonce}
           dangerouslySetInnerHTML={{
             __html: `(() => {
   try {
