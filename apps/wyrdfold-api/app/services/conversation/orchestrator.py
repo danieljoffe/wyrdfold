@@ -118,13 +118,19 @@ async def handle_turn(
         history, "[skipped question]" if skipped else user_content
     )
     if current_prose and current_prose.content.strip():
+        prose_context = "[context: current prose doc]\n" + current_prose.content
         messages.insert(
             0,
             Message(
                 role="user",
-                content=(
-                    "[context: current prose doc]\n" + current_prose.content
-                ),
+                content=prose_context,
+                # Cache the prose-doc prefix (#73): it's the largest stable
+                # chunk re-sent on every turn. cache_prefix_chars ==
+                # len(content) marks the whole block as a prompt-cache
+                # breakpoint (system + prose cached); the volatile
+                # conversation turns that follow are billed normally. A
+                # prose_append on a later turn simply misses and re-creates.
+                cache_prefix_chars=len(prose_context),
             ),
         )
 
