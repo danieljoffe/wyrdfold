@@ -22,10 +22,12 @@ export const metadata: Metadata = {
   robots: { index: true, follow: true },
 };
 
-// Pure marketing page — no per-request data, no cookies, no Supabase. Render
-// it once at build time so the first paint for unauthenticated visitors is
-// pure CDN HTML.
-export const dynamic = 'force-static';
+// This is a pure marketing page with no per-request data, so it would ideally
+// be `force-static`. It can't be: the root layout reads `headers()` to source
+// the per-request CSP nonce (see proxy.ts), which forces every route to render
+// per request. A statically prerendered copy would bake its <script> tags with
+// no nonce and `'strict-dynamic'` would block them, so this page renders
+// dynamically like the rest of the app.
 
 interface Capability {
   title: string;
