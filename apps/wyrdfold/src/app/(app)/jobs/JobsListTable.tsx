@@ -2,8 +2,8 @@
 
 import { Fragment, useState } from 'react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
-import { Pagination } from '@danieljoffe/shared-ui/Pagination';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import Button from '@/components/Button';
 import { cn } from '@/lib/cn';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
@@ -19,9 +19,9 @@ import {
 interface JobsListTableProps {
   postings: JobPosting[];
   loading: boolean;
-  page: number;
-  setPage: (p: number) => void;
-  totalPages: number;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
   sort: JobsSortColumn;
   order: 'asc' | 'desc';
   handleSort: (col: JobsSortColumn) => void;
@@ -73,9 +73,9 @@ const COLUMNS: { key: JobsSortColumn; label: string }[] = [
 export default function JobsListTable({
   postings,
   loading,
-  page,
-  setPage,
-  totalPages,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   sort: activeSort,
   order: sortOrder,
   handleSort,
@@ -271,13 +271,17 @@ export default function JobsListTable({
           </tbody>
         </table>
       </div>
-      {totalPages > 1 && (
+      {hasMore && (
         <div className='mt-4 flex justify-center'>
-          <Pagination
-            currentPage={page}
-            totalPages={totalPages}
-            onPageChange={setPage}
-          />
+          <Button
+            name='jobs-load-more'
+            variant='outline'
+            onClick={onLoadMore}
+            loading={loadingMore}
+            disabled={loadingMore}
+          >
+            Load more
+          </Button>
         </div>
       )}
     </div>

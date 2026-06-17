@@ -1,7 +1,7 @@
 'use client';
 
-import { Pagination } from '@danieljoffe/shared-ui/Pagination';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
+import Button from '@/components/Button';
 import { useToast } from '@/state/Toast/ToastProvider';
 import JobCard from './JobCard';
 import JobsEmptyState from './JobsEmptyState';
@@ -10,9 +10,9 @@ import type { JobPosting } from './types';
 interface JobsListMobileProps {
   postings: JobPosting[];
   loading: boolean;
-  page: number;
-  setPage: (p: number) => void;
-  totalPages: number;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
   selectedIds: Set<string>;
   onSelectionChange: (ids: Set<string>) => void;
   onRefetch: () => void;
@@ -21,9 +21,9 @@ interface JobsListMobileProps {
 export default function JobsListMobile({
   postings,
   loading,
-  page,
-  setPage,
-  totalPages,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   selectedIds,
   onSelectionChange,
   onRefetch,
@@ -99,13 +99,17 @@ export default function JobsListMobile({
         ))}
       </ul>
 
-      {totalPages > 1 && (
+      {hasMore && (
         <div className='mt-2 flex justify-center'>
-          <Pagination
-            currentPage={page}
-            totalPages={totalPages}
-            onPageChange={setPage}
-          />
+          <Button
+            name='jobs-load-more'
+            variant='outline'
+            onClick={onLoadMore}
+            loading={loadingMore}
+            disabled={loadingMore}
+          >
+            Load more
+          </Button>
         </div>
       )}
     </div>

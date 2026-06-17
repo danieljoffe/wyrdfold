@@ -100,9 +100,8 @@ export default function JobsList({
         minScore: next.minScore || null,
         excludeLocations: next.excludeLocations || null,
         onlyLocations: next.onlyLocations || null,
-        // Filter changes always reset to page 1 — match
-        // ``useAdminTableFetch``'s ``extraParams`` reset.
-        page: 1,
+        // No page reset needed: ``useAdminTableFetch`` re-fetches the first
+        // page (and drops the accumulated list) whenever filters change.
       });
     },
     [setUrlState]
@@ -167,7 +166,6 @@ export default function JobsList({
       minScore: saved.minScore || null,
       excludeLocations: saved.excludeLocations || null,
       onlyLocations: saved.onlyLocations || null,
-      page: 1,
     });
     // Intentionally narrow deps: we only want this to fire on the first
     // render per target. Including ``urlState`` would re-trigger after
@@ -176,32 +174,23 @@ export default function JobsList({
     // with a small dep array.
   }, [activeTargetId, persistence, setUrlState]);
 
-  // Sort/order/page wiring for ``useAdminTableFetch``. Defined here so we
-  // can hand them down to JobsListView as a controlled trio + change
-  // callbacks. Sort defaults are mirrored from ``useJobsUrlState`` so the
-  // values match.
+  // Sort/order wiring for ``useAdminTableFetch``. Defined here so we can
+  // hand them down to JobsListView as a controlled pair + change callback.
+  // Sort defaults are mirrored from ``useJobsUrlState`` so the values match.
+  // (Pagination isn't URL-backed — it's an in-memory load-more cursor.)
   const controlledTableState = useMemo(
     () => ({
       sort: urlState.sort as JobsSortColumn,
       order: urlState.order,
-      page: urlState.page,
     }),
-    [urlState.sort, urlState.order, urlState.page]
+    [urlState.sort, urlState.order]
   );
 
   const onTableSortChange = useCallback(
     (sort: JobsSortColumn, order: 'asc' | 'desc') => {
-      // Sort changes reset to page 1 and create a history entry so back
-      // restores the old sort.
-      setUrlState({ sort, order, page: 1 }, 'push');
-    },
-    [setUrlState]
-  );
-
-  const onTablePageChange = useCallback(
-    (page: number) => {
-      // Page changes create history entries so the back button works.
-      setUrlState({ page }, 'push');
+      // Sort changes create a history entry so back restores the old sort.
+      // The hook re-fetches the first page when sort changes.
+      setUrlState({ sort, order }, 'push');
     },
     [setUrlState]
   );
@@ -364,7 +353,6 @@ export default function JobsList({
           minScore: saved?.minScore || null,
           excludeLocations: saved?.excludeLocations || null,
           onlyLocations: saved?.onlyLocations || null,
-          page: 1,
         },
         'push'
       );
@@ -737,7 +725,6 @@ export default function JobsList({
             onPostingsLoaded={setVisiblePostings}
             controlledTableState={controlledTableState}
             onTableSortChange={onTableSortChange}
-            onTablePageChange={onTablePageChange}
           />
 
           {/* Thin-results CTA. Empty state (0 jobs) is owned by
