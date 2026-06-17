@@ -31,6 +31,18 @@ DEFAULT_PURPOSE = "tailor.resume"
 DEFAULT_COVER_LETTER_PURPOSE = "tailor.cover_letter"
 
 
+def _optimized_section(optimized: OptimizedPayload) -> str:
+    """The ``[OptimizedPayload]`` section — the user's master experience doc.
+
+    It's the largest chunk of the user turn and is byte-identical across every
+    tailor/cover-letter call in a session, so both builders emit it *first* and
+    the callers set a ``cache_prefix_chars`` breakpoint at its end (#73). That
+    caches the heaviest repeated prefix; only the trailing job-specific content
+    is re-billed at full input price on a cache hit.
+    """
+    return f"[OptimizedPayload]\n{optimized.model_dump_json(indent=2)}"
+
+
 def build_user_message(
     *,
     optimized: OptimizedPayload,
@@ -48,7 +60,7 @@ def build_user_message(
     per call lives here.
     """
     sections: list[str] = []
-    sections.append(f"[OptimizedPayload]\n{optimized.model_dump_json(indent=2)}")
+    sections.append(_optimized_section(optimized))
     sections.append(f"[ContactInfo]\n{contact.model_dump_json(indent=2)}")
     sections.append(f"[ResumeType] {resume_type}")
     sections.append(f"[PageBudget] {page_budget}")
@@ -210,7 +222,13 @@ async def tailor_resume(
         llm,
         model=model,
         system=TAILOR_SYSTEM,
-        messages=[Message(role="user", content=user_message)],
+        messages=[
+            Message(
+                role="user",
+                content=user_message,
+                cache_prefix_chars=len(_optimized_section(optimized)),
+            )
+        ],
         schema=TailoredResume,
         purpose=purpose,
         cache_system=True,
@@ -251,7 +269,7 @@ def build_cover_letter_user_message(
     per call lives here.
     """
     sections: list[str] = []
-    sections.append(f"[OptimizedPayload]\n{optimized.model_dump_json(indent=2)}")
+    sections.append(_optimized_section(optimized))
     sections.append(f"[ContactInfo]\n{contact.model_dump_json(indent=2)}")
     sections.append(f"[RecipientCompany] {company_name}")
     if role_title:
@@ -374,7 +392,13 @@ async def tailor_cover_letter(
         llm,
         model=model,
         system=COVER_LETTER_SYSTEM,
-        messages=[Message(role="user", content=user_message)],
+        messages=[
+            Message(
+                role="user",
+                content=user_message,
+                cache_prefix_chars=len(_optimized_section(optimized)),
+            )
+        ],
         schema=TailoredCoverLetter,
         purpose=purpose,
         cache_system=True,
