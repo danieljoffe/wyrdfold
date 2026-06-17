@@ -22,15 +22,17 @@
 --    single-tenant DBs were backfilled in 20260614140000), so this is a no-op
 --    safety net rather than a guess.
 update public.status_log s
-set user_id = uj.user_id
+set user_id = owners.user_id
 from (
-    select job_posting_id, min(user_id) as user_id
+    -- Postgres has no min(uuid) aggregate; the HAVING guarantees a single
+    -- distinct owner per posting, so take that one value out of the array.
+    select job_posting_id, (array_agg(distinct user_id))[1] as user_id
     from public.user_jobs
     group by job_posting_id
     having count(distinct user_id) = 1
-) uj
+) owners
 where s.user_id is null
-  and uj.job_posting_id = s.posting_id;
+  and owners.job_posting_id = s.posting_id;
 
 -- 2. Enforce the invariant now that every row is attributed.
 alter table public.status_log alter column user_id set not null;
