@@ -95,10 +95,14 @@ def get_status_history(
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
     _assert_user_owns_posting(supabase, posting_id, user_id)
+    # Scope to the caller's own transitions (#113): a posting is shared catalog,
+    # so two users targeting the same job both "own" it — without the user_id
+    # filter each would see the other's pipeline actions in the history.
     result = (
         supabase.table("status_log")
         .select("id, old_status, new_status, note, created_at")
         .eq("posting_id", posting_id)
+        .eq("user_id", user_id)
         .order("created_at", desc=True)
         .limit(50)
         .execute()
