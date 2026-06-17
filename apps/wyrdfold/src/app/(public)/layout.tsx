@@ -77,8 +77,9 @@ const PORTFOLIO_URL = 'https://danieljoffe.com';
  * upstream in proxy.ts, which redirects signed-in users to /dashboard.
  */
 export default function PublicLayout({ children }: { children: ReactNode }) {
-  // The page is force-static, so this resolves at build time. Re-deploys
-  // pick up the new year; not worth more than that.
+  // Resolved per request now that the route renders dynamically (the nonce
+  // CSP forces it — see (public)/page.tsx). The footer year stays current
+  // without a redeploy; that's a minor upside, not the reason for the change.
   const year = new Date().getFullYear();
 
   return (
