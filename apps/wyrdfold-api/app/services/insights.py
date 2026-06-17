@@ -11,6 +11,7 @@ at beta scale, so a byte-identical SQL rewrite is risk without payoff (#101).
 
 from __future__ import annotations
 
+import logging
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, cast
@@ -34,9 +35,59 @@ from app.models.insights import (
 )
 from app.services.supabase_retry import execute_with_retry_sync
 
+logger = logging.getLogger(__name__)
+
 # Supabase .execute().data is typed as list[JSON] (a broad union).
 # In practice every row is a dict — this alias makes casts readable.
 Row = dict[str, Any]
+
+
+def _cost_by_purpose(
+    supabase: Client, user_id: str | None, since: datetime | None
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Per-purpose ``(total_cost, call_count)`` for the user's ``llm_costs``.
+
+    RPC-first (``cost_by_purpose_since`` does the GROUP BY server-side and
+    returns raw sums + counts), falling back to a client-side fetch+group.
+    The fallback is also the only path for the ``user_id is None`` "sum every
+    row" case, which the per-user RPC deliberately doesn't model. Sums are
+    returned RAW; the caller rounds in Python (Postgres vs Python rounding
+    differ — see the migration's byte-identity note).
+    """
+    if user_id is not None:
+        try:
+            resp = supabase.rpc(
+                "cost_by_purpose_since",
+                {
+                    "p_user_id": user_id,
+                    "p_since": since.isoformat() if since is not None else None,
+                },
+            ).execute()
+            raw = resp.data
+            if isinstance(raw, dict):
+                totals = {p: float(v["sum"]) for p, v in raw.items()}
+                counts = {p: int(v["count"]) for p, v in raw.items()}
+                return totals, counts
+        except Exception:
+            logger.debug(
+                "cost_by_purpose_since RPC unavailable, falling back to "
+                "client-side group"
+            )
+
+    cq = supabase.table("llm_costs").select("purpose, cost_usd")
+    if since:
+        cq = cq.gte("created_at", since.isoformat())
+    if user_id is not None:
+        cq = cq.eq("user_id", user_id)
+    rows = _rows(cq, label="insights/skills_cost_llm_costs")
+
+    totals_acc: defaultdict[str, float] = defaultdict(float)
+    counts_acc: Counter[str] = Counter()
+    for cl in rows:
+        purpose = cl.get("purpose", "unknown")
+        totals_acc[purpose] += float(cl.get("cost_usd") or 0)
+        counts_acc[purpose] += 1
+    return dict(totals_acc), dict(counts_acc)
 
 
 def _rows(query: Any, label: str) -> list[Row]:
@@ -1031,13 +1082,9 @@ def compute_skills_cost(
     else:
         analyses = _rows(_analyses_base(), label="insights/skills_cost_analyses")
 
-    # Fetch LLM cost log — has a direct user_id column.
-    cq = supabase.table("llm_costs").select("purpose, cost_usd, created_at")
-    if since:
-        cq = cq.gte("created_at", since.isoformat())
-    if user_id is not None:
-        cq = cq.eq("user_id", user_id)
-    cost_logs = _rows(cq, label="insights/skills_cost_llm_costs")
+    # Per-purpose LLM spend — aggregated server-side via the
+    # cost_by_purpose_since RPC (#105), client-side fallback inside the helper.
+    purpose_totals, purpose_counts = _cost_by_purpose(supabase, user_id, since)
 
     # Fetch tailored resumes for per-resume cost. ``documents`` has no
     # ``target_id`` column (renamed from ``tailored_resumes`` without
@@ -1155,13 +1202,6 @@ def compute_skills_cost(
     ]
 
     # --- Cost by purpose ---
-    purpose_totals: defaultdict[str, float] = defaultdict(float)
-    purpose_counts: Counter[str] = Counter()
-    for cl in cost_logs:
-        purpose = cl.get("purpose", "unknown")
-        purpose_totals[purpose] += float(cl.get("cost_usd") or 0)
-        purpose_counts[purpose] += 1
-
     cost_by_purpose = sorted(
         [
             PurposeCost(
@@ -1176,7 +1216,7 @@ def compute_skills_cost(
     )
 
     # --- Totals ---
-    total_cost = sum(float(cl.get("cost_usd") or 0) for cl in cost_logs)
+    total_cost = sum(purpose_totals.values())
     total_resumes = len(resume_costs)
     avg_cost_per_resume = (total_cost / total_resumes) if total_resumes > 0 else None
 
