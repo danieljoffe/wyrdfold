@@ -244,8 +244,7 @@ def test_target_two_query_orders_by_recency_when_enabled(
     result = _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
-        offset=0,
-        page=1,
+        cursor={},
         page_size=10,
         sort="score",
         ascending=False,
@@ -285,8 +284,7 @@ def test_across_targets_orders_by_recency_when_enabled(
     result = _list_jobs_across_user_targets(
         sb,
         user_target_ids={"t-1", "t-2"},
-        offset=0,
-        page=1,
+        cursor={},
         page_size=10,
         sort="score",
         ascending=False,
