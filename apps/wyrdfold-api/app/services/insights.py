@@ -393,6 +393,7 @@ def _fetch_status_logs_window(
     since: datetime | None,
     until: datetime | None,
     posting_ids: set[str] | None,
+    user_id: str | None,
 ) -> list[Row]:
     if posting_ids is not None and not posting_ids:
         return []
@@ -401,6 +402,13 @@ def _fetch_status_logs_window(
         sq = supabase.table("status_log").select(
             "posting_id, old_status, new_status, created_at"
         )
+        # Per-user scoping (#113): a posting in the shared catalog can sit
+        # under several users' targets, so the audit log must be filtered to
+        # the caller's own transitions — otherwise one user's response-time
+        # KPIs absorb another's. user_id is None only on the admin/global
+        # rollup (the "sum every user" path), which intentionally skips it.
+        if user_id is not None:
+            sq = sq.eq("user_id", user_id)
         if since:
             sq = sq.gte("created_at", since.isoformat())
         if until:
@@ -483,7 +491,7 @@ def compute_pipeline(
     # whose time-series logic stays in Python (status_log is ~1 row at beta
     # scale — moving it is risk without payoff, #101).
     posting_ids = _fetch_window_posting_ids(supabase, since, None, target_ids)
-    status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids)
+    status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids, user_id)
     status_counts = _pipeline_status_counts(
         supabase, since, None, target_ids, user_id
     )
@@ -530,7 +538,7 @@ def compute_pipeline(
             supabase, prior_since, prior_until, target_ids
         )
         prior_logs = _fetch_status_logs_window(
-            supabase, prior_since, prior_until, prior_posting_ids
+            supabase, prior_since, prior_until, prior_posting_ids, user_id
         )
         prior_counts = _pipeline_status_counts(
             supabase, prior_since, prior_until, target_ids, user_id
