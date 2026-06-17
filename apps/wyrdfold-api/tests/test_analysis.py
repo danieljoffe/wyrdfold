@@ -27,7 +27,12 @@ from app.models.experience import (
     Skill,
 )
 from app.services.analysis import persistence as persistence_mod
-from app.services.analysis.analyze import DEFAULT_PURPOSE, analyze_job, build_user_message
+from app.services.analysis.analyze import (
+    DEFAULT_PURPOSE,
+    _optimized_section,
+    analyze_job,
+    build_user_message,
+)
 from app.services.llm import cost_log as cost_log_mod
 from app.services.llm.mock import MockLLMClient
 
@@ -198,6 +203,20 @@ async def test_analyze_job_includes_target_context_in_message() -> None:
     )
     assert "[TargetContext]" in seen["latest"]
     assert "Senior FE at Acme" in seen["latest"]
+
+
+async def test_analyze_job_sets_cache_breakpoint_on_master_doc() -> None:
+    """The user turn carries a cache breakpoint at the end of the master doc
+    (#73), byte-identical to the OptimizedPayload section, so the heavy prefix
+    is cached across analyses while the job description is re-billed."""
+    optimized = _optimized_payload()
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
+    await analyze_job(llm, optimized=optimized, job_description="JD text")
+
+    user_msg = llm.calls[-1]["messages"][0]  # type: ignore[index]
+    section = _optimized_section(optimized)
+    assert user_msg.cache_prefix_chars == len(section)
+    assert user_msg.content[: user_msg.cache_prefix_chars] == section
 
 
 async def test_analyze_job_json_parse_error_raises() -> None:

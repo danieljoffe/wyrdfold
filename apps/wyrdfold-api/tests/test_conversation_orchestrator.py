@@ -149,6 +149,32 @@ async def test_handle_turn_appends_prose_when_llm_requests(
     assert "FightCamp" in create_call.kwargs["content"]
 
 
+async def test_handle_turn_caches_prose_doc_prefix(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """The prose-doc context message carries a cache breakpoint over its whole
+    content (#73), so system + prose are cached across conversation turns while
+    the volatile turns that follow are billed normally."""
+    llm = MockLLMClient(
+        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(prose_append=None)}
+    )
+    mock_service_layer["prose_get_latest"].return_value = _prose("existing prose.")
+
+    await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="hi",
+        skipped=False,
+    )
+
+    prose_msg = llm.calls[-1]["messages"][0]  # type: ignore[index]
+    assert prose_msg.content.startswith("[context: current prose doc]\n")
+    assert "existing prose." in prose_msg.content
+    assert prose_msg.cache_prefix_chars == len(prose_msg.content)
+
+
 async def test_handle_turn_does_not_append_when_no_prose_content(
     mock_service_layer: dict[str, Any],
 ) -> None:

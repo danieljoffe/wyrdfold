@@ -272,6 +272,33 @@ def spend_by_purpose_all(
     return {k: round(v, 6) for k, v in totals.items()}
 
 
+def cache_metrics_all(
+    supabase: Client,
+    since: datetime | None = None,
+) -> dict[str, int]:
+    """Sum prompt-cache token usage across ALL users over the window.
+
+    Returns ``{"cache_read", "cache_creation", "uncached_input"}`` — the
+    three Anthropic input-token buckets (``input_tokens`` is the
+    non-cached portion). Powers the cache hit-rate line on the operator
+    cost-summary (#73). No RPC variant: the operator surface is queried
+    infrequently and the table is bounded by retention, so a client-side
+    sum is fine — same posture as ``spend_by_purpose_all``.
+    """
+    query = supabase.table(TABLE).select(
+        "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
+    )
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {
+        "cache_read": sum(int(r["cache_read_input_tokens"]) for r in rows),
+        "cache_creation": sum(int(r["cache_creation_input_tokens"]) for r in rows),
+        "uncached_input": sum(int(r["input_tokens"]) for r in rows),
+    }
+
+
 def spend_by_purpose(
     supabase: Client,
     user_id: str | None,
