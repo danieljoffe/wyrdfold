@@ -21,6 +21,7 @@ def _good_settings(**overrides: object) -> Settings:
         "allowed_hosts": "*",
         "supabase_url": "https://example.supabase.co",
         "supabase_service_role_key": "sk-test",
+        "supabase_anon_key": "anon-test",
         "llm_provider": "mock",
         "embeddings_provider": "mock",
     }
@@ -48,6 +49,14 @@ def test_missing_supabase_url_fails_boot() -> None:
 def test_missing_supabase_service_role_key_fails_boot() -> None:
     with pytest.raises(RuntimeError, match="SUPABASE_URL"):
         _validate_settings(_good_settings(supabase_service_role_key=""))
+
+
+def test_missing_supabase_anon_key_fails_boot() -> None:
+    """A deploy with the service-role key but no anon key boots clean, then
+    503s every per-user RLS route (#79). Caught prod this exact way — fail
+    loudly at startup instead."""
+    with pytest.raises(RuntimeError, match="SUPABASE_ANON_KEY"):
+        _validate_settings(_good_settings(supabase_anon_key=""))
 
 
 def test_anthropic_provider_without_key_fails_boot() -> None:
