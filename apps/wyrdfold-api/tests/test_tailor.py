@@ -16,6 +16,7 @@ from app.models.tailor import (
 from app.services.llm.mock import MockLLMClient
 from app.services.tailor.tailor import (
     DEFAULT_PURPOSE,
+    _optimized_section,
     build_user_message,
     tailor_resume,
     validate_cover_letter_refs,
@@ -550,3 +551,39 @@ def test_validate_cover_letter_drops_truly_unknown_skill() -> None:
     )
     assert letter.source_skill_refs == []
     assert any("Kafka" in w for w in warnings)
+
+
+# ---- prompt caching (#73) -------------------------------------------------
+
+
+def test_optimized_section_is_message_prefix() -> None:
+    optimized = _optimized()
+    msg = build_user_message(
+        optimized=optimized,
+        job_description="jd",
+        contact=_contact(),
+        resume_type="generic",
+        preferences_text=None,
+        annotations_text=None,
+        critique=None,
+        page_budget=2,
+    )
+    assert msg.startswith(_optimized_section(optimized))
+
+
+async def test_tailor_resume_sets_cache_breakpoint_on_master_doc() -> None:
+    optimized = _optimized()
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
+    await tailor_resume(
+        llm,
+        optimized=optimized,
+        job_description="We want a senior FE",
+        contact=_contact(),
+    )
+    user_msg = llm.calls[-1]["messages"][0]  # type: ignore[index]
+    section = _optimized_section(optimized)
+    # The user turn carries a cache breakpoint at the end of the master doc,
+    # and that prefix is byte-identical to the OptimizedPayload section so the
+    # cached block stays stable across calls.
+    assert user_msg.cache_prefix_chars == len(section)
+    assert user_msg.content[: user_msg.cache_prefix_chars] == section

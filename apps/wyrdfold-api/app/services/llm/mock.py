@@ -90,6 +90,7 @@ class MockLLMClient:
                 "purpose": purpose,
                 "system_len": len(system),
                 "messages_count": len(messages),
+                "messages": list(messages),
                 "cache_system": cache_system,
                 "max_tokens": max_tokens,
             }
@@ -156,6 +157,7 @@ class MockLLMClient:
                 "purpose": purpose,
                 "system_len": len(system),
                 "messages_count": len(messages),
+                "messages": list(messages),
                 "cache_system": cache_system,
                 "max_tokens": max_tokens,
                 "tool_name": tool_name,
@@ -212,6 +214,7 @@ class MockLLMClient:
                 "purpose": purpose,
                 "system_len": len(system),
                 "messages_count": len(messages),
+                "messages": list(messages),
                 "cache_system": cache_system,
                 "max_tokens": max_tokens,
                 "streamed": True,
