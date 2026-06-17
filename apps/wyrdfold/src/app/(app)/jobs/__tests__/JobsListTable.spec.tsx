@@ -34,9 +34,9 @@ function makeJob(overrides: Partial<JobPosting> = {}): JobPosting {
 }
 
 const baseProps = {
-  page: 1,
-  setPage: () => undefined,
-  totalPages: 1,
+  hasMore: false,
+  loadingMore: false,
+  onLoadMore: () => undefined,
   sort: 'score' as JobsSortColumn,
   order: 'desc' as const,
   handleSort: () => undefined,
