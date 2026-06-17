@@ -11,7 +11,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from app.routers.jobs import (
+    _decode_cursor,
+    _encode_cursor,
     _list_jobs_across_user_targets,
+    _list_jobs_for_target_rpc,
     _list_jobs_for_target_two_query,
 )
 
@@ -87,8 +90,7 @@ def test_target_two_query_restores_score_desc_order() -> None:
     result = _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
-        offset=0,
-        page=1,
+        cursor={},
         page_size=10,
         sort="score",
         ascending=False,
@@ -124,8 +126,7 @@ def test_across_user_targets_restores_score_desc_order() -> None:
     result = _list_jobs_across_user_targets(
         sb,
         user_target_ids={"t-1", "t-2"},
-        offset=0,
-        page=1,
+        cursor={},
         page_size=10,
         sort="score",
         ascending=False,
@@ -164,8 +165,7 @@ def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
     result = _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
-        offset=0,
-        page=1,
+        cursor={},
         page_size=10,
         sort="score",
         ascending=False,
@@ -181,3 +181,100 @@ def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
     # The crux of the regression: total should be the post-filter count,
     # not the 3 pre-filter scores rows.
     assert result["total"] == 1
+
+
+# ── cursor pagination (#113) ────────────────────────────────────────────────
+
+
+def test_cursor_codec_round_trips() -> None:
+    for payload in ({"v": 90, "id": "j-1"}, {"o": 40}):
+        assert _decode_cursor(_encode_cursor(payload)) == payload
+    # Empty / None / malformed → first page (empty dict).
+    assert _decode_cursor(None) == {}
+    assert _encode_cursor(None) is None
+    assert _encode_cursor({}) is None
+    assert _decode_cursor("not-base64!!") == {}
+
+
+def _rpc_supabase(rows: list[dict[str, Any]], captured: dict[str, Any]) -> MagicMock:
+    sb = MagicMock()
+
+    def _rpc(name: str, params: dict[str, Any]) -> MagicMock:
+        captured["name"] = name
+        captured["params"] = params
+        call = MagicMock()
+        call.execute.return_value = _Resp(rows)
+        return call
+
+    sb.rpc.side_effect = _rpc
+    return sb
+
+
+def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
+    # page_size+1 rows come back → there's a next page; the extra row is
+    # dropped and the cursor is the last KEPT row's (score, id).
+    rows = [{"id": f"j{i}", "score": 100 - i} for i in range(3)]  # 3 = 2 + 1
+    captured: dict[str, Any] = {}
+    sb = _rpc_supabase(rows, captured)
+    result = _list_jobs_for_target_rpc(
+        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        min_score=None, status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={},
+    )
+    assert captured["params"]["p_limit"] == 3  # page_size + 1
+    assert captured["params"]["p_after_value"] is None  # first page
+    assert captured["params"]["p_after_id"] is None
+    assert [p["id"] for p in result["postings"]] == ["j0", "j1"]  # extra trimmed
+    assert _decode_cursor(result["next_cursor"]) == {"v": 99, "id": "j1"}
+    assert result["total"] is None  # no COUNT on the keyset path
+
+
+def test_rpc_keyset_last_page_has_no_cursor() -> None:
+    rows = [{"id": "j0", "score": 100}, {"id": "j1", "score": 99}]  # exactly page_size
+    sb = _rpc_supabase(rows, {})
+    result = _list_jobs_for_target_rpc(
+        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        min_score=None, status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={},
+    )
+    assert result["next_cursor"] is None
+
+
+def test_rpc_keyset_consumes_incoming_cursor() -> None:
+    captured: dict[str, Any] = {}
+    sb = _rpc_supabase([], captured)
+    _list_jobs_for_target_rpc(
+        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        min_score=None, status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={"v": 90, "id": "j-x"},
+    )
+    assert captured["params"]["p_after_value"] == "90"  # stringified for the RPC
+    assert captured["params"]["p_after_id"] == "j-x"
+
+
+def test_two_query_offset_cursor_advances_when_more_rows() -> None:
+    # 3 rows, page_size 2 → first page carries a next-cursor at offset 2.
+    # Use a title sort so pagination happens in the Python-slice branch (the
+    # score fast-path slices page_ids at the scores layer, which the fluent
+    # mock — ignoring .in_() — can't represent).
+    ts_rows = [
+        {"job_posting_id": f"j{i}", "score": 90 - i, "score_breakdown": {}, "scoring_status": "complete"}
+        for i in range(3)
+    ]
+    postings = [{"id": f"j{i}", "title": f"t{i}"} for i in range(3)]
+    sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
+    result = _list_jobs_for_target_two_query(
+        sb, target_id="t-1", page_size=2, sort="title", ascending=True,
+        min_score=None, status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={},
+    )
+    assert [p["id"] for p in result["postings"]] == ["j0", "j1"]
+    assert _decode_cursor(result["next_cursor"]) == {"o": 2}
+    # Following that cursor yields the last row and no further cursor.
+    result2 = _list_jobs_for_target_two_query(
+        sb, target_id="t-1", page_size=2, sort="title", ascending=True,
+        min_score=None, status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={"o": 2},
+    )
+    assert [p["id"] for p in result2["postings"]] == ["j2"]
+    assert result2["next_cursor"] is None
