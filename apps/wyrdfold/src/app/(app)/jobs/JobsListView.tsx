@@ -118,7 +118,6 @@ export default function JobsListView({
     order,
     handleSort,
     sortIndicator,
-    refetch,
   } = useAdminTableFetch<JobPosting, JobsSortColumn>({
     endpoint: '/api/jobs',
     defaultSort: 'score',
@@ -135,8 +134,12 @@ export default function JobsListView({
   }, [postings, onPostingsLoaded]);
 
   function handleRefetch() {
+    // Bump the cache-buster (``_r``) so ``buildUrl`` changes and the
+    // hook's effect issues exactly ONE authoritative ``/api/jobs`` fetch.
+    // Previously this ALSO called ``refetch()`` explicitly, so every
+    // status-change / target-chip / delete fired the list GET twice (one
+    // plain, one ``&_r=N``). The ``deleteKey`` bump alone is sufficient.
     setDeleteKey(k => k + 1);
-    refetch();
   }
 
   return (
@@ -148,36 +151,42 @@ export default function JobsListView({
         order={order}
         handleSort={handleSort}
       />
-      {!hydrated ? (
-        <JobsTableSkeleton />
-      ) : isDesktop ? (
-        <JobsListTable
-          postings={postings}
-          loading={loading}
-          hasMore={hasMore}
-          loadingMore={loadingMore}
-          onLoadMore={loadMore}
-          sort={sort}
-          order={order}
-          handleSort={handleSort}
-          sortIndicator={sortIndicator}
-          selectedIds={selectedIds}
-          onSelectionChange={onSelectionChange}
-          analysisTargetId={analysisTargetId}
-          onRefetch={handleRefetch}
-        />
-      ) : (
-        <JobsListMobile
-          postings={postings}
-          loading={loading}
-          hasMore={hasMore}
-          loadingMore={loadingMore}
-          onLoadMore={loadMore}
-          selectedIds={selectedIds}
-          onSelectionChange={onSelectionChange}
-          onRefetch={handleRefetch}
-        />
-      )}
+      {/* Reserve a minimum height so the list doesn't collapse between
+          result sets during a filter/search/sort refetch — that shrink-then-
+          regrow is the source of the search CLS (~0.03). The full skeleton
+          (8 rows) sets the baseline; once data is loaded the rows take over. */}
+      <div className='min-h-[480px]'>
+        {!hydrated ? (
+          <JobsTableSkeleton />
+        ) : isDesktop ? (
+          <JobsListTable
+            postings={postings}
+            loading={loading}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            onLoadMore={loadMore}
+            sort={sort}
+            order={order}
+            handleSort={handleSort}
+            sortIndicator={sortIndicator}
+            selectedIds={selectedIds}
+            onSelectionChange={onSelectionChange}
+            analysisTargetId={analysisTargetId}
+            onRefetch={handleRefetch}
+          />
+        ) : (
+          <JobsListMobile
+            postings={postings}
+            loading={loading}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            onLoadMore={loadMore}
+            selectedIds={selectedIds}
+            onSelectionChange={onSelectionChange}
+            onRefetch={handleRefetch}
+          />
+        )}
+      </div>
     </div>
   );
 }

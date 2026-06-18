@@ -2,6 +2,7 @@
 
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import Button from '@/components/Button';
+import { cn } from '@/lib/cn';
 import { useToast } from '@/state/Toast/ToastProvider';
 import JobCard from './JobCard';
 import JobsEmptyState from './JobsEmptyState';
@@ -84,9 +85,20 @@ export default function JobsListMobile({
     return <JobsEmptyState onJobAdded={onRefetch} />;
   }
 
+  // Refetch of an already-loaded list (filter/search/sort): keep the cards
+  // mounted (no layout collapse) but dim them and mark the region busy so
+  // there's visible + assistive feedback while the new page lands.
+  const refetching = loading && postings.length > 0;
+
   return (
     <div className='flex flex-col gap-3'>
-      <ul className='flex flex-col gap-3'>
+      <ul
+        className={cn(
+          'flex flex-col gap-3 transition-opacity',
+          refetching && 'opacity-50'
+        )}
+        aria-busy={refetching || undefined}
+      >
         {postings.map(job => (
           <li key={job.id}>
             <JobCard
