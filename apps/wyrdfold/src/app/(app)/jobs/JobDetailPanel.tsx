@@ -10,6 +10,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
 import ConfirmModal from '@/components/ConfirmModal';
+import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -353,19 +354,7 @@ export default function JobDetailPanel({
             onClick: () => updateStatus(s),
           }))}
         />
-        <Badge
-          variant={
-            posting.score >= 70
-              ? 'success'
-              : posting.score >= 40
-                ? 'warning'
-                : 'error'
-          }
-          size='sm'
-          aria-label={`Match score ${posting.score}`}
-        >
-          {posting.score}
-        </Badge>
+        <ScoreBadge score={posting.score} size='sm' />
 
         {/* Resume + Cover Letter as compact pills in the toolbar. Only when
             a target is selected — tailoring requires one. The components
