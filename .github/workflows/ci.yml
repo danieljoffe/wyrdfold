@@ -173,8 +173,25 @@ jobs:
         run: uv sync --frozen
 
       # python-docx resume/cover-letter rendering tests shell out to pandoc.
+      # Install the pinned .deb straight from the pandoc GitHub release rather
+      # than `apt-get update && apt-get install`: the apt path intermittently
+      # hung for ~15 min on a slow mirror and the job was cancelled (flaky CI).
+      # curl has explicit connect/max timeouts + retries so it can't hang the
+      # job; apt stays as a fallback, and timeout-minutes bounds the worst case.
       - name: Install pandoc
-        run: sudo apt-get update && sudo apt-get install -y pandoc
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PANDOC_VERSION=3.1.3
+          if curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+               -o /tmp/pandoc.deb \
+               "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"; then
+            sudo dpkg -i /tmp/pandoc.deb
+          else
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pandoc
+          fi
+          pandoc --version
 
       - name: Lint, typecheck, test
         working-directory: apps/wyrdfold-api
