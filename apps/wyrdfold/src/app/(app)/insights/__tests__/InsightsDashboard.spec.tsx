@@ -36,6 +36,54 @@ jest.mock('../charts/VelocityChart', () => ({
   default: () => <div data-testid='velocity-chart' />,
 }));
 
+// Live URL-state mock that triggers re-renders on write — replace re-parses
+// the query string, bumps a tick counter, and notifies subscribed components
+// so ``useSearchParams`` reflects ``?period=`` writes (mirrors JobsList.spec).
+const mockReplace = jest.fn();
+type Listener = () => void;
+const navState: { params: URLSearchParams; listeners: Set<Listener> } = {
+  params: new URLSearchParams(),
+  listeners: new Set(),
+};
+const writeUrl = (url: unknown) => {
+  if (typeof url !== 'string') return;
+  const qs = url.includes('?') ? url.split('?', 2)[1] : '';
+  navState.params = new URLSearchParams(qs);
+  navState.listeners.forEach(l => l());
+};
+
+jest.mock('next/navigation', () => {
+  const { useEffect, useState } =
+    jest.requireActual<typeof import('react')>('react');
+  return {
+    useRouter: () => ({
+      push: (...args: unknown[]) => {
+        writeUrl(args[0]);
+        mockReplace(...args);
+      },
+      replace: (...args: unknown[]) => {
+        writeUrl(args[0]);
+        mockReplace(...args);
+      },
+      refresh: jest.fn(),
+      prefetch: jest.fn(),
+      back: jest.fn(),
+    }),
+    useSearchParams: () => {
+      const [, setTick] = useState(0);
+      useEffect(() => {
+        const listener = () => setTick(t => t + 1);
+        navState.listeners.add(listener);
+        return () => {
+          navState.listeners.delete(listener);
+        };
+      }, []);
+      return navState.params;
+    },
+    usePathname: () => '/insights',
+  };
+});
+
 const mockUseInsights = jest.fn();
 jest.mock('@/hooks/useInsights', () => ({
   useInsights: (period: unknown) => mockUseInsights(period),
@@ -98,6 +146,8 @@ const READY_STATE = {
 beforeEach(() => {
   mockUseInsights.mockReset();
   mockDownload.mockReset();
+  mockReplace.mockReset();
+  navState.params = new URLSearchParams();
 });
 
 describe('InsightsDashboard', () => {
@@ -117,6 +167,29 @@ describe('InsightsDashboard', () => {
     await waitFor(() => {
       expect(mockUseInsights).toHaveBeenLastCalledWith('90d');
     });
+  });
+
+  it('persists the selected period to the URL (?period=)', async () => {
+    mockUseInsights.mockReturnValue(LOADING_STATE);
+    const user = userEvent.setup();
+    render(<InsightsDashboard />);
+    await user.click(screen.getByRole('button', { name: '90d' }));
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenLastCalledWith(
+        expect.stringContaining('period=90d'),
+        expect.objectContaining({ scroll: false })
+      );
+    });
+  });
+
+  it('reads the initial period from the URL (?period=)', () => {
+    navState.params = new URLSearchParams('period=7d');
+    mockUseInsights.mockReturnValue(LOADING_STATE);
+    render(<InsightsDashboard />);
+    expect(
+      screen.getByRole('button', { name: '7d', pressed: true })
+    ).toBeInTheDocument();
+    expect(mockUseInsights).toHaveBeenLastCalledWith('7d');
   });
 
   it('shows an error banner when useInsights returns an error', () => {
