@@ -12,6 +12,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import { FormFieldError } from '@danieljoffe/shared-ui/FormFieldError';
 import Button from '@/components/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -36,6 +37,22 @@ function weightBadgeVariant(w: number): 'default' | 'info' | 'brand' {
   return 'brand';
 }
 
+/** Declared ranges for the three editable numeric weights. The browser
+ * `max`/`min` attrs don't block typing, so we clamp on change AND validate
+ * before save against these same bounds. */
+const CATEGORY_WEIGHT_RANGE = { min: 0, max: 10 } as const;
+const DOMAIN_WEIGHT_RANGE = { min: 0, max: 10 } as const;
+const NEGATIVE_WEIGHT_RANGE = { min: -100, max: 0 } as const;
+
+function clamp(value: number, min: number, max: number): number {
+  if (Number.isNaN(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function inRange(value: number, min: number, max: number): boolean {
+  return Number.isFinite(value) && value >= min && value <= max;
+}
+
 export default function ScoringProfileEditor({
   target,
   onSaved,
@@ -58,7 +75,45 @@ export default function ScoringProfileEditor({
     [profile, target.scoring_profile]
   );
 
+  // Which category weights fall outside [0,10]. Clamp-on-change keeps these
+  // empty in normal use, but a paste/programmatic value can still land out of
+  // range, so Save is gated on this too.
+  const invalidCategories = useMemo(
+    () =>
+      Object.entries(profile.categories)
+        .filter(
+          ([, cat]) =>
+            !inRange(
+              cat.weight,
+              CATEGORY_WEIGHT_RANGE.min,
+              CATEGORY_WEIGHT_RANGE.max
+            )
+        )
+        .map(([name]) => name),
+    [profile.categories]
+  );
+
+  const domainWeightInvalid = !inRange(
+    profile.domain.weight,
+    DOMAIN_WEIGHT_RANGE.min,
+    DOMAIN_WEIGHT_RANGE.max
+  );
+
+  const negativeWeightInvalid = !inRange(
+    profile.negative.weight,
+    NEGATIVE_WEIGHT_RANGE.min,
+    NEGATIVE_WEIGHT_RANGE.max
+  );
+
+  const isValid =
+    invalidCategories.length === 0 &&
+    !domainWeightInvalid &&
+    !negativeWeightInvalid;
+
   const handleSave = useCallback(async () => {
+    // Belt-and-suspenders: the Save button is disabled while invalid, but
+    // never PATCH out-of-range weights even if invoked programmatically.
+    if (!isValid) return;
     setSaving(true);
     try {
       const res = await fetch(`/api/targets/${target.id}`, {
@@ -78,7 +133,7 @@ export default function ScoringProfileEditor({
     } finally {
       setSaving(false);
     }
-  }, [target.id, profile, toast, onSaved]);
+  }, [target.id, profile, isValid, toast, onSaved]);
 
   // ---- Category operations ----
 
@@ -288,11 +343,17 @@ export default function ScoringProfileEditor({
                       <input
                         type='number'
                         aria-label={`Weight for ${catName} category`}
+                        aria-invalid={invalidCategories.includes(catName)}
                         value={cat.weight}
+                        onFocus={e => e.target.select()}
                         onChange={e =>
                           updateCategoryWeight(
                             catName,
-                            parseFloat(e.target.value) || 0
+                            clamp(
+                              parseFloat(e.target.value),
+                              CATEGORY_WEIGHT_RANGE.min,
+                              CATEGORY_WEIGHT_RANGE.max
+                            )
                           )
                         }
                         step={0.1}
@@ -321,6 +382,13 @@ export default function ScoringProfileEditor({
                     </Button>
                   </div>
                 </div>
+
+                {invalidCategories.includes(catName) && (
+                  <FormFieldError
+                    id={`cat-weight-error-${catName}`}
+                    message={`Weight must be between ${CATEGORY_WEIGHT_RANGE.min} and ${CATEGORY_WEIGHT_RANGE.max}.`}
+                  />
+                )}
 
                 <div className='flex flex-wrap gap-2'>
                   {Object.entries(cat.keywords).map(([kw, weight]) => (
@@ -465,10 +533,16 @@ export default function ScoringProfileEditor({
             <input
               type='number'
               aria-label='Domain weight'
+              aria-invalid={domainWeightInvalid}
               value={profile.domain.weight}
+              onFocus={e => e.target.select()}
               onChange={e =>
                 updateDomain({
-                  weight: parseFloat(e.target.value) || 0,
+                  weight: clamp(
+                    parseFloat(e.target.value),
+                    DOMAIN_WEIGHT_RANGE.min,
+                    DOMAIN_WEIGHT_RANGE.max
+                  ),
                 })
               }
               step={0.1}
@@ -479,6 +553,12 @@ export default function ScoringProfileEditor({
               className='w-16 rounded border border-border bg-surface px-2 py-1 text-xs text-text-primary'
             />
           </label>
+          {domainWeightInvalid && (
+            <FormFieldError
+              id='domain-weight-error'
+              message={`Weight must be between ${DOMAIN_WEIGHT_RANGE.min} and ${DOMAIN_WEIGHT_RANGE.max}.`}
+            />
+          )}
           <TagList
             label='Signals'
             items={profile.domain.signals}
@@ -510,10 +590,16 @@ export default function ScoringProfileEditor({
             <input
               type='number'
               aria-label='Negative keywords weight'
+              aria-invalid={negativeWeightInvalid}
               value={profile.negative.weight}
+              onFocus={e => e.target.select()}
               onChange={e =>
                 updateNegative({
-                  weight: parseFloat(e.target.value) || 0,
+                  weight: clamp(
+                    parseFloat(e.target.value),
+                    NEGATIVE_WEIGHT_RANGE.min,
+                    NEGATIVE_WEIGHT_RANGE.max
+                  ),
                 })
               }
               step={1}
@@ -525,6 +611,12 @@ export default function ScoringProfileEditor({
               className='w-16 rounded border border-border bg-surface px-2 py-1 text-xs text-text-primary'
             />
           </label>
+          {negativeWeightInvalid && (
+            <FormFieldError
+              id='negative-weight-error'
+              message={`Weight must be between ${NEGATIVE_WEIGHT_RANGE.min} and ${NEGATIVE_WEIGHT_RANGE.max}.`}
+            />
+          )}
           <TagList
             label='Keywords'
             items={profile.negative.keywords}
@@ -545,15 +637,20 @@ export default function ScoringProfileEditor({
           role='status'
           aria-live='polite'
         >
-          <Text variant='caption' className='text-warning'>
-            Unsaved changes
+          <Text
+            variant='caption'
+            className={isValid ? 'text-warning' : 'text-error'}
+          >
+            {isValid
+              ? 'Unsaved changes'
+              : 'Fix out-of-range weights before saving'}
           </Text>
           <Button
             name='target-profile-save'
             variant='primary'
             size='sm'
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || !isValid}
           >
             {saving ? (
               <>
