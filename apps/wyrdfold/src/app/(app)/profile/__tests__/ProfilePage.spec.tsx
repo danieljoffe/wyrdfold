@@ -1,6 +1,7 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import ProfilePage from '../ProfilePage';
 
 const mockToast = jest.fn();
@@ -69,5 +70,82 @@ describe('ProfilePage', () => {
         expect.objectContaining({ variant: 'error' })
       );
     });
+  });
+
+  it('debounced prose autosave POSTs prose then refreshes only gap-health (no redundant prose/optimized re-fetch)', async () => {
+    const fetchMock = jest.fn().mockImplementation((url: string) => {
+      if (url.includes('/optimized'))
+        return Promise.resolve(jsonRes({ optimized: null }));
+      if (url.includes('/gap-health'))
+        return Promise.resolve(
+          jsonRes({ tier: 'green', gap_pct: 0, gaps: [] })
+        );
+      if (url.includes('/prose'))
+        return Promise.resolve(
+          jsonRes({
+            id: 'prose-1',
+            user_id: null,
+            version: 1,
+            content: 'Initial',
+            created_at: '2026-06-18',
+          })
+        );
+      return Promise.resolve(jsonRes({}, 404));
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<ProfilePage />);
+
+    // Wait for the initial load (3 GETs) to settle and the editor to mount.
+    // Use real timers here so findByRole's polling can resolve the fetch
+    // microtasks; switch to fake timers afterwards to drive the debounce.
+    const textarea = await screen.findByRole('textbox', {
+      name: /master document/i,
+    });
+
+    // Initial load fires exactly one GET to each endpoint.
+    const countGets = (fragment: string) =>
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          typeof url === 'string' &&
+          url.includes(fragment) &&
+          (init?.method ?? 'GET') === 'GET'
+      ).length;
+    expect(countGets('/prose')).toBe(1);
+    expect(countGets('/optimized')).toBe(1);
+    expect(countGets('/gap-health')).toBe(1);
+
+    jest.useFakeTimers();
+    const user = userEvent.setup({
+      advanceTimers: (ms: number) => jest.advanceTimersByTime(ms),
+    });
+    await user.type(textarea, ' more');
+
+    // Cross the 800ms debounce so the autosave fires.
+    await act(async () => {
+      jest.advanceTimersByTime(800);
+    });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            typeof url === 'string' &&
+            url.includes('/prose') &&
+            init?.method === 'POST'
+        )
+      ).toBe(true);
+    });
+
+    // After save: gap-health refreshed (2nd GET), but prose/optimized are NOT
+    // re-fetched — the local draft is authoritative and the LLM re-derive stays
+    // behind the explicit Re-derive button.
+    await waitFor(() => {
+      expect(countGets('/gap-health')).toBe(2);
+    });
+    expect(countGets('/prose')).toBe(1);
+    expect(countGets('/optimized')).toBe(1);
+
+    jest.useRealTimers();
   });
 });
