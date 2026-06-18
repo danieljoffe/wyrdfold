@@ -205,8 +205,15 @@ def reset_content(
     supabase: Client,
     *,
     user_id: str | None,
+    include_turns: bool = True,
 ) -> ResetResult:
-    """Wipe prose, optimized (chunks cascade), and turns. Preserve preferences."""
+    """Wipe prose and optimized (chunks cascade). Preserve preferences.
+
+    ``include_turns=True`` (the default) also wipes conversation turns — the
+    full "start over" behind POST /conversation/reset. Deleting just the
+    master document (DELETE /experience/prose) passes ``include_turns=False``
+    so the user's chat history survives a document delete.
+    """
 
     def _scoped(table: str) -> Any:
         q = supabase.table(table).delete()
@@ -214,11 +221,14 @@ def reset_content(
 
     prose_resp = _scoped("experience_prose_docs").execute()
     optimized_resp = _scoped("experience_optimized_docs").execute()
-    turns_resp = _scoped("experience_conversation_turns").execute()
 
     prose_deleted = len(cast(list[Any], prose_resp.data or []))
     optimized_deleted = len(cast(list[Any], optimized_resp.data or []))
-    turns_deleted = len(cast(list[Any], turns_resp.data or []))
+
+    turns_deleted = 0
+    if include_turns:
+        turns_resp = _scoped("experience_conversation_turns").execute()
+        turns_deleted = len(cast(list[Any], turns_resp.data or []))
 
     return ResetResult(
         prose_versions_deleted=prose_deleted,
