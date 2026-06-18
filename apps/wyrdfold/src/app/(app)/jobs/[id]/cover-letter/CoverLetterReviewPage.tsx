@@ -17,6 +17,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -67,6 +68,10 @@ export default function CoverLetterReviewPage({
   const [unapproving, setUnapproving] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [lintWarnings, setLintWarnings] = useState<LintViolation[]>([]);
+  const [confirmRegenerateOpen, setConfirmRegenerateOpen] = useState(false);
+  // The version awaiting restore confirmation; null when no dialog is open.
+  const [versionToRestore, setVersionToRestore] =
+    useState<ResumeVersion | null>(null);
 
   const [versions, setVersions] = useState<ResumeVersion[] | null>(null);
   const [versionCap, setVersionCap] = useState<number>(5);
@@ -343,13 +348,6 @@ export default function CoverLetterReviewPage({
 
   async function handleRegenerate() {
     if (!record || !posting) return;
-    const message = isApproved
-      ? 'Generate a new cover letter from scratch? This will replace the approved letter — the current one stays in version history but will no longer be the active draft.'
-      : 'Re-generate this cover letter from scratch? Current draft is saved as a version first.';
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (!window.confirm(message))
-      /* eslint-enable no-alert */
-      return;
     setRegenerating(true);
     try {
       await flushPendingSave();
@@ -375,6 +373,7 @@ export default function CoverLetterReviewPage({
         return;
       }
       toast({ variant: 'success', title: 'Cover letter re-generated with AI' });
+      setConfirmRegenerateOpen(false);
       setVersions(null);
       await load();
     } catch {
@@ -387,7 +386,7 @@ export default function CoverLetterReviewPage({
     }
   }
 
-  async function restoreVersion(version: ResumeVersion) {
+  function restoreVersion(version: ResumeVersion) {
     const md = (version as ResumeVersion & { payload_md?: string | null })
       .payload_md;
     if (!md) {
@@ -397,14 +396,13 @@ export default function CoverLetterReviewPage({
       });
       return;
     }
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (
-      !window.confirm(
-        'Load this version? Your current draft is saved as a version first so you can roll back.'
-      )
-    )
-      /* eslint-enable no-alert */
-      return;
+    setVersionToRestore(version);
+  }
+
+  async function performRestore(version: ResumeVersion) {
+    const md = (version as ResumeVersion & { payload_md?: string | null })
+      .payload_md;
+    if (!md) return;
     // Mirrors ResumeReviewPage — snapshot the live draft before
     // ``setMarkdown(md)`` so the autosave that follows doesn't
     // overwrite the live document without leaving a recoverable
@@ -414,6 +412,7 @@ export default function CoverLetterReviewPage({
     setMarkdown(md);
     setSaveStatus('pending');
     setVersionsOpen(false);
+    setVersionToRestore(null);
   }
 
   // ``(app)/layout.tsx`` already supplies the page's ``<main>``
@@ -677,7 +676,7 @@ export default function CoverLetterReviewPage({
                 {
                   label: 'Re-generate with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
-                  onClick: handleRegenerate,
+                  onClick: () => setConfirmRegenerateOpen(true),
                   disabled:
                     regenerating ||
                     approving ||
@@ -733,6 +732,32 @@ export default function CoverLetterReviewPage({
           </Text>
         </div>
       </div>
+
+      <ConfirmModal
+        isOpen={confirmRegenerateOpen}
+        onClose={() => setConfirmRegenerateOpen(false)}
+        onConfirm={handleRegenerate}
+        title='Re-generate cover letter?'
+        message={
+          isApproved
+            ? 'Generate a new cover letter from scratch? This will replace the approved letter — the current one stays in version history but will no longer be the active draft.'
+            : 'Re-generate this cover letter from scratch? Current draft is saved as a version first.'
+        }
+        confirmLabel='Regenerate'
+        loading={regenerating}
+        loadingLabel='Regenerating…'
+      />
+
+      <ConfirmModal
+        isOpen={versionToRestore !== null}
+        onClose={() => setVersionToRestore(null)}
+        onConfirm={() => {
+          if (versionToRestore) void performRestore(versionToRestore);
+        }}
+        title='Load this version?'
+        message='Load this version? Your current draft is saved as a version first so you can roll back.'
+        confirmLabel='Restore'
+      />
     </div>
   );
 }

@@ -27,6 +27,7 @@ import { consumeSse } from '@/lib/consumeSse';
 import { extractApiError } from '@/lib/extractApiError';
 import { parsePartialJson } from '@/lib/parsePartialJson';
 import { useToast } from '@/state/Toast/ToastProvider';
+import ConfirmModal from '@/components/ConfirmModal';
 import ConversationChatModal from '../../_components/ConversationChatModal';
 import ProfileIdentityCard from './ProfileIdentityCard';
 import type {
@@ -113,6 +114,7 @@ export default function ProfilePage() {
   const [saving, setSaving] = useState(false);
   const [consolidating, setConsolidating] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Track the server's known content so autosave only fires on actual edits and
   // doesn't overwrite mid-typing when fetchData refreshes the prose state.
@@ -358,12 +360,6 @@ export default function ProfilePage() {
   }, [fetchData, toast]);
 
   const handleDelete = useCallback(async () => {
-    const message =
-      'Delete your master document? This also removes the profile derived ' +
-      'from it (skills, experience). Uploading a new resume afterwards starts ' +
-      'clean instead of merging into the old document. This cannot be undone.';
-    // eslint-disable-next-line no-alert -- personal tool, native confirm is fine
-    if (!window.confirm(message)) return;
     setDeleting(true);
     try {
       const res = await fetch('/api/career/experience/prose', {
@@ -381,6 +377,7 @@ export default function ProfilePage() {
       setProse(null);
       setOptimized(null);
       setStreamingPayload(null);
+      setConfirmDeleteOpen(false);
       toast({ variant: 'success', title: 'Master document deleted' });
       await fetchData();
     } catch (err) {
@@ -634,7 +631,7 @@ export default function ProfilePage() {
               name='profile-delete-master-document'
               variant='outline'
               size='sm'
-              onClick={handleDelete}
+              onClick={() => setConfirmDeleteOpen(true)}
               disabled={deleting || !prose}
               className='text-error hover:text-error'
               title='Delete the master document and the profile derived from it. A new upload then starts clean.'
@@ -793,6 +790,18 @@ export default function ProfilePage() {
         isOpen={chatOpen}
         onClose={() => setChatOpen(false)}
         onComplete={fetchData}
+      />
+
+      <ConfirmModal
+        isOpen={confirmDeleteOpen}
+        onClose={() => setConfirmDeleteOpen(false)}
+        onConfirm={handleDelete}
+        title='Delete master document?'
+        message='This also removes the profile derived from it (skills, experience). Uploading a new resume afterwards starts clean instead of merging into the old document. This cannot be undone.'
+        confirmLabel='Delete'
+        destructive
+        loading={deleting}
+        loadingLabel='Deleting…'
       />
     </div>
   );

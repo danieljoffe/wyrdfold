@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import TargetsList from '../TargetsList';
 import {
@@ -307,6 +307,89 @@ describe('TargetsList', () => {
       });
       expect(screen.getByText(/^Active$/i)).toBeInTheDocument();
       expect(mockRefresh).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('delete', () => {
+    const originalFetch = global.fetch;
+    afterEach(() => {
+      global.fetch = originalFetch;
+      mockToast.mockClear();
+      mockRefresh.mockClear();
+    });
+
+    async function openDeleteDialog() {
+      const user = userEvent.setup();
+      render(
+        <TargetsList
+          initialTargets={[
+            makeSummaryEntry('t-1', 'Senior Frontend Engineer', {
+              fit_score: 80,
+            }),
+          ]}
+        />
+      );
+      const trigger = document.querySelector(
+        '[aria-haspopup="menu"]'
+      ) as HTMLElement;
+      await user.click(trigger);
+      await user.click(screen.getByRole('menuitem', { name: /delete/i }));
+      return user;
+    }
+
+    it('opens a confirm dialog from the Delete menu item without deleting', async () => {
+      const fetchMock = jest.fn();
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const user = await openDeleteDialog();
+      const dialog = await screen.findByRole('dialog');
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument();
+    });
+
+    it('DELETEs the target and removes the card after confirming', async () => {
+      const fetchMock = jest.fn().mockResolvedValue({ ok: true } as Response);
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const user = await openDeleteDialog();
+      const dialog = await screen.findByRole('dialog');
+      await user.click(
+        within(dialog).getByRole('button', { name: /^delete$/i })
+      );
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith('/api/targets/t-1', {
+          method: 'DELETE',
+        });
+      });
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'success' })
+      );
+      await waitFor(() => {
+        expect(screen.queryByText('Senior Frontend Engineer')).toBeNull();
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('toasts an error and keeps the card when delete fails', async () => {
+      const fetchMock = jest.fn().mockResolvedValue({ ok: false } as Response);
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const user = await openDeleteDialog();
+      const dialog = await screen.findByRole('dialog');
+      await user.click(
+        within(dialog).getByRole('button', { name: /^delete$/i })
+      );
+
+      await waitFor(() => {
+        expect(mockToast).toHaveBeenCalledWith(
+          expect.objectContaining({ variant: 'error' })
+        );
+      });
+      expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument();
     });
   });
 });

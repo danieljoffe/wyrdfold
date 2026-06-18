@@ -10,6 +10,7 @@ import {
 } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { TargetReferenceJD } from '../types';
@@ -28,43 +29,38 @@ export default function ReferenceJDList({
 }: ReferenceJDListProps) {
   const [modalOpen, setModalOpen] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Reference JD id awaiting delete confirmation; opens the confirm modal.
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const { toast } = useToast();
 
-  const handleDelete = useCallback(
-    async (refId: string) => {
-      /* eslint-disable no-alert -- personal tool */
-      if (
-        !window.confirm(
-          'Delete this reference JD? The scoring profile will be re-merged.'
-        )
-      )
-        return;
-      /* eslint-enable no-alert */
+  const handleDelete = useCallback((refId: string) => {
+    setPendingDeleteId(refId);
+  }, []);
 
-      setDeletingId(refId);
-      try {
-        const res = await fetch(
-          `/api/targets/${targetId}/reference-jds/${refId}`,
-          { method: 'DELETE' }
-        );
-        if (!res.ok)
-          throw new Error(await extractApiError(res, 'Delete failed'));
-        toast({ variant: 'success', title: 'Reference JD removed' });
-        onChanged();
-      } catch (err) {
-        toast({
-          variant: 'error',
-          title:
-            err instanceof Error
-              ? err.message
-              : 'Failed to delete reference JD',
-        });
-      } finally {
-        setDeletingId(null);
-      }
-    },
-    [targetId, toast, onChanged]
-  );
+  const confirmDelete = useCallback(async () => {
+    const refId = pendingDeleteId;
+    if (!refId) return;
+
+    setDeletingId(refId);
+    try {
+      const res = await fetch(
+        `/api/targets/${targetId}/reference-jds/${refId}`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) throw new Error(await extractApiError(res, 'Delete failed'));
+      toast({ variant: 'success', title: 'Reference JD removed' });
+      setPendingDeleteId(null);
+      onChanged();
+    } catch (err) {
+      toast({
+        variant: 'error',
+        title:
+          err instanceof Error ? err.message : 'Failed to delete reference JD',
+      });
+    } finally {
+      setDeletingId(null);
+    }
+  }, [pendingDeleteId, targetId, toast, onChanged]);
 
   const handleAdded = useCallback(() => {
     setModalOpen(false);
@@ -141,6 +137,18 @@ export default function ReferenceJDList({
         onClose={() => setModalOpen(false)}
         targetId={targetId}
         onAdded={handleAdded}
+      />
+
+      <ConfirmModal
+        isOpen={pendingDeleteId !== null}
+        onClose={() => setPendingDeleteId(null)}
+        onConfirm={confirmDelete}
+        title='Delete reference JD?'
+        message='The scoring profile will be re-merged. This cannot be undone.'
+        confirmLabel='Delete'
+        destructive
+        loading={deletingId !== null}
+        loadingLabel='Deleting…'
       />
     </Card>
   );

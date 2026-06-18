@@ -11,6 +11,7 @@ import {
 } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { useToast } from '@/state/Toast/ToastProvider';
 
 /**
@@ -21,27 +22,16 @@ import { useToast } from '@/state/Toast/ToastProvider';
  * to /onboarding. **Does not** delete prose, targets, or any other
  * profile data — only the wizard's notion of completion is reset.
  *
- * A 2-step confirm guards against accidental clicks. Plain native
- * confirm() is fine — no animation budget for a modal here, and the
- * action is reversible (the user can just finish the wizard again).
+ * A styled `ConfirmModal` guards against accidental clicks so the prompt
+ * matches the app's design system and can show the reset in flight.
  */
 export default function OnboardingResetCard() {
   const router = useRouter();
   const { toast } = useToast();
   const [submitting, setSubmitting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const handleRedo = useCallback(async () => {
-    // Native confirm is intentional here — the action is reversible
-    // (the user can just finish the wizard again) and we don't want
-    // the modal weight for this rare path.
-    const message =
-      'Redo onboarding? Your profile data, targets, and saved jobs ' +
-      'are preserved — only the wizard restarts.';
-    // eslint-disable-next-line no-alert
-    if (!window.confirm(message)) {
-      return;
-    }
-
     setSubmitting(true);
     try {
       const res = await fetch('/api/profile/onboarding/reset', {
@@ -50,6 +40,7 @@ export default function OnboardingResetCard() {
       if (!res.ok) {
         throw new Error(`Reset failed (${res.status})`);
       }
+      setConfirmOpen(false);
       router.push('/onboarding');
     } catch (err) {
       setSubmitting(false);
@@ -74,13 +65,24 @@ export default function OnboardingResetCard() {
           name='settings-redo-onboarding'
           variant='outline'
           size='sm'
-          onClick={handleRedo}
+          onClick={() => setConfirmOpen(true)}
           disabled={submitting}
         >
           <RotateCcw className='size-4' aria-hidden />
           <span>{submitting ? 'Resetting…' : 'Redo onboarding'}</span>
         </Button>
       </CardContent>
+
+      <ConfirmModal
+        isOpen={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        onConfirm={handleRedo}
+        title='Redo onboarding?'
+        message='Your profile data, targets, and saved jobs are preserved — only the wizard restarts.'
+        confirmLabel='Redo onboarding'
+        loading={submitting}
+        loadingLabel='Resetting…'
+      />
     </Card>
   );
 }
