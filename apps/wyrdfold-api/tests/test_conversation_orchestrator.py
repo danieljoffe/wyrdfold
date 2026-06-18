@@ -309,6 +309,22 @@ def test_reset_content_deletes_three_tables() -> None:
     assert result.prose_versions_deleted == 0
 
 
+def test_reset_content_keeps_turns_when_include_turns_false() -> None:
+    """Deleting just the master document (DELETE /experience/prose) wipes prose
+    + the derived optimized doc but preserves conversation turns."""
+    supabase = MagicMock()
+    delete_chain = supabase.table.return_value.delete.return_value
+    delete_chain.is_.return_value.execute.return_value.data = []
+
+    result = orchestrator.reset_content(supabase, user_id=None, include_turns=False)
+
+    tables_deleted = [c.args[0] for c in supabase.table.call_args_list]
+    assert "experience_prose_docs" in tables_deleted
+    assert "experience_optimized_docs" in tables_deleted
+    assert "experience_conversation_turns" not in tables_deleted
+    assert result.turns_deleted == 0
+
+
 def test_llm_turn_response_contract_is_parseable() -> None:
     """Sanity check: the JSON shape we ask the LLM for round-trips."""
     raw = _llm_response(
