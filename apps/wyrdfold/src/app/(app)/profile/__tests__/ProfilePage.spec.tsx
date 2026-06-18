@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ProfilePage from '../ProfilePage';
 
@@ -147,5 +147,79 @@ describe('ProfilePage', () => {
     expect(countGets('/optimized')).toBe(1);
 
     jest.useRealTimers();
+  });
+
+  describe('delete master document', () => {
+    function mockLoadedWithProse() {
+      const fetchMock = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('/optimized'))
+          return Promise.resolve(jsonRes({ optimized: null }));
+        if (url.includes('/gap-health'))
+          return Promise.resolve(
+            jsonRes({ tier: 'green', gap_pct: 0, gaps: [] })
+          );
+        if (url.includes('/prose'))
+          return Promise.resolve(
+            jsonRes({
+              id: 'prose-1',
+              user_id: null,
+              version: 1,
+              content: 'Initial',
+              created_at: '2026-06-18',
+            })
+          );
+        return Promise.resolve(jsonRes({}, 404));
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+      return fetchMock;
+    }
+
+    it('opens a confirm dialog from the Delete button without deleting', async () => {
+      const fetchMock = mockLoadedWithProse();
+      const user = userEvent.setup();
+      render(<ProfilePage />);
+
+      await screen.findByRole('textbox', { name: /master document/i });
+      await user.click(screen.getByRole('button', { name: /^delete$/i }));
+
+      const dialog = await screen.findByRole('dialog');
+      expect(
+        fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')
+      ).toBe(false);
+
+      // Cancelling closes the dialog without deleting.
+      await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
+      expect(
+        fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')
+      ).toBe(false);
+    });
+
+    it('DELETEs the master document after confirming', async () => {
+      const fetchMock = mockLoadedWithProse();
+      const user = userEvent.setup();
+      render(<ProfilePage />);
+
+      await screen.findByRole('textbox', { name: /master document/i });
+      await user.click(screen.getByRole('button', { name: /^delete$/i }));
+
+      const dialog = await screen.findByRole('dialog');
+      await user.click(
+        within(dialog).getByRole('button', { name: /^delete$/i })
+      );
+
+      await waitFor(() => {
+        expect(
+          fetchMock.mock.calls.some(
+            ([url, init]) =>
+              typeof url === 'string' &&
+              url.includes('/prose') &&
+              init?.method === 'DELETE'
+          )
+        ).toBe(true);
+      });
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'success' })
+      );
+    });
   });
 });

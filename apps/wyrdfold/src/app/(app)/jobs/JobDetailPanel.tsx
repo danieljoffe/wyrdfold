@@ -9,6 +9,7 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -123,6 +124,7 @@ export default function JobDetailPanel({
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzingStartedAt, setAnalyzingStartedAt] = useState<number | null>(
@@ -250,17 +252,12 @@ export default function JobDetailPanel({
   }, [targetId, analysis, analyzing, analysisError, runAnalysis]);
 
   async function handleDelete() {
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (
-      !window.confirm(`Delete "${posting.title}" from ${posting.company_name}?`)
-    )
-      /* eslint-enable no-alert */
-      return;
     setDeleting(true);
     try {
       const res = await fetch(`/api/jobs/${posting.id}`, { method: 'DELETE' });
       if (res.ok) {
         toast({ variant: 'success', title: 'Job deleted' });
+        setConfirmDeleteOpen(false);
         onDelete?.();
       } else {
         toast({
@@ -421,12 +418,24 @@ export default function JobDetailPanel({
                 label: deleting ? 'Deleting…' : 'Delete',
                 danger: true,
                 disabled: deleting,
-                onClick: handleDelete,
+                onClick: () => setConfirmDeleteOpen(true),
               },
             ]}
           />
         )}
       </div>
+
+      <ConfirmModal
+        isOpen={confirmDeleteOpen}
+        onClose={() => setConfirmDeleteOpen(false)}
+        onConfirm={handleDelete}
+        title='Delete posting?'
+        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
+        confirmLabel='Delete'
+        destructive
+        loading={deleting}
+        loadingLabel='Deleting…'
+      />
 
       {/* Two-column main body: Score Breakdown on the left, LLM Analysis on
           the right. The previous stacked-section layout forced the eye down

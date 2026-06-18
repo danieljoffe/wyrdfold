@@ -7,6 +7,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { cn } from '@/lib/cn';
@@ -202,6 +203,8 @@ export default function JobsList({
     { completed: number; total: number } | undefined
   >(undefined);
   const [exporting, setExporting] = useState(false);
+  const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const [visiblePostings, setVisiblePostings] = useState<JobPosting[]>([]);
   const [activationStatus, setActivationStatus] = useState<string>('idle');
   // Total job count for the active target, sourced from
@@ -566,23 +569,28 @@ export default function JobsList({
   const handleBatchDelete = useCallback(async () => {
     if (selectedIds.size === 0) return;
 
-    /* eslint-disable no-alert -- personal tool */
-    if (!window.confirm(`Delete ${selectedIds.size} jobs?`)) return;
-    /* eslint-enable no-alert */
+    setBatchDeleting(true);
+    try {
+      const deleteResults = await Promise.allSettled(
+        [...selectedIds].map(id =>
+          fetch(`/api/jobs/${id}`, { method: 'DELETE' })
+        )
+      );
+      const deleted = deleteResults.filter(
+        r => r.status === 'fulfilled' && r.value.ok
+      ).length;
 
-    const deleteResults = await Promise.allSettled(
-      [...selectedIds].map(id => fetch(`/api/jobs/${id}`, { method: 'DELETE' }))
-    );
-    const deleted = deleteResults.filter(
-      r => r.status === 'fulfilled' && r.value.ok
-    ).length;
-
-    toast({
-      variant: deleted > 0 ? 'success' : 'error',
-      title: deleted > 0 ? `Deleted ${deleted} jobs` : 'Failed to delete jobs',
-    });
-    setSelectedIds(new Set());
-    setRefreshKey(k => k + 1);
+      toast({
+        variant: deleted > 0 ? 'success' : 'error',
+        title:
+          deleted > 0 ? `Deleted ${deleted} jobs` : 'Failed to delete jobs',
+      });
+      setSelectedIds(new Set());
+      setRefreshKey(k => k + 1);
+      setConfirmBatchDeleteOpen(false);
+    } finally {
+      setBatchDeleting(false);
+    }
   }, [selectedIds, toast]);
 
   // When the action bar is visible it overlaps the bottom of the table /
@@ -753,7 +761,7 @@ export default function JobsList({
             selectedCount={selectedIds.size}
             onClear={() => setSelectedIds(new Set())}
             onBatchGenerate={handleBatchGenerate}
-            onBatchDelete={handleBatchDelete}
+            onBatchDelete={() => setConfirmBatchDeleteOpen(true)}
             onBatchExport={handleBatchExport}
             generating={generating}
             exporting={exporting}
@@ -761,6 +769,20 @@ export default function JobsList({
               p => selectedIds.has(p.id) && p.status === 'resume_ready'
             )}
             batchProgress={batchProgress}
+          />
+
+          <ConfirmModal
+            isOpen={confirmBatchDeleteOpen}
+            onClose={() => setConfirmBatchDeleteOpen(false)}
+            onConfirm={handleBatchDelete}
+            title='Delete jobs?'
+            message={`Delete ${selectedIds.size} ${
+              selectedIds.size === 1 ? 'job' : 'jobs'
+            }? This can't be undone.`}
+            confirmLabel='Delete'
+            destructive
+            loading={batchDeleting}
+            loadingLabel='Deleting…'
           />
         </>
       )}

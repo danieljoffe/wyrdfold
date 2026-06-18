@@ -1,11 +1,13 @@
 'use client';
 
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { ExternalLink, Maximize2, MoreVertical, Trash2 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import ConfirmModal from '@/components/ConfirmModal';
 import { cn } from '@/lib/cn';
 import StatusIndicator from './StatusIndicator';
 import { MANUAL_SOURCE_ID, type JobPosting, type ScoringStatus } from './types';
@@ -56,14 +58,7 @@ export default function JobCard({
 }: JobCardProps) {
   const router = useRouter();
   const detailHref = `/jobs/${job.id}`;
-
-  function handleDeleteWithConfirm() {
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (!window.confirm(`Delete "${job.title}" from ${job.company_name}?`))
-      return;
-    /* eslint-enable no-alert */
-    onDelete();
-  }
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
   const items: DropdownItem[] = [
     {
@@ -90,7 +85,7 @@ export default function JobCard({
       label: 'Delete',
       icon: <Trash2 className='size-4' aria-hidden />,
       danger: true,
-      onClick: handleDeleteWithConfirm,
+      onClick: () => setConfirmDeleteOpen(true),
     },
   ];
 
@@ -175,6 +170,23 @@ export default function JobCard({
 
       <div className='flex justify-end'>
         <StatusIndicator status={job.status} />
+      </div>
+
+      {/* Stop clicks inside the dialog (and its backdrop) from bubbling up
+          to the article's navigate handler. */}
+      <div onClick={e => e.stopPropagation()}>
+        <ConfirmModal
+          isOpen={confirmDeleteOpen}
+          onClose={() => setConfirmDeleteOpen(false)}
+          onConfirm={() => {
+            setConfirmDeleteOpen(false);
+            onDelete();
+          }}
+          title='Delete posting?'
+          message={`Delete "${job.title}" from ${job.company_name}? This can't be undone.`}
+          confirmLabel='Delete'
+          destructive
+        />
       </div>
     </article>
   );
