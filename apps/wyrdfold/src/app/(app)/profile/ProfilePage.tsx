@@ -27,6 +27,7 @@ import { consumeSse } from '@/lib/consumeSse';
 import { extractApiError } from '@/lib/extractApiError';
 import { parsePartialJson } from '@/lib/parsePartialJson';
 import { useToast } from '@/state/Toast/ToastProvider';
+import ConfirmModal from '@/components/ConfirmModal';
 import ConversationChatModal from '../../_components/ConversationChatModal';
 import ProfileIdentityCard from './ProfileIdentityCard';
 import type {
@@ -113,11 +114,27 @@ export default function ProfilePage() {
   const [saving, setSaving] = useState(false);
   const [consolidating, setConsolidating] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Track the server's known content so autosave only fires on actual edits and
   // doesn't overwrite mid-typing when fetchData refreshes the prose state.
   const lastSavedProseRef = useRef<string | null>(null);
   const { toast } = useToast();
+
+  // Refresh just the Document Health panel. This is the cheap, derived-on-read
+  // signal we want fresh after a prose autosave — unlike `optimized` (an
+  // expensive LLM re-derivation, gated behind the explicit Re-derive button)
+  // and `prose` (already authoritative in the local draft / lastSavedProseRef).
+  const refreshGapHealth = useCallback(async () => {
+    try {
+      const ghRes = await fetch('/api/career/experience/gap-health');
+      if (ghRes.ok) {
+        setGapHealth((await ghRes.json()) as GapHealthResult);
+      }
+    } catch {
+      // Non-fatal: the save itself succeeded; leave the stale health value.
+    }
+  }, []);
 
   const fetchData = useCallback(async () => {
     try {
@@ -188,7 +205,11 @@ export default function ProfilePage() {
         }
         lastSavedProseRef.current = draft;
         toast({ variant: 'success', title: 'Master document saved' });
-        await fetchData();
+        // Refresh only the cheap Document Health signal. The local draft is
+        // authoritative for prose, and `optimized` is an expensive LLM
+        // re-derivation that must stay behind the explicit Re-derive button —
+        // re-deriving it on every keystroke-pause was the autosave fan-out.
+        await refreshGapHealth();
       } catch (err) {
         toast({
           variant: 'error',
@@ -199,7 +220,7 @@ export default function ProfilePage() {
       }
     }, 800);
     return () => clearTimeout(handle);
-  }, [draft, loading, saving, deriving, deleting, fetchData, toast]);
+  }, [draft, loading, saving, deriving, deleting, refreshGapHealth, toast]);
 
   const handleUpload = useCallback(
     async (file: File) => {
@@ -339,12 +360,6 @@ export default function ProfilePage() {
   }, [fetchData, toast]);
 
   const handleDelete = useCallback(async () => {
-    const message =
-      'Delete your master document? This also removes the profile derived ' +
-      'from it (skills, experience). Uploading a new resume afterwards starts ' +
-      'clean instead of merging into the old document. This cannot be undone.';
-    // eslint-disable-next-line no-alert -- personal tool, native confirm is fine
-    if (!window.confirm(message)) return;
     setDeleting(true);
     try {
       const res = await fetch('/api/career/experience/prose', {
@@ -362,6 +377,7 @@ export default function ProfilePage() {
       setProse(null);
       setOptimized(null);
       setStreamingPayload(null);
+      setConfirmDeleteOpen(false);
       toast({ variant: 'success', title: 'Master document deleted' });
       await fetchData();
     } catch (err) {
@@ -615,7 +631,7 @@ export default function ProfilePage() {
               name='profile-delete-master-document'
               variant='outline'
               size='sm'
-              onClick={handleDelete}
+              onClick={() => setConfirmDeleteOpen(true)}
               disabled={deleting || !prose}
               className='text-error hover:text-error'
               title='Delete the master document and the profile derived from it. A new upload then starts clean.'
@@ -634,6 +650,9 @@ export default function ProfilePage() {
             </Button>
           </div>
           <textarea
+            id='master-document'
+            name='master-document'
+            aria-label='Master document'
             value={draft}
             onChange={e => setDraft(e.target.value)}
             className='min-h-[300px] w-full rounded-md border border-border bg-surface-primary p-3 font-mono text-sm text-text-primary focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand'
@@ -771,6 +790,18 @@ export default function ProfilePage() {
         isOpen={chatOpen}
         onClose={() => setChatOpen(false)}
         onComplete={fetchData}
+      />
+
+      <ConfirmModal
+        isOpen={confirmDeleteOpen}
+        onClose={() => setConfirmDeleteOpen(false)}
+        onConfirm={handleDelete}
+        title='Delete master document?'
+        message='This also removes the profile derived from it (skills, experience). Uploading a new resume afterwards starts clean instead of merging into the old document. This cannot be undone.'
+        confirmLabel='Delete'
+        destructive
+        loading={deleting}
+        loadingLabel='Deleting…'
       />
     </div>
   );

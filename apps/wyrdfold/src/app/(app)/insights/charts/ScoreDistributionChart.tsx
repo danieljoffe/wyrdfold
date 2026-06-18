@@ -102,6 +102,7 @@ export default function ScoreDistributionChart({
             <Link
               key={row.bucket}
               href={`/jobs?minScore=${bucketLow(row.bucket)}`}
+              prefetch={false}
               className={DRILL_LINK_CLASS}
             >
               {bucketLow(row.bucket)}+ ({row.count})
