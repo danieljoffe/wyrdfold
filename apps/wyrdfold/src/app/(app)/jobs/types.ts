@@ -31,7 +31,7 @@ export function formatStatus(status: string): string {
 export type ScoringStatus = 'stage1' | 'stage2' | 'complete';
 
 // Sentinel UUID for jobs added via POST /jobs/manual.
-// Mirrors `MANUAL_SOURCE_ID` in apps/job-api/app/services/extract.py.
+// Mirrors `MANUAL_SOURCE_ID` in apps/wyrdfold-api/app/services/extract.py.
 export const MANUAL_SOURCE_ID = '00000000-0000-4000-a000-000000000001';
 
 export interface JobPosting {

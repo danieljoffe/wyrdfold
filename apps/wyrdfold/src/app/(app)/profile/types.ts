@@ -1,5 +1,5 @@
-// TypeScript mirror of the Pydantic shapes in apps/job-api/app/models/experience.py
-// and apps/job-api/app/models/conversation.py.
+// TypeScript mirror of the Pydantic shapes in apps/wyrdfold-api/app/models/experience.py
+// and apps/wyrdfold-api/app/models/conversation.py.
 
 export interface Outcome {
   description: string;

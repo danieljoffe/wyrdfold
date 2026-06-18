@@ -1,9 +1,10 @@
 [project]
 name = "wyrdfold-api"
 version = "0.1.0"
-description = "WyrdFold API — fork of job-api for the standalone WyrdFold product (career-decision tooling)"
+description = "WyrdFold API — FastAPI backend for the WyrdFold job-search workspace"
 authors = [{ name = "Daniel Joffe" }]
 readme = "README.md"
+license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",

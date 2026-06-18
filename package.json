@@ -1,7 +1,7 @@
 {
   "name": "wyrdfold",
   "version": "0.0.0",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE.md",
   "packageManager": "pnpm@10.12.1",
   "engines": {
     "node": "24.x"

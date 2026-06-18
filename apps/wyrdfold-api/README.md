@@ -1,6 +1,6 @@
 # wyrdfold-api
 
-FastAPI service that powers the standalone WyrdFold product. Forked from `apps/job-api` in Phase 3a (see `.claude/docs/wyrdfold-migration/PHASES.md` and `job-api.md`). Phase 3b.1 wired Sentry and renamed the shared-secret env var to `WYRDFOLD_API_KEY`. Phase 3b.2 swapped the locally-minted admin session JWT for Supabase auth — user requests now present a Supabase Bearer token, while `WYRDFOLD_API_KEY` is reserved for cron / poller / batch callers. The remaining slices thread real `user_id` through services + cache keys (3b.3) and add per-user token-budget guards (3b.4).
+FastAPI service that powers WyrdFold: Supabase persistence, LLM calls (Anthropic / OpenRouter), source discovery (Brave Search), and ATS polling (Greenhouse / Lever / Ashby). User requests authenticate with a Supabase Bearer token (validated against the project JWKS); `WYRDFOLD_API_KEY` is a shared secret reserved for cron / poller / batch callers.
 
 ## Local
 
@@ -9,14 +9,14 @@ uv run --package wyrdfold-api uvicorn app.main:app --reload --port 8001
 pnpm nx test wyrdfold-api
 ```
 
-Copy `.env.example` → `.env` and fill in Supabase + secrets. Default dev port is `8001` to coexist with job-api on `8000`.
+Copy `.env.example` → `.env` and fill in Supabase + secrets. Default dev port is `8001`.
 
 ## Deploy to Railway
 
 The service builds from the monorepo root so the uv workspace lockfile is in scope.
 
 1. **Create the service**
-   - New Project → Deploy from GitHub repo → select `danieljoffe.com`.
+   - New Project → Deploy from GitHub repo → select your WyrdFold repo.
    - In service **Settings**:
      - **Root Directory**: leave empty (repo root) — required so the Dockerfile can see `pyproject.toml` and `uv.lock`.
      - **Config Path**: `apps/wyrdfold-api/railway.toml`.
@@ -40,4 +40,4 @@ The service builds from the monorepo root so the uv workspace lockfile is in sco
 - The Dockerfile uses `ghcr.io/astral-sh/uv:latest` for deps, then `python:3.11-slim` at runtime.
 - Railway supplies `$PORT` at runtime; the `startCommand` in `railway.toml` binds to it.
 - Healthcheck path is `/health`; Railway marks the deploy live once it returns 200.
-- Auth is in place (Supabase JWT for users, API key for cron) but the service layer is **still single-tenant** through Phase 3b.2 — every persistence call still resolves to `SINGLE_USER_ID = "tools-admin"`. Do not deploy publicly until Phase 3b.3 threads real `user_id` through services and cache keys.
+- Auth: Supabase JWT for user requests, `WYRDFOLD_API_KEY` for cron / poller / batch. Persistence is scoped per authenticated `user_id` in the service layer; database-level tenant isolation via RLS is tracked in #79.
