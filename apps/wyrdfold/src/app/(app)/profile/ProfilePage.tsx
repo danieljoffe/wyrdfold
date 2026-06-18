@@ -23,6 +23,7 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import CircleBadge from '@/components/CircleBadge';
 import { consumeSse } from '@/lib/consumeSse';
 import { extractApiError } from '@/lib/extractApiError';
 import { parsePartialJson } from '@/lib/parsePartialJson';
@@ -524,9 +525,13 @@ export default function ProfilePage() {
           <CardHeader>
             <div className='flex items-center justify-between'>
               <CardTitle>Document Health</CardTitle>
-              <Badge variant={tierToBadgeVariant(gapHealth.tier)} size='sm'>
+              <CircleBadge
+                variant={tierToBadgeVariant(gapHealth.tier)}
+                size='md'
+                ariaLabel={`Document health ${Math.round(100 - gapHealth.gap_pct)}%`}
+              >
                 {Math.round(100 - gapHealth.gap_pct)}%
-              </Badge>
+              </CircleBadge>
             </div>
           </CardHeader>
           <CardContent>
@@ -850,9 +855,13 @@ function GapsList({
         >
           <CardTitle>Gaps to Fill</CardTitle>
           <div className='flex items-center gap-2'>
-            <Badge variant='default' size='sm'>
-              {count} {count === 1 ? 'gap' : 'gaps'}
-            </Badge>
+            <CircleBadge
+              variant='default'
+              size='sm'
+              ariaLabel={`${count} ${count === 1 ? 'gap' : 'gaps'}`}
+            >
+              {count}
+            </CircleBadge>
             <RefreshCw
               className={`size-4 text-text-tertiary transition-transform ${open ? 'rotate-90' : ''}`}
               aria-hidden
