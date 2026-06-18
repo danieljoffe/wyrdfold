@@ -119,6 +119,21 @@ export default function ProfilePage() {
   const lastSavedProseRef = useRef<string | null>(null);
   const { toast } = useToast();
 
+  // Refresh just the Document Health panel. This is the cheap, derived-on-read
+  // signal we want fresh after a prose autosave — unlike `optimized` (an
+  // expensive LLM re-derivation, gated behind the explicit Re-derive button)
+  // and `prose` (already authoritative in the local draft / lastSavedProseRef).
+  const refreshGapHealth = useCallback(async () => {
+    try {
+      const ghRes = await fetch('/api/career/experience/gap-health');
+      if (ghRes.ok) {
+        setGapHealth((await ghRes.json()) as GapHealthResult);
+      }
+    } catch {
+      // Non-fatal: the save itself succeeded; leave the stale health value.
+    }
+  }, []);
+
   const fetchData = useCallback(async () => {
     try {
       const [optRes, ghRes, proseRes] = await Promise.all([
@@ -188,7 +203,11 @@ export default function ProfilePage() {
         }
         lastSavedProseRef.current = draft;
         toast({ variant: 'success', title: 'Master document saved' });
-        await fetchData();
+        // Refresh only the cheap Document Health signal. The local draft is
+        // authoritative for prose, and `optimized` is an expensive LLM
+        // re-derivation that must stay behind the explicit Re-derive button —
+        // re-deriving it on every keystroke-pause was the autosave fan-out.
+        await refreshGapHealth();
       } catch (err) {
         toast({
           variant: 'error',
@@ -199,7 +218,7 @@ export default function ProfilePage() {
       }
     }, 800);
     return () => clearTimeout(handle);
-  }, [draft, loading, saving, deriving, deleting, fetchData, toast]);
+  }, [draft, loading, saving, deriving, deleting, refreshGapHealth, toast]);
 
   const handleUpload = useCallback(
     async (file: File) => {
@@ -634,6 +653,9 @@ export default function ProfilePage() {
             </Button>
           </div>
           <textarea
+            id='master-document'
+            name='master-document'
+            aria-label='Master document'
             value={draft}
             onChange={e => setDraft(e.target.value)}
             className='min-h-[300px] w-full rounded-md border border-border bg-surface-primary p-3 font-mono text-sm text-text-primary focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand'
