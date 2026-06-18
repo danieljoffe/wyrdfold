@@ -11,7 +11,8 @@
 #   - Only `trivy` needs Docker; it is skipped automatically when Docker
 #     isn't installed/running.
 #   - `python` shells out to pandoc for some render tests: brew install pandoc
-#   - `e2e` needs the Playwright browser once: pnpm exec playwright install chromium
+#   - `e2e` runs in CI mode (chromium-only public specs, prod server); install
+#     the browser once: pnpm exec playwright install chromium
 #
 # Unlike CI, this keeps going after a failing job so you see everything in one
 # pass; it exits non-zero if any job failed.
@@ -20,6 +21,13 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Run in CI mode so this faithfully mirrors GitHub Actions rather than local
+# dev behavior. Concretely: the e2e suite runs chromium-only public specs
+# against the built prod server (the dev matrix also spins up firefox/webkit,
+# which you'd otherwise have to install), and the wyrdfold build skips Sentry
+# source-map upload. Must be exported before any job runs.
+export CI=1
 
 if [ "$#" -gt 0 ]; then JOBS=("$@"); else JOBS=(js python e2e lighthouse trivy); fi
 
