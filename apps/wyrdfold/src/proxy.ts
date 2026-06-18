@@ -20,7 +20,11 @@ function safeNext(value: string | null): string {
   return value;
 }
 
-function buildCspValue(request: NextRequest, nonce: string): string {
+function buildCspValue(
+  request: NextRequest,
+  nonce: string,
+  extraConnectOrigins: string[] = []
+): string {
   const cspHeader = `
     default-src 'self';
     script-src 'self' 'nonce-${nonce}' 'strict-dynamic' https: ${
@@ -36,7 +40,7 @@ function buildCspValue(request: NextRequest, nonce: string): string {
         ? `\n    upgrade-insecure-requests;`
         : ''
     }
-    connect-src 'self' ${allowedOrigins.join(' ')};
+    connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
     img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
 `;
   return cspHeader.replace(/\s{2,}/g, ' ').trim();
@@ -47,7 +51,25 @@ export async function proxy(request: NextRequest) {
   const anonKey = process.env['NEXT_PUBLIC_SUPABASE_ANON_ID'];
 
   const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
-  const cspValue = buildCspValue(request, nonce);
+  // The browser-side Supabase client (auth `signOut`, token refresh) calls
+  // `<supabaseUrl>/auth/v1/*` directly from the page, so the configured
+  // Supabase origin must be in `connect-src`. Hosted prod is already covered
+  // by the `*.supabase.co` wildcard in `allowedOrigins`, but local dev
+  // (`http://127.0.0.1:54321`) and self-hosted / custom domains are not —
+  // derive the origin from the env so logout works in every environment
+  // instead of being silently blocked by CSP.
+  const supabaseOrigin = (() => {
+    try {
+      return new URL(supabaseUrl ?? '').origin;
+    } catch {
+      return null;
+    }
+  })();
+  const cspValue = buildCspValue(
+    request,
+    nonce,
+    supabaseOrigin ? [supabaseOrigin] : []
+  );
 
   if (!supabaseUrl || !anonKey) {
     // Missing anon URL/key is a server-side misconfiguration, not a failed

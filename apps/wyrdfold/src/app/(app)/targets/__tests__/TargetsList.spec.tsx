@@ -202,6 +202,114 @@ describe('TargetsList', () => {
     });
   });
 
+  describe('activate / deactivate', () => {
+    const originalFetch = global.fetch;
+    afterEach(() => {
+      mockToast.mockReset();
+      mockRefresh.mockReset();
+      global.fetch = originalFetch;
+    });
+
+    /** Open the per-card dropdown (kebab `aria-haspopup=menu` trigger, which
+     * has no accessible name) and click the named menu item. */
+    async function clickMenuAction(name: RegExp): Promise<void> {
+      const user = userEvent.setup();
+      const trigger = screen
+        .getAllByRole('button')
+        .find(b => b.getAttribute('aria-haspopup') === 'menu');
+      if (!trigger) throw new Error('dropdown trigger not found');
+      await user.click(trigger);
+      const item = await screen.findByRole('menuitem', { name });
+      await user.click(item);
+    }
+
+    it('flips the badge optimistically and does NOT call router.refresh on activate', async () => {
+      // Activate POST never resolves during the assertion window, so any
+      // badge flip we observe is purely optimistic.
+      let resolveActivate: (v: unknown) => void = () => undefined;
+      const activatePromise = new Promise(res => {
+        resolveActivate = res;
+      });
+      const fetchMock = jest.fn((url: string) => {
+        if (url.endsWith('/activate')) return activatePromise;
+        if (url.endsWith('/user-target'))
+          return Promise.resolve({
+            ok: true,
+            json: async () =>
+              makeEntry('t-1', 'Senior Frontend Engineer', {
+                activation_status: 'ready',
+                fit_score: 80,
+              }),
+          });
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      // Seed an INACTIVE target so the menu offers "Activate".
+      const entry = makeSummaryEntry('t-1', 'Senior Frontend Engineer', {
+        activation_status: 'ready',
+        fit_score: 80,
+      });
+      entry.user_target.is_active = false;
+      render(<TargetsList initialTargets={[entry]} />);
+
+      expect(screen.getByText(/inactive/i)).toBeInTheDocument();
+
+      await clickMenuAction(/^Activate$/i);
+
+      // Badge flips immediately, before the POST resolves.
+      await waitFor(() => {
+        expect(screen.getByText(/^Active$/i)).toBeInTheDocument();
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/targets/t-1/activate',
+        expect.objectContaining({ method: 'POST' })
+      );
+      // No blanket RSC refresh / nav re-prefetch for a single toggle.
+      expect(mockRefresh).not.toHaveBeenCalled();
+
+      // Let the POST + reconcile settle so the test exits cleanly.
+      await act(async () => {
+        resolveActivate({ ok: true, json: async () => ({}) });
+      });
+    });
+
+    it('rolls back the optimistic flip and toasts on error', async () => {
+      const fetchMock = jest.fn((url: string) => {
+        if (url.endsWith('/deactivate'))
+          return Promise.resolve({
+            ok: false,
+            json: async () => ({ detail: 'nope' }),
+            text: async () => 'nope',
+          });
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      // Seed an ACTIVE target so the menu offers "Deactivate".
+      const entry = makeSummaryEntry('t-1', 'Senior Frontend Engineer', {
+        activation_status: 'ready',
+        fit_score: 80,
+      });
+      entry.user_target.is_active = true;
+      render(<TargetsList initialTargets={[entry]} />);
+
+      expect(screen.getByText(/^Active$/i)).toBeInTheDocument();
+
+      await clickMenuAction(/^Deactivate$/i);
+
+      // After the failed POST the badge rolls back to Active and an error
+      // toast fires.
+      await waitFor(() => {
+        expect(mockToast).toHaveBeenCalledWith(
+          expect.objectContaining({ variant: 'error' })
+        );
+      });
+      expect(screen.getByText(/^Active$/i)).toBeInTheDocument();
+      expect(mockRefresh).not.toHaveBeenCalled();
+    });
+  });
+
   describe('delete', () => {
     const originalFetch = global.fetch;
     afterEach(() => {
@@ -221,8 +329,6 @@ describe('TargetsList', () => {
           ]}
         />
       );
-      // Open the card's actions dropdown, then pick Delete — which should
-      // only open the confirm dialog, not delete directly.
       const trigger = document.querySelector(
         '[aria-haspopup="menu"]'
       ) as HTMLElement;
@@ -239,7 +345,6 @@ describe('TargetsList', () => {
       const dialog = await screen.findByRole('dialog');
       expect(fetchMock).not.toHaveBeenCalled();
 
-      // Cancelling closes the dialog and leaves the target in place.
       await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
       expect(fetchMock).not.toHaveBeenCalled();
       expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument();
@@ -263,7 +368,6 @@ describe('TargetsList', () => {
       expect(mockToast).toHaveBeenCalledWith(
         expect.objectContaining({ variant: 'success' })
       );
-      // Optimistic removal.
       await waitFor(() => {
         expect(screen.queryByText('Senior Frontend Engineer')).toBeNull();
       });
