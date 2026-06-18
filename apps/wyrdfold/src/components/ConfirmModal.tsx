@@ -84,7 +84,13 @@ export default function ConfirmModal({
         </div>
       }
     >
-      {typeof message === 'string' ? <Text as='p'>{message}</Text> : message}
+      {typeof message === 'string' ? (
+        <Text as='p' variant='body'>
+          {message}
+        </Text>
+      ) : (
+        message
+      )}
     </Modal>
   );
 }
