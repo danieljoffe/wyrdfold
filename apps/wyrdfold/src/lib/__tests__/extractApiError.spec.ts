@@ -2,14 +2,18 @@ import { extractApiError } from '../extractApiError';
 
 // jsdom has no fetch Response global; extractApiError only touches
 // `.status` and `.clone().json()`, so a minimal fake suffices.
-function res429(detail: unknown): Response {
+function resWithDetail(status: number, detail: unknown): Response {
   const fake = {
-    status: 429,
+    status,
     clone() {
       return { json: async () => ({ detail }) };
     },
   };
   return fake as unknown as Response;
+}
+
+function res429(detail: unknown): Response {
+  return resWithDetail(429, detail);
 }
 
 describe('extractApiError — cost-cap shapes', () => {
@@ -59,5 +63,43 @@ describe('extractApiError — cost-cap shapes', () => {
       'Request failed'
     );
     expect(msg).toBe('Request failed (429)');
+  });
+});
+
+describe('extractApiError — pydantic validation arrays gated by status', () => {
+  const pydanticDetail = [
+    {
+      type: 'value_error',
+      loc: ['body', 'phone'],
+      msg: 'Value error, Phone must be E.164',
+    },
+  ];
+
+  it('surfaces the first validation msg on a 422 (client error)', async () => {
+    const msg = await extractApiError(
+      resWithDetail(422, pydanticDetail),
+      'Update failed'
+    );
+    // ``Value error,`` prefix is stripped.
+    expect(msg).toBe('Phone must be E.164');
+  });
+
+  it('returns the generic fallback on a 500 even with a pydantic array (server bug)', async () => {
+    const msg = await extractApiError(
+      resWithDetail(
+        500,
+        // The analysis 500 shape: server failed to validate its OWN payload.
+        [
+          {
+            type: 'missing',
+            loc: ['response', 'scorecard'],
+            msg: 'Field required',
+          },
+        ]
+      ),
+      'Analysis failed'
+    );
+    // Must NOT leak the raw validation msg ("Field required") to the user.
+    expect(msg).toBe('Analysis failed (500)');
   });
 });

@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useTransition } from 'react';
 import dynamic from 'next/dynamic';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { Download } from 'lucide-react';
 import {
   Card,
@@ -62,18 +63,31 @@ const PERIODS: { id: Period; label: string }[] = [
   { id: 'all', label: 'All' },
 ];
 
+const PERIOD_IDS = new Set<string>(PERIODS.map(p => p.id));
+
+/** Coerce an arbitrary URL value to a known {@link Period}, else undefined. */
+function parsePeriod(raw: string | null): Period | undefined {
+  return raw !== null && PERIOD_IDS.has(raw) ? (raw as Period) : undefined;
+}
+
 function PeriodFilter({
   value,
   onChange,
+  isPending = false,
 }: {
   value: Period;
   onChange: (p: Period) => void;
+  isPending?: boolean;
 }) {
   return (
     <div
       role='group'
       aria-label='Period'
-      className='flex w-full gap-1 p-1 bg-surface-tertiary rounded-lg'
+      aria-busy={isPending}
+      className={cn(
+        'flex w-full gap-1 p-1 bg-surface-tertiary rounded-lg transition-opacity',
+        isPending && 'opacity-60'
+      )}
     >
       {PERIODS.map(p => (
         <button
@@ -150,7 +164,30 @@ export default function InsightsDashboard({
 }: {
   initial?: InsightsInitial;
 } = {}) {
-  const [period, setPeriod] = useState<Period>(initial?.period ?? '30d');
+  const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // The selected window lives in the URL (`?period=`) so it's shareable and
+  // sticky across visits. Fall back to the server-seeded period, then 30d.
+  const period =
+    parsePeriod(searchParams.get('period')) ?? initial?.period ?? '30d';
+
+  // Switching windows re-renders/re-measures all 7 charts; wrap the state
+  // change in a transition so the toggle stays responsive (the heavy chart
+  // re-render becomes a non-blocking update) and dim the filter while pending.
+  const [isPending, startTransition] = useTransition();
+  const handlePeriodChange = useCallback(
+    (next: Period) => {
+      startTransition(() => {
+        const params = new URLSearchParams(searchParams.toString());
+        params.set('period', next);
+        router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+      });
+    },
+    [pathname, router, searchParams]
+  );
+
   const { pipeline, targets, skillsCost, loading, error } = useInsights(
     period,
     initial
@@ -197,7 +234,11 @@ export default function InsightsDashboard({
   return (
     <div className='space-y-6'>
       {/* Period filter — full-width */}
-      <PeriodFilter value={period} onChange={setPeriod} />
+      <PeriodFilter
+        value={period}
+        onChange={handlePeriodChange}
+        isPending={isPending}
+      />
 
       {/* Error banner */}
       {error && (

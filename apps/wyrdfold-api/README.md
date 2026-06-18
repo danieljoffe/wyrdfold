@@ -35,6 +35,26 @@ The service builds from the monorepo root so the uv workspace lockfile is in sco
    # → {"status":"ok"}
    ```
 
+## Evaluation
+
+`scripts/eval_*.py` are offline LLM-quality harnesses (scoring, cover letters,
+target suggestion, etc.). They read an **eval set you provide** at
+`tests/fixtures/eval_set.json` — a snapshot captured from a live instance. It's
+gitignored on purpose: it contains real user/job data, so it's never committed.
+Bring your own. The shape is:
+
+```jsonc
+{
+  "version": 1, "seed": 0, "captured_at_unix": 0,
+  "targets": { "<target_id>": { "label", "payload" /* OptimizedPayload */,
+                                 "profile_version", "target" /* scoring_profile */ } },
+  "cases": [ { "target_id", "job_posting_id", "title", "jd_text",
+               "baseline_score", "baseline_axes", "baseline_reasoning", "band" } ]
+}
+```
+
+Run outputs land in `scripts/eval_results/` (also gitignored).
+
 ## Notes
 
 - The Dockerfile uses `ghcr.io/astral-sh/uv:latest` for deps, then `python:3.11-slim` at runtime.

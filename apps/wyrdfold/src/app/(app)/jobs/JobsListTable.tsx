@@ -118,9 +118,20 @@ export default function JobsListTable({
     return <JobsEmptyState onJobAdded={onRefetch} />;
   }
 
+  // Refetch of an already-loaded list (filter/search/sort): keep the rows
+  // mounted (no layout collapse) but dim them and mark the region busy so
+  // there's visible + assistive feedback while the new page lands.
+  const refetching = loading && postings.length > 0;
+
   return (
     <div>
-      <div className='overflow-x-auto'>
+      <div
+        className={cn(
+          'overflow-x-auto transition-opacity',
+          refetching && 'opacity-50'
+        )}
+        aria-busy={refetching || undefined}
+      >
         <table className='w-full text-sm' aria-label='Job postings'>
           <thead>
             <tr className='border-b border-border text-left'>

@@ -9,6 +9,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
@@ -70,75 +71,116 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     setTargets(initialTargets);
   }, [initialTargets]);
 
-  const handleActivate = useCallback(
-    async (id: string) => {
+  // Flip THIS user's `user_target.is_active` for one target in local state.
+  // `isActive` on the card reads this per-user flag (see TargetCard ~14-27),
+  // distinct from the shared catalog `target.is_active`.
+  const setActive = useCallback((id: string, active: boolean) => {
+    setTargets(prev =>
+      prev.map(t =>
+        t.target.id === id
+          ? { ...t, user_target: { ...t.user_target, is_active: active } }
+          : t
+      )
+    );
+  }, []);
+
+  // Activate/Deactivate share one path: flip the badge optimistically, POST,
+  // then reconcile from the server WITHOUT `router.refresh()`. The blanket
+  // refresh re-rendered the whole /targets RSC tree AND re-prefetched every
+  // nav route (7 requests for one toggle); a targeted GET of just this
+  // target's user-target row settles the single card instead.
+  const toggleActive = useCallback(
+    async (id: string, active: boolean) => {
+      const endpoint = active ? 'activate' : 'deactivate';
+      const failTitle = active
+        ? 'Failed to activate target'
+        : 'Failed to deactivate target';
+      // (a) optimistic flip
+      setActive(id, active);
       try {
-        const res = await fetch(`/api/targets/${id}/activate`, {
+        const res = await fetch(`/api/targets/${id}/${endpoint}`, {
           method: 'POST',
         });
         if (!res.ok)
-          throw new Error(await extractApiError(res, 'Activate failed'));
-        toast({ variant: 'success', title: 'Target activated' });
-        // RSC re-render rather than a second client fetch — saves a
-        // round-trip and keeps the targets page authoritative on the
-        // server.
-        router.refresh();
+          throw new Error(
+            await extractApiError(
+              res,
+              active ? 'Activate failed' : 'Deactivate failed'
+            )
+          );
+        toast({
+          variant: 'success',
+          title: active ? 'Target activated' : 'Target deactivated',
+        });
+        // (c) targeted reconcile: re-GET only this target's row so the card
+        // reflects canonical state without refetching the whole RSC tree or
+        // re-prefetching the nav.
+        try {
+          const reconcile = await fetch(`/api/targets/${id}/user-target`);
+          if (reconcile.ok) {
+            const entry = (await reconcile.json()) as UserTargetWithTarget;
+            const summary: UserTargetWithSummary = {
+              user_target: entry.user_target,
+              target: toSummary(entry.target),
+            };
+            setTargets(prev =>
+              prev.map(t => (t.target.id === id ? summary : t))
+            );
+          }
+        } catch {
+          // Reconcile is best-effort; the optimistic flip already reflects
+          // the successful toggle.
+        }
       } catch (err) {
+        // (b) roll back the optimistic flip + surface the error
+        setActive(id, !active);
         toast({
           variant: 'error',
-          title:
-            err instanceof Error ? err.message : 'Failed to activate target',
+          title: err instanceof Error ? err.message : failTitle,
         });
       }
     },
-    [toast, router]
+    [toast, setActive]
+  );
+
+  const handleActivate = useCallback(
+    (id: string) => void toggleActive(id, true),
+    [toggleActive]
   );
 
   const handleDeactivate = useCallback(
-    async (id: string) => {
-      try {
-        const res = await fetch(`/api/targets/${id}/deactivate`, {
-          method: 'POST',
-        });
-        if (!res.ok)
-          throw new Error(await extractApiError(res, 'Deactivate failed'));
-        toast({ variant: 'success', title: 'Target deactivated' });
-        router.refresh();
-      } catch (err) {
-        toast({
-          variant: 'error',
-          title:
-            err instanceof Error ? err.message : 'Failed to deactivate target',
-        });
-      }
-    },
-    [toast, router]
+    (id: string) => void toggleActive(id, false),
+    [toggleActive]
   );
 
-  const handleDelete = useCallback(
-    async (id: string) => {
-      /* eslint-disable no-alert -- personal tool */
-      if (!window.confirm('Delete this target?')) return;
-      /* eslint-enable no-alert */
+  // The card's Delete action stashes the target id and opens the confirm
+  // modal; the actual DELETE runs once the user confirms below.
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
-      try {
-        const res = await fetch(`/api/targets/${id}`, { method: 'DELETE' });
-        if (!res.ok)
-          throw new Error(await extractApiError(res, 'Delete failed'));
-        toast({ variant: 'success', title: 'Target deleted' });
-        // Optimistic removal so the card disappears instantly; refresh
-        // brings authoritative state to backstop the optimistic delete.
-        setTargets(prev => prev.filter(t => t.target.id !== id));
-        router.refresh();
-      } catch (err) {
-        toast({
-          variant: 'error',
-          title: err instanceof Error ? err.message : 'Failed to delete target',
-        });
-      }
-    },
-    [toast, router]
-  );
+  const handleDelete = useCallback((id: string) => {
+    setPendingDeleteId(id);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    const id = pendingDeleteId;
+    if (!id) return;
+    try {
+      const res = await fetch(`/api/targets/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await extractApiError(res, 'Delete failed'));
+      toast({ variant: 'success', title: 'Target deleted' });
+      // Optimistic removal so the card disappears instantly; refresh
+      // brings authoritative state to backstop the optimistic delete.
+      setTargets(prev => prev.filter(t => t.target.id !== id));
+      router.refresh();
+    } catch (err) {
+      toast({
+        variant: 'error',
+        title: err instanceof Error ? err.message : 'Failed to delete target',
+      });
+    } finally {
+      setPendingDeleteId(null);
+    }
+  }, [pendingDeleteId, toast, router]);
 
   const handleViewJobs = useCallback(
     (id: string) => {
@@ -536,6 +578,16 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onClose={() => setModalOpen(false)}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
+      />
+
+      <ConfirmModal
+        isOpen={pendingDeleteId !== null}
+        onClose={() => setPendingDeleteId(null)}
+        onConfirm={confirmDelete}
+        title='Delete target?'
+        message='Saved jobs scored against this target lose their target context. This cannot be undone.'
+        confirmLabel='Delete'
+        destructive
       />
     </div>
   );

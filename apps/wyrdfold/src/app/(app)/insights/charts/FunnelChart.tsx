@@ -117,6 +117,7 @@ export default function FunnelChart({ data }: FunnelChartProps) {
             <Link
               key={row.stage}
               href={`/jobs?status=${row.stage}`}
+              prefetch={false}
               className={DRILL_LINK_CLASS}
             >
               {row.label} ({row.count})
