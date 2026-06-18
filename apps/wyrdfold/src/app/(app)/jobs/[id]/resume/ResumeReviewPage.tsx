@@ -17,6 +17,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -68,6 +69,10 @@ export default function ResumeReviewPage({
   const [unapproving, setUnapproving] = useState(false);
   const [readapting, setReadapting] = useState(false);
   const [lintWarnings, setLintWarnings] = useState<LintViolation[]>([]);
+  const [confirmReadaptOpen, setConfirmReadaptOpen] = useState(false);
+  // The version awaiting restore confirmation; null when no dialog is open.
+  const [versionToRestore, setVersionToRestore] =
+    useState<ResumeVersion | null>(null);
 
   const [versions, setVersions] = useState<ResumeVersion[] | null>(null);
   const [versionCap, setVersionCap] = useState<number>(5);
@@ -355,13 +360,6 @@ export default function ResumeReviewPage({
 
   async function handleReadapt() {
     if (!record || !record.job_posting_id) return;
-    const message = isApproved
-      ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
-      : 'Re-generate this resume from scratch? Current draft is saved as a version first.';
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (!window.confirm(message))
-      /* eslint-enable no-alert */
-      return;
     setReadapting(true);
     try {
       // Snapshot the current draft before regenerating so users can
@@ -390,6 +388,7 @@ export default function ResumeReviewPage({
         return;
       }
       toast({ variant: 'success', title: 'Resume re-adapted with AI' });
+      setConfirmReadaptOpen(false);
       setVersions(null);
       await load();
     } catch {
@@ -399,7 +398,7 @@ export default function ResumeReviewPage({
     }
   }
 
-  async function restoreVersion(version: ResumeVersion) {
+  function restoreVersion(version: ResumeVersion) {
     // Versions before the markdown pivot stored only structured payload.
     // Newer versions include payload_md. We fall back to current markdown
     // if the snapshot has no markdown to restore.
@@ -412,14 +411,13 @@ export default function ResumeReviewPage({
       });
       return;
     }
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (
-      !window.confirm(
-        'Load this version? Your current draft is saved as a version first so you can roll back.'
-      )
-    )
-      /* eslint-enable no-alert */
-      return;
+    setVersionToRestore(version);
+  }
+
+  async function performRestore(version: ResumeVersion) {
+    const md = (version as ResumeVersion & { payload_md?: string | null })
+      .payload_md;
+    if (!md) return;
     // Snapshot the current draft before swapping markdown so the
     // pre-restore content is recoverable from the same version
     // history dropdown. Mirrors handleReadapt's pre-mutate pattern.
@@ -431,6 +429,7 @@ export default function ResumeReviewPage({
     setMarkdown(md);
     setSaveStatus('pending');
     setVersionsOpen(false);
+    setVersionToRestore(null);
   }
 
   // The ``(app)/layout.tsx`` wrapper already supplies the page's
@@ -716,7 +715,7 @@ export default function ResumeReviewPage({
                 {
                   label: 'Re-adapt with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
-                  onClick: handleReadapt,
+                  onClick: () => setConfirmReadaptOpen(true),
                   disabled:
                     readapting ||
                     approving ||
@@ -776,6 +775,32 @@ export default function ResumeReviewPage({
           </Text>
         </div>
       </div>
+
+      <ConfirmModal
+        isOpen={confirmReadaptOpen}
+        onClose={() => setConfirmReadaptOpen(false)}
+        onConfirm={handleReadapt}
+        title='Re-adapt resume?'
+        message={
+          isApproved
+            ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
+            : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+        }
+        confirmLabel='Regenerate'
+        loading={readapting}
+        loadingLabel='Regenerating…'
+      />
+
+      <ConfirmModal
+        isOpen={versionToRestore !== null}
+        onClose={() => setVersionToRestore(null)}
+        onConfirm={() => {
+          if (versionToRestore) void performRestore(versionToRestore);
+        }}
+        title='Load this version?'
+        message='Load this version? Your current draft is saved as a version first so you can roll back.'
+        confirmLabel='Restore'
+      />
     </div>
   );
 }

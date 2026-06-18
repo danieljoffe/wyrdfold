@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import JobDetailPage from '../JobDetailPage';
 import type { JobPosting } from '../../types';
@@ -92,11 +92,9 @@ const POSTING: JobPosting = {
 };
 
 const ORIGINAL_FETCH = global.fetch;
-const ORIGINAL_CONFIRM = window.confirm;
 
 afterAll(() => {
   global.fetch = ORIGINAL_FETCH;
-  window.confirm = ORIGINAL_CONFIRM;
 });
 
 beforeEach(() => {
@@ -272,8 +270,7 @@ describe('JobDetailPage — not found', () => {
 });
 
 describe('JobDetailPage — delete', () => {
-  it('confirms, calls DELETE, toasts success, and routes back to /jobs', async () => {
-    window.confirm = jest.fn(() => true);
+  it('opens the confirm dialog, calls DELETE on confirm, toasts success, and routes back to /jobs', async () => {
     const fetchMock = jest
       .fn()
       .mockImplementation((url: string, init?: RequestInit) => {
@@ -302,9 +299,19 @@ describe('JobDetailPage — delete', () => {
     const user = userEvent.setup();
     render(<JobDetailPage id='job-42' targetId='target-xyz' />);
 
+    // The page-level trigger only opens the confirm dialog — it must NOT
+    // fire the DELETE on its own.
     await user.click(
       await screen.findByRole('button', { name: /delete posting/i })
     );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/api/jobs/job-42',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+
+    // Confirm in the dialog ("Delete") to actually perform the deletion.
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
