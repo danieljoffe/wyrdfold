@@ -2,11 +2,11 @@
 
 import { useRouter } from 'next/navigation';
 import { Briefcase, MoreVertical, Power, Trash2 } from 'lucide-react';
-import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import type { JobTargetSummary } from './types';
 
@@ -118,14 +118,12 @@ export default function TargetCard({
         <header className='flex items-start justify-between gap-2'>
           <div className='flex min-w-0 flex-1 items-center gap-2'>
             {fitScore !== null && (
-              <Badge
+              <ScoreBadge
+                score={fitScore}
                 variant={fitScoreVariant(fitScore)}
                 size='sm'
                 title={fitScoreReasoning ?? undefined}
-                className='shrink-0'
-              >
-                {fitScore}
-              </Badge>
+              />
             )}
             <span className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary'>
               {target.label}
