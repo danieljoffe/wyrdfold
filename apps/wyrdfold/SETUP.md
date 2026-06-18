@@ -2,7 +2,7 @@
 
 WyrdFold is a single-tenant AI job-search workspace: paste a few job descriptions, let it derive what you're looking for, and watch matching postings stream into a scored backlog. This guide walks through standing up your own instance from a fresh machine.
 
-> **Status:** alpha. The hosted product at https://wyrdfold.com is the canonical reference deployment. This doc tracks the [#838 extraction](https://github.com/danieljoffe/danieljoffe.com/issues/838) — once WyrdFold lives in its own repo, this file moves with it.
+> **Status:** alpha. The hosted product at https://wyrdfold.com is the canonical reference deployment.
 
 ---
 
@@ -24,7 +24,7 @@ External integrations are **all optional**. The app degrades gracefully when a k
 
 | Tool                    | Version               | Install                                                                                                  |
 | ----------------------- | --------------------- | -------------------------------------------------------------------------------------------------------- |
-| Node.js                 | `>=22` (see `.nvmrc`) | [nodejs.org](https://nodejs.org) or `mise use node@22`                                                   |
+| Node.js                 | `24.x` (see `.nvmrc`) | [nodejs.org](https://nodejs.org) or `mise use node@24`                                                   |
 | pnpm                    | `>=10.12`             | `npm install -g pnpm`                                                                                    |
 | Python                  | `3.11+`               | [python.org](https://python.org) or `mise use python@3.11`                                               |
 | uv                      | latest                | `curl -LsSf https://astral.sh/uv/install.sh \| sh`                                                       |
@@ -134,8 +134,6 @@ pnpm install
 uv sync
 ```
 
-(In the standalone repo this becomes a single `pnpm install` — `uv` resolution will be wired into the dev script.)
-
 ---
 
 ## 4. Run it
@@ -188,7 +186,7 @@ The reference deployment runs:
 - **Frontend** on [Vercel](https://vercel.com) (auto from `develop` → preview, `main` → production)
 - **Backend** on [Railway](https://railway.app) (Dockerfile at `apps/wyrdfold-api/Dockerfile`)
 
-Both are vanilla deployments — no platform-specific code. Anywhere that runs Node 22 and Python 3.11 will work: Fly.io, Render, your own VPS, etc.
+Both are vanilla deployments — no platform-specific code. Anywhere that runs Node 24 and Python 3.11 will work: Fly.io, Render, your own VPS, etc.
 
 When deploying:
 
@@ -201,11 +199,11 @@ When deploying:
 
 ## Architecture
 
-See [`.claude/docs/architecture.md`](../../.claude/docs/architecture.md) for the full monorepo map. The condensed version:
+The condensed map:
 
 - **Frontend (`apps/wyrdfold/`)** — Next.js 16 App Router. Server components fetch from the backend via `src/lib/api/proxy.ts`. Client islands handle interactive state. Auth via `@supabase/ssr`.
 - **Backend (`apps/wyrdfold-api/`)** — FastAPI with async handlers. JWT-validated against Supabase JWKS. Service-role Supabase client (RLS bypass; per-user scoping enforced in application code).
-- **Shared UI (`libs/shared/ui/`)** — React component library. Tailwind CSS 4. Will publish to npm as `@danieljoffe/shared-ui` (tracked in #839).
+- **Shared UI** — React component library consumed as the published npm package `@danieljoffe/shared-ui`. Tailwind CSS 4.
 - **Migrations (`supabase/migrations/`)** — flat directory of timestamped `.sql` files. Forward-only; never edited after merge.
 
 ---
@@ -222,8 +220,8 @@ See [`.claude/docs/architecture.md`](../../.claude/docs/architecture.md) for the
 
 ## Contributing
 
-See the root `CLAUDE.md` for conventions (Rule of Three, component patterns, the shared-ui boundary). Issues and PRs welcome at the [parent monorepo](https://github.com/danieljoffe/danieljoffe.com) for now; will move to the standalone repo when #838 lands.
+See [`CONTRIBUTING.md`](../../CONTRIBUTING.md) for dev conventions and PR guidelines, and the root `CLAUDE.md` for code patterns (Rule of Three, component patterns, the shared-ui boundary).
 
 ## License
 
-The frontend and backend will inherit the standalone repo's license once the extraction lands. The shared-ui library is published under [FSL-1.1-MIT](../../libs/shared/ui/LICENSE.md).
+WyrdFold is licensed under the Functional Source License, FSL-1.1-ALv2 — see [`LICENSE.md`](../../LICENSE.md).
