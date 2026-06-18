@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import ReferenceJDList from '../ReferenceJDList';
 import type { TargetReferenceJD } from '../../types';
@@ -32,7 +32,6 @@ const SAMPLE_JD: TargetReferenceJD = {
 };
 
 const originalFetch = global.fetch;
-const originalConfirm = window.confirm;
 
 beforeEach(() => {
   mockToast.mockReset();
@@ -41,7 +40,6 @@ beforeEach(() => {
 
 afterEach(() => {
   global.fetch = originalFetch;
-  window.confirm = originalConfirm;
 });
 
 describe('ReferenceJDList', () => {
@@ -70,7 +68,6 @@ describe('ReferenceJDList', () => {
 
   it('asks for confirmation before deleting and aborts when cancelled', async () => {
     const onChanged = jest.fn();
-    window.confirm = jest.fn().mockReturnValue(false);
     const user = userEvent.setup();
 
     render(
@@ -80,15 +77,19 @@ describe('ReferenceJDList', () => {
         onChanged={onChanged}
       />
     );
+    // The trash button only opens the confirm dialog.
     await user.click(screen.getByLabelText('Delete reference JD'));
-    expect(window.confirm).toHaveBeenCalled();
+    const dialog = await screen.findByRole('dialog');
+    expect(global.fetch).not.toHaveBeenCalled();
+
+    // Cancelling closes the dialog without deleting.
+    await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
     expect(global.fetch).not.toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
   });
 
   it('deletes the JD and notifies onChanged when confirmed', async () => {
     const onChanged = jest.fn();
-    window.confirm = jest.fn().mockReturnValue(true);
     (global.fetch as jest.Mock).mockResolvedValue({ ok: true } as Response);
     const user = userEvent.setup();
 
@@ -100,6 +101,8 @@ describe('ReferenceJDList', () => {
       />
     );
     await user.click(screen.getByLabelText('Delete reference JD'));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
 
     await waitFor(() => {
       expect(global.fetch).toHaveBeenCalledWith(
@@ -115,7 +118,6 @@ describe('ReferenceJDList', () => {
 
   it('toasts an error when delete fails', async () => {
     const onChanged = jest.fn();
-    window.confirm = jest.fn().mockReturnValue(true);
     (global.fetch as jest.Mock).mockResolvedValue({ ok: false } as Response);
     const user = userEvent.setup();
 
@@ -127,6 +129,8 @@ describe('ReferenceJDList', () => {
       />
     );
     await user.click(screen.getByLabelText('Delete reference JD'));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
 
     await waitFor(() => {
       expect(mockToast).toHaveBeenCalledWith(

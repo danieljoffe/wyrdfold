@@ -10,6 +10,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { UserTargetWithSummary } from '../../targets/types';
@@ -26,6 +27,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [fallbackTargetId, setFallbackTargetId] = useState<string | undefined>(
     undefined
   );
@@ -120,17 +122,12 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
 
   const handleDelete = useCallback(async () => {
     if (!posting) return;
-    /* eslint-disable no-alert -- personal tool, native confirm is fine */
-    if (
-      !window.confirm(`Delete "${posting.title}" from ${posting.company_name}?`)
-    )
-      /* eslint-enable no-alert */
-      return;
     setDeleting(true);
     try {
       const res = await fetch(`/api/jobs/${posting.id}`, { method: 'DELETE' });
       if (res.ok) {
         toast({ variant: 'success', title: 'Job deleted' });
+        setConfirmDeleteOpen(false);
         router.push('/jobs');
       } else {
         toast({ variant: 'error', title: 'Failed to delete job' });
@@ -296,12 +293,24 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
           name='delete-posting'
           variant='error'
           size='sm'
-          onClick={handleDelete}
+          onClick={() => setConfirmDeleteOpen(true)}
           disabled={deleting}
         >
           {deleting ? 'Deleting...' : 'Delete posting'}
         </Button>
       </div>
+
+      <ConfirmModal
+        isOpen={confirmDeleteOpen}
+        onClose={() => setConfirmDeleteOpen(false)}
+        onConfirm={handleDelete}
+        title='Delete posting?'
+        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
+        confirmLabel='Delete'
+        destructive
+        loading={deleting}
+        loadingLabel='Deleting…'
+      />
     </div>
   );
 }

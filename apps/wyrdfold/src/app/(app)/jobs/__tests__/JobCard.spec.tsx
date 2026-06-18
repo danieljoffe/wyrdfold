@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import JobCard from '../JobCard';
 import { MANUAL_SOURCE_ID, type JobPosting } from '../types';
@@ -136,5 +136,32 @@ describe('JobCard', () => {
     expect(
       screen.getByRole('checkbox', { name: /Select Senior Frontend Engineer/i })
     ).toBeChecked();
+  });
+
+  it('opens a confirm dialog from the Delete menu item and calls onDelete only after confirming', async () => {
+    const onDelete = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobCard
+        job={makeJob()}
+        selected={false}
+        onSelectToggle={noop}
+        onDelete={onDelete}
+      />
+    );
+
+    // Open the actions dropdown (the only menu trigger on the card).
+    await user.click(screen.getByRole('button', { expanded: false }));
+    // Click the Delete menu item — this should only open the dialog,
+    // not delete directly.
+    await user.click(screen.getByRole('menuitem', { name: /delete/i }));
+    expect(onDelete).not.toHaveBeenCalled();
+
+    // Confirm in the dialog.
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    // Confirming delete must NOT also navigate (the click is contained).
+    expect(mockPush).not.toHaveBeenCalled();
   });
 });

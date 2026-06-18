@@ -9,6 +9,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import Button from '@/components/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
@@ -115,30 +116,34 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     [toast, router]
   );
 
-  const handleDelete = useCallback(
-    async (id: string) => {
-      /* eslint-disable no-alert -- personal tool */
-      if (!window.confirm('Delete this target?')) return;
-      /* eslint-enable no-alert */
+  // The card's Delete action stashes the target id and opens the confirm
+  // modal; the actual DELETE runs once the user confirms below.
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
-      try {
-        const res = await fetch(`/api/targets/${id}`, { method: 'DELETE' });
-        if (!res.ok)
-          throw new Error(await extractApiError(res, 'Delete failed'));
-        toast({ variant: 'success', title: 'Target deleted' });
-        // Optimistic removal so the card disappears instantly; refresh
-        // brings authoritative state to backstop the optimistic delete.
-        setTargets(prev => prev.filter(t => t.target.id !== id));
-        router.refresh();
-      } catch (err) {
-        toast({
-          variant: 'error',
-          title: err instanceof Error ? err.message : 'Failed to delete target',
-        });
-      }
-    },
-    [toast, router]
-  );
+  const handleDelete = useCallback((id: string) => {
+    setPendingDeleteId(id);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    const id = pendingDeleteId;
+    if (!id) return;
+    try {
+      const res = await fetch(`/api/targets/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await extractApiError(res, 'Delete failed'));
+      toast({ variant: 'success', title: 'Target deleted' });
+      // Optimistic removal so the card disappears instantly; refresh
+      // brings authoritative state to backstop the optimistic delete.
+      setTargets(prev => prev.filter(t => t.target.id !== id));
+      router.refresh();
+    } catch (err) {
+      toast({
+        variant: 'error',
+        title: err instanceof Error ? err.message : 'Failed to delete target',
+      });
+    } finally {
+      setPendingDeleteId(null);
+    }
+  }, [pendingDeleteId, toast, router]);
 
   const handleViewJobs = useCallback(
     (id: string) => {
@@ -536,6 +541,16 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onClose={() => setModalOpen(false)}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
+      />
+
+      <ConfirmModal
+        isOpen={pendingDeleteId !== null}
+        onClose={() => setPendingDeleteId(null)}
+        onConfirm={confirmDelete}
+        title='Delete target?'
+        message='Saved jobs scored against this target lose their target context. This cannot be undone.'
+        confirmLabel='Delete'
+        destructive
       />
     </div>
   );

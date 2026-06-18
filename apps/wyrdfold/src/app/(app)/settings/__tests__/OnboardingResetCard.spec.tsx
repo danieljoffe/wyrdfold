@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import OnboardingResetCard from '../OnboardingResetCard';
 
@@ -20,8 +20,6 @@ describe('OnboardingResetCard', () => {
     mockPush.mockClear();
     mockToast.mockClear();
     global.fetch = jest.fn() as jest.Mock;
-    // Default: user confirms the dialog.
-    jest.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
   afterEach(() => {
@@ -38,14 +36,21 @@ describe('OnboardingResetCard', () => {
     ).toBeInTheDocument();
   });
 
-  it('on click, confirms → POSTs reset → routes to /onboarding', async () => {
+  it('opens the confirm modal, then POSTs reset → routes to /onboarding on confirm', async () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce({ ok: true });
     const user = userEvent.setup();
     render(<OnboardingResetCard />);
 
+    // Clicking the trigger only opens the dialog — no reset yet.
     await user.click(screen.getByRole('button', { name: /Redo onboarding/i }));
+    expect(global.fetch).not.toHaveBeenCalled();
 
-    expect(window.confirm).toHaveBeenCalled();
+    // Confirm inside the dialog.
+    const dialog = await screen.findByRole('dialog');
+    await user.click(
+      within(dialog).getByRole('button', { name: /^Redo onboarding$/i })
+    );
+
     await waitFor(() =>
       expect(global.fetch).toHaveBeenCalledWith(
         '/api/profile/onboarding/reset',
@@ -57,11 +62,12 @@ describe('OnboardingResetCard', () => {
   });
 
   it('aborts when the user cancels the confirm dialog', async () => {
-    jest.spyOn(window, 'confirm').mockReturnValue(false);
     const user = userEvent.setup();
     render(<OnboardingResetCard />);
 
     await user.click(screen.getByRole('button', { name: /Redo onboarding/i }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
 
     expect(global.fetch).not.toHaveBeenCalled();
     expect(mockPush).not.toHaveBeenCalled();
@@ -76,6 +82,10 @@ describe('OnboardingResetCard', () => {
     render(<OnboardingResetCard />);
 
     await user.click(screen.getByRole('button', { name: /Redo onboarding/i }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(
+      within(dialog).getByRole('button', { name: /^Redo onboarding$/i })
+    );
 
     await waitFor(() =>
       expect(mockToast).toHaveBeenCalledWith(
