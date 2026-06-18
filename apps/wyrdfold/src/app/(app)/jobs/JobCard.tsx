@@ -6,11 +6,11 @@ import { ExternalLink, Maximize2, MoreVertical, Trash2 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
-import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import ConfirmModal from '@/components/ConfirmModal';
+import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import StatusIndicator from './StatusIndicator';
-import { MANUAL_SOURCE_ID, type JobPosting, type ScoringStatus } from './types';
+import { MANUAL_SOURCE_ID, type JobPosting } from './types';
 
 interface JobCardProps {
   job: JobPosting;
@@ -26,28 +26,6 @@ function timeAgo(dateStr: string | null): string {
   if (days === 0) return 'today';
   if (days === 1) return '1d ago';
   return `${days}d ago`;
-}
-
-function ScoreBadge({
-  score,
-  scoringStatus,
-}: {
-  score: number;
-  scoringStatus: ScoringStatus | undefined;
-}) {
-  const variant = score >= 70 ? 'success' : score >= 40 ? 'warning' : 'error';
-  const isScoring = scoringStatus && scoringStatus !== 'complete';
-  return (
-    <span className='inline-flex shrink-0 items-center gap-1'>
-      <Badge variant={variant}>{score}</Badge>
-      {isScoring && (
-        <Spinner
-          size='sm'
-          aria-label={`Scoring in progress (${scoringStatus})`}
-        />
-      )}
-    </span>
-  );
 }
 
 export default function JobCard({

@@ -2,8 +2,8 @@
 
 import { Fragment, useState } from 'react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
-import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/Button';
+import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
@@ -13,7 +13,6 @@ import {
   MANUAL_SOURCE_ID,
   type JobPosting,
   type JobsSortColumn,
-  type ScoringStatus,
 } from './types';
 
 interface JobsListTableProps {
@@ -30,28 +29,6 @@ interface JobsListTableProps {
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
   onRefetch: () => void;
-}
-
-function ScoreBadge({
-  score,
-  scoringStatus,
-}: {
-  score: number;
-  scoringStatus: ScoringStatus | undefined;
-}) {
-  const variant = score >= 70 ? 'success' : score >= 40 ? 'warning' : 'error';
-  const isScoring = scoringStatus && scoringStatus !== 'complete';
-  return (
-    <span className='inline-flex items-center gap-1'>
-      <Badge variant={variant}>{score}</Badge>
-      {isScoring && (
-        <Spinner
-          size='sm'
-          aria-label={`Scoring in progress (${scoringStatus})`}
-        />
-      )}
-    </span>
-  );
 }
 
 function timeAgo(dateStr: string | null): string {
