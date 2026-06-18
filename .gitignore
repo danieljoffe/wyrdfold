@@ -62,6 +62,12 @@ Thumbs.db
 ruvector.db
 .tmp/
 
+# Internal-only working notes — not for the public repo.
+# `.claude/docs` holds planning/research/eval notes; `audit/` holds carve-out
+# QA findings + screenshots of real account data. Kept local, out of git.
+.claude/docs/
+audit/
+
 # Next.js
 .next
 out
