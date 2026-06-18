@@ -1,7 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FileText, Layers, RefreshCw, Sparkles, Upload } from 'lucide-react';
+import {
+  FileText,
+  Layers,
+  RefreshCw,
+  Sparkles,
+  Trash2,
+  Upload,
+} from 'lucide-react';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import {
@@ -105,6 +112,7 @@ export default function ProfilePage() {
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [consolidating, setConsolidating] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Track the server's known content so autosave only fires on actual edits and
   // doesn't overwrite mid-typing when fetchData refreshes the prose state.
@@ -163,7 +171,7 @@ export default function ProfilePage() {
   useEffect(() => {
     if (loading) return;
     if (lastSavedProseRef.current === null) return;
-    if (saving || deriving) return;
+    if (saving || deriving || deleting) return;
     if (draft === lastSavedProseRef.current) return;
     if (!draft.trim()) return;
 
@@ -191,7 +199,7 @@ export default function ProfilePage() {
       }
     }, 800);
     return () => clearTimeout(handle);
-  }, [draft, loading, saving, deriving, fetchData, toast]);
+  }, [draft, loading, saving, deriving, deleting, fetchData, toast]);
 
   const handleUpload = useCallback(
     async (file: File) => {
@@ -327,6 +335,42 @@ export default function ProfilePage() {
       });
     } finally {
       setConsolidating(false);
+    }
+  }, [fetchData, toast]);
+
+  const handleDelete = useCallback(async () => {
+    const message =
+      'Delete your master document? This also removes the profile derived ' +
+      'from it (skills, experience). Uploading a new resume afterwards starts ' +
+      'clean instead of merging into the old document. This cannot be undone.';
+    // eslint-disable-next-line no-alert -- personal tool, native confirm is fine
+    if (!window.confirm(message)) return;
+    setDeleting(true);
+    try {
+      const res = await fetch('/api/career/experience/prose', {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        throw new Error(await extractApiError(res, 'Delete failed'));
+      }
+      // Clear local state up front so the editor and derived cards empty out
+      // immediately; the autosave guard above (`!draft.trim()` + the matching
+      // ref) keeps the now-empty draft from being re-saved. fetchData then
+      // reconciles with the server (prose/optimized are gone).
+      lastSavedProseRef.current = '';
+      setDraft('');
+      setProse(null);
+      setOptimized(null);
+      setStreamingPayload(null);
+      toast({ variant: 'success', title: 'Master document deleted' });
+      await fetchData();
+    } catch (err) {
+      toast({
+        variant: 'error',
+        title: err instanceof Error ? err.message : 'Delete failed',
+      });
+    } finally {
+      setDeleting(false);
     }
   }, [fetchData, toast]);
 
@@ -564,6 +608,27 @@ export default function ProfilePage() {
                 <>
                   <Layers className='size-4' aria-hidden />
                   <span>Consolidate</span>
+                </>
+              )}
+            </Button>
+            <Button
+              name='profile-delete-master-document'
+              variant='outline'
+              size='sm'
+              onClick={handleDelete}
+              disabled={deleting || !prose}
+              className='text-error hover:text-error'
+              title='Delete the master document and the profile derived from it. A new upload then starts clean.'
+            >
+              {deleting ? (
+                <>
+                  <Spinner size='sm' aria-label='Deleting' />
+                  <span>Deleting...</span>
+                </>
+              ) : (
+                <>
+                  <Trash2 className='size-4' aria-hidden />
+                  <span>Delete</span>
                 </>
               )}
             </Button>

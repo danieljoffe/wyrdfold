@@ -14,3 +14,7 @@ export async function POST(request: NextRequest) {
     body: parsed.body,
   });
 }
+
+export async function DELETE() {
+  return proxyToWyrdfoldAPI('/experience/prose', { method: 'DELETE' });
+}
