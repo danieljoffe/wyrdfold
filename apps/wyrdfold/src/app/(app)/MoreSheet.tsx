@@ -4,6 +4,7 @@ import { useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { LogOut, X, type LucideIcon } from 'lucide-react';
 import Button from '@/components/Button';
+import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { cn } from '@/lib/cn';
 import { useFocusTrap } from '@/hooks/useFocusTrap';
 import DarkModeToggle from '@/components/Nav/DarkModeToggle';
@@ -26,6 +27,8 @@ interface MoreSheetProps {
   items: MoreSheetItem[];
   activeId: string;
   onSignOut: () => void | Promise<void>;
+  /** True while a sign-out request is in flight (disables the button). */
+  signingOut?: boolean;
 }
 
 /**
@@ -41,6 +44,7 @@ export default function MoreSheet({
   items,
   activeId,
   onSignOut,
+  signingOut = false,
 }: MoreSheetProps) {
   const sheetRef = useFocusTrap(open) as React.RefObject<HTMLDivElement>;
 
@@ -146,14 +150,22 @@ export default function MoreSheet({
               <Button
                 name='wyrdfold-more-sign-out'
                 variant='bare'
-                onClick={() => {
-                  close();
-                  void onSignOut();
-                }}
+                onClick={() => void onSignOut()}
+                disabled={signingOut}
+                aria-busy={signingOut}
                 className='w-full flex items-center justify-start gap-3 px-3 py-2.5 rounded-lg hover:scale-100 text-sm font-medium transition-colors cursor-pointer text-text-secondary hover:text-text-primary hover:bg-surface-tertiary'
               >
-                <LogOut className='h-4 w-4' aria-hidden='true' />
-                Sign out
+                {signingOut ? (
+                  <>
+                    <Spinner size='sm' aria-hidden />
+                    Signing out…
+                  </>
+                ) : (
+                  <>
+                    <LogOut className='h-4 w-4' aria-hidden='true' />
+                    Sign out
+                  </>
+                )}
               </Button>
             </li>
           </ul>
