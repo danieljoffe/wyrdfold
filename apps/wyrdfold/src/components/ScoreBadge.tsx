@@ -26,6 +26,8 @@ interface ScoreBadgeProps {
   size?: BadgeSize;
   /** When scoring is in flight, render a spinner beside the chip. */
   scoringStatus?: string | null | undefined;
+  /** Native tooltip on the chip (e.g. the fit-score reasoning). */
+  title?: string | undefined;
   className?: string;
 }
 
@@ -43,6 +45,7 @@ export default function ScoreBadge({
   variant,
   size = 'md',
   scoringStatus,
+  title,
   className,
 }: ScoreBadgeProps) {
   const isScoring = !!scoringStatus && scoringStatus !== 'complete';
@@ -52,6 +55,7 @@ export default function ScoreBadge({
         variant={variant ?? defaultVariant(score)}
         size={size}
         aria-label={`Match score ${score}`}
+        title={title}
         className={cn(
           'aspect-square justify-center rounded-full p-0 tabular-nums',
           SIZE_CLASS[size],
