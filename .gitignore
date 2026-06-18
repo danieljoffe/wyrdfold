@@ -68,6 +68,12 @@ ruvector.db
 .claude/docs/
 audit/
 
+# Eval data is captured from a live instance (real user/job data) — never
+# commit it. Bring your own set; outputs are regenerated. See
+# apps/wyrdfold-api/README.md ("Evaluation").
+apps/wyrdfold-api/tests/fixtures/eval_set.json
+apps/wyrdfold-api/scripts/eval_results/
+
 # Next.js
 .next
 out
