@@ -47,7 +47,14 @@ export async function extractApiError(
   // previously had a copy of this branch in its own
   // ``extractFastApiError``; centralizing here so every PATCH/PUT
   // gets the same treatment.
-  if (Array.isArray(detail) && detail.length > 0) {
+  //
+  // Client-errors only (``status < 500``). A pydantic ``ValidationError``
+  // array on a 5xx means the *server* failed to validate its own
+  // response/payload — a server bug, not a user-actionable field error.
+  // Surfacing it leaks raw pydantic text (e.g. the analysis 500 dumping
+  // "scorecard Field required" into the UI), so for 5xx we fall through
+  // to the generic ``statusFallback`` instead.
+  if (res.status < 500 && Array.isArray(detail) && detail.length > 0) {
     const first = detail[0] as { msg?: unknown } | undefined;
     if (first && typeof first.msg === 'string' && first.msg.trim()) {
       return first.msg.replace(/^Value error,\s*/, '');
