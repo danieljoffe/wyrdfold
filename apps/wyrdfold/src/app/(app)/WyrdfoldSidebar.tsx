@@ -18,6 +18,8 @@ import Button from '@/components/Button';
 import { cn } from '@/lib/cn';
 import DarkModeToggle from '@/components/Nav/DarkModeToggle';
 import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';
+import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import { useToast } from '@/state/Toast/ToastProvider';
 
 // Mobile sheet ships its own JSX, useFocusTrap, and the secondary nav.
 // `dynamic({ ssr: false })` keeps it out of the eager bundle on every
@@ -63,10 +65,12 @@ function activeIdFrom(pathname: string): string | undefined {
 export default function WyrdfoldSidebar() {
   const router = useRouter();
   const pathname = usePathname();
+  const { toast } = useToast();
   const activeId = activeIdFrom(pathname ?? '') ?? '';
   const isMoreActive = MORE_ITEMS.some(item => item.id === activeId);
 
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
   // Stable id linking the "More" trigger to the MoreSheet dialog so
   // assistive tech can announce the relationship (aria-controls).
@@ -90,14 +94,31 @@ export default function WyrdfoldSidebar() {
   // signs out. Top-level import would pull @supabase/ssr into the eager
   // sidebar bundle on every authed page — significant for a flow used
   // once per session.
-  async function handleSignOut() {
-    const { createAuthBrowserClient } =
-      await import('@/lib/supabase/auth-client');
-    const supabase = createAuthBrowserClient();
-    await supabase.auth.signOut();
-    router.replace('/login');
-    router.refresh();
-  }
+  // Await sign-out and only navigate on success. A failed `signOut()`
+  // (network error, or a CSP-blocked auth request in a misconfigured env)
+  // used to fall through to `router.replace('/login')` while the session
+  // cookie was still set — middleware then bounced the user straight back
+  // to /dashboard and the failure was invisible. Surface it instead, keep
+  // the user where they are, and re-enable the button so they can retry.
+  const handleSignOut = useCallback(async () => {
+    setIsSigningOut(true);
+    try {
+      const { createAuthBrowserClient } =
+        await import('@/lib/supabase/auth-client');
+      const supabase = createAuthBrowserClient();
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      router.replace('/login');
+      router.refresh();
+    } catch {
+      toast({
+        variant: 'error',
+        title: 'Couldn’t sign out',
+        description: 'Something went wrong. Please try again.',
+      });
+      setIsSigningOut(false);
+    }
+  }, [router, toast]);
 
   return (
     <>
@@ -150,10 +171,21 @@ export default function WyrdfoldSidebar() {
               variant='outline'
               size='sm'
               onClick={handleSignOut}
+              disabled={isSigningOut}
+              aria-busy={isSigningOut}
               className='w-full justify-center'
             >
-              <LogOut className='size-4' aria-hidden />
-              <span>Sign out</span>
+              {isSigningOut ? (
+                <>
+                  <Spinner size='sm' aria-hidden />
+                  <span>Signing out…</span>
+                </>
+              ) : (
+                <>
+                  <LogOut className='size-4' aria-hidden />
+                  <span>Sign out</span>
+                </>
+              )}
             </Button>
           </div>
         </div>
@@ -221,6 +253,7 @@ export default function WyrdfoldSidebar() {
           items={MORE_ITEMS}
           activeId={activeId}
           onSignOut={handleSignOut}
+          signingOut={isSigningOut}
         />
       )}
     </>

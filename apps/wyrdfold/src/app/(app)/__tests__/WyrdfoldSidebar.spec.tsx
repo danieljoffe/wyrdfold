@@ -7,6 +7,7 @@ import WyrdfoldSidebar from '../WyrdfoldSidebar';
 const mockReplace = jest.fn();
 const mockRefresh = jest.fn();
 const mockSignOut = jest.fn();
+const mockToast = jest.fn();
 
 jest.mock('next/navigation', () => ({
   useRouter: () => ({
@@ -24,6 +25,10 @@ jest.mock('@/lib/supabase/auth-client', () => ({
       signOut: (...args: unknown[]) => mockSignOut(...args),
     },
   }),
+}));
+
+jest.mock('@/state/Toast/ToastProvider', () => ({
+  useToast: () => ({ toast: mockToast }),
 }));
 
 beforeEach(() => {
@@ -76,6 +81,41 @@ describe('WyrdfoldSidebar', () => {
     });
     expect(mockReplace).toHaveBeenCalledWith('/login');
     expect(mockRefresh).toHaveBeenCalled();
+  });
+
+  it('does not navigate and surfaces an error toast when sign out fails', async () => {
+    mockSignOut.mockResolvedValue({ error: { message: 'boom' } });
+    const user = userEvent.setup();
+    render(<WyrdfoldSidebar />);
+    await user.click(screen.getByRole('button', { name: /^sign out$/i }));
+    await waitFor(() => {
+      expect(mockSignOut).toHaveBeenCalledTimes(1);
+    });
+    // The session never cleared, so we must NOT optimistically route away —
+    // doing so would just bounce back through middleware and hide the failure.
+    expect(mockReplace).not.toHaveBeenCalled();
+    expect(mockToast).toHaveBeenCalledWith(
+      expect.objectContaining({ variant: 'error' })
+    );
+  });
+
+  it('disables the Sign out button while signing out', async () => {
+    // Hold the signOut promise open so the in-flight state is observable.
+    let resolveSignOut!: (value: { error: null }) => void;
+    const pending = new Promise<{ error: null }>(resolve => {
+      resolveSignOut = resolve;
+    });
+    mockSignOut.mockReturnValue(pending);
+    const user = userEvent.setup();
+    render(<WyrdfoldSidebar />);
+    const button = screen.getByRole('button', { name: /^sign out$/i });
+    await user.click(button);
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /signing out/i })
+      ).toBeDisabled();
+    });
+    resolveSignOut({ error: null });
   });
 
   it('toggles the mobile More sheet open and closed', async () => {
