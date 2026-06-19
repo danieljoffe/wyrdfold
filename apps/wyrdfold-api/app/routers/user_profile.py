@@ -21,6 +21,7 @@ from app.config import settings
 from app.dependencies import (
     get_current_user_email,
     get_current_user_id,
+    get_supabase,
     get_user_supabase,
     verify_supabase_jwt,
 )
@@ -49,10 +50,9 @@ def _email_channel_available() -> bool:
 
 def _sms_channel_available() -> bool:
     return bool(
-        settings.twilio_account_sid
-        and settings.twilio_auth_token
-        and settings.twilio_phone_number
+        settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_phone_number
     )
+
 
 # `verify_supabase_jwt` (not `_or_jwt`) — profile data is per-user, never
 # accessed by cron/poller. Restricting to JWT-only blocks the api-key
@@ -75,9 +75,7 @@ _IDENTITY_COLUMNS = "name, email, phone_number, location, linkedin_url, website_
 
 _RESUME_STYLE_COLUMNS = "resume_style_settings"
 
-_ONBOARDING_COLUMNS = (
-    "onboarding_completed_at, onboarding_path, onboarding_current_step"
-)
+_ONBOARDING_COLUMNS = "onboarding_completed_at, onboarding_path, onboarding_current_step"
 
 
 async def _get_or_create_profile(
@@ -99,11 +97,13 @@ async def _get_or_create_profile(
     or changed the value in Settings.
     """
     resp = await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .select(columns)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
+        lambda: (
+            supabase.table("user_profiles")
+            .select(columns)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
     )
     rows = resp.data or []
     if rows:
@@ -112,17 +112,17 @@ async def _get_or_create_profile(
     seed: dict[str, Any] = {"user_id": user_id}
     if seed_email:
         seed["email"] = seed_email
-    insert = await asyncio.to_thread(
-        lambda: supabase.table("user_profiles").insert(seed).execute()
-    )
+    insert = await asyncio.to_thread(lambda: supabase.table("user_profiles").insert(seed).execute())
     if not insert.data:
         raise HTTPException(status_code=500, detail="Failed to create profile")
     resp2 = await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .select(columns)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
+        lambda: (
+            supabase.table("user_profiles")
+            .select(columns)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
     )
     return cast(dict[str, Any], (resp2.data or [{}])[0])
 
@@ -133,9 +133,7 @@ async def get_notification_preferences(
     user_email: str | None = Depends(get_current_user_email),
     supabase: Client = Depends(get_user_supabase),
 ) -> NotificationPreferences:
-    row = await _get_or_create_profile(
-        supabase, user_id, _PREFS_COLUMNS, seed_email=user_email
-    )
+    row = await _get_or_create_profile(supabase, user_id, _PREFS_COLUMNS, seed_email=user_email)
     return NotificationPreferences(
         **row,
         email_available=_email_channel_available(),
@@ -163,9 +161,7 @@ async def update_notification_preferences(
             "configured Twilio credentials.",
         )
 
-    profile = await _get_or_create_profile(
-        supabase, user_id, _PREFS_COLUMNS, seed_email=user_email
-    )
+    profile = await _get_or_create_profile(supabase, user_id, _PREFS_COLUMNS, seed_email=user_email)
 
     updates = body.model_dump(exclude_none=True)
     if not updates:
@@ -176,10 +172,7 @@ async def update_notification_preferences(
         )
 
     await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .update(updates)
-        .eq("user_id", user_id)
-        .execute()
+        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
     )
 
     merged = {**profile, **updates}
@@ -201,9 +194,7 @@ async def get_identity(
     user_email: str | None = Depends(get_current_user_email),
     supabase: Client = Depends(get_user_supabase),
 ) -> IdentityFields:
-    row = await _get_or_create_profile(
-        supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email
-    )
+    row = await _get_or_create_profile(supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email)
     return IdentityFields(**row)
 
 
@@ -228,10 +219,7 @@ async def update_identity(
         return IdentityFields(**profile)
 
     await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .update(updates)
-        .eq("user_id", user_id)
-        .execute()
+        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
     )
 
     merged = {**profile, **updates}
@@ -285,10 +273,12 @@ async def update_resume_style(
 
     merged = current.model_copy(update=updates)
     await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .update({"resume_style_settings": merged.model_dump()})
-        .eq("user_id", user_id)
-        .execute()
+        lambda: (
+            supabase.table("user_profiles")
+            .update({"resume_style_settings": merged.model_dump()})
+            .eq("user_id", user_id)
+            .execute()
+        )
     )
     return merged
 
@@ -363,9 +353,7 @@ async def update_onboarding_step(
     ``path`` is set once when the user picks a path on PathChooser.
     Idempotent: re-PATCHing the same step is a no-op.
     """
-    await _get_or_create_profile(
-        supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
-    )
+    await _get_or_create_profile(supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email)
 
     updates: dict[str, Any] = {}
     if body.path is not None:
@@ -374,10 +362,7 @@ async def update_onboarding_step(
         updates["onboarding_current_step"] = body.current_step
     if updates:
         await asyncio.to_thread(
-            lambda: supabase.table("user_profiles")
-            .update(updates)
-            .eq("user_id", user_id)
-            .execute()
+            lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
         )
 
     row = await _get_or_create_profile(
@@ -416,10 +401,7 @@ async def complete_onboarding(
         updates["onboarding_completed_at"] = datetime.now(UTC).isoformat()
 
     await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .update(updates)
-        .eq("user_id", user_id)
-        .execute()
+        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
     )
 
     fresh = await _get_or_create_profile(
@@ -450,20 +432,20 @@ async def reset_onboarding(
     path they last picked — useful for product analytics later
     ("which paths get re-done most often").
     """
-    await _get_or_create_profile(
-        supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
-    )
+    await _get_or_create_profile(supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email)
 
     await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .update(
-            {
-                "onboarding_completed_at": None,
-                "onboarding_current_step": None,
-            }
+        lambda: (
+            supabase.table("user_profiles")
+            .update(
+                {
+                    "onboarding_completed_at": None,
+                    "onboarding_current_step": None,
+                }
+            )
+            .eq("user_id", user_id)
+            .execute()
         )
-        .eq("user_id", user_id)
-        .execute()
     )
 
     fresh = await _get_or_create_profile(
@@ -511,9 +493,7 @@ async def get_llm_usage(
             or [],
         )
         if oldest:
-            oldest_dt = datetime.fromisoformat(
-                str(oldest[0]["created_at"]).replace("Z", "+00:00")
-            )
+            oldest_dt = datetime.fromisoformat(str(oldest[0]["created_at"]).replace("Z", "+00:00"))
             resets_at = oldest_dt + timedelta(days=budget.MONTHLY_WINDOW_DAYS)
 
         analysis_used = (
@@ -547,3 +527,27 @@ async def get_llm_usage(
         )
 
     return await asyncio.to_thread(_snapshot)
+
+
+@router.delete("/account")
+async def delete_account(
+    user_id: str = Depends(get_current_user_id),
+    supabase: Client = Depends(get_supabase),
+) -> dict[str, Any]:
+    """Right-to-erasure (#29): permanently delete the caller's account.
+
+    Removes every per-user row, both storage buckets' objects under the
+    caller's prefix, and the auth user — **irreversible**. The shared
+    catalog (jobs/targets/scores) is left intact (see
+    ``app.services.account_deletion``). Uses the **service-role** client
+    (the cascade crosses RLS and calls ``auth.admin``); the router-level
+    ``verify_supabase_jwt`` blocks api-key callers, so only a real
+    logged-in user can erase their own account. The FE gates this behind
+    an explicit confirmation step.
+
+    Returns a per-resource count map for the user's records / audit log.
+    """
+    from app.services import account_deletion
+
+    report = await asyncio.to_thread(account_deletion.delete_account, supabase, user_id=user_id)
+    return {"deleted": True, "report": report}

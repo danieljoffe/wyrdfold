@@ -42,3 +42,24 @@ def upload_file(
 def download_file(supabase: Client, storage_path: str) -> bytes:
     """Download a resume file from Supabase Storage."""
     return supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
+
+
+def purge_user_objects(supabase: Client, user_id: str) -> int:
+    """Delete every object under the user's ``<user_id>/`` prefix.
+
+    Returns the number of objects removed. Used by account deletion
+    (#29). Loops list→remove until the prefix is empty so it covers more
+    than one storage page; bounded to avoid an unbounded loop if a
+    backend ever fails to remove. Paths are flat (``<user_id>/<file>``),
+    so a single-level listing is sufficient.
+    """
+    bucket = supabase.storage.from_(STORAGE_BUCKET)
+    removed = 0
+    for _ in range(1000):  # safety bound: 1000 pages
+        listing = bucket.list(user_id) or []
+        names = [obj["name"] for obj in listing if obj.get("name")]
+        if not names:
+            break
+        bucket.remove([f"{user_id}/{name}" for name in names])
+        removed += len(names)
+    return removed
