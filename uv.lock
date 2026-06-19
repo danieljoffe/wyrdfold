@@ -3253,7 +3253,7 @@ requires-dist = [
     { name = "slowapi", specifier = ">=0.1.9" },
     { name = "supabase", specifier = ">=2.13" },
     { name = "twilio", specifier = ">=9.0" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.49.0" },
     { name = "voyageai", specifier = ">=0.3" },
 ]
 
