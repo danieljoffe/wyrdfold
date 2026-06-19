@@ -32,7 +32,8 @@ from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs
 from app.services.lever import fetch_lever_jobs
-from app.services.llm import get_default_client as get_default_llm_client
+from app.services.llm import MissingUserKeyError
+from app.services.llm import get_client as get_llm_client
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.cost_log import record as record_llm_cost
@@ -729,6 +730,41 @@ async def _resolve_user_targets_for_stage3(
     return primary_by_user, user_optimized
 
 
+def _resolve_payer_client(
+    cache: dict[str | None, LLMClient | None],
+    supabase: Client,
+    payer_user_id: str | None,
+) -> LLMClient | None:
+    """Per-payer LLM client for background grading (#5 P3 BYOK).
+
+    Each payer's background LLM work bills the payer's own OpenRouter key
+    (via ``llm.get_client``), not the instance key. Memoized by payer for
+    the duration of one source poll, so the N targets/jobs a payer owns
+    reuse a single client — one key decrypt, and that payer's calls stay
+    grouped rather than interleaved across keys (interleaving would
+    cold-start each key's prompt cache).
+
+    Returns ``None`` when the payer can't be served: hosted
+    ``BYOK_REQUIRE_USER_KEYS`` with no stored key (``MissingUserKeyError``).
+    Callers defer that payer's grading — jobs stay promising / score NULL
+    and grade on a later cycle once a key is added — exactly like the
+    over-allowance defer, never billing the operator key for a stranger.
+    A ``None``/unattributable payer resolves to the instance key, unchanged
+    from P2.
+    """
+    if payer_user_id not in cache:
+        try:
+            cache[payer_user_id] = get_llm_client(supabase, payer_user_id)
+        except MissingUserKeyError:
+            logger.info(
+                "Background grading deferred for payer %s "
+                "(no BYOK key; BYOK_REQUIRE_USER_KEYS set)",
+                payer_user_id,
+            )
+            cache[payer_user_id] = None
+    return cache[payer_user_id]
+
+
 async def _poll_one_source(
     source: dict[str, Any],
     supabase: Client,
@@ -829,6 +865,11 @@ async def _poll_one_source(
                 )
                 gate = PayerBudgetGate()
 
+        # BYOK (#5 P3): each payer's background grading bills the payer's
+        # own OpenRouter key. Resolved + memoized per payer across this
+        # source's Phase 1/2/3 work via ``_resolve_payer_client``.
+        payer_clients: dict[str | None, LLMClient | None] = {}
+
         # Phase 1: per-target LLM binary title triage (replaces cosine
         # prefilter). See ``app/services/relevance/title_triage.py``.
         # Verdicts: phase1_verdicts[target.id][1-based job idx] -> bool.
@@ -856,7 +897,6 @@ async def _poll_one_source(
             and _passes_free_gates(job, active_targets)
         ]
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
-            llm = get_default_llm_client()
             titles = [job.title for _, job in triage_candidates]
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
@@ -873,6 +913,20 @@ async def _poll_one_source(
                         gate.payer_for(active_target.id),
                     )
                     continue
+                # BYOK (#5 P3): grade on the payer's own key. No key in
+                # hosted require-mode → defer like over-allowance above
+                # (empty verdicts → fail-open ingest, grade once a key is
+                # added).
+                payer = gate.payer_for(active_target.id)
+                llm = _resolve_payer_client(payer_clients, supabase, payer)
+                if llm is None:
+                    phase1_verdicts[active_target.id] = {}
+                    logger.info(
+                        "Phase 1 deferred for target %s (payer %s has no BYOK key)",
+                        active_target.id,
+                        payer,
+                    )
+                    continue
                 # Chunk to PHASE1_BATCH_SIZE per call. Sources usually
                 # return well under one batch (10-200 jobs); larger
                 # sources spread cost across multiple calls.
@@ -886,7 +940,7 @@ async def _poll_one_source(
                         try:
                             record_llm_cost(
                                 supabase,
-                                user_id=gate.payer_for(active_target.id),
+                                user_id=payer,
                                 purpose=PHASE1_PURPOSE,
                                 result=result,
                                 metadata={
@@ -1151,7 +1205,6 @@ async def _poll_one_source(
                 # ``jobs.score`` afterwards because Phase 2 rewrites
                 # ``scores.score`` (Stage 2's keyword value was a
                 # placeholder until graded).
-                llm = get_default_llm_client()
                 cycle_rows = [
                     cast(dict[str, Any], r) for r in upsert_resp.data or []
                 ]
@@ -1163,6 +1216,17 @@ async def _poll_one_source(
                         logger.info(
                             "Phase 2 deferred for user %s / target %s "
                             "(over monthly allowance)",
+                            uid,
+                            p2_target.id,
+                        )
+                        continue
+                    # BYOK (#5 P3): grade on this user's own key; no key in
+                    # hosted require-mode defers like over-allowance.
+                    llm = _resolve_payer_client(payer_clients, supabase, uid)
+                    if llm is None:
+                        logger.info(
+                            "Phase 2 deferred for user %s / target %s "
+                            "(no BYOK key)",
                             uid,
                             p2_target.id,
                         )
@@ -1192,7 +1256,6 @@ async def _poll_one_source(
                             "Global score update failed after Phase 2"
                         )
             elif primary_by_user:
-                llm = get_default_llm_client()
                 llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
 
                 # Pre-fetch scores once: Stage 2 just wrote them, and
@@ -1211,12 +1274,18 @@ async def _poll_one_source(
                     doc: OptimizedDoc,
                     payer: str,
                 ) -> None:
+                    # BYOK (#5 P3): each row grades on its payer's own key
+                    # (memoized, so a payer's rows reuse one client). No
+                    # key in hosted require-mode → skip this row's grading.
+                    client = _resolve_payer_client(payer_clients, supabase, payer)
+                    if client is None:
+                        return
                     async with llm_sem:
                         await _run_llm_scoring_for_row(
                             supabase,
                             row_data,
                             doc,
-                            llm,
+                            client,
                             target,
                             current_score=score_map.get(
                                 cast(str, row_data.get("id", "")), 0
@@ -1736,6 +1805,9 @@ async def _poll_one_source_for_target(
     """
     summary: dict[str, Any] = {"polled": False, "new": 0, "updated": 0, "error": None}
     company_name: str = source.get("company_name", "?")
+    # BYOK (#5 P3): grade on the payer's own key. Single payer here, but
+    # memoized so Phase 1 and Phase 2/3 reuse one resolved client.
+    payer_clients: dict[str | None, LLMClient | None] = {}
 
     try:
         board_token: str = source["board_token"]
@@ -1769,8 +1841,17 @@ async def _poll_one_source_for_target(
             if _title_matches_target(job.title, target.search_keywords)
             and _is_us_location(job.location_name)
         ]
-        if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget:
-            llm = get_default_llm_client()
+        # BYOK (#5 P3): triage on the payer's own key. ``None`` means
+        # triage is off / over-budget / no BYOK key in require-mode — all
+        # leave verdicts empty → fail-open ingest, grade on a later cycle.
+        llm = (
+            _resolve_payer_client(payer_clients, supabase, payer_user_id)
+            if settings.phase1_triage_enabled
+            and triage_candidates
+            and not payer_over_budget
+            else None
+        )
+        if llm is not None:
             titles = [job.title for _, job in triage_candidates]
             for start in range(0, len(titles), PHASE1_BATCH_SIZE):
                 batch = titles[start : start + PHASE1_BATCH_SIZE]
@@ -1956,71 +2037,93 @@ async def _poll_one_source_for_target(
                 # Sonnet call ($0.038/job) below, which previously ran
                 # unconditionally on this activation path. Legacy stays
                 # only as the flag-off fallback.
-                llm = get_default_llm_client()
-                cycle_rows = [
-                    cast(dict[str, Any], r) for r in upsert_resp.data or []
-                ]
-                for uid in primary_by_user:
-                    try:
-                        await run_phase2_for_jobs(
-                            supabase,
-                            llm,
-                            target=target,
-                            payload=user_optimized[uid].payload,
-                            jobs=cycle_rows,
-                            user_id=payer_user_id,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Phase 2 grading failed for user %s / target %s",
-                            uid,
-                            target.id,
-                        )
-                if s2_ids:
-                    try:
-                        await asyncio.to_thread(
-                            batch_update_global_scores, supabase, s2_ids
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Global score update failed after Phase 2"
-                        )
-            elif primary_by_user:
-                llm = get_default_llm_client()
-                llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-
-                # Pre-fetch scores once (Stage 2 just wrote them).
-                stage3_ids_t = [
-                    cast(str, cast(dict[str, Any], r).get("id"))
-                    for r in upsert_resp.data or []
-                    if cast(dict[str, Any], r).get("id")
-                ]
-                score_map_t = await _batch_fetch_job_scores(supabase, stage3_ids_t)
-
-                async def _llm_one_t(
-                    row_data: dict[str, Any],
-                    doc: OptimizedDoc,
-                ) -> None:
-                    async with llm_sem:
-                        await _run_llm_scoring_for_row(
-                            supabase,
-                            row_data,
-                            doc,
-                            llm,
-                            target,
-                            current_score=score_map_t.get(
-                                cast(str, row_data.get("id", "")), 0
-                            ),
-                            payer_user_id=payer_user_id,
-                        )
-
-                await asyncio.gather(
-                    *(
-                        _llm_one_t(cast(dict[str, Any], r), user_optimized[uid])
-                        for r in upsert_resp.data or []
-                        for uid in primary_by_user
+                # BYOK (#5 P3): grade on the payer's own key; no key in
+                # hosted require-mode defers (jobs stay promising/NULL,
+                # grade once a key is added).
+                llm = _resolve_payer_client(payer_clients, supabase, payer_user_id)
+                if llm is None:
+                    logger.info(
+                        "Phase 2 deferred for target %s (payer %s has no BYOK key)",
+                        target.id,
+                        payer_user_id,
                     )
-                )
+                else:
+                    cycle_rows = [
+                        cast(dict[str, Any], r) for r in upsert_resp.data or []
+                    ]
+                    for uid in primary_by_user:
+                        try:
+                            await run_phase2_for_jobs(
+                                supabase,
+                                llm,
+                                target=target,
+                                payload=user_optimized[uid].payload,
+                                jobs=cycle_rows,
+                                user_id=payer_user_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Phase 2 grading failed for user %s / target %s",
+                                uid,
+                                target.id,
+                            )
+                    if s2_ids:
+                        try:
+                            await asyncio.to_thread(
+                                batch_update_global_scores, supabase, s2_ids
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Global score update failed after Phase 2"
+                            )
+            elif primary_by_user:
+                # BYOK (#5 P3): grade on the payer's own key; no key in
+                # hosted require-mode defers.
+                llm = _resolve_payer_client(payer_clients, supabase, payer_user_id)
+                if llm is None:
+                    logger.info(
+                        "Stage 3 deferred for target %s (payer %s has no BYOK key)",
+                        target.id,
+                        payer_user_id,
+                    )
+                else:
+                    # Bind a non-optional alias: mypy doesn't carry the
+                    # ``llm is not None`` narrowing into the nested closure.
+                    grading_client: LLMClient = llm
+                    llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
+
+                    # Pre-fetch scores once (Stage 2 just wrote them).
+                    stage3_ids_t = [
+                        cast(str, cast(dict[str, Any], r).get("id"))
+                        for r in upsert_resp.data or []
+                        if cast(dict[str, Any], r).get("id")
+                    ]
+                    score_map_t = await _batch_fetch_job_scores(supabase, stage3_ids_t)
+
+                    async def _llm_one_t(
+                        row_data: dict[str, Any],
+                        doc: OptimizedDoc,
+                    ) -> None:
+                        async with llm_sem:
+                            await _run_llm_scoring_for_row(
+                                supabase,
+                                row_data,
+                                doc,
+                                grading_client,
+                                target,
+                                current_score=score_map_t.get(
+                                    cast(str, row_data.get("id", "")), 0
+                                ),
+                                payer_user_id=payer_user_id,
+                            )
+
+                    await asyncio.gather(
+                        *(
+                            _llm_one_t(cast(dict[str, Any], r), user_optimized[uid])
+                            for r in upsert_resp.data or []
+                            for uid in primary_by_user
+                        )
+                    )
 
     except Exception:
         logger.exception("Poll failed for %s (target %s)", company_name, target.label)
