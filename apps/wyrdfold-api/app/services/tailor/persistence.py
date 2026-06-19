@@ -35,9 +35,7 @@ from app.services.tailor import versions
 
 TABLE = "documents"
 STORAGE_BUCKET = "tailored-resumes"
-DOCX_CONTENT_TYPE = (
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-)
+DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def jd_hash(job_description: str) -> str:
@@ -74,6 +72,27 @@ def upload_docx(
 
 def download_docx(supabase: Client, storage_path: str) -> bytes:
     return supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
+
+
+def purge_user_objects(supabase: Client, user_id: str) -> int:
+    """Delete every object under the user's ``<user_id>/`` prefix.
+
+    Returns the number of objects removed. Used by account deletion
+    (#29). Loops list→remove until the prefix is empty so it covers more
+    than one storage page; bounded to avoid an unbounded loop if a
+    backend ever fails to remove. Paths are flat
+    (``<user_id>/<resume_id>.docx``), so a single-level listing suffices.
+    """
+    bucket = supabase.storage.from_(STORAGE_BUCKET)
+    removed = 0
+    for _ in range(1000):  # safety bound: 1000 pages
+        listing = bucket.list(user_id) or []
+        names = [obj["name"] for obj in listing if obj.get("name")]
+        if not names:
+            break
+        bucket.remove([f"{user_id}/{name}" for name in names])
+        removed += len(names)
+    return removed
 
 
 def insert_row(
@@ -306,18 +325,20 @@ def mark_docx_rendered(
 
     Defense-in-depth (post-#714): see ``update_payload``.
     """
-    query = supabase.table(TABLE).update(
-        {
-            "storage_path": storage_path,
-            "docx_payload_md_hash": payload_md_hash,
-        }
-    ).eq("id", resume_id)
+    query = (
+        supabase.table(TABLE)
+        .update(
+            {
+                "storage_path": storage_path,
+                "docx_payload_md_hash": payload_md_hash,
+            }
+        )
+        .eq("id", resume_id)
+    )
     _scope_to_user(query, user_id).execute()
 
 
-def upsert_user_job(
-    supabase: Client, *, user_id: str, job_posting_id: str, status: str
-) -> None:
+def upsert_user_job(supabase: Client, *, user_id: str, job_posting_id: str, status: str) -> None:
     """Mirror a jobs.status write into the per-user user_jobs table (#75 C1).
     Service-role client; the row is keyed by (user_id, job_posting_id)."""
     supabase.table("user_jobs").upsert(
@@ -331,9 +352,7 @@ def upsert_user_job(
     ).execute()
 
 
-def mark_job_resume_draft(
-    supabase: Client, job_posting_id: str, *, user_id: str | None
-) -> None:
+def mark_job_resume_draft(supabase: Client, job_posting_id: str, *, user_id: str | None) -> None:
     """Advance a job posting to status='resume_draft' for the caller.
 
     Called after a tailored resume is persisted (single, batch, or reuse
@@ -354,9 +373,7 @@ def mark_job_resume_draft(
         )
 
 
-def approve(
-    supabase: Client, resume_id: str, *, user_id: str | None
-) -> TailoredResumeRecord:
+def approve(supabase: Client, resume_id: str, *, user_id: str | None) -> TailoredResumeRecord:
     """Set approved_at on a tailored resume.
 
     Defense-in-depth (post-#714): see ``update_payload``.
@@ -369,9 +386,7 @@ def approve(
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def unapprove(
-    supabase: Client, resume_id: str, *, user_id: str | None
-) -> TailoredResumeRecord:
+def unapprove(supabase: Client, resume_id: str, *, user_id: str | None) -> TailoredResumeRecord:
     """Clear approved_at on a tailored resume — reopens it for editing.
 
     Defense-in-depth (post-#714): see ``update_payload``.
@@ -404,11 +419,7 @@ def get_by_job(
         .eq("document_type", document_type)
     )
     query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
-    resp = (
-        query.order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
+    resp = query.order("created_at", desc=True).limit(1).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
