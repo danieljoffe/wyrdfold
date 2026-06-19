@@ -73,6 +73,25 @@ class OptimizedPayload(BaseModel):
     outcomes: list[Outcome] = Field(default_factory=list)
     annotations: list[Annotation] = Field(default_factory=list)
 
+    def owner_role_id(self, outcome: Outcome) -> str | None:
+        """The id of the Role that owns ``outcome``, or None if unknown.
+
+        The role<->outcome link is stored in both directions: an Outcome
+        names its role via ``role_ref``, and a Role lists the outcome
+        descriptions it owns in ``outcome_refs``. ``role_ref`` is the
+        authoritative signal, but the schema allows it to be null, so we
+        fall back to the reverse link (the role whose ``outcome_refs``
+        contains this outcome's description). Returning None means neither
+        link resolves — ownership is genuinely unknown and callers must not
+        treat the outcome as misattributed (#87).
+        """
+        if outcome.role_ref:
+            return outcome.role_ref
+        for role in self.roles:
+            if outcome.description in role.outcome_refs:
+                return role.id
+        return None
+
 
 class PreferencesPayload(BaseModel):
     rules: list[str] = Field(default_factory=list)
