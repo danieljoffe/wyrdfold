@@ -25,6 +25,7 @@ from app.routers import (
     feedback,
     insights,
     jobs,
+    keys,
     poll,
     sources,
     status,
@@ -291,6 +292,7 @@ app.include_router(experience.router)
 app.include_router(feedback.router)
 app.include_router(insights.router)
 app.include_router(jobs.router)
+app.include_router(keys.router)
 app.include_router(poll.router)
 app.include_router(sources.router)
 app.include_router(status.router)
