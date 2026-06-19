@@ -60,6 +60,56 @@ async def test_returns_parsed_optimized_payload() -> None:
     assert len(payload.outcomes) == 1
 
 
+def _payload_json_null_role_ref(*, with_reverse_link: bool = True) -> str:
+    """Outcome with a null role_ref. When ``with_reverse_link`` the owning
+    role lists it in outcome_refs so the backfill can recover the owner;
+    otherwise ownership is genuinely unknown and must stay null (#87)."""
+    return json.dumps(
+        {
+            "summary": "s",
+            "roles": [
+                {
+                    "id": "ib-fe",
+                    "company": "Internet Brands",
+                    "title": "Senior Frontend Engineer",
+                    "start": "2018-03",
+                    "end": "2019-08",
+                    "summary": None,
+                    "skills": [],
+                    "outcome_refs": (
+                        ["Grew the component library from 12 to 30 components"]
+                        if with_reverse_link
+                        else []
+                    ),
+                }
+            ],
+            "skills": [],
+            "outcomes": [
+                {
+                    "description": "Grew the component library from 12 to 30 components",
+                    "metric": None,
+                    "value": None,
+                    "role_ref": None,
+                }
+            ],
+        }
+    )
+
+
+async def test_backfills_null_role_ref_from_reverse_link() -> None:
+    client = MockLLMClient(scripted={DEFAULT_PURPOSE: _payload_json_null_role_ref()})
+    payload, _ = await derive_from_prose(client, prose_text="prose")
+    assert payload.outcomes[0].role_ref == "ib-fe"
+
+
+async def test_leaves_role_ref_null_when_unresolvable() -> None:
+    client = MockLLMClient(
+        scripted={DEFAULT_PURPOSE: _payload_json_null_role_ref(with_reverse_link=False)}
+    )
+    payload, _ = await derive_from_prose(client, prose_text="prose")
+    assert payload.outcomes[0].role_ref is None
+
+
 async def test_passes_default_model_and_purpose() -> None:
     client = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
     await derive_from_prose(client, prose_text="prose")

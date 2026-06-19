@@ -553,6 +553,116 @@ def test_validate_cover_letter_drops_truly_unknown_skill() -> None:
     assert any("Kafka" in w for w in warnings)
 
 
+# ---- attribution ownership (#87 follow-up) --------------------------------
+
+
+def test_owner_role_id_prefers_role_ref() -> None:
+    optimized = _optimized()
+    outcome = optimized.outcomes[0]  # role_ref="fc"
+    assert optimized.owner_role_id(outcome) == "fc"
+
+
+def test_owner_role_id_falls_back_to_reverse_link() -> None:
+    # role_ref is null, but role "fc" lists the outcome in outcome_refs.
+    optimized = OptimizedPayload(
+        roles=[
+            Role(
+                id="fc",
+                company="FightCamp",
+                title="Senior FE",
+                start="2021-11",
+                end="2024-04",
+                outcome_refs=["Cut mobile LCP from 10s to 2s"],
+            )
+        ],
+        outcomes=[Outcome(description="Cut mobile LCP from 10s to 2s", role_ref=None)],
+    )
+    assert optimized.owner_role_id(optimized.outcomes[0]) == "fc"
+
+
+def test_owner_role_id_unknown_when_no_link() -> None:
+    optimized = OptimizedPayload(
+        roles=[Role(id="fc", company="FightCamp", title="FE", start="2021-11")],
+        outcomes=[Outcome(description="Orphan outcome", role_ref=None)],
+    )
+    assert optimized.owner_role_id(optimized.outcomes[0]) is None
+
+
+def test_validate_drops_cross_employer_bullet_via_reverse_link() -> None:
+    # The outcome has no role_ref, but role "fc" owns it via outcome_refs.
+    # The LLM still files the bullet under "winc" — the drop must fire even
+    # though the forward link was null (#87 null-role_ref bypass).
+    optimized = OptimizedPayload(
+        roles=[
+            Role(
+                id="fc",
+                company="FightCamp",
+                title="Senior FE",
+                start="2021-11",
+                end="2024-04",
+                outcome_refs=["Cut mobile LCP from 10s to 2s"],
+            ),
+            Role(id="winc", company="Winc", title="FE", start="2018-01", end="2021-10"),
+        ],
+        outcomes=[Outcome(description="Cut mobile LCP from 10s to 2s", role_ref=None)],
+    )
+    resume = TailoredResume(
+        summary="x",
+        contact=_contact(),
+        experience=[
+            TailoredRole(
+                company="Winc",
+                title="FE",
+                start="2018-01",
+                end="2021-10",
+                bullets=[
+                    TailoredBullet(
+                        text="Cut LCP.",
+                        source_outcome_ref="Cut mobile LCP from 10s to 2s",
+                    )
+                ],
+                source_role_ref="winc",
+            )
+        ],
+        skills=[],
+    )
+    cleaned, warnings = validate_trace_refs(resume, optimized)
+    assert cleaned.experience[0].bullets == []
+    assert any("wrong employer" in w for w in warnings)
+
+
+def _letter_citing(outcome_refs: list[str], role_refs: list[str]) -> TailoredCoverLetter:
+    from app.models.tailor import CoverLetterParagraph
+
+    return TailoredCoverLetter(
+        contact=ContactInfo(name="Daniel Joffe", email="d@example.com"),
+        recipient_company="Acme",
+        salutation="Dear Acme team,",
+        paragraphs=[CoverLetterParagraph(text="Body.")],
+        closing="Sincerely,",
+        signature="Daniel Joffe",
+        source_role_refs=role_refs,
+        source_outcome_refs=outcome_refs,
+        source_skill_refs=[],
+    )
+
+
+def test_cover_letter_credits_outcome_owner_when_undeclared() -> None:
+    # The letter draws on an outcome owned by "fc" but declares no role refs:
+    # the fingerprint of a cross-employer misattribution in the prose (#87).
+    letter = _letter_citing(["Cut mobile load times from 10s to 2s"], [])
+    cleaned, warnings = validate_cover_letter_refs(letter, _optimized())
+    assert "fc" in cleaned.source_role_refs
+    assert any("owned by role 'fc'" in w for w in warnings)
+
+
+def test_cover_letter_no_warning_when_owner_declared() -> None:
+    letter = _letter_citing(["Cut mobile load times from 10s to 2s"], ["fc"])
+    cleaned, warnings = validate_cover_letter_refs(letter, _optimized())
+    assert cleaned.source_role_refs == ["fc"]
+    assert warnings == []
+
+
 # ---- prompt caching (#73) -------------------------------------------------
 
 

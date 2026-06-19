@@ -32,6 +32,11 @@ HALLUCINATION CONTAINMENT (non-negotiable):
   If neither fits, drop the bullet.
 - Never invent companies, titles, dates, metrics, or numbers. If the \
 OptimizedPayload doesn't state it, it does not go in the resume.
+- Attribute each accomplishment to its owner. An Outcome names the role \
+that owns it via `role_ref` (a `roles[].id`). Place that outcome's bullet \
+ONLY under the role whose `source_role_ref` equals that `role_ref`. Never \
+move an accomplishment to a different employer — a bullet placed under the \
+wrong role is dropped downstream, so the work is lost rather than credited.
 
 RELEVANCE & SELECTION:
 - Lead with roles and skills that map to the JD's stated requirements.
@@ -108,6 +113,10 @@ exact `roles[].id` from the OptimizedPayload.
 `skills[].name` from the OptimizedPayload.
 - Do not reference companies, metrics, dates, or facts absent from the \
 OptimizedPayload. Paraphrase is fine; invention is not.
+- Credit every accomplishment to the right employer. Each Outcome names its \
+owning role via `role_ref`; when you mention that accomplishment, attribute \
+it to that role's `company` and to no other. Never describe one employer's \
+work as if it happened at a different company.
 - If the OptimizedPayload is thin, the letter is short. Don't pad.
 
 STRUCTURE:
