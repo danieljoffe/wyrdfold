@@ -2,9 +2,23 @@ version: 2
 updates:
   - package-ecosystem: npm
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     groups:
+      # Nx packages must move together (core + every @nx/* plugin share a
+      # version). Grouping all update types — majors included — keeps a
+      # major bump like 22 -> 23 as ONE coordinated PR instead of a swarm
+      # of per-plugin PRs that conflict in the lockfile.
+      nx:
+        patterns:
+          - 'nx'
+          - '@nx/*'
+          - '@nrwl/*'
+        update-types:
+          - major
+          - minor
+          - patch
       npm-minor-patch:
         update-types:
           - minor
@@ -12,6 +26,7 @@ updates:
 
   - package-ecosystem: uv
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     groups:
@@ -22,5 +37,6 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
