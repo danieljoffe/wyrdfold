@@ -8,9 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # so the developer's real `.env` (with experimental flags like
 # RECENCY_DECAY_ENABLED / PHASE1_TRIAGE_ENABLED) can't leak into the
 # test process and silently switch code paths. See #28.
-_TEST_ENV_FILE: str | None = (
-    None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
-)
+_TEST_ENV_FILE: str | None = None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
 
 
 class Settings(BaseSettings):
@@ -84,6 +82,15 @@ class Settings(BaseSettings):
     # use the operator env keys above). NOT interchangeable with the
     # Supabase service-role key; rotating it orphans all stored ciphertext.
     byok_master_key: str = Field(default="", repr=False)
+
+    # BYOK (#5 P2). When True, a logged-in user with no stored OpenRouter
+    # key is refused (HTTP 402 "add your key") rather than billed to the
+    # instance key — the hosted-multi-tenant posture, so strangers can't
+    # spend the operator's credits. Default False keeps single-tenant
+    # self-host working untouched: missing user key → fall back to the
+    # operator env key above. Has no effect in mock mode or for api-key /
+    # cron callers (background spend is gated per payer in the poller).
+    byok_require_user_keys: bool = False
 
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
