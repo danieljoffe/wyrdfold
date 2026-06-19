@@ -10,7 +10,7 @@ variable content, which is ideal for Anthropic's prompt caching
 becomes a genuine cost-saver.
 """
 
-from app.models.experience import OptimizedPayload
+from app.models.experience import OptimizedPayload, Outcome
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
 
@@ -99,6 +99,32 @@ the outcome description
 Return ONLY the JSON object. No prose, no code fences."""
 
 
+def _backfill_outcome_role_refs(payload: OptimizedPayload) -> OptimizedPayload:
+    """Recover any null ``Outcome.role_ref`` from the reverse role link.
+
+    The prompt asks for both directions of the role<->outcome link, but the
+    schema lets ``role_ref`` be null and the LLM occasionally omits it while
+    still listing the outcome under a Role's ``outcome_refs``. A null
+    ``role_ref`` silently disables the tailor's cross-employer drop (#87) —
+    a misplaced accomplishment then sails through unverified. We close that
+    by deterministically filling ``role_ref`` from the owning role
+    (``OptimizedPayload.owner_role_id``) whenever the reverse link resolves.
+    """
+    patched: list[Outcome] = []
+    changed = False
+    for outcome in payload.outcomes:
+        if outcome.role_ref is None:
+            owner = payload.owner_role_id(outcome)
+            if owner is not None:
+                patched.append(outcome.model_copy(update={"role_ref": owner}))
+                changed = True
+                continue
+        patched.append(outcome)
+    if not changed:
+        return payload
+    return payload.model_copy(update={"outcomes": patched})
+
+
 async def derive_from_prose(
     llm: LLMClient,
     *,
@@ -108,7 +134,7 @@ async def derive_from_prose(
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> tuple[OptimizedPayload, LLMResult]:
     """Run the derivation. Returns (payload, result) so callers can cost-log."""
-    return await complete_json(
+    payload, result = await complete_json(
         llm,
         model=model,
         system=SYSTEM_PROMPT,
@@ -118,3 +144,4 @@ async def derive_from_prose(
         max_tokens=max_tokens,
         cache_system=True,
     )
+    return _backfill_outcome_role_refs(payload), result

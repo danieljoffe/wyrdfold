@@ -133,14 +133,11 @@ def validate_trace_refs(
                 continue
             if traces_to_outcome:
                 outcome = outcomes_by_desc.get(ref)
-                if (
-                    outcome is not None
-                    and outcome.role_ref
-                    and outcome.role_ref != role.source_role_ref
-                ):
+                owner = optimized.owner_role_id(outcome) if outcome else None
+                if owner is not None and owner != role.source_role_ref:
                     warnings.append(
                         "Dropped bullet attributed to the wrong employer "
-                        f"(outcome belongs to role {outcome.role_ref!r}, placed "
+                        f"(outcome belongs to role {owner!r}, placed "
                         f"under {role.source_role_ref!r}): {bullet.text[:80]!r}"
                     )
                     continue
@@ -343,6 +340,31 @@ def validate_cover_letter_refs(
             kept_skill_refs.append(canonical)
         else:
             warnings.append(f"Dropped unknown skill_ref: {ref!r}")
+
+    # Attribution consistency (#87). A cover letter is free prose, so we
+    # can't pin a company per sentence the way the resume validator does.
+    # But every outcome the letter draws on has an owning role, and that
+    # role's company is the only employer the accomplishment may be credited
+    # to. If the letter cites an outcome whose owning role it never declared,
+    # that's the fingerprint of a cross-employer misattribution (an Internet
+    # Brands accomplishment narrated under HubSpot). We fold the true owner
+    # into the role refs so the audit trail names the right employer, and
+    # warn so the prose gets a human check.
+    outcomes_by_desc = {o.description: o for o in optimized.outcomes}
+    declared_roles = set(kept_role_refs)
+    for ref in kept_outcome_refs:
+        outcome = outcomes_by_desc.get(ref)
+        if outcome is None:
+            continue
+        owner = optimized.owner_role_id(outcome)
+        if owner in valid_role_ids and owner not in declared_roles:
+            kept_role_refs.append(owner)
+            declared_roles.add(owner)
+            warnings.append(
+                f"Outcome {ref[:50]!r} is owned by role {owner!r}, which the "
+                "letter did not credit — added to role refs; verify the prose "
+                "attributes it to the correct employer"
+            )
 
     cleaned = letter.model_copy(
         update={
