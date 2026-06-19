@@ -9,11 +9,11 @@ import {
   CardTitle,
 } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { FormFieldError } from '@danieljoffe/shared-ui/FormFieldError';
 import Button from '@/components/Button';
+import CircleBadge from '@/components/CircleBadge';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type {
@@ -403,9 +403,13 @@ export default function ScoringProfileEditor({
                         aria-label={`Cycle weight for ${kw}`}
                       >
                         <span className='text-text-primary'>{kw}</span>
-                        <Badge variant={weightBadgeVariant(weight)} size='sm'>
+                        <CircleBadge
+                          variant={weightBadgeVariant(weight)}
+                          size='sm'
+                          ariaLabel={`Weight ${weight}`}
+                        >
                           {weight}
-                        </Badge>
+                        </CircleBadge>
                       </button>
                       <button
                         type='button'
