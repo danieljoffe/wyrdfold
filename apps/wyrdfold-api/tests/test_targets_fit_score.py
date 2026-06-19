@@ -84,6 +84,32 @@ async def test_derive_fit_score_returns_cost(llm: MockLLMClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_caches_user_profile_prefix(llm: MockLLMClient) -> None:
+    """#73: the stable user-profile block must be a cache breakpoint so a
+    user fit-scoring several targets pays full input tokens once."""
+    await derive_fit_score(llm, payload=_payload(), target=_target())
+    msg = llm.calls[0]["messages"][0]
+    n = msg.cache_prefix_chars
+    assert n is not None and n > 0
+    prefix, suffix = msg.content[:n], msg.content[n:]
+    # Stable user profile sits entirely in the cached prefix; the variable
+    # target block is excluded so the cached bytes don't shift per target.
+    assert "## User Profile" in prefix
+    assert "## Target" not in prefix
+    assert "## Target: Senior Frontend Engineer" in suffix
+
+
+@pytest.mark.asyncio
+async def test_no_cache_breakpoint_when_profile_empty(llm: MockLLMClient) -> None:
+    """An empty profile has nothing stable to cache — cache_prefix_chars
+    must be None (it requires >=1), and the message is just the target."""
+    await derive_fit_score(llm, payload=OptimizedPayload(summary=""), target=_target())
+    msg = llm.calls[0]["messages"][0]
+    assert msg.cache_prefix_chars is None
+    assert msg.content.startswith("## Target:")
+
+
+@pytest.mark.asyncio
 async def test_derive_fit_score_invalid_json_raises() -> None:
     client = MockLLMClient(scripted={DEFAULT_PURPOSE: "{not json"})
     with pytest.raises(Exception):

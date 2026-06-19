@@ -8,9 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # so the developer's real `.env` (with experimental flags like
 # RECENCY_DECAY_ENABLED / PHASE1_TRIAGE_ENABLED) can't leak into the
 # test process and silently switch code paths. See #28.
-_TEST_ENV_FILE: str | None = (
-    None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
-)
+_TEST_ENV_FILE: str | None = None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
 
 
 class Settings(BaseSettings):
@@ -85,6 +83,15 @@ class Settings(BaseSettings):
     # Supabase service-role key; rotating it orphans all stored ciphertext.
     byok_master_key: str = Field(default="", repr=False)
 
+    # BYOK (#5 P2). When True, a logged-in user with no stored OpenRouter
+    # key is refused (HTTP 402 "add your key") rather than billed to the
+    # instance key — the hosted-multi-tenant posture, so strangers can't
+    # spend the operator's credits. Default False keeps single-tenant
+    # self-host working untouched: missing user key → fall back to the
+    # operator env key above. Has no effect in mock mode or for api-key /
+    # cron callers (background spend is gated per payer in the poller).
+    byok_require_user_keys: bool = False
+
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 
@@ -147,6 +154,17 @@ class Settings(BaseSettings):
     # Per ``feedback-prompt-change-shadow-run``: ship behind this flag,
     # compare axis-score distributions before flipping in production.
     logistics_extraction_enabled: bool = False
+
+    # Résumé-free label derivation (#78 layer 1). When True,
+    # ``derive_profile_from_label`` builds the target's baseline
+    # ScoringProfile from the LABEL ALONE (the model's world-knowledge of
+    # what the role generally requires) instead of grounding it in the
+    # activating user's résumé. The résumé only ever feeds ``fit_score``
+    # (``targets/fit_score.py``), which is unchanged. This de-skews shared
+    # targets (no single user's experience stamped on everyone's rubric)
+    # and improves cold-start matching. It changes scoring behavior, so it
+    # ships FALSE: validate with the #27 eval pass before flipping on.
+    resume_free_label_derivation: bool = False
 
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""

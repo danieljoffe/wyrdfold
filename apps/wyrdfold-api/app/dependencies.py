@@ -50,9 +50,7 @@ def get_user_supabase(
     data paths migrate onto it table-by-table in later #79 phases.
     """
     if not s.supabase_url or not s.supabase_anon_key:
-        raise HTTPException(
-            status_code=503, detail="Supabase user client not configured"
-        )
+        raise HTTPException(status_code=503, detail="Supabase user client not configured")
     token = _extract_bearer_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="Missing auth token")
@@ -113,13 +111,35 @@ def get_embeddings_client() -> "EmbeddingsClient":
     return get_default_client()
 
 
-def get_llm_client() -> "LLMClient":
-    """LLM client factory. Returns the default (mock today, Anthropic
-    when the real implementation lands).
-    """
-    from app.services.llm import get_default_client
+def get_llm_client(
+    request: Request,
+    s: Settings = Depends(get_settings),
+) -> "LLMClient":
+    """BYOK-aware LLM client for the request (#5 P2).
 
-    return get_default_client()
+    Threads the caller's per-user OpenRouter key (when they've stored one)
+    so their inference bills their key; otherwise falls back to the
+    instance key, or — when ``BYOK_REQUIRE_USER_KEYS`` is set — 402s the
+    request asking them to add one. See ``app.services.llm.get_client``.
+
+    Auth is unchanged: the user is read opportunistically via the same
+    non-raising JWT path as the optional-user dep, so a valid Bearer token
+    identifies the user and api-key / cron callers resolve to None (and
+    use the instance key). A route's own auth dependency still governs
+    access.
+    """
+    from app.services.llm import MissingUserKeyError, get_client
+    from app.supabase_pool import get_supabase_pool
+
+    user_id = _try_decode_jwt_sub(request, s)
+    supabase = get_supabase_pool()
+    try:
+        return get_client(supabase, user_id)
+    except MissingUserKeyError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail="Add your OpenRouter API key in Settings to use AI features.",
+        ) from exc
 
 
 def _api_key_matches(presented: str | None, expected: str) -> bool:
@@ -418,5 +438,3 @@ def enforce_llm_budget(
         hourly_limit_usd=s.user_llm_hourly_budget_usd,
         monthly_limit_usd=monthly_cap,
     )
-
-

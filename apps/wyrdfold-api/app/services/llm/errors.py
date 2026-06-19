@@ -21,6 +21,23 @@ from __future__ import annotations
 from typing import Any
 
 
+class MissingUserKeyError(Exception):
+    """A logged-in user has no usable BYOK key and the instance requires
+    one (``BYOK_REQUIRE_USER_KEYS=true``, the hosted posture).
+
+    Raised by ``app.services.llm.get_client``; the DI layer
+    (``dependencies.get_llm_client``) translates it into an HTTP 402 that
+    tells the user to add their key. Deliberately NOT an
+    ``LLMServiceError``: that hierarchy is Sentry-captured by the global
+    handler, and "user hasn't added a key yet" is an expected, actionable
+    state — not a fault worth an alert.
+    """
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        super().__init__(f"no {provider} API key on file for this user")
+
+
 class LLMServiceError(Exception):
     """Base class for all LLM-provider failures we expose to callers.
 
@@ -69,9 +86,7 @@ class LLMRateLimitedError(LLMServiceError):
     """Provider returned 429. Transient — retry after a backoff."""
 
     reason = "rate_limited"
-    user_message = (
-        "The AI service is busy right now. Please wait a moment and try again."
-    )
+    user_message = "The AI service is busy right now. Please wait a moment and try again."
     http_status = 503
 
 
@@ -79,9 +94,7 @@ class LLMUpstreamUnavailableError(LLMServiceError):
     """Provider returned 5xx or connection failed. Transient."""
 
     reason = "upstream_unavailable"
-    user_message = (
-        "We couldn't reach the AI service right now. Please try again in a few minutes."
-    )
+    user_message = "We couldn't reach the AI service right now. Please try again in a few minutes."
     http_status = 503
 
 
@@ -90,9 +103,7 @@ class LLMAuthError(LLMServiceError):
 
     reason = "auth_failed"
     # Don't expose "API key invalid" to end users. They can't act on it.
-    user_message = (
-        "Our AI service is temporarily unavailable. We've been notified."
-    )
+    user_message = "Our AI service is temporarily unavailable. We've been notified."
     http_status = 503
 
 
