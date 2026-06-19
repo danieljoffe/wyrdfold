@@ -37,9 +37,7 @@ class _Chain:
 def _synth_user_targets(profiles: list[dict]) -> list[dict]:
     """One active target per profile (`t-<id>`), so each user is relevant to
     their own jobs by default."""
-    return [
-        {"user_id": p["user_id"], "target_id": f"t-{p['id']}"} for p in profiles
-    ]
+    return [{"user_id": p["user_id"], "target_id": f"t-{p['id']}"} for p in profiles]
 
 
 def _synth_scores(profiles: list[dict], jobs: list[dict]) -> list[dict]:
@@ -85,11 +83,7 @@ def _build_supabase_mock(
     profiles = _prep_profiles(profiles)
     jobs = jobs or []
     scores = scores_rows if scores_rows is not None else _synth_scores(profiles, jobs)
-    targets = (
-        user_targets_rows
-        if user_targets_rows is not None
-        else _synth_user_targets(profiles)
-    )
+    targets = user_targets_rows if user_targets_rows is not None else _synth_user_targets(profiles)
 
     claim_chain = _Chain(_ExecuteStub(claim_response))
     update_chain = _Chain(_ExecuteStub([]))
@@ -128,11 +122,7 @@ def _build_sms_supabase_mock(
     profiles = _prep_profiles(profiles)
     jobs = jobs or []
     scores = scores_rows if scores_rows is not None else _synth_scores(profiles, jobs)
-    targets = (
-        user_targets_rows
-        if user_targets_rows is not None
-        else _synth_user_targets(profiles)
-    )
+    targets = user_targets_rows if user_targets_rows is not None else _synth_user_targets(profiles)
 
     count_chain = _Chain(_ExecuteStub([], count=sms_count_today))
     claim_chain = _Chain(_ExecuteStub(claim_response))
@@ -453,9 +443,7 @@ async def test_sms_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         claim_response=[{"id": "sent-1"}],
     )
 
-    with patch(
-        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
-    ) as mock_send:
+    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
         mock_send.return_value = "SM123abc"
         sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
 
@@ -490,9 +478,7 @@ async def test_sms_only_alerts_for_own_target_match(
         scores_rows=[{"job_posting_id": "j1", "target_id": "tA", "score": 92}],
     )
 
-    with patch(
-        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
-    ) as mock_send:
+    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
         sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0
@@ -510,10 +496,118 @@ async def test_sms_twilio_failure(monkeypatch: pytest.MonkeyPatch) -> None:
         claim_response=[{"id": "sent-1"}],
     )
 
-    with patch(
-        "app.services.notify._send_twilio_sms", new_callable=AsyncMock
-    ) as mock_send:
+    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
         mock_send.side_effect = RuntimeError("Twilio down")
         sent = await notify.send_sms_alerts_for_new_jobs(supabase, jobs)
 
     assert sent == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-target notification thresholds (#15)
+# ---------------------------------------------------------------------------
+
+
+def test_qualifying_score_per_target_override_and_fallback() -> None:
+    """Per-target override sets the bar; NULL falls back to the profile
+    default. Returns the highest score that clears its own target's bar."""
+    scores_by_job = {"j1": [("t1", 60), ("t2", 95)]}
+    targets = {
+        "t1": {"job_score_threshold": 50, "sms_score_threshold": None},  # 60 >= 50 ✓
+        "t2": {"job_score_threshold": None, "sms_score_threshold": None},  # 95 >= 90 ✓
+    }
+    score = notify._qualifying_score("j1", targets, 90, scores_by_job, "job_score_threshold")
+    assert score == 95
+
+
+def test_qualifying_score_override_above_suppresses() -> None:
+    scores_by_job = {"j1": [("t1", 60)]}
+    targets = {"t1": {"job_score_threshold": 90, "sms_score_threshold": None}}
+    # 60 < the per-target 90, even though it clears the profile default 50.
+    assert notify._qualifying_score("j1", targets, 50, scores_by_job, "job_score_threshold") is None
+
+
+def test_qualifying_score_ignores_scores_for_other_users_targets() -> None:
+    scores_by_job = {"j1": [("tX", 99)]}  # tX not among this user's active targets
+    targets = {"t1": {"job_score_threshold": None, "sms_score_threshold": None}}
+    assert notify._qualifying_score("j1", targets, 70, scores_by_job, "job_score_threshold") is None
+
+
+async def test_per_target_threshold_below_profile_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-target threshold lower than the profile default lets a job that
+    wouldn't clear the global bar still alert for that target (#15)."""
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 60, "title": "x", "company_name": "y"},
+    ]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "user_id": "u1", "email": "me@test", "job_score_threshold": 90}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[{"user_id": "u1", "target_id": "t1", "job_score_threshold": 50}],
+        scores_rows=[{"job_posting_id": "j1", "target_id": "t1", "score": 60}],
+    )
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"resendId": "r1"}
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=response)
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
+
+    sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
+
+    assert sent == 1
+    http_client.post.assert_awaited_once()
+
+
+async def test_per_target_threshold_above_profile_suppresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-target threshold higher than the profile default suppresses a job
+    that would otherwise clear the global bar."""
+    jobs: list[dict[str, object]] = [
+        {"id": "j1", "score": 60, "title": "x", "company_name": "y"},
+    ]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "user_id": "u1", "email": "me@test", "job_score_threshold": 50}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[{"user_id": "u1", "target_id": "t1", "job_score_threshold": 90}],
+        scores_rows=[{"job_posting_id": "j1", "target_id": "t1", "score": 60}],
+    )
+    http_client = MagicMock()
+    http_client.post = AsyncMock()
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
+
+    sent = await notify.send_alerts_for_new_jobs(supabase, jobs)
+
+    assert sent == 0
+    http_client.post.assert_not_awaited()
+
+
+async def test_sms_per_target_threshold_below_profile_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SMS path honors the per-target sms_score_threshold override (#15): a
+    score below the profile SMS bar but above the target's override sends."""
+    monkeypatch.setattr(notify.settings, "twilio_account_sid", "AC123")
+    monkeypatch.setattr(notify.settings, "twilio_auth_token", "token")
+    monkeypatch.setattr(notify.settings, "twilio_phone_number", "+15559999999")
+    # Profile SMS bar is 85; job scored 80 — below profile, above target's 70.
+    low_job: dict[str, object] = {**_HIGH_SCORE_JOB, "score": 80}
+    supabase = _build_sms_supabase_mock(
+        profiles=[_SMS_PROFILE],
+        jobs=[low_job],
+        sms_count_today=0,
+        claim_response=[{"id": "sent-1"}],
+        user_targets_rows=[{"user_id": "uA", "target_id": "t-p1", "sms_score_threshold": 70}],
+        scores_rows=[{"job_posting_id": "j1", "target_id": "t-p1", "score": 80}],
+    )
+
+    with patch("app.services.notify._send_twilio_sms", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = "SM123"
+        sent = await notify.send_sms_alerts_for_new_jobs(supabase, [low_job])
+
+    assert sent == 1
+    mock_send.assert_awaited_once()
