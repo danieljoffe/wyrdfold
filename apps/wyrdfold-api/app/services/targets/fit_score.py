@@ -49,13 +49,21 @@ class FitScoreResult(BaseModel):
     reasoning: str = Field(max_length=1500)
 
 
-def _build_prompt(payload: OptimizedPayload, target: JobTarget) -> str:
-    """Build the evaluation prompt from user profile and target."""
-    parts: list[str] = []
+def _build_prompt(payload: OptimizedPayload, target: JobTarget) -> tuple[str, str]:
+    """Compose the user message as ``(static_prefix, dynamic_suffix)`` (#73).
+
+    The user-profile block is stable per user — the master doc, re-sent for
+    every target they fit-score — so it leads and becomes a prompt-cache
+    breakpoint via ``Message.cache_prefix_chars``; the variable target block
+    trails. The ``\\n\\n`` separator lives in the suffix so the cached prefix
+    bytes never shift with the target, and ``static_prefix + dynamic_suffix``
+    is byte-identical to the message this path has always sent.
+    """
+    profile_parts: list[str] = []
 
     # User profile summary
     if payload.summary:
-        parts.append(f"## User Profile\n{payload.summary}")
+        profile_parts.append(f"## User Profile\n{payload.summary}")
 
     if payload.roles:
         role_lines = []
@@ -64,7 +72,7 @@ def _build_prompt(payload: OptimizedPayload, target: JobTarget) -> str:
             if r.skills:
                 line += f" | Skills: {', '.join(r.skills)}"
             role_lines.append(line)
-        parts.append("## Experience\n" + "\n".join(role_lines))
+        profile_parts.append("## Experience\n" + "\n".join(role_lines))
 
     if payload.skills:
         skill_parts = []
@@ -73,9 +81,9 @@ def _build_prompt(payload: OptimizedPayload, target: JobTarget) -> str:
             if s.years:
                 name += f" ({s.years}y)"
             skill_parts.append(name)
-        parts.append("## Skills\n" + ", ".join(skill_parts))
+        profile_parts.append("## Skills\n" + ", ".join(skill_parts))
 
-    # Target description
+    # Target description (variable per target — the dynamic suffix)
     target_parts = [f"## Target: {target.label}"]
     if target.description:
         target_parts.append(target.description)
@@ -95,9 +103,10 @@ def _build_prompt(payload: OptimizedPayload, target: JobTarget) -> str:
     if profile.domain.signals:
         target_parts.append(f"**Domain**: {', '.join(profile.domain.signals)}")
 
-    parts.append("\n".join(target_parts))
-
-    return "\n\n".join(parts)
+    static_prefix = "\n\n".join(profile_parts)
+    target_block = "\n".join(target_parts)
+    dynamic_suffix = f"\n\n{target_block}" if static_prefix else target_block
+    return static_prefix, dynamic_suffix
 
 
 async def derive_fit_score(
@@ -112,12 +121,23 @@ async def derive_fit_score(
 
     Returns (fit_score_result, llm_result) so callers can log cost.
     """
-    user_message = _build_prompt(payload, target)
+    static_prefix, dynamic_suffix = _build_prompt(payload, target)
+    user_message = static_prefix + dynamic_suffix
     return await complete_json(
         llm,
         model=model,
         system=SYSTEM_PROMPT,
-        messages=[Message(role="user", content=user_message)],
+        # Cache the stable user-profile prefix so a user fit-scoring several
+        # targets in one session pays full input tokens once, then cache
+        # reads (#73). ``or None`` because cache_prefix_chars requires >=1 —
+        # an empty profile (no summary/roles/skills) has nothing to cache.
+        messages=[
+            Message(
+                role="user",
+                content=user_message,
+                cache_prefix_chars=len(static_prefix) or None,
+            )
+        ],
         schema=FitScoreResult,
         purpose=purpose,
         max_tokens=512,
