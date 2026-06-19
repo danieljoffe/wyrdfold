@@ -13,11 +13,11 @@ import {
   Star,
   Target,
 } from 'lucide-react';
-import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import ScoreBadge from '@/components/ScoreBadge';
 import type { JobPosting } from './jobs/types';
 
 export interface DashboardInitial {
@@ -258,13 +258,11 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                 href={`/jobs/${posting.id}`}
                 className='group flex min-w-0 items-start gap-3 rounded-xl border border-border bg-surface-elevated p-3 transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
               >
-                <Badge
+                <ScoreBadge
+                  score={posting.score}
                   variant={scoreBadgeVariant(posting.score)}
                   size='sm'
-                  className='shrink-0'
-                >
-                  {posting.score}
-                </Badge>
+                />
                 <div className='min-w-0 flex-1'>
                   <Text
                     variant='body'
