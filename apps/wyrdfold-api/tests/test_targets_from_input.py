@@ -321,6 +321,55 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
     assert kwargs["label"] == "Senior Frontend Engineer"
 
 
+@pytest.mark.asyncio
+async def test_from_manual_malformed_llm_output_raises_clean_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed LLM response (fails TargetSuggestion validation) yields a
+    clean 502 HTTPException, not an unhandled pydantic ValidationError /
+    raw 500 (Finding 2)."""
+    import pydantic
+    from fastapi import HTTPException
+
+    # Reproduce the real failure: the schema parse inside
+    # normalize_manual_input raises a pydantic.ValidationError.
+    def _validation_error() -> pydantic.ValidationError:
+        try:
+            TargetSuggestion.model_validate({})  # missing required fields
+        except pydantic.ValidationError as exc:
+            return exc
+        raise AssertionError("expected TargetSuggestion validation to fail")
+
+    async def fake_normalize(llm, *, label, description, payload):  # type: ignore[no-untyped-def]
+        raise _validation_error()
+
+    monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
+    # If the guard works, matching/crud are never reached — fail loudly if they are.
+    monkeypatch.setattr(
+        from_input,
+        "find_matching_target",
+        lambda *_a, **_kw: pytest.fail("should not reach matching on malformed LLM"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await from_input.from_manual(
+            MagicMock(),
+            MagicMock(),
+            BackgroundTasks(),
+            user_id="user-1",
+            label="sr fe eng",
+            description=None,
+            payload=OptimizedPayload(),
+        )
+
+    assert exc_info.value.status_code == 502
+    detail = exc_info.value.detail.lower()
+    # User-facing, retry-friendly message — no traceback / pydantic internals.
+    assert "try again" in detail
+    assert "validationerror" not in detail
+    assert "field required" not in detail
+
+
 # ---- derive_manual_target_bg: background path -------------------------------
 
 

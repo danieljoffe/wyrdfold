@@ -262,3 +262,75 @@ class TestManualJobEndpoint:
             await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
         assert exc_info.value.status_code == 400
         assert "banned" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_ensures_manual_source_before_job_upsert(self, monkeypatch):
+        """The manual pseudo-source is upserted before the job, so a missing
+        ``sources`` row no longer FK-500s the job insert (Finding 1)."""
+        _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML)
+
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value = (
+            MagicMock(data=[{"id": "posting-uuid-1"}])
+        )
+
+        from app.models.schemas import ManualJobRequest
+        from app.routers.jobs import add_manual_job
+
+        body = ManualJobRequest(url="https://example.com/jobs/123")
+        result = await add_manual_job(
+            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+        )
+
+        assert result.success is True
+
+        # The "sources" table was upserted (self-healing) before "jobs".
+        table_names = [c.args[0] for c in mock_supabase.table.call_args_list]
+        assert "sources" in table_names
+        assert "jobs" in table_names
+        assert table_names.index("sources") < table_names.index("jobs")
+
+        # The seeded source row carries the manual id and is poller-safe.
+        from app.services.extract import MANUAL_SOURCE_ID
+
+        source_upsert = mock_supabase.table.return_value.upsert.call_args_list[0]
+        source_row = source_upsert.args[0]
+        assert source_row["id"] == MANUAL_SOURCE_ID
+        assert source_row["enabled"] is False
+        assert 5 <= source_row["poll_interval_minutes"] <= 10080
+
+    @pytest.mark.asyncio
+    async def test_db_error_returns_clean_502_not_raw_postgres(self, monkeypatch):
+        """A DB/PostgREST failure on persist surfaces a clean 502 rather than
+        leaking the raw Postgres FK-violation string to the client (Finding 1)."""
+        from postgrest.exceptions import APIError
+
+        _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML)
+
+        raw_pg_message = (
+            'insert or update on table "jobs" violates foreign key constraint '
+            '"job_postings_source_id_fkey" ... Key (source_id)='
+            "(00000000-0000-4000-a000-000000000001) is not present in table "
+            '"sources".'
+        )
+        mock_supabase = MagicMock()
+        mock_supabase.table.return_value.upsert.return_value.execute.side_effect = (
+            APIError({"message": raw_pg_message})
+        )
+
+        from fastapi import HTTPException
+
+        from app.models.schemas import ManualJobRequest
+        from app.routers.jobs import add_manual_job
+
+        body = ManualJobRequest(url="https://example.com/jobs/123")
+        with pytest.raises(HTTPException) as exc_info:
+            await add_manual_job(
+                request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+            )
+
+        assert exc_info.value.status_code == 502
+        # No raw Postgres internals leak to the client.
+        assert "foreign key" not in exc_info.value.detail.lower()
+        assert "source_id" not in exc_info.value.detail
+        assert "sources" not in exc_info.value.detail.lower()
