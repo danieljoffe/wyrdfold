@@ -148,9 +148,10 @@ class NotificationThresholdsUpdate(BaseModel):
     """Per-target email/SMS score thresholds (#15).
 
     Each is the minimum score a new match must reach to alert on that
-    channel. ``None`` resets the channel to the user-profile default
-    (``user_profiles.{job,sms}_score_threshold``). The PATCH sets both
-    columns from this body, so the UI sends the full pair.
+    channel. The PATCH is a partial update: an *omitted* field leaves that
+    channel untouched, while an explicit ``null`` resets it to the
+    user-profile default (``user_profiles.{job,sms}_score_threshold``). The
+    UI can send one channel or both.
     """
 
     job_score_threshold: int | None = Field(default=None, ge=0, le=200)

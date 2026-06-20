@@ -722,17 +722,18 @@ async def set_notification_thresholds(
 ) -> UserTarget:
     """Set this target's per-channel email/SMS score thresholds (#15).
 
-    ``None`` for a channel resets it to the user-profile default
-    (``notify.py`` reads target → profile fallback). Thresholds only gate
-    which *new* matches alert; stored scores and the jobs list are
-    unaffected, so no cache invalidation is needed.
+    Partial PATCH: only the channels included in the request body are
+    written, so editing one never clobbers the other. An explicit ``null``
+    resets that channel to the user-profile default (``notify.py`` reads
+    target → profile fallback); an omitted channel is left untouched.
+    Thresholds only gate which *new* matches alert; stored scores and the
+    jobs list are unaffected, so no cache invalidation is needed.
     """
     updated = crud.set_user_target_notification_thresholds(
         supabase,
         user_id=user_id,
         target_id=target_id,
-        job_score_threshold=body.job_score_threshold,
-        sms_score_threshold=body.sms_score_threshold,
+        thresholds=cast(dict[str, int | None], body.model_dump(exclude_unset=True)),
     )
     if updated is None:
         raise HTTPException(

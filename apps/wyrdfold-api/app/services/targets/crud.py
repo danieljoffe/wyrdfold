@@ -563,31 +563,38 @@ def set_user_target_axis_weights(
     return _parse_user_target(rows[0]) if rows else None
 
 
+_NOTIFICATION_THRESHOLD_COLUMNS = ("job_score_threshold", "sms_score_threshold")
+
+
 def set_user_target_notification_thresholds(
     supabase: Client,
     *,
     user_id: str,
     target_id: str,
-    job_score_threshold: int | None,
-    sms_score_threshold: int | None,
+    thresholds: dict[str, int | None],
 ) -> UserTarget | None:
     """Set this user-target pair's per-channel notification thresholds (#15).
 
-    Sets both columns from the arguments; ``None`` resets that channel to
-    the user-profile default (``notify.py`` reads target → profile
-    fallback). Does not re-grade — thresholds only gate which *new*
-    matches alert, not the stored scores.
+    Partial update: only the channels **present** in ``thresholds`` are
+    written, so editing one channel never clobbers the other. A key mapped
+    to ``None`` is an explicit reset of that channel to the user-profile
+    default (``notify.py`` reads target → profile fallback); an *omitted*
+    key leaves the stored value untouched. An empty ``thresholds`` is a
+    no-op that returns the current row unchanged. Does not re-grade —
+    thresholds only gate which *new* matches alert, not the stored scores.
 
-    Returns the updated ``UserTarget`` or ``None`` if no row exists for
-    this (user, target) pairing (the router 404s on None).
+    Returns the updated (or unchanged) ``UserTarget`` or ``None`` if no row
+    exists for this (user, target) pairing (the router 404s on None).
     """
-    if get_user_target(supabase, user_id, target_id) is None:
+    current = get_user_target(supabase, user_id, target_id)
+    if current is None:
         return None
     updates: dict[str, Any] = {
-        "job_score_threshold": job_score_threshold,
-        "sms_score_threshold": sms_score_threshold,
-        "updated_at": datetime.now(UTC).isoformat(),
+        col: thresholds[col] for col in _NOTIFICATION_THRESHOLD_COLUMNS if col in thresholds
     }
+    if not updates:
+        return current
+    updates["updated_at"] = datetime.now(UTC).isoformat()
     resp = (
         supabase.table(USER_TARGETS_TABLE)
         .update(updates)
