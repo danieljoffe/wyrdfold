@@ -18,6 +18,7 @@ import ScoringProfileEditor from './ScoringProfileEditor';
 import ReferenceJDList from './ReferenceJDList';
 import TargetDetailSkeleton from './TargetDetailSkeleton';
 import AxisWeightsEditor from './AxisWeightsEditor';
+import NotificationThresholdsEditor from './NotificationThresholdsEditor';
 
 interface TargetDetailProps {
   id: string;
@@ -217,6 +218,14 @@ export default function TargetDetail({ id }: TargetDetailProps) {
 
       {userTarget && (
         <AxisWeightsEditor
+          targetId={id}
+          userTarget={userTarget}
+          onUpdated={setUserTarget}
+        />
+      )}
+
+      {userTarget && (
+        <NotificationThresholdsEditor
           targetId={id}
           userTarget={userTarget}
           onUpdated={setUserTarget}
