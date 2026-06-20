@@ -1,8 +1,14 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
-import { headers } from 'next/headers';
+import { cookies } from 'next/headers';
 import { ToastProvider } from '@/state/Toast/ToastProvider';
 import { ThemeProvider } from '@/state/Theme/ThemeProvider';
+import {
+  THEME_COOKIE,
+  THEME_RESOLVED_COOKIE,
+  type ThemePreference,
+  resolveIsDark,
+} from '@/state/Theme/themeCookies';
 import './global.css';
 
 export const metadata: Metadata = {
@@ -26,37 +32,28 @@ export default async function RootLayout({
 }: {
   children: ReactNode;
 }) {
-  // Reading a request header opts this layout — and therefore every route
-  // beneath it — into per-request dynamic rendering. That's a hard
-  // requirement for the nonce-based CSP set in proxy.ts: Next only stamps the
-  // per-request nonce onto the scripts it emits when the page renders per
-  // request, and the inline theme script below needs that same nonce to be
-  // authorized. A statically prerendered / CDN-cached page would ship HTML
-  // whose scripts carry no nonce, so `'strict-dynamic'` would block every one.
-  const nonce = (await headers()).get('x-nonce') ?? undefined;
+  // Read the theme preference server-side so the `<html>` class is painted on
+  // the first byte — no pre-hydration inline script (and thus no theme-class or
+  // CSP-nonce hydration mismatch) and no light-flash. `cookies()` is a dynamic
+  // API, so reading it also opts this layout — and every route beneath it —
+  // into per-request rendering, which the nonce-based CSP in proxy.ts requires:
+  // Next only stamps the per-request nonce onto the scripts it emits when the
+  // page renders per request (a statically prerendered page would ship
+  // nonce-less scripts and `'strict-dynamic'` would block them).
+  const cookieStore = await cookies();
+  const prefCookie = cookieStore.get(THEME_COOKIE)?.value;
+  const resolvedCookie = cookieStore.get(THEME_RESOLVED_COOKIE)?.value;
+  const isDark = resolveIsDark(prefCookie, resolvedCookie);
+  const initialTheme: ThemePreference =
+    prefCookie === 'light' || prefCookie === 'dark' || prefCookie === 'system'
+      ? prefCookie
+      : 'system';
 
   return (
-    // ``pyre`` namespaces the design-token reset; ``ThemeProvider``
-    // toggles ``dark`` on the html element based on the stored theme
-    // preference (system / light / dark). To avoid a light-flash for
-    // users whose preference is dark (the typical OS default for
-    // this app), the inline script tag below sets the class
-    // synchronously before React hydrates.
-    <html lang='en' className='pyre'>
-      <head>
-        <script
-          nonce={nonce}
-          dangerouslySetInnerHTML={{
-            __html: `(() => {
-  try {
-    const stored = localStorage.getItem('theme');
-    const isDark = stored === 'dark' || (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    if (isDark) document.documentElement.classList.add('dark');
-  } catch (_) {}
-})();`,
-          }}
-        />
-      </head>
+    // ``pyre`` namespaces the design-token reset; ``dark`` is painted here from
+    // the cookie (resolved server-side) and kept in sync after hydration by
+    // ThemeProvider's class effect.
+    <html lang='en' className={isDark ? 'pyre dark' : 'pyre'}>
       <body>
         {/* WCAG 2.4.1 Bypass Blocks — keyboard/SR users skip past the
             sidebar (~7 nav links + sign-out) on every authed route.
@@ -67,7 +64,10 @@ export default async function RootLayout({
         >
           Skip to main content
         </a>
-        <ThemeProvider>
+        <ThemeProvider
+          initialTheme={initialTheme}
+          initialResolvedTheme={isDark ? 'dark' : 'light'}
+        >
           <ToastProvider>{children}</ToastProvider>
         </ThemeProvider>
       </body>

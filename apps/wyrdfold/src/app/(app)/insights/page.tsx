@@ -27,13 +27,13 @@ export default async function FittedInsights() {
   // partial outage still renders the slices that did come back.
   const qs = new URLSearchParams({ period: DEFAULT_PERIOD });
   const [pipeline, targets, skillsCost] = await Promise.all([
-    fetchJsonFromWyrdfoldAPI<PipelineInsights>('/jobs/insights/pipeline', {
+    fetchJsonFromWyrdfoldAPI<PipelineInsights>('/insights/pipeline', {
       searchParams: qs,
     }),
-    fetchJsonFromWyrdfoldAPI<TargetInsights>('/jobs/insights/targets', {
+    fetchJsonFromWyrdfoldAPI<TargetInsights>('/insights/targets', {
       searchParams: qs,
     }),
-    fetchJsonFromWyrdfoldAPI<SkillsCostInsights>('/jobs/insights/skills-cost', {
+    fetchJsonFromWyrdfoldAPI<SkillsCostInsights>('/insights/skills-cost', {
       searchParams: qs,
     }),
   ]);

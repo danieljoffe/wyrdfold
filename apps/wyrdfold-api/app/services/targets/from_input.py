@@ -23,17 +23,21 @@ the ``_activate_pipeline`` BackgroundTask pattern in ``routers/targets``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
-from fastapi import BackgroundTasks
+import pydantic
+from fastapi import BackgroundTasks, HTTPException
 from supabase import Client
 
 from app.models.experience import OptimizedPayload
+from app.models.llm import LLMResult
 from app.models.targets import (
     CreateOrLinkResult,
     JobTarget,
     ScoringProfile,
     TargetCreate,
+    TargetSuggestion,
     TargetUpdate,
 )
 from app.services.llm import cost_log
@@ -260,6 +264,50 @@ async def derive_url_target_bg(
 # ---- Inline create-or-link orchestration -----------------------------------
 
 
+# User-facing message when the LLM returns output we can't parse into a
+# TargetSuggestion. 502 (Bad Gateway): the upstream LLM gave us a malformed
+# response, not the client's fault. Matches the transient, retry-friendly
+# framing of the LLM error hierarchy in app/services/llm/errors.py without
+# leaking the raw pydantic/JSON traceback.
+_MALFORMED_SUGGESTION_DETAIL = (
+    "Couldn't derive a target profile from the role title — please try again."
+)
+
+
+async def _normalize_suggestion(
+    llm: LLMClient,
+    *,
+    label: str,
+    description: str | None,
+    payload: OptimizedPayload,
+) -> tuple[TargetSuggestion, LLMResult]:
+    """Normalize user input into a ``TargetSuggestion``, guarding the parse.
+
+    ``normalize_manual_input`` validates the LLM's tool output against the
+    ``TargetSuggestion`` schema. A real LLM occasionally returns output that
+    doesn't match (missing/extra fields, non-JSON), which raises
+    ``pydantic.ValidationError`` (or a JSON decode error). Left unhandled
+    these propagate as a raw 500 with a traceback. Translate them into a
+    clean 502 so the caller gets an actionable, retry-friendly message.
+
+    Centralized here so every entry point that derives a ``TargetSuggestion``
+    inline (currently ``from_manual``) shares the same guard.
+    """
+    try:
+        return await normalize_manual_input(
+            llm, label=label, description=description, payload=payload
+        )
+    except (pydantic.ValidationError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "LLM returned malformed TargetSuggestion for label=%r: %s",
+            label,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502, detail=_MALFORMED_SUGGESTION_DETAIL
+        ) from exc
+
+
 async def from_manual(
     supabase: Client,
     llm: LLMClient,
@@ -281,7 +329,7 @@ async def from_manual(
     3. If matched, link the user; defer the fit score
     4. If new, create in ``deriving`` status, link, defer profile + fit score
     """
-    suggestion, norm_result = await normalize_manual_input(
+    suggestion, norm_result = await _normalize_suggestion(
         llm, label=label, description=description, payload=payload
     )
     cost_log.record(
