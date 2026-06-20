@@ -8,6 +8,7 @@ Three-tier extraction cascade:
 
 import logging
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -23,6 +24,23 @@ from app.services.jsonld import (
 logger = logging.getLogger(__name__)
 
 MANUAL_SOURCE_ID = "00000000-0000-4000-a000-000000000001"
+
+# The "manual" pseudo-source row that user-pasted jobs (POST /jobs/manual)
+# are filed under. It satisfies the NOT-NULL job_postings.source_id FK
+# without belonging to a real polled board. ``enabled`` is False so the
+# poller skips it; ``poll_interval_minutes`` stays inside the table's
+# 5..10080 CHECK. Kept here (rather than only in the seed migration) so the
+# manual-add path can self-heal a missing row at request time. See
+# supabase/migrations/*_seed_manual_source.sql.
+MANUAL_SOURCE_ROW: dict[str, Any] = {
+    "id": MANUAL_SOURCE_ID,
+    "provider": "manual",
+    "board_token": "__manual__",
+    "company_name": "Manually Added",
+    "enabled": False,
+    "poll_interval_minutes": 10080,
+    "consecutive_failures": 0,
+}
 
 # Patterns for finding job description content areas.
 # Matches BEM (job__description), kebab (job-description), and plain (jobdescription).
