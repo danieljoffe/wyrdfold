@@ -236,8 +236,13 @@ class _FakeQuery:
     def execute(self) -> SimpleNamespace:
         if self._op == "upsert":
             assert self._row is not None
-            self._store.append(dict(self._row))
-            return SimpleNamespace(data=[self._row])
+            # Mimic PostgREST's RETURNING representation: the full row,
+            # including the DB-default columns set_key doesn't send.
+            stored = dict(self._row)
+            stored.setdefault("created_at", "2026-01-01T00:00:00+00:00")
+            stored.setdefault("rotated_at", None)
+            self._store.append(stored)
+            return SimpleNamespace(data=[stored])
         if self._op == "select":
             cols = [c.strip() for c in (self._cols or "").split(",")]
             out = [{c: row.get(c) for c in cols} for row in self._store if self._matches(row)]

@@ -87,16 +87,14 @@ def test_put_new_key_sets_without_rotation(client, monkeypatch):
 
     set_calls: list[dict] = []
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
-    # First read (rotation check) sees nothing; read-back returns the new row.
-    metas = iter([[], [_meta()]])
-    monkeypatch.setattr(
-        router_mod.keys, "list_key_meta", lambda *_a, **_k: next(metas)
-    )
-    monkeypatch.setattr(
-        router_mod.keys,
-        "set_key",
-        lambda *_a, **k: set_calls.append(k),
-    )
+    # Rotation check sees nothing → first-time set.
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [])
+
+    def _set_key(*_a, **k):
+        set_calls.append(k)
+        return _meta()  # the atomic upsert returns its own row metadata
+
+    monkeypatch.setattr(router_mod.keys, "set_key", _set_key)
 
     resp = client.put("/profile/keys/openrouter", json={"key": "sk-or-newkey"})
 
@@ -117,9 +115,12 @@ def test_put_replacing_existing_key_marks_rotation(client, monkeypatch):
     monkeypatch.setattr(
         router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()]
     )
-    monkeypatch.setattr(
-        router_mod.keys, "set_key", lambda *_a, **k: set_calls.append(k)
-    )
+
+    def _set_key(*_a, **k):
+        set_calls.append(k)
+        return _meta(last4="9999")
+
+    monkeypatch.setattr(router_mod.keys, "set_key", _set_key)
 
     resp = client.put("/profile/keys/openrouter", json={"key": "sk-or-rotated"})
 
