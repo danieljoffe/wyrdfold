@@ -17,6 +17,7 @@ from supabase import Client
 from app.config import settings
 from app.dependencies import get_supabase, verify_api_key
 from app.services.llm import cost_log
+from app.services.retention import purge_expired_records
 
 router = APIRouter(
     prefix="/admin",
@@ -75,13 +76,10 @@ class CostSummaryResponse(BaseModel):
             "circuit breaker is disabled."
         )
     )
-    today_usd: float = Field(
-        description="Spend since UTC midnight (the breaker's window)."
-    )
+    today_usd: float = Field(description="Spend since UTC midnight (the breaker's window).")
     today_usage_pct: float | None = Field(
         description=(
-            "today_usd / global_daily_cap_usd × 100. None when the cap is "
-            "0 (breaker disabled)."
+            "today_usd / global_daily_cap_usd × 100. None when the cap is 0 (breaker disabled)."
         )
     )
     last_24h_usd: float
@@ -116,16 +114,12 @@ def get_cost_summary(
     last_7d = cost_log.total_spend_all(supabase, since=now - timedelta(days=7))
     last_30d = cost_log.total_spend_all(supabase, since=now - timedelta(days=30))
 
-    by_purpose_today: dict[str, float] = cost_log.spend_by_purpose_all(
-        supabase, since=midnight
-    )
+    by_purpose_today: dict[str, float] = cost_log.spend_by_purpose_all(supabase, since=midnight)
     by_purpose_30d: dict[str, float] = cost_log.spend_by_purpose_all(
         supabase, since=now - timedelta(days=30)
     )
 
-    cache_today = CacheStats.from_buckets(
-        cost_log.cache_metrics_all(supabase, since=midnight)
-    )
+    cache_today = CacheStats.from_buckets(cost_log.cache_metrics_all(supabase, since=midnight))
     cache_30d = CacheStats.from_buckets(
         cost_log.cache_metrics_all(supabase, since=now - timedelta(days=30))
     )
@@ -150,3 +144,30 @@ def get_cost_summary(
         cache_today=cache_today,
         cache_30d=cache_30d,
     )
+
+
+class RetentionPurgeResult(BaseModel):
+    """Rows deleted per operational log by a retention purge (#29 P3)."""
+
+    llm_costs: int = Field(description="Rows deleted from llm_costs.")
+    notifications_sent: int = Field(description="Rows deleted from notifications_sent.")
+
+
+@router.post("/retention/purge", response_model=RetentionPurgeResult)
+def purge_retention(
+    supabase: Client = Depends(get_supabase),
+) -> RetentionPurgeResult:
+    """Delete operational-log rows past their retention window (#29 P3).
+
+    Idempotent; safe to call repeatedly. Mirrors the in-process scheduler
+    job (gated on ``RETENTION_PURGE_ENABLED``), exposed so external cron
+    (pg_cron, GitHub Actions) can drive the purge without running
+    APScheduler. Windows come from settings; a 0-day window keeps that
+    log indefinitely.
+    """
+    report = purge_expired_records(
+        supabase,
+        llm_costs_days=settings.llm_costs_retention_days,
+        notifications_sent_days=settings.notifications_sent_retention_days,
+    )
+    return RetentionPurgeResult(**report)
