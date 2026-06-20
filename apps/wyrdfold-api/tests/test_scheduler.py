@@ -20,11 +20,12 @@ def test_build_scheduler_registers_single_job() -> None:
     assert jobs[0].id == "poll_due_sources"
 
 
-def test_start_scheduler_returns_none_when_both_disabled() -> None:
-    """Default settings have both schedulers off — verify nothing starts."""
+def test_start_scheduler_returns_none_when_all_disabled() -> None:
+    """Default settings have every scheduler off — verify nothing starts."""
     with patch("app.scheduler.settings") as mock_settings:
         mock_settings.poll_scheduler_enabled = False
         mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -37,6 +38,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.poll_scheduler_enabled = True
         mock_settings.poll_tick_minutes = 30
         mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -56,6 +58,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.poll_scheduler_enabled = False
         mock_settings.url_health_check_enabled = True
         mock_settings.url_health_tick_hours = 6
+        mock_settings.retention_purge_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -76,6 +79,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.poll_tick_minutes = 30
         mock_settings.url_health_check_enabled = True
         mock_settings.url_health_tick_hours = 6
+        mock_settings.retention_purge_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -85,6 +89,95 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         assert ids == {"poll_due_sources", "url_health_check"}
     finally:
         scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_registers_only_retention_when_only_retention_enabled() -> None:
+    """Retention-only operation — verify only the retention_purge job lands."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = True
+        mock_settings.retention_purge_tick_hours = 24
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].id == "retention_purge"
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_registers_all_three_when_all_enabled() -> None:
+    """All flags on — three jobs live on the single shared scheduler."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = True
+        mock_settings.poll_tick_minutes = 30
+        mock_settings.url_health_check_enabled = True
+        mock_settings.url_health_tick_hours = 6
+        mock_settings.retention_purge_enabled = True
+        mock_settings.retention_purge_tick_hours = 24
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        ids = {j.id for j in scheduler.get_jobs()}
+        assert ids == {"poll_due_sources", "url_health_check", "retention_purge"}
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> None:
+    """The tick body must pull the singleton client and pass the configured
+    windows to ``purge_expired_records`` (run in a worker thread)."""
+    from app.scheduler import _run_scheduled_retention_purge
+
+    fake_client = object()
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=fake_client),
+        patch("app.scheduler.settings") as mock_settings,
+        patch("app.scheduler.purge_expired_records", autospec=True) as mock_purge,
+    ):
+        mock_settings.llm_costs_retention_days = 365
+        mock_settings.notifications_sent_retention_days = 180
+        mock_purge.return_value = {"llm_costs": 0, "notifications_sent": 0}
+        await _run_scheduled_retention_purge()
+
+    mock_purge.assert_called_once_with(fake_client, llm_costs_days=365, notifications_sent_days=180)
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_retention_purge_skips_when_supabase_uninitialized() -> None:
+    from app.scheduler import _run_scheduled_retention_purge
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch("app.scheduler.purge_expired_records", autospec=True) as mock_purge,
+    ):
+        await _run_scheduled_retention_purge()
+
+    mock_purge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_retention_purge_swallows_exceptions() -> None:
+    from app.scheduler import _run_scheduled_retention_purge
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch(
+            "app.scheduler.purge_expired_records",
+            side_effect=RuntimeError("kaboom"),
+        ),
+    ):
+        # Must not raise.
+        await _run_scheduled_retention_purge()
 
 
 @pytest.mark.asyncio

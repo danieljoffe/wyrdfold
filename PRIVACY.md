@@ -7,9 +7,9 @@ stores it, and what leaves your instance** — written for self-hosters,
 who are the data controller for their own deployment.
 
 It describes the current state of `main`. Where a capability is missing
-(notably one-click account deletion and full data export), this document
-says so plainly and links the tracking issue rather than implying a
-guarantee that doesn't exist yet. See
+(notably full personal-data export), this document says so plainly and
+links the tracking issue rather than implying a guarantee that doesn't
+exist yet. See
 [#29](https://github.com/danieljoffe/wyrdfold/issues/29) for the open
 privacy audit this map belongs to.
 
@@ -44,12 +44,12 @@ local disk beyond ephemeral request scope.
 
 ### Operational data that can reference a person
 
-| Category              | Where                 | Notes                                                                         |
-| --------------------- | --------------------- | ----------------------------------------------------------------------------- |
-| LLM cost ledger       | `llm_costs`           | per-call tokens/cost/purpose + a `metadata` JSON; **append-only, not purged** |
-| Job analyses & scores | `analyses`, `scores`  | LLM reasoning that may quote the user's profile against a job                 |
-| Target learning log   | `target_learning_log` | how a target's profile evolved from feedback                                  |
-| Notification log      | `notifications_sent`  | which job alerts went to which profile/channel; **append-only**               |
+| Category              | Where                 | Notes                                                                                                                         |
+| --------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| LLM cost ledger       | `llm_costs`           | per-call tokens/cost/purpose + a `metadata` JSON; append-only, **opt-in retention purge** (`LLM_COSTS_RETENTION_DAYS`)        |
+| Job analyses & scores | `analyses`, `scores`  | LLM reasoning that may quote the user's profile against a job                                                                 |
+| Target learning log   | `target_learning_log` | how a target's profile evolved from feedback                                                                                  |
+| Notification log      | `notifications_sent`  | which job alerts went to which profile/channel; append-only, **opt-in retention purge** (`NOTIFICATIONS_SENT_RETENTION_DAYS`) |
 
 ### Shared catalog (not personal, by design)
 
@@ -72,9 +72,10 @@ inert.
   the operator is responsible for keeping ZDR on and rotating the key.
 - **Sentry (error tracking, optional)** — initialized with
   `send_default_pii=False`, so request bodies and user identifiers are
-  not attached by default. There is **no `before_send` scrubbing hook**,
-  so an exception that happens to carry user data in a local variable
-  could still surface. Disabled entirely when no DSN is set.
+  not attached by default, **plus a `before_send` hook** that redacts
+  secret/PII values by key name (résumé/JD text, emails, phone numbers,
+  provider/BYOK key material) across event context and exception-frame
+  locals. Disabled entirely when no DSN is set.
 - **Resend (email alerts, via the Next.js BFF, optional)** — receives the
   recipient email plus the alerting job's title, company, location, score,
   and URL. No resume content is sent.
@@ -83,21 +84,30 @@ inert.
 
 ## Retention & lifecycle
 
-- **There is no automatic data purge.** The idle-account lifecycle
+- **User content is not auto-purged.** The idle-account lifecycle
   (`idle_deactivate_days`, default 30) only flips a user's targets to
   inactive and sends one "paused" email — **deactivation is not
-  deletion**. All prose, resumes, documents, feedback, scores, and logs
-  remain until something explicitly deletes them.
-- `llm_costs` and `notifications_sent` are append-only and grow
-  unbounded; no retention window is applied today.
+  deletion**. All prose, resumes, documents, feedback, and scores remain
+  until something explicitly deletes them (see account deletion below).
+- The append-only operational logs `llm_costs` and `notifications_sent`
+  have an **opt-in retention purge** (#29 P3): set
+  `RETENTION_PURGE_ENABLED=true` to delete rows older than
+  `LLM_COSTS_RETENTION_DAYS` (default 365) / `NOTIFICATIONS_SENT_RETENTION_DAYS`
+  (default 180); a window of `0` keeps that log indefinitely. Runs on the
+  in-process scheduler, or trigger it from external cron via
+  `POST /admin/retention/purge`. Off by default, so self-host retains
+  everything until you choose a window.
 
 ## Deleting & exporting data
 
-Current capabilities are **partial and scoped** — there is no single
-"delete my account" or "export everything" action yet.
+Account **deletion** is automated; full **export** is still partial.
 
 What exists today:
 
+- **Account deletion (right-to-erasure, #29 P1):** `DELETE /profile/account`
+  permanently erases every per-user row and both storage buckets'
+  `{user_id}/` objects, then the auth account — the shared catalog
+  (`jobs`/`targets`/`scores`/`sources`) is deliberately left intact.
 - **Export:** `POST /tailor/resumes/export-zip` downloads approved
   tailored resumes/cover letters as a `.docx` zip. It does **not** export
   prose, conversation history, preferences, feedback, or logs.
@@ -110,15 +120,12 @@ What's missing (tracked in
 [#29](https://github.com/danieljoffe/wyrdfold/issues/29) as follow-up
 implementation):
 
-- A single account-deletion path that cascades across DB rows, both
-  storage buckets, embeddings, and the cost/notification logs.
-- A full personal-data export ("download everything I've given you").
-- A documented retention policy for the append-only logs.
+- A full personal-data export ("download everything I've given you") —
+  beyond today's approved-docs zip.
 
-Until those land, an operator removing a person's data must do it
-manually: delete the user's rows across the per-user tables above and the
-`{user_id}/` prefixes in both storage buckets, then confirm in the
-OpenRouter and Sentry dashboards per those providers' retention settings.
+Retention of the append-only operational logs is now an opt-in purge
+(see above); user content is removed via the account-deletion path rather
+than a time-based purge.
 
 ## Operator responsibilities
 
