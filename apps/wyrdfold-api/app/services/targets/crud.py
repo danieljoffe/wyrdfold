@@ -87,9 +87,9 @@ def _parse_user_target(row: dict[str, Any]) -> UserTarget:
         fit_score=row.get("fit_score"),
         fit_score_reasoning=row.get("fit_score_reasoning"),
         axis_weights=AxisWeights.model_validate(aw_raw) if aw_raw else None,
-        axis_weights_previous=(
-            AxisWeights.model_validate(awp_raw) if awp_raw else None
-        ),
+        axis_weights_previous=(AxisWeights.model_validate(awp_raw) if awp_raw else None),
+        job_score_threshold=row.get("job_score_threshold"),
+        sms_score_threshold=row.get("sms_score_threshold"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -101,9 +101,7 @@ def _parse_ref_jd(row: dict[str, Any]) -> TargetReferenceJD:
         target_id=row["target_id"],
         jd_url=row.get("jd_url"),
         jd_text=row["jd_text"],
-        extracted_profile=ScoringProfile.model_validate(
-            row.get("extracted_profile") or {}
-        ),
+        extracted_profile=ScoringProfile.model_validate(row.get("extracted_profile") or {}),
         created_at=row["created_at"],
     )
 
@@ -128,21 +126,14 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
 
 
 def get(supabase: Client, target_id: str) -> JobTarget | None:
-    resp = (
-        supabase.table(TARGETS_TABLE).select("*").eq("id", target_id).execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).select("*").eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return _parse_target(rows[0]) if rows else None
 
 
 def list_all(supabase: Client) -> list[JobTarget]:
     """Return all targets, ordered by creation date."""
-    resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .order("created_at", desc=True)
-        .execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).select("*").order("created_at", desc=True).execute()
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
@@ -152,12 +143,7 @@ def list_all_summary(supabase: Client) -> list[JobTargetSummary]:
     Still selects the full row (counts are derived from ``scoring_profile``),
     but returns the light summary so the JSONB never crosses the wire.
     """
-    resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .order("created_at", desc=True)
-        .execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).select("*").order("created_at", desc=True).execute()
     return [_summarize_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
@@ -167,18 +153,11 @@ def get_active(supabase: Client) -> list[JobTarget]:
     The trigger on user_targets maintains targets.is_active, so this
     query works without joining user_targets.
     """
-    resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .eq("is_active", True)
-        .execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).select("*").eq("is_active", True).execute()
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def update(
-    supabase: Client, target_id: str, payload: TargetUpdate
-) -> JobTarget | None:
+def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
         updates["label"] = payload.label
@@ -207,17 +186,13 @@ def update(
     if payload.domain_hints is not None:
         updates["domain_hints"] = payload.domain_hints
 
-    resp = (
-        supabase.table(TARGETS_TABLE).update(updates).eq("id", target_id).execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return _parse_target(rows[0]) if rows else None
 
 
 def delete(supabase: Client, target_id: str) -> bool:
-    resp = (
-        supabase.table(TARGETS_TABLE).delete().eq("id", target_id).execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).delete().eq("id", target_id).execute()
     return bool(resp.data)
 
 
@@ -258,10 +233,7 @@ def set_inactive(supabase: Client, target_id: str) -> JobTarget | None:
 def list_for_user(supabase: Client, user_id: str) -> list[JobTarget]:
     """Return all targets a user is linked to, ordered by creation date."""
     ut_resp = (
-        supabase.table(USER_TARGETS_TABLE)
-        .select("target_id")
-        .eq("user_id", user_id)
-        .execute()
+        supabase.table(USER_TARGETS_TABLE).select("target_id").eq("user_id", user_id).execute()
     )
     ut_rows = cast(list[dict[str, Any]], ut_resp.data or [])
     target_ids = [r["target_id"] for r in ut_rows]
@@ -292,30 +264,18 @@ def get_active_for_user(supabase: Client, user_id: str) -> list[JobTarget]:
     if not target_ids:
         return []
 
-    resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .in_("id", target_ids)
-        .execute()
-    )
+    resp = supabase.table(TARGETS_TABLE).select("*").in_("id", target_ids).execute()
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
 def get_user_target_ids(supabase: Client, user_id: str) -> set[str]:
     """Return the set of target IDs a user is linked to (any status)."""
-    resp = (
-        supabase.table(USER_TARGETS_TABLE)
-        .select("target_id")
-        .eq("user_id", user_id)
-        .execute()
-    )
+    resp = supabase.table(USER_TARGETS_TABLE).select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 
 
-def list_user_targets_with_targets(
-    supabase: Client, user_id: str
-) -> list[UserTargetWithTarget]:
+def list_user_targets_with_targets(supabase: Client, user_id: str) -> list[UserTargetWithTarget]:
     """Return a user's targets paired with their junction data (fit score)."""
     ut_resp = (
         supabase.table(USER_TARGETS_TABLE)
@@ -329,12 +289,7 @@ def list_user_targets_with_targets(
         return []
 
     target_ids = [r["target_id"] for r in ut_rows]
-    t_resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .in_("id", target_ids)
-        .execute()
-    )
+    t_resp = supabase.table(TARGETS_TABLE).select("*").in_("id", target_ids).execute()
     targets_by_id = {
         cast(dict[str, Any], r)["id"]: _parse_target(cast(dict[str, Any], r))
         for r in (t_resp.data or [])
@@ -354,9 +309,7 @@ def list_user_targets_with_targets(
     return results
 
 
-def list_user_targets_with_summary(
-    supabase: Client, user_id: str
-) -> list[UserTargetWithSummary]:
+def list_user_targets_with_summary(supabase: Client, user_id: str) -> list[UserTargetWithSummary]:
     """List-view projection of :func:`list_user_targets_with_targets` (#863).
 
     Same junction + targets fetch, but pairs each link with the light
@@ -374,12 +327,7 @@ def list_user_targets_with_summary(
         return []
 
     target_ids = [r["target_id"] for r in ut_rows]
-    t_resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("*")
-        .in_("id", target_ids)
-        .execute()
-    )
+    t_resp = supabase.table(TARGETS_TABLE).select("*").in_("id", target_ids).execute()
     summaries_by_id = {
         cast(dict[str, Any], r)["id"]: _summarize_target(cast(dict[str, Any], r))
         for r in (t_resp.data or [])
@@ -433,9 +381,7 @@ class ActiveTargetLimitError(Exception):
     def __init__(self, current_count: int, limit: int) -> None:
         self.current_count = current_count
         self.limit = limit
-        super().__init__(
-            f"Active target limit ({limit}) reached; currently {current_count} active"
-        )
+        super().__init__(f"Active target limit ({limit}) reached; currently {current_count} active")
 
 
 def count_active_for_user(supabase: Client, user_id: str) -> int:
@@ -504,20 +450,14 @@ def link_user_to_target(
     if fit_score_reasoning is not None:
         row["fit_score_reasoning"] = fit_score_reasoning
 
-    resp = (
-        supabase.table(USER_TARGETS_TABLE)
-        .upsert(row, on_conflict="user_id,target_id")
-        .execute()
-    )
+    resp = supabase.table(USER_TARGETS_TABLE).upsert(row, on_conflict="user_id,target_id").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert user_targets row")
     return _parse_user_target(rows[0])
 
 
-def unlink_user_from_target(
-    supabase: Client, user_id: str, target_id: str
-) -> bool:
+def unlink_user_from_target(supabase: Client, user_id: str, target_id: str) -> bool:
     """Remove a user–target link. The DB trigger will deactivate the target
     if no other users have it active."""
     resp = (
@@ -530,9 +470,7 @@ def unlink_user_from_target(
     return bool(resp.data)
 
 
-def get_user_target(
-    supabase: Client, user_id: str, target_id: str
-) -> UserTarget | None:
+def get_user_target(supabase: Client, user_id: str, target_id: str) -> UserTarget | None:
     """Get a specific user–target link."""
     resp = (
         supabase.table(USER_TARGETS_TABLE)
@@ -557,9 +495,7 @@ def list_user_targets(supabase: Client, user_id: str) -> list[UserTarget]:
     return [_parse_user_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def set_user_target_active(
-    supabase: Client, user_id: str, target_id: str
-) -> UserTarget | None:
+def set_user_target_active(supabase: Client, user_id: str, target_id: str) -> UserTarget | None:
     """Activate a user's link to a target. The DB trigger syncs targets.is_active."""
     resp = (
         supabase.table(USER_TARGETS_TABLE)
@@ -572,9 +508,7 @@ def set_user_target_active(
     return _parse_user_target(rows[0]) if rows else None
 
 
-def set_user_target_inactive(
-    supabase: Client, user_id: str, target_id: str
-) -> UserTarget | None:
+def set_user_target_inactive(supabase: Client, user_id: str, target_id: str) -> UserTarget | None:
     """Deactivate a user's link to a target. The DB trigger syncs targets.is_active."""
     resp = (
         supabase.table(USER_TARGETS_TABLE)
@@ -614,10 +548,44 @@ def set_user_target_axis_weights(
     updates: dict[str, Any] = {
         "axis_weights": weights.model_dump() if weights is not None else None,
         "axis_weights_previous": (
-            current.axis_weights.model_dump()
-            if current.axis_weights is not None
-            else None
+            current.axis_weights.model_dump() if current.axis_weights is not None else None
         ),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_user_target(rows[0]) if rows else None
+
+
+def set_user_target_notification_thresholds(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    job_score_threshold: int | None,
+    sms_score_threshold: int | None,
+) -> UserTarget | None:
+    """Set this user-target pair's per-channel notification thresholds (#15).
+
+    Sets both columns from the arguments; ``None`` resets that channel to
+    the user-profile default (``notify.py`` reads target → profile
+    fallback). Does not re-grade — thresholds only gate which *new*
+    matches alert, not the stored scores.
+
+    Returns the updated ``UserTarget`` or ``None`` if no row exists for
+    this (user, target) pairing (the router 404s on None).
+    """
+    if get_user_target(supabase, user_id, target_id) is None:
+        return None
+    updates: dict[str, Any] = {
+        "job_score_threshold": job_score_threshold,
+        "sms_score_threshold": sms_score_threshold,
         "updated_at": datetime.now(UTC).isoformat(),
     }
     resp = (
@@ -650,12 +618,8 @@ def undo_user_target_axis_weights(
     new_current = current.axis_weights_previous
     new_previous = current.axis_weights
     updates: dict[str, Any] = {
-        "axis_weights": (
-            new_current.model_dump() if new_current is not None else None
-        ),
-        "axis_weights_previous": (
-            new_previous.model_dump() if new_previous is not None else None
-        ),
+        "axis_weights": (new_current.model_dump() if new_current is not None else None),
+        "axis_weights_previous": (new_previous.model_dump() if new_previous is not None else None),
         "updated_at": datetime.now(UTC).isoformat(),
     }
     resp = (
@@ -692,9 +656,7 @@ def add_reference_jd(
     return _parse_ref_jd(rows[0])
 
 
-def list_reference_jds(
-    supabase: Client, target_id: str
-) -> list[TargetReferenceJD]:
+def list_reference_jds(supabase: Client, target_id: str) -> list[TargetReferenceJD]:
     resp = (
         supabase.table(REF_JDS_TABLE)
         .select("*")
@@ -705,9 +667,7 @@ def list_reference_jds(
     return [_parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def delete_reference_jd(
-    supabase: Client, ref_jd_id: str, *, target_id: str
-) -> bool:
+def delete_reference_jd(supabase: Client, ref_jd_id: str, *, target_id: str) -> bool:
     # target_id constrains the delete to the target the route already
     # ownership-checked — without it, any ref_jd_id across any target
     # would be deletable (IDOR, audit #24 F1).
