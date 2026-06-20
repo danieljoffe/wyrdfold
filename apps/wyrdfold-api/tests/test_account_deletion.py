@@ -44,6 +44,8 @@ class _FakeTableQuery:
         self._log = log
         self._op: str | None = None
         self._filters: list[tuple[str, Any]] = []
+        self._in_filters: list[tuple[str, list[Any]]] = []
+        self._payload: dict[str, Any] = {}
 
     def delete(self) -> _FakeTableQuery:
         self._op = "delete"
@@ -53,21 +55,35 @@ class _FakeTableQuery:
         self._op = "select"
         return self
 
+    def update(self, payload: dict[str, Any]) -> _FakeTableQuery:
+        self._op = "update"
+        self._payload = payload
+        return self
+
     def eq(self, col: str, val: Any) -> _FakeTableQuery:
         self._filters.append((col, val))
+        return self
+
+    def in_(self, col: str, vals: list[Any]) -> _FakeTableQuery:
+        self._in_filters.append((col, list(vals)))
         return self
 
     def limit(self, _n: int) -> _FakeTableQuery:
         return self
 
     def _matches(self, row: dict[str, Any]) -> bool:
-        return all(row.get(c) == v for c, v in self._filters)
+        return all(row.get(c) == v for c, v in self._filters) and all(
+            row.get(c) in vals for c, vals in self._in_filters
+        )
 
     def execute(self) -> SimpleNamespace:
         matched = [r for r in self._rows if self._matches(r)]
         self._log.append((self._op, self.name, dict(self._filters)))
         if self._op == "delete":
             self._rows[:] = [r for r in self._rows if not self._matches(r)]
+        elif self._op == "update":
+            for row in matched:
+                row.update(self._payload)
         return SimpleNamespace(data=matched)
 
 
@@ -183,6 +199,58 @@ def test_shared_catalog_is_never_deleted() -> None:
     # And the shared rows are physically still present.
     assert sb.tables["scores"] == [{"target_id": "t1", "job_posting_id": "j1"}]
     assert sb.tables["jobs"] == [{"id": "j1", "status": "applied"}]
+
+
+def test_scrubs_shared_score_pii_for_user_targets() -> None:
+    """Erasure nulls the Phase-2 grader PII on shared ``scores`` rows for
+    the user's targets (without deleting the rows), re-opens them to grade,
+    and leaves scores for *other* tenants' targets untouched."""
+    tables: dict[str, list[dict[str, Any]]] = {
+        "user_targets": [{"user_id": _UID, "target_id": "t1"}],
+        "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+        "scores": [
+            {
+                "target_id": "t1",
+                "job_posting_id": "j1",
+                "score": 80,
+                "fit_reasoning": "Your FightCamp work (Lighthouse +40)",
+                "axis_scores": {"skills_fit": 90},
+                "logistics_filters": {"remote": True},
+                "scoring_status": "complete",
+            },
+            # Another tenant's target — must NOT be touched.
+            {
+                "target_id": "t2",
+                "job_posting_id": "j1",
+                "fit_reasoning": "Someone else's resume",
+                "scoring_status": "complete",
+            },
+        ],
+    }
+    sb = _FakeSupabase(tables, {})
+    report = account_deletion.delete_account(sb, user_id=_UID)
+
+    scrubbed = next(r for r in sb.tables["scores"] if r["target_id"] == "t1")
+    assert scrubbed["fit_reasoning"] is None
+    assert scrubbed["axis_scores"] is None
+    assert scrubbed["logistics_filters"] is None
+    assert scrubbed["scoring_status"] == "stage2"
+    assert scrubbed["score"] == 80  # numeric score left to re-grade
+    assert report["scores_scrubbed"] == 1
+
+    other = next(r for r in sb.tables["scores"] if r["target_id"] == "t2")
+    assert other["fit_reasoning"] == "Someone else's resume"
+    # The row was scrubbed, never deleted — still present.
+    assert {r["target_id"] for r in sb.tables["scores"]} == {"t1", "t2"}
+    assert "scores" not in {table for op, table, _ in sb.log if op == "delete"}
+
+
+def test_no_targets_skips_score_scrub() -> None:
+    """A user with no target links issues no scores update (no ``.in_([])``)."""
+    sb = _seeded()  # seeded user_targets row carries no target_id
+    report = account_deletion.delete_account(sb, user_id=_UID)
+    assert report["scores_scrubbed"] == 0
+    assert ("update", "scores", {}) not in sb.log
 
 
 def test_both_storage_buckets_purged() -> None:

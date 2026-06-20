@@ -31,6 +31,7 @@ class _FakeQuery:
         self._rows = rows
         self._cols = "*"
         self._filters: list[tuple[str, Any]] = []
+        self._in_filters: list[tuple[str, list[Any]]] = []
 
     def select(self, cols: str) -> _FakeQuery:
         self._cols = cols
@@ -40,8 +41,17 @@ class _FakeQuery:
         self._filters.append((col, val))
         return self
 
+    def in_(self, col: str, vals: list[Any]) -> _FakeQuery:
+        self._in_filters.append((col, list(vals)))
+        return self
+
     def execute(self) -> SimpleNamespace:
-        matched = [r for r in self._rows if all(r.get(c) == v for c, v in self._filters)]
+        matched = [
+            r
+            for r in self._rows
+            if all(r.get(c) == v for c, v in self._filters)
+            and all(r.get(c) in vals for c, vals in self._in_filters)
+        ]
         if self._cols != "*":
             keep = [c.strip() for c in self._cols.split(",")]
             matched = [{k: r.get(k) for k in keep} for r in matched]
@@ -137,6 +147,41 @@ def test_data_json_covers_all_tables_with_rows() -> None:
     assert data["user_profiles"][0]["email"] == "j@example.com"
     assert data["experience_prose_docs"][0]["prose"] == "I led teams."
     assert data["job_feedback"][0]["reason"] == "too junior"
+
+
+def test_scores_pii_exported_for_user_targets_only() -> None:
+    """The shared ``scores`` catalog has no user_id; the export must include
+    the Phase-2 grader PII for the user's own targets and nothing else."""
+    sb = _FakeSupabase(
+        {
+            "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+            "user_targets": [{"user_id": _UID, "target_id": "t1"}],
+            "scores": [
+                {
+                    "target_id": "t1",
+                    "job_posting_id": "j1",
+                    "score": 80,
+                    "fit_reasoning": "Your FightCamp work (Lighthouse +40)",
+                    "axis_scores": {"skills_fit": 90},
+                    "logistics_filters": {"remote": True},
+                    "scoring_status": "complete",
+                    "updated_at": "2026-06-01T00:00:00+00:00",
+                },
+                {"target_id": "t2", "job_posting_id": "j1", "fit_reasoning": "not yours"},
+            ],
+        }
+    )
+    data = _data_json(build_export_zip(sb, user_id=_UID))
+    assert len(data["scores"]) == 1
+    row = data["scores"][0]
+    assert row["target_id"] == "t1"
+    assert row["fit_reasoning"] == "Your FightCamp work (Lighthouse +40)"
+    assert row["axis_scores"] == {"skills_fit": 90}
+
+
+def test_scores_absent_when_user_has_no_targets() -> None:
+    data = _data_json(build_export_zip(_seeded(), user_id=_UID))
+    assert data["scores"] == []
 
 
 def test_api_keys_exported_without_ciphertext() -> None:

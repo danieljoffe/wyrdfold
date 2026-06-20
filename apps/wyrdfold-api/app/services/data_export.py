@@ -6,7 +6,10 @@ Builds a single ZIP of everything a user has given us:
   keys are projected **without the ciphertext** (provider + ``last4``
   only); derived vector embeddings are omitted (they live in
   ``experience_chunks``, which cascades off the optimized doc and carries
-  no user-authored content).
+  no user-authored content). The shared ``scores`` catalog has no
+  ``user_id``, so only the rows for the user's targets are included,
+  projected to the Phase-2 grader fields derived from their resume — kept
+  in lockstep with the erasure scrub (``account_deletion``).
 * ``files/<bucket>/<name>`` — the original uploaded resumes and generated
   documents from both Storage buckets.
 * ``README.txt`` — a manifest with per-table row counts.
@@ -62,6 +65,16 @@ _EXPORT_TABLES: tuple[str, ...] = (
 # which keys are stored without exposing the secret material.
 _API_KEYS_PROJECTION = "provider, last4, created_at, updated_at, rotated_at"
 
+# scores has no ``user_id`` (shared catalog keyed by job+target); export
+# only the rows for the user's targets, projected to the personal Phase-2
+# grader fields (+ identifying keys). Mirrors the erasure scrub in
+# ``account_deletion._SCORE_PII_COLUMNS`` so export and deletion cover the
+# same personal data.
+_SCORE_EXPORT_COLUMNS = (
+    "job_posting_id, target_id, score, axis_scores, fit_reasoning, "
+    "logistics_filters, scoring_status, updated_at"
+)
+
 _STORAGE_BUCKETS: tuple[str, ...] = (
     resume_storage.STORAGE_BUCKET,
     tailored_storage.STORAGE_BUCKET,
@@ -91,7 +104,28 @@ def collect_user_data(supabase: Client, *, user_id: str) -> dict[str, list[dict[
         data["notifications_sent"] = _select_all(
             supabase, "notifications_sent", "user_profile_id", profile_id
         )
+
+    # scores has no user_id; pull the rows for the user's targets (already
+    # collected above) so the export carries the Phase-2 grader fields
+    # derived from this user's resume — in lockstep with the erasure scrub.
+    target_ids = [t["target_id"] for t in data["user_targets"] if t.get("target_id")]
+    data["scores"] = _scores_for_targets(supabase, target_ids)
     return data
+
+
+def _scores_for_targets(supabase: Client, target_ids: list[str]) -> list[dict[str, Any]]:
+    """Shared ``scores`` rows for the user's targets, projected to the
+    Phase-2 grader fields (+ identifying keys). Empty when the user has no
+    targets — never issues ``.in_([])``."""
+    if not target_ids:
+        return []
+    resp = (
+        supabase.table("scores")
+        .select(_SCORE_EXPORT_COLUMNS)
+        .in_("target_id", target_ids)
+        .execute()
+    )
+    return cast(list[dict[str, Any]], resp.data or [])
 
 
 # Storage ``list`` returns one page; the backend caps a page at this many
