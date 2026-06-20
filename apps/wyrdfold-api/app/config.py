@@ -107,6 +107,23 @@ class Settings(BaseSettings):
     url_health_concurrency: int = Field(default=10, ge=1, le=50)
     url_health_failure_threshold: int = Field(default=3, ge=1, le=10)
 
+    # Retention purge for append-only operational logs (#29 P3). OFF by
+    # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
+    # every row until an operator chooses a window. When on, the scheduler
+    # ticks every ``retention_purge_tick_hours`` and deletes rows older
+    # than the per-table window below. A window of 0 days means "keep
+    # indefinitely" (that table is skipped). External cron can call
+    # ``POST /admin/retention/purge`` instead of running APScheduler.
+    # See app/services/retention.py.
+    retention_purge_enabled: bool = False
+    retention_purge_tick_hours: int = Field(default=24, ge=1, le=720)
+    # llm_costs.created_at feeds the rolling budget windows (≤30d) and the
+    # cost/insights history, so the floor is a year; 0 = keep forever.
+    llm_costs_retention_days: int = Field(default=365, ge=0)
+    # notifications_sent.sent_at is the alert-dedup ledger; 180d is well
+    # past any posting's active life. 0 = keep forever.
+    notifications_sent_retention_days: int = Field(default=180, ge=0)
+
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
 

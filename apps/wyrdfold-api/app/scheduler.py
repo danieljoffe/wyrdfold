@@ -17,6 +17,7 @@ don't double-poll.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,7 @@ from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import
 from app.cache import job_list_cache
 from app.config import settings
 from app.services.poller import poll_due_sources
+from app.services.retention import purge_expired_records
 from app.services.url_health import run_url_health_check
 from app.supabase_pool import get_supabase_pool
 
@@ -72,15 +74,37 @@ async def _run_scheduled_url_health() -> None:
     try:
         client = get_supabase_pool()
         if client is None:
-            logger.warning(
-                "scheduled url_health skipped — supabase client not initialized"
-            )
+            logger.warning("scheduled url_health skipped — supabase client not initialized")
             return
         summary = await run_url_health_check(client)
         if summary["archived"] > 0:
             job_list_cache.invalidate()
     except Exception:
         logger.exception("scheduled url_health raised")
+
+
+async def _run_scheduled_retention_purge() -> None:
+    """Tick body — delete operational-log rows past their retention window.
+
+    Same defensive shape as ``_run_scheduled_poll``: pull the singleton
+    client, skip if uninitialized, never raise (APScheduler would swallow
+    it). The purge is synchronous (service-role supabase client), so it
+    runs in a worker thread to keep the event loop free.
+    """
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            logger.warning("scheduled retention purge skipped — supabase client not initialized")
+            return
+        report = await asyncio.to_thread(
+            purge_expired_records,
+            client,
+            llm_costs_days=settings.llm_costs_retention_days,
+            notifications_sent_days=settings.notifications_sent_retention_days,
+        )
+        logger.info("scheduled retention purge: %s", report)
+    except Exception:
+        logger.exception("scheduled retention purge raised")
 
 
 def build_scheduler(
@@ -111,18 +135,24 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
     Called from the FastAPI lifespan; the returned handle is what the
     lifespan must shut down on exit.
 
-    Two independent recurring jobs may run on the same scheduler:
+    Three independent recurring jobs may run on the same scheduler:
       - ``poll_due_sources`` — gated on ``POLL_SCHEDULER_ENABLED``
       - ``url_health_check`` — gated on ``URL_HEALTH_CHECK_ENABLED``
+      - ``retention_purge`` — gated on ``RETENTION_PURGE_ENABLED``
 
-    If both flags are off, no scheduler is started. If only one flag is on,
-    only that job is registered. Sharing one scheduler avoids two thread
-    pools competing in the same FastAPI process.
+    If all flags are off, no scheduler is started. If only some are on,
+    only those jobs are registered. Sharing one scheduler avoids multiple
+    thread pools competing in the same FastAPI process.
     """
-    if not (settings.poll_scheduler_enabled or settings.url_health_check_enabled):
+    if not (
+        settings.poll_scheduler_enabled
+        or settings.url_health_check_enabled
+        or settings.retention_purge_enabled
+    ):
         logger.info(
-            "schedulers disabled (set POLL_SCHEDULER_ENABLED=true or "
-            "URL_HEALTH_CHECK_ENABLED=true to enable)"
+            "schedulers disabled (set POLL_SCHEDULER_ENABLED=true, "
+            "URL_HEALTH_CHECK_ENABLED=true, or RETENTION_PURGE_ENABLED=true "
+            "to enable)"
         )
         return None
 
@@ -154,6 +184,20 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "url_health scheduler registered (tick every %d h)",
             settings.url_health_tick_hours,
+        )
+
+    if settings.retention_purge_enabled:
+        scheduler.add_job(
+            _run_scheduled_retention_purge,
+            IntervalTrigger(hours=settings.retention_purge_tick_hours),
+            id="retention_purge",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        logger.info(
+            "retention purge scheduler registered (tick every %d h)",
+            settings.retention_purge_tick_hours,
         )
 
     scheduler.start()
