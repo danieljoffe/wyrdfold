@@ -34,6 +34,7 @@ from app.models.targets import (
     JobTarget,
     MatchedSuggestions,
     MyTargetsSummaryListResponse,
+    NotificationThresholdsUpdate,
     ReferenceJDAdd,
     ReferenceJDsListResponse,
     ScoringProfile,
@@ -143,9 +144,7 @@ def _retro_score_existing_jobs(supabase: Client, target: JobTarget) -> int:
     return written
 
 
-def _require_user_owns_target(
-    supabase: Client, *, user_id: str | None, target_id: str
-) -> None:
+def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_id: str) -> None:
     """Raise 404 if a JWT caller is not linked to ``target_id``.
 
     Targets are a shared resource keyed only by the explicit ``user_targets``
@@ -173,15 +172,11 @@ async def _activate_pipeline(
     try:
         if needs_derive:
             # Step 1: derive profile + search keywords from label
-            crud.update(
-                supabase, target_id, TargetUpdate(activation_status="deriving")
-            )
+            crud.update(supabase, target_id, TargetUpdate(activation_status="deriving"))
             doc = optimized.get_latest(supabase, user_id=user_id)
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
-                crud.update(
-                    supabase, target_id, TargetUpdate(activation_status="error")
-                )
+                crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
                 return
 
             derived, result = await derive_profile_from_label(
@@ -216,9 +211,7 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        crud.update(
-            supabase, target_id, TargetUpdate(activation_status="polling")
-        )
+        crud.update(supabase, target_id, TargetUpdate(activation_status="polling"))
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: %d sources, %d new jobs",
@@ -235,23 +228,17 @@ async def _activate_pipeline(
         # database. ``score_title_and_upsert`` returns ``None`` (no row
         # written) when no keywords match, so this only creates rows where
         # the title actually scores against the new profile.
-        retro_scored = await asyncio.to_thread(
-            _retro_score_existing_jobs, supabase, target
-        )
+        retro_scored = await asyncio.to_thread(_retro_score_existing_jobs, supabase, target)
         logger.info(
             "Activation pipeline for target %s: retro-scored %d existing jobs",
             target_id,
             retro_scored,
         )
 
-        crud.update(
-            supabase, target_id, TargetUpdate(activation_status="ready")
-        )
+        crud.update(supabase, target_id, TargetUpdate(activation_status="ready"))
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
-        crud.update(
-            supabase, target_id, TargetUpdate(activation_status="error")
-        )
+        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
 
 
 # ---- Target CRUD -----------------------------------------------------------
@@ -396,9 +383,7 @@ async def suggest(
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
-    matched, result = await suggest_and_match(
-        supabase, llm, payload=doc.payload, user_id=user_id
-    )
+    matched, result = await suggest_and_match(supabase, llm, payload=doc.payload, user_id=user_id)
     cost_log.record(
         supabase,
         user_id=user_id,
@@ -565,9 +550,7 @@ async def activate_target(
         raise HTTPException(status_code=404, detail="Target not found")
 
     try:
-        crud.link_user_to_target(
-            supabase, user_id=user_id, target_id=target_id, is_active=True
-        )
+        crud.link_user_to_target(supabase, user_id=user_id, target_id=target_id, is_active=True)
     except crud.ActiveTargetLimitError as e:
         # 409 Conflict — the request was well-formed but conflicts with
         # current state (the user is already at the active-target cap).
@@ -587,9 +570,7 @@ async def activate_target(
         ) from e
     refreshed = crud.get(supabase, target_id) or target
 
-    background_tasks.add_task(
-        _activate_pipeline, supabase, llm, refreshed, user_id
-    )
+    background_tasks.add_task(_activate_pipeline, supabase, llm, refreshed, user_id)
     return refreshed
 
 
@@ -639,9 +620,7 @@ async def deactivate_target(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    crud.set_user_target_inactive(
-        supabase, user_id=user_id, target_id=target_id
-    )
+    crud.set_user_target_inactive(supabase, user_id=user_id, target_id=target_id)
     return crud.get(supabase, target_id) or target
 
 
@@ -724,15 +703,43 @@ async def undo_axis_weights(
     consecutive undos toggle back and forth — that's the intended
     contract (undo, then change-my-mind-and-redo).
     """
-    updated = crud.undo_user_target_axis_weights(
-        supabase, user_id=user_id, target_id=target_id
-    )
+    updated = crud.undo_user_target_axis_weights(supabase, user_id=user_id, target_id=target_id)
     if updated is None:
         raise HTTPException(
             status_code=404,
             detail="No user_targets row for (user, target).",
         )
     _invalidate_jobs_cache_for_target(target_id)
+    return updated
+
+
+@router.patch("/{target_id}/notification-thresholds", response_model=UserTarget)
+async def set_notification_thresholds(
+    target_id: str,
+    body: NotificationThresholdsUpdate,
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> UserTarget:
+    """Set this target's per-channel email/SMS score thresholds (#15).
+
+    Partial PATCH: only the channels included in the request body are
+    written, so editing one never clobbers the other. An explicit ``null``
+    resets that channel to the user-profile default (``notify.py`` reads
+    target → profile fallback); an omitted channel is left untouched.
+    Thresholds only gate which *new* matches alert; stored scores and the
+    jobs list are unaffected, so no cache invalidation is needed.
+    """
+    updated = crud.set_user_target_notification_thresholds(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        thresholds=cast(dict[str, int | None], body.model_dump(exclude_unset=True)),
+    )
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No user_targets row for (user, target). Link the target first.",
+        )
     return updated
 
 
@@ -769,9 +776,7 @@ async def link_target(
     fit_reasoning: str | None = None
     doc = optimized.get_latest(supabase, user_id=user_id)
     if doc is not None:
-        fit_result, result = await derive_fit_score(
-            llm, payload=doc.payload, target=target
-        )
+        fit_result, result = await derive_fit_score(llm, payload=doc.payload, target=target)
         cost_log.record(
             supabase,
             user_id=user_id,
@@ -829,9 +834,7 @@ async def derive_target_profile(
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
-    derived, result = await derive_profile_from_label(
-        llm, label=target.label, payload=doc.payload
-    )
+    derived, result = await derive_profile_from_label(llm, label=target.label, payload=doc.payload)
     cost_log.record(
         supabase,
         user_id=user_id,
@@ -976,10 +979,12 @@ async def create_target_from_posting(
     reference, and activates the target.
     """
     resp = await asyncio.to_thread(
-        lambda: supabase.table("jobs")
-        .select("id, title, description_html, absolute_url")
-        .eq("id", posting_id)
-        .execute()
+        lambda: (
+            supabase.table("jobs")
+            .select("id, title, description_html, absolute_url")
+            .eq("id", posting_id)
+            .execute()
+        )
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -997,9 +1002,7 @@ async def create_target_from_posting(
     jd_text = strip_html(description_html)
     if len(jd_text) >= 50:
         try:
-            derived, result = await derive_profile_from_jd(
-                llm, jd_text=jd_text, supabase=supabase
-            )
+            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
             cost_log.record(
                 supabase,
                 user_id=user_id,
@@ -1032,9 +1035,7 @@ async def create_target_from_posting(
                 ),
             )
         except Exception:
-            logger.exception(
-                "Profile derivation failed for posting %s", posting_id
-            )
+            logger.exception("Profile derivation failed for posting %s", posting_id)
 
     # Link the calling user to the new target (multi-user flow) so it
     # actually shows up in ``/targets/mine``. Without this insert, the
@@ -1049,9 +1050,7 @@ async def create_target_from_posting(
     # user identity to link.
     if user_id is not None:
         try:
-            crud.link_user_to_target(
-                supabase, user_id=user_id, target_id=target.id, is_active=True
-            )
+            crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=True)
         except crud.ActiveTargetLimitError as e:
             raise HTTPException(
                 status_code=409,
@@ -1097,9 +1096,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
     try:
         assert_safe_host(hostname)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=422, detail=f"Refusing to fetch JD URL: {exc}"
-        ) from exc
+        raise HTTPException(status_code=422, detail=f"Refusing to fetch JD URL: {exc}") from exc
 
     # Size-capped streaming fetch — without this, a user-pasted URL
     # pointing to a huge payload could OOM the API (the shared
@@ -1107,9 +1104,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
     try:
         # validate_host gates every redirect hop (not just the first/final
         # URL) before connecting — closes the SSRF redirect gap (#110).
-        resp, body_bytes = await get_with_size_cap(
-            url, validate_host=assert_safe_host
-        )
+        resp, body_bytes = await get_with_size_cap(url, validate_host=assert_safe_host)
         final_url = str(resp.url)
     except ResponseTooLargeError as exc:
         raise HTTPException(
@@ -1135,11 +1130,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
 
     # The stream was consumed by ``get_with_size_cap`` so ``resp.text``
     # is empty here; decode the bytes the helper returned.
-    html = (
-        body_bytes.decode("utf-8", errors="replace")
-        if resp.status_code == 200
-        else ""
-    )
+    html = body_bytes.decode("utf-8", errors="replace") if resp.status_code == 200 else ""
     extraction: ExtractionResult
     if html:
         extraction = extract_job_from_html(html, final_url)
@@ -1206,15 +1197,11 @@ async def add_reference_jd(
     # If no jd_text, fetch + extract from the URL
     if not body.jd_text:
         if not body.jd_url:
-            raise HTTPException(
-                status_code=422, detail="Either jd_text or jd_url is required"
-            )
+            raise HTTPException(status_code=422, detail="Either jd_text or jd_url is required")
         _, body.jd_text = await _fetch_jd_from_url(body.jd_url)
 
     # Derive profile from JD via LLM (cached by content hash + prompt version)
-    derived, result = await derive_profile_from_jd(
-        llm, jd_text=body.jd_text, supabase=supabase
-    )
+    derived, result = await derive_profile_from_jd(llm, jd_text=body.jd_text, supabase=supabase)
     cost_log.record(
         supabase,
         user_id=user_id,

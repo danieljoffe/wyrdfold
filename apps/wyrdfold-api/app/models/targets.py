@@ -136,8 +136,26 @@ class UserTarget(BaseModel):
     # holds the one-step-back snapshot for the undo button.
     axis_weights: AxisWeights | None = None
     axis_weights_previous: AxisWeights | None = None
+    # Per-target notification thresholds (#15, columns from #178). NULL =
+    # fall back to the user-profile default for that channel (notify.py).
+    job_score_threshold: int | None = None
+    sms_score_threshold: int | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class NotificationThresholdsUpdate(BaseModel):
+    """Per-target email/SMS score thresholds (#15).
+
+    Each is the minimum score a new match must reach to alert on that
+    channel. The PATCH is a partial update: an *omitted* field leaves that
+    channel untouched, while an explicit ``null`` resets it to the
+    user-profile default (``user_profiles.{job,sms}_score_threshold``). The
+    UI can send one channel or both.
+    """
+
+    job_score_threshold: int | None = Field(default=None, ge=0, le=200)
+    sms_score_threshold: int | None = Field(default=None, ge=0, le=200)
 
 
 class TargetReferenceJD(BaseModel):
