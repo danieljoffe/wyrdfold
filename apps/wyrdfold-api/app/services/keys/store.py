@@ -39,12 +39,19 @@ def set_key(
     provider: Provider,
     plaintext: str,
     rotating: bool = False,
-) -> None:
-    """Encrypt + upsert a user's key for ``provider``.
+) -> UserApiKeyMeta:
+    """Encrypt + upsert a user's key for ``provider``; return its metadata.
 
     ``rotating=True`` stamps ``rotated_at`` (a re-entered key replacing an
     old one); a first-time set leaves it NULL. Upsert keys on
     ``(user_id, provider)`` so re-setting overwrites in place.
+
+    Returns the upserted row's non-secret :class:`UserApiKeyMeta` directly
+    from the write's ``RETURNING`` representation. Callers must NOT re-read
+    to build their response: a concurrent ``delete_key`` landing between
+    the write and a separate read would make that read come back empty and
+    spuriously 500 the request (found by P4 stress testing). The upsert's
+    own returned row is immune — it's the row this statement just wrote.
     """
     _validate_provider(provider)
     if not plaintext.strip():
@@ -61,7 +68,17 @@ def set_key(
     if rotating:
         row["rotated_at"] = now
 
-    supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
+    resp = (
+        supabase.table(TABLE)
+        .upsert(row, on_conflict="user_id,provider")
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        # PostgREST returns the upserted representation by default; an empty
+        # body means a misconfigured deployment, not a concurrency race.
+        raise RuntimeError("set_key: upsert returned no representation row")
+    return UserApiKeyMeta.model_validate(rows[0])
 
 
 def get_key(

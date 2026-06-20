@@ -219,6 +219,26 @@ def test_rotate_stamps_rotated_at() -> None:
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "new"
 
 
+def test_set_key_returns_upserted_meta() -> None:
+    # The router relies on this so it never re-reads to build its response
+    # (a concurrent delete could empty that read and spuriously 500 — found
+    # by P4 stress testing). set_key returns the upsert's own row metadata.
+    sb = _FakeSupabase()
+    meta = keys.set_key(
+        sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-abcd"
+    )
+    assert meta.provider == "openrouter"
+    assert meta.last4 == "abcd"
+    assert meta.rotated_at is None
+
+    rotated = keys.set_key(
+        sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-wxyz",
+        rotating=True,
+    )
+    assert rotated.last4 == "wxyz"
+    assert rotated.rotated_at is not None
+
+
 def test_delete_removes_row() -> None:
     sb = _FakeSupabase()
     keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="k")

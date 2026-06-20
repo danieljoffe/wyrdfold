@@ -96,30 +96,19 @@ def put_key(
             detail="Key must not be empty.",
         )
 
+    # Rotation is cosmetic (drives the "added vs rotated" date in the UI);
+    # this pre-read can race a concurrent set/delete but only mislabels,
+    # never errors. The key write + the returned metadata are one atomic
+    # upsert, so there's no read-back that a concurrent delete could defeat.
     existing = keys.list_key_meta(supabase, user_id=user_id)
     rotating = any(m.provider == provider for m in existing)
-    keys.set_key(
+    return keys.set_key(
         supabase,
         user_id=user_id,
         provider=provider,
         plaintext=key,
         rotating=rotating,
     )
-
-    meta = next(
-        (
-            m
-            for m in keys.list_key_meta(supabase, user_id=user_id)
-            if m.provider == provider
-        ),
-        None,
-    )
-    if meta is None:  # pragma: no cover - set succeeded but read-back missed
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Key saved but metadata read failed.",
-        )
-    return meta
 
 
 @router.delete("/{provider}")
