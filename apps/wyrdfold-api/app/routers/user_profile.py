@@ -14,7 +14,7 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from supabase import Client
 
 from app.config import settings
@@ -551,3 +551,31 @@ async def delete_account(
 
     report = await asyncio.to_thread(account_deletion.delete_account, supabase, user_id=user_id)
     return {"deleted": True, "report": report}
+
+
+@router.get("/export")
+async def export_account_data(
+    user_id: str = Depends(get_current_user_id),
+    supabase: Client = Depends(get_supabase),
+) -> Response:
+    """Personal-data export / portability (#29 P2).
+
+    Returns a ZIP with ``data.json`` (every per-user DB row; stored API-key
+    secrets redacted to provider + last4), ``files/`` (uploaded resumes +
+    generated documents), and a ``README.txt`` manifest. The export
+    inventory mirrors the deletion cascade, so "download everything" and
+    "delete everything" cover the same rows.
+
+    Uses the **service-role** client scoped by ``user_id`` (same model as
+    ``DELETE /account``); the router-level ``verify_supabase_jwt`` blocks
+    api-key callers, so only a logged-in user can export their own data.
+    """
+    from app.services import data_export
+
+    blob = await asyncio.to_thread(data_export.build_export_zip, supabase, user_id=user_id)
+    filename = f"wyrdfold-export-{user_id}.zip"
+    return Response(
+        content=blob,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
