@@ -66,6 +66,13 @@ export interface UserTarget {
   axis_weights: AxisWeights | null;
   /** One-step-back snapshot for the undo button. NULL = nothing to undo. */
   axis_weights_previous: AxisWeights | null;
+  /**
+   * Per-target email/SMS alert thresholds (#15). NULL = inherit the
+   * account-wide default from `user_profiles` (notify.py target→profile
+   * fallback). A number overrides the default for this target only.
+   */
+  job_score_threshold: number | null;
+  sms_score_threshold: number | null;
   created_at: string;
   updated_at: string;
 }

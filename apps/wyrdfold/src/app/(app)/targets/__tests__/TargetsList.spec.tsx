@@ -66,6 +66,10 @@ function makeEntry(
     is_active: true,
     fit_score: overrides.fit_score ?? null,
     fit_score_reasoning: null,
+    axis_weights: null,
+    axis_weights_previous: null,
+    job_score_threshold: null,
+    sms_score_threshold: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-04-30T00:00:00Z',
   };
