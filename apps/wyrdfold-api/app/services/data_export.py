@@ -94,8 +94,20 @@ def collect_user_data(supabase: Client, *, user_id: str) -> dict[str, list[dict[
     return data
 
 
+# Storage ``list`` returns one page; the backend caps a page at this many
+# objects, so we must page through ``offset`` to bundle them all. Matches
+# the page-walking that account_deletion.purge_user_objects relies on, so
+# "download everything" covers the same objects "delete everything" removes.
+_STORAGE_PAGE_SIZE = 100
+
+
 def _add_storage_files(zf: zipfile.ZipFile, supabase: Client, user_id: str) -> int:
     """Add every object under ``{user_id}/`` in both buckets to the zip.
+
+    Pages through the listing (``bucket.list`` returns at most
+    ``_STORAGE_PAGE_SIZE`` objects per call) so a user with more than one
+    page of files still gets all of them — otherwise the export would
+    silently truncate while account deletion still removes everything.
 
     A failing bucket is logged and skipped rather than aborting the whole
     export — a partial export still beats no export.
@@ -104,12 +116,21 @@ def _add_storage_files(zf: zipfile.ZipFile, supabase: Client, user_id: str) -> i
     for bucket_name in _STORAGE_BUCKETS:
         try:
             bucket = supabase.storage.from_(bucket_name)
-            listing = bucket.list(user_id) or []
-            for obj in listing:
-                name = obj["name"]
-                blob = bucket.download(f"{user_id}/{name}")
-                zf.writestr(f"files/{bucket_name}/{name}", blob)
-                count += 1
+            offset = 0
+            for _ in range(1000):  # safety bound: 1000 pages
+                listing = (
+                    bucket.list(user_id, {"limit": _STORAGE_PAGE_SIZE, "offset": offset}) or []
+                )
+                if not listing:
+                    break
+                for obj in listing:
+                    name = obj["name"]
+                    blob = bucket.download(f"{user_id}/{name}")
+                    zf.writestr(f"files/{bucket_name}/{name}", blob)
+                    count += 1
+                if len(listing) < _STORAGE_PAGE_SIZE:
+                    break
+                offset += len(listing)
         except Exception:
             logger.exception("data_export: bucket %s failed for user=%s", bucket_name, user_id)
     return count
