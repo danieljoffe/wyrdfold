@@ -49,11 +49,21 @@ class _FakeQuery:
 
 
 class _FakeBucket:
+    """Mimics storage3: ``list`` returns at most ``limit`` (default 100)
+    objects starting at ``offset`` — the same paging contract the real
+    client enforces, so the export's pagination loop is exercised."""
+
+    DEFAULT_LIMIT = 100
+
     def __init__(self, objects: dict[str, dict[str, bytes]]) -> None:
         self._objects = objects
 
-    def list(self, prefix: str) -> list[dict[str, str]]:
-        return [{"name": n} for n in self._objects.get(prefix, {})]
+    def list(self, prefix: str, options: dict[str, Any] | None = None) -> list[dict[str, str]]:
+        names = sorted(self._objects.get(prefix, {}))
+        opts = options or {}
+        limit = opts.get("limit", self.DEFAULT_LIMIT)
+        offset = opts.get("offset", 0)
+        return [{"name": n} for n in names[offset : offset + limit]]
 
     def download(self, path: str) -> bytes:
         prefix, name = path.split("/", 1)
@@ -158,6 +168,55 @@ def test_no_profile_skips_notifications_without_crashing() -> None:
     data = _data_json(build_export_zip(sb, user_id=_UID))
     assert "notifications_sent" not in data
     assert data["user_profiles"] == []
+
+
+def test_storage_export_pages_past_one_page() -> None:
+    """A user with >1 page of files must get ALL of them bundled.
+
+    Regression: ``bucket.list`` caps a page at 100 objects, so a single
+    un-paged call truncated the export to 100 while account deletion (which
+    walks pages) still removed everything — breaking the lockstep promise.
+    """
+    many = {f"resume-{i:03d}.pdf": f"BYTES-{i}".encode() for i in range(150)}
+    sb = _FakeSupabase(
+        {"user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}]},
+        {"resume-uploads": {_UID: many}, "tailored-resumes": {}},
+    )
+    zf = _open(build_export_zip(sb, user_id=_UID))
+    bundled = [n for n in zf.namelist() if n.startswith("files/resume-uploads/")]
+    assert len(bundled) == 150
+    # Every distinct object made it (no overwrite/dupe from offset reuse).
+    assert len(set(bundled)) == 150
+    assert zf.read("files/resume-uploads/resume-149.pdf") == b"BYTES-149"
+
+
+def test_readme_file_count_matches_bundled_files() -> None:
+    """The README manifest must not under-report when paging kicks in."""
+    many = {f"r-{i:03d}.pdf": f"B{i}".encode() for i in range(150)}
+    sb = _FakeSupabase(
+        {"user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}]},
+        {"resume-uploads": {_UID: many}, "tailored-resumes": {}},
+    )
+    zf = _open(build_export_zip(sb, user_id=_UID))
+    bundled = len([n for n in zf.namelist() if n.startswith("files/")])
+    readme = zf.read("README.txt").decode()
+    files_line = next(ln for ln in readme.splitlines() if ln.startswith("Files:"))
+    assert int(files_line.split(":", 1)[1].strip()) == bundled == 150
+
+
+def test_same_filename_in_both_buckets_does_not_collide() -> None:
+    """Identical object names in each bucket both survive (namespaced by
+    ``files/<bucket>/``)."""
+    sb = _FakeSupabase(
+        {"user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}]},
+        {
+            "resume-uploads": {_UID: {"doc.pdf": b"FROM-UPLOADS"}},
+            "tailored-resumes": {_UID: {"doc.pdf": b"FROM-TAILORED"}},
+        },
+    )
+    zf = _open(build_export_zip(sb, user_id=_UID))
+    assert zf.read("files/resume-uploads/doc.pdf") == b"FROM-UPLOADS"
+    assert zf.read("files/tailored-resumes/doc.pdf") == b"FROM-TAILORED"
 
 
 def test_export_endpoint_is_jwt_gated_and_streams_zip() -> None:
