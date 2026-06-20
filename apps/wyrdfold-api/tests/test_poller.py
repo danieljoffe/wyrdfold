@@ -567,7 +567,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two_job_fetch)
     monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
-    monkeypatch.setattr(poller_mod, "get_default_llm_client", lambda: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     # Permissive payer-budget gate — this test is about triage scoping,
@@ -730,7 +730,7 @@ async def test_phase1_triage_only_sees_free_gate_survivors(monkeypatch):
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_default_llm_client", lambda: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -794,7 +794,7 @@ async def test_phase1_verdicts_keyed_by_original_indices_after_free_gates(monkey
     )
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_default_llm_client", lambda: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -873,7 +873,7 @@ async def test_targeted_triage_only_sees_free_gate_survivors(monkeypatch):
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_default_llm_client", lambda: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     summary = await poller_mod._poll_one_source_for_target(
@@ -930,7 +930,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     fake_legacy = AsyncMock()
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_default_llm_client", lambda: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "get_latest_optimized", lambda _sb, _uid: doc)
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", MagicMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", MagicMock())
@@ -981,6 +981,56 @@ async def test_targeted_stage3_legacy_fallback_when_flag_off(monkeypatch):
     assert summary["error"] is None
     assert fake_legacy.await_count == 1
     fake_phase2.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_targeted_grading_uses_payer_byok_key(monkeypatch):
+    """#5 P3: background grading resolves the LLM client on the payer's own
+    OpenRouter key (``get_client(supabase, payer)``), not the instance key."""
+    from app.services import poller as poller_mod
+
+    supabase, fake_phase2, _fake_legacy, target = _wire_targeted_stage3(
+        monkeypatch, phase2_enabled=True
+    )
+    seen_payers: list[str | None] = []
+    monkeypatch.setattr(
+        poller_mod,
+        "get_llm_client",
+        lambda _sb, user_id: seen_payers.append(user_id) or MagicMock(),
+    )
+
+    summary = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+
+    assert summary["error"] is None
+    assert fake_phase2.await_count == 1
+    assert seen_payers == ["payer-1"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_grading_deferred_when_payer_has_no_byok_key(monkeypatch):
+    """#5 P3: hosted require-mode with no stored key → grading defers
+    gracefully (no exception, jobs still ingest, never billing the operator
+    key), exactly like the over-allowance defer."""
+    from app.services import poller as poller_mod
+    from app.services.llm import MissingUserKeyError
+
+    supabase, fake_phase2, _fake_legacy, target = _wire_targeted_stage3(
+        monkeypatch, phase2_enabled=True
+    )
+
+    def _no_key(_sb, _uid):
+        raise MissingUserKeyError("openrouter")
+
+    monkeypatch.setattr(poller_mod, "get_llm_client", _no_key)
+
+    summary = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+
+    assert summary["error"] is None  # graceful defer, not a poll failure
+    fake_phase2.assert_not_awaited()  # no grading on the operator's key
 
 
 # ---- adaptive cadence: last_candidate_at stamp ------------------------------

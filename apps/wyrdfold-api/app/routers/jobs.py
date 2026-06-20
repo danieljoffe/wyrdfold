@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
 from supabase import Client
 
@@ -38,6 +39,7 @@ from app.models.targets import AxisWeights
 from app.rate_limit import limiter
 from app.services.extract import (
     MANUAL_SOURCE_ID,
+    MANUAL_SOURCE_ROW,
     ExtractionResult,
     _extract_from_firecrawl,
     extract_job_from_html,
@@ -94,6 +96,24 @@ _JP_SELECT_COLS = (
 # UI can render the JD body in the detail panel; analysis/tailor flows
 # already read ``description_html`` directly off ``jobs``.
 _JP_DETAIL_SELECT_COLS = _JP_SELECT_COLS + ", description_html"
+
+
+def _ensure_manual_source(supabase: Client) -> None:
+    """Idempotently ensure the "manual" pseudo-source row exists.
+
+    Jobs added via POST /jobs/manual are filed under a fixed pseudo-source
+    (``MANUAL_SOURCE_ID``) to satisfy the NOT-NULL ``job_postings.source_id``
+    FK. A seed migration creates this row, but if it's ever missing (fresh DB
+    that skipped the seed, a manual wipe, etc.) the job upsert violates the FK
+    and 500s. This upserts the row first so the path self-heals.
+
+    ``on_conflict="id"`` makes it a no-op when the row already exists — the
+    common case — so this adds one cheap round-trip and never overwrites an
+    operator's edits to the row.
+    """
+    supabase.table("sources").upsert(
+        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
+    ).execute()
 
 
 def _tokenize_search(raw: str | None) -> list[str]:
@@ -1399,11 +1419,29 @@ async def add_manual_job(
         "salary_text": salary,
     }
 
-    resp_db = await asyncio.to_thread(
-        lambda: supabase.table("jobs")
-        .upsert(row, on_conflict="source_id,external_id")
-        .execute()
-    )
+    # Make sure the manual pseudo-source exists before inserting the job —
+    # otherwise the source_id FK fails. Wrap both writes so a DB/PostgREST
+    # error surfaces as a clean 502 instead of leaking the raw Postgres
+    # message (e.g. the FK-violation string) to the client.
+    try:
+
+        def _persist() -> Any:
+            _ensure_manual_source(supabase)
+            return (
+                supabase.table("jobs")
+                .upsert(row, on_conflict="source_id,external_id")
+                .execute()
+            )
+
+        resp_db = await asyncio.to_thread(_persist)
+    except APIError as exc:
+        logger.error(
+            "Manual job upsert failed for url=%s: %s", final_url, exc, exc_info=exc
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't save this job right now — please try again.",
+        ) from exc
 
     posting_id = None
     if resp_db.data:
