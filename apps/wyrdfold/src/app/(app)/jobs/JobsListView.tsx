@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import dynamic from 'next/dynamic';
 import { useAdminTableFetch } from '@/hooks/useAdminTableFetch';
+import { useToast } from '@/state/Toast/ToastProvider';
 import JobsFilter from './JobsFilter';
 import JobsListMobile from './JobsListMobile';
 import JobsTableSkeleton from './JobsTableSkeleton';
@@ -82,6 +83,7 @@ export default function JobsListView({
   onTableSortChange,
 }: JobsListViewProps) {
   const [deleteKey, setDeleteKey] = useState(0);
+  const { toast } = useToast();
   const isDesktop = useIsDesktop();
   // ``useIsDesktop`` returns the server snapshot (false) during the first
   // client render to avoid hydration mismatch, which forces a flash of
@@ -112,6 +114,7 @@ export default function JobsListView({
     data: postings,
     loading,
     loadingMore,
+    error,
     hasMore,
     loadMore,
     sort,
@@ -132,6 +135,11 @@ export default function JobsListView({
   useEffect(() => {
     onPostingsLoaded?.(postings);
   }, [postings, onPostingsLoaded]);
+
+  // Surface a load failure (was silently swallowed — list just looked empty).
+  useEffect(() => {
+    if (error) toast({ variant: 'error', title: error });
+  }, [error, toast]);
 
   function handleRefetch() {
     // Bump the cache-buster (``_r``) so ``buildUrl`` changes and the

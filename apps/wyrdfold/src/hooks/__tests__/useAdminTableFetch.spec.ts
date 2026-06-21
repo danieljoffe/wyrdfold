@@ -48,7 +48,8 @@ describe('useAdminTableFetch', () => {
     // A non-null next_cursor means there's another page.
     expect(result.current.hasMore).toBe(true);
     expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/test?')
+      expect.stringContaining('/api/test?'),
+      expect.objectContaining({ signal: expect.anything() })
     );
   });
 
@@ -171,5 +172,67 @@ describe('useAdminTableFetch', () => {
     });
 
     expect(mockFetch.mock.calls.length).toBe(callCount + 1);
+  });
+
+  // Regression for #195: rapidly changing the filter fires overlapping
+  // /api/jobs requests; a slow *stale* one must not resolve last and clobber
+  // the current result.
+  it('ignores a stale first-page response that resolves after a newer one', async () => {
+    const resolvers: Array<(r: Response) => void> = [];
+    mockFetch.mockImplementation(
+      () => new Promise<Response>(resolve => resolvers.push(resolve))
+    );
+
+    const { result, rerender } = renderHook(
+      (props: { extraParams: Record<string, string> }) =>
+        useAdminTableFetch({
+          ...defaultOptions,
+          extraParams: props.extraParams,
+        }),
+      { initialProps: { extraParams: { f: 'a' } } }
+    );
+
+    // First (stale) request in flight.
+    await waitFor(() => expect(resolvers).toHaveLength(1));
+
+    // Filter changes → second (fresh) request in flight.
+    rerender({ extraParams: { f: 'b' } });
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+
+    const stale = { items: [{ id: 'stale' }], next_cursor: null };
+    const fresh = { items: [{ id: 'fresh' }], next_cursor: null };
+
+    // Resolve the FRESH (2nd) request first, then the STALE (1st) one late.
+    await act(async () => {
+      resolvers[1]({ ok: true, json: async () => fresh } as Response);
+    });
+    await act(async () => {
+      resolvers[0]({ ok: true, json: async () => stale } as Response);
+    });
+
+    // The late stale response is dropped — fresh result stands.
+    expect(result.current.data).toEqual(fresh.items);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('sets error on a failed first page and clears it on a successful refetch', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: 'boom' }),
+    } as Response);
+
+    const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.error).toBe('Failed to load. Please try again.');
+    expect(result.current.data).toEqual([]);
+
+    // beforeEach's default mock resolves ok → refetch clears the error.
+    await act(async () => {
+      await result.current.refetch();
+    });
+
+    expect(result.current.error).toBeUndefined();
+    expect(result.current.data).toEqual(firstPage.items);
   });
 });
