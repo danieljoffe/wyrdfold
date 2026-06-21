@@ -64,9 +64,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_derive_target")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 _MODELS_TO_RUN: dict[str, str] = {
@@ -100,9 +98,7 @@ def _load_payload() -> OptimizedPayload:
     """
     fixture = cast(dict[str, Any], json.loads(_FIXTURE_PATH.read_text()))
     first_tid = next(iter(fixture["targets"]))
-    return OptimizedPayload.model_validate(
-        fixture["targets"][first_tid]["payload"]
-    )
+    return OptimizedPayload.model_validate(fixture["targets"][first_tid]["payload"])
 
 
 def _tokenise(s: str) -> set[str]:
@@ -146,8 +142,10 @@ async def _derive_one(
         system=SYSTEM_PROMPT,
         user=user_message,
         api_key=api_key,
-        # DerivedTarget JSON is ~800-1500 tokens — 2048 is comfortable.
-        max_tokens=2048,
+        # Verbose leadership roles (full scoring_profile + title pools +
+        # description) can exceed 2048 and truncate mid-JSON, which the eval
+        # previously mis-counted as a schema failure (#27). 4096 gives headroom.
+        max_tokens=4096,
     )
 
     parsed_ok = result.parsed is not None
@@ -158,9 +156,7 @@ async def _derive_one(
             derived = DerivedTarget.model_validate(result.parsed)
             schema_ok = True
         except Exception as exc:
-            result.error = (
-                f"{result.error or ''} schema_validation: {type(exc).__name__}"
-            ).strip()
+            result.error = (f"{result.error or ''} schema_validation: {type(exc).__name__}").strip()
 
     return {
         "label": label,
@@ -170,9 +166,7 @@ async def _derive_one(
         "schema_ok": schema_ok,
         "derived": result.parsed,  # raw dict — easier to diff than typed
         "derived_summary": {
-            "description_len": (
-                len(derived.description) if derived and derived.description else 0
-            ),
+            "description_len": (len(derived.description) if derived and derived.description else 0),
             "domain_hints": derived.domain_hints if derived else None,
             "search_keywords": derived.search_keywords if derived else None,
             "seniority_hint": derived.seniority_hint if derived else None,
@@ -197,11 +191,7 @@ async def _run(
     concurrency: int,
 ) -> list[dict[str, Any]]:
     sem = asyncio.Semaphore(concurrency)
-    jobs = [
-        (label, short, slug)
-        for label in labels
-        for short, slug in models.items()
-    ]
+    jobs = [(label, short, slug) for label in labels for short, slug in models.items()]
     total = len(jobs)
     logger.info("Total scheduled calls: %d", total)
 
@@ -220,9 +210,7 @@ async def _run(
     pending = {asyncio.create_task(_bounded(j)) for j in jobs}
     completed = 0
     while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             results.append(t.result())
             completed += 1
@@ -242,9 +230,7 @@ async def _run(
     return results
 
 
-def _report(
-    results: list[dict[str, Any]], *, baseline: str = "sonnet-4.6"
-) -> dict[str, Any]:
+def _report(results: list[dict[str, Any]], *, baseline: str = "sonnet-4.6") -> dict[str, Any]:
     """Per-label, per-model comparison vs baseline."""
     by_label: dict[str, dict[str, dict[str, Any]]] = {}
     for r in results:
@@ -286,9 +272,7 @@ def _report(
                     == base["derived_summary"]["seniority_hint"]
                 ),
                 "description_len": other["derived_summary"]["description_len"],
-                "baseline_description_len": base["derived_summary"][
-                    "description_len"
-                ],
+                "baseline_description_len": base["derived_summary"]["description_len"],
             }
         per_label_comparison.append(
             {
@@ -326,9 +310,7 @@ def _report(
             if c.get("hint_jaccard") is not None:
                 per_model[other_short]["hint_jaccards"].append(c["hint_jaccard"])
             if c.get("keyword_jaccard") is not None:
-                per_model[other_short]["keyword_jaccards"].append(
-                    c["keyword_jaccard"]
-                )
+                per_model[other_short]["keyword_jaccards"].append(c["keyword_jaccard"])
 
     summary: dict[str, dict[str, Any]] = {}
     for m, agg in per_model.items():
@@ -337,14 +319,10 @@ def _report(
         summary[m] = {
             "schema_ok": f"{agg['schema_ok_count']}/{agg['total']}",
             "total_cost_usd": round(agg["cost_usd"], 5),
-            "avg_latency_ms": int(
-                sum(agg["latency_ms"]) / max(1, len(agg["latency_ms"]))
-            ),
+            "avg_latency_ms": int(sum(agg["latency_ms"]) / max(1, len(agg["latency_ms"]))),
             "errors": agg["errors"],
             "mean_hint_jaccard": round(sum(hj) / len(hj), 4) if hj else None,
-            "mean_keyword_jaccard": (
-                round(sum(kj) / len(kj), 4) if kj else None
-            ),
+            "mean_keyword_jaccard": (round(sum(kj) / len(kj), 4) if kj else None),
         }
     return {
         "baseline": baseline,
@@ -397,24 +375,18 @@ def _write_report(
     md.append("")
     md.append("## Per-label comparison (Sonnet 4.5 vs Sonnet 4.6)")
     md.append("")
-    md.append(
-        "| Label | Hint Jaccard | Keyword Jaccard | Seniority match | Desc len (4.6 / 4.5) |"
-    )
+    md.append("| Label | Hint Jaccard | Keyword Jaccard | Seniority match | Desc len (4.6 / 4.5) |")
     md.append("| --- | --- | --- | --- | --- |")
     for entry in report["per_label"]:
         if not entry["baseline_ok"]:
-            md.append(
-                f"| {entry['label']} | baseline schema FAIL | — | — | — |"
-            )
+            md.append(f"| {entry['label']} | baseline schema FAIL | — | — | — |")
             continue
         comp = entry["comparisons"].get("sonnet-4.5")
         if not comp:
             md.append(f"| {entry['label']} | candidate missing | — | — | — |")
             continue
         if not comp.get("schema_ok"):
-            md.append(
-                f"| {entry['label']} | candidate schema FAIL | — | — | — |"
-            )
+            md.append(f"| {entry['label']} | candidate schema FAIL | — | — | — |")
             continue
         md.append(
             f"| {entry['label']} | {comp['hint_jaccard']} | "
@@ -439,11 +411,7 @@ def main() -> None:
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
-    base = (
-        Path(args.output)
-        if args.output
-        else (_RESULTS_DIR / f"eval_derive_target_{ts}")
-    )
+    base = Path(args.output) if args.output else (_RESULTS_DIR / f"eval_derive_target_{ts}")
     base.parent.mkdir(parents=True, exist_ok=True)
     inflight = base.with_suffix(".inflight.json")
 

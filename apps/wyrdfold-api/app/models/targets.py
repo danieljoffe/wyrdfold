@@ -7,9 +7,9 @@ while keeping the original intact for backward compatibility.
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---- Scoring Profile schema ------------------------------------------------
 
@@ -337,6 +337,12 @@ class ReferenceJDAdd(BaseModel):
 # ---- Suggestion shapes (LLM output) ----------------------------------------
 
 
+# Verbose leadership roles overshoot the prompt's 80-600 char target; the
+# field is truncated (not rejected) so a long paragraph never discards the
+# whole derivation. The DB column is unbounded TEXT. #27.
+_DERIVED_DESCRIPTION_MAX = 800
+
+
 class DerivedTarget(BaseModel):
     """LLM output: scoring profile + search keywords + few-shot title
     pools + slim shape fields derived from a target.
@@ -361,9 +367,41 @@ class DerivedTarget(BaseModel):
     # Slim shape — optional in the model so legacy LLM outputs that
     # don't include these fields still validate. The prompt asks for
     # them; reality may serve old-prompt cached responses for a while.
-    description: str | None = Field(default=None, max_length=800)
+    description: str | None = Field(default=None, max_length=_DERIVED_DESCRIPTION_MAX)
     seniority_hint: SeniorityHint | None = None
     domain_hints: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("seniority_hint", mode="before")
+    @classmethod
+    def _coerce_seniority_hint(cls, value: object) -> object:
+        """Safety net (#27): never let one out-of-vocabulary seniority value
+        reject the whole derived profile.
+
+        The prompt instructs the model to map title nomenclature onto the
+        closed ``SeniorityHint`` set, but this is a probabilistic generator
+        against a hard ``Literal`` — a stray value like "principal" or "lead"
+        would otherwise raise and discard the entire derivation. Normalize
+        case/whitespace and drop anything outside the set to None ("no hint"),
+        so Phase 2 degrades to label-only seniority grading instead of failing.
+        """
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized if normalized in get_args(SeniorityHint) else None
+        return value
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _truncate_description(cls, value: object) -> object:
+        """Truncate an over-long description instead of rejecting the whole
+        derivation (#27). The prompt asks for 80-600 chars, but verbose
+        leadership roles overshoot the cap; trim at a word boundary. Runs
+        before the ``max_length`` constraint so the trimmed value passes.
+        """
+        if isinstance(value, str) and len(value) > _DERIVED_DESCRIPTION_MAX:
+            truncated = value[: _DERIVED_DESCRIPTION_MAX - 1].rstrip()
+            head, sep, _tail = truncated.rpartition(" ")
+            return f"{head if sep else truncated}…"
+        return value
 
 
 class TargetSuggestion(BaseModel):
