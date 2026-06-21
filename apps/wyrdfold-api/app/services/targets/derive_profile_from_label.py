@@ -155,11 +155,14 @@ echo the label). Mention the flavor of work — operations-heavy? IC \
 craft? transformation-led? — and the kind of companies that hire for it. \
 Avoid vague phrases like "great team player". This feeds Phase 2's \
 ``## Target`` block in the fit-grading prompt, so concreteness pays off.
-- ``seniority_hint``: exactly one of ic, senior, staff, manager, \
-director, vp, c_level. Pick the level the user is targeting. This is \
-what Phase 2's seniority_fit axis grades against. Match the LABEL's \
-implied level when the user is on-track for it; pick the stretch \
-level when the user is clearly reaching.
+- ``seniority_hint``: MUST be EXACTLY one of these seven values — ic, \
+senior, staff, manager, director, vp, c_level — never any other word. \
+Map the title's nomenclature onto the closest one (Lead / Principal -> \
+staff, Sr -> senior, Head of -> director, EVP / SVP -> vp, Chief _ \
+Officer -> c_level). Pick the level the user is targeting: match the \
+LABEL's implied level when the user is on-track for it; pick the stretch \
+level when the user is clearly reaching. This is what Phase 2's \
+seniority_fit axis grades against.
 - ``domain_hints``: 3-6 industries / verticals / product types relevant \
 to this target (e.g. ["SaaS", "DTC", "healthtech"]). Empty array if the \
 target is genuinely domain-agnostic. This feeds Phase 2's domain_fit \
@@ -308,9 +311,12 @@ operations-heavy? IC craft? transformation-led? — and the kind of \
 companies that hire for it. Avoid vague phrases like "great team player". \
 This feeds Phase 2's ``## Target`` block in the fit-grading prompt, so \
 concreteness pays off.
-- ``seniority_hint``: exactly one of ic, senior, staff, manager, director, \
-vp, c_level. Pick the level the label implies. This is what Phase 2's \
-seniority_fit axis grades against.
+- ``seniority_hint``: MUST be EXACTLY one of these seven values — ic, \
+senior, staff, manager, director, vp, c_level — never any other word. \
+Map the title's nomenclature onto the closest one (Lead / Principal -> \
+staff, Sr -> senior, Head of -> director, EVP / SVP -> vp, Chief _ \
+Officer -> c_level). Pick the level the label implies. This is what \
+Phase 2's seniority_fit axis grades against.
 - ``domain_hints``: 3-6 industries / verticals / product types this role \
 commonly spans (e.g. ["SaaS", "DTC", "healthtech"]). Empty array if the \
 role is genuinely domain-agnostic. This feeds Phase 2's domain_fit axis — \
