@@ -18,3 +18,14 @@ A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
   residual risk.
 
 See also `CONTRIBUTING.md` → "Before opening a PR" and "Touching prompts or scoring code".
+
+## Repo & PR governance
+
+- **Base branch:** open PRs against `develop`, not `main`. `main` is release-only
+  (`develop` → `main`); `.github/workflows/pr-base-branch.yml` fails PRs opened
+  against `main` from anything but `develop` / `release/*` / `hotfix/*`.
+- **Sign automated comments.** `gh` posts as the repo owner, so when an agent
+  authors an issue/PR comment, sign it (e.g. "— Claude (Claude Code)") so it's
+  distinguishable from a human-authored one.
+- **Reading CI as an agent:** the default `GITHUB_TOKEN` 403s on Actions reads;
+  use `env -u GITHUB_TOKEN gh …` (keychain auth) to watch checks / read job logs.

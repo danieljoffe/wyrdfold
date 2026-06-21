@@ -1,0 +1,32 @@
+name: PR base branch
+
+# Governance (#197): PRs target `develop`, not `main`. `main` is release-only.
+# This only triggers for PRs whose BASE is `main` (on.pull_request.branches),
+# so it adds zero friction to the normal develop-targeted flow. The rule used
+# to live only in agent memory; this enforces it in-repo.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-base:
+    name: Require develop -> main
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check PR source branch
+        env:
+          HEAD: ${{ github.head_ref }} # via env, never inlined into the script
+        run: |
+          echo "PR: $HEAD -> main"
+          case "$HEAD" in
+            develop | release/* | hotfix/*)
+              echo "OK: release path into main." ;;
+            *)
+              echo "::error title=Wrong base branch::Open PRs against 'develop', not 'main'. 'main' is release-only (merge develop -> main, or a release/* | hotfix/* branch). Re-target this PR to develop — see CONTRIBUTING.md -> 'PR conventions'."
+              exit 1 ;;
+          esac

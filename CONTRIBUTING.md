@@ -96,6 +96,9 @@ there is fine.
 - **Tests**: every behavior change needs a regression test. The bar
   isn't 100% coverage — it's "if this regresses, what catches it?"
 - **One concern per PR.** A dep bump and a refactor go in separate PRs.
+- **Base branch**: open PRs against `develop`, not `main`. `main` is
+  release-only (`develop` → `main`); CI fails PRs opened against `main` from
+  anything but `develop` / `release/*` / `hotfix/*`.
 
 ## Touching prompts or scoring code
 

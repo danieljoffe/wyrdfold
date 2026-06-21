@@ -1,0 +1,20 @@
+{
+  "stack": ["python", "fastapi", "supabase-postgres", "nextjs"],
+  "paths": {
+    "code": ["apps/wyrdfold-api/app", "apps/wyrdfold/src"],
+    "migrations": ["supabase/migrations"],
+    "tests": [
+      "apps/wyrdfold-api/tests",
+      "apps/wyrdfold/src/**/__tests__",
+      "apps/wyrdfold-e2e/src"
+    ]
+  },
+  "outOfScope": [
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/*.lock",
+    "**/dist/**",
+    "**/.next/**"
+  ]
+}
