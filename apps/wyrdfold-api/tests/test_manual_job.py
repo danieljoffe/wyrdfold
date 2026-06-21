@@ -114,6 +114,63 @@ class TestManualJobEndpoint:
         assert row["score"] >= 0
 
     @pytest.mark.asyncio
+    async def test_manual_add_scores_through_gated_caller_client(self, monkeypatch):
+        """#6 R2 step 2: a JWT user's manual-add scores their target via the
+        gated RPCs on the caller's client, not a direct service-role write."""
+        _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML)
+
+        from datetime import UTC, datetime
+
+        from app.models.targets import JobTarget, ScoringProfile
+        from app.routers import jobs as jobs_router
+
+        target = JobTarget(
+            id="tgt-1",
+            label="X",
+            scoring_profile=ScoringProfile(),
+            is_active=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        monkeypatch.setattr(jobs_router, "get_active_for_user", lambda *_a, **_kw: [target])
+        monkeypatch.setattr(jobs_router, "update_global_score", lambda *_a, **_kw: None)
+
+        captured: dict[str, object] = {}
+
+        def fake_score(client, **kwargs):
+            captured["score_client"] = client
+            captured["gated"] = kwargs.get("gated")
+            return None
+
+        monkeypatch.setattr(jobs_router, "target_score_and_upsert", fake_score)
+
+        mock_service = MagicMock()
+        mock_service.table.return_value.upsert.return_value.execute = MagicMock(
+            return_value=MagicMock(data=[{"id": "posting-uuid-r2"}])
+        )
+        mock_caller = MagicMock()
+
+        from app.models.schemas import ManualJobRequest
+        from app.routers.jobs import add_manual_job
+
+        body = ManualJobRequest(url="https://example.com/jobs/r2")
+        result = await add_manual_job(
+            request=MagicMock(),
+            body=body,
+            user_id="user-a",
+            supabase=mock_service,
+            caller_supabase=mock_caller,
+        )
+
+        assert result.posting_id == "posting-uuid-r2"
+        # Per-target scoring ran on the caller's client, gated.
+        assert captured["score_client"] is mock_caller
+        assert captured["gated"] is True
+        # Force-include went through the gated RPC on the caller's client.
+        rpc_names = [c.args[0] for c in mock_caller.rpc.call_args_list]
+        assert "user_set_scores_included" in rpc_names
+
+    @pytest.mark.asyncio
     async def test_user_overrides(self, monkeypatch):
         # Page with OG tags, but user provides their own title
         _patch_size_cap_fetch(monkeypatch, text=OG_HTML)

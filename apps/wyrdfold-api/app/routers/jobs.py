@@ -21,6 +21,7 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -1278,6 +1279,11 @@ async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
     supabase: Client = Depends(get_supabase),
+    # #6 R2 step 2: the manual-add scores writes are gated through SECURITY
+    # DEFINER RPCs on the caller's client (user JWT → target ownership enforced
+    # in-DB; api-key/operator → service-role, exempt). Reads + the job insert
+    # stay on the service-role `supabase`.
+    caller_supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ManualJobResponse:
     """Add a job posting by URL. Extracts metadata via cascade."""
@@ -1469,12 +1475,13 @@ async def add_manual_job(
             *[
                 asyncio.to_thread(
                     target_score_and_upsert,
-                    supabase,
+                    caller_supabase,
                     job_posting_id=posting_id,
                     title=title,
                     description_html=description_html,
                     target=t,
                     parsed_jd=parsed,
+                    gated=True,
                 )
                 for t in active_targets
             ],
@@ -1512,11 +1519,13 @@ async def add_manual_job(
         if scored_target_ids:
             try:
                 await asyncio.to_thread(
-                    lambda: supabase.table("scores")
-                    .update({"excluded": False})
-                    .eq("job_posting_id", posting_id)
-                    .in_("target_id", scored_target_ids)
-                    .execute()
+                    lambda: caller_supabase.rpc(
+                        "user_set_scores_included",
+                        {
+                            "p_job_posting_id": posting_id,
+                            "p_target_ids": scored_target_ids,
+                        },
+                    ).execute()
                 )
             except Exception:
                 logger.exception(
