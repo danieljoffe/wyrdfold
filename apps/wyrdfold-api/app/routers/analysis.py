@@ -20,6 +20,7 @@ from app.dependencies import (
     get_llm_client,
     get_settings,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.models.analysis import JobAnalysisRecord
@@ -45,6 +46,11 @@ async def create_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
     supabase: Client = Depends(get_supabase),
+    # #6 R2: the scores-blend WRITE is gated through a SECURITY DEFINER RPC
+    # called on the caller's client (user JWT → ownership enforced in-DB;
+    # api-key/operator → service-role, exempt). Everything else stays on the
+    # service-role `supabase` (persist/cost_log hit SELECT-only tables).
+    caller_supabase: Client = Depends(get_supabase_for_caller),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
     s: Settings = Depends(get_settings),
@@ -91,6 +97,7 @@ async def create_analysis(
         await asyncio.to_thread(
             _apply_llm_blend,
             supabase,
+            caller_supabase,
             job_posting_id=job_id,
             target_id=target_id,
             scorecard=cached.scorecard,
@@ -180,6 +187,7 @@ async def create_analysis(
     await asyncio.to_thread(
         _apply_llm_blend,
         supabase,
+        caller_supabase,
         job_posting_id=job_id,
         target_id=target_id,
         scorecard=analysis.scorecard,
@@ -191,6 +199,7 @@ async def create_analysis(
 
 def _apply_llm_blend(
     supabase: Client,
+    caller_supabase: Client,
     *,
     job_posting_id: str,
     target_id: str,
@@ -199,9 +208,14 @@ def _apply_llm_blend(
 ) -> None:
     """Blend the LLM scorecard into the per-target ``scores`` row.
 
-    Reads the current keyword score, blends with the LLM numeric, writes
-    back score + scoring_status='complete'. Best-effort: failures are
-    swallowed so an LLM blend hiccup doesn't fail the user's request.
+    Reads the current keyword score (shared-readable), blends with the LLM
+    numeric, then writes back score + scoring_status='complete' via the
+    ``user_apply_score_blend`` SECURITY DEFINER RPC (#6 R2) on the caller's
+    client — Postgres re-checks that the caller follows ``target_id`` before
+    touching the shared row (a service-role/operator caller is exempt). The
+    Python ownership gate in ``create_analysis`` stays for the 404 UX; this is
+    the DB-level backstop. Best-effort: failures are swallowed so an LLM blend
+    hiccup doesn't fail the user's request.
     """
     try:
         cur_resp = (
@@ -216,19 +230,16 @@ def _apply_llm_blend(
         keyword_score = int(rows[0]["score"]) if rows else 0
         llm_score = scorecard_to_numeric(scorecard)
         blended = blend_scores(keyword_score, llm_score)
-        supabase.table("scores").update(
+        # Gated write: updates the shared (job, target) scores row + stamps
+        # jobs.llm_analysis_id behind an ownership check enforced in Postgres.
+        caller_supabase.rpc(
+            "user_apply_score_blend",
             {
-                "score": blended,
-                "scoring_status": "complete",
-            }
-        ).eq("job_posting_id", job_posting_id).eq(
-            "target_id", target_id
-        ).execute()
-        # Also stamp the analysis id on the jobs row so the poller's
-        # cache lookup (keyed on llm_analysis_id) can still hit on a
-        # future re-score without re-running the LLM.
-        supabase.table("jobs").update({"llm_analysis_id": analysis_id}).eq(
-            "id", job_posting_id
+                "p_job_posting_id": job_posting_id,
+                "p_target_id": target_id,
+                "p_score": blended,
+                "p_analysis_id": analysis_id,
+            },
         ).execute()
         # Invalidate the in-memory list cache so the new blended score
         # is reflected immediately. Without this the dashboard +
