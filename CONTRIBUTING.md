@@ -110,10 +110,23 @@ regression audit). If your change touches anything in:
 - `apps/wyrdfold-api/app/services/targets/derive_profile*.py`
 - `apps/wyrdfold-api/app/services/tailor/prompts*.py`
 
-…please run the relevant eval script in `apps/wyrdfold-api/scripts/`
-and attach a before/after summary to the PR. The eval scripts live in
-that directory; pick the one closest to the prompt you touched.
-Reviewers will ask for this if you don't volunteer it.
+…the **prompt-regression guard** (`apps/wyrdfold-api/tests/test_prompt_regression.py`)
+will fail CI. It pins every scoring/matching/generation system prompt, the
+per-purpose default model, and prompt-version markers into a golden snapshot
+(`tests/golden/llm_behavior_contract.txt`), so a prompt edit, model swap, or
+version bump can't merge silently. When it fails:
+
+1. **Re-run the relevant eval** in `apps/wyrdfold-api/scripts/` (pick the one
+   closest to the prompt you touched — they need an `OPENROUTER_API_KEY` and
+   cost real spend) and attach a before/after summary to the PR.
+2. **Regenerate the golden** so the change lands as an explicit, reviewable diff:
+   ```bash
+   cd apps/wyrdfold-api && UPDATE_PROMPT_GOLDENS=1 uv run pytest tests/test_prompt_regression.py
+   ```
+
+The guard is spend-free and runs in the normal `pytest` CI job — it pins the
+quality-bearing _inputs_ but does not measure quality itself; that's what the
+eval run in step 1 is for. Reviewers will still ask for the eval summary.
 
 ## Typography (system fonts only)
 
