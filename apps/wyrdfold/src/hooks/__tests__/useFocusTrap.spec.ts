@@ -142,42 +142,78 @@ describe('useFocusTrap', () => {
     expect(document.activeElement).toBe(lastButton);
   });
 
-  it('focuses previously focused element on Escape', () => {
+  // #196: focus must return to the trigger when the trap closes — by ANY path
+  // (the old code only attempted it on Escape, via an attribute nothing set).
+  it('restores focus to the previously-focused element on close', () => {
     container.innerHTML =
       '<button data-testid="first">First</button>' +
       '<button data-testid="last">Last</button>';
 
-    // Create an element outside the trap that was previously focused
-    const triggerButton = document.createElement('button');
-    triggerButton.setAttribute('data-previously-focused', '');
-    triggerButton.textContent = 'Trigger';
-    document.body.appendChild(triggerButton);
+    // The trigger holds focus before the trap opens.
+    const trigger = document.createElement('button');
+    trigger.textContent = 'Trigger';
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
 
     const { result, rerender } = renderHook(
       ({ isActive }) => useFocusTrap(isActive),
       { initialProps: { isActive: false } }
     );
-
     Object.defineProperty(result.current, 'current', {
       writable: true,
       value: container,
     });
 
+    // Open → focus moves into the trap.
+    rerender({ isActive: true });
+    expect(document.activeElement).toBe(
+      container.querySelector('[data-testid="first"]')
+    );
+
+    // Close (isActive flips false) → focus returns to the trigger.
+    rerender({ isActive: false });
+    expect(document.activeElement).toBe(trigger);
+
+    document.body.removeChild(trigger);
+  });
+
+  // #196: the focusable list is re-queried each Tab, so elements added after
+  // open (async modal content) are trapped too.
+  it('includes focusable elements added after activation when wrapping Tab', () => {
+    container.innerHTML = '<button data-testid="first">First</button>';
+
+    const { result, rerender } = renderHook(
+      ({ isActive }) => useFocusTrap(isActive),
+      { initialProps: { isActive: false } }
+    );
+    Object.defineProperty(result.current, 'current', {
+      writable: true,
+      value: container,
+    });
     rerender({ isActive: true });
 
-    // Press Escape
-    const escapeEvent = new KeyboardEvent('keydown', {
-      key: 'Escape',
-      bubbles: true,
-      cancelable: true,
-    });
-    document.dispatchEvent(escapeEvent);
+    // Add a second focusable AFTER activation.
+    const late = document.createElement('button');
+    late.setAttribute('data-testid', 'late');
+    container.appendChild(late);
 
-    expect(document.activeElement).toBe(triggerButton);
-    expect(triggerButton.hasAttribute('data-previously-focused')).toBe(false);
+    const first = container.querySelector(
+      '[data-testid="first"]'
+    ) as HTMLButtonElement;
 
-    // Clean up
-    document.body.removeChild(triggerButton);
+    // Tab from the newly-added last element wraps to first — only works if the
+    // list is re-queried (the old code captured it once at open, so `late`
+    // wasn't the known "last" and Tab wouldn't wrap).
+    late.focus();
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: 'Tab',
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+    expect(document.activeElement).toBe(first);
   });
 
   it('does nothing when there are no focusable elements', () => {
@@ -221,8 +257,9 @@ describe('useFocusTrap', () => {
     const keydownRemovals = removeSpy.mock.calls.filter(
       call => call[0] === 'keydown'
     );
-    // Two listeners: handleTabKey and handleEscapeKey
-    expect(keydownRemovals).toHaveLength(2);
+    // One listener now: handleTabKey. Escape-to-close lives in the consumer;
+    // focus restoration moved to the effect cleanup (runs on every close path).
+    expect(keydownRemovals).toHaveLength(1);
 
     removeSpy.mockRestore();
   });
