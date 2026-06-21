@@ -75,7 +75,13 @@ async def create_feedback(
     body: FeedbackCreate,
     background: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #79 R1: the foreground reads + the job_feedback upsert run through the
+    # caller's JWT so RLS is the backstop (job_feedback self-CRUD, user_targets
+    # self). The background learner keeps the service-role client — it writes
+    # the shared `targets` catalog and re-scores, which RLS denies to a user
+    # client.
+    supabase: Client = Depends(get_user_supabase),
+    service_supabase: Client = Depends(get_supabase),
 ) -> FeedbackCreateResponse:
     if not _job_exists(supabase, job_id):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -98,7 +104,7 @@ async def create_feedback(
     queued = body.signal == "irrelevant"
     if queued:
         background.add_task(
-            _safe_run_learner, supabase, user_id, body.target_id
+            _safe_run_learner, service_supabase, user_id, body.target_id
         )
 
     return FeedbackCreateResponse(feedback=row, queued_learn_run=queued)
@@ -109,7 +115,8 @@ async def remove_feedback(
     job_id: str,
     target_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #79 R1: delete through the caller's JWT (job_feedback self-DELETE RLS).
+    supabase: Client = Depends(get_user_supabase),
 ) -> None:
     delete_feedback(
         supabase,
@@ -194,7 +201,9 @@ def list_learning_log(
     ),
     limit: int = Query(50, ge=1, le=200),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #79 R1: read through the caller's JWT (target_learning_log self-SELECT
+    # RLS). The .eq("user_id") filter stays as belt-and-suspenders + 404 UX.
+    supabase: Client = Depends(get_user_supabase),
 ) -> list[TargetLearningLogRow]:
     if not _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
