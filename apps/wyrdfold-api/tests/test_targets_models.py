@@ -29,12 +29,8 @@ def test_scoring_profile_defaults():
 def test_scoring_profile_full():
     p = ScoringProfile(
         categories={
-            "core_skills": CategoryProfile(
-                keywords={"React": 3, "TypeScript": 3}, weight=2.0
-            ),
-            "secondary_skills": CategoryProfile(
-                keywords={"Node.js": 2}, weight=1.0
-            ),
+            "core_skills": CategoryProfile(keywords={"React": 3, "TypeScript": 3}, weight=2.0),
+            "secondary_skills": CategoryProfile(keywords={"Node.js": 2}, weight=1.0),
         },
         seniority=SeniorityProfile(level="senior", signals=["5+ years", "lead"]),
         domain=DomainProfile(signals=["fintech"], weight=0.5),
@@ -201,6 +197,44 @@ def test_derived_target_with_example_title_pools():
     d = DerivedTarget.model_validate(raw)
     assert len(d.example_promising_titles) == 2
     assert d.example_unpromising_titles == ["Senior Product Designer"]
+
+
+def test_derived_target_coerces_out_of_vocab_seniority_hint_to_none():
+    """#27 safety net: a seniority_hint outside the closed set must NOT reject
+    the whole derived profile — it degrades to None ("no hint")."""
+    from app.models.targets import DerivedTarget
+
+    # "principal" is not in SeniorityHint; old behaviour raised ValidationError
+    # and discarded the entire derivation.
+    d = DerivedTarget.model_validate(
+        {"scoring_profile": {"categories": {}}, "seniority_hint": "principal"}
+    )
+    assert d.seniority_hint is None
+
+    # A valid value (any case) is kept, normalized to lower-case.
+    d2 = DerivedTarget.model_validate(
+        {"scoring_profile": {"categories": {}}, "seniority_hint": "Staff"}
+    )
+    assert d2.seniority_hint == "staff"
+
+    # Absent / None stays None.
+    d3 = DerivedTarget.model_validate({"scoring_profile": {"categories": {}}})
+    assert d3.seniority_hint is None
+
+
+def test_derived_target_truncates_oversized_description():
+    """#27 safety net: a description over the cap is truncated, not rejected
+    (verbose leadership roles overshoot the prompt's 80-600 char target)."""
+    from app.models.targets import DerivedTarget
+
+    long_desc = ("word " * 250).strip()  # ~1250 chars, over the 800 cap
+    assert len(long_desc) > 800
+    d = DerivedTarget.model_validate(
+        {"scoring_profile": {"categories": {}}, "description": long_desc}
+    )
+    assert d.description is not None
+    assert len(d.description) <= 800
+    assert d.description.endswith("…")
 
 
 def test_target_update_passes_through_example_title_pools():
