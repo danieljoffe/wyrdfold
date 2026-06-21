@@ -59,9 +59,7 @@ def seeded_target_job(
                 # archived_at left NULL -> globally live.
             }
         ).execute()
-        service_client.table("targets").insert(
-            {"id": target_id, "label": "Test Target"}
-        ).execute()
+        service_client.table("targets").insert({"id": target_id, "label": "Test Target"}).execute()
         # Score links target -> job; score 50, not excluded -> shows in list.
         service_client.table("scores").insert(
             {
@@ -76,17 +74,13 @@ def seeded_target_job(
         ).execute()
         yield uid_a, target_id, posting_id
     finally:
-        service_client.table("user_targets").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("user_targets").delete().eq("target_id", target_id).execute()
         # source cascade -> jobs -> scores
         service_client.table("sources").delete().eq("id", source_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
-def _get_target_jobs(
-    client: Client, target_id: str, user_id: str | None
-) -> list[dict]:
+def _get_target_jobs(client: Client, target_id: str, user_id: str | None) -> list[dict]:
     resp = client.rpc(
         "get_target_jobs",
         {
@@ -98,7 +92,8 @@ def _get_target_jobs(
             "p_sort": "score",
             "p_ascending": False,
             "p_limit": 20,
-            "p_offset": 0,
+            "p_after_value": None,
+            "p_after_id": None,
             "p_user_id": user_id,
         },
     ).execute()
@@ -127,9 +122,9 @@ def test_globally_archived_job_is_excluded(
     uid_a, target_id, posting_id = seeded_target_job
 
     # Globally archive the job via the service client.
-    service_client.table("jobs").update(
-        {"archived_at": datetime.now(UTC).isoformat()}
-    ).eq("id", posting_id).execute()
+    service_client.table("jobs").update({"archived_at": datetime.now(UTC).isoformat()}).eq(
+        "id", posting_id
+    ).execute()
 
     rows = _get_target_jobs(service_client, target_id, uid_a)
     matched = [r for r in rows if r["id"] == posting_id]
