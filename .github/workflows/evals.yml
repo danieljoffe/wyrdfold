@@ -1,0 +1,89 @@
+name: Evals — LLM matching quality (on-demand)
+
+# Recurring eval cadence (#27), tier 2 of 3:
+#   1. Per-PR, automated, free: the prompt-regression guard in the Python CI
+#      job (tests/test_prompt_regression.py) — catches prompt/model drift.
+#   2. THIS workflow — on-demand (and optional monthly) schema + cross-model
+#      evals against a FABRICATED fixture (scripts/gen_sample_eval_set.py — no
+#      real user data), so it runs in CI without exposing PII. Spends only when
+#      triggered, and only if the OPENROUTER_API_KEY secret is set.
+#   3. Real-data quality baseline (incl. grading vs production gold) — a manual
+#      LOCAL runbook, apps/wyrdfold-api/scripts/EVALS.md, because it needs
+#      production PII + an Anthropic key. Never runs in CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      evals:
+        description: Which evals to run
+        type: choice
+        options: [both, phase1, derive]
+        default: both
+      models:
+        description: 'phase1 model subset (e.g. haiku-4.5,sonnet-4.6,deepseek-v3.2)'
+        type: string
+        default: ''
+  # Opt-in monthly cadence. Uncomment once the OPENROUTER_API_KEY secret is set
+  # and you accept the recurring spend (~$0.5/run).
+  # schedule:
+  #   - cron: '0 9 1 * *' # 09:00 UTC, 1st of the month
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    name: LLM evals (synthetic fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # scripts/_openrouter.py reads OPEN_ROUTER_API_KEY (underscored).
+      OPEN_ROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      EVALS: ${{ inputs.evals }}
+      MODELS: ${{ inputs.models }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Generate synthetic (PII-free) eval fixture
+        working-directory: apps/wyrdfold-api
+        run: uv run python scripts/gen_sample_eval_set.py
+
+      - name: Run evals
+        working-directory: apps/wyrdfold-api
+        run: |
+          set -euo pipefail
+          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+            echo "::warning title=Evals skipped::Set the OPENROUTER_API_KEY repository secret to run the spend-bearing evals."
+            exit 0
+          fi
+          run_phase1() { uv run python scripts/eval_phase1_triage.py ${MODELS:+--models "$MODELS"}; }
+          run_derive() { uv run python scripts/eval_derive_target.py; }
+          case "${EVALS:-both}" in
+            phase1) run_phase1 ;;
+            derive) run_derive ;;
+            *) run_phase1; run_derive ;;
+          esac
+
+      - name: Publish eval reports to the job summary
+        if: ${{ always() }}
+        working-directory: apps/wyrdfold-api
+        run: |
+          shopt -s nullglob
+          for f in scripts/eval_results/*.md; do
+            { echo "## $(basename "$f")"; cat "$f"; echo; } >> "$GITHUB_STEP_SUMMARY"
+          done
