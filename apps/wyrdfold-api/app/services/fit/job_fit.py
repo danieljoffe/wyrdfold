@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, Message, ModelId
@@ -63,6 +63,12 @@ class AxisScores(BaseModel):
     domain_fit: int = Field(ge=0, le=100)
 
 
+# Storage/UI nicety — keeps the job-detail reasoning block bounded. The DB
+# column (``scores.fit_reasoning``) is unbounded TEXT, so this is NOT a hard
+# limit: over-long reasoning is truncated, not rejected (see validator). #27.
+_REASONING_MAX_CHARS = 1500
+
+
 class JobFitResult(BaseModel):
     """LLM output: overall fit + axis breakdown + reasoning.
 
@@ -80,8 +86,25 @@ class JobFitResult(BaseModel):
 
     fit_score: int = Field(ge=0, le=100)
     axes: AxisScores
-    reasoning: str = Field(max_length=1500)
+    reasoning: str = Field(max_length=_REASONING_MAX_CHARS)
     logistics: LogisticsFilters | None = None
+
+    @field_validator("reasoning", mode="before")
+    @classmethod
+    def _truncate_reasoning(cls, value: object) -> object:
+        """Truncate an over-long reasoning instead of rejecting the grade.
+
+        The grader is told "2-3 sentences, longer if you must" and the
+        evidence-first rules push for detail, so it occasionally overruns the
+        cap. Losing the whole grade (score + axes) over a long string is the
+        worse outcome (#27) — trim at a word boundary, keep the grade. Runs
+        ``before`` the ``max_length`` constraint so the trimmed value passes.
+        """
+        if isinstance(value, str) and len(value) > _REASONING_MAX_CHARS:
+            truncated = value[: _REASONING_MAX_CHARS - 1].rstrip()
+            head, sep, _tail = truncated.rpartition(" ")
+            return f"{head if sep else truncated}…"
+        return value
 
 
 _SYSTEM_PROMPT = """\
@@ -246,9 +269,7 @@ def _split_user_message(
     if target.domain_hints:
         target_lines.append(f"Domain: {', '.join(target.domain_hints)}")
     elif target.scoring_profile.domain.signals:
-        target_lines.append(
-            f"Domain signals: {', '.join(target.scoring_profile.domain.signals)}"
-        )
+        target_lines.append(f"Domain signals: {', '.join(target.scoring_profile.domain.signals)}")
 
     if not has_slim:
         # Legacy fallback: dump the scoring_profile categories. Phase 2
@@ -258,13 +279,9 @@ def _split_user_message(
             for cat_name, cat in profile.categories.items():
                 if cat.keywords:
                     top_kws = list(cat.keywords.keys())[:10]
-                    target_lines.append(
-                        f"{cat_name} (weight {cat.weight}x): {', '.join(top_kws)}"
-                    )
+                    target_lines.append(f"{cat_name} (weight {cat.weight}x): {', '.join(top_kws)}")
         if profile.negative.keywords:
-            target_lines.append(
-                f"Negative keywords: {', '.join(profile.negative.keywords)}"
-            )
+            target_lines.append(f"Negative keywords: {', '.join(profile.negative.keywords)}")
     parts.append("\n".join(target_lines))
 
     # Job posting (last — cache-unfriendly, varies per call). Kept out
@@ -325,9 +342,7 @@ async def derive_job_fit(
     user_message = static_prefix + dynamic_suffix
 
     system_prompt = (
-        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM
-        if extract_logistics
-        else _SYSTEM_PROMPT
+        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM if extract_logistics else _SYSTEM_PROMPT
     )
 
     return await complete_json(
