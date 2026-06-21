@@ -86,9 +86,7 @@ class TestSchemas:
     def test_job_fit_result_round_trip(self) -> None:
         result = JobFitResult(
             fit_score=82,
-            axes=AxisScores(
-                title_fit=95, skills_fit=80, seniority_fit=85, domain_fit=70
-            ),
+            axes=AxisScores(title_fit=95, skills_fit=80, seniority_fit=85, domain_fit=70),
             reasoning="Title squarely matches; missing e-commerce domain.",
         )
         # Round-trip preserves both the overall score and the axes.
@@ -98,17 +96,30 @@ class TestSchemas:
         assert re.axes.title_fit == 95
         assert re.reasoning.startswith("Title squarely")
 
-    def test_job_fit_result_rejects_oversized_reasoning(self) -> None:
-        # Mirror the 1500-char cap on the existing target-level
-        # FitScoreResult — keeps the UI's reasoning block bounded.
-        with pytest.raises(ValidationError):
-            JobFitResult(
-                fit_score=50,
-                axes=AxisScores(
-                    title_fit=50, skills_fit=50, seniority_fit=50, domain_fit=50
-                ),
-                reasoning="x" * 1501,
-            )
+    def test_job_fit_result_truncates_oversized_reasoning(self) -> None:
+        # #27: an over-long reasoning must be TRUNCATED, not rejected — losing
+        # the whole grade (score + axes) over a long string is the worse
+        # outcome. The DB column is unbounded TEXT; the cap is a UI nicety.
+        long_reasoning = ("word " * 400).strip()  # ~2000 chars, word-separated
+        assert len(long_reasoning) > 1500
+        result = JobFitResult(
+            fit_score=50,
+            axes=AxisScores(title_fit=50, skills_fit=50, seniority_fit=50, domain_fit=50),
+            reasoning=long_reasoning,
+        )
+        assert len(result.reasoning) <= 1500
+        assert result.reasoning.startswith("word word")
+        assert result.reasoning.endswith("…")  # trimmed at a word boundary
+
+    def test_job_fit_result_keeps_in_bounds_reasoning_verbatim(self) -> None:
+        # Negative control: at/under the cap, the validator is a no-op.
+        reasoning = "x" * 1500
+        result = JobFitResult(
+            fit_score=50,
+            axes=AxisScores(title_fit=50, skills_fit=50, seniority_fit=50, domain_fit=50),
+            reasoning=reasoning,
+        )
+        assert result.reasoning == reasoning
 
     def test_job_fit_result_requires_axes(self) -> None:
         # Unlike the legacy FitScoreResult (no axes), the new shape
