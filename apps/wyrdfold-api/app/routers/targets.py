@@ -87,7 +87,7 @@ from app.services.targets.lateral_discovery import (
     suggest_lateral_targets,
 )
 from app.services.targets.match import suggest_and_match
-from app.services.targets.merge import merge_profiles
+from app.services.targets.merge import merge_reference_jds
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
 from app.services.validate import assert_safe_host, validate_job_url
 
@@ -1210,18 +1210,21 @@ async def add_reference_jd(
         metadata={"target_id": target_id, "jd_url": body.jd_url or ""},
     )
 
-    # Store the reference JD
+    # Store the reference JD, attributed to the contributing user so the
+    # merge can de-bias by contributor (#5 refinement layer).
     crud.add_reference_jd(
         supabase,
         target_id=target_id,
         jd_text=body.jd_text,
         jd_url=body.jd_url,
         extracted_profile=derived.scoring_profile,
+        user_id=user_id,
     )
 
-    # Merge all reference JD profiles into composite
+    # Merge all reference JD profiles into composite, de-biased by contributor
+    # (each user counts once regardless of how many JDs they've added).
     all_ref_jds = crud.list_reference_jds(supabase, target_id)
-    composite = merge_profiles([jd.extracted_profile for jd in all_ref_jds])
+    composite = merge_reference_jds(all_ref_jds)
 
     # Update target with merged profile + search keywords, bump version for re-scoring.
     # Example title pools come from the LATEST JD only — these are concrete
@@ -1268,14 +1271,19 @@ async def delete_reference_jd(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    deleted = crud.delete_reference_jd(supabase, ref_jd_id, target_id=target_id)
+    # A regular caller may only remove their OWN contribution; operators
+    # (user_id None) may remove any. A non-owner's delete matches no rows and
+    # returns 404 — without enumerating who contributed it.
+    deleted = crud.delete_reference_jd(
+        supabase, ref_jd_id, target_id=target_id, user_id=user_id
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
-    # Re-merge remaining profiles
+    # Re-merge remaining profiles, de-biased by contributor.
     remaining = crud.list_reference_jds(supabase, target_id)
     if remaining:
-        composite = merge_profiles([jd.extracted_profile for jd in remaining])
+        composite = merge_reference_jds(remaining)
     else:
         composite = ScoringProfile()
 

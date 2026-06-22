@@ -161,6 +161,10 @@ class NotificationThresholdsUpdate(BaseModel):
 class TargetReferenceJD(BaseModel):
     id: str
     target_id: str
+    # The user who contributed this JD. NULL for legacy rows and
+    # operator/system-seeded JDs, which the merge treats as one shared
+    # "system" contributor (#5 refinement layer / de-bias).
+    user_id: str | None = None
     jd_url: str | None = None
     jd_text: str
     extracted_profile: ScoringProfile

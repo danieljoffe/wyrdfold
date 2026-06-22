@@ -1,4 +1,9 @@
-"""Tests for scoring profile merge logic (#495)."""
+"""Tests for scoring profile merge logic (#495).
+
+The de-bias-by-contributor tests (#5 refinement layer) live at the bottom.
+"""
+
+from datetime import UTC, datetime
 
 from app.models.targets import (
     CategoryProfile,
@@ -6,8 +11,13 @@ from app.models.targets import (
     NegativeProfile,
     ScoringProfile,
     SeniorityProfile,
+    TargetReferenceJD,
 )
-from app.services.targets.merge import merge_profiles
+from app.services.targets.merge import (
+    merge_by_contributor,
+    merge_profiles,
+    merge_reference_jds,
+)
 
 
 def _profile(
@@ -154,3 +164,72 @@ def test_merge_negative_keeps_most_negative_weight():
     b = _profile(negative_weight=-15)
     result = merge_profiles([a, b])
     assert result.negative.weight == -15
+
+
+# ---- De-bias by contributor (#5 refinement layer) --------------------------
+
+
+def _ref_jd(user_id: str | None, profile: ScoringProfile) -> TargetReferenceJD:
+    return TargetReferenceJD(
+        id="00000000-0000-0000-0000-000000000000",
+        target_id="11111111-1111-1111-1111-111111111111",
+        user_id=user_id,
+        jd_url=None,
+        jd_text="x",
+        extracted_profile=profile,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_merge_by_contributor_single_contributor_matches_flat_merge():
+    """One contributor's JDs de-bias to the same thing as a flat merge."""
+    a = _profile(core={"React": 3}, seniority_level="staff")
+    b = _profile(core={"Vue": 1}, seniority_level="senior")
+    assert merge_by_contributor([[a, b]]) == merge_profiles([a, b])
+
+
+def test_merge_by_contributor_prolific_contributor_does_not_dominate_seniority():
+    """A user with 3 JDs shouldn't outvote two users with 1 each.
+
+    Flat merge sees levels [staff, staff, staff, senior, senior] -> mode staff.
+    De-biased sees one voice per contributor [staff, senior, senior] -> senior.
+    """
+    prolific = [_profile(seniority_level="staff") for _ in range(3)]
+    other1 = _profile(seniority_level="senior")
+    other2 = _profile(seniority_level="senior")
+
+    # The prolific user wins the naive (per-JD) merge...
+    assert merge_profiles([*prolific, other1, other2]).seniority.level == "staff"
+    # ...but de-bias gives each contributor one voice, so the majority wins.
+    debiased = merge_by_contributor([prolific, [other1], [other2]])
+    assert debiased.seniority.level == "senior"
+
+
+def test_merge_by_contributor_caps_category_weight_influence():
+    prolific = [_profile(core={"React": 3}, core_weight=2.0) for _ in range(3)]
+    other = _profile(core={"React": 3}, core_weight=1.0)
+
+    # Flat: avg(2, 2, 2, 1) = 1.75 — pulled toward the prolific contributor.
+    assert merge_profiles([*prolific, other]).categories["core_skills"].weight == 1.75
+    # De-biased: avg(2, 1) = 1.5 — each contributor counts once.
+    debiased = merge_by_contributor([prolific, [other]])
+    assert debiased.categories["core_skills"].weight == 1.5
+
+
+def test_merge_by_contributor_skips_empty_groups():
+    a = _profile(core={"React": 3})
+    assert merge_by_contributor([[a], []]) == merge_profiles([a])
+
+
+def test_merge_reference_jds_collapses_null_users_to_one_voice():
+    """Legacy/system JDs (NULL user_id) count as a single 'system' contributor."""
+    legacy = [_ref_jd(None, _profile(seniority_level="staff")) for _ in range(3)]
+    u1 = _ref_jd("user-1", _profile(seniority_level="senior"))
+    u2 = _ref_jd("user-2", _profile(seniority_level="senior"))
+
+    # 3 system JDs (one voice) + 2 distinct users -> [staff, senior, senior].
+    assert merge_reference_jds([*legacy, u1, u2]).seniority.level == "senior"
+
+
+def test_merge_reference_jds_empty():
+    assert merge_reference_jds([]) == ScoringProfile()
