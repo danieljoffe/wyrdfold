@@ -40,10 +40,6 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("phase2_fit.system", "app.services.fit.job_fit:_SYSTEM_PROMPT"),
     ("phase2_fit.logistics_addendum", "app.services.fit.job_fit:_LOGISTICS_PROMPT_ADDENDUM"),
     (
-        "derive_target_from_label.system",
-        "app.services.targets.derive_profile_from_label:SYSTEM_PROMPT",
-    ),
-    (
         "derive_target_from_label.generic",
         "app.services.targets.derive_profile_from_label:SYSTEM_PROMPT_GENERIC",
     ),

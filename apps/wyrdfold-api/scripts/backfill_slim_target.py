@@ -60,16 +60,10 @@ def _needs_backfill(target: JobTarget) -> bool:
     fill in whichever slim fields it's missing. ``derive_profile_from_label``
     is the same source of truth either way, so re-running is idempotent.
     """
-    return (
-        not target.description
-        or target.seniority_hint is None
-        or not target.domain_hints
-    )
+    return not target.description or target.seniority_hint is None or not target.domain_hints
 
 
-def _resolve_owner_payload(
-    supabase: Any, target_id: str
-) -> tuple[str | None, Any | None]:
+def _resolve_owner_payload(supabase: Any, target_id: str) -> tuple[str | None, Any | None]:
     """Find an active owner of the target + their latest optimized payload.
 
     The derivation prompt grounds the slim shape in the user's actual
@@ -90,9 +84,7 @@ def _resolve_owner_payload(
     return None, None
 
 
-async def backfill_target(
-    supabase: Any, target: JobTarget, llm: Any, *, dry_run: bool
-) -> bool:
+async def backfill_target(supabase: Any, target: JobTarget, llm: Any, *, dry_run: bool) -> bool:
     """Derive the slim fields for one target. Returns True if updated."""
     if not _needs_backfill(target):
         logger.info("  ✓ %s — already has full slim shape; skipping", target.label)
@@ -121,9 +113,7 @@ async def backfill_target(
         )
         return False
 
-    derived, result = await derive_profile_from_label(
-        llm, label=target.label, payload=payload
-    )
+    derived, result = await derive_profile_from_label(llm, label=target.label)
     cost_log.record(
         supabase,
         user_id=None,
@@ -162,9 +152,7 @@ async def backfill_target(
     return True
 
 
-async def backfill(
-    *, dry_run: bool, target_id: str | None
-) -> int:
+async def backfill(*, dry_run: bool, target_id: str | None) -> int:
     init_supabase()
     supabase = get_supabase_pool()
     if supabase is None:
@@ -178,9 +166,7 @@ async def backfill(
         return 0
 
     needs = [t for t in targets if _needs_backfill(t)]
-    logger.info(
-        "Found %d target(s); %d need slim backfill", len(targets), len(needs)
-    )
+    logger.info("Found %d target(s); %d need slim backfill", len(targets), len(needs))
     if not needs:
         return 0
 

@@ -180,7 +180,7 @@ async def _activate_pipeline(
                 return
 
             derived, result = await derive_profile_from_label(
-                llm, label=target.label, payload=doc.payload
+                llm, label=target.label
             )
             cost_log.record(
                 supabase,
@@ -834,7 +834,7 @@ async def derive_target_profile(
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
-    derived, result = await derive_profile_from_label(llm, label=target.label, payload=doc.payload)
+    derived, result = await derive_profile_from_label(llm, label=target.label)
     cost_log.record(
         supabase,
         user_id=user_id,

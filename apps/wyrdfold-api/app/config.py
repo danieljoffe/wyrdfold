@@ -172,17 +172,6 @@ class Settings(BaseSettings):
     # compare axis-score distributions before flipping in production.
     logistics_extraction_enabled: bool = False
 
-    # Résumé-free label derivation (#78 layer 1). When True,
-    # ``derive_profile_from_label`` builds the target's baseline
-    # ScoringProfile from the LABEL ALONE (the model's world-knowledge of
-    # what the role generally requires) instead of grounding it in the
-    # activating user's résumé. The résumé only ever feeds ``fit_score``
-    # (``targets/fit_score.py``), which is unchanged. This de-skews shared
-    # targets (no single user's experience stamped on everyone's rubric)
-    # and improves cold-start matching. It changes scoring behavior, so it
-    # ships FALSE: validate with the #27 eval pass before flipping on.
-    resume_free_label_derivation: bool = False
-
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""
     job_alert_secret: str = Field(default="", repr=False)
