@@ -48,16 +48,14 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 # Make scripts._openrouter importable.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.models.experience import OptimizedPayload
 from app.services.targets.derive_profile_from_label import (
-    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_GENERIC,
     DerivedTarget,
-    _build_user_message,
 )
 from scripts._openrouter import MODELS, call_model, get_api_key
 
@@ -89,18 +87,6 @@ _CANONICAL_LABELS: list[str] = [
 ]
 
 
-def _load_payload() -> OptimizedPayload:
-    """Pull the first target's OptimizedPayload from the eval fixture.
-
-    The slim derivation is user-conditional but we only need ONE consistent
-    user context to evaluate prompt-vs-model fidelity — varying the user
-    would conflate "model drift" with "user-shape drift".
-    """
-    fixture = cast(dict[str, Any], json.loads(_FIXTURE_PATH.read_text()))
-    first_tid = next(iter(fixture["targets"]))
-    return OptimizedPayload.model_validate(fixture["targets"][first_tid]["payload"])
-
-
 def _tokenise(s: str) -> set[str]:
     """Tokenise on word boundaries, lowercase. Used for Jaccard."""
     return {t.lower() for t in re.findall(r"[a-zA-Z0-9]+", s or "")}
@@ -129,17 +115,15 @@ def _jaccard(a: list[str], b: list[str]) -> float:
 async def _derive_one(
     *,
     label: str,
-    payload: OptimizedPayload,
     model_short: str,
     model_slug: str,
     api_key: str,
 ) -> dict[str, Any]:
-    user_context = _build_user_message(payload)
-    user_message = f"Target role: {label}\n\n{user_context}"
+    user_message = f"Target role: {label}"
 
     result = await call_model(
         model_slug=model_slug,
-        system=SYSTEM_PROMPT,
+        system=SYSTEM_PROMPT_GENERIC,
         user=user_message,
         api_key=api_key,
         # Verbose leadership roles (full scoring_profile + title pools +
@@ -183,7 +167,6 @@ async def _derive_one(
 
 async def _run(
     *,
-    payload: OptimizedPayload,
     labels: list[str],
     models: dict[str, str],
     api_key: str,
@@ -200,7 +183,6 @@ async def _run(
         async with sem:
             return await _derive_one(
                 label=label,
-                payload=payload,
                 model_short=short,
                 model_slug=slug,
                 api_key=api_key,
@@ -407,7 +389,6 @@ def main() -> None:
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    payload = _load_payload()
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
@@ -424,7 +405,6 @@ def main() -> None:
 
     results = asyncio.run(
         _run(
-            payload=payload,
             labels=_CANONICAL_LABELS,
             models=_MODELS_TO_RUN,
             api_key=api_key,

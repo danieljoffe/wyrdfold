@@ -144,7 +144,7 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
             _llm_result(),
         )
 
-    async def fake_derive_label(llm, *, label, payload):  # type: ignore[no-untyped-def]
+    async def fake_derive_label(llm, *, label):  # type: ignore[no-untyped-def]
         recorder.record("derive_from_label", label=label)
         return (
             DerivedTarget(
