@@ -24,18 +24,22 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.config import settings
 from app.models.feedback import FeedbackRow
 from app.models.learning import (
     CONFIDENCE_AUTO_APPLY,
     LearningRunResult,
     LearningStatus,
     ProfilePatch,
+    RescoreProjection,
     TargetLearningLogRow,
 )
 from app.models.llm import Message, ModelId
+from app.models.targets import ScoringProfile
 from app.services.feedback import _MIN_FEEDBACK_FOR_LEARN, _parse_row
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
+from app.services.targets.learning_projection import ScoredJobText, project_rescore
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +151,65 @@ def _fetch_job_titles(
     return {r["id"]: r.get("title", "?") for r in rows}
 
 
+def _fetch_recent_scored_jobs(
+    supabase: Client, target_id: str, limit: int
+) -> list[ScoredJobText]:
+    """The (title, description_html) of a target's most recently scored jobs.
+
+    Bounded by ``limit`` to keep the deterministic re-score projection cheap.
+    Returns [] when the target has no scores yet (a brand-new target), which
+    the caller treats as "nothing to project against".
+    """
+    score_resp = (
+        supabase.table("scores")
+        .select("job_posting_id")
+        .eq("target_id", target_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+    job_ids = [r["job_posting_id"] for r in score_rows if r.get("job_posting_id")]
+    if not job_ids:
+        return []
+    jobs_resp = (
+        supabase.table("jobs")
+        .select("id, title, description_html")
+        .in_("id", job_ids)
+        .execute()
+    )
+    job_rows = cast(list[dict[str, Any]], jobs_resp.data or [])
+    return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
+
+
+def _project_patch_impact(
+    supabase: Client,
+    target_id: str,
+    prev_profile: dict[str, Any],
+    next_profile: dict[str, Any],
+    search_keywords: list[str] | None,
+) -> RescoreProjection | None:
+    """Project how much a patch would move the target's existing scores.
+
+    Returns None when there are no scored jobs to project against — the caller
+    then applies without a learning-rate check (nothing to over-churn yet).
+    """
+    jobs = _fetch_recent_scored_jobs(
+        supabase, target_id, settings.learning_rescore_sample_size
+    )
+    if not jobs:
+        return None
+    return project_rescore(
+        ScoringProfile.model_validate(prev_profile or {}),
+        ScoringProfile.model_validate(next_profile or {}),
+        jobs,
+        search_keywords=search_keywords,
+        move_threshold=settings.learning_rescore_move_threshold,
+        max_moved_fraction=settings.learning_rescore_max_moved_fraction,
+        min_jobs=settings.learning_rescore_min_jobs,
+    )
+
+
 def _apply_patch_to_profile(
     profile: dict[str, Any], patch: ProfilePatch
 ) -> dict[str, Any]:
@@ -204,6 +267,7 @@ def _insert_log(
     patch: ProfilePatch,
     signals_consumed: int,
     applied_run_id: str | None,
+    projection: dict[str, Any] | None = None,
 ) -> TargetLearningLogRow:
     payload: dict[str, Any] = {
         "user_id": user_id,
@@ -216,6 +280,7 @@ def _insert_log(
         "rationale": patch.rationale,
         "signals_consumed": signals_consumed,
         "applied_run_id": applied_run_id,
+        "projection": projection,
     }
     resp = supabase.table(LEARNING_LOG_TABLE).insert(payload).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
@@ -333,6 +398,56 @@ async def run_llm_learner(
         )
         return LearningRunResult(log=log, applied=False)
 
+    # High confidence — but before auto-applying, project the patch over the
+    # target's recent scored jobs and stage it instead if it would churn an
+    # outlier share of the list (the learning-rate cap, #5 P4). Off-loaded to
+    # a thread: it fetches + deterministically re-scores up to N jobs.
+    search_keywords = cast(list[str] | None, target_row.get("search_keywords"))
+    projection = await asyncio.to_thread(
+        _project_patch_impact,
+        supabase,
+        target_id,
+        prev_profile,
+        next_profile,
+        search_keywords,
+    )
+    projection_json = projection.model_dump(mode="json") if projection else None
+
+    if projection is not None and projection.capped:
+        note = (
+            f"[auto-staged by the learning-rate cap: this patch would move "
+            f"{projection.jobs_moved}/{projection.jobs_considered} recent jobs "
+            f"by ≥{projection.move_threshold} pts, over the "
+            f"{projection.max_moved_fraction:.0%} cap] "
+        )
+        staged_patch = patch.model_copy(
+            update={"rationale": note + patch.rationale}
+        )
+        log = _insert_log(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            status="staged",
+            prev_profile=prev_profile,
+            next_profile=next_profile,
+            patch=staged_patch,
+            signals_consumed=len(feedback_ids),
+            applied_run_id=None,
+            projection=projection_json,
+        )
+        logger.info(
+            "LLM learner OUTLIER-staged for (user=%s, target=%s): conf=%.2f "
+            "but projected to move %d/%d jobs ≥%d pts (cap %.0f%%)",
+            user_id,
+            target_id,
+            patch.confidence,
+            projection.jobs_moved,
+            projection.jobs_considered,
+            projection.move_threshold,
+            projection.max_moved_fraction * 100,
+        )
+        return LearningRunResult(log=log, applied=False)
+
     # Apply
     new_version = cast(int, target_row.get("profile_version") or 1) + 1
     await asyncio.to_thread(
@@ -358,6 +473,7 @@ async def run_llm_learner(
         patch=patch,
         signals_consumed=len(feedback_ids),
         applied_run_id=run_id,
+        projection=projection_json,
     )
     _stamp_consumed_feedback(supabase, feedback_ids, run_id)
 
