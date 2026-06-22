@@ -99,6 +99,7 @@ def _parse_ref_jd(row: dict[str, Any]) -> TargetReferenceJD:
     return TargetReferenceJD(
         id=row["id"],
         target_id=row["target_id"],
+        user_id=row.get("user_id"),
         jd_url=row.get("jd_url"),
         jd_text=row["jd_text"],
         extracted_profile=ScoringProfile.model_validate(row.get("extracted_profile") or {}),
@@ -649,9 +650,11 @@ def add_reference_jd(
     jd_text: str,
     jd_url: str | None,
     extracted_profile: ScoringProfile,
+    user_id: str | None = None,
 ) -> TargetReferenceJD:
     row = {
         "target_id": target_id,
+        "user_id": user_id,
         "jd_text": jd_text,
         "jd_url": jd_url,
         "extracted_profile": extracted_profile.model_dump(),
@@ -674,15 +677,23 @@ def list_reference_jds(supabase: Client, target_id: str) -> list[TargetReference
     return [_parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def delete_reference_jd(supabase: Client, ref_jd_id: str, *, target_id: str) -> bool:
+def delete_reference_jd(
+    supabase: Client, ref_jd_id: str, *, target_id: str, user_id: str | None = None
+) -> bool:
     # target_id constrains the delete to the target the route already
     # ownership-checked — without it, any ref_jd_id across any target
     # would be deletable (IDOR, audit #24 F1).
-    resp = (
+    query = (
         supabase.table(REF_JDS_TABLE)
         .delete()
         .eq("id", ref_jd_id)
         .eq("target_id", target_id)
-        .execute()
     )
+    # A regular JWT caller may only remove their OWN contribution (#5
+    # refinement: "remove-your-own + re-merge", never hard-delete others').
+    # user_id is None only on the operator/api-key path, which the route's
+    # ownership guard also lets bypass — operators may remove any ref JD.
+    if user_id is not None:
+        query = query.eq("user_id", user_id)
+    resp = query.execute()
     return bool(resp.data)
