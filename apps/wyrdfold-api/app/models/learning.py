@@ -57,6 +57,25 @@ class ProfilePatch(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
 
 
+class RescoreProjection(BaseModel):
+    """How much a ``ProfilePatch`` would move the target's existing scores.
+
+    Computed deterministically (no LLM) by re-scoring the target's recent
+    scored jobs under the current vs patched profile (#5 P4). Drives the
+    learning-rate cap: a high-confidence patch whose ``capped`` is True is
+    staged for review instead of auto-applied. Stored on the learning-log row
+    for audit + threshold tuning.
+    """
+
+    jobs_considered: int = Field(ge=0)
+    jobs_moved: int = Field(ge=0)
+    moved_fraction: float = Field(ge=0.0, le=1.0)
+    max_abs_delta: int = Field(ge=0)
+    move_threshold: int
+    max_moved_fraction: float
+    capped: bool
+
+
 class TargetLearningLogRow(BaseModel):
     """One ``target_learning_log`` row as the API returns it."""
 
@@ -71,6 +90,9 @@ class TargetLearningLogRow(BaseModel):
     rationale: str | None = None
     signals_consumed: int
     applied_run_id: str | None = None
+    # The re-score projection that drove the apply/stage decision (#5 P4).
+    # NULL for empty patches, low-confidence stages, and pre-P4 rows.
+    projection: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 

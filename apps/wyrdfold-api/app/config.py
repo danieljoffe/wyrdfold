@@ -172,6 +172,27 @@ class Settings(BaseSettings):
     # compare axis-score distributions before flipping in production.
     logistics_extraction_enabled: bool = False
 
+    # Learner re-score projection / learning-rate cap (#5 P4). Before a
+    # high-confidence ``ProfilePatch`` auto-applies, the learner projects the
+    # patch over the target's recent scored jobs (deterministic keyword
+    # re-score) and stages it for review instead of applying when the
+    # projected churn is an outlier — so one learn run can't silently reshuffle
+    # the whole list. All four are tunable knobs.
+    #
+    # A job "moves" when its projected blended score changes by at least this
+    # many points (blend is 60% keyword / 40% LLM, so a keyword-only delta is
+    # scaled by 0.6 before comparison).
+    learning_rescore_move_threshold: int = Field(default=20, ge=1, le=100)
+    # The patch is an outlier (→ stage) when this fraction of considered jobs
+    # move by >= the threshold.
+    learning_rescore_max_moved_fraction: float = Field(default=0.30, ge=0.0, le=1.0)
+    # Cap how many recent scored jobs the projection re-scores (bounds cost).
+    learning_rescore_sample_size: int = Field(default=150, ge=1, le=2000)
+    # Don't apply the cap until the target has at least this many scored jobs —
+    # a brand-new target has too little signal to judge "outlier" against, and
+    # shouldn't have its first patches blocked.
+    learning_rescore_min_jobs: int = Field(default=10, ge=1, le=1000)
+
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""
     job_alert_secret: str = Field(default="", repr=False)
