@@ -67,6 +67,7 @@ def _upsert_score(
     scored_profile_version: int = 1,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
+    gated: bool = False,
 ) -> JobTargetScore:
     """Upsert a score row and return the parsed result.
 
@@ -103,13 +104,23 @@ def _upsert_score(
     if phase1_confidence is not None:
         row["phase1_confidence"] = phase1_confidence
     # Idempotent upsert (`on_conflict` matches the unique constraint), so
-    # retrying on a Supabase HTTP/2 stream drop is safe.
-    resp = execute_with_retry_sync(
-        supabase.table(TABLE)
-        .upsert(row, on_conflict="job_posting_id,target_id")
-        .execute,
-        label="scores upsert",
-    )
+    # retrying on a Supabase HTTP/2 stream drop is safe. When ``gated`` (the
+    # user-facing manual-add path, #6 R2), route through the user_upsert_score
+    # SECURITY DEFINER RPC on the caller's client so Postgres enforces target
+    # ownership; the poller keeps the direct service-role upsert.
+    resp: Any
+    if gated:
+        resp = execute_with_retry_sync(
+            supabase.rpc("user_upsert_score", {"p_row": row}).execute,
+            label="scores upsert (gated)",
+        )
+    else:
+        resp = execute_with_retry_sync(
+            supabase.table(TABLE)
+            .upsert(row, on_conflict="job_posting_id,target_id")
+            .execute,
+            label="scores upsert",
+        )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert scores row")
@@ -165,6 +176,7 @@ def score_and_upsert(
     excluded_by_prefilter: bool = False,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
+    gated: bool = False,
 ) -> JobTargetScore:
     """Stage 2: Score one job's full JD against one target and upsert.
 
@@ -204,6 +216,7 @@ def score_and_upsert(
         scored_profile_version=target.profile_version,
         promising=promising,
         phase1_confidence=phase1_confidence,
+        gated=gated,
     )
 
 

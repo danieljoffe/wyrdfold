@@ -158,3 +158,75 @@ def test_service_role_is_exempt(
     ).execute()
 
     assert _score(service_client, job_id, target_a) == 77
+
+
+# --- R2 step 2: manual-add scores write RPCs -------------------------------
+
+
+def _row(job_id: str, target_id: str, score: int) -> dict:
+    return {
+        "job_posting_id": job_id,
+        "target_id": target_id,
+        "score": score,
+        "score_breakdown": {},
+        "matched_keywords": [],
+        "excluded": False,
+        "scoring_status": "stage2",
+        "scored_profile_version": 1,
+        "recency_score": score,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
+def test_user_upsert_score_enforces_ownership(
+    seeded_for_blend: tuple[str, str, str, str, str, str],
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+) -> None:
+    uid_a, uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
+
+    # Follower upserts their own target's score.
+    user_client_factory(uid_a).rpc(
+        "user_upsert_score", {"p_row": _row(job_id, target_a, 70)}
+    ).execute()
+    assert _score(service_client, job_id, target_a) == 70
+
+    # Non-follower (B doesn't follow target_a) is rejected by the RPC.
+    with pytest.raises(APIError):
+        user_client_factory(uid_b).rpc(
+            "user_upsert_score", {"p_row": _row(job_id, target_a, 5)}
+        ).execute()
+    assert _score(service_client, job_id, target_a) == 70
+
+
+def test_user_set_scores_included_enforces_ownership(
+    seeded_for_blend: tuple[str, str, str, str, str, str],
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+) -> None:
+    uid_a, uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
+    service_client.table("scores").update({"excluded": True}).eq(
+        "job_posting_id", job_id
+    ).eq("target_id", target_a).execute()
+
+    # Non-follower can't force-include.
+    with pytest.raises(APIError):
+        user_client_factory(uid_b).rpc(
+            "user_set_scores_included",
+            {"p_job_posting_id": job_id, "p_target_ids": [target_a]},
+        ).execute()
+
+    # Follower can.
+    user_client_factory(uid_a).rpc(
+        "user_set_scores_included",
+        {"p_job_posting_id": job_id, "p_target_ids": [target_a]},
+    ).execute()
+    rows = (
+        service_client.table("scores")
+        .select("excluded")
+        .eq("job_posting_id", job_id)
+        .eq("target_id", target_a)
+        .execute()
+        .data
+    )
+    assert rows and rows[0]["excluded"] is False
