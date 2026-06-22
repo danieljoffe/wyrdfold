@@ -193,6 +193,11 @@ class Settings(BaseSettings):
     # shouldn't have its first patches blocked.
     learning_rescore_min_jobs: int = Field(default=10, ge=1, le=1000)
 
+    # Anonymous voting on reference-JD contributions (#5 P3). A contribution is
+    # suppressed from the shared-profile merge once its NET down-votes
+    # (down minus up) reach this quorum; re-merged without it.
+    contribution_downvote_quorum: int = Field(default=3, ge=1, le=100)
+
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""
     job_alert_secret: str = Field(default="", repr=False)

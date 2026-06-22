@@ -168,6 +168,9 @@ class TargetReferenceJD(BaseModel):
     jd_url: str | None = None
     jd_text: str
     extracted_profile: ScoringProfile
+    # Down-voted past the quorum → excluded from the shared-profile merge
+    # (#5 P3). The only surfaced signal of the otherwise-anonymous votes.
+    suppressed: bool = False
     created_at: datetime
 
 
@@ -336,6 +339,28 @@ class ReferenceJDAdd(BaseModel):
         if self.jd_text is not None and len(self.jd_text) < 50:
             raise ValueError("jd_text must be at least 50 characters")
         return self
+
+
+class ReferenceJDVote(BaseModel):
+    """Cast a vote on a reference-JD contribution (#5 P3).
+
+    ``-1`` down-votes, ``+1`` up-votes, ``0`` clears the caller's vote. Votes
+    are anonymous; the response surfaces only the caller's own vote and the
+    contribution's suppression outcome.
+    """
+
+    value: int = Field(ge=-1, le=1)
+
+
+class ContributionVoteResult(BaseModel):
+    """Outcome of a vote: the caller's recorded vote + the shared suppression
+    state. Deliberately omits the vote tally + voter identities (anonymous)."""
+
+    reference_jd_id: str
+    your_vote: int
+    suppressed: bool
+    # Set when the vote flipped suppression and the profile was re-merged.
+    profile_version: int | None = None
 
 
 # ---- Suggestion shapes (LLM output) ----------------------------------------

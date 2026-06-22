@@ -64,11 +64,15 @@ def merge_by_contributor(
 
 def merge_reference_jds(ref_jds: list[TargetReferenceJD]) -> ScoringProfile:
     """Merge a target's reference JDs into the shared profile, de-biased by
-    contributor. Groups by ``user_id`` (NULL → one shared "system" contributor)
-    in first-contributed order, then defers to :func:`merge_by_contributor`.
+    contributor. ``suppressed`` contributions (down-voted past the quorum, #5
+    P3) are excluded. Groups the rest by ``user_id`` (NULL → one shared
+    "system" contributor) in first-contributed order, then defers to
+    :func:`merge_by_contributor`.
     """
     by_contributor: dict[str, list[ScoringProfile]] = {}
     for jd in ref_jds:
+        if jd.suppressed:
+            continue
         key = jd.user_id or _SYSTEM_CONTRIBUTOR
         by_contributor.setdefault(key, []).append(jd.extracted_profile)
     return merge_by_contributor(list(by_contributor.values()))
