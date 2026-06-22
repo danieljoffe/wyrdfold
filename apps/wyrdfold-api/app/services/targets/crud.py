@@ -103,6 +103,7 @@ def _parse_ref_jd(row: dict[str, Any]) -> TargetReferenceJD:
         jd_url=row.get("jd_url"),
         jd_text=row["jd_text"],
         extracted_profile=ScoringProfile.model_validate(row.get("extracted_profile") or {}),
+        suppressed=bool(row.get("suppressed", False)),
         created_at=row["created_at"],
     )
 

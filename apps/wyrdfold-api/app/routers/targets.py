@@ -15,12 +15,14 @@ from postgrest.types import CountMethod
 from supabase import Client
 
 from app.cache import job_list_cache, jobs_cache_prefix
+from app.config import settings
 from app.dependencies import (
     enforce_llm_budget,
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
+    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -29,6 +31,7 @@ from app.models.diagnostics import TargetFunnelResponse
 from app.models.schemas import PollResult
 from app.models.targets import (
     AxisWeights,
+    ContributionVoteResult,
     CreateOrLinkResult,
     DeleteResponse,
     JobTarget,
@@ -37,6 +40,7 @@ from app.models.targets import (
     NotificationThresholdsUpdate,
     ReferenceJDAdd,
     ReferenceJDsListResponse,
+    ReferenceJDVote,
     ScoringProfile,
     TargetCreate,
     TargetFromManual,
@@ -65,7 +69,7 @@ from app.services.source_discovery import (
     run_discovery_for_target,
 )
 from app.services.target_scoring import score_title_and_upsert
-from app.services.targets import crud, from_input
+from app.services.targets import crud, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -1299,3 +1303,70 @@ async def delete_reference_jd(
     if updated is None:
         raise HTTPException(status_code=404, detail="Target not found")
     return updated
+
+
+@router.post(
+    "/{target_id}/reference-jds/{ref_jd_id}/vote",
+    response_model=ContributionVoteResult,
+)
+@limiter.limit("30/minute")
+async def vote_on_reference_jd(
+    request: Request,
+    target_id: str,
+    ref_jd_id: str,
+    body: ReferenceJDVote,
+    supabase: Client = Depends(get_supabase),
+    user_supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> ContributionVoteResult:
+    """Up/down-vote (or clear) a reference-JD contribution (#5 P3).
+
+    A target's followers moderate its contributions: once a contribution's net
+    down-votes reach the quorum it is suppressed from the shared-profile merge
+    and the profile is re-merged without it (and restored if up-votes later
+    rescue it). Votes are anonymous — only the caller's own vote and the
+    suppression outcome are returned, never the tally or who voted.
+    """
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+
+    # The contribution must belong to this target — no cross-target voting, and
+    # a 404 rather than leaking the existence of another target's JD.
+    if not any(j.id == ref_jd_id for j in crud.list_reference_jds(supabase, target_id)):
+        raise HTTPException(status_code=404, detail="Reference JD not found")
+
+    # The caller's vote goes through their RLS client (DB enforces own-row).
+    votes.set_user_vote(
+        user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
+    )
+
+    # Tally every vote (service-role) and reconcile the suppression flag.
+    suppressed, changed = votes.recompute_suppression(
+        supabase,
+        reference_jd_id=ref_jd_id,
+        quorum=settings.contribution_downvote_quorum,
+    )
+
+    profile_version: int | None = None
+    if changed:
+        # Suppression flipped — re-merge the shared profile over the now
+        # (un)suppressed set and bump the version so lazy re-scoring picks it up.
+        target = crud.get(supabase, target_id)
+        if target is not None:
+            composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
+            updated = crud.update(
+                supabase,
+                target_id,
+                TargetUpdate(
+                    scoring_profile=composite,
+                    profile_version=target.profile_version + 1,
+                ),
+            )
+            if updated is not None:
+                profile_version = updated.profile_version
+
+    return ContributionVoteResult(
+        reference_jd_id=ref_jd_id,
+        your_vote=body.value,
+        suppressed=suppressed,
+        profile_version=profile_version,
+    )

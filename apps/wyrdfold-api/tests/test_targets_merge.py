@@ -233,3 +233,21 @@ def test_merge_reference_jds_collapses_null_users_to_one_voice():
 
 def test_merge_reference_jds_empty():
     assert merge_reference_jds([]) == ScoringProfile()
+
+
+def test_merge_reference_jds_excludes_suppressed_contributions():
+    """A down-voted-past-quorum contribution (#5 P3) is dropped from the merge."""
+    kept = _ref_jd("user-1", _profile(core={"React": 3}))
+    suppressed = _ref_jd("user-2", _profile(core={"Vue": 3}))
+    suppressed.suppressed = True
+
+    result = merge_reference_jds([kept, suppressed])
+    # Only the kept contributor survives — "Vue" is gone entirely.
+    assert result == merge_profiles([kept.extracted_profile])
+    assert "Vue" not in result.categories.get("core_skills", CategoryProfile()).keywords
+
+
+def test_merge_reference_jds_all_suppressed_yields_empty():
+    a = _ref_jd("user-1", _profile(core={"React": 3}))
+    a.suppressed = True
+    assert merge_reference_jds([a]) == ScoringProfile()
