@@ -25,6 +25,20 @@ This buffer batches those writes:
 On flush failure the rows are re-queued so a transient Supabase outage
 doesn't drop spend data — the next tick will retry. Pair with
 provider-side spend alerts for a hard ceiling.
+
+Bounded memory
+--------------
+Re-queueing on every failed flush means a *sustained* Supabase write
+outage would otherwise grow ``_rows`` without bound until the process
+OOMs — and the rows are lost on restart anyway. To stay alive (and keep
+serving traffic) under that failure mode the buffer enforces a hard
+``max_rows`` ceiling, independent of ``max_size``: once full, the OLDEST
+buffered rows are evicted to make room (the budget guard cares most about
+recent spend) and the drop is logged. The bulk INSERT is also chunked
+into ``insert_batch_size`` slices so a single drained list of tens of
+thousands of rows can't blow out the statement size / request body —
+rows already committed in earlier chunks are never re-sent on a later
+chunk's failure, so chunking introduces no duplicate-write risk.
 """
 
 from __future__ import annotations
@@ -48,9 +62,22 @@ class CostLogBuffer:
         *,
         max_size: int = 100,
         flush_interval_s: float = 5.0,
+        max_rows: int = 10_000,
+        insert_batch_size: int = 500,
     ) -> None:
         self._max_size = max_size
         self._flush_interval_s = flush_interval_s
+        # Hard capacity ceiling, independent of ``max_size`` (which only
+        # gates the early-flush wakeup). Default 10k ≫ the 100-row
+        # early-flush threshold: ~hundreds of bytes/row → low single-digit
+        # MB worst case, so the process survives a sustained Supabase
+        # outage instead of OOMing. Past this, the oldest rows are dropped.
+        self._max_rows = max_rows
+        # Chunk size for the bulk INSERT so one drained list can't produce
+        # a single oversized statement / request body.
+        self._insert_batch_size = insert_batch_size
+        # Running count of rows dropped on overflow, for observability.
+        self._dropped = 0
         self._rows: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -70,12 +97,40 @@ class CostLogBuffer:
         with self._lock:
             return len(self._rows)
 
+    @property
+    def dropped(self) -> int:
+        """Total rows evicted on overflow since process start."""
+        with self._lock:
+            return self._dropped
+
     def enqueue(self, row: dict[str, Any]) -> None:
         """Add one row to the buffer. Thread-safe; safe to call from
-        sync code (e.g. inside `asyncio.to_thread`)."""
+        sync code (e.g. inside `asyncio.to_thread`).
+
+        If the buffer is already at its hard ``max_rows`` ceiling (a
+        sustained flush outage), the oldest row is evicted to bound
+        memory. The eviction is logged so the drop is never silent.
+        """
         with self._lock:
             self._rows.append(row)
+            dropped_now = 0
+            while len(self._rows) > self._max_rows:
+                # Drop oldest: the budget guard values recent spend most,
+                # and these rows are lost on restart regardless.
+                del self._rows[0]
+                self._dropped += 1
+                dropped_now += 1
+            total_dropped = self._dropped
             full = len(self._rows) >= self._max_size
+        if dropped_now:
+            _log.error(
+                "cost-log buffer at capacity (max_rows=%d); dropped %d oldest "
+                "row(s), %d total dropped this process. Supabase writes are "
+                "failing — check the DB and provider-side spend alerts.",
+                self._max_rows,
+                dropped_now,
+                total_dropped,
+            )
         if not full:
             return
         # The wakeup must be set from the loop's own thread —
@@ -98,30 +153,72 @@ class CostLogBuffer:
         return rows
 
     def _requeue(self, rows: list[dict[str, Any]]) -> None:
-        """Push failed rows back to the front so retries preserve order."""
+        """Push failed rows back to the front so retries preserve order.
+
+        Honors the hard ``max_rows`` ceiling: if the re-queued rows plus
+        whatever was enqueued during the flush exceed capacity, the
+        oldest rows are dropped (logged) so a flush failure can never
+        push the buffer past its bound.
+        """
+        dropped_now = 0
         with self._lock:
             self._rows = rows + self._rows
+            while len(self._rows) > self._max_rows:
+                del self._rows[0]
+                self._dropped += 1
+                dropped_now += 1
+            total_dropped = self._dropped
+        if dropped_now:
+            _log.error(
+                "cost-log buffer at capacity (max_rows=%d) on re-queue; "
+                "dropped %d oldest row(s), %d total dropped this process.",
+                self._max_rows,
+                dropped_now,
+                total_dropped,
+            )
 
     async def flush(self, supabase: Client) -> int:
-        """Drain the buffer and write the rows in a single INSERT.
+        """Drain the buffer and write the rows in chunked bulk INSERTs.
 
-        Returns the number of rows written. Re-queues on failure and
-        re-raises so the caller can decide whether to log/retry.
+        The drained list is sliced into ``insert_batch_size`` chunks so a
+        large backlog can't produce one oversized statement / request
+        body. Returns the number of rows written. On the first failing
+        chunk, the rows already committed in earlier chunks are dropped
+        (they're durably written) and only the failing chunk + the
+        remaining un-sent chunks are re-queued, then the error re-raises
+        so the caller can log/retry. This makes chunking duplicate-safe.
         """
         rows = self._drain()
         if not rows:
             return 0
-        try:
-            await asyncio.to_thread(
-                lambda: supabase.table(TABLE).insert(rows).execute()
-            )
-        except Exception:
-            self._requeue(rows)
-            _log.exception(
-                "cost-log buffer flush failed; re-queued %d row(s)", len(rows)
-            )
-            raise
-        return len(rows)
+
+        def _insert(batch_rows: list[dict[str, Any]]) -> None:
+            supabase.table(TABLE).insert(batch_rows).execute()
+
+        written = 0
+        batch = self._insert_batch_size
+        for start in range(0, len(rows), batch):
+            chunk = rows[start : start + batch]
+            try:
+                # Pass ``chunk`` as an argument (not a closure) so each
+                # iteration's slice is bound explicitly — no loop-variable
+                # capture, and mypy can infer the call's types.
+                await asyncio.to_thread(_insert, chunk)
+            except Exception:
+                # Only re-queue what hasn't been committed: this failing
+                # chunk plus everything after it. Earlier chunks are
+                # already in Postgres, so dropping them avoids duplicates.
+                remaining = rows[start:]
+                self._requeue(remaining)
+                _log.exception(
+                    "cost-log buffer flush failed after %d row(s); "
+                    "re-queued %d row(s)",
+                    written,
+                    len(remaining),
+                )
+                raise
+            written += len(chunk)
+        return written
 
     async def _run(self, supabase: Client) -> None:
         # `_wakeup` is created synchronously in `start` before this task

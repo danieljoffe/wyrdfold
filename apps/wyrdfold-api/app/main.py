@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -161,11 +162,19 @@ async def _rate_limit_exceeded_handler(
 app.add_middleware(SlowAPIMiddleware)
 
 
+_PROBE_PATHS = frozenset({"/health", "/ready"})
+
+
 class _HealthBypassTrustedHost(TrustedHostMiddleware):
-    """Skip host validation for infrastructure health probes."""
+    """Skip host validation for infrastructure health/readiness probes.
+
+    Railway's load balancer and the Docker HEALTHCHECK hit these by IP,
+    not by the public Host header, so they'd be rejected by the host
+    allowlist otherwise.
+    """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"] == "/health":
+        if scope["type"] == "http" and scope["path"] in _PROBE_PATHS:
             await self.app(scope, receive, send)
             return
         await super().__call__(scope, receive, send)
@@ -313,4 +322,61 @@ app.include_router(user_profile.router)
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Liveness probe. Pure: touches no dependency, never 503s while the
+    process is up. This is what the Railway healthcheck and the Docker
+    HEALTHCHECK target, deliberately — see ``/ready`` below for why."""
     return {"status": "ok"}
+
+
+# How long the readiness DB ping may take before we call the dependency
+# unhealthy. Kept short: a slow Supabase is a failing Supabase for the
+# purpose of "should the LB send this instance traffic?".
+_READY_PING_TIMEOUT_S = 3.0
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    """Readiness probe — checks the critical dependency (Supabase) cheaply.
+
+    Returns 200 only when the service-role Supabase client is configured
+    AND a lightweight ``SELECT ... LIMIT 1`` against the shared ``sources``
+    catalog round-trips within ``_READY_PING_TIMEOUT_S``. Otherwise 503.
+
+    Intended for load-balancer readiness gating and external monitoring,
+    NOT for the container restart healthcheck. ``/health`` (liveness)
+    stays the restart target on purpose:
+
+    A restart loop triggered by a transient Supabase blip would be
+    strictly worse than riding it out — the dependency is external, so
+    cycling the container doesn't fix it and only adds cold-start latency
+    on top of the outage. So we expose readiness for traffic gating /
+    alerting but leave liveness as the thing that decides "kill and
+    restart". See railway.toml and the Dockerfile HEALTHCHECK.
+
+    Wrapped in ``asyncio.to_thread`` because supabase-py is synchronous;
+    a bare ``.execute()`` here would block the event loop (repo #107
+    convention, enforced by
+    ``tests/test_no_blocking_supabase_in_async_handlers.py``).
+    """
+    supabase = get_supabase_pool()
+    if supabase is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependency": "supabase", "reason": "unconfigured"},
+        )
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: supabase.table("sources").select("id").limit(1).execute()
+            ),
+            timeout=_READY_PING_TIMEOUT_S,
+        )
+    except Exception as exc:
+        # Covers asyncio.TimeoutError (== TimeoutError in 3.11+) from the
+        # wait_for deadline and any transport/SDK error from the ping.
+        _log.warning("readiness check failed: %s: %s", type(exc).__name__, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependency": "supabase", "reason": "ping_failed"},
+        )
+    return JSONResponse(status_code=200, content={"status": "ready"})

@@ -222,3 +222,129 @@ async def test_stop_does_not_lose_rows_to_cancelled_error() -> None:
     # been called at least once.
     assert buf.pending == 0
     assert write_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Bounded memory: hard ``max_rows`` ceiling + chunked INSERT (audit #29 B)
+# ---------------------------------------------------------------------------
+
+
+def _failing_supabase() -> MagicMock:
+    """A supabase mock whose INSERT always raises — simulates a sustained
+    write outage so the buffer must re-queue every flush."""
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute.side_effect = Exception("db down")
+    return sb
+
+
+def test_enqueue_enforces_hard_ceiling_drop_oldest() -> None:
+    """Past ``max_rows``, ``enqueue`` evicts the OLDEST row so memory is
+    bounded. Without this guard ``_rows`` grows unbounded → OOM."""
+    buf = CostLogBuffer(max_size=2, flush_interval_s=60.0, max_rows=5)
+    for i in range(8):  # 3 more than the ceiling
+        buf.enqueue(_row(i))
+
+    assert buf.pending == 5
+    assert buf.dropped == 3
+    drained = buf._drain()
+    # Oldest three (0,1,2) dropped; newest five retained, in order.
+    assert [r["i"] for r in drained] == [3, 4, 5, 6, 7]
+
+
+def test_enqueue_overflow_is_logged(caplog) -> None:
+    """The drop must never be silent — operators need the signal."""
+    import logging
+
+    buf = CostLogBuffer(max_size=2, flush_interval_s=60.0, max_rows=3)
+    with caplog.at_level(logging.ERROR):
+        for i in range(5):
+            buf.enqueue(_row(i))
+
+    assert buf.dropped == 2
+    assert any("at capacity" in r.message for r in caplog.records)
+
+
+async def test_rows_never_exceed_ceiling_under_sustained_flush_failure() -> None:
+    """THE regression for the OOM finding: a sustained Supabase outage
+    makes every flush fail and re-queue, while new rows keep arriving.
+    ``_rows`` must stay capped at ``max_rows`` no matter how long it lasts.
+    """
+    buf = CostLogBuffer(max_size=10, flush_interval_s=60.0, max_rows=50)
+    sb = _failing_supabase()
+
+    for cycle in range(20):  # 20 outage cycles
+        for i in range(25):  # 25 new rows per cycle = 500 total enqueued
+            buf.enqueue(_row(cycle * 100 + i))
+        # Flush fails and re-queues; must not push us past the ceiling.
+        with pytest.raises(Exception, match="db down"):
+            await buf.flush(sb)
+        assert buf.pending <= 50, f"ceiling breached at cycle {cycle}: {buf.pending}"
+
+    assert buf.pending == 50
+    # 500 enqueued, only 50 can be held → 450 dropped.
+    assert buf.dropped == 450
+
+
+def test_requeue_honors_ceiling() -> None:
+    """A failed flush of a large drained batch combined with rows added
+    during the flush must not push ``_rows`` past the ceiling."""
+    buf = CostLogBuffer(max_size=100, flush_interval_s=60.0, max_rows=4)
+    # Simulate: 4 rows already buffered (added "during" the flush) ...
+    for i in range(100, 104):
+        buf.enqueue(_row(i))
+    assert buf.pending == 4
+    # ... and a flush of 3 rows fails and tries to push them to the front.
+    buf._requeue([_row(0), _row(1), _row(2)])
+    assert buf.pending == 4  # still capped
+
+
+async def test_flush_chunks_bulk_insert() -> None:
+    """A large drained list is written in bounded chunks, not one giant
+    INSERT — bounds statement / request-body size."""
+    buf = CostLogBuffer(max_size=10_000, flush_interval_s=60.0, insert_batch_size=100)
+    sb = _supabase_mock()
+
+    for i in range(250):
+        buf.enqueue(_row(i))
+
+    written = await buf.flush(sb)
+
+    assert written == 250
+    assert buf.pending == 0
+    insert = sb.table.return_value.insert
+    # 250 rows / 100 per chunk = 3 inserts (100, 100, 50).
+    assert insert.call_count == 3
+    chunk_sizes = [len(call.args[0]) for call in insert.call_args_list]
+    assert chunk_sizes == [100, 100, 50]
+
+
+async def test_chunked_flush_partial_failure_requeues_only_uncommitted() -> None:
+    """If chunk 3 fails, chunks 1-2 are already committed and must NOT be
+    re-queued (no duplicate writes); only the failing + remaining rows
+    come back, preserving order."""
+    buf = CostLogBuffer(max_size=10_000, flush_interval_s=60.0, insert_batch_size=2)
+    sb = MagicMock()
+
+    calls: list[list[dict[str, Any]]] = []
+
+    def _insert(rows: list[dict[str, Any]]) -> MagicMock:
+        calls.append(rows)
+        m = MagicMock()
+        # Fail on the 3rd chunk (rows 4,5).
+        if len(calls) == 3:
+            m.execute.side_effect = Exception("chunk boom")
+        else:
+            m.execute.return_value = MagicMock(data=[])
+        return m
+
+    sb.table.return_value.insert.side_effect = _insert
+
+    for i in range(6):  # 3 chunks of 2
+        buf.enqueue(_row(i))
+
+    with pytest.raises(Exception, match="chunk boom"):
+        await buf.flush(sb)
+
+    # First two chunks (rows 0-3) committed; only 4,5 re-queued in order.
+    remaining = buf._drain()
+    assert [r["i"] for r in remaining] == [4, 5]
