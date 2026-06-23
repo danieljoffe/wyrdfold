@@ -46,6 +46,53 @@ function buildCspValue(
   return cspHeader.replace(/\s{2,}/g, ' ').trim();
 }
 
+// A *stricter* sibling of the enforced policy, shipped as
+// `Content-Security-Policy-Report-Only` (audit #29, round 3 M1). Report-only is
+// never enforced — the browser evaluates it and *reports* violations but blocks
+// nothing — so it can't break the live app. Its job is to measure what a future
+// *tightening of the enforced policy* would catch, before we make that change.
+//
+// The enforced `buildCspValue` above already covers the M1 ask (a real
+// document-level CSP exists). The two deliberately-loose spots left in it are:
+//
+//   1. `style-src 'unsafe-inline'` — kept because Tailwind/Next emit inline
+//      styles. Here we drop `'unsafe-inline'` and switch to a nonce so reports
+//      reveal exactly which inline styles we'd have to nonce/refactor first.
+//   2. `script-src … https:` — a host fallback that `'strict-dynamic'` already
+//      neuters in supporting browsers. Here we drop `https:` to confirm nothing
+//      legitimately loads scripts from an arbitrary https host.
+//
+// Everything else mirrors the enforced policy so the report-only signal is about
+// *only* these two tightenings, not unrelated noise. Reusing the same per-request
+// `nonce` keeps Next's nonce-stamped <script>/<style> tags valid under both
+// headers. Flipping these tightenings into the enforced policy is a deliberate
+// follow-up, after the reports confirm they're safe.
+function buildReportOnlyCspValue(
+  request: NextRequest,
+  nonce: string,
+  extraConnectOrigins: string[] = []
+): string {
+  const cspHeader = `
+    default-src 'self';
+    script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${
+      !isProduction() ? ` 'unsafe-eval'` : ''
+    };
+    style-src 'self' 'nonce-${nonce}';
+    font-src 'self' https: data:;
+    object-src 'none';
+    base-uri 'self';
+    form-action 'self';
+    frame-ancestors 'none';${
+      request.nextUrl.protocol === 'https:'
+        ? `\n    upgrade-insecure-requests;`
+        : ''
+    }
+    connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
+    img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
+`;
+  return cspHeader.replace(/\s{2,}/g, ' ').trim();
+}
+
 export async function proxy(request: NextRequest) {
   const supabaseUrl = process.env['NEXT_PUBLIC_SUPABASE_URL'];
   const anonKey = process.env['NEXT_PUBLIC_SUPABASE_ANON_ID'];
@@ -66,6 +113,13 @@ export async function proxy(request: NextRequest) {
     }
   })();
   const cspValue = buildCspValue(
+    request,
+    nonce,
+    supabaseOrigin ? [supabaseOrigin] : []
+  );
+  // Non-enforcing companion policy (audit #29, round 3 M1). Set as
+  // `Content-Security-Policy-Report-Only` below — it only reports, never blocks.
+  const cspReportOnlyValue = buildReportOnlyCspValue(
     request,
     nonce,
     supabaseOrigin ? [supabaseOrigin] : []
@@ -105,6 +159,10 @@ export async function proxy(request: NextRequest) {
     const requestHeaders = new Headers(request.headers);
     requestHeaders.set('x-nonce', nonce);
     requestHeaders.set('Content-Security-Policy', cspValue);
+    requestHeaders.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
     return NextResponse.next({ request: { headers: requestHeaders } });
   };
 
@@ -146,6 +204,10 @@ export async function proxy(request: NextRequest) {
   // from 401-ing the moment the session crosses the JWT TTL.
   if (pathname.startsWith('/api/')) {
     supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
     return supabaseResponse;
   }
 
@@ -159,6 +221,10 @@ export async function proxy(request: NextRequest) {
       return NextResponse.redirect(url);
     }
     supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
     return supabaseResponse;
   }
 
@@ -170,6 +236,10 @@ export async function proxy(request: NextRequest) {
       return NextResponse.redirect(url);
     }
     supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
     return supabaseResponse;
   }
 
@@ -182,6 +252,10 @@ export async function proxy(request: NextRequest) {
   }
 
   supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+  supabaseResponse.headers.set(
+    'Content-Security-Policy-Report-Only',
+    cspReportOnlyValue
+  );
   return supabaseResponse;
 }
 
