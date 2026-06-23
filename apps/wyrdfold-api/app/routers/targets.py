@@ -169,31 +169,51 @@ def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_i
 async def _activate_pipeline(
     supabase: Client, llm: LLMClient, target: JobTarget, user_id: str
 ) -> None:
-    """Derive profile (if needed) then poll jobs for a target. Runs as BackgroundTask."""
+    """Derive profile (if needed) then poll jobs for a target. Runs as BackgroundTask.
+
+    Genuinely async (awaits the LLM derive + the poller), so it stays
+    ``async def`` and runs on the event loop. supabase-py is synchronous, so
+    each blocking ``crud``/``optimized`` round-trip is offloaded via
+    ``asyncio.to_thread`` to keep it off the loop. See #107.
+    """
     target_id = target.id
     needs_derive = not target.search_keywords or not target.scoring_profile.categories
 
     try:
         if needs_derive:
             # Step 1: derive profile + search keywords from label
-            crud.update(supabase, target_id, TargetUpdate(activation_status="deriving"))
-            doc = optimized.get_latest(supabase, user_id=user_id)
+            await asyncio.to_thread(
+                crud.update,
+                supabase,
+                target_id,
+                TargetUpdate(activation_status="deriving"),
+            )
+            doc = await asyncio.to_thread(
+                optimized.get_latest, supabase, user_id=user_id
+            )
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
-                crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+                await asyncio.to_thread(
+                    crud.update,
+                    supabase,
+                    target_id,
+                    TargetUpdate(activation_status="error"),
+                )
                 return
 
             derived, result = await derive_profile_from_label(
                 llm, label=target.label
             )
-            cost_log.record(
+            await asyncio.to_thread(
+                cost_log.record,
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_LABEL_PURPOSE,
                 result=result,
                 metadata={"target_id": target_id, "trigger": "activation"},
             )
-            updated = crud.update(
+            updated = await asyncio.to_thread(
+                crud.update,
                 supabase,
                 target_id,
                 TargetUpdate(
@@ -215,7 +235,12 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        crud.update(supabase, target_id, TargetUpdate(activation_status="polling"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="polling"),
+        )
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: %d sources, %d new jobs",
@@ -239,17 +264,28 @@ async def _activate_pipeline(
             retro_scored,
         )
 
-        crud.update(supabase, target_id, TargetUpdate(activation_status="ready"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="ready"),
+        )
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="error"),
+        )
 
 
 # ---- Target CRUD -----------------------------------------------------------
 
 
+# Sync `def`: blocking supabase write runs in the threadpool (#107).
 @router.post("", response_model=JobTarget, status_code=201)
-async def create_target(
+def create_target(
     body: TargetCreate,
     supabase: Client = Depends(get_supabase),
 ) -> JobTarget:
@@ -537,12 +573,16 @@ def update_target(
     return target
 
 
+# Sync `def` (not `async def`): the foreground body is blocking supabase work
+# (link + reads), so FastAPI runs it in its threadpool and keeps it off the
+# event loop. The async LLM/poll work runs after the response as the
+# ``_activate_pipeline`` BackgroundTask. See #107.
 @router.post(
     "/{target_id}/activate",
     response_model=JobTarget,
     dependencies=[Depends(enforce_llm_budget)],
 )
-async def activate_target(
+def activate_target(
     target_id: str,
     background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
@@ -614,8 +654,9 @@ async def discover_sources_for_target_endpoint(
     return await run_discovery_for_target(supabase, target)
 
 
+# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
 @router.post("/{target_id}/deactivate", response_model=JobTarget)
-async def deactivate_target(
+def deactivate_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -640,8 +681,10 @@ async def deactivate_target(
 #   snapshots, so undo recovers the prior custom weights.
 
 
+# Sync `def` (not `async def`): blocking supabase round-trips run in the
+# threadpool, keeping them off the event loop. See #107.
 @router.patch("/{target_id}/axis-weights", response_model=UserTarget)
-async def set_axis_weights(
+def set_axis_weights(
     target_id: str,
     weights: AxisWeights,
     supabase: Client = Depends(get_supabase),
@@ -668,8 +711,9 @@ async def set_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.delete("/{target_id}/axis-weights", response_model=UserTarget)
-async def reset_axis_weights(
+def reset_axis_weights(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -695,8 +739,9 @@ async def reset_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.post("/{target_id}/axis-weights/undo", response_model=UserTarget)
-async def undo_axis_weights(
+def undo_axis_weights(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -717,8 +762,9 @@ async def undo_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.patch("/{target_id}/notification-thresholds", response_model=UserTarget)
-async def set_notification_thresholds(
+def set_notification_thresholds(
     target_id: str,
     body: NotificationThresholdsUpdate,
     supabase: Client = Depends(get_supabase),
@@ -927,12 +973,14 @@ def get_target_status(
     )
 
 
+# Sync `def`: the funnel report is blocking supabase work; the threadpool
+# keeps it off the event loop (#107).
 @router.get(
     "/{target_id}/funnel",
     response_model=TargetFunnelResponse,
     dependencies=[Depends(verify_api_key)],
 )
-async def get_target_funnel(
+def get_target_funnel(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> TargetFunnelResponse:
@@ -948,8 +996,10 @@ async def get_target_funnel(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+# Sync `def`: blocking supabase ownership-check + delete run in the
+# threadpool (#107).
 @router.delete("/{target_id}", response_model=DeleteResponse)
-async def delete_target(
+def delete_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -1181,10 +1231,17 @@ async def add_reference_jd(
     is provided, the server fetches the page and extracts JD text via the
     same cascade used by ``POST /jobs/manual`` (JSON-LD → meta tags →
     Firecrawl).
+
+    Genuinely async (awaits URL validation, the JD fetch, and the LLM
+    derive), so it stays ``async def``. supabase-py is synchronous, so each
+    blocking ``crud``/``cost_log`` round-trip is offloaded via
+    ``asyncio.to_thread`` to keep it off the event loop. See #107.
     """
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    await asyncio.to_thread(
+        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
+    )
     # Verify target exists
-    target = crud.get(supabase, target_id)
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
@@ -1204,9 +1261,15 @@ async def add_reference_jd(
             raise HTTPException(status_code=422, detail="Either jd_text or jd_url is required")
         _, body.jd_text = await _fetch_jd_from_url(body.jd_url)
 
+    # Bind to a non-None local: ``body.jd_text`` is guaranteed set past this
+    # point, but the narrowing wouldn't survive into the deferred to_thread
+    # closure below.
+    jd_text = body.jd_text
+
     # Derive profile from JD via LLM (cached by content hash + prompt version)
-    derived, result = await derive_profile_from_jd(llm, jd_text=body.jd_text, supabase=supabase)
-    cost_log.record(
+    derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=DEFAULT_PURPOSE,
@@ -1216,25 +1279,28 @@ async def add_reference_jd(
 
     # Store the reference JD, attributed to the contributing user so the
     # merge can de-bias by contributor (#5 refinement layer).
-    crud.add_reference_jd(
-        supabase,
-        target_id=target_id,
-        jd_text=body.jd_text,
-        jd_url=body.jd_url,
-        extracted_profile=derived.scoring_profile,
-        user_id=user_id,
+    await asyncio.to_thread(
+        lambda: crud.add_reference_jd(
+            supabase,
+            target_id=target_id,
+            jd_text=jd_text,
+            jd_url=body.jd_url,
+            extracted_profile=derived.scoring_profile,
+            user_id=user_id,
+        )
     )
 
     # Merge all reference JD profiles into composite, de-biased by contributor
     # (each user counts once regardless of how many JDs they've added).
-    all_ref_jds = crud.list_reference_jds(supabase, target_id)
+    all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
     composite = merge_reference_jds(all_ref_jds)
 
     # Update target with merged profile + search keywords, bump version for re-scoring.
     # Example title pools come from the LATEST JD only — these are concrete
     # examples not weighted aggregates, and merging across JDs would dilute
     # the few-shot signal. The latest JD overwrites; pools stay coherent.
-    updated = crud.update(
+    updated = await asyncio.to_thread(
+        crud.update,
         supabase,
         target_id,
         TargetUpdate(
@@ -1250,8 +1316,9 @@ async def add_reference_jd(
     return updated
 
 
+# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/{target_id}/reference-jds", response_model=ReferenceJDsListResponse)
-async def list_reference_jds(
+def list_reference_jds(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> ReferenceJDsListResponse:
@@ -1259,11 +1326,14 @@ async def list_reference_jds(
     return ReferenceJDsListResponse(reference_jds=ref_jds)
 
 
+# Sync `def` (not `async def`): the whole body is blocking supabase work
+# (ownership check, delete, re-merge read, update), so FastAPI runs it in its
+# threadpool and keeps it off the event loop. See #107.
 @router.delete(
     "/{target_id}/reference-jds/{ref_jd_id}",
     response_model=JobTarget,
 )
-async def delete_reference_jd(
+def delete_reference_jd(
     target_id: str,
     ref_jd_id: str,
     supabase: Client = Depends(get_supabase),
@@ -1305,12 +1375,16 @@ async def delete_reference_jd(
     return updated
 
 
+# Sync `def` (not `async def`): the whole body is blocking supabase work
+# (vote write + tally + conditional re-merge), so FastAPI runs it in its
+# threadpool, keeping it off the event loop. slowapi's @limiter.limit works
+# on sync handlers too (it reads the `request` arg). See #107.
 @router.post(
     "/{target_id}/reference-jds/{ref_jd_id}/vote",
     response_model=ContributionVoteResult,
 )
 @limiter.limit("30/minute")
-async def vote_on_reference_jd(
+def vote_on_reference_jd(
     request: Request,
     target_id: str,
     ref_jd_id: str,
