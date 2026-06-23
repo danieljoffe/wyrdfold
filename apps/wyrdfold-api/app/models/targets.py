@@ -317,7 +317,7 @@ class TargetFromUrl(BaseModel):
     page is used. Falls back to "Untitled Target" if neither is available.
     """
 
-    jd_url: str
+    jd_url: str = Field(max_length=2048)
     label: str | None = Field(default=None, max_length=200)
 
 
@@ -330,7 +330,7 @@ class ReferenceJDAdd(BaseModel):
     """
 
     jd_text: str | None = Field(default=None, max_length=100_000)
-    jd_url: str | None = None
+    jd_url: str | None = Field(default=None, max_length=2048)
 
     @model_validator(mode="after")
     def _require_text_or_url(self) -> "ReferenceJDAdd":

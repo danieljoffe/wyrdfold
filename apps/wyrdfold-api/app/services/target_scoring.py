@@ -220,6 +220,12 @@ def score_and_upsert(
     )
 
 
+# Page size for streaming stale ``scores`` rows in ``bulk_score_for_target``.
+# Kept as a module constant so peak memory is bounded to one page and so tests
+# can shrink it to exercise the multi-page streaming path cheaply.
+_RESCORE_BATCH_SIZE = 500
+
+
 def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
     """Re-score stale jobs for this target. Returns count scored.
 
@@ -232,6 +238,10 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
     the OR across all users via the user_targets trigger; if it's
     ``False`` nobody currently has this target enabled, so the
     re-score would just burn LLM/CPU on rows nobody will see.
+
+    Streams the stale rows page-by-page (peak memory O(page), not
+    O(catalog)) — see the loop below for why each iteration re-reads the
+    first page (audit #29).
     """
     if not target.is_active:
         logger.info(
@@ -241,56 +251,44 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         )
         return 0
 
-    batch_size = 500
-    offset = 0
+    batch_size = _RESCORE_BATCH_SIZE
     total_scored = 0
 
-    # Fetch job IDs with stale scores for this target
-    all_job_ids: list[str] = []
+    # Stream the stale ``scores`` rows page-by-page and fully process each
+    # page (fetch JDs → score → upsert → recompute global scores) before
+    # reading the next, so peak memory is O(batch) rather than O(catalog)
+    # — we never hold the entire catalog's stale ids in one list (audit
+    # #29). Each page's upsert bumps ``scored_profile_version`` up to the
+    # target's current version, so those rows immediately drop out of the
+    # ``.lt(scored_profile_version, profile_version)`` predicate. We
+    # therefore always re-read the *first* page (offset 0): the next page
+    # of still-stale rows shifts into its place, and every stale row is
+    # processed exactly once with no ever-growing offset and no rows
+    # skipped. The ``promising`` verdict rides along in the same select so
+    # the Phase 1 floor is preserved without a separate per-batch lookup.
     while True:
-        resp = (
-            supabase.table(TABLE)
-            .select("job_posting_id")
-            .eq("target_id", target.id)
-            .lt("scored_profile_version", target.profile_version)
-            .range(offset, offset + batch_size - 1)
-            .execute()
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
-            break
-        all_job_ids.extend(r["job_posting_id"] for r in rows)
-        if len(rows) < batch_size:
-            break
-        offset += batch_size
-
-    if not all_job_ids:
-        return 0
-
-    # Pre-load existing ``promising`` verdicts so the rescore preserves
-    # the Phase 1 verdict instead of overwriting it via scorer-only
-    # ``excluded``. Without this, a target's ``profile_version`` bump
-    # (feedback learner, manual /rescore) would re-admit jobs that
-    # Phase 1 previously dropped. Keyed by job_posting_id (per-target
-    # row already filtered by ``eq("target_id", ...)`` above).
-    existing_promising_by_job: dict[str, bool | None] = {}
-    for i in range(0, len(all_job_ids), batch_size):
-        batch_ids = all_job_ids[i : i + batch_size]
         resp = (
             supabase.table(TABLE)
             .select("job_posting_id, promising")
             .eq("target_id", target.id)
-            .in_("job_posting_id", batch_ids)
+            .lt("scored_profile_version", target.profile_version)
+            .range(0, batch_size - 1)
             .execute()
         )
-        for existing_row in cast(list[dict[str, Any]], resp.data or []):
-            existing_promising_by_job[existing_row["job_posting_id"]] = (
-                existing_row.get("promising")
-            )
+        stale_rows = cast(list[dict[str, Any]], resp.data or [])
+        if not stale_rows:
+            break
 
-    # Score those jobs in batches
-    for i in range(0, len(all_job_ids), batch_size):
-        batch_ids = all_job_ids[i : i + batch_size]
+        # Existing ``promising`` verdicts for this page, keyed by job id.
+        # promising=False -> excluded stays True regardless of the scorer;
+        # promising=True/None -> rely on the scorer's own ``excluded``.
+        # Preserving this stops a ``profile_version`` bump (feedback
+        # learner, manual /rescore) from re-admitting jobs Phase 1 dropped.
+        existing_promising_by_job: dict[str, bool | None] = {
+            r["job_posting_id"]: r.get("promising") for r in stale_rows
+        }
+        batch_ids = list(existing_promising_by_job.keys())
+
         resp = (
             supabase.table("jobs")
             .select("id, title, description_html")
@@ -299,7 +297,11 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         )
         jobs = cast(list[dict[str, Any]], resp.data or [])
         if not jobs:
-            continue
+            # No backing ``jobs`` rows for this page (e.g. deleted). Without
+            # an upsert these stale ``scores`` rows would keep matching the
+            # ``.lt()`` filter and the first-page re-read would loop forever.
+            # They aren't scorable, so stop.
+            break
 
         rows_to_upsert: list[dict[str, Any]] = []
         now = datetime.now(UTC).isoformat()
@@ -313,9 +315,6 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
                 parsed_jd=parsed,
                 search_keywords=target.search_keywords,
             )
-            # Preserve the Phase 1 verdict from the existing row:
-            # promising=False -> excluded=True regardless of scorer.
-            # promising=True or None -> rely on scorer's own excluded.
             existing_promising = existing_promising_by_job.get(job["id"])
             excluded_by_prefilter = existing_promising is False
             row: dict[str, Any] = {
@@ -340,14 +339,16 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
                 row["promising"] = existing_promising
             rows_to_upsert.append(row)
 
-        if rows_to_upsert:
-            supabase.table(TABLE).upsert(
-                rows_to_upsert, on_conflict="job_posting_id,target_id"
-            ).execute()
-            total_scored += len(rows_to_upsert)
+        if not rows_to_upsert:
+            break
 
-            scored_ids = [r["job_posting_id"] for r in rows_to_upsert]
-            batch_update_global_scores(supabase, scored_ids)
+        supabase.table(TABLE).upsert(
+            rows_to_upsert, on_conflict="job_posting_id,target_id"
+        ).execute()
+        total_scored += len(rows_to_upsert)
+
+        scored_ids = [r["job_posting_id"] for r in rows_to_upsert]
+        batch_update_global_scores(supabase, scored_ids)
 
     return total_scored
 

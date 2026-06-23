@@ -254,16 +254,18 @@ def test_bulk_score_for_target_preserves_phase1_promising_verdict(
     we hit after the post-PR-#782 Railway deploy, just now with the
     Phase 1 verdict instead of cosine.
 
-    Mechanism: bulk_score_for_target pre-loads ``scores.promising`` per
-    job and uses it as the ``excluded_by_prefilter`` floor on each
-    rescore. promising=False -> excluded stays True even if the keyword
-    scorer would admit; promising=True/None -> scorer decides.
+    Mechanism: bulk_score_for_target selects ``scores.promising`` inline in
+    the stale-row paging query and uses it as the ``excluded_by_prefilter``
+    floor on each rescore. promising=False -> excluded stays True even if
+    the keyword scorer would admit; promising=True/None -> scorer decides.
     """
     monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
 
-    jts_rows = [{"job_posting_id": "good"}, {"job_posting_id": "bad"}]
-    # Existing scores rows: Phase 1 previously admitted "good", rejected "bad".
-    existing_promising_rows = [
+    # The stale-row page carries the ``promising`` verdict inline (selected
+    # in the same paging query), so the Phase 1 floor is preserved without a
+    # separate per-batch ``scores`` lookup. Phase 1 previously admitted
+    # "good", rejected "bad".
+    jts_rows = [
         {"job_posting_id": "good", "promising": True},
         {"job_posting_id": "bad", "promising": False},
     ]
@@ -293,18 +295,11 @@ def test_bulk_score_for_target_preserves_phase1_promising_verdict(
         mock.execute.return_value.data = jts_rows if range_calls["n"] == 1 else []
         return mock
 
-    # Stale-row paging: ``.select().eq().lt().range()``.
+    # Stale-row paging carries ``promising`` inline: ``.select().eq().lt().range()``.
     supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
         range_side_effect
     )
-    # ``.select().eq().in_()`` is used both for the existing-promising
-    # lookup (scores table) AND would be used for jobs if the jobs
-    # query didn't use ``.select().in_()`` — distinguish by the depth
-    # of the chain. The existing-promising path returns the verdict
-    # rows; the jobs path returns the job rows.
-    supabase.table.return_value.select.return_value.eq.return_value.in_.return_value.execute.return_value.data = (
-        existing_promising_rows
-    )
+    # The jobs fetch is ``.select().in_()`` — returns the backing job rows.
     supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = (
         jobs
     )
@@ -324,6 +319,130 @@ def test_bulk_score_for_target_preserves_phase1_promising_verdict(
     # still finds the verdict.
     assert by_id["good"]["promising"] is True
     assert by_id["bad"]["promising"] is False
+
+
+def test_bulk_score_for_target_streams_multiple_pages_without_holding_all_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit #29: stale rows spanning several pages are all rescored, and the
+    function never accumulates every stale id into one in-memory list.
+
+    The streaming contract: each loop iteration re-reads the FIRST page of
+    still-stale ``scores`` rows (the prior page's upsert bumps
+    ``scored_profile_version`` so those rows drop out of the ``.lt()``
+    predicate), fetches just that page's jobs, scores+upserts them, then
+    recomputes global scores — before touching the next page. We prove:
+      1. every job across all pages is scored exactly once (no skips), and
+      2. no single jobs-fetch (``.in_()``) ever receives more than one
+         page's worth of ids (peak memory is O(page), not O(catalog)).
+    """
+    import app.services.target_scoring as ts
+
+    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
+    # Shrink the page so a small catalog spans multiple pages cheaply.
+    page = 2
+    monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", page)
+
+    # A 5-row catalog → 3 pages at page size 2 (2, 2, 1).
+    catalog = [f"job-{i}" for i in range(5)]
+    # ``remaining`` models the DB: ids still stale (not yet rescored). Each
+    # upsert removes its ids, so the next "first page" is the next slice.
+    remaining = list(catalog)
+    jobs_in_calls: list[list[str]] = []
+
+    supabase = MagicMock()
+
+    # Stale-row paging: ``.select().eq().lt().range()`` → first ``page`` of
+    # whatever is still stale right now.
+    def range_side_effect(*_args: Any, **_kwargs: Any) -> MagicMock:
+        m = MagicMock()
+        m.execute.return_value.data = [
+            {"job_posting_id": jid, "promising": None} for jid in remaining[:page]
+        ]
+        return m
+
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
+        range_side_effect
+    )
+
+    # Jobs fetch: ``.select().in_(ids)`` → record the width, return job rows
+    # for exactly those ids.
+    def in_side_effect(_col: str, ids: list[str]) -> MagicMock:
+        jobs_in_calls.append(list(ids))
+        m = MagicMock()
+        m.execute.return_value.data = [
+            {"id": jid, "title": "Senior FE", "description_html": "<p>React</p>"}
+            for jid in ids
+        ]
+        return m
+
+    supabase.table.return_value.select.return_value.in_.side_effect = in_side_effect
+
+    # Upsert: mark those ids no-longer-stale (drop from ``remaining``) and echo
+    # them back as the upsert result.
+    def upsert_side_effect(rows: list[dict[str, Any]], **_kwargs: Any) -> MagicMock:
+        for r in rows:
+            if r["job_posting_id"] in remaining:
+                remaining.remove(r["job_posting_id"])
+        m = MagicMock()
+        m.execute.return_value.data = rows
+        return m
+
+    supabase.table.return_value.upsert.side_effect = upsert_side_effect
+
+    target = _target(core={"React": 3})
+    count = bulk_score_for_target(supabase, target)
+
+    # 1. Every job scored exactly once.
+    assert count == len(catalog)
+    scored_ids = [jid for call in jobs_in_calls for jid in call]
+    assert sorted(scored_ids) == sorted(catalog), "every stale job rescored once"
+    # 2. Multiple pages were processed (not one giant batch)...
+    assert len(jobs_in_calls) == 3, jobs_in_calls
+    # ...and no single jobs fetch held more than one page of ids.
+    assert all(len(call) <= page for call in jobs_in_calls), jobs_in_calls
+
+
+def test_bulk_score_for_target_terminates_when_page_has_no_backing_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control for the streaming loop: if a page of stale ``scores``
+    rows has no backing ``jobs`` rows (all deleted), the first-page re-read
+    must NOT spin forever. The loop breaks instead of looping on rows it can
+    never upsert away.
+    """
+    import app.services.target_scoring as ts
+
+    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
+    monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", 2)
+
+    range_calls = {"n": 0}
+
+    def range_side_effect(*_args: Any, **_kwargs: Any) -> MagicMock:
+        # Always returns stale rows — if the loop didn't break on the empty
+        # jobs fetch, it would call this unboundedly.
+        range_calls["n"] += 1
+        assert range_calls["n"] < 50, "first-page re-read looped without progress"
+        m = MagicMock()
+        m.execute.return_value.data = [
+            {"job_posting_id": "ghost-1", "promising": None},
+            {"job_posting_id": "ghost-2", "promising": None},
+        ]
+        return m
+
+    supabase = MagicMock()
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
+        range_side_effect
+    )
+    # No backing jobs for these ids.
+    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
+
+    target = _target(core={"React": 3})
+    count = bulk_score_for_target(supabase, target)
+
+    assert count == 0
+    # Upsert never fired — nothing was scorable.
+    supabase.table.return_value.upsert.assert_not_called()
 
 
 def test_bulk_score_for_target_handles_no_stale_jobs() -> None:

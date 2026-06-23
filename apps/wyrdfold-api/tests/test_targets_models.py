@@ -1,13 +1,18 @@
 """Tests for job target Pydantic models (#495)."""
 
+import pytest
+from pydantic import ValidationError
+
 from app.models.targets import (
     CategoryProfile,
     DomainProfile,
     JobTarget,
     NegativeProfile,
+    ReferenceJDAdd,
     ScoringProfile,
     SeniorityProfile,
     TargetCreate,
+    TargetFromUrl,
     TargetReferenceJD,
     TargetUpdate,
 )
@@ -253,3 +258,66 @@ def test_target_update_passes_through_example_title_pools():
     upd2 = TargetUpdate(label="Renamed Target")
     assert upd2.example_promising_titles is None
     assert upd2.example_unpromising_titles is None
+
+
+# ---- jd_url length bound (audit #29) --------------------------------------
+#
+# ``TargetFromUrl.jd_url`` and ``ReferenceJDAdd.jd_url`` are user-supplied URLs
+# that get fetched server-side. They must carry the same 2048-char bound as
+# ``ManualJobRequest.url`` / ``UrlValidateRequest.url`` so an oversized URL is
+# rejected at the edge (422 via FastAPI) rather than flowing into the fetch
+# pipeline. These exercise the model validator directly; a ValidationError here
+# is what FastAPI surfaces as a 422.
+
+_MAX_URL = 2048
+
+
+def _url_of_length(n: int) -> str:
+    """A syntactically plausible https URL padded to exactly ``n`` chars."""
+    prefix = "https://example.com/"
+    return prefix + "a" * (n - len(prefix))
+
+
+def test_target_from_url_accepts_max_length_url():
+    url = _url_of_length(_MAX_URL)
+    assert len(url) == _MAX_URL
+    t = TargetFromUrl(jd_url=url)
+    assert t.jd_url == url
+
+
+def test_target_from_url_rejects_oversized_url():
+    url = _url_of_length(_MAX_URL + 1)
+    assert len(url) == _MAX_URL + 1
+    with pytest.raises(ValidationError) as exc:
+        TargetFromUrl(jd_url=url)
+    # The failure is specifically the length bound on jd_url.
+    errors = exc.value.errors()
+    assert any(
+        e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors
+    ), errors
+
+
+def test_reference_jd_add_accepts_max_length_url():
+    url = _url_of_length(_MAX_URL)
+    ref = ReferenceJDAdd(jd_url=url)
+    assert ref.jd_url == url
+
+
+def test_reference_jd_add_rejects_oversized_url():
+    url = _url_of_length(_MAX_URL + 1)
+    with pytest.raises(ValidationError) as exc:
+        ReferenceJDAdd(jd_url=url)
+    errors = exc.value.errors()
+    assert any(
+        e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors
+    ), errors
+
+
+def test_reference_jd_add_still_requires_text_or_url():
+    """Negative control: the new length bound must not weaken the existing
+    "either jd_text or jd_url" guard. An empty payload still fails, but for
+    the missing-field reason — not a length error."""
+    with pytest.raises(ValidationError) as exc:
+        ReferenceJDAdd()
+    msg = str(exc.value)
+    assert "Either jd_text or jd_url is required" in msg
