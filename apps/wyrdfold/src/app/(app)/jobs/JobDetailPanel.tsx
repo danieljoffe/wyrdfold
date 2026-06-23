@@ -275,13 +275,13 @@ export default function JobDetailPanel({
 
   const breakdown = posting.score_breakdown;
 
-  // Sanitize the upstream JD HTML once per posting. Greenhouse returns
-  // (and the poller persists) the description body entity-encoded —
-  // ``&lt;h4&gt;…&lt;/h4&gt;`` rather than ``<h4>…</h4>`` — so we have
-  // to decode one level before DOMPurify will recognize the tags;
-  // otherwise the panel just renders the encoded source as text.
-  // DOMPurify itself scrubs against XSS — defence-in-depth even
-  // though the source is first-party.
+  // Sanitize the upstream JD HTML once per posting. The body is THIRD-PARTY
+  // (Greenhouse et al.) and merely passes through our poller, so it must be
+  // treated as attacker-controlled at render time. ``sanitizeJobDescription``
+  // decodes one level of entities (Greenhouse persists ``&lt;h4&gt;`` rather
+  // than ``<h4>``) and then runs DOMPurify with an explicit allow-list that
+  // mirrors the server's bleach config — see that module for the full
+  // threat-model rationale (audit #29 R2-3).
   //
   // ``description_html`` is only populated on the /jobs/{id} detail
   // response — the /jobs list omits it. Dynamic-import keeps the
@@ -296,12 +296,13 @@ export default function JobDetailPanel({
       return;
     }
     let cancelled = false;
-    void import('isomorphic-dompurify').then(mod => {
+    void Promise.all([
+      import('isomorphic-dompurify'),
+      import('./sanitizeJobDescription'),
+    ]).then(([purifyMod, sanitizeMod]) => {
       if (cancelled) return;
-      const ta = document.createElement('textarea');
-      ta.innerHTML = raw;
       setSanitizedDescription(
-        mod.default.sanitize(ta.value, { USE_PROFILES: { html: true } })
+        sanitizeMod.sanitizeJobDescriptionHtml(raw, purifyMod.default)
       );
     });
     return () => {
