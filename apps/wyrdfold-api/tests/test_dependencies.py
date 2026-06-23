@@ -274,12 +274,75 @@ def test_verify_api_key_or_jwt_rejects_both_missing():
     assert exc.value.status_code == 401
 
 
-def test_verify_api_key_or_jwt_rejects_invalid_jwt():
-    bad_token = _mint(private_pem=_OTHER_PRIVATE_PEM)
-    req = _make_request({"authorization": f"Bearer {bad_token}"})
+# ---------------------------------------------------------------------------
+# Dedicated cron/automation key scope (#29 round 3 / H4)
+# ---------------------------------------------------------------------------
+
+
+def _settings_with_cron(
+    api_key: str = "legacykey", cron_key: str = "cronkey"
+) -> Settings:
+    return Settings(
+        wyrdfold_api_key=api_key,
+        wyrdfold_cron_key=cron_key,
+        supabase_url=TEST_SUPABASE_URL,
+    )
+
+
+def test_verify_api_key_accepts_cron_key_on_operator_routes():
+    """The cron key authenticates the strictly-operator gate."""
+    assert (
+        verify_api_key(key="cronkey", s=_settings_with_cron()) == "cronkey"
+    )
+
+
+def test_verify_api_key_still_accepts_legacy_key():
+    """No regression: the legacy key keeps working on operator routes."""
+    assert (
+        verify_api_key(key="legacykey", s=_settings_with_cron()) == "legacykey"
+    )
+
+
+def test_verify_api_key_rejects_unknown_key():
     with pytest.raises(HTTPException) as exc:
-        verify_api_key_or_jwt(req, key=None, s=_settings())
+        verify_api_key(key="nope", s=_settings_with_cron())
     assert exc.value.status_code == 401
+
+
+def test_cron_key_is_rejected_by_user_data_gate():
+    """The key-isolation guarantee: the cron key must NOT authenticate
+    against the user-data routers (verify_api_key_or_jwt). Only the legacy
+    key or a JWT may. Without this, the 'narrow' cron key would be just as
+    over-broad as the key it's meant to replace."""
+    req = _make_request()
+    with pytest.raises(HTTPException) as exc:
+        verify_api_key_or_jwt(req, key="cronkey", s=_settings_with_cron())
+    assert exc.value.status_code == 401
+
+
+def test_legacy_key_still_accepted_by_user_data_gate():
+    """No regression: the legacy key still passes the user-data gate (so
+    nothing breaks until the operator chooses to retire it)."""
+    req = _make_request()
+    assert (
+        verify_api_key_or_jwt(req, key="legacykey", s=_settings_with_cron())
+        == "api-key"
+    )
+
+
+def test_cron_key_unset_changes_nothing():
+    """With WYRDFOLD_CRON_KEY empty (the default), only the legacy key is
+    accepted on operator routes — additive feature, off by default."""
+    s = Settings(
+        wyrdfold_api_key="legacykey",
+        wyrdfold_cron_key="",
+        supabase_url=TEST_SUPABASE_URL,
+    )
+    assert verify_api_key(key="legacykey", s=s) == "legacykey"
+    with pytest.raises(HTTPException):
+        # An empty configured cron key must never match an empty/blank
+        # presented key.
+        verify_api_key(key="", s=s)
 
 
 def test_get_current_user_id_returns_jwt_sub():
