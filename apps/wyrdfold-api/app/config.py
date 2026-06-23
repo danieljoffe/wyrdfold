@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     # data access migrates onto the user client; unset is fine until then.
     supabase_anon_key: str = Field(default="", repr=False)
     wyrdfold_api_key: str = Field(default="", repr=False)
+    # Dedicated cron/automation key (#29 round 3 / H4). OPTIONAL, default
+    # empty. When set, it is accepted by ``verify_api_key`` (the strictly
+    # operator/cron routes: /poll, /discovery, /admin, jobs rescore +
+    # backfill-salary, sources POST/seed, targets funnel) IN ADDITION to
+    # ``wyrdfold_api_key`` — but it is deliberately NOT accepted by
+    # ``verify_api_key_or_jwt`` (the six user-data routers). This gives the
+    # operator a migration path to a narrowly-scoped automation credential:
+    # point cron/poller/batch at WYRDFOLD_CRON_KEY (works only on operator
+    # routes), then the broad WYRDFOLD_API_KEY can be retired so a leak of
+    # the automation key can no longer authenticate against user data. Empty
+    # changes nothing (the legacy key keeps working everywhere it does today).
+    wyrdfold_cron_key: str = Field(default="", repr=False)
     # JWT verification uses Supabase's JWKS endpoint at
     # `<supabase_url>/auth/v1/.well-known/jwks.json` — public-key verification
     # with key rotation handled automatically. No shared secret required.

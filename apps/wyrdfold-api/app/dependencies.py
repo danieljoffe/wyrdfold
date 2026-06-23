@@ -148,11 +148,29 @@ def _api_key_matches(presented: str | None, expected: str) -> bool:
     return hmac.compare_digest(presented, expected)
 
 
+def _operator_key_matches(presented: str | None, s: Settings) -> bool:
+    """True if *presented* matches EITHER the legacy shared key or the
+    dedicated cron/automation key (#29 round 3 / H4).
+
+    Both checks run unconditionally (no short-circuit) so timing doesn't
+    reveal which key — each underlying compare is already constant-time and
+    no-ops when its expected value is unset.
+    """
+    legacy = _api_key_matches(presented, s.wyrdfold_api_key)
+    cron = _api_key_matches(presented, s.wyrdfold_cron_key)
+    return legacy or cron
+
+
 def verify_api_key(
     key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
 ) -> str:
-    if not _api_key_matches(key, s.wyrdfold_api_key):
+    # Strictly operator/cron routes accept EITHER the legacy
+    # ``WYRDFOLD_API_KEY`` or the narrower ``WYRDFOLD_CRON_KEY`` (#29 R3 /
+    # H4). The broad user-data acceptance in ``verify_api_key_or_jwt`` keeps
+    # accepting only the legacy key, so the cron key can never authenticate
+    # against user data.
+    if not _operator_key_matches(key, s):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key or ""
 
@@ -257,6 +275,15 @@ def verify_api_key_or_jwt(
     JWT decode failures are logged at WARNING (no token detail) so a
     spike of invalid tokens is detectable in observability — the
     previous silent swallow was a detection blind spot.
+
+    NOTE (#29 round 3 / H4): this gate intentionally accepts ONLY the legacy
+    ``wyrdfold_api_key`` — NOT ``wyrdfold_cron_key``. The cron key is for
+    the strictly-operator routes (``verify_api_key``) and must never
+    authenticate against the user-data routers this guard protects. Do not
+    add ``wyrdfold_cron_key`` here. (The audit's recommended end-state is to
+    drop api-key acceptance from these user-data routers entirely once cron
+    is migrated to the cron key + the broad key retired — a human-gated
+    config/rollout decision; see the PR body.)
     """
     if _api_key_matches(key, s.wyrdfold_api_key):
         return "api-key"
