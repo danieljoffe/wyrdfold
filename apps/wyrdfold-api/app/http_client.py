@@ -22,15 +22,44 @@ _client: httpx.AsyncClient | None = None
 # particular) reject the default httpx UA outright.
 DEFAULT_USER_AGENT = "wyrdfold-jobs/1.0 (+https://wyrdfold.com)"
 
+# Connection-pool ceiling sized to the real fan-out of a poll cycle.
+#
+# The poller runs ``POLL_CONCURRENCY = 10`` source workers concurrently
+# (app/services/poller.py). The SmartRecruiters and Workday fetchers each
+# fan out ``_DETAIL_CONCURRENCY = 5`` per-posting detail fetches through
+# THIS shared client. Worst case is all 10 workers being SR/Workday at
+# once: 10 x 5 = 50 simultaneous detail requests. The previous ceiling of
+# 20 meant ~30 of those queued behind the limit and timed out under the
+# 15 s deadline, silently dropping postings.
+#
+# We size for that worst case plus headroom for the other callers that
+# share this client: the scheduler tick, ad-hoc user-paste URL fetches,
+# and source-discovery probes. (Per-user Supabase traffic uses a SEPARATE
+# httpx pool in app/supabase_pool.py and is not counted here.)
+#
+#   50 (poll detail fan-out) + 14 (headroom) = 64
+_POLL_DETAIL_FANOUT = 10 * 5  # POLL_CONCURRENCY x max(_DETAIL_CONCURRENCY)
+MAX_CONNECTIONS = _POLL_DETAIL_FANOUT + 14  # = 64
+MAX_KEEPALIVE_CONNECTIONS = 20
+
+# Explicit per-phase timeouts. The single 15 s number used to govern
+# every phase, including ``pool`` (waiting for a free connection). With
+# the pool saturated that wait silently ate into the read budget and
+# surfaced as an opaque timeout. Splitting the phases means a
+# pool-acquisition stall raises ``PoolTimeout`` (a distinct, retryable
+# transport error) instead of masquerading as a slow read — and with the
+# ceiling sized above it should not trigger in normal operation.
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=5.0)
+
 
 def get_http_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=15.0,
+            timeout=HTTP_TIMEOUT,
             limits=httpx.Limits(
-                max_connections=20,
-                max_keepalive_connections=10,
+                max_connections=MAX_CONNECTIONS,
+                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
             ),
             follow_redirects=True,
             headers={"User-Agent": DEFAULT_USER_AGENT},
