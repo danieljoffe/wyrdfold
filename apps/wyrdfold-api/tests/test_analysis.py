@@ -153,14 +153,10 @@ def _make_supabase_mock(
     select_data: list[dict[str, Any]] | None = None,
 ) -> MagicMock:
     supabase = MagicMock()
-    # insert chain
-    supabase.table.return_value.insert.return_value.execute.return_value.data = (
-        insert_data or []
-    )
+    # upsert chain (persist now upserts on the cache-key conflict target)
+    supabase.table.return_value.upsert.return_value.execute.return_value.data = insert_data or []
     # select chain (get_cached uses .eq * 3 → .order → .limit → .is_/.eq → .execute)
-    cached_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
-    )
+    cached_chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
     cached_chain.is_.return_value.execute.return_value.data = select_data or []
     cached_chain.eq.return_value.execute.return_value.data = select_data or []
     return supabase
@@ -278,7 +274,38 @@ def test_get_cached_returns_record_when_exists() -> None:
     assert result.recommendation.startswith("Apply")
 
 
-def test_persist_inserts_and_returns_record() -> None:
+def test_get_cached_scopes_query_to_user_tenant() -> None:
+    """The cache read must filter by ``user_id`` so one user's analysis is
+    never returned to another (and so the poller — which now stamps the
+    doc's owning user — shares the same cache entry the user view reads).
+
+    For a real user the query ends in ``.eq("user_id", <uuid>)``; for the
+    api-key/legacy ``None`` caller it ends in ``.is_("user_id", "null")``.
+    """
+    supabase = _make_supabase_mock(select_data=[])
+    persistence_mod.get_cached(
+        supabase, "job-1", target_id="tgt-1", optimized_doc_id="opt-1", user_id="user-A"
+    )
+    # The terminal filter for a real user is the user_id .eq on the
+    # ordered+limited query (the 4th .eq in the chain).
+    final_eq = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.eq
+    final_eq.assert_called_once_with("user_id", "user-A")
+
+    # And the None caller uses the IS NULL branch, never the user .eq.
+    supabase_null = _make_supabase_mock(select_data=[])
+    persistence_mod.get_cached(
+        supabase_null,
+        "job-1",
+        target_id="tgt-1",
+        optimized_doc_id="opt-1",
+        user_id=None,
+    )
+    null_chain = supabase_null.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
+    null_chain.is_.assert_called_once_with("user_id", "null")
+    null_chain.eq.assert_not_called()
+
+
+def test_persist_upserts_and_returns_record() -> None:
     from app.models.llm import LLMResult, LLMUsage
 
     supabase = _make_supabase_mock(insert_data=[_analysis_record_row()])
@@ -299,10 +326,14 @@ def test_persist_inserts_and_returns_record() -> None:
         llm_result=llm_result,
     )
     assert record.id == "rec-analysis-1"
-    supabase.table.return_value.insert.assert_called_once()
+    # Idempotent upsert (not a blind insert) so concurrent/duplicate
+    # computations collapse onto one row via the cache-key conflict target.
+    supabase.table.return_value.upsert.assert_called_once()
+    _, kwargs = supabase.table.return_value.upsert.call_args
+    assert kwargs["on_conflict"] == persistence_mod._CACHE_KEY_COLS
 
 
-def test_persist_raises_on_empty_insert() -> None:
+def test_persist_raises_on_empty_upsert() -> None:
     from app.models.llm import LLMResult, LLMUsage
 
     supabase = _make_supabase_mock(insert_data=[])
@@ -313,7 +344,7 @@ def test_persist_raises_on_empty_insert() -> None:
         cost_usd=0.001,
         latency_ms=50,
     )
-    with pytest.raises(RuntimeError, match="Failed to insert"):
+    with pytest.raises(RuntimeError, match="Failed to upsert"):
         persistence_mod.persist(
             supabase,
             job_posting_id="job-1",
@@ -323,6 +354,129 @@ def test_persist_raises_on_empty_insert() -> None:
             analysis=_valid_analysis(),
             llm_result=llm_result,
         )
+
+
+# ---------------------------------------------------------------------------
+# Poller ↔ user-view shared cache (the phase-3 re-fire root cause)
+# ---------------------------------------------------------------------------
+
+
+def _owned_optimized_doc(user_id: str) -> OptimizedDoc:
+    return OptimizedDoc(
+        id="opt-owned-1",
+        user_id=user_id,
+        prose_doc_id=None,
+        version=3,
+        payload=_optimized_payload(),
+        markdown_view=None,
+        source="llm",
+        created_at=datetime.now(UTC),
+    )
+
+
+async def test_poller_stage3_persists_under_doc_owner_then_reuses_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the phase-3 re-fire bug.
+
+    The cron poller computed analyses against each user's OWN optimized
+    doc but persisted them under ``user_id=None`` — a separate tenant
+    namespace the user-facing view (which reads under the JWT ``sub``)
+    could never hit, so every first visit re-ran a full LLM analysis the
+    cron had already paid for.
+
+    This proves two things end to end through ``_run_llm_scoring_for_row``:
+      1. The first pass persists the analysis under the doc's OWNER
+         (``optimized_doc.user_id``), not None.
+      2. A second identical pass finds that row via the cache and does
+         NOT call the LLM again — exactly the inputs the user view sees.
+    """
+    from app.services import poller as poller_mod
+    from app.services.targets import crud as targets_crud_mod  # noqa: F401
+
+    owner = "user-owner-42"
+    doc = _owned_optimized_doc(owner)
+
+    # An in-memory stand-in for the analyses cache. Keyed by the full cache
+    # key INCLUDING user_id so a tenant mismatch (the old bug) would miss.
+    store: dict[tuple[str, str, str, str | None], JobAnalysisRecord] = {}
+
+    def fake_get_cached(
+        _sb: Any,
+        job_posting_id: str,
+        *,
+        target_id: str,
+        optimized_doc_id: str,
+        user_id: str | None,
+    ) -> JobAnalysisRecord | None:
+        return store.get((job_posting_id, target_id, optimized_doc_id, user_id))
+
+    persisted_user_ids: list[str | None] = []
+
+    def fake_persist(
+        _sb: Any,
+        *,
+        job_posting_id: str,
+        target_id: str,
+        user_id: str | None,
+        optimized_doc_id: str | None,
+        analysis: JobAnalysis,
+        llm_result: Any,
+    ) -> JobAnalysisRecord:
+        persisted_user_ids.append(user_id)
+        rec = JobAnalysisRecord.model_validate(
+            {
+                **_analysis_record_row(record_id=f"rec-{len(store)}"),
+                "user_id": user_id,
+                "optimized_doc_id": optimized_doc_id,
+            }
+        )
+        store[(job_posting_id, target_id, cast_str(optimized_doc_id), user_id)] = rec
+        return rec
+
+    monkeypatch.setattr(poller_mod, "get_cached_analysis", fake_get_cached)
+    monkeypatch.setattr(poller_mod, "persist_analysis", fake_persist)
+    # Don't touch the real DB for the score-blend writes / mark-complete.
+    monkeypatch.setattr(poller_mod, "mark_target_scores_complete", lambda *_a, **_k: None)
+    monkeypatch.setattr(poller_mod, "enqueue_llm_cost", lambda *_a, **_k: None)
+
+    llm = MockLLMClient(scripted={"poll_scoring": _valid_analysis_json()})
+    supabase = MagicMock()
+    target = _job_target()
+    row_data = {"id": "job-1", "description_html": "We want a React engineer."}
+
+    # First pass: cache miss → one LLM call → persist under the owner.
+    await poller_mod._run_llm_scoring_for_row(
+        supabase,
+        row_data,
+        doc,
+        llm,
+        target,
+        current_score=80,
+        payer_user_id=owner,
+    )
+    assert len(llm.calls) == 1
+    assert persisted_user_ids == [owner], (
+        "poller must persist under the doc's owning user, not None"
+    )
+
+    # Second pass with identical inputs: must hit the cache, no 2nd LLM call.
+    await poller_mod._run_llm_scoring_for_row(
+        supabase,
+        row_data,
+        doc,
+        llm,
+        target,
+        current_score=80,
+        payer_user_id=owner,
+    )
+    assert len(llm.calls) == 1, "second identical pass must reuse the cache"
+    assert persisted_user_ids == [owner], "no second persist on a cache hit"
+
+
+def cast_str(v: str | None) -> str:
+    assert v is not None
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -346,9 +500,7 @@ async def test_router_cache_hit_skips_llm(
     """When a cached analysis exists, the LLM should not be called."""
 
     cached_record = JobAnalysisRecord.model_validate(_analysis_record_row())
-    monkeypatch.setattr(
-        persistence_mod, "get_cached", lambda *_a, **_kw: cached_record
-    )
+    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: cached_record)
 
     from app.services.experience import optimized as opt_mod
 
