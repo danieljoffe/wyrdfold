@@ -589,7 +589,13 @@ async def _run_llm_scoring_for_row(
             logger.exception("Failed to mark scores complete for job %s", job_id)
         return
 
-    # Check LLM cache — skip re-analysis if this job+target+optimized was already done
+    # Check LLM cache — skip re-analysis if this job+target+optimized was already
+    # done. Scope to the doc's OWNING user (``optimized_doc.user_id``) — the same
+    # tenant the user-facing ``POST /analysis`` reads under (its
+    # ``get_latest(user_id=sub)`` returns this very doc). Reading/persisting under
+    # ``user_id=None`` (the old value) stranded cron-computed analyses in a
+    # separate namespace the user view could never hit, so every first visit
+    # re-fired a full-price LLM call the cron had already paid for.
     try:
         cached = await asyncio.to_thread(
             get_cached_analysis,
@@ -597,7 +603,7 @@ async def _run_llm_scoring_for_row(
             job_id,
             target_id=target.id,
             optimized_doc_id=optimized_doc.id,
-            user_id=None,
+            user_id=optimized_doc.user_id,
         )
         if cached is not None:
             llm_score = scorecard_to_numeric(cached.scorecard)
@@ -629,13 +635,16 @@ async def _run_llm_scoring_for_row(
             purpose="poll_scoring",
         )
 
-        # Persist analysis and log cost
+        # Persist analysis and log cost. Owned by ``optimized_doc.user_id`` so
+        # the user-facing ``POST /analysis`` flow reuses this exact row (shared
+        # cache key (job, target, optimized_doc_id, user_id)) instead of
+        # re-running the LLM on first view.
         record = await asyncio.to_thread(
             persist_analysis,
             supabase,
             job_posting_id=job_id,
             target_id=target.id,
-            user_id=None,
+            user_id=optimized_doc.user_id,
             optimized_doc_id=optimized_doc.id,
             analysis=analysis,
             llm_result=llm_result,
