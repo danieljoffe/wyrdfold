@@ -2,4 +2,10 @@
 @import '@danieljoffe/shared-ui/styles/pyre-theme.css';
 
 @source "../**/*.{ts,tsx,js,jsx}";
-@source "../../../../node_modules/@danieljoffe/shared-ui/dist";
+/* Resolves relative to this stylesheet (apps/wyrdfold/src/app/) -> apps/wyrdfold/node_modules.
+   pnpm symlinks each workspace app's deps under that app's own node_modules, so this
+   is the path that actually exists. The previous "../../../../" pointed at a repo-root
+   node_modules/@danieljoffe that pnpm never creates, so Tailwind scanned nothing from
+   shared-ui and design-system-only utilities (e.g. Card padding='lg' -> p-8) were
+   silently dropped from the generated CSS. */
+@source "../../node_modules/@danieljoffe/shared-ui/dist";
