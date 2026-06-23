@@ -16,6 +16,7 @@ expected here — feedback is fundamentally per-user.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -69,8 +70,11 @@ def _target_exists_for_user(
     return bool(resp.data)
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.post("/jobs/{job_id}/feedback", response_model=FeedbackCreateResponse)
-async def create_feedback(
+def create_feedback(
     job_id: str,
     body: FeedbackCreate,
     background: BackgroundTasks,
@@ -110,8 +114,9 @@ async def create_feedback(
     return FeedbackCreateResponse(feedback=row, queued_learn_run=queued)
 
 
+# Sync `def`: blocking supabase delete runs in the threadpool (#107).
 @router.delete("/jobs/{job_id}/feedback", status_code=204)
-async def remove_feedback(
+def remove_feedback(
     job_id: str,
     target_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
@@ -126,8 +131,9 @@ async def remove_feedback(
     )
 
 
+# Sync `def`: blocking supabase reads run in the threadpool (#107).
 @router.get("/targets/{target_id}/feedback", response_model=FeedbackList)
-async def list_feedback(
+def list_feedback(
     target_id: str,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -149,11 +155,13 @@ async def list_feedback(
     return FeedbackList(rows=rows, total=total)
 
 
+# Sync `def`: the deterministic learner is blocking supabase work; the
+# threadpool keeps it off the event loop (#107).
 @router.post(
     "/targets/{target_id}/learn",
     response_model=LearnerPatchSummary | None,
 )
-async def run_learner_now(
+def run_learner_now(
     target_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
@@ -180,7 +188,13 @@ async def run_llm_learner_now(
     Returns a result with ``applied=True`` when the patch was auto-applied
     (confidence ≥ 0.6), or ``applied=False`` when it was staged for review.
     """
-    if not _target_exists_for_user(supabase, user_id, target_id):
+    # Genuinely async (awaits the LLM), so it stays `async def`; the
+    # blocking supabase precheck is offloaded to a thread so it doesn't
+    # freeze the event loop before the await (#107).
+    exists = await asyncio.to_thread(
+        _target_exists_for_user, supabase, user_id, target_id
+    )
+    if not exists:
         raise HTTPException(status_code=404, detail="Target not found for user")
     return await run_llm_learner(
         supabase, llm, user_id=user_id, target_id=target_id
@@ -222,11 +236,12 @@ def list_learning_log(
     return [TargetLearningLogRow.model_validate(r) for r in rows]
 
 
+# Sync `def`: blocking supabase work runs in the threadpool (#107).
 @router.post(
     "/targets/{target_id}/learn/{run_id}/apply",
     response_model=LearningRunResult,
 )
-async def apply_learning_run(
+def apply_learning_run(
     target_id: str,
     run_id: str,
     user_id: str = Depends(get_current_user_id),
@@ -243,11 +258,12 @@ async def apply_learning_run(
     return result
 
 
+# Sync `def`: blocking supabase work runs in the threadpool (#107).
 @router.post(
     "/targets/{target_id}/learn/{run_id}/reject",
     response_model=LearningRunResult,
 )
-async def reject_learning_run(
+def reject_learning_run(
     target_id: str,
     run_id: str,
     user_id: str = Depends(get_current_user_id),

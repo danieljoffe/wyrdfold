@@ -1545,8 +1545,11 @@ async def add_manual_job(
     )
 
 
+# Sync `def` (not `async def`): the bulk re-score is blocking supabase work,
+# so FastAPI runs it in its threadpool and keeps the O(jobs x keywords) DB
+# round-trips off the event loop. See #107.
 @router.post("/rescore/{target_id}", dependencies=[Depends(verify_api_key)])
-async def rescore_for_target(
+def rescore_for_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:

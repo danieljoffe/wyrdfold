@@ -545,7 +545,7 @@ class TestBatchEndpoint:
 
         with patch("app.routers.tailor.get_batch", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
-                await tailor_router.get_batch_status(
+                tailor_router.get_batch_status(
                     batch_id="nonexistent",
                     supabase=supabase,
                 )
@@ -573,7 +573,7 @@ class TestBatchEndpoint:
         )
 
         with patch("app.routers.tailor.get_batch", return_value=batch):
-            result = await tailor_router.get_batch_status(
+            result = tailor_router.get_batch_status(
                 batch_id="batch-1",
                 supabase=supabase,
             )

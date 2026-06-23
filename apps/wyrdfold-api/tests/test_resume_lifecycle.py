@@ -426,7 +426,7 @@ class TestEditResume:
                 return_value=updated_record,
             ),
         ):
-            result = await tailor_router.edit_tailored_resume(
+            result = tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -446,7 +446,7 @@ class TestEditResume:
             patch("app.services.tailor.persistence.get", return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.edit_tailored_resume(
+            tailor_router.edit_tailored_resume(
                 resume_id="nonexistent",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -466,7 +466,7 @@ class TestEditResume:
             patch("app.services.tailor.persistence.get", return_value=record),
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.edit_tailored_resume(
+            tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -498,7 +498,7 @@ class TestEditResume:
                 return_value=record,
             ),
         ):
-            result = await tailor_router.edit_tailored_resume(
+            result = tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=cover_md),
                 supabase=supabase,
@@ -522,7 +522,7 @@ class TestEditResume:
             patch("app.services.tailor.persistence.get", return_value=record),
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.edit_tailored_resume(
+            tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=bad_md),
                 supabase=supabase,
@@ -551,7 +551,7 @@ class TestApproveResume:
                 return_value=approved_record,
             ),
         ):
-            result = await tailor_router.approve_tailored_resume(
+            result = tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -573,7 +573,7 @@ class TestApproveResume:
             "app.services.tailor.persistence.get",
             return_value=already_approved,
         ):
-            result = await tailor_router.approve_tailored_resume(
+            result = tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -592,7 +592,7 @@ class TestApproveResume:
             patch("app.services.tailor.persistence.get", return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.approve_tailored_resume(
+            tailor_router.approve_tailored_resume(
                 resume_id="nonexistent",
                 supabase=supabase,
             )
@@ -617,7 +617,7 @@ class TestApproveResume:
                 return_value=approved_record,
             ),
         ):
-            result = await tailor_router.approve_tailored_resume(
+            result = tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -644,7 +644,7 @@ class TestApproveResume:
                 return_value=approved_record,
             ),
         ):
-            await tailor_router.approve_tailored_resume(
+            tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id="user-7",
@@ -674,7 +674,7 @@ class TestApproveResume:
                 return_value=approved_record,
             ),
         ):
-            await tailor_router.approve_tailored_resume(
+            tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id=None,
@@ -701,7 +701,7 @@ class TestApproveResume:
                 return_value=reopened,
             ),
         ):
-            await tailor_router.unapprove_tailored_resume(
+            tailor_router.unapprove_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id="user-7",
@@ -806,7 +806,7 @@ class TestGetByJob:
             "app.services.tailor.persistence.get_by_job",
             return_value=record,
         ):
-            result = await tailor_router.get_resume_by_job(
+            result = tailor_router.get_resume_by_job(
                 job_posting_id="job-1",
                 supabase=supabase,
             )
@@ -830,7 +830,7 @@ class TestGetByJob:
             "app.services.tailor.persistence.get_by_job",
             return_value=None,
         ):
-            result = await tailor_router.get_resume_by_job(
+            result = tailor_router.get_resume_by_job(
                 job_posting_id="nonexistent",
                 supabase=supabase,
             )
@@ -905,7 +905,7 @@ class TestCheckpointEndpoint:
                 "app.services.tailor.persistence.update_payload_md"
             ) as mock_update,
         ):
-            result = await tailor_router.checkpoint_tailored_resume(
+            result = tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
@@ -934,7 +934,7 @@ class TestCheckpointEndpoint:
                 return_value=True,
             ) as mock_checkpoint,
         ):
-            await tailor_router.checkpoint_tailored_resume(
+            tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(markdown=new_md),
                 supabase=supabase,
@@ -969,7 +969,7 @@ class TestCheckpointEndpoint:
             ) as mock_checkpoint,
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.checkpoint_tailored_resume(
+            tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(markdown=bad_md),
                 supabase=supabase,
@@ -992,7 +992,7 @@ class TestCheckpointEndpoint:
                 "app.services.tailor.versions.checkpoint"
             ) as mock_checkpoint,
         ):
-            result = await tailor_router.checkpoint_tailored_resume(
+            result = tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
@@ -1014,7 +1014,7 @@ class TestCheckpointEndpoint:
             patch("app.services.tailor.persistence.get", return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            await tailor_router.checkpoint_tailored_resume(
+            tailor_router.checkpoint_tailored_resume(
                 resume_id="missing",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
