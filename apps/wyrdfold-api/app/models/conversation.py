@@ -72,6 +72,11 @@ class TurnResult(BaseModel):
     prose_updated: bool
     prose_version: int | None
     done: bool
+    prose_warnings: list[str] = Field(default_factory=list)
+    """Faithfulness warnings for an appended prose chunk (#47): key tokens
+    (numbers, proper-noun names) the LLM put in the append that the user never
+    said this turn. The prose doc is the source of truth the tailor later
+    reproduces, so an unfaithful append silently becomes 'truth' — surface it."""
 
 
 class ProbeResult(BaseModel):

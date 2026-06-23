@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import re
 from typing import Any, cast
 
 from supabase import Client
@@ -40,6 +42,8 @@ from app.services.experience import gap_tracker, optimized, prose, turns
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient, complete_json
 
+logger = logging.getLogger(__name__)
+
 PURPOSE_TURN_ONBOARDING = "conversation.onboarding"
 PURPOSE_TURN_UPDATE = "conversation.update"
 PURPOSE_PROBE = "conversation.probe"
@@ -61,6 +65,107 @@ def _purpose_for(conv_type: ConversationType) -> str:
         if conv_type == "onboarding"
         else PURPOSE_TURN_UPDATE
     )
+
+
+# A bare number, optionally with thousands separators / a decimal. Compared on
+# the digit-core (commas stripped) so "1,200" in the append is supported by
+# "1200" in what the user said.
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# A proper-noun-ish token: a capitalized word, an ALL-CAPS acronym, or a
+# dotted/identifier name like "Next.js" / "Node.js". These are the company /
+# product / skill names the LLM could invent.
+_PROPER_NOUN_RE = re.compile(r"\b[A-Z][A-Za-z0-9.+#/-]{1,}\b")
+# Sentence-initial / common words that get capitalized but aren't names — kept
+# small and conservative so we don't flag legitimate prose.
+_STOPWORD_NAMES = frozenset(
+    {
+        "i",
+        "the",
+        "a",
+        "an",
+        "and",
+        "but",
+        "or",
+        "for",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "with",
+        "as",
+        "led",
+        "built",
+        "shipped",
+        "worked",
+        "this",
+        "that",
+        "they",
+        "he",
+        "she",
+        "we",
+    }
+)
+
+
+def _digit_core(raw: str) -> str:
+    core = raw.replace(",", "")
+    if "." in core:
+        core = core.rstrip("0").rstrip(".")
+    return core
+
+
+def _prose_append_warnings(prose_append: str, user_content: str) -> list[str]:
+    """Key tokens in ``prose_append`` that the user never said this turn (#47).
+
+    ``prose_append`` is concatenated verbatim into the prose doc — the
+    source-of-truth the tailor later faithfully reproduces — on the weakest
+    (Haiku) model, with no faithfulness check today. A fabricated number or
+    company/skill name silently becomes "truth". This cheap guard flags
+    appends whose numbers or proper-noun names are absent from what the user
+    actually said. Conservative by design: numbers (unambiguous) and
+    proper-noun-ish tokens only, so we don't over-flag ordinary restatement.
+
+    Returns warnings; the caller logs them and surfaces them. We do NOT drop
+    the append — that would lose real career content; a human/de-bias step
+    owns the disposition.
+    """
+    source = user_content.lower()
+    source_numbers = {_digit_core(m) for m in _NUMBER_RE.findall(user_content)}
+
+    warnings: list[str] = []
+
+    bad_numbers: list[str] = []
+    seen_num: set[str] = set()
+    for raw in _NUMBER_RE.findall(prose_append):
+        core = _digit_core(raw)
+        if not core or core in source_numbers or raw in seen_num:
+            continue
+        seen_num.add(raw)
+        bad_numbers.append(raw)
+    if bad_numbers:
+        warnings.append(
+            f"prose_append introduced number(s) not in the user's message: "
+            f"{bad_numbers}"
+        )
+
+    bad_names: list[str] = []
+    seen_name: set[str] = set()
+    for token in _PROPER_NOUN_RE.findall(prose_append):
+        low = token.lower()
+        if low in _STOPWORD_NAMES or low in seen_name:
+            continue
+        if low in source:
+            continue
+        seen_name.add(low)
+        bad_names.append(token)
+    if bad_names:
+        warnings.append(
+            f"prose_append introduced name(s) not in the user's message: "
+            f"{bad_names}"
+        )
+
+    return warnings
 
 
 def _history_as_messages(
@@ -154,12 +259,30 @@ async def handle_turn(
 
     new_prose_version: int | None = None
     prose_updated = False
+    prose_warnings: list[str] = []
     if parsed.prose_append and parsed.prose_append.strip():
+        append_text = parsed.prose_append.strip()
+        # Faithfulness guard (#47): the append becomes source-of-truth the
+        # tailor later reproduces verbatim, written by the weakest model with
+        # no check. Flag (don't drop) numbers/names the user never said — we
+        # keep the content (it may be real) but log + surface so it gets a
+        # human check before it hardens into "truth".
+        skip_token = skipped or not user_content.strip()
+        prose_warnings = (
+            [] if skip_token else _prose_append_warnings(append_text, user_content)
+        )
+        if prose_warnings:
+            logger.warning(
+                "prose_append faithfulness flags (user_id=%s, type=%s): %s",
+                user_id,
+                conversation_type,
+                "; ".join(prose_warnings),
+            )
         existing = current_prose.content if current_prose else ""
         new_content = (
-            (existing + "\n\n" + parsed.prose_append.strip()).strip()
+            (existing + "\n\n" + append_text).strip()
             if existing
-            else parsed.prose_append.strip()
+            else append_text
         )
         new_doc = prose.create_version(
             supabase, user_id=user_id, content=new_content
@@ -198,6 +321,7 @@ async def handle_turn(
         prose_updated=prose_updated,
         prose_version=new_prose_version,
         done=parsed.done,
+        prose_warnings=prose_warnings,
     )
 
 

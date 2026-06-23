@@ -257,6 +257,44 @@ def test_validate_keeps_all_valid_refs() -> None:
     assert warnings == []
 
 
+# ---- prose claim-level faithfulness (#47) ---------------------------------
+
+
+def _letter_with_paragraph(text: str) -> TailoredCoverLetter:
+    """A letter whose refs are all valid; only the prose under test varies."""
+    return TailoredCoverLetter(
+        contact=_contact(),
+        recipient_company="Acme Corp",
+        salutation="Dear Acme Hiring Team,",
+        paragraphs=[CoverLetterParagraph(text=text)],
+        closing="Sincerely,",
+        signature="Daniel Joffe",
+        source_outcome_refs=["Cut mobile load times from 10s to 2s"],
+        source_role_refs=["fc"],
+        source_skill_refs=["React"],
+    )
+
+
+def test_validate_warns_on_fabricated_number_in_prose() -> None:
+    # The ref set is clean, but the prose narrates a number the source never
+    # had — the exact gap the validator's old docstring conceded it missed.
+    letter = _letter_with_paragraph(
+        "At FightCamp I grew revenue 40% and shipped 12 features."
+    )
+    cleaned, warnings = validate_cover_letter_refs(letter, _optimized_payload())
+    # WARN, not strip: prose is preserved so legitimate copy isn't mangled.
+    assert cleaned.paragraphs[0].text == letter.paragraphs[0].text
+    assert any("paragraph 1 contains number" in w for w in warnings)
+    assert any("40" in w for w in warnings)
+
+
+def test_validate_prose_with_grounded_numbers_is_silent() -> None:
+    # Numbers that match the source corpus digits ("10s"/"2s") must not warn.
+    letter = _letter_with_paragraph("I cut mobile load times from 10s to 2s.")
+    _, warnings = validate_cover_letter_refs(letter, _optimized_payload())
+    assert warnings == []
+
+
 # ---------------------------------------------------------------------------
 # tailor_cover_letter end-to-end
 # ---------------------------------------------------------------------------

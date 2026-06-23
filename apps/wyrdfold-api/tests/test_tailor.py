@@ -257,6 +257,124 @@ def test_validate_keeps_bullets_matching_role_summary_substring() -> None:
     assert len(cleaned.experience[0].bullets) == 1
 
 
+# ---- claim-level faithfulness (#47) ---------------------------------------
+
+
+def _resume_with_bullet(text: str, ref: str, *, skills: list[str] | None = None,
+                        summary: str = "Senior FE.") -> TailoredResume:
+    return TailoredResume(
+        summary=summary,
+        contact=_contact(),
+        experience=[
+            TailoredRole(
+                company="FightCamp",
+                title="Senior Frontend Engineer",
+                start="2021-11",
+                bullets=[TailoredBullet(text=text, source_outcome_ref=ref)],
+                source_role_ref="fc",
+            )
+        ],
+        skills=skills if skills is not None else [],
+    )
+
+
+def test_validate_drops_bullet_with_fabricated_number_on_valid_ref() -> None:
+    # The ref points at a real outcome ("Cut mobile load times from 10s to 2s")
+    # but the shipped text inflates the win with numbers the source never had.
+    # This is the headline #47 gap: a real ref, a fabricated metric.
+    resume = _resume_with_bullet(
+        "Cut LCP from 10s to 0.5s and grew revenue 40%.",
+        "Cut mobile load times from 10s to 2s",
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.experience[0].bullets == []
+    assert any("fabricated number" in w for w in warnings)
+
+
+def test_validate_keeps_bullet_whose_numbers_are_all_in_source() -> None:
+    # Same ref; every number the bullet ships ("10s", "2s") is in the source.
+    # Faithful text must pass unchanged with no warning.
+    resume = _resume_with_bullet(
+        "Cut mobile LCP from 10s to 2s.",
+        "Cut mobile load times from 10s to 2s",
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert len(cleaned.experience[0].bullets) == 1
+    assert warnings == []
+
+
+def test_validate_rejects_trivial_substring_summary_ref() -> None:
+    # The role summary is "Led the PDP rebuild and cut mobile load times."
+    # A trivial one-word ref ('the') is a substring but not real traceability;
+    # the tightened clause check must reject it (#47 fix 4).
+    resume = _resume_with_bullet("Worked on the team.", "the")
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.experience[0].bullets == []
+    assert any("untraceable" in w for w in warnings)
+
+
+def test_validate_keeps_meaningful_clause_summary_ref() -> None:
+    # A genuine multi-word clause from the summary still traces (no over-strip).
+    resume = _resume_with_bullet("Led the PDP rebuild.", "Led the PDP rebuild")
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert len(cleaned.experience[0].bullets) == 1
+    assert warnings == []
+
+
+def test_validate_drops_unknown_skill_from_resume() -> None:
+    # "Kafka" is not in optimized.skills (React/TypeScript). Drop + warn (#47
+    # fix 2). "react" (lowercase) and "TypeScript" survive via the canonical
+    # map, proving the tolerance carries over from the cover-letter path.
+    resume = _resume_with_bullet(
+        "Led the PDP rebuild.", "Led the PDP rebuild",
+        skills=["react", "TypeScript", "Kafka"],
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.skills == ["React", "TypeScript"]
+    assert any("Kafka" in w for w in warnings)
+
+
+def test_validate_enforces_skills_cap() -> None:
+    # 25 valid skills must be trimmed to the 20 cap, with a warning.
+    payload = OptimizedPayload(
+        roles=[Role(id="fc", company="FightCamp", title="FE", start="2021-11",
+                    summary="Built things across the stack with care.")],
+        skills=[Skill(name=f"Skill{i}") for i in range(25)],
+    )
+    resume = TailoredResume(
+        summary="Senior FE.",
+        contact=_contact(),
+        experience=[],
+        skills=[f"Skill{i}" for i in range(25)],
+    )
+    cleaned, warnings = validate_trace_refs(resume, payload)
+    assert len(cleaned.skills) == 20
+    assert any("cap" in w.lower() for w in warnings)
+
+
+def test_validate_warns_on_fabricated_summary_number_without_stripping() -> None:
+    # The summary is required text (min_length=1), so a fabricated number is
+    # WARNed and surfaced, not stripped (#47 fix 2/conservative policy).
+    resume = _resume_with_bullet(
+        "Led the PDP rebuild.", "Led the PDP rebuild",
+        summary="Senior FE who grew revenue 300% in 18 months.",
+    )
+    cleaned, warnings = validate_trace_refs(resume, _optimized())
+    assert cleaned.summary == "Senior FE who grew revenue 300% in 18 months."
+    assert any("summary contains number" in w for w in warnings)
+
+
+def test_validate_summary_with_grounded_number_is_silent() -> None:
+    # Source corpus has "10s"/"2s"; a summary number that matches the digits
+    # ("2" -> "2s" in source) must not warn.
+    resume = _resume_with_bullet(
+        "Led the PDP rebuild.", "Led the PDP rebuild",
+        summary="Cut load to 2s on the flagship surface.",
+    )
+    _, warnings = validate_trace_refs(resume, _optimized())
+    assert not any("summary contains number" in w for w in warnings)
+
+
 def test_validate_pins_company_from_source_role() -> None:
     # The LLM labels the role with a company the user never worked at; the
     # source_role_ref still points at a real role (#87 employer misattribution).
