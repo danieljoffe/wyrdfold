@@ -80,18 +80,31 @@ export default function OnboardingWizard() {
     setCurrentStep(firstStep);
   }, []);
 
-  const handleSkip = useCallback(() => {
+  const handleSkip = useCallback(async () => {
     // Mark onboarding complete on skip so the user isn't bounced back to
     // /onboarding by the dashboard's completed_at gate. CompletionScreen
     // hits the same endpoint on the "happy path" finish; the API is
-    // idempotent (user_profile.py:404 short-circuits if completed_at is
+    // idempotent (complete_onboarding short-circuits if completed_at is
     // already set) so re-completing after a finish is a no-op.
     //
-    // Fired-and-not-awaited: the navigation should feel instant. If the
-    // POST fails for any reason the user lands on /targets anyway and
-    // the dashboard guard will redirect them back on next visit — same
-    // behavior as before this fix, never worse.
-    void fetch('/api/profile/onboarding/complete', { method: 'POST' });
+    // We MUST await the POST before navigating. Firing it un-awaited and
+    // immediately calling router.push() tore the component down before
+    // the request settled, so in practice the in-flight fetch was
+    // aborted and `onboarding_completed_at` was never written — the next
+    // visit to the dashboard saw a NULL flag and re-fired the wizard
+    // (the "skip doesn't stick" bug). Awaiting guarantees the flag is
+    // persisted before we leave the page.
+    //
+    // On failure we still navigate (degrade gracefully rather than
+    // trapping the user in the wizard); the dashboard guard will bounce
+    // them back on the next visit, which is the pre-fix behaviour — so a
+    // failed POST is never worse than before, and a successful one now
+    // actually sticks.
+    try {
+      await fetch('/api/profile/onboarding/complete', { method: 'POST' });
+    } catch {
+      // Network error — fall through to navigation.
+    }
     router.push('/targets');
   }, [router]);
 

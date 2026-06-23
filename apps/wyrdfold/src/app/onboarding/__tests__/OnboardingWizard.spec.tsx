@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import OnboardingWizard from '../OnboardingWizard';
 
@@ -175,6 +175,56 @@ describe('OnboardingWizard — initial state', () => {
     expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
       method: 'POST',
     });
+  });
+
+  // Regression for the "skip doesn't stick" bug: handleSkip used to fire
+  // the complete POST un-awaited and navigate immediately, so the page
+  // tore down before the request settled and the flag was never written
+  // — the dashboard then re-fired onboarding on the next visit. The skip
+  // MUST persist (await the POST) before navigation. Pre-fix, mockPush
+  // was already called before the deferred fetch resolved → this fails.
+  it('awaits the complete POST BEFORE navigating away (skip persists)', async () => {
+    const user = userEvent.setup();
+
+    // Deferred fetch we resolve by hand, to observe ordering: navigation
+    // must NOT happen until the completion write has resolved.
+    type FetchResult = { ok: boolean; status: number };
+    const deferred: {
+      promise: Promise<FetchResult>;
+      resolve: (value: FetchResult) => void;
+    } = (() => {
+      let resolve!: (value: FetchResult) => void;
+      const promise = new Promise<FetchResult>(res => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    })();
+    mockFetch.mockReturnValueOnce(deferred.promise);
+
+    render(<OnboardingWizard />);
+
+    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+
+    // POST is in flight but unresolved → we must still be on the wizard.
+    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
+      method: 'POST',
+    });
+    expect(mockPush).not.toHaveBeenCalled();
+
+    // Once the completion write settles, navigation proceeds.
+    deferred.resolve({ ok: true, status: 200 });
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+  });
+
+  it('still navigates to /targets if the complete POST fails (graceful degradation)', async () => {
+    const user = userEvent.setup();
+    mockFetch.mockRejectedValueOnce(new Error('network down'));
+
+    render(<OnboardingWizard />);
+
+    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
   });
 });
 
