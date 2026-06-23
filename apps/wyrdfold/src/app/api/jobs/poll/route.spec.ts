@@ -4,11 +4,12 @@
  * Tests for the cron-only global poll trigger (`POST /api/jobs/poll`).
  *
  * The route force-polls every enabled source across all tenants via the
- * upstream API-key-gated `/poll`. The only legitimate caller is the Vercel
+ * upstream operator-key-gated `/poll`. The only legitimate caller is the Vercel
  * cron presenting `CRON_SECRET`. Audit #29: the route used to also accept any
  * authenticated user session, letting any logged-in user trigger the global
- * all-tenant poll. These tests pin the cron-only contract so that regression
- * can't come back.
+ * all-tenant poll. These tests pin the cron-only contract so the regression
+ * can't come back, and pin that the BFF forwards ONLY the narrow
+ * `WYRDFOLD_CRON_KEY` (no fallback to the broad `WYRDFOLD_API_KEY`).
  */
 import { NextRequest } from 'next/server';
 
@@ -23,8 +24,14 @@ jest.mock('@/lib/api/proxy', () => ({
 import { POST } from './route';
 
 const CRON = 'test-cron-secret';
-const API_KEY = 'test-api-key';
+const CRON_KEY = 'test-cron-key';
 const BASE_URL = 'http://api.test';
+const ENV_KEYS = [
+  'CRON_SECRET',
+  'WYRDFOLD_API_KEY',
+  'WYRDFOLD_CRON_KEY',
+  'WYRDFOLD_API_URL',
+];
 
 function setEnv(name: string, value: string | undefined): void {
   if (value === undefined) {
@@ -48,24 +55,21 @@ describe('POST /api/jobs/poll (cron-only)', () => {
   const realFetch = global.fetch;
 
   beforeEach(() => {
-    for (const k of ['CRON_SECRET', 'WYRDFOLD_API_KEY', 'WYRDFOLD_API_URL']) {
-      original[k] = process.env[k];
-    }
+    for (const k of ENV_KEYS) original[k] = process.env[k];
     setEnv('CRON_SECRET', CRON);
-    setEnv('WYRDFOLD_API_KEY', API_KEY);
+    setEnv('WYRDFOLD_CRON_KEY', CRON_KEY);
+    setEnv('WYRDFOLD_API_KEY', undefined);
     setEnv('WYRDFOLD_API_URL', BASE_URL);
     mockGetAccessToken.mockReset();
     global.fetch = jest.fn();
   });
 
   afterEach(() => {
-    for (const k of ['CRON_SECRET', 'WYRDFOLD_API_KEY', 'WYRDFOLD_API_URL']) {
-      setEnv(k, original[k]);
-    }
+    for (const k of ENV_KEYS) setEnv(k, original[k]);
     global.fetch = realFetch;
   });
 
-  it('forwards to upstream /poll with the API key when the cron secret matches', async () => {
+  it('forwards to upstream /poll with the cron key when the cron secret matches', async () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce(
       new Response(JSON.stringify({ sources_polled: 3, new_jobs: 7 }), {
         status: 200,
@@ -85,9 +89,20 @@ describe('POST /api/jobs/poll (cron-only)', () => {
     expect((init as RequestInit).method).toBe('POST');
     expect(
       (init as { headers: Record<string, string> }).headers['x-api-key']
-    ).toBe(API_KEY);
+    ).toBe(CRON_KEY);
     // The session path must be gone — getAccessToken is never consulted.
     expect(mockGetAccessToken).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fall back to WYRDFOLD_API_KEY — cron key only (#29 migration)', async () => {
+    setEnv('WYRDFOLD_CRON_KEY', undefined);
+    setEnv('WYRDFOLD_API_KEY', 'the-broad-legacy-key');
+
+    const res = await POST(req(`Bearer ${CRON}`));
+
+    // No cron key -> 503, even though the broad legacy key is present.
+    expect(res.status).toBe(503);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 
   it('rejects an authenticated user session (no cron secret) with 403 — the priv-esc fix', async () => {
@@ -128,8 +143,8 @@ describe('POST /api/jobs/poll (cron-only)', () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  it('returns 503 when WYRDFOLD_API_KEY is missing even for a valid cron call', async () => {
-    setEnv('WYRDFOLD_API_KEY', undefined);
+  it('returns 503 when WYRDFOLD_CRON_KEY is missing even for a valid cron call', async () => {
+    setEnv('WYRDFOLD_CRON_KEY', undefined);
 
     const res = await POST(req(`Bearer ${CRON}`));
 
