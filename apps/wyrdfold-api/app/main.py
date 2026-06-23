@@ -33,6 +33,7 @@ from app.routers import (
     tailor,
     targets,
     user_profile,
+    waitlist,
 )
 from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
@@ -318,6 +319,7 @@ app.include_router(status.router)
 app.include_router(tailor.router)
 app.include_router(targets.router)
 app.include_router(user_profile.router)
+app.include_router(waitlist.router)
 
 
 @app.get("/health")
