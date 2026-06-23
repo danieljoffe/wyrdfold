@@ -2,6 +2,16 @@
 builder = "DOCKERFILE"
 dockerfilePath = "apps/wyrdfold-api/Dockerfile"
 
+# NOTE: Railway config-as-code only covers the build/deploy SETTINGS sections
+# — it cannot define service environment variables (those live in the Railway
+# dashboard / CLI `railway variables`). Set these there for production:
+#   - SENTRY_ENVIRONMENT=production   (so Sentry tags events as prod; the
+#     default in app/config.py is "development")
+#   - DEBUG_ERRORS is intentionally LEFT UNSET → fail-closed generic 500
+#     bodies. The 500 handler in app/main.py no longer keys verbose error
+#     detail off SENTRY_ENVIRONMENT (that was fail-open, audit #29 R3 / H5);
+#     it is generic by default and only verbose when DEBUG_ERRORS=true.
+
 [deploy]
 startCommand = "uv run --package wyrdfold-api uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8001}"
 healthcheckPath = "/health"

@@ -1150,7 +1150,12 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
     try:
         assert_safe_host(hostname)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"Refusing to fetch JD URL: {exc}") from exc
+        # Generic client message — echoing the resolved host/IP back is an
+        # internal-recon oracle (audit #29 R3 / H8). Keep specifics in logs.
+        logger.warning("ssrf_reject JD host=%s: %s", hostname, exc)
+        raise HTTPException(
+            status_code=422, detail="This URL cannot be fetched"
+        ) from exc
 
     # Size-capped streaming fetch — without this, a user-pasted URL
     # pointing to a huge payload could OOM the API (the shared
@@ -1166,8 +1171,11 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
             detail=f"JD page too large to fetch ({exc.size} bytes > {exc.limit}).",
         ) from exc
     except UnsafeURLError as exc:
+        # A redirect hop resolved to an internal address — don't reflect it
+        # (audit #29 R3 / H8).
+        logger.warning("ssrf_reject JD redirect for %s: %s", url, exc)
         raise HTTPException(
-            status_code=422, detail=f"Refusing to fetch JD URL after redirect: {exc}"
+            status_code=422, detail="This URL cannot be fetched"
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail="Failed to fetch JD URL") from exc
@@ -1177,9 +1185,13 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
         try:
             assert_safe_host(final_hostname)
         except ValueError as exc:
+            # Don't reflect the resolved internal host/IP (audit #29 R3 / H8).
+            logger.warning(
+                "ssrf_reject JD redirect host=%s: %s", final_hostname, exc
+            )
             raise HTTPException(
                 status_code=422,
-                detail=f"Refusing to fetch JD URL after redirect: {exc}",
+                detail="This URL cannot be fetched",
             ) from exc
 
     # The stream was consumed by ``get_with_size_cap`` so ``resp.text``

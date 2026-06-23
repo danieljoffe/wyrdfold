@@ -746,8 +746,13 @@ async def download_tailored_resume(
                     persistence.download_docx, user_supabase, row.storage_path
                 )
             except Exception as exc:
+                # Generic client message — the raw exception (Storage path,
+                # internal errors) stays server-side only (audit #29 R3 / M4).
+                _log.exception(
+                    "docx storage fetch failed for resume_id=%s", resume_id
+                )
                 raise HTTPException(
-                    status_code=502, detail=f"storage fetch failed: {exc}"
+                    status_code=502, detail="failed to fetch resume document"
                 ) from exc
             filename = f"{row.id}.docx"
             return Response(
@@ -759,10 +764,16 @@ async def download_tailored_resume(
         try:
             data = await asyncio.to_thread(md_to_docx, row.payload_md, style)
         except PandocNotInstalledError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except PandocRenderError as exc:
+            # Server misconfiguration — don't echo the raw error (which can
+            # name internal paths) to the client (audit #29 R3 / M4).
+            _log.exception("pandoc not installed while rendering resume_id=%s", resume_id)
             raise HTTPException(
-                status_code=500, detail=f"docx render failed: {exc}"
+                status_code=500, detail="failed to render resume document"
+            ) from exc
+        except PandocRenderError as exc:
+            _log.exception("docx render failed for resume_id=%s", resume_id)
+            raise HTTPException(
+                status_code=500, detail="failed to render resume document"
             ) from exc
 
         try:
@@ -796,8 +807,13 @@ async def download_tailored_resume(
                 persistence.download_docx, user_supabase, row.storage_path  # type: ignore[arg-type]
             )
         except Exception as exc:
+            # Generic client message — raw exception stays server-side only
+            # (audit #29 R3 / M4).
+            _log.exception(
+                "docx storage fetch failed for resume_id=%s", resume_id
+            )
             raise HTTPException(
-                status_code=502, detail=f"storage fetch failed: {exc}"
+                status_code=502, detail="failed to fetch resume document"
             ) from exc
 
     filename = f"{row.id}.docx"
