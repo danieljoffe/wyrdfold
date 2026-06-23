@@ -136,7 +136,7 @@ async def derive_manual_target_bg(
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
             derived, derive_result = await derive_profile_from_label(
-                llm, label=label, payload=payload
+                llm, label=label
             )
             cost_log.record(
                 supabase,

@@ -19,7 +19,13 @@ from app.models.targets import (
     NegativeProfile,
     ScoringProfile,
     SeniorityProfile,
+    TargetReferenceJD,
 )
+
+# Reference JDs with no contributor (legacy rows, operator/system seeds) are
+# pooled under one synthetic contributor so they collectively count as a single
+# voice in the de-bias, not one-per-JD.
+_SYSTEM_CONTRIBUTOR = "__system__"
 
 
 def merge_profiles(profiles: list[ScoringProfile]) -> ScoringProfile:
@@ -35,6 +41,41 @@ def merge_profiles(profiles: list[ScoringProfile]) -> ScoringProfile:
         domain=_merge_domain(profiles),
         negative=_merge_negative(profiles),
     )
+
+
+def merge_by_contributor(
+    profiles_by_contributor: list[list[ScoringProfile]],
+) -> ScoringProfile:
+    """De-bias the composite by contributor.
+
+    Two-level merge: collapse each contributor's JDs into one per-contributor
+    profile, then merge those per-contributor profiles with equal weight. A user
+    who contributes five JDs therefore counts the same as a user who contributes
+    one — the shared rubric reflects the *breadth* of contributors, not whoever
+    was most prolific (#5 refinement layer). Reuses ``merge_profiles`` at both
+    levels so the averaging/union semantics stay identical to the single-level
+    merge it replaces.
+    """
+    per_contributor = [
+        merge_profiles(profiles) for profiles in profiles_by_contributor if profiles
+    ]
+    return merge_profiles(per_contributor)
+
+
+def merge_reference_jds(ref_jds: list[TargetReferenceJD]) -> ScoringProfile:
+    """Merge a target's reference JDs into the shared profile, de-biased by
+    contributor. ``suppressed`` contributions (down-voted past the quorum, #5
+    P3) are excluded. Groups the rest by ``user_id`` (NULL → one shared
+    "system" contributor) in first-contributed order, then defers to
+    :func:`merge_by_contributor`.
+    """
+    by_contributor: dict[str, list[ScoringProfile]] = {}
+    for jd in ref_jds:
+        if jd.suppressed:
+            continue
+        key = jd.user_id or _SYSTEM_CONTRIBUTOR
+        by_contributor.setdefault(key, []).append(jd.extracted_profile)
+    return merge_by_contributor(list(by_contributor.values()))
 
 
 def _merge_categories(

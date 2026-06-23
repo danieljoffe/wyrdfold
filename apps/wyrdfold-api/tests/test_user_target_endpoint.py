@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from app.dependencies import (
     get_current_user_id,
+    get_current_user_id_optional,
     get_supabase,
     verify_api_key_or_jwt,
 )
@@ -52,6 +53,9 @@ def _user_target() -> UserTarget:
 def client() -> TestClient:
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
+    # GET /targets/{id} now resolves the caller via the optional dep and
+    # ownership-checks it (#29 round 3 / M3), so the fixture must supply it.
+    app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
     app.dependency_overrides.clear()
@@ -122,6 +126,11 @@ def test_does_not_collide_with_get_target_route(
     monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: _job_target())
     monkeypatch.setattr(
         router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target()
+    )
+    # GET /targets/{id} ownership-checks the caller (#29 round 3 / M3); the
+    # fixture user owns target-1.
+    monkeypatch.setattr(
+        router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"}
     )
 
     plain = client.get("/targets/target-1")

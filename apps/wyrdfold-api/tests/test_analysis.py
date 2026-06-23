@@ -365,6 +365,7 @@ async def test_router_cache_hit_skips_llm(
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -418,6 +419,7 @@ async def test_router_cache_miss_runs_llm_and_persists(
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -448,6 +450,7 @@ async def test_router_missing_optimized_doc_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -485,6 +488,7 @@ async def test_router_empty_description_returns_422(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -519,6 +523,7 @@ async def test_router_missing_job_posting_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -551,6 +556,7 @@ async def test_router_missing_target_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -561,10 +567,56 @@ async def test_router_missing_target_returns_404(
         app.dependency_overrides.clear()
 
 
+async def test_router_blend_writes_score_via_caller_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#6 R2: the scores blend is written via the user_apply_score_blend
+    SECURITY DEFINER RPC on the caller's client — not a direct service-role
+    scores update."""
+    cached_record = JobAnalysisRecord.model_validate(_analysis_record_row())
+    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: cached_record)
+
+    from app.services.experience import optimized as opt_mod
+
+    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+
+    supabase = MagicMock(name="service_role")
+    # The keyword-score read in _apply_llm_blend (.select.eq.eq.limit.execute).
+    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+        {"score": 60}
+    ]
+    caller = MagicMock(name="caller")
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_supabase_for_caller] = lambda: caller
+    app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
+    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+
+    try:
+        resp = TestClient(app).post("/analysis/job-1?target_id=tgt-1")
+        assert resp.status_code == 200
+        # Gated write goes through the RPC on the caller client...
+        caller.rpc.assert_called_once()
+        assert caller.rpc.call_args[0][0] == "user_apply_score_blend"
+        rpc_args = caller.rpc.call_args[0][1]
+        assert rpc_args["p_job_posting_id"] == "job-1"
+        assert rpc_args["p_target_id"] == "tgt-1"
+        # ...not via a direct service-role scores UPDATE.
+        supabase.table.return_value.update.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+
+
 # Need these imports for dependency overrides
 from app.dependencies import (
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )

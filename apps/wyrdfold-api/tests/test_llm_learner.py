@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.models.learning import ProfilePatch
+from app.models.learning import ProfilePatch, RescoreProjection
 from app.models.llm import LLMResult, LLMUsage
 from app.services.llm_learner import (
     _apply_patch_to_profile,
@@ -273,6 +273,60 @@ async def test_high_confidence_patch_auto_applies(
     assert target_updates, "expected a targets update"
     payload = target_updates[0]["payload"]
     assert payload["profile_version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_outlier_patch_is_staged_by_learning_rate_cap(
+    fake: _FakeSupabase,
+) -> None:
+    """A confident patch that the re-score projection flags as an outlier is
+    staged for review, NOT auto-applied — the learning-rate cap (#5 P4)."""
+    fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
+    fake.push("targets", "select", [_target_row(profile_version=1)])
+    fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
+    fake.push("target_learning_log", "insert", [
+        {
+            "id": "cap-1", "user_id": "u", "target_id": "t",
+            "status": "staged",
+            "prev_profile": {}, "next_profile": {}, "diff": {},
+            "confidence": 0.95, "rationale": "outlier",
+            "signals_consumed": 3, "applied_run_id": None,
+            "created_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    ])
+
+    capped = RescoreProjection(
+        jobs_considered=20, jobs_moved=12, moved_fraction=0.6,
+        max_abs_delta=40, move_threshold=20, max_moved_fraction=0.30, capped=True,
+    )
+    patch_obj = ProfilePatch(
+        add_negative=["sales"], confidence=0.95, rationale="confident but broad"
+    )
+    with patch(
+        "app.services.llm_learner.complete_json",
+        return_value=(patch_obj, _llm_result()),
+    ), patch(
+        "app.services.llm_learner._project_patch_impact",
+        return_value=capped,
+    ):
+        result = await run_llm_learner(
+            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+        )
+
+    assert result is not None
+    assert result.applied is False
+    # High confidence, yet NOT applied: no target mutation, no feedback stamp.
+    assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
+    assert [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"] == []
+    # The staged row records the projection + an auto-stage note in the rationale.
+    log_insert = next(
+        r for r in fake.log
+        if r["table"] == "target_learning_log" and r["op"] == "insert"
+    )
+    assert log_insert["payload"]["status"] == "staged"
+    assert log_insert["payload"]["projection"] == capped.model_dump(mode="json")
+    assert "learning-rate cap" in log_insert["payload"]["rationale"]
 
 
 @pytest.mark.asyncio

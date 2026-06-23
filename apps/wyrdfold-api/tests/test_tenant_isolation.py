@@ -21,6 +21,7 @@ from app.dependencies import (
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.services.llm.mock import MockLLMClient
@@ -92,6 +93,7 @@ async def test_analysis_unowned_target_is_404_before_any_work(
             get_llm_client: lambda: llm,
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
+            get_supabase_for_caller: lambda: MagicMock(),
             enforce_llm_budget: lambda: None,
         }
     )
@@ -124,6 +126,7 @@ async def test_analysis_owned_target_passes_gate(
             get_llm_client: lambda: MockLLMClient(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
+            get_supabase_for_caller: lambda: MagicMock(),
             enforce_llm_budget: lambda: None,
         }
     )

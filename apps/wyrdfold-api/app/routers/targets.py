@@ -15,12 +15,14 @@ from postgrest.types import CountMethod
 from supabase import Client
 
 from app.cache import job_list_cache, jobs_cache_prefix
+from app.config import settings
 from app.dependencies import (
     enforce_llm_budget,
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
+    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -29,6 +31,7 @@ from app.models.diagnostics import TargetFunnelResponse
 from app.models.schemas import PollResult
 from app.models.targets import (
     AxisWeights,
+    ContributionVoteResult,
     CreateOrLinkResult,
     DeleteResponse,
     JobTarget,
@@ -37,6 +40,7 @@ from app.models.targets import (
     NotificationThresholdsUpdate,
     ReferenceJDAdd,
     ReferenceJDsListResponse,
+    ReferenceJDVote,
     ScoringProfile,
     TargetCreate,
     TargetFromManual,
@@ -65,7 +69,7 @@ from app.services.source_discovery import (
     run_discovery_for_target,
 )
 from app.services.target_scoring import score_title_and_upsert
-from app.services.targets import crud, from_input
+from app.services.targets import crud, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -87,7 +91,7 @@ from app.services.targets.lateral_discovery import (
     suggest_lateral_targets,
 )
 from app.services.targets.match import suggest_and_match
-from app.services.targets.merge import merge_profiles
+from app.services.targets.merge import merge_reference_jds
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
 from app.services.validate import assert_safe_host, validate_job_url
 
@@ -165,31 +169,51 @@ def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_i
 async def _activate_pipeline(
     supabase: Client, llm: LLMClient, target: JobTarget, user_id: str
 ) -> None:
-    """Derive profile (if needed) then poll jobs for a target. Runs as BackgroundTask."""
+    """Derive profile (if needed) then poll jobs for a target. Runs as BackgroundTask.
+
+    Genuinely async (awaits the LLM derive + the poller), so it stays
+    ``async def`` and runs on the event loop. supabase-py is synchronous, so
+    each blocking ``crud``/``optimized`` round-trip is offloaded via
+    ``asyncio.to_thread`` to keep it off the loop. See #107.
+    """
     target_id = target.id
     needs_derive = not target.search_keywords or not target.scoring_profile.categories
 
     try:
         if needs_derive:
             # Step 1: derive profile + search keywords from label
-            crud.update(supabase, target_id, TargetUpdate(activation_status="deriving"))
-            doc = optimized.get_latest(supabase, user_id=user_id)
+            await asyncio.to_thread(
+                crud.update,
+                supabase,
+                target_id,
+                TargetUpdate(activation_status="deriving"),
+            )
+            doc = await asyncio.to_thread(
+                optimized.get_latest, supabase, user_id=user_id
+            )
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
-                crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+                await asyncio.to_thread(
+                    crud.update,
+                    supabase,
+                    target_id,
+                    TargetUpdate(activation_status="error"),
+                )
                 return
 
             derived, result = await derive_profile_from_label(
-                llm, label=target.label, payload=doc.payload
+                llm, label=target.label
             )
-            cost_log.record(
+            await asyncio.to_thread(
+                cost_log.record,
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_LABEL_PURPOSE,
                 result=result,
                 metadata={"target_id": target_id, "trigger": "activation"},
             )
-            updated = crud.update(
+            updated = await asyncio.to_thread(
+                crud.update,
                 supabase,
                 target_id,
                 TargetUpdate(
@@ -211,7 +235,12 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        crud.update(supabase, target_id, TargetUpdate(activation_status="polling"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="polling"),
+        )
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: %d sources, %d new jobs",
@@ -235,17 +264,28 @@ async def _activate_pipeline(
             retro_scored,
         )
 
-        crud.update(supabase, target_id, TargetUpdate(activation_status="ready"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="ready"),
+        )
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(activation_status="error"),
+        )
 
 
 # ---- Target CRUD -----------------------------------------------------------
 
 
+# Sync `def`: blocking supabase write runs in the threadpool (#107).
 @router.post("", response_model=JobTarget, status_code=201)
-async def create_target(
+def create_target(
     body: TargetCreate,
     supabase: Client = Depends(get_supabase),
 ) -> JobTarget:
@@ -485,7 +525,14 @@ def get_my_targets(
 def get_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
+    # Targets are shared, service-role-read (no RLS backstop). Without this
+    # guard any authenticated user could read any target's full JD text and
+    # scoring profile by id (audit #29 round 3 / M3). Operators (api-key,
+    # user_id None) bypass; non-owners get 404 so they can't enumerate
+    # target existence.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     target = crud.get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -533,12 +580,16 @@ def update_target(
     return target
 
 
+# Sync `def` (not `async def`): the foreground body is blocking supabase work
+# (link + reads), so FastAPI runs it in its threadpool and keeps it off the
+# event loop. The async LLM/poll work runs after the response as the
+# ``_activate_pipeline`` BackgroundTask. See #107.
 @router.post(
     "/{target_id}/activate",
     response_model=JobTarget,
     dependencies=[Depends(enforce_llm_budget)],
 )
-async def activate_target(
+def activate_target(
     target_id: str,
     background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
@@ -610,8 +661,9 @@ async def discover_sources_for_target_endpoint(
     return await run_discovery_for_target(supabase, target)
 
 
+# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
 @router.post("/{target_id}/deactivate", response_model=JobTarget)
-async def deactivate_target(
+def deactivate_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -636,8 +688,10 @@ async def deactivate_target(
 #   snapshots, so undo recovers the prior custom weights.
 
 
+# Sync `def` (not `async def`): blocking supabase round-trips run in the
+# threadpool, keeping them off the event loop. See #107.
 @router.patch("/{target_id}/axis-weights", response_model=UserTarget)
-async def set_axis_weights(
+def set_axis_weights(
     target_id: str,
     weights: AxisWeights,
     supabase: Client = Depends(get_supabase),
@@ -664,8 +718,9 @@ async def set_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.delete("/{target_id}/axis-weights", response_model=UserTarget)
-async def reset_axis_weights(
+def reset_axis_weights(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -691,8 +746,9 @@ async def reset_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.post("/{target_id}/axis-weights/undo", response_model=UserTarget)
-async def undo_axis_weights(
+def undo_axis_weights(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
@@ -713,8 +769,9 @@ async def undo_axis_weights(
     return updated
 
 
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.patch("/{target_id}/notification-thresholds", response_model=UserTarget)
-async def set_notification_thresholds(
+def set_notification_thresholds(
     target_id: str,
     body: NotificationThresholdsUpdate,
     supabase: Client = Depends(get_supabase),
@@ -834,7 +891,7 @@ async def derive_target_profile(
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
-    derived, result = await derive_profile_from_label(llm, label=target.label, payload=doc.payload)
+    derived, result = await derive_profile_from_label(llm, label=target.label)
     cost_log.record(
         supabase,
         user_id=user_id,
@@ -895,8 +952,13 @@ async def poll_jobs_for_target(
 def get_target_status(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> TargetStatusResponse:
     """Return activation status and job count for a target."""
+    # Without this, any authenticated user could read any target's
+    # activation status + scored-job count by id (audit #29 round 3 / M2).
+    # Operators (user_id None) bypass; non-owners get 404.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     target = crud.get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -923,12 +985,14 @@ def get_target_status(
     )
 
 
+# Sync `def`: the funnel report is blocking supabase work; the threadpool
+# keeps it off the event loop (#107).
 @router.get(
     "/{target_id}/funnel",
     response_model=TargetFunnelResponse,
     dependencies=[Depends(verify_api_key)],
 )
-async def get_target_funnel(
+def get_target_funnel(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> TargetFunnelResponse:
@@ -944,8 +1008,10 @@ async def get_target_funnel(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+# Sync `def`: blocking supabase ownership-check + delete run in the
+# threadpool (#107).
 @router.delete("/{target_id}", response_model=DeleteResponse)
-async def delete_target(
+def delete_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -1096,7 +1162,12 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
     try:
         assert_safe_host(hostname)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"Refusing to fetch JD URL: {exc}") from exc
+        # Generic client message — echoing the resolved host/IP back is an
+        # internal-recon oracle (audit #29 R3 / H8). Keep specifics in logs.
+        logger.warning("ssrf_reject JD host=%s: %s", hostname, exc)
+        raise HTTPException(
+            status_code=422, detail="This URL cannot be fetched"
+        ) from exc
 
     # Size-capped streaming fetch — without this, a user-pasted URL
     # pointing to a huge payload could OOM the API (the shared
@@ -1112,8 +1183,11 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
             detail=f"JD page too large to fetch ({exc.size} bytes > {exc.limit}).",
         ) from exc
     except UnsafeURLError as exc:
+        # A redirect hop resolved to an internal address — don't reflect it
+        # (audit #29 R3 / H8).
+        logger.warning("ssrf_reject JD redirect for %s: %s", url, exc)
         raise HTTPException(
-            status_code=422, detail=f"Refusing to fetch JD URL after redirect: {exc}"
+            status_code=422, detail="This URL cannot be fetched"
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail="Failed to fetch JD URL") from exc
@@ -1123,9 +1197,13 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
         try:
             assert_safe_host(final_hostname)
         except ValueError as exc:
+            # Don't reflect the resolved internal host/IP (audit #29 R3 / H8).
+            logger.warning(
+                "ssrf_reject JD redirect host=%s: %s", final_hostname, exc
+            )
             raise HTTPException(
                 status_code=422,
-                detail=f"Refusing to fetch JD URL after redirect: {exc}",
+                detail="This URL cannot be fetched",
             ) from exc
 
     # The stream was consumed by ``get_with_size_cap`` so ``resp.text``
@@ -1177,10 +1255,17 @@ async def add_reference_jd(
     is provided, the server fetches the page and extracts JD text via the
     same cascade used by ``POST /jobs/manual`` (JSON-LD → meta tags →
     Firecrawl).
+
+    Genuinely async (awaits URL validation, the JD fetch, and the LLM
+    derive), so it stays ``async def``. supabase-py is synchronous, so each
+    blocking ``crud``/``cost_log`` round-trip is offloaded via
+    ``asyncio.to_thread`` to keep it off the event loop. See #107.
     """
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    await asyncio.to_thread(
+        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
+    )
     # Verify target exists
-    target = crud.get(supabase, target_id)
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
@@ -1200,9 +1285,15 @@ async def add_reference_jd(
             raise HTTPException(status_code=422, detail="Either jd_text or jd_url is required")
         _, body.jd_text = await _fetch_jd_from_url(body.jd_url)
 
+    # Bind to a non-None local: ``body.jd_text`` is guaranteed set past this
+    # point, but the narrowing wouldn't survive into the deferred to_thread
+    # closure below.
+    jd_text = body.jd_text
+
     # Derive profile from JD via LLM (cached by content hash + prompt version)
-    derived, result = await derive_profile_from_jd(llm, jd_text=body.jd_text, supabase=supabase)
-    cost_log.record(
+    derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=DEFAULT_PURPOSE,
@@ -1210,24 +1301,30 @@ async def add_reference_jd(
         metadata={"target_id": target_id, "jd_url": body.jd_url or ""},
     )
 
-    # Store the reference JD
-    crud.add_reference_jd(
-        supabase,
-        target_id=target_id,
-        jd_text=body.jd_text,
-        jd_url=body.jd_url,
-        extracted_profile=derived.scoring_profile,
+    # Store the reference JD, attributed to the contributing user so the
+    # merge can de-bias by contributor (#5 refinement layer).
+    await asyncio.to_thread(
+        lambda: crud.add_reference_jd(
+            supabase,
+            target_id=target_id,
+            jd_text=jd_text,
+            jd_url=body.jd_url,
+            extracted_profile=derived.scoring_profile,
+            user_id=user_id,
+        )
     )
 
-    # Merge all reference JD profiles into composite
-    all_ref_jds = crud.list_reference_jds(supabase, target_id)
-    composite = merge_profiles([jd.extracted_profile for jd in all_ref_jds])
+    # Merge all reference JD profiles into composite, de-biased by contributor
+    # (each user counts once regardless of how many JDs they've added).
+    all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
+    composite = merge_reference_jds(all_ref_jds)
 
     # Update target with merged profile + search keywords, bump version for re-scoring.
     # Example title pools come from the LATEST JD only — these are concrete
     # examples not weighted aggregates, and merging across JDs would dilute
     # the few-shot signal. The latest JD overwrites; pools stay coherent.
-    updated = crud.update(
+    updated = await asyncio.to_thread(
+        crud.update,
         supabase,
         target_id,
         TargetUpdate(
@@ -1243,20 +1340,34 @@ async def add_reference_jd(
     return updated
 
 
+# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/{target_id}/reference-jds", response_model=ReferenceJDsListResponse)
-async def list_reference_jds(
+def list_reference_jds(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ReferenceJDsListResponse:
+    # Reference JDs are read via the service-role client with no RLS
+    # backstop. Without this guard any authenticated user could read any
+    # target's full reference-JD text by id (audit #29 round 3 / M3).
+    # Operators (user_id None) bypass; non-owners get 404.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     ref_jds = crud.list_reference_jds(supabase, target_id)
-    return ReferenceJDsListResponse(reference_jds=ref_jds)
+    # Strip the contributor ``user_id``: the contribution graph is meant to
+    # be anonymous (votes are anonymous, #5 P3), and surfacing the
+    # per-row ``user_id`` here deanonymizes who contributed each JD.
+    anonymized = [jd.model_copy(update={"user_id": None}) for jd in ref_jds]
+    return ReferenceJDsListResponse(reference_jds=anonymized)
 
 
+# Sync `def` (not `async def`): the whole body is blocking supabase work
+# (ownership check, delete, re-merge read, update), so FastAPI runs it in its
+# threadpool and keeps it off the event loop. See #107.
 @router.delete(
     "/{target_id}/reference-jds/{ref_jd_id}",
     response_model=JobTarget,
 )
-async def delete_reference_jd(
+def delete_reference_jd(
     target_id: str,
     ref_jd_id: str,
     supabase: Client = Depends(get_supabase),
@@ -1268,14 +1379,19 @@ async def delete_reference_jd(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    deleted = crud.delete_reference_jd(supabase, ref_jd_id, target_id=target_id)
+    # A regular caller may only remove their OWN contribution; operators
+    # (user_id None) may remove any. A non-owner's delete matches no rows and
+    # returns 404 — without enumerating who contributed it.
+    deleted = crud.delete_reference_jd(
+        supabase, ref_jd_id, target_id=target_id, user_id=user_id
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
-    # Re-merge remaining profiles
+    # Re-merge remaining profiles, de-biased by contributor.
     remaining = crud.list_reference_jds(supabase, target_id)
     if remaining:
-        composite = merge_profiles([jd.extracted_profile for jd in remaining])
+        composite = merge_reference_jds(remaining)
     else:
         composite = ScoringProfile()
 
@@ -1291,3 +1407,74 @@ async def delete_reference_jd(
     if updated is None:
         raise HTTPException(status_code=404, detail="Target not found")
     return updated
+
+
+# Sync `def` (not `async def`): the whole body is blocking supabase work
+# (vote write + tally + conditional re-merge), so FastAPI runs it in its
+# threadpool, keeping it off the event loop. slowapi's @limiter.limit works
+# on sync handlers too (it reads the `request` arg). See #107.
+@router.post(
+    "/{target_id}/reference-jds/{ref_jd_id}/vote",
+    response_model=ContributionVoteResult,
+)
+@limiter.limit("30/minute")
+def vote_on_reference_jd(
+    request: Request,
+    target_id: str,
+    ref_jd_id: str,
+    body: ReferenceJDVote,
+    supabase: Client = Depends(get_supabase),
+    user_supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> ContributionVoteResult:
+    """Up/down-vote (or clear) a reference-JD contribution (#5 P3).
+
+    A target's followers moderate its contributions: once a contribution's net
+    down-votes reach the quorum it is suppressed from the shared-profile merge
+    and the profile is re-merged without it (and restored if up-votes later
+    rescue it). Votes are anonymous — only the caller's own vote and the
+    suppression outcome are returned, never the tally or who voted.
+    """
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+
+    # The contribution must belong to this target — no cross-target voting, and
+    # a 404 rather than leaking the existence of another target's JD.
+    if not any(j.id == ref_jd_id for j in crud.list_reference_jds(supabase, target_id)):
+        raise HTTPException(status_code=404, detail="Reference JD not found")
+
+    # The caller's vote goes through their RLS client (DB enforces own-row).
+    votes.set_user_vote(
+        user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
+    )
+
+    # Tally every vote (service-role) and reconcile the suppression flag.
+    suppressed, changed = votes.recompute_suppression(
+        supabase,
+        reference_jd_id=ref_jd_id,
+        quorum=settings.contribution_downvote_quorum,
+    )
+
+    profile_version: int | None = None
+    if changed:
+        # Suppression flipped — re-merge the shared profile over the now
+        # (un)suppressed set and bump the version so lazy re-scoring picks it up.
+        target = crud.get(supabase, target_id)
+        if target is not None:
+            composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
+            updated = crud.update(
+                supabase,
+                target_id,
+                TargetUpdate(
+                    scoring_profile=composite,
+                    profile_version=target.profile_version + 1,
+                ),
+            )
+            if updated is not None:
+                profile_version = updated.profile_version
+
+    return ContributionVoteResult(
+        reference_jd_id=ref_jd_id,
+        your_vote=body.value,
+        suppressed=suppressed,
+        profile_version=profile_version,
+    )

@@ -1,8 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { type NextRequest, NextResponse } from 'next/server';
 
-import { getAccessToken } from '@/lib/api/proxy';
-
 function constantTimeEqual(a: string, b: string): boolean {
   const aBuf = Buffer.from(a, 'utf8');
   const bBuf = Buffer.from(b, 'utf8');
@@ -10,28 +8,56 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf);
 }
 
+/**
+ * Cron-only global poll trigger.
+ *
+ * This route force-polls EVERY enabled source across ALL tenants via the
+ * upstream API-key-gated `/poll` endpoint (RLS-bypassed, service-role).
+ * It is a privileged, cost-bearing, all-tenant fan-out — the only legitimate
+ * caller is the Vercel cron defined in `vercel.json`
+ * (`{ path: "/api/jobs/poll", schedule: "0 9 * * *" }`), which presents the
+ * `CRON_SECRET` as a Bearer token.
+ *
+ * It is NOT user-facing: nothing in the app calls it from a user action
+ * (verified — no `/api/jobs/poll` references in the frontend). The
+ * per-user "refresh now" surface is the separately authenticated,
+ * ownership-checked `/api/targets/[id]/poll-jobs` route, which forwards the
+ * user's JWT and polls only that target's sources.
+ *
+ * Previously this route also accepted any authenticated user session and
+ * then forwarded with the shared `WYRDFOLD_API_KEY`, letting any logged-in
+ * user trigger the global all-tenant poll (privilege escalation + abuse
+ * vector, audit #29). The session path is removed: a request that does not
+ * present the cron secret is rejected outright. Fails closed when
+ * `CRON_SECRET` is unset so a misconfigured deploy can't be probed into the
+ * privileged path.
+ */
 export async function POST(request: NextRequest) {
   const cronSecret = process.env['CRON_SECRET'];
+  if (!cronSecret) {
+    return NextResponse.json(
+      { error: 'CRON_SECRET not configured' },
+      { status: 503 }
+    );
+  }
+
   const authHeader = request.headers.get('authorization') ?? '';
   const presented = authHeader.startsWith('Bearer ')
     ? authHeader.slice('Bearer '.length)
     : '';
-  const isCron = !!cronSecret && constantTimeEqual(presented, cronSecret);
-
-  if (!isCron) {
-    const accessToken = await getAccessToken();
-    if (accessToken === null) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
+  if (!constantTimeEqual(presented, cronSecret)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
-  // Upstream /poll is API-key-gated (cron path). Convert here regardless of
-  // whether the caller arrived via cron secret or session — the BFF is the
-  // only thing that holds the API key.
-  const apiKey = process.env['WYRDFOLD_API_KEY'];
+  // Upstream /poll is operator-key-gated. The BFF holds the narrow,
+  // operator-only WYRDFOLD_CRON_KEY (audit #29 — this cron path uses ONLY this
+  // key, never the broad WYRDFOLD_API_KEY) and attaches it after the cron
+  // secret is verified. Requires WYRDFOLD_CRON_KEY to be set in this app's env
+  // and accepted by the API's /poll route.
+  const apiKey = process.env['WYRDFOLD_CRON_KEY'];
   if (!apiKey) {
     return NextResponse.json(
-      { error: 'WYRDFOLD_API_KEY not configured' },
+      { error: 'WYRDFOLD_CRON_KEY not configured' },
       { status: 503 }
     );
   }

@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     # data access migrates onto the user client; unset is fine until then.
     supabase_anon_key: str = Field(default="", repr=False)
     wyrdfold_api_key: str = Field(default="", repr=False)
+    # Dedicated cron/automation key (#29 round 3 / H4). OPTIONAL, default
+    # empty. When set, it is accepted by ``verify_api_key`` (the strictly
+    # operator/cron routes: /poll, /discovery, /admin, jobs rescore +
+    # backfill-salary, sources POST/seed, targets funnel) IN ADDITION to
+    # ``wyrdfold_api_key`` — but it is deliberately NOT accepted by
+    # ``verify_api_key_or_jwt`` (the six user-data routers). This gives the
+    # operator a migration path to a narrowly-scoped automation credential:
+    # point cron/poller/batch at WYRDFOLD_CRON_KEY (works only on operator
+    # routes), then the broad WYRDFOLD_API_KEY can be retired so a leak of
+    # the automation key can no longer authenticate against user data. Empty
+    # changes nothing (the legacy key keeps working everywhere it does today).
+    wyrdfold_cron_key: str = Field(default="", repr=False)
     # JWT verification uses Supabase's JWKS endpoint at
     # `<supabase_url>/auth/v1/.well-known/jwks.json` — public-key verification
     # with key rotation handled automatically. No shared secret required.
@@ -45,6 +57,16 @@ class Settings(BaseSettings):
     sentry_dsn: str = Field(default="", repr=False)
     sentry_environment: str = "development"
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
+
+    # Verbose 500 bodies — FAIL-CLOSED. The unhandled-exception handler
+    # returns a generic body by DEFAULT; raw exception text (which can carry
+    # SQL fragments, PostgREST detail, file paths, or secrets) is only echoed
+    # to the client when this is explicitly opted into. Previously the gate
+    # keyed off ``sentry_environment == "production"``, which defaults to
+    # "development" and is unset in deploy config — so prod was fail-OPEN and
+    # leaked exception detail to any caller who triggered a 500 (audit #29
+    # round 3 / H5). Set DEBUG_ERRORS=true ONLY in local/dev debugging.
+    debug_errors: bool = False
 
     # Twilio SMS — set all three to enable SMS notifications (#511).
     twilio_account_sid: str = ""
@@ -172,16 +194,31 @@ class Settings(BaseSettings):
     # compare axis-score distributions before flipping in production.
     logistics_extraction_enabled: bool = False
 
-    # Résumé-free label derivation (#78 layer 1). When True,
-    # ``derive_profile_from_label`` builds the target's baseline
-    # ScoringProfile from the LABEL ALONE (the model's world-knowledge of
-    # what the role generally requires) instead of grounding it in the
-    # activating user's résumé. The résumé only ever feeds ``fit_score``
-    # (``targets/fit_score.py``), which is unchanged. This de-skews shared
-    # targets (no single user's experience stamped on everyone's rubric)
-    # and improves cold-start matching. It changes scoring behavior, so it
-    # ships FALSE: validate with the #27 eval pass before flipping on.
-    resume_free_label_derivation: bool = False
+    # Learner re-score projection / learning-rate cap (#5 P4). Before a
+    # high-confidence ``ProfilePatch`` auto-applies, the learner projects the
+    # patch over the target's recent scored jobs (deterministic keyword
+    # re-score) and stages it for review instead of applying when the
+    # projected churn is an outlier — so one learn run can't silently reshuffle
+    # the whole list. All four are tunable knobs.
+    #
+    # A job "moves" when its projected blended score changes by at least this
+    # many points (blend is 60% keyword / 40% LLM, so a keyword-only delta is
+    # scaled by 0.6 before comparison).
+    learning_rescore_move_threshold: int = Field(default=20, ge=1, le=100)
+    # The patch is an outlier (→ stage) when this fraction of considered jobs
+    # move by >= the threshold.
+    learning_rescore_max_moved_fraction: float = Field(default=0.30, ge=0.0, le=1.0)
+    # Cap how many recent scored jobs the projection re-scores (bounds cost).
+    learning_rescore_sample_size: int = Field(default=150, ge=1, le=2000)
+    # Don't apply the cap until the target has at least this many scored jobs —
+    # a brand-new target has too little signal to judge "outlier" against, and
+    # shouldn't have its first patches blocked.
+    learning_rescore_min_jobs: int = Field(default=10, ge=1, le=1000)
+
+    # Anonymous voting on reference-JD contributions (#5 P3). A contribution is
+    # suppressed from the shared-profile merge once its NET down-votes
+    # (down minus up) reach this quorum; re-merged without it.
+    contribution_downvote_quorum: int = Field(default=3, ge=1, le=100)
 
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""

@@ -200,6 +200,82 @@ jobs:
           uv run --package wyrdfold-api mypy app/
           uv run --package wyrdfold-api pytest -v
 
+  # RLS integration (#6 R4). The `tests/integration/` suite is deselected by
+  # default (`-m 'not integration'`) because it needs a live Postgres+PostgREST
+  # to actually exercise Row-Level Security — the mock suite can't. Without this
+  # job nothing runs it, and it bit-rotted unnoticed (#6). Here we boot the real
+  # local Supabase stack and run it, so RLS regressions fail a PR.
+  rls-integration:
+    name: RLS — integration (live Supabase)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          filter: tree:0
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      # Install the Supabase CLI from its pinned GitHub-release .deb (mirrors the
+      # pandoc step) rather than a third-party action, to keep CI dependencies
+      # version-pinned and avoid an unpinned `uses:`. curl has explicit timeouts
+      # + retries so a slow mirror can't hang the job.
+      - name: Install Supabase CLI
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          SUPABASE_CLI_VERSION=2.104.0
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+            -o /tmp/supabase.deb \
+            "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
+          sudo dpkg -i /tmp/supabase.deb
+          supabase --version
+
+      # ubuntu-latest preinstalls Docker. `supabase start` boots the local stack
+      # (Postgres + PostgREST + GoTrue + Storage) and applies every migration,
+      # so the suite exercises real RLS against the current schema. config.toml
+      # already disables the heavy unused services (imgproxy/edge-runtime/pooler).
+      - name: Start Supabase stack
+        run: supabase start
+
+      # Guard against a false green: if the stack weren't reachable the conftest
+      # would SKIP the whole suite (pytest still exits 0). Confirm REST answers
+      # before running, so a stack failure fails the job loudly.
+      - name: Verify Supabase REST is reachable
+        run: |
+          for _ in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/rest/v1/ || echo 000)
+            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then echo "REST up ($code)"; exit 0; fi
+            sleep 2
+          done
+          echo "Supabase REST not reachable" >&2; exit 1
+
+      # `-o addopts=''` clears the default `-m 'not integration'` + coverage opts
+      # so the integration marker actually selects (conftest self-skips if the
+      # stack is somehow unreachable, which would surface as 0 tests, not a pass).
+      - name: Run RLS integration tests
+        working-directory: apps/wyrdfold-api
+        run: uv run --package wyrdfold-api pytest tests/integration/ -m integration -o addopts='' -v
+
+      - name: Stop Supabase stack
+        if: always()
+        run: supabase stop || true
+
   # Image scan (#30 F5). Builds the same Dockerfile the deploy uses and
   # scans the result with Trivy. Fails on HIGH/CRITICAL OS or library
   # CVEs in the runtime layer. Complements `pnpm audit --prod` (JS tree)

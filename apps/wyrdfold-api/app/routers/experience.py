@@ -77,8 +77,11 @@ router = APIRouter(
 # ---- Prose doc ------------------------------------------------------------
 
 
+# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
+# this in its threadpool, keeping the blocking `.execute()` round-trips off
+# the event loop. See #107.
 @router.get("/prose")
-async def get_prose(
+def get_prose(
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ProseDoc | dict[str, None]:
@@ -88,8 +91,9 @@ async def get_prose(
     return doc
 
 
+# Sync `def`: blocking supabase write runs in the threadpool (#107).
 @router.post("/prose")
-async def create_prose(
+def create_prose(
     body: ProseDocCreate,
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -591,8 +595,10 @@ def get_gap_health(
 # ---- Preferences ----------------------------------------------------------
 
 
+# Sync `def` (not `async def`): blocking supabase reads/writes run in the
+# threadpool, keeping them off the event loop. See #107.
 @router.get("/preferences")
-async def get_preferences(
+def get_preferences(
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> Preferences | dict[str, None]:
@@ -602,8 +608,9 @@ async def get_preferences(
     return row
 
 
+# Sync `def`: blocking supabase upsert runs in the threadpool (#107).
 @router.put("/preferences")
-async def upsert_preferences(
+def upsert_preferences(
     body: PreferencesUpsert,
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -611,8 +618,9 @@ async def upsert_preferences(
     return preferences.upsert(supabase, user_id=user_id, payload=body.payload)
 
 
+# Sync `def`: blocking supabase delete runs in the threadpool (#107).
 @router.delete("/preferences")
-async def reset_preferences(
+def reset_preferences(
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, bool]:
@@ -623,8 +631,9 @@ async def reset_preferences(
 # ---- Conversation turns --------------------------------------------------
 
 
+# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/turns")
-async def list_turns(
+def list_turns(
     conversation_type: ConversationType | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
     supabase: Client = Depends(get_supabase_for_caller),
@@ -639,8 +648,9 @@ async def list_turns(
     return {"turns": [r.model_dump(mode="json") for r in rows]}
 
 
+# Sync `def`: blocking supabase write runs in the threadpool (#107).
 @router.post("/turns")
-async def append_turn(
+def append_turn(
     body: TurnAppend,
     supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -684,8 +694,9 @@ async def conversation_turn(
     )
 
 
+# Sync `def`: blocking supabase wipe runs in the threadpool (#107).
 @router.post("/conversation/reset")
-async def conversation_reset(
+def conversation_reset(
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ResetResult:

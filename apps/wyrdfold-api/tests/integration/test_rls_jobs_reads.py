@@ -51,9 +51,7 @@ def seeded_shared_job(
                 "company_name": "Acme",
             }
         ).execute()
-        service_client.table("targets").insert(
-            {"id": target_id, "label": "Test Target"}
-        ).execute()
+        service_client.table("targets").insert({"id": target_id, "label": "Test Target"}).execute()
         # Score links target -> job; score 50, not excluded -> shows in list.
         service_client.table("scores").insert(
             {
@@ -79,9 +77,7 @@ def seeded_shared_job(
         ).execute()
         yield uid_a, uid_b, target_id, posting_id
     finally:
-        service_client.table("user_targets").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("user_targets").delete().eq("target_id", target_id).execute()
         # source cascade -> jobs -> scores + user_jobs
         service_client.table("sources").delete().eq("id", source_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
@@ -101,7 +97,8 @@ def _status_for(
             "p_sort": "score",
             "p_ascending": False,
             "p_limit": 20,
-            "p_offset": 0,
+            "p_after_value": None,
+            "p_after_id": None,
             "p_user_id": user_id,
         },
     ).execute()

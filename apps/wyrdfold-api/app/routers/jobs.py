@@ -21,6 +21,7 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase,
+    get_supabase_for_caller,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -49,6 +50,7 @@ from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.jd_parser import parse_jd
 from app.services.sanitize import sanitize_html
 from app.services.scoring import strip_html
+from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
     update_global_score,
@@ -1278,6 +1280,11 @@ async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
     supabase: Client = Depends(get_supabase),
+    # #6 R2 step 2: the manual-add scores writes are gated through SECURITY
+    # DEFINER RPCs on the caller's client (user JWT → target ownership enforced
+    # in-DB; api-key/operator → service-role, exempt). Reads + the job insert
+    # stay on the service-role `supabase`.
+    caller_supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ManualJobResponse:
     """Add a job posting by URL. Extracts metadata via cascade."""
@@ -1300,7 +1307,13 @@ async def add_manual_job(
     try:
         assert_safe_host(hostname)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Generic client message — echoing the resolved host/IP back lets a
+        # caller enumerate which internal hostnames resolve to private ranges
+        # (recon oracle, audit #29 R3 / H8). Keep specifics server-side.
+        logger.warning("ssrf_reject host=%s: %s", hostname, exc)
+        raise HTTPException(
+            status_code=400, detail="This URL cannot be fetched"
+        ) from exc
 
     # Fetch the page with a hard size cap — without this, a user
     # pasting a URL to a multi-GB payload (CDN downloads, infinite
@@ -1320,8 +1333,11 @@ async def add_manual_job(
             detail=f"Page too large to fetch ({exc.size} bytes > {exc.limit}).",
         ) from exc
     except UnsafeURLError as exc:
+        # A redirect hop resolved to an internal address. Don't reflect the
+        # resolved host/IP (audit #29 R3 / H8).
+        logger.warning("ssrf_reject redirect for %s: %s", cleaned, exc)
         raise HTTPException(
-            status_code=400, detail=f"Redirect target rejected: {exc}"
+            status_code=400, detail="This URL cannot be fetched"
         ) from exc
     except httpx.HTTPError:
         raise HTTPException(status_code=400, detail="Failed to fetch URL") from None
@@ -1337,9 +1353,11 @@ async def add_manual_job(
         try:
             assert_safe_host(final_hostname)
         except ValueError as exc:
+            # Don't reflect the resolved internal host/IP (audit #29 R3 / H8).
+            logger.warning("ssrf_reject redirect host=%s: %s", final_hostname, exc)
             raise HTTPException(
                 status_code=400,
-                detail=f"Redirect target rejected: {exc}",
+                detail="This URL cannot be fetched",
             ) from exc
     if registrable_domain(hostname) != registrable_domain(final_hostname):
         warnings.append(
@@ -1469,12 +1487,13 @@ async def add_manual_job(
             *[
                 asyncio.to_thread(
                     target_score_and_upsert,
-                    supabase,
+                    caller_supabase,
                     job_posting_id=posting_id,
                     title=title,
                     description_html=description_html,
                     target=t,
                     parsed_jd=parsed,
+                    gated=True,
                 )
                 for t in active_targets
             ],
@@ -1512,11 +1531,13 @@ async def add_manual_job(
         if scored_target_ids:
             try:
                 await asyncio.to_thread(
-                    lambda: supabase.table("scores")
-                    .update({"excluded": False})
-                    .eq("job_posting_id", posting_id)
-                    .in_("target_id", scored_target_ids)
-                    .execute()
+                    lambda: caller_supabase.rpc(
+                        "user_set_scores_included",
+                        {
+                            "p_job_posting_id": posting_id,
+                            "p_target_ids": scored_target_ids,
+                        },
+                    ).execute()
                 )
             except Exception:
                 logger.exception(
@@ -1536,8 +1557,11 @@ async def add_manual_job(
     )
 
 
+# Sync `def` (not `async def`): the bulk re-score is blocking supabase work,
+# so FastAPI runs it in its threadpool and keeps the O(jobs x keywords) DB
+# round-trips off the event loop. See #107.
 @router.post("/rescore/{target_id}", dependencies=[Depends(verify_api_key)])
-async def rescore_for_target(
+def rescore_for_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
@@ -1743,15 +1767,31 @@ def delete_job(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
+    """Per-user "delete" of a job from the caller's pipeline.
+
+    ``jobs`` is a SHARED, deduplicated catalog with no owner column —
+    per-user pipeline state lives in ``user_jobs``. The previous shape ran
+    an unscoped service-role ``jobs.delete().eq('id', …)``; FK
+    ``ON DELETE CASCADE`` then wiped ``scores`` / ``job_feedback`` /
+    ``status_log`` / ``user_jobs`` for **every** other user following that
+    posting — cross-tenant data destruction triggered by the ordinary
+    "delete job" button (audit #29 round 3 / H1).
+
+    The user-facing "delete" is therefore a per-user soft action: archive
+    only the caller's own ``user_jobs`` row (``status='archived'``), which
+    the list/counts endpoints already filter out. The shared ``jobs`` row
+    and other users' state are never touched. A true global hard-delete,
+    if ever needed, must be gated behind operator/api-key auth — not a
+    follower's JWT. Mirrors the per-user write pattern in ``status.py``.
+    """
     _assert_user_owns_posting(supabase, posting_id, user_id)
-    resp = (
-        supabase.table("jobs")
-        .delete()
-        .eq("id", posting_id)
-        .execute()
+
+    persistence.upsert_user_job(
+        supabase,
+        user_id=user_id,
+        job_posting_id=posting_id,
+        status="archived",
     )
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Posting not found")
 
     job_list_cache.invalidate()
     return {"success": True, "deleted_id": posting_id}
