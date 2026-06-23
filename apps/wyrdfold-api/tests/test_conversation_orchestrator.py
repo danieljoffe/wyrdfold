@@ -149,6 +149,59 @@ async def test_handle_turn_appends_prose_when_llm_requests(
     assert "FightCamp" in create_call.kwargs["content"]
 
 
+async def test_handle_turn_flags_prose_append_with_unsaid_number_and_name(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    # The LLM invents a number (40%) and a company (Stripe) the user never
+    # mentioned, then concatenates them verbatim into the source-of-truth doc
+    # on Haiku (#47). The guard must flag both — without dropping the append,
+    # which may contain real content — and still surface them to the user.
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append="At Stripe, grew revenue 40%."
+            )
+        }
+    )
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="I helped grow the business a lot.",
+        skipped=False,
+    )
+    # The append is still persisted (flag, not drop).
+    assert result.prose_updated is True
+    joined = " ".join(result.prose_warnings)
+    assert "40" in joined
+    assert "Stripe" in joined
+
+
+async def test_handle_turn_does_not_flag_faithful_prose_append(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    # Every number and name in the append was in what the user said this turn:
+    # a faithful restatement must produce no warnings.
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append="Worked at FightCamp and cut load times to 2s."
+            )
+        }
+    )
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="At FightCamp I cut load times to 2s.",
+        skipped=False,
+    )
+    assert result.prose_updated is True
+    assert result.prose_warnings == []
+
+
 async def test_handle_turn_caches_prose_doc_prefix(
     mock_service_layer: dict[str, Any],
 ) -> None:
