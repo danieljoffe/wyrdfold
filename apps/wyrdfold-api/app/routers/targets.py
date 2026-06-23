@@ -525,7 +525,14 @@ def get_my_targets(
 def get_target(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
+    # Targets are shared, service-role-read (no RLS backstop). Without this
+    # guard any authenticated user could read any target's full JD text and
+    # scoring profile by id (audit #29 round 3 / M3). Operators (api-key,
+    # user_id None) bypass; non-owners get 404 so they can't enumerate
+    # target existence.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     target = crud.get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -945,8 +952,13 @@ async def poll_jobs_for_target(
 def get_target_status(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> TargetStatusResponse:
     """Return activation status and job count for a target."""
+    # Without this, any authenticated user could read any target's
+    # activation status + scored-job count by id (audit #29 round 3 / M2).
+    # Operators (user_id None) bypass; non-owners get 404.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     target = crud.get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -1321,9 +1333,19 @@ async def add_reference_jd(
 def list_reference_jds(
     target_id: str,
     supabase: Client = Depends(get_supabase),
+    user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ReferenceJDsListResponse:
+    # Reference JDs are read via the service-role client with no RLS
+    # backstop. Without this guard any authenticated user could read any
+    # target's full reference-JD text by id (audit #29 round 3 / M3).
+    # Operators (user_id None) bypass; non-owners get 404.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     ref_jds = crud.list_reference_jds(supabase, target_id)
-    return ReferenceJDsListResponse(reference_jds=ref_jds)
+    # Strip the contributor ``user_id``: the contribution graph is meant to
+    # be anonymous (votes are anonymous, #5 P3), and surfacing the
+    # per-row ``user_id`` here deanonymizes who contributed each JD.
+    anonymized = [jd.model_copy(update={"user_id": None}) for jd in ref_jds]
+    return ReferenceJDsListResponse(reference_jds=anonymized)
 
 
 # Sync `def` (not `async def`): the whole body is blocking supabase work
