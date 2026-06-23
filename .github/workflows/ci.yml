@@ -172,20 +172,46 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --frozen
 
+      # Python advisory gate (audit #29 round-3 L3). Trivy (image-scan job) is
+      # the only other Python-tree gate and runs `--ignore-unfixed` against the
+      # OS/library DB, so it misses unfixed and PyPI-only (PyPA) advisories.
+      # pip-audit queries the OSV database directly against the exact resolved
+      # tree exported from the committed `uv.lock` (`--all-groups` so dev/test
+      # deps are covered too). Non-zero exit on any advisory fails the PR.
+      #
+      # `uvx` runs pip-audit in an ephemeral, isolated env without polluting the
+      # synced project venv. The audit covers the whole locked tree, not just
+      # direct deps, because transitive packages are where most CVEs land. The
+      # round-3 audit confirmed this tree is clean per OSV, so this passes today
+      # and becomes the regression gate going forward.
+      - name: Audit Python dependencies (pip-audit / OSV)
+        run: |
+          set -euo pipefail
+          uv export --package wyrdfold-api --all-groups --no-emit-project --no-hashes > /tmp/reqs.txt
+          uvx pip-audit --requirement /tmp/reqs.txt --no-deps --strict --progress-spinner off
+
       # python-docx resume/cover-letter rendering tests shell out to pandoc.
       # Install the pinned .deb straight from the pandoc GitHub release rather
       # than `apt-get update && apt-get install`: the apt path intermittently
       # hung for ~15 min on a slow mirror and the job was cancelled (flaky CI).
       # curl has explicit connect/max timeouts + retries so it can't hang the
       # job; apt stays as a fallback, and timeout-minutes bounds the worst case.
+      #
+      # The .deb is fetched over HTTPS with no signature, so verify its sha256
+      # against the recorded hash for the pinned version before `dpkg -i`. A
+      # tampered/corrupted download fails the job loudly instead of being
+      # installed. Re-record PANDOC_SHA256 whenever PANDOC_VERSION changes
+      # (`curl -fsSL <url> | sha256sum`).
       - name: Install pandoc
         timeout-minutes: 5
         run: |
           set -euo pipefail
           PANDOC_VERSION=3.1.3
+          PANDOC_SHA256=caa7e0410f9e2cb1da2eb8db13cc97b5548fe455985e2c944e3929d22f99bcdc
           if curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
                -o /tmp/pandoc.deb \
                "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"; then
+            echo "${PANDOC_SHA256}  /tmp/pandoc.deb" | sha256sum -c -
             sudo dpkg -i /tmp/pandoc.deb
           else
             sudo apt-get update
@@ -235,14 +261,22 @@ jobs:
       # pandoc step) rather than a third-party action, to keep CI dependencies
       # version-pinned and avoid an unpinned `uses:`. curl has explicit timeouts
       # + retries so a slow mirror can't hang the job.
+      #
+      # The .deb is fetched over HTTPS with no signature, so verify its sha256
+      # against the recorded hash for the pinned version before `dpkg -i`. A
+      # tampered/corrupted download fails the job loudly instead of being
+      # installed. Re-record SUPABASE_CLI_SHA256 whenever SUPABASE_CLI_VERSION
+      # changes (`curl -fsSL <url> | sha256sum`).
       - name: Install Supabase CLI
         timeout-minutes: 5
         run: |
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
+          SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
           curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
+          echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -
           sudo dpkg -i /tmp/supabase.deb
           supabase --version
 
@@ -308,12 +342,19 @@ jobs:
       # `ignore-unfixed` keeps the gate firing only on actionable
       # findings. `.trivyignore` documents the accepted-risk transitive
       # build-tool CVEs with expiry dates.
+      #
+      # The scanner image is pinned by digest (not just the mutable 0.69.1
+      # tag): it runs with the host docker socket mounted, so a re-tagged or
+      # compromised image would execute against the daemon. The tag is kept
+      # alongside the digest for readability. Re-resolve the digest whenever
+      # the version is bumped (`docker buildx imagetools inspect aquasec/trivy:<ver>`
+      # or `docker manifest inspect aquasec/trivy:<ver>`).
       - name: Scan with Trivy
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/.trivyignore:/.trivyignore:ro" \
-            aquasec/trivy:0.69.1 image \
+            aquasec/trivy:0.69.1@sha256:1c78ed1ef824ab8bb05b04359d186e4c1229d0b3e67005faacb54a7d71974f73 image \
               --severity HIGH,CRITICAL \
               --vuln-type os,library \
               --ignore-unfixed \
