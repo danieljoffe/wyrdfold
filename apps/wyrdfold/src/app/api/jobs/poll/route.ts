@@ -49,12 +49,15 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
-  // Upstream /poll is API-key-gated. The BFF is the only thing that holds the
-  // shared API key; we attach it only after the cron secret is verified.
-  const apiKey = process.env['WYRDFOLD_API_KEY'];
+  // Upstream /poll is operator-key-gated. The BFF holds the narrow,
+  // operator-only WYRDFOLD_CRON_KEY (audit #29 — this cron path uses ONLY this
+  // key, never the broad WYRDFOLD_API_KEY) and attaches it after the cron
+  // secret is verified. Requires WYRDFOLD_CRON_KEY to be set in this app's env
+  // and accepted by the API's /poll route.
+  const apiKey = process.env['WYRDFOLD_CRON_KEY'];
   if (!apiKey) {
     return NextResponse.json(
-      { error: 'WYRDFOLD_API_KEY not configured' },
+      { error: 'WYRDFOLD_CRON_KEY not configured' },
       { status: 503 }
     );
   }
