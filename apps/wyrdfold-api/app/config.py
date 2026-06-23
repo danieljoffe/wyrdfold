@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     sentry_environment: str = "development"
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
 
+    # Verbose 500 bodies — FAIL-CLOSED. The unhandled-exception handler
+    # returns a generic body by DEFAULT; raw exception text (which can carry
+    # SQL fragments, PostgREST detail, file paths, or secrets) is only echoed
+    # to the client when this is explicitly opted into. Previously the gate
+    # keyed off ``sentry_environment == "production"``, which defaults to
+    # "development" and is unset in deploy config — so prod was fail-OPEN and
+    # leaked exception detail to any caller who triggered a 500 (audit #29
+    # round 3 / H5). Set DEBUG_ERRORS=true ONLY in local/dev debugging.
+    debug_errors: bool = False
+
     # Twilio SMS — set all three to enable SMS notifications (#511).
     twilio_account_sid: str = ""
     twilio_auth_token: str = Field(default="", repr=False)

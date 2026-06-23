@@ -1307,7 +1307,13 @@ async def add_manual_job(
     try:
         assert_safe_host(hostname)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Generic client message — echoing the resolved host/IP back lets a
+        # caller enumerate which internal hostnames resolve to private ranges
+        # (recon oracle, audit #29 R3 / H8). Keep specifics server-side.
+        logger.warning("ssrf_reject host=%s: %s", hostname, exc)
+        raise HTTPException(
+            status_code=400, detail="This URL cannot be fetched"
+        ) from exc
 
     # Fetch the page with a hard size cap — without this, a user
     # pasting a URL to a multi-GB payload (CDN downloads, infinite
@@ -1327,8 +1333,11 @@ async def add_manual_job(
             detail=f"Page too large to fetch ({exc.size} bytes > {exc.limit}).",
         ) from exc
     except UnsafeURLError as exc:
+        # A redirect hop resolved to an internal address. Don't reflect the
+        # resolved host/IP (audit #29 R3 / H8).
+        logger.warning("ssrf_reject redirect for %s: %s", cleaned, exc)
         raise HTTPException(
-            status_code=400, detail=f"Redirect target rejected: {exc}"
+            status_code=400, detail="This URL cannot be fetched"
         ) from exc
     except httpx.HTTPError:
         raise HTTPException(status_code=400, detail="Failed to fetch URL") from None
@@ -1344,9 +1353,11 @@ async def add_manual_job(
         try:
             assert_safe_host(final_hostname)
         except ValueError as exc:
+            # Don't reflect the resolved internal host/IP (audit #29 R3 / H8).
+            logger.warning("ssrf_reject redirect host=%s: %s", final_hostname, exc)
             raise HTTPException(
                 status_code=400,
-                detail=f"Redirect target rejected: {exc}",
+                detail="This URL cannot be fetched",
             ) from exc
     if registrable_domain(hostname) != registrable_domain(final_hostname):
         warnings.append(

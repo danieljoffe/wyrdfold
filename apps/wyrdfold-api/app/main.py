@@ -264,9 +264,16 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 
     Without this, Starlette's default handler returns plain-text
     ``Internal Server Error``, which trips the proxy's non-JSON branch.
-    Verbose detail (class name + message) is gated on non-production
-    environments — production gets a generic body so SQL fragments,
-    file paths, or secrets in stringified exceptions don't leak.
+
+    The body is generic by DEFAULT (fail-closed). Verbose detail (class
+    name + message) is echoed to the client ONLY when ``DEBUG_ERRORS`` is
+    explicitly opted into — the full traceback always goes to the server
+    log regardless. The previous gate keyed off
+    ``sentry_environment == "production"``, which defaults to "development"
+    and is unset in deploy config, so prod was fail-OPEN and leaked
+    exception detail (SQL fragments, PostgREST/file paths, secrets in
+    stringified exceptions) to any caller who triggered a 500 (audit #29
+    round 3 / H5).
     """
     # FastAPI/Starlette resolves more-specific handlers first, so HTTPException
     # never reaches us. Re-raise defensively in case a future middleware path
@@ -277,9 +284,12 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
         raise exc
 
     _log.exception("unhandled exception on %s %s", request.method, request.url.path)
-    is_production = settings.sentry_environment == "production"
     body: dict[str, str] = {
-        "detail": "Internal server error" if is_production else f"{type(exc).__name__}: {exc}",
+        "detail": (
+            f"{type(exc).__name__}: {exc}"
+            if settings.debug_errors
+            else "Internal server error"
+        ),
         "path": request.url.path,
     }
     return JSONResponse(status_code=500, content=body)
