@@ -1,9 +1,9 @@
 import type { Metadata } from 'next';
 import Image from 'next/image';
 import {
-  ArrowRight,
   BarChart3,
   FileText,
+  ShieldCheck,
   Target,
   type LucideIcon,
 } from 'lucide-react';
@@ -12,13 +12,15 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
+import WaitlistForm from './WaitlistForm';
 
 const HERO_SUBTITLE =
-  'Your profile is the scoring model. Top matches turn into ATS-safe drafts — traced to your experience, never hallucinated.';
+  'Job hunting has become a second job — endless boards, postings you miss, your resume rewritten for the 40th time. WyrdFold runs the search for you: relevant roles and ready-to-send, tailored applications, delivered while you get on with your life.';
 
 export const metadata: Metadata = {
-  title: 'WyrdFold',
-  description: HERO_SUBTITLE,
+  title: 'WyrdFold — your job search, on autopilot',
+  description:
+    'WyrdFold runs your job search in the background: relevant roles surface automatically and turn into tailored, ready-to-send applications — every line traced to your real experience, never made up.',
   robots: { index: true, follow: true },
 };
 
@@ -37,18 +39,23 @@ interface Capability {
 
 const CAPABILITIES: Capability[] = [
   {
-    title: 'Match',
-    body: 'Every new posting scored against your profile. Sorted by fit, broken down to the keyword.',
+    title: 'Roles that actually fit',
+    body: 'Every new posting is scored against your real experience and sorted by fit — down to the keyword. You see the strong matches, not another firehose to wade through.',
     icon: Target,
   },
   {
-    title: 'Tailor',
-    body: 'Top matches become tailored .docx drafts — markdown-editable, ATS-linted. Cover letters on the same pipeline.',
+    title: 'Applications, already written',
+    body: 'A strong match becomes a tailored resume draft in one click — editable, formatted to pass the resume scanners (ATS) employers use. Cover letters come from the same place.',
     icon: FileText,
   },
   {
-    title: 'Track',
-    body: 'Pipeline funnel, skill gaps, LLM cost. Click any chart to filter the job list underneath.',
+    title: 'Nothing invented',
+    body: 'Every line in a draft is traced back to something you actually did. The AI rephrases and reorders your experience for each role — it never makes up a job, a skill, or a number.',
+    icon: ShieldCheck,
+  },
+  {
+    title: 'See where you stand',
+    body: 'A clear view of your pipeline, the skills that keep coming up in roles you want, and where each application sits — so you always know the next move.',
     icon: BarChart3,
   },
 ];
@@ -70,23 +77,23 @@ interface Step {
 const STEPS: Step[] = [
   {
     number: '01',
-    title: 'Bring in your experience.',
-    body: 'Upload a resume, talk through it, or both. The output is a master document — structured, editable, source-of-truth.',
+    title: 'Tell us about your experience.',
+    body: 'Upload your resume, talk it through, or both. WyrdFold turns it into one master profile you can edit — the single source everything else is built from.',
   },
   {
     number: '02',
-    title: "Name what you're looking for.",
-    body: 'Pick or paste a target role. Its scoring profile gets derived from real job descriptions.',
+    title: 'Say what you’re looking for.',
+    body: 'Pick or describe the kind of role you want. WyrdFold learns what “a good fit” means for you from real job postings.',
   },
   {
     number: '03',
-    title: 'The feed runs.',
-    body: 'Every new posting scores against your profile. The good ones surface for review. The rest stay out of your way.',
+    title: 'The search runs in the background.',
+    body: 'New postings are checked against your profile as they appear. The ones worth your time surface for review; the rest stay out of your way.',
   },
   {
     number: '04',
-    title: 'Tailor on click.',
-    body: 'One click turns a match into a tailored resume drafted from your master document — ATS-linted, .docx-ready. Cover letters on the same pipeline.',
+    title: 'Apply with one click.',
+    body: 'Turn any match into a tailored resume drafted from your profile — formatted to clear resume scanners and ready to send. Cover letters, same one click.',
   },
 ];
 
@@ -97,14 +104,14 @@ export default function WyrdfoldLandingPage() {
       <section className='py-16 md:py-24'>
         <div className='max-w-3xl'>
           <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-950 dark:text-brand-300'>
-            Private beta · invite-only
+            Now taking waitlist signups
           </span>
           <Heading
             variant='detail'
             as='h1'
             className='mt-4 text-balance text-text-primary'
           >
-            The search runs while you don&apos;t.
+            The job search that runs while you don&apos;t.
           </Heading>
           <Text
             variant='subtitle'
@@ -113,35 +120,34 @@ export default function WyrdfoldLandingPage() {
           >
             {HERO_SUBTITLE}
           </Text>
-          <div className='mt-8 flex flex-col sm:flex-row gap-3 sm:gap-4'>
-            <Button
-              name='wyrdfold-hero-sign-in'
-              as='link'
-              href='/login'
-              variant='primary'
-              size='md'
-            >
-              Sign in
-              <ArrowRight className='size-4' aria-hidden='true' />
-            </Button>
-            <Button
-              name='wyrdfold-hero-how-it-works'
-              as='link'
-              href='#how-it-works'
-              variant='outline'
-              size='md'
-            >
-              See how it works
-            </Button>
+
+          {/* Primary CTA: join the waitlist. Secondary: sign in (invited users). */}
+          <div className='mt-8 flex flex-col gap-4'>
+            <WaitlistForm />
+            <Text variant='helper' as='p' className='text-text-tertiary'>
+              Already invited?{' '}
+              <Button
+                name='wyrdfold-hero-sign-in'
+                as='link'
+                href='/login'
+                variant='bare'
+                size='sm'
+                highlighted
+                className='inline px-0 py-0'
+              >
+                Sign in
+              </Button>
+            </Text>
           </div>
+
           <Alert
-            variant='warning'
-            title='Heads up — this is a beta'
+            variant='info'
+            title='Built so you can trust it'
             className='mt-8'
           >
-            WyrdFold is invite-only and under active development. Schemas,
-            features, and accounts may change or be reset without notice. Don’t
-            rely on it as your only system of record while we iterate.
+            WyrdFold never invents experience. Every sentence in a tailored
+            application is traced back to something you actually did — so what
+            you send is genuinely yours.
           </Alert>
         </div>
 
@@ -163,7 +169,7 @@ export default function WyrdfoldLandingPage() {
       <section className='border-y border-border py-8 md:py-10'>
         <div className='flex flex-col items-center gap-3 md:gap-4'>
           <p className='text-xs uppercase tracking-wider text-text-tertiary'>
-            The feed runs across
+            Watching roles across
           </p>
           <div className='flex flex-wrap items-center justify-center gap-x-5 gap-y-2 md:gap-x-7 font-mono text-sm md:text-base text-text-secondary'>
             {ATS_PROVIDERS.map((name, i) => (
@@ -182,7 +188,7 @@ export default function WyrdfoldLandingPage() {
 
       {/* Capabilities */}
       <section className='py-16 md:py-24'>
-        <div className='grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6'>
+        <div className='grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6'>
           {CAPABILITIES.map(cap => {
             const Icon = cap.icon;
             return (
@@ -272,24 +278,32 @@ export default function WyrdfoldLandingPage() {
 
       {/* Footer CTA */}
       <section className='py-16 md:py-24 border-t border-border'>
-        <div className='flex flex-col items-center gap-4 text-center'>
+        <div className='flex flex-col items-center gap-6 text-center'>
           <Heading variant='section' as='h2' className='max-w-2xl text-balance'>
-            You&apos;ll be authenticated in two clicks.
+            Stop chasing the search. Let it come to you.
           </Heading>
           <Text variant='body' as='p' className='max-w-xl text-text-secondary'>
-            Beta access is invite-only — bring an invited email address. Data
-            created during beta may be reset.
+            Join the waitlist and we&apos;ll email you the moment a spot opens
+            up. WyrdFold is in early access while we get it right, so invites go
+            out in small batches.
           </Text>
-          <Button
-            name='wyrdfold-footer-sign-in'
-            as='link'
-            href='/login'
-            variant='primary'
-            size='lg'
-          >
-            Sign in with email
-            <ArrowRight className='size-4' aria-hidden='true' />
-          </Button>
+          <div className='flex w-full max-w-md flex-col items-center gap-3'>
+            <WaitlistForm />
+            <Text variant='helper' as='p' className='text-text-tertiary'>
+              Already invited?{' '}
+              <Button
+                name='wyrdfold-footer-sign-in'
+                as='link'
+                href='/login'
+                variant='bare'
+                size='sm'
+                highlighted
+                className='inline px-0 py-0'
+              >
+                Sign in
+              </Button>
+            </Text>
+          </div>
         </div>
       </section>
     </div>
