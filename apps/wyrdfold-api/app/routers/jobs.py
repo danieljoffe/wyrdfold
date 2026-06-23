@@ -50,6 +50,7 @@ from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.jd_parser import parse_jd
 from app.services.sanitize import sanitize_html
 from app.services.scoring import strip_html
+from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
     update_global_score,
@@ -1755,15 +1756,31 @@ def delete_job(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
 ) -> dict[str, Any]:
+    """Per-user "delete" of a job from the caller's pipeline.
+
+    ``jobs`` is a SHARED, deduplicated catalog with no owner column —
+    per-user pipeline state lives in ``user_jobs``. The previous shape ran
+    an unscoped service-role ``jobs.delete().eq('id', …)``; FK
+    ``ON DELETE CASCADE`` then wiped ``scores`` / ``job_feedback`` /
+    ``status_log`` / ``user_jobs`` for **every** other user following that
+    posting — cross-tenant data destruction triggered by the ordinary
+    "delete job" button (audit #29 round 3 / H1).
+
+    The user-facing "delete" is therefore a per-user soft action: archive
+    only the caller's own ``user_jobs`` row (``status='archived'``), which
+    the list/counts endpoints already filter out. The shared ``jobs`` row
+    and other users' state are never touched. A true global hard-delete,
+    if ever needed, must be gated behind operator/api-key auth — not a
+    follower's JWT. Mirrors the per-user write pattern in ``status.py``.
+    """
     _assert_user_owns_posting(supabase, posting_id, user_id)
-    resp = (
-        supabase.table("jobs")
-        .delete()
-        .eq("id", posting_id)
-        .execute()
+
+    persistence.upsert_user_job(
+        supabase,
+        user_id=user_id,
+        job_posting_id=posting_id,
+        status="archived",
     )
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Posting not found")
 
     job_list_cache.invalidate()
     return {"success": True, "deleted_id": posting_id}
