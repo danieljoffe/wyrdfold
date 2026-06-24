@@ -1,12 +1,13 @@
 """Retry transient HTTP failures on supabase-py calls.
 
-supabase-py runs over httpx, which negotiates HTTP/2 with the
-Cloudflare-fronted Supabase REST endpoint. Under concurrent upsert
-load (the poller flushing 122 sources in parallel) we observe stream
-drops surfaced as ``httpx.RemoteProtocolError: Server disconnected``.
-The underlying request was idempotent in every place we use this
-helper (upsert with ON CONFLICT, UPDATE with a stable WHERE), so
-re-issuing the call is safe.
+supabase-py runs over httpx against the Cloudflare-fronted Supabase REST
+endpoint. The poller flushes many sources in parallel, and even with the
+service-role transport pinned to HTTP/1.1 (see ``app.supabase_pool`` — the
+real fix for the HTTP/2 stream-corruption storm) a busy pooler can still
+drop a connection mid-flight, surfaced as ``httpx.RemoteProtocolError:
+Server disconnected`` or a broken pipe. The underlying request was
+idempotent in every place we use this helper (upsert with ON CONFLICT,
+UPDATE with a stable WHERE), so re-issuing the call is safe.
 
 Each callsite wraps the bound ``.execute`` method of a built
 postgrest query so the retry re-runs the same request without
@@ -70,7 +71,12 @@ def execute_with_retry_sync(
                 )
                 raise
             delay = _backoff_delay(attempt, backoff_base, backoff_cap)
-            logger.warning(
+            # Down-ranked to debug (was warning): under a concurrent poll
+            # burst a transient blip retries on many rows at once, and one
+            # warning per attempt floods Railway's 500-logs/sec budget. The
+            # exhaustion case above stays at warning — that's the line that
+            # actually signals a write we failed to land.
+            logger.debug(
                 "supabase %s: %s (attempt %d/%d), retrying in %.2fs",
                 label,
                 exc,

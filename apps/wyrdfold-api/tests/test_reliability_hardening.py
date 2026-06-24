@@ -38,17 +38,24 @@ def test_pool_ceiling_covers_worst_case_detail_fanout() -> None:
     every poll worker (POLL_CONCURRENCY) being an SR/Workday source that
     each fans out _DETAIL_CONCURRENCY per-posting fetches through the
     SAME client. The old ceiling of 20 starved ~30 of those 50 → drops.
+
+    POLL_CONCURRENCY was lowered (audit #29 / prod broken-pipe storm) to
+    bound the Supabase write herd; the http pool is intentionally sized
+    for an UPPER bound of 10 workers so a future POLL_CONCURRENCY bump
+    back up to 10 stays safe without a pool resize. So the live worst-case
+    must be <= the sized-for ceiling, and both must fit the pool.
     """
-    worst_case = POLL_CONCURRENCY * max(
-        smartrecruiters._DETAIL_CONCURRENCY, workday._DETAIL_CONCURRENCY
-    )
-    assert worst_case == 50  # pins the assumption the sizing rests on
-    assert worst_case <= MAX_CONNECTIONS, (
-        f"pool ceiling {MAX_CONNECTIONS} < worst-case fan-out {worst_case}: "
+    detail = max(smartrecruiters._DETAIL_CONCURRENCY, workday._DETAIL_CONCURRENCY)
+    worst_case = POLL_CONCURRENCY * detail
+    sized_for = 10 * detail  # the upper bound the pool is provisioned for
+    assert sized_for == 50  # pins the sizing the pool ceiling rests on
+    assert worst_case <= sized_for  # current fan-out fits within the sizing
+    assert sized_for <= MAX_CONNECTIONS, (
+        f"pool ceiling {MAX_CONNECTIONS} < sized-for fan-out {sized_for}: "
         "detail fetches will queue and time out"
     )
     # Headroom for the scheduler tick / user-paste fetches on top.
-    assert worst_case + 10 <= MAX_CONNECTIONS
+    assert sized_for + 10 <= MAX_CONNECTIONS
 
 
 def test_client_built_with_configured_limits_and_explicit_timeout() -> None:
