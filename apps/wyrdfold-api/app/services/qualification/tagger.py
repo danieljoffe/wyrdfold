@@ -94,7 +94,7 @@ class QualificationTags(BaseModel):
     """The structured verdict the LLM returns for one job.
 
     Maps 1:1 onto the ``jobs`` qualification columns (migration
-    20260624090000). ``metro`` is the only optional field — null when no
+    20260624110000). ``metro`` is the only optional field — null when no
     single city is identifiable (remote-only / multi-metro / unstated).
     """
 
