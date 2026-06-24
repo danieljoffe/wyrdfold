@@ -9,10 +9,15 @@ the lifespan stays deterministic; ops enable it on the production
 process. Any external cron driver (pg_cron, GitHub Actions) can call
 ``POST /poll/due`` instead and reach the same code path.
 
-Single-instance assumption: APScheduler with ``max_instances=1`` and
-``coalesce=True`` is safe for a single FastAPI process. If we ever
-horizontally scale the API, swap this for an external trigger so we
-don't double-poll.
+Single-poll safety: the scheduled poll is the PRIMARY ingestion trigger
+in production (no longer dependent on the Vercel cron). To stay safe with
+multiple replicas — or with the legacy Vercel cron still firing — each
+scheduled poll runs inside a Postgres advisory lock (see
+``app/services/poll_lock.py``): only one holder polls per tick, everyone
+else skips cleanly. Job upserts are idempotent regardless, so the lock is
+defense-in-depth, not the sole guarantee. APScheduler's ``max_instances=1``
++ ``coalesce=True`` still guard against overlapping ticks within ONE
+process; the advisory lock extends that across processes.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import
 
 from app.cache import job_list_cache
 from app.config import settings
+from app.services.ingestion_health import check_ingestion_health
+from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import poll_due_sources
 from app.services.retention import purge_expired_records
 from app.services.url_health import run_url_health_check
@@ -38,7 +45,18 @@ logger = logging.getLogger(__name__)
 
 
 async def _run_scheduled_poll() -> None:
-    """Tick body — fetch due sources and invalidate the list cache.
+    """Tick body — fetch due sources, run the ingestion health check, and
+    invalidate the list cache.
+
+    Guarded by a Postgres advisory lock so only one poll runs at a time
+    across every replica (and alongside the legacy Vercel cron). A tick
+    that can't get the lock skips cleanly — another holder is already
+    polling.
+
+    The ingestion health check runs every tick that acquires the lock
+    (cheap: two count queries + a 1-row read) so the "no new jobs in N
+    days" / mass-disable alerts fire even when the poll itself produces
+    nothing.
 
     Errors are logged but never raised; APScheduler would otherwise
     suppress and we'd lose the trace.
@@ -48,17 +66,31 @@ async def _run_scheduled_poll() -> None:
         if client is None:
             logger.warning("scheduled poll skipped — supabase client not initialized")
             return
-        result = await poll_due_sources(client)
-        if result.sources_polled > 0:
-            job_list_cache.invalidate()
-        logger.info(
-            "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
-            result.sources_polled,
-            result.new_jobs,
-            result.updated_jobs,
-            result.archived_jobs,
-            len(result.errors),
-        )
+        async with poll_advisory_lock(
+            client, settings.poll_advisory_lock_key
+        ) as acquired:
+            if not acquired:
+                logger.info(
+                    "scheduled poll skipped — another poll holds the advisory "
+                    "lock (key=%s)",
+                    settings.poll_advisory_lock_key,
+                )
+                return
+            result = await poll_due_sources(client)
+            if result.sources_polled > 0:
+                job_list_cache.invalidate()
+            logger.info(
+                "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
+                result.sources_polled,
+                result.new_jobs,
+                result.updated_jobs,
+                result.archived_jobs,
+                len(result.errors),
+            )
+            # Health check piggybacks the locked poll tick so it can't
+            # race a concurrent poll and so it only runs on the replica
+            # actually driving ingestion.
+            await check_ingestion_health(client)
     except Exception:
         logger.exception("scheduled poll raised")
 
