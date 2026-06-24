@@ -35,6 +35,7 @@ from app.services.ingestion_health import check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import poll_all_sources, poll_due_sources
 from app.services.retention import purge_expired_records
+from app.services.source_discovery import run_discovery_all_targets_locked
 from app.services.url_health import run_url_health_check
 from app.supabase_pool import get_supabase_pool
 
@@ -66,13 +67,10 @@ async def _run_scheduled_poll() -> None:
         if client is None:
             logger.warning("scheduled poll skipped — supabase client not initialized")
             return
-        async with poll_advisory_lock(
-            client, settings.poll_advisory_lock_key
-        ) as acquired:
+        async with poll_advisory_lock(client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
                 logger.info(
-                    "scheduled poll skipped — another poll holds the advisory "
-                    "lock (key=%s)",
+                    "scheduled poll skipped — another poll holds the advisory lock (key=%s)",
                     settings.poll_advisory_lock_key,
                 )
                 return
@@ -122,9 +120,7 @@ async def run_force_poll_locked() -> None:
         if client is None:
             logger.warning("force poll skipped — supabase client not initialized")
             return
-        async with poll_advisory_lock(
-            client, settings.poll_advisory_lock_key
-        ) as acquired:
+        async with poll_advisory_lock(client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
                 logger.info(
                     "force poll: poll already running, skipping (another poll "
@@ -221,10 +217,11 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
     Called from the FastAPI lifespan; the returned handle is what the
     lifespan must shut down on exit.
 
-    Three independent recurring jobs may run on the same scheduler:
+    Four independent recurring jobs may run on the same scheduler:
       - ``poll_due_sources`` — gated on ``POLL_SCHEDULER_ENABLED``
       - ``url_health_check`` — gated on ``URL_HEALTH_CHECK_ENABLED``
       - ``retention_purge`` — gated on ``RETENTION_PURGE_ENABLED``
+      - ``discovery_run`` — gated on ``DISCOVERY_SCHEDULER_ENABLED``
 
     If all flags are off, no scheduler is started. If only some are on,
     only those jobs are registered. Sharing one scheduler avoids multiple
@@ -234,11 +231,12 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         settings.poll_scheduler_enabled
         or settings.url_health_check_enabled
         or settings.retention_purge_enabled
+        or settings.discovery_scheduler_enabled
     ):
         logger.info(
             "schedulers disabled (set POLL_SCHEDULER_ENABLED=true, "
-            "URL_HEALTH_CHECK_ENABLED=true, or RETENTION_PURGE_ENABLED=true "
-            "to enable)"
+            "URL_HEALTH_CHECK_ENABLED=true, RETENTION_PURGE_ENABLED=true, or "
+            "DISCOVERY_SCHEDULER_ENABLED=true to enable)"
         )
         return None
 
@@ -284,6 +282,20 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "retention purge scheduler registered (tick every %d h)",
             settings.retention_purge_tick_hours,
+        )
+
+    if settings.discovery_scheduler_enabled:
+        scheduler.add_job(
+            run_discovery_all_targets_locked,
+            IntervalTrigger(hours=settings.discovery_tick_hours),
+            id="discovery_run",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        logger.info(
+            "discovery scheduler registered (tick every %d h)",
+            settings.discovery_tick_hours,
         )
 
     scheduler.start()

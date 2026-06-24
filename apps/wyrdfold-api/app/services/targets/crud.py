@@ -159,6 +159,20 @@ def get_active(supabase: Client) -> list[JobTarget]:
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
+def get_all(supabase: Client) -> list[JobTarget]:
+    """Return EVERY target, active or not, as parsed ``JobTarget`` models.
+
+    The active-only counterpart is :func:`get_active`. Scheduled/bulk source
+    discovery uses this one so a target nobody currently has active still has
+    its ATS boards refreshed — an inactive target the user re-activates later
+    should already have fresh sources rather than starting cold. Returns the
+    full target (unlike :func:`list_all_summary`) because discovery needs
+    ``search_keywords``.
+    """
+    resp = supabase.table(TARGETS_TABLE).select("*").execute()
+    return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
 def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
@@ -684,12 +698,7 @@ def delete_reference_jd(
     # target_id constrains the delete to the target the route already
     # ownership-checked — without it, any ref_jd_id across any target
     # would be deletable (IDOR, audit #24 F1).
-    query = (
-        supabase.table(REF_JDS_TABLE)
-        .delete()
-        .eq("id", ref_jd_id)
-        .eq("target_id", target_id)
-    )
+    query = supabase.table(REF_JDS_TABLE).delete().eq("id", ref_jd_id).eq("target_id", target_id)
     # A regular JWT caller may only remove their OWN contribution (#5
     # refinement: "remove-your-own + re-merge", never hard-delete others').
     # user_id is None only on the operator/api-key path, which the route's
