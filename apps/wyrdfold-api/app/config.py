@@ -182,6 +182,19 @@ class Settings(BaseSettings):
     # ``phase1_triage_enabled`` to surface any work.
     phase2_enabled: bool = False
 
+    # Job qualification firewall (#60). When True the poller runs the
+    # target-INDEPENDENT qualification tagger
+    # (``app/services/qualification/``) over each newly-ingested job — one
+    # cheap Haiku call per job, AFTER the US filter and BEFORE per-target
+    # scoring — and writes the intrinsic tags (is_us, role_family,
+    # seniority, employment_type, metro, is_remote, is_genuine_role) onto
+    # the ``jobs`` row so per-target grading can pre-filter cheaply. Ships
+    # FALSE so merging the package + migration triggers NO LLM spend; the
+    # tagger is best-effort (failures never break polling) and the
+    # content-hash (``jobs.qualified_hash``) skips re-tagging unchanged
+    # rows. Flip per-deploy once validated in DEV.
+    qualification_enabled: bool = False
+
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
     # model to emit a `logistics` JSON object (remote_status, salary
@@ -290,6 +303,26 @@ class Settings(BaseSettings):
     discovery_query_cap_per_run: int = Field(default=200, ge=1, le=2000)
     # Per-keyword result depth — top N URLs we look at from each search.
     discovery_results_per_query: int = Field(default=20, ge=1, le=50)
+
+    # In-process scheduled source discovery. Off by default (same posture as
+    # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
+    # queries; ops opt-in via env var. When enabled the scheduler ticks every
+    # ``discovery_tick_hours`` and runs a discovery pass across ALL targets
+    # (active + inactive) so a dormant target's boards keep refreshing. The
+    # Brave-key gate still applies inside the run — an empty
+    # ``brave_search_api_key`` makes each per-target pass a clean no-op, so
+    # enabling this flag without a Brave key does nothing. Tick is hours
+    # (discovery is a daily-cadence job, not minutes like the poll).
+    discovery_scheduler_enabled: bool = False
+    discovery_tick_hours: int = Field(default=24, ge=1, le=720)
+    # Postgres advisory-lock key for the bulk discovery run. A DISTINCT bigint
+    # from ``poll_advisory_lock_key`` so a discovery pass and a poll never
+    # contend on the same lock — they guard different work. Like the poll key
+    # it serializes discovery across every replica AND the manual ``POST
+    # /discovery/run`` trigger: a second caller gets ``false`` from
+    # pg_try_advisory_lock and skips cleanly. The same generic
+    # try_poll_advisory_lock / release_poll_advisory_lock RPCs back both keys.
+    discovery_advisory_lock_key: int = 8675310
 
     @property
     def cors_allowed_origins_list(self) -> list[str]:

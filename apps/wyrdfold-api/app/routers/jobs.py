@@ -36,7 +36,7 @@ from app.models.schemas import (
     UrlValidateRequest,
     UrlValidateResponse,
 )
-from app.models.targets import AxisWeights
+from app.models.targets import SENIORITY_ORDER, AxisWeights, TargetPreferences
 from app.rate_limit import limiter
 from app.services.extract import (
     MANUAL_SOURCE_ID,
@@ -65,6 +65,7 @@ from app.services.targets.crud import (
     get_user_target,
     get_user_target_ids,
     list_user_targets,
+    preferences_from_user_target,
 )
 from app.services.validate import (
     assert_safe_host,
@@ -416,6 +417,7 @@ def _list_jobs_for_target_two_query(
     only_terms: list[str],
     cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
+    preferences: TargetPreferences | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
@@ -442,6 +444,13 @@ def _list_jobs_for_target_two_query(
         else "score"
     )
     has_location_filter = bool(exclude_terms or only_terms)
+    # Per-user preference filters (employment-type / seniority / location) are
+    # also post-fetch, so they constrain pagination exactly like the location
+    # chip: when active we must materialise + filter the full candidate set
+    # before paginating, or pages would carry the pre-filter total and render
+    # short. The score cutoff is NOT here — it's already folded into min_score.
+    has_pref_filter = _preferences_have_post_fetch_filter(preferences)
+    has_post_fetch_filter = has_location_filter or has_pref_filter
     ts_query = (
         supabase.table("scores")
         .select(
@@ -485,7 +494,7 @@ def _list_jobs_for_target_two_query(
         and not status
         and not company
         and not search
-        and not has_location_filter
+        and not has_post_fetch_filter
     ):
         page_ids = [r["job_posting_id"] for r in ts_rows[offset : offset + page_size]]
         total = len(ts_rows) if ts_resp.count is None else ts_resp.count
@@ -526,6 +535,8 @@ def _list_jobs_for_target_two_query(
                 exclude_terms=exclude_terms,
                 only_terms=only_terms,
             )
+        if has_pref_filter:
+            postings = _apply_preferences_filter(postings, preferences)
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
@@ -573,6 +584,7 @@ def _list_jobs_for_target(
     only_terms: list[str],
     cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
+    preferences: TargetPreferences | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
@@ -586,6 +598,12 @@ def _list_jobs_for_target(
     the RPC doesn't return ``axis_scores`` so it can't apply the overlay. This
     keeps the v1 behaviour: the displayed ``score`` is the weighted blend,
     sort order is unchanged (still raw / recency).
+
+    ``preferences`` is the caller's per-(user, target) read-time filter (#60).
+    The score cutoff is folded into ``min_score`` by the caller (server-side);
+    the remaining post-fetch filters (employment-type / seniority / location)
+    force the two-query path — the RPC paginates server-side with no knowledge
+    of them, so its keyset would walk pre-filter rows.
     """
     kwargs: dict[str, Any] = {
         "target_id": target_id,
@@ -601,15 +619,17 @@ def _list_jobs_for_target(
         "cursor": cursor,
         "user_id": user_id,
     }
-    if axis_weights is not None:
+    if axis_weights is not None or _preferences_have_post_fetch_filter(preferences):
         return _list_jobs_for_target_two_query(
-            supabase, axis_weights=axis_weights, **kwargs
+            supabase, axis_weights=axis_weights, preferences=preferences, **kwargs
         )
     try:
         return _list_jobs_for_target_rpc(supabase, **kwargs)
     except Exception:
         logger.debug("RPC get_target_jobs unavailable, falling back to two-query pattern")
-        return _list_jobs_for_target_two_query(supabase, **kwargs)
+        return _list_jobs_for_target_two_query(
+            supabase, preferences=preferences, **kwargs
+        )
 
 
 def _list_jobs_across_user_targets(
@@ -876,6 +896,182 @@ def _apply_location_filter(
     ]
 
 
+# ── Per-user target preferences (#60) ───────────────────────────────────────
+# A read-time filter over the SHARED, cached fit score. NEVER a re-grade.
+#
+# Score cutoff is pushed into ``min_score`` (server-side, exact, keeps
+# pagination correct). The remaining filters (employment_type / seniority /
+# location-via-metro-or-text) are POST-FETCH, mirroring how the location chip
+# already works — they read the job's firewall tag columns when present and are
+# LENIENT on absence: the tag columns (employment_type / seniority / metro /
+# is_remote) are added by a separate firewall PR and are not backfilled, so a
+# missing-or-NULL tag means "unknown" and the job is KEPT. This makes the
+# filters inert until the firewall lands without coupling this PR to it.
+
+
+def _job_tag(posting: dict[str, Any], column: str) -> str | None:
+    """Return a job's firewall tag value, or ``None`` when the column is
+    absent (firewall PR not deployed) or NULL/blank (not backfilled).
+
+    Feature-detection: ``posting.get(column)`` is ``None`` both when the SELECT
+    never asked for the column and when the row's value is NULL — both collapse
+    to "unknown", which the predicates treat leniently (keep the job)."""
+    value = posting.get(column)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _employment_type_passes(
+    posting: dict[str, Any], allowed: list[str] | None
+) -> bool:
+    """Keep the job when its ``employment_type`` tag is in ``allowed``.
+
+    Lenient: no preference set → keep; unknown job tag → keep. Only an
+    explicit, KNOWN tag that's outside the allowed set drops the job."""
+    if not allowed:
+        return True
+    tag = _job_tag(posting, "employment_type")
+    if tag is None:
+        return True  # unknown → keep (lenient)
+    allowed_lower = {a.strip().lower() for a in allowed if a.strip()}
+    return not allowed_lower or tag.lower() in allowed_lower
+
+
+def _seniority_passes(
+    posting: dict[str, Any],
+    *,
+    seniority_min: str | None,
+    seniority_max: str | None,
+) -> bool:
+    """Keep the job when its ``seniority`` tag falls within the inclusive
+    [min, max] range on the ``SENIORITY_ORDER`` ladder.
+
+    Lenient: no range set → keep; unknown job tag → keep; a job tag that
+    isn't on the known ladder → keep (we can't position it, so don't hide
+    it). Only a KNOWN, on-ladder tag outside the range drops the job."""
+    if seniority_min is None and seniority_max is None:
+        return True
+    tag = _job_tag(posting, "seniority")
+    if tag is None:
+        return True  # unknown → keep
+    try:
+        rank = SENIORITY_ORDER.index(cast(Any, tag.lower()))
+    except ValueError:
+        return True  # off-ladder tag → keep (can't compare)
+    if seniority_min is not None and rank < SENIORITY_ORDER.index(cast(Any, seniority_min)):
+        return False
+    return not (
+        seniority_max is not None
+        and rank > SENIORITY_ORDER.index(cast(Any, seniority_max))
+    )
+
+
+def _job_is_remote(posting: dict[str, Any]) -> bool:
+    """True when a job is remote. Prefers the ``is_remote`` firewall tag; falls
+    back to the word "remote" appearing in the free-text ``location``."""
+    flag = posting.get("is_remote")
+    if isinstance(flag, bool):
+        return flag
+    location = _job_tag(posting, "location")
+    return location is not None and "remote" in location.lower()
+
+
+def _location_pref_passes(
+    posting: dict[str, Any],
+    *,
+    locations: list[str] | None,
+    remote_ok: bool,
+) -> bool:
+    """Keep the job when it matches the user's preferred ``locations``.
+
+    Matching uses the ``metro`` firewall tag when present, else a free-text
+    substring/synonym match on ``location`` (reusing ``_term_matches_location``
+    so "us" doesn't match "Austin"). ``remote_ok`` lets remote roles through
+    even when they don't match a preferred location — detected via the
+    ``is_remote`` tag when present, else the word "remote" in ``location``.
+
+    Lenient: no preference set → keep; a job with neither a ``metro`` tag nor
+    a ``location`` string → keep (we can't prove it doesn't match), matching
+    the existing location-chip behaviour for unknown locations."""
+    if not locations:
+        return True
+
+    # Remote escape hatch first — a remote role passes regardless of metro.
+    if remote_ok and _job_is_remote(posting):
+        return True
+
+    metro = _job_tag(posting, "metro")
+    location = _job_tag(posting, "location")
+    if metro is None and location is None:
+        return True  # unknown location → keep (lenient)
+
+    terms = [loc.strip().lower() for loc in locations if loc.strip()]
+    if not terms:
+        return True
+
+    # Prefer the structured metro tag (exact-ish, case-insensitive) when
+    # present; otherwise fall back to the free-text location match. A metro
+    # that misses still gets a second chance against a free-text location.
+    if metro is not None:
+        metro_lower = metro.lower()
+        if any(_term_matches_location(t, metro_lower) for t in terms):
+            return True
+        if location is None:
+            return False
+    if location is not None:
+        location_lower = location.lower()
+        return any(_term_matches_location(t, location_lower) for t in terms)
+    return False
+
+
+def _preferences_have_post_fetch_filter(
+    preferences: "TargetPreferences | None",
+) -> bool:
+    """True when the preferences carry a filter that must run POST-FETCH
+    (employment-type / seniority / location). The score cutoff is excluded —
+    it's folded into ``min_score`` server-side, not applied here."""
+    if preferences is None:
+        return False
+    return bool(
+        preferences.pref_employment_types
+        or preferences.pref_seniority_min
+        or preferences.pref_seniority_max
+        or preferences.pref_locations
+    )
+
+
+def _apply_preferences_filter(
+    postings: list[dict[str, Any]],
+    preferences: "TargetPreferences | None",
+) -> list[dict[str, Any]]:
+    """Drop postings that fail the user's post-fetch preference filters
+    (employment-type / seniority / location). Score-cutoff is handled
+    server-side via ``min_score`` and is NOT re-applied here.
+
+    All predicates are lenient on missing/NULL job tags (keep the job), so
+    this is a no-op until the firewall tag columns exist + are populated."""
+    if preferences is None or not _preferences_have_post_fetch_filter(preferences):
+        return postings
+    prefs = preferences  # local non-None binding for the closure below
+    return [
+        p
+        for p in postings
+        if _employment_type_passes(p, prefs.pref_employment_types)
+        and _seniority_passes(
+            p,
+            seniority_min=prefs.pref_seniority_min,
+            seniority_max=prefs.pref_seniority_max,
+        )
+        and _location_pref_passes(
+            p,
+            locations=prefs.pref_locations,
+            remote_ok=prefs.pref_remote_ok,
+        )
+    ]
+
+
 @router.get("")
 def list_jobs(
     cursor: str | None = Query(None),
@@ -962,13 +1158,25 @@ def list_jobs(
     # Target view: sort/paginate by target-specific scores
     if target_id:
         # Per-pairing axis weights override the displayed score for this
-        # user's target view. JWT-only — api-key callers get raw scores
-        # (no user identity to scope weights by).
+        # user's target view. Per-pairing preferences (#60) filter/re-rank
+        # that view at read time. Both are JWT-only — api-key callers get raw
+        # scores + no preference filtering (no user identity to scope by) — and
+        # both are read from the SAME user_targets row, so this is one round-trip.
         axis_weights: AxisWeights | None = None
+        preferences: TargetPreferences | None = None
         if user_id is not None:
             ut = get_user_target(supabase, user_id, target_id)
             if ut is not None:
                 axis_weights = ut.axis_weights
+                preferences = preferences_from_user_target(ut)
+                # Fold the preference score cutoff into the effective floor.
+                # Take the MAX of any explicit/profile-default min_score and
+                # the cutoff so the stricter bar wins, and so a user who set
+                # min_score=0 to "see everything" still can't drop below a
+                # cutoff they configured. Pushed server-side via min_score —
+                # this is a filter over the shared cached score, not a re-grade.
+                cutoff = preferences.pref_score_cutoff
+                min_score = cutoff if min_score is None else max(min_score, cutoff)
         result = _list_jobs_for_target(
             supabase,
             target_id=target_id,
@@ -983,6 +1191,7 @@ def list_jobs(
             only_terms=only_terms,
             cursor=cursor_data,
             axis_weights=axis_weights,
+            preferences=preferences,
             user_id=user_id,
         )
         result["applied_min_score"] = min_score

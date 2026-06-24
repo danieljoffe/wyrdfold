@@ -25,6 +25,7 @@ from app.models.targets import (
 from app.services.ats_detect import DetectResult
 from app.services.source_discovery import (
     DiscoveryRunStats,
+    run_discovery_all_targets,
     run_discovery_for_target,
 )
 
@@ -40,9 +41,7 @@ def _make_target(keywords: list[str] | None = None) -> JobTarget:
         normalized_label="director of cx ops",
         description=None,
         scoring_profile=ScoringProfile(
-            categories={
-                "core": CategoryProfile(keywords={"foo": 1}, weight=1.0)
-            },
+            categories={"core": CategoryProfile(keywords={"foo": 1}, weight=1.0)},
             seniority=SeniorityProfile(level="director", signals=["director"]),
             domain=DomainProfile(signals=[], weight=0.5),
             negative=NegativeProfile(keywords=[], weight=-10.0),
@@ -414,9 +413,7 @@ async def test_discovery_rpc_returning_false_marks_duplicate(monkeypatch):
     assert stats.duplicates == 1
     # RPC was still called — we tried, the DB told us it was a no-op.
     rpc_calls = [
-        c
-        for c in supabase.rpc.call_args_list
-        if c.args[0] == "insert_source_if_not_exists"
+        c for c in supabase.rpc.call_args_list if c.args[0] == "insert_source_if_not_exists"
     ]
     assert len(rpc_calls) == 1
 
@@ -437,9 +434,7 @@ async def test_brave_search_retries_on_429_with_retry_after():
     ok = MagicMock()
     ok.status_code = 200
     ok.json = MagicMock(
-        return_value={
-            "web": {"results": [{"url": "https://boards.greenhouse.io/example"}]}
-        }
+        return_value={"web": {"results": [{"url": "https://boards.greenhouse.io/example"}]}}
     )
 
     client = MagicMock()
@@ -541,8 +536,7 @@ async def test_discovery_fires_brave_queries_concurrently(monkeypatch):
     # With purely sequential execution peak would be exactly 1; with the
     # semaphore in place we expect multiple queries overlapping.
     assert peak >= 2, (
-        f"expected concurrent Brave queries, peak in-flight was {peak} "
-        "— is the semaphore wired up?"
+        f"expected concurrent Brave queries, peak in-flight was {peak} — is the semaphore wired up?"
     )
 
 
@@ -590,3 +584,58 @@ async def test_discovery_survives_detect_ats_raise(monkeypatch):
     assert stats.unclassified == 1
     assert stats.inserted == 1
     assert stats.urls_examined == 2
+
+
+# --- Bulk all-targets pass --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_all_targets_preserves_brave_key_gate(monkeypatch):
+    """The Brave-key gate is preserved on the BULK path: with an empty
+    ``BRAVE_SEARCH_API_KEY``, walking many targets fires ZERO Brave queries —
+    each per-target run early-exits with zeroed stats. The whole pass costs
+    only the (mocked) target read."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "brave_search_api_key", "")
+    supabase = _make_supabase()
+    targets = [_make_target(), _make_target(keywords=["other"])]
+
+    fake_brave = AsyncMock(return_value=[])
+    with patch("app.services.source_discovery._brave_search", fake_brave):
+        result = await run_discovery_all_targets(supabase, targets)
+
+    # No Brave query fired across either target.
+    fake_brave.assert_not_awaited()
+    # Both targets were "processed" (they returned cleanly), zero work done.
+    assert result.targets_processed == 2
+    assert result.queries_issued == 0
+    assert result.inserted == 0
+    assert result.errors == []
+
+
+@pytest.mark.asyncio
+async def test_run_all_targets_caps_queries_per_target(monkeypatch):
+    """The per-target query cap is preserved on the bulk path: each target is
+    independently capped, so two targets at cap=2 fire 2 + 2 = 4 queries, not
+    one shared budget of 2."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "brave_search_api_key", "test-key")
+    monkeypatch.setattr(live_settings, "discovery_query_cap_per_run", 2)
+
+    supabase = _make_supabase()
+    targets = [_make_target(keywords=["a", "b"]), _make_target(keywords=["c", "d"])]
+
+    fake_brave = AsyncMock(return_value=[])
+    fake_detect = AsyncMock(return_value=None)
+    with (
+        patch("app.services.source_discovery._brave_search", fake_brave),
+        patch("app.services.source_discovery.detect_ats", fake_detect),
+    ):
+        result = await run_discovery_all_targets(supabase, targets)
+
+    # Cap is PER target (2 each), so the bulk total is 2 + 2.
+    assert result.queries_issued == 4
+    assert fake_brave.await_count == 4
+    assert result.targets_processed == 2
