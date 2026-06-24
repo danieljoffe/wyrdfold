@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.dependencies import get_settings, get_supabase
 from app.main import app
-from app.models.schemas import PollResult
 
 _SETTINGS = Settings(
     wyrdfold_api_key="legacykey",
@@ -32,31 +31,24 @@ def _client() -> TestClient:
 
 
 def test_cron_key_authenticates_operator_poll_route() -> None:
-    with patch(
-        "app.routers.poll.poll_all_sources",
-        return_value=PollResult(
-            sources_polled=0, new_jobs=0, updated_jobs=0, errors=[]
-        ),
-    ):
+    # /poll now schedules the poll in the background and returns 202;
+    # patch the background body so the test never runs a real poll. The
+    # auth assertion is unchanged: the cron key reaches the operator route.
+    with patch("app.routers.poll.run_force_poll_locked"):
         client = _client()
         try:
             res = client.post("/poll", headers={"x-api-key": "cronkey"})
-            assert res.status_code == 200
+            assert res.status_code == 202
         finally:
             app.dependency_overrides.clear()
 
 
 def test_legacy_key_still_authenticates_operator_poll_route() -> None:
-    with patch(
-        "app.routers.poll.poll_all_sources",
-        return_value=PollResult(
-            sources_polled=0, new_jobs=0, updated_jobs=0, errors=[]
-        ),
-    ):
+    with patch("app.routers.poll.run_force_poll_locked"):
         client = _client()
         try:
             res = client.post("/poll", headers={"x-api-key": "legacykey"})
-            assert res.status_code == 200
+            assert res.status_code == 202
         finally:
             app.dependency_overrides.clear()
 

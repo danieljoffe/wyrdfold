@@ -33,7 +33,7 @@ from app.cache import job_list_cache
 from app.config import settings
 from app.services.ingestion_health import check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
-from app.services.poller import poll_due_sources
+from app.services.poller import poll_all_sources, poll_due_sources
 from app.services.retention import purge_expired_records
 from app.services.url_health import run_url_health_check
 from app.supabase_pool import get_supabase_pool
@@ -93,6 +93,60 @@ async def _run_scheduled_poll() -> None:
             await check_ingestion_health(client)
     except Exception:
         logger.exception("scheduled poll raised")
+
+
+async def run_force_poll_locked() -> None:
+    """Background body for the manual force-poll (``POST /poll``).
+
+    Force-polls EVERY enabled source (ignores ``poll_interval_minutes``),
+    the manual hammer the ``/poll`` route used to ``await`` inline. It now
+    runs detached so the route can return ``202`` immediately instead of
+    holding the request open for the multi-minute poll (which tripped the
+    edge's 300s timeout).
+
+    Routed through the SAME Postgres advisory lock as ``_run_scheduled_poll``
+    (``settings.poll_advisory_lock_key``), so a manual trigger and the
+    scheduled due-poll can never run concurrently: whichever gets the lock
+    polls, the other logs "poll already running, skipping" and exits cleanly.
+
+    Self-contained on purpose: it pulls the service-role singleton via
+    ``get_supabase_pool()`` (the same client the scheduler uses) rather than
+    a request-scoped client, so it keeps running correctly after the request
+    that scheduled it has returned.
+
+    Wrapped in try/except so a backgrounded task's exception is logged
+    rather than silently swallowed by the event loop.
+    """
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            logger.warning("force poll skipped — supabase client not initialized")
+            return
+        async with poll_advisory_lock(
+            client, settings.poll_advisory_lock_key
+        ) as acquired:
+            if not acquired:
+                logger.info(
+                    "force poll: poll already running, skipping (another poll "
+                    "holds the advisory lock, key=%s)",
+                    settings.poll_advisory_lock_key,
+                )
+                return
+            result = await poll_all_sources(client)
+            job_list_cache.invalidate()
+            logger.info(
+                "force poll: polled=%d new=%d updated=%d archived=%d errors=%d",
+                result.sources_polled,
+                result.new_jobs,
+                result.updated_jobs,
+                result.archived_jobs,
+                len(result.errors),
+            )
+            # Health check piggybacks the locked poll so it can't race a
+            # concurrent poll, mirroring the scheduled tick.
+            await check_ingestion_health(client)
+    except Exception:
+        logger.exception("force poll raised")
 
 
 async def _run_scheduled_url_health() -> None:
