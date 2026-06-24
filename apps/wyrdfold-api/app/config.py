@@ -182,6 +182,19 @@ class Settings(BaseSettings):
     # ``phase1_triage_enabled`` to surface any work.
     phase2_enabled: bool = False
 
+    # Job qualification firewall (#60). When True the poller runs the
+    # target-INDEPENDENT qualification tagger
+    # (``app/services/qualification/``) over each newly-ingested job — one
+    # cheap Haiku call per job, AFTER the US filter and BEFORE per-target
+    # scoring — and writes the intrinsic tags (is_us, role_family,
+    # seniority, employment_type, metro, is_remote, is_genuine_role) onto
+    # the ``jobs`` row so per-target grading can pre-filter cheaply. Ships
+    # FALSE so merging the package + migration triggers NO LLM spend; the
+    # tagger is best-effort (failures never break polling) and the
+    # content-hash (``jobs.qualified_hash``) skips re-tagging unchanged
+    # rows. Flip per-deploy once validated in DEV.
+    qualification_enabled: bool = False
+
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
     # model to emit a `logistics` JSON object (remote_status, salary

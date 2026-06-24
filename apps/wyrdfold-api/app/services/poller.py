@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -39,6 +38,12 @@ from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.cost_log import record as record_llm_cost
 from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
+from app.services.qualification import (
+    QUALIFICATION_PURPOSE,
+    is_us_location,
+    qualification_hash,
+    tag_job,
+)
 from app.services.recency import refresh_recency_scores
 from app.services.relevance.title_triage import (
     PHASE1_BATCH_SIZE,
@@ -111,99 +116,11 @@ DB_WRITE_CONCURRENCY = 12
 # Below this threshold, only keyword scoring is used.
 LLM_SCORE_THRESHOLD = 40
 
-# Substrings that flag a location as non-US. Case-insensitive, substring match.
-_NON_US_HINTS: tuple[str, ...] = (
-    "united kingdom",
-    "england",
-    "scotland",
-    "wales",
-    "ireland",
-    "dublin",
-    "germany",
-    "berlin",
-    "munich",
-    "france",
-    "paris",
-    "netherlands",
-    "amsterdam",
-    "spain",
-    "barcelona",
-    "madrid",
-    "italy",
-    "rome",
-    "milan",
-    "sweden",
-    "stockholm",
-    "denmark",
-    "copenhagen",
-    "norway",
-    "oslo",
-    "finland",
-    "helsinki",
-    "switzerland",
-    "zurich",
-    "geneva",
-    "austria",
-    "vienna",
-    "poland",
-    "warsaw",
-    "czech",
-    "czechia",
-    "prague",
-    "portugal",
-    "lisbon",
-    "greece",
-    "athens",
-    "turkey",
-    "istanbul",
-    "canada",
-    "toronto",
-    "vancouver",
-    "montreal",
-    "ottawa",
-    "mexico",
-    "brazil",
-    "são paulo",
-    "sao paulo",
-    "india",
-    "bangalore",
-    "bengaluru",
-    "hyderabad",
-    "mumbai",
-    "delhi",
-    "pune",
-    "china",
-    "beijing",
-    "shanghai",
-    "hong kong",
-    "singapore",
-    "japan",
-    "tokyo",
-    "korea",
-    "seoul",
-    "taiwan",
-    "australia",
-    "sydney",
-    "melbourne",
-    "new zealand",
-    "auckland",
-    "israel",
-    "tel aviv",
-    "south africa",
-    "johannesburg",
-    "argentina",
-    "buenos aires",
-    "chile",
-    "colombia",
-    "peru",
-    "uae",
-    "dubai",
-    "abu dhabi",
-    "emea",
-    "apac",
-    "latam",
-    "europe",
-)
+# US-location detection (hint list + regexes + ``_is_us_location``) moved to
+# ``app/services/qualification/heuristics.py`` so the poller's ingestion gate
+# and the #60 qualification tagger's L1 share ONE implementation (single source
+# of truth). ``_is_us_location`` is re-exported below for back-compat with
+# callers/tests that import it from this module.
 
 
 # Per-event-loop global cap on concurrent supabase write threads. Created
@@ -333,57 +250,11 @@ def _title_matches_target(title: str, keywords: list[str]) -> bool:
     return False
 
 
-# Word-boundary pattern over the hints. Plain substring matching produced
-# false drops on US locations that merely *contain* a hint: "india" ⊂
-# "Indianapolis, Indiana", "rome" ⊂ "Rome, GA", etc.
-_NON_US_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(h) for h in _NON_US_HINTS) + r")\b"
-)
-
-# Explicit US markers that short-circuit the non-US rejection. Needed for
-# US cities that share a name with a non-US hint city: "Dublin, OH",
-# "Dublin, CA", "Athens, GA", "Milan, MI" are all real US locations that
-# the hint list would otherwise reject.
-_US_COUNTRY_RE = re.compile(r"\b(?:usa|u\.s\.a?|united states)\b", re.I)
-
-_US_STATE_ABBREVS: frozenset[str] = frozenset(
-    {
-        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-        "DC",
-    }
-)
-
-# ", XX" with XX upper-case — the standard "City, ST" form. Checked against
-# the original casing so lowercase words ("ca" in "Africa") can't match.
-_US_STATE_ABBREV_RE = re.compile(r",\s*([A-Z]{2})\b")
-
-
-def _is_us_location(location: str | None) -> bool:
-    """Return True if the location looks like it's in the US (or is ambiguous).
-
-    Permissive by design: empty/None and generic 'Remote' pass through,
-    since many US companies list remote roles with no country. Rejects
-    only when a known non-US country or major city name is detected as a
-    whole word AND no explicit US marker (country name or "City, ST"
-    state abbreviation) is present. The US marker wins ties on purpose —
-    a rare "Berlin, DE" style ISO-code listing slips through as US, which
-    the downstream scoring tolerates far better than silently dropping
-    every "Dublin, CA".
-    """
-    if not location:
-        return True
-    if _US_COUNTRY_RE.search(location):
-        return True
-    if any(
-        m.group(1) in _US_STATE_ABBREVS
-        for m in _US_STATE_ABBREV_RE.finditer(location)
-    ):
-        return True
-    return not _NON_US_RE.search(location.lower())
+# ``_is_us_location`` now lives in ``qualification.heuristics`` (single source
+# of truth shared with the #60 tagger). Re-exported under the original private
+# name so existing callers/tests (``tests/test_poller.py``) keep importing it
+# from this module unchanged.
+_is_us_location = is_us_location
 
 
 def _passes_free_gates(job: StandardJob, active_targets: list[JobTarget]) -> bool:
@@ -785,6 +656,96 @@ async def _resolve_user_targets_for_stage3(
     return primary_by_user, user_optimized
 
 
+async def _qualify_one_job(
+    llm: LLMClient,
+    supabase: Client,
+    row: dict[str, Any],
+) -> None:
+    """Tag ONE job row and persist its qualification columns (#60).
+
+    Content-hash cached: skips the LLM call when the row's current
+    ``qualified_hash`` already matches the freshly-computed hash over
+    (title, company, location, description) — so a re-poll that returns an
+    unchanged posting costs nothing. Fully best-effort: any error is logged
+    and swallowed so the row simply stays NULL (not-yet-tagged) and a later
+    cycle re-attempts it.
+    """
+    new_hash = qualification_hash(
+        title=row.get("title"),
+        company=row.get("company_name"),
+        location=row.get("location"),
+        description=row.get("description_html"),
+    )
+    if row.get("qualified_hash") == new_hash and row.get("qualified_at"):
+        # Unchanged content already tagged — skip the spend.
+        return
+
+    tags, result = await tag_job(
+        llm,
+        title=row.get("title", ""),
+        company=row.get("company_name"),
+        location=row.get("location"),
+        description=row.get("description_html"),
+    )
+    if tags is None:
+        # Tagger failed (logged inside tag_job). Leave the row NULL.
+        return
+
+    if result is not None:
+        # System-driven spend → async buffered cost-log path, like the rest
+        # of the poller's background LLM work.
+        with contextlib.suppress(Exception):
+            enqueue_llm_cost(None, QUALIFICATION_PURPOSE, result)
+
+    payload: dict[str, Any] = {
+        "is_us": tags.is_us,
+        "us_confidence": tags.us_confidence,
+        "role_family": tags.role_family,
+        "seniority": tags.seniority,
+        "employment_type": tags.employment_type,
+        "metro": tags.metro,
+        "is_remote": tags.is_remote,
+        "is_genuine_role": tags.is_genuine_role,
+        "qualified_at": datetime.now(UTC).isoformat(),
+        "qualified_hash": new_hash,
+    }
+    try:
+        await _db_to_thread(
+            lambda: execute_with_retry_sync(
+                supabase.table("jobs").update(payload).eq("id", row["id"]).execute,
+                label="qualification tags update",
+            )
+        )
+    except Exception:
+        logger.exception(
+            "Qualification tag write failed for job %s", row.get("id")
+        )
+
+
+async def _qualify_jobs(
+    supabase: Client,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Run the #60 qualification tagger over ``rows`` (best-effort).
+
+    Target-INDEPENDENT, so it bills the instance key (``get_client(..,
+    None)``) — never a per-target payer. Concurrency is bounded by the
+    shared DB-write semaphore inside ``_qualify_one_job``; the tagger calls
+    themselves fan out together. The whole step is wrapped so a tagger or
+    client-resolution failure can never break the poll.
+    """
+    try:
+        llm = get_llm_client(supabase, None)
+    except Exception:
+        logger.exception("Qualification tagger: LLM client unavailable; skipping")
+        return
+
+    await asyncio.gather(
+        *(_qualify_one_job(llm, supabase, row) for row in rows),
+        return_exceptions=True,
+    )
+
+
 def _resolve_payer_client(
     cache: dict[str | None, LLMClient | None],
     supabase: Client,
@@ -1122,6 +1083,20 @@ async def _poll_one_source(
                     new_rows.append(data)
                 else:
                     summary["updated"] += 1
+
+            # ---- Qualification firewall (#60) ----
+            # Target-INDEPENDENT tagging: classify each upserted job ONCE and
+            # write the intrinsic tags onto its row, so per-target scoring
+            # below can pre-filter cheaply. Runs AFTER the US filter (every
+            # row here is a free-gate survivor) and BEFORE per-target scoring.
+            # Best-effort and flag-gated: failures are swallowed so a tagger
+            # outage never breaks polling, and nothing runs unless
+            # ``qualification_enabled`` is set (no LLM spend by default).
+            if settings.qualification_enabled and upsert_resp.data:
+                await _qualify_jobs(
+                    supabase,
+                    [cast(dict[str, Any], r) for r in upsert_resp.data],
+                )
 
             # ---- Stage 1: Title scoring per target ----
             for active_target in active_targets:
@@ -2091,6 +2066,15 @@ async def _poll_one_source_for_target(
                     summary["new"] += 1
                 else:
                     summary["updated"] += 1
+
+            # Qualification firewall (#60): same target-INDEPENDENT tagging
+            # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target
+            # scoring, flag-gated, best-effort.
+            if settings.qualification_enabled and upsert_resp.data:
+                await _qualify_jobs(
+                    supabase,
+                    [cast(dict[str, Any], r) for r in upsert_resp.data],
+                )
 
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
