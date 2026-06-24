@@ -291,6 +291,26 @@ class Settings(BaseSettings):
     # Per-keyword result depth — top N URLs we look at from each search.
     discovery_results_per_query: int = Field(default=20, ge=1, le=50)
 
+    # In-process scheduled source discovery. Off by default (same posture as
+    # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
+    # queries; ops opt-in via env var. When enabled the scheduler ticks every
+    # ``discovery_tick_hours`` and runs a discovery pass across ALL targets
+    # (active + inactive) so a dormant target's boards keep refreshing. The
+    # Brave-key gate still applies inside the run — an empty
+    # ``brave_search_api_key`` makes each per-target pass a clean no-op, so
+    # enabling this flag without a Brave key does nothing. Tick is hours
+    # (discovery is a daily-cadence job, not minutes like the poll).
+    discovery_scheduler_enabled: bool = False
+    discovery_tick_hours: int = Field(default=24, ge=1, le=720)
+    # Postgres advisory-lock key for the bulk discovery run. A DISTINCT bigint
+    # from ``poll_advisory_lock_key`` so a discovery pass and a poll never
+    # contend on the same lock — they guard different work. Like the poll key
+    # it serializes discovery across every replica AND the manual ``POST
+    # /discovery/run`` trigger: a second caller gets ``false`` from
+    # pg_try_advisory_lock and skips cleanly. The same generic
+    # try_poll_advisory_lock / release_poll_advisory_lock RPCs back both keys.
+    discovery_advisory_lock_key: int = 8675310
+
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]

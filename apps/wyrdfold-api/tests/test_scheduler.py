@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from app.scheduler import build_scheduler, start_scheduler_if_enabled
+from app.services.source_discovery import run_discovery_all_targets_locked
 
 
 def _patch_lock_acquired() -> contextlib.AbstractContextManager[object]:
@@ -49,6 +50,7 @@ def test_start_scheduler_returns_none_when_all_disabled() -> None:
         mock_settings.poll_scheduler_enabled = False
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -62,6 +64,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.poll_tick_minutes = 30
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -82,6 +85,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.url_health_check_enabled = True
         mock_settings.url_health_tick_hours = 6
         mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -103,6 +107,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.url_health_check_enabled = True
         mock_settings.url_health_tick_hours = 6
         mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -122,6 +127,7 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = True
         mock_settings.retention_purge_tick_hours = 24
+        mock_settings.discovery_scheduler_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -135,8 +141,9 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
 
 
 @pytest.mark.asyncio
-async def test_start_scheduler_registers_all_three_when_all_enabled() -> None:
-    """All flags on — three jobs live on the single shared scheduler."""
+async def test_start_scheduler_registers_three_when_poll_health_retention_enabled() -> None:
+    """Poll + url_health + retention on, discovery off — exactly those three
+    jobs live on the single shared scheduler."""
     with patch("app.scheduler.settings") as mock_settings:
         mock_settings.poll_scheduler_enabled = True
         mock_settings.poll_tick_minutes = 30
@@ -144,6 +151,7 @@ async def test_start_scheduler_registers_all_three_when_all_enabled() -> None:
         mock_settings.url_health_tick_hours = 6
         mock_settings.retention_purge_enabled = True
         mock_settings.retention_purge_tick_hours = 24
+        mock_settings.discovery_scheduler_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -151,6 +159,72 @@ async def test_start_scheduler_registers_all_three_when_all_enabled() -> None:
         assert scheduler.running is True
         ids = {j.id for j in scheduler.get_jobs()}
         assert ids == {"poll_due_sources", "url_health_check", "retention_purge"}
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_registers_only_discovery_when_only_discovery_enabled() -> None:
+    """Discovery-only operation — verify only the discovery_run job lands, and
+    that it's the bulk all-targets body (``run_discovery_all_targets_locked``)."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = True
+        mock_settings.discovery_tick_hours = 24
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].id == "discovery_run"
+        # The registered callable is the bulk, all-targets, advisory-locked body.
+        assert jobs[0].func is run_discovery_all_targets_locked
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_discovery_scheduler_off_by_default_does_not_register() -> None:
+    """With every flag off (the default posture) discovery does NOT start —
+    the Brave-key gate is the inner guard, but the flag is the outer one."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
+        scheduler = start_scheduler_if_enabled()
+    # No flags on → no scheduler at all, so no discovery_run job.
+    assert scheduler is None
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_registers_all_four_when_all_enabled() -> None:
+    """All four flags on — four jobs live on the single shared scheduler."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = True
+        mock_settings.poll_tick_minutes = 30
+        mock_settings.url_health_check_enabled = True
+        mock_settings.url_health_tick_hours = 6
+        mock_settings.retention_purge_enabled = True
+        mock_settings.retention_purge_tick_hours = 24
+        mock_settings.discovery_scheduler_enabled = True
+        mock_settings.discovery_tick_hours = 24
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        ids = {j.id for j in scheduler.get_jobs()}
+        assert ids == {
+            "poll_due_sources",
+            "url_health_check",
+            "retention_purge",
+            "discovery_run",
+        }
     finally:
         scheduler.shutdown(wait=False)
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
@@ -30,6 +30,9 @@ from app.models.targets import JobTarget
 # it as a cheap pre-probe grouping key so 20 hits on the same board cost one
 # probe instead of 20.
 from app.services.ats_detect import DetectResult, _parse_input, detect_ats
+from app.services.poll_lock import poll_advisory_lock
+from app.services.targets import crud
+from app.supabase_pool import get_supabase_pool
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +131,7 @@ async def _brave_search(
 
     for attempt in range(1, _BRAVE_MAX_ATTEMPTS + 1):
         try:
-            resp = await client.get(
-                _BRAVE_URL, headers=headers, params=params, timeout=15.0
-            )
+            resp = await client.get(_BRAVE_URL, headers=headers, params=params, timeout=15.0)
         except httpx.HTTPError as exc:
             logger.warning(
                 "brave search transport error for %r (attempt %d/%d): %s",
@@ -141,9 +142,7 @@ async def _brave_search(
             )
             if attempt >= _BRAVE_MAX_ATTEMPTS:
                 return []
-            await asyncio.sleep(
-                _backoff_with_jitter(attempt)
-            )
+            await asyncio.sleep(_backoff_with_jitter(attempt))
             continue
 
         if resp.status_code == 200:
@@ -166,13 +165,9 @@ async def _brave_search(
             # 429: prefer server's Retry-After. 5xx: exponential backoff.
             sleep_seconds: float
             if resp.status_code == 429:
-                retry_after = _parse_retry_after(
-                    resp.headers.get("retry-after", "")
-                )
+                retry_after = _parse_retry_after(resp.headers.get("retry-after", ""))
                 sleep_seconds = (
-                    retry_after
-                    if retry_after is not None
-                    else _backoff_with_jitter(attempt)
+                    retry_after if retry_after is not None else _backoff_with_jitter(attempt)
                 )
             else:
                 sleep_seconds = _backoff_with_jitter(attempt)
@@ -306,9 +301,7 @@ def _insert_source(supabase: Client, *, detect: DetectResult) -> bool:
             if isinstance(inserted, bool):
                 return inserted
     # Unknown response shape — log and treat as not-inserted to be safe.
-    logger.warning(
-        "insert_source_if_not_exists returned unexpected shape: %r", data
-    )
+    logger.warning("insert_source_if_not_exists returned unexpected shape: %r", data)
     return False
 
 
@@ -377,9 +370,7 @@ async def run_discovery_for_target(
     # Random sampling covers the whole keyword x site space across repeated
     # runs without needing rotation state.
     query_plan = [
-        (keyword, site_filter)
-        for keyword in keywords
-        for site_filter in _ATS_SITE_FILTERS
+        (keyword, site_filter) for keyword in keywords for site_filter in _ATS_SITE_FILTERS
     ]
     random.shuffle(query_plan)
     if len(query_plan) > cap:
@@ -403,9 +394,8 @@ async def run_discovery_for_target(
     brave_semaphore = asyncio.Semaphore(8)
 
     async with httpx.AsyncClient() as brave_client:
-        async def _bounded_brave(
-            kw: str, site: str
-        ) -> tuple[str, str, list[str]]:
+
+        async def _bounded_brave(kw: str, site: str) -> tuple[str, str, list[str]]:
             async with brave_semaphore:
                 # Keyword left unquoted on purpose. Exact-phrase quoting
                 # ("director of cx operations") missed boards whose posting
@@ -546,6 +536,116 @@ async def run_discovery_for_target(
         filtered=filtered,
         deduped=deduped,
     )
+
+
+@dataclass(slots=True)
+class BulkDiscoveryStats:
+    """Aggregate of one discovery pass across many targets.
+
+    Returned by :func:`run_discovery_all_targets` so callers (the router,
+    a test, the scheduler log line) can report a single roll-up. ``errors``
+    holds one ``"{target_id}: discovery failed"`` string per target whose
+    run raised — a failed target is recorded and skipped, the rest still run.
+    """
+
+    targets_processed: int = 0
+    queries_issued: int = 0
+    urls_examined: int = 0
+    inserted: int = 0
+    duplicates: int = 0
+    unclassified: int = 0
+    filtered: int = 0
+    errors: list[str] = field(default_factory=list)
+    per_target: list[DiscoveryRunStats] = field(default_factory=list)
+
+
+async def run_discovery_all_targets(
+    supabase: Client, targets: list[JobTarget]
+) -> BulkDiscoveryStats:
+    """Run source discovery for the given targets, sequentially.
+
+    Sequential on purpose: each per-target run already fans its Brave
+    queries out under an internal semaphore, and the per-run query cap
+    applies per target — running targets concurrently would multiply the
+    burst against Brave's rate limit without finishing meaningfully sooner.
+    A failed target is recorded in ``errors`` and skipped; the rest still
+    run. The caller decides which targets to pass (active-only for the
+    manual per-request path historically; ALL targets for the scheduled /
+    cron bulk path).
+    """
+    result = BulkDiscoveryStats()
+    for target in targets:
+        try:
+            stats = await run_discovery_for_target(supabase, target)
+        except Exception:
+            logger.exception("bulk discovery failed for target %s", target.id)
+            result.errors.append(f"{target.id}: discovery failed")
+            continue
+        result.targets_processed += 1
+        result.queries_issued += stats.queries_issued
+        result.urls_examined += stats.urls_examined
+        result.inserted += stats.inserted
+        result.duplicates += stats.duplicates
+        result.unclassified += stats.unclassified
+        result.filtered += stats.filtered
+        result.per_target.append(stats)
+
+    logger.info(
+        "bulk discovery: %d targets, %d queries, %d inserted, %d errors",
+        result.targets_processed,
+        result.queries_issued,
+        result.inserted,
+        len(result.errors),
+    )
+    return result
+
+
+async def run_discovery_all_targets_locked() -> None:
+    """Background body for bulk discovery (``POST /discovery/run`` + scheduler).
+
+    Walks EVERY target (active + inactive — see ``crud.get_all``) and runs a
+    discovery pass for each, the multi-minute work the ``/discovery/run`` route
+    used to ``await`` inline. It now runs detached so the route can return
+    ``202`` immediately instead of holding the request open for the ~10-minute
+    run (which tripped the edge's 300s timeout).
+
+    Routed through a Postgres advisory lock keyed on
+    ``settings.discovery_advisory_lock_key`` (DISTINCT from the poll key, so a
+    discovery pass and a poll never contend): a manual trigger and the
+    scheduled discovery tick can't run concurrently — whichever gets the lock
+    runs, the other logs "discovery already running, skipping" and exits
+    cleanly. Overlapping runs would otherwise multiply the burst against
+    Brave's monthly quota.
+
+    Self-contained on purpose: it pulls the service-role singleton via
+    ``get_supabase_pool()`` (the same client the scheduler uses) rather than a
+    request-scoped client, so it keeps running correctly after the request
+    that scheduled it has returned.
+
+    The Brave-key gate is preserved: with an empty ``brave_search_api_key``
+    every per-target run is a clean no-op (it returns zeroed stats and logs a
+    warning), so the whole pass costs only the ``crud.get_all`` read.
+
+    Wrapped in try/except so a backgrounded task's exception is logged rather
+    than silently swallowed by the event loop.
+    """
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            logger.warning("bulk discovery skipped — supabase client not initialized")
+            return
+        async with poll_advisory_lock(client, settings.discovery_advisory_lock_key) as acquired:
+            if not acquired:
+                logger.info(
+                    "bulk discovery skipped — another discovery run holds the "
+                    "advisory lock (key=%s)",
+                    settings.discovery_advisory_lock_key,
+                )
+                return
+            targets = crud.get_all(client)
+            await run_discovery_all_targets(client, targets)
+    except Exception:
+        logger.exception("bulk discovery raised")
 
 
 __all__ = ["DiscoveryRunStats", "run_discovery_for_target"]
