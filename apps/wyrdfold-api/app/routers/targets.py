@@ -45,6 +45,8 @@ from app.models.targets import (
     TargetCreate,
     TargetFromManual,
     TargetFromUrl,
+    TargetPreferences,
+    TargetPreferencesUpdate,
     TargetsListResponse,
     TargetsSummaryListResponse,
     TargetStatusResponse,
@@ -809,6 +811,72 @@ def _invalidate_jobs_cache_for_target(target_id: str) -> None:
     """
     job_list_cache.invalidate(prefix=jobs_cache_prefix(target_id=target_id))
     job_list_cache.invalidate(prefix=jobs_cache_prefix(target_id=None))
+
+
+# ---- Per-user target preferences (#60) ------------------------------------
+#
+# Read-time filter/re-rank over the SHARED, cached fit score. Preferences live
+# on the user_targets junction and NEVER trigger a re-grade or per-user
+# scoring. JWT-only (no api-key fallback) — there is no "current user" without
+# a JWT, and ownership is enforced exactly like the axis-weights /
+# notification-thresholds routes (the crud helpers 404 via None when the
+# (user, target) link is missing, so the service-role client can't be steered
+# onto another user's row).
+
+
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+@router.get("/{target_id}/preferences", response_model=TargetPreferences)
+def get_target_preferences(
+    target_id: str,
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> TargetPreferences:
+    """Return the calling user's preferences for a target.
+
+    404s when the user has no link to the target — preferences are
+    meaningless without a (user, target) pairing, and a 404 keeps a
+    non-owner from confirming the target exists.
+    """
+    prefs = crud.get_user_target_preferences(
+        supabase, user_id=user_id, target_id=target_id
+    )
+    if prefs is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No user_targets row for (user, target). Link the target first.",
+        )
+    return prefs
+
+
+# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+@router.put("/{target_id}/preferences", response_model=TargetPreferences)
+def set_target_preferences(
+    target_id: str,
+    body: TargetPreferencesUpdate,
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> TargetPreferences:
+    """Replace the calling user's preferences for a target (PUT semantics).
+
+    Every preference column is written from the body (omitted fields fall
+    back to their documented defaults), so the stored row is always a
+    complete set. Pure read-time config — does NOT re-grade; existing
+    ``scores`` rows are untouched. The jobs-list cache is busted so the
+    next list read reflects the new filters.
+    """
+    prefs = crud.set_user_target_preferences(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        preferences=TargetPreferences(**body.model_dump()),
+    )
+    if prefs is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No user_targets row for (user, target). Link the target first.",
+        )
+    _invalidate_jobs_cache_for_target(target_id)
+    return prefs
 
 
 @router.post(

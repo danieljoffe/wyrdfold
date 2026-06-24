@@ -140,6 +140,18 @@ class UserTarget(BaseModel):
     # fall back to the user-profile default for that channel (notify.py).
     job_score_threshold: int | None = None
     sms_score_threshold: int | None = None
+    # Per-user target preferences (#60). A read-time filter/re-rank over the
+    # SHARED, cached fit score — never a per-user re-grade. See
+    # ``TargetPreferences`` for field semantics + defaults. Carried on the
+    # junction row so a single user_targets read hydrates them alongside the
+    # other per-user knobs.
+    pref_score_cutoff: int = 40
+    pref_locations: list[str] | None = None
+    pref_remote_ok: bool = True
+    pref_seniority_min: str | None = None
+    pref_seniority_max: str | None = None
+    pref_employment_types: list[str] | None = None
+    pref_include_unknown_salary: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -156,6 +168,100 @@ class NotificationThresholdsUpdate(BaseModel):
 
     job_score_threshold: int | None = Field(default=None, ge=0, le=200)
     sms_score_threshold: int | None = Field(default=None, ge=0, le=200)
+
+
+# Closed vocabulary for the seniority range. Mirrors ``SeniorityHint`` (the
+# job-side firewall tag the read path filters against) plus a sentinel so the
+# preference set and the job tag compare on the same ladder. Ordered low→high;
+# the read path uses the index to do range comparisons.
+SeniorityLevel = Literal["ic", "senior", "staff", "manager", "director", "vp", "c_level"]
+
+SENIORITY_ORDER: tuple[SeniorityLevel, ...] = get_args(SeniorityLevel)
+
+
+class TargetPreferences(BaseModel):
+    """Per-user, per-target read-time preferences (#60).
+
+    These shape the *calling user's* view of a SHARED target's jobs list. They
+    are applied as a filter/re-rank over the shared, cached fit score at read
+    time — they NEVER trigger a re-grade or any per-user scoring. Every field
+    has a behaviorally-neutral default so an un-customized link sees the same
+    list it always did.
+
+    Field semantics:
+
+    * ``pref_score_cutoff`` — hide jobs whose fit score is below this. Always
+      enforceable (``scores.score`` always exists). Default 40.
+    * ``pref_locations`` — keep jobs whose location matches any of these terms
+      (matched against the job's ``metro`` firewall tag when present, else a
+      free-text ILIKE on ``location``). ``None``/empty = no location filter.
+    * ``pref_remote_ok`` — when True, remote roles pass the location filter even
+      if they don't match ``pref_locations``. Default True.
+    * ``pref_seniority_min`` / ``pref_seniority_max`` — keep jobs whose
+      ``seniority`` firewall tag falls within this (inclusive) range on the
+      ``SENIORITY_ORDER`` ladder. ``None`` = open-ended on that end.
+    * ``pref_employment_types`` — keep jobs whose ``employment_type`` firewall
+      tag is in this set. ``None``/empty = no employment-type filter.
+    * ``pref_include_unknown_salary`` — out of scope for v1 filtering (salary
+      filtering isn't implemented yet); stored so the UI can round-trip the
+      toggle. Default True.
+
+    The seniority / employment-type / metro / remote job-side tag columns are
+    added by a separate firewall PR and are NOT backfilled. The read path
+    feature-detects them and treats a missing/NULL job tag as "unknown → keep"
+    (lenient), so these preferences are inert until the firewall lands.
+    """
+
+    pref_score_cutoff: int = Field(default=40, ge=0, le=200)
+    pref_locations: list[str] | None = None
+    pref_remote_ok: bool = True
+    pref_seniority_min: SeniorityLevel | None = None
+    pref_seniority_max: SeniorityLevel | None = None
+    pref_employment_types: list[str] | None = None
+    pref_include_unknown_salary: bool = True
+
+    @model_validator(mode="after")
+    def _seniority_range_ordered(self) -> "TargetPreferences":
+        """Reject an inverted range (min ranks above max) — it would silently
+        match nothing, which reads as a bug to the user. Open-ended ends
+        (``None``) are always fine."""
+        if self.pref_seniority_min is not None and self.pref_seniority_max is not None:
+            lo = SENIORITY_ORDER.index(self.pref_seniority_min)
+            hi = SENIORITY_ORDER.index(self.pref_seniority_max)
+            if lo > hi:
+                raise ValueError(
+                    "pref_seniority_min must not rank above pref_seniority_max"
+                )
+        return self
+
+
+class TargetPreferencesUpdate(BaseModel):
+    """PUT body for the per-user target preferences (#60).
+
+    A full replace (PUT semantics): every omitted scalar falls back to its
+    documented default, and omitted array fields clear to ``None`` (no filter).
+    This keeps the stored row a complete, self-describing preference set rather
+    than an accreting partial. The validation mirrors ``TargetPreferences``.
+    """
+
+    pref_score_cutoff: int = Field(default=40, ge=0, le=200)
+    pref_locations: list[str] | None = Field(default=None, max_length=50)
+    pref_remote_ok: bool = True
+    pref_seniority_min: SeniorityLevel | None = None
+    pref_seniority_max: SeniorityLevel | None = None
+    pref_employment_types: list[str] | None = Field(default=None, max_length=20)
+    pref_include_unknown_salary: bool = True
+
+    @model_validator(mode="after")
+    def _seniority_range_ordered(self) -> "TargetPreferencesUpdate":
+        if self.pref_seniority_min is not None and self.pref_seniority_max is not None:
+            lo = SENIORITY_ORDER.index(self.pref_seniority_min)
+            hi = SENIORITY_ORDER.index(self.pref_seniority_max)
+            if lo > hi:
+                raise ValueError(
+                    "pref_seniority_min must not rank above pref_seniority_max"
+                )
+        return self
 
 
 class TargetReferenceJD(BaseModel):
