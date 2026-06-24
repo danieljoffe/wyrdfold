@@ -245,6 +245,38 @@ class Settings(BaseSettings):
     # actual per-source cadence is governed by ``sources.poll_interval_minutes``.
     poll_scheduler_enabled: bool = False
     poll_tick_minutes: int = Field(default=30, ge=1, le=1440)
+    # Postgres advisory-lock key for the scheduled poll. A single stable
+    # bigint so only ONE poll runs at a time across every replica AND the
+    # Vercel cron — pg_try_advisory_lock returns false to a second caller,
+    # which skips cleanly. Arbitrary but fixed; change it only if it ever
+    # collides with another advisory lock in the same database.
+    poll_advisory_lock_key: int = 8675309
+
+    # Ingestion auto-recovery + health alerting (poll-outage hardening).
+    # The Sept-2026 outage went unnoticed for 10+ days: the only poll
+    # trigger (a daily Vercel Hobby cron) broke, every source then tripped
+    # the failure backoff and was disabled the same day, and nothing
+    # alerted. These settings stop that recurring.
+    #
+    # Auto-recovery: a source the backoff auto-disabled is re-enabled (and
+    # its consecutive_failures reset) once its ``disabled_at`` is older
+    # than this many hours, so a transient ATS-wide outage can't kill
+    # ingestion forever. The sweep runs from the poll cycle. 0 disables
+    # recovery (sources stay disabled until an operator intervenes).
+    source_recovery_after_hours: int = Field(default=24, ge=0, le=8760)
+    # Health check (runs from the scheduler/poll cycle). Fires a Sentry
+    # alert when ingestion looks dead — the symptom that went unnoticed.
+    # Off-switch is the threshold being 0.
+    ingestion_health_check_enabled: bool = True
+    # "No new jobs in N hours" — the highest-value alert. max(jobs.created_at)
+    # older than this fires. 48h is comfortably inside a healthy daily
+    # cadence yet catches a stall long before the 10-day blind spot. 0
+    # disables this check.
+    ingestion_max_job_age_hours: int = Field(default=48, ge=0, le=8760)
+    # Mass-disable alert: fires when this fraction (or more) of all sources
+    # are currently disabled — the other face of the outage (every source
+    # backed off at once). 0 disables this check.
+    ingestion_mass_disable_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # Brave Search API — powers the target-driven source-discovery loop. Set
     # the key to enable; empty key disables discovery entirely (the service

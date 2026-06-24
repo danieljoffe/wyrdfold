@@ -37,6 +37,9 @@ interface Capability {
   icon: LucideIcon;
 }
 
+// The payoff — "what you get" — shown just above the closing CTA so the page
+// crescendos into the waitlist. The trust beat ("Nothing invented") is pulled
+// out into its own section below; it's the differentiator, not just one feature.
 const CAPABILITIES: Capability[] = [
   {
     title: 'Roles that actually fit',
@@ -49,16 +52,19 @@ const CAPABILITIES: Capability[] = [
     icon: FileText,
   },
   {
-    title: 'Nothing invented',
-    body: 'Every line in a draft is traced back to something you actually did. The AI rephrases and reorders your experience for each role — it never makes up a job, a skill, or a number.',
-    icon: ShieldCheck,
-  },
-  {
     title: 'See where you stand',
     body: 'A clear view of your pipeline, the skills that keep coming up in roles you want, and where each application sits — so you always know the next move.',
     icon: BarChart3,
   },
 ];
+
+// The trust differentiator, given its own section between the steps and the
+// payoff so it lands as the reason to believe the rest.
+const TRUST = {
+  title: 'Nothing invented',
+  body: 'Every line in a draft is traced back to something you actually did. The AI rephrases and reorders your experience for each role — it never makes up a job, a skill, or a number.',
+  icon: ShieldCheck,
+} as const;
 
 const ATS_PROVIDERS = [
   'Greenhouse',
@@ -100,7 +106,20 @@ const STEPS: Step[] = [
 export default function WyrdfoldLandingPage() {
   return (
     <div className='mx-auto w-full max-w-6xl px-4 md:px-6'>
-      {/* Hero */}
+      {/*
+        Narrative arc, top to bottom, built to crescendo into the closing CTA:
+          1. Hook            — the hero headline + the pain it answers
+          2. Credibility     — the ATS strip (where it's already watching)
+          3. How it works    — the four steps
+          4. Trust           — "Nothing invented", the differentiator
+          5. Payoff          — what you actually get
+          6. Closing CTA     — the waitlist, with all the momentum behind it
+        Vertical rhythm: every major section uses `py-16 md:py-24`; the ATS
+        strip is a deliberately thinner divider band. Section intros use a
+        single `mb-10 md:mb-14` heading gap so the spacing reads consistently.
+      */}
+
+      {/* 1. Hook */}
       <section className='py-16 md:py-24'>
         <div className='max-w-3xl'>
           <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-950 dark:text-brand-300'>
@@ -109,7 +128,7 @@ export default function WyrdfoldLandingPage() {
           <Heading
             variant='detail'
             as='h1'
-            className='mt-4 text-balance text-text-primary'
+            className='mt-6 text-balance text-text-primary'
           >
             The job search that runs while you don&apos;t.
           </Heading>
@@ -139,16 +158,6 @@ export default function WyrdfoldLandingPage() {
               </Button>
             </Text>
           </div>
-
-          <Alert
-            variant='info'
-            title='Built so you can trust it'
-            className='mt-8'
-          >
-            WyrdFold never invents experience. Every sentence in a tailored
-            application is traced back to something you actually did — so what
-            you send is genuinely yours.
-          </Alert>
         </div>
 
         {/* Hero screenshot — optimized via scripts/optimize-covers.ts. */}
@@ -165,7 +174,7 @@ export default function WyrdfoldLandingPage() {
         </div>
       </section>
 
-      {/* ATS provider strip */}
+      {/* 2. Credibility — ATS provider strip */}
       <section className='border-y border-border py-8 md:py-10'>
         <div className='flex flex-col items-center gap-3 md:gap-4'>
           <p className='text-xs uppercase tracking-wider text-text-tertiary'>
@@ -186,38 +195,7 @@ export default function WyrdfoldLandingPage() {
         </div>
       </section>
 
-      {/* Capabilities */}
-      <section className='py-16 md:py-24'>
-        <div className='grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6'>
-          {CAPABILITIES.map(cap => {
-            const Icon = cap.icon;
-            return (
-              <Card
-                key={cap.title}
-                padding='lg'
-                className='border-border-secondary transition-colors duration-200 motion-reduce:transition-none hover:border-brand-300/60 hover:bg-surface-elevated'
-              >
-                <CardContent className='flex flex-col gap-3'>
-                  <div className='flex items-center gap-3'>
-                    <Icon
-                      className='size-5 text-brand-300'
-                      aria-hidden='true'
-                    />
-                    <Heading variant='component' as='h3'>
-                      {cap.title}
-                    </Heading>
-                  </div>
-                  <Text variant='body' as='p'>
-                    {cap.body}
-                  </Text>
-                </CardContent>
-              </Card>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* How it works */}
+      {/* 3. How it works */}
       <section
         id='how-it-works'
         aria-labelledby='how-it-works-heading'
@@ -228,7 +206,7 @@ export default function WyrdfoldLandingPage() {
             variant='section'
             as='h2'
             id='how-it-works-heading'
-            className='mb-10 md:mb-14 text-center'
+            className='mb-10 md:mb-14 text-center text-balance'
           >
             How it works
           </Heading>
@@ -276,10 +254,89 @@ export default function WyrdfoldLandingPage() {
         </div>
       </section>
 
-      {/* Footer CTA */}
-      <section className='py-16 md:py-24 border-t border-border'>
+      {/* 4. Trust differentiator */}
+      <section
+        aria-labelledby='trust-heading'
+        className='py-16 md:py-24 border-t border-border'
+      >
+        <Card
+          padding='lg'
+          elevated
+          className='mx-auto max-w-2xl border-brand-300/40'
+        >
+          <CardContent className='flex flex-col items-center gap-4 text-center'>
+            <span className='flex size-12 items-center justify-center rounded-full bg-brand-300/10 text-brand-700 dark:text-brand-300'>
+              <TRUST.icon className='size-6' aria-hidden='true' />
+            </span>
+            <Heading variant='section' as='h2' id='trust-heading'>
+              {TRUST.title}
+            </Heading>
+            <Text variant='bodyLg' as='p' className='text-text-secondary'>
+              {TRUST.body}
+            </Text>
+            <Alert variant='info' title='Built so you can trust it'>
+              WyrdFold never invents experience. Every sentence in a tailored
+              application is traced back to something you actually did — so what
+              you send is genuinely yours.
+            </Alert>
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* 5. Payoff — what you get */}
+      <section
+        aria-labelledby='payoff-heading'
+        className='py-16 md:py-24 border-t border-border'
+      >
+        <Heading
+          variant='section'
+          as='h2'
+          id='payoff-heading'
+          className='mb-10 md:mb-14 text-center text-balance'
+        >
+          What you get
+        </Heading>
+        <div className='grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6'>
+          {CAPABILITIES.map(cap => {
+            const Icon = cap.icon;
+            return (
+              <Card
+                key={cap.title}
+                padding='lg'
+                className='border-border-secondary transition-colors duration-200 motion-reduce:transition-none hover:border-brand-300/60 hover:bg-surface-elevated'
+              >
+                <CardContent className='flex flex-col gap-3'>
+                  <div className='flex items-center gap-3'>
+                    <Icon
+                      className='size-5 text-brand-700 dark:text-brand-300'
+                      aria-hidden='true'
+                    />
+                    <Heading variant='component' as='h3'>
+                      {cap.title}
+                    </Heading>
+                  </div>
+                  <Text variant='body' as='p'>
+                    {cap.body}
+                  </Text>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 6. Closing CTA */}
+      <section
+        aria-labelledby='closing-cta-heading'
+        className='py-16 md:py-24 border-t border-border'
+      >
         <div className='flex flex-col items-center gap-6 text-center'>
-          <Heading variant='section' as='h2' className='max-w-2xl text-balance'>
+          <Heading
+            variant='section'
+            as='h2'
+            id='closing-cta-heading'
+            className='max-w-2xl text-balance'
+          >
             Stop chasing the search. Let it come to you.
           </Heading>
           <Text variant='body' as='p' className='max-w-xl text-text-secondary'>

@@ -589,7 +589,13 @@ async def _run_llm_scoring_for_row(
             logger.exception("Failed to mark scores complete for job %s", job_id)
         return
 
-    # Check LLM cache — skip re-analysis if this job+target+optimized was already done
+    # Check LLM cache — skip re-analysis if this job+target+optimized was already
+    # done. Scope to the doc's OWNING user (``optimized_doc.user_id``) — the same
+    # tenant the user-facing ``POST /analysis`` reads under (its
+    # ``get_latest(user_id=sub)`` returns this very doc). Reading/persisting under
+    # ``user_id=None`` (the old value) stranded cron-computed analyses in a
+    # separate namespace the user view could never hit, so every first visit
+    # re-fired a full-price LLM call the cron had already paid for.
     try:
         cached = await asyncio.to_thread(
             get_cached_analysis,
@@ -597,7 +603,7 @@ async def _run_llm_scoring_for_row(
             job_id,
             target_id=target.id,
             optimized_doc_id=optimized_doc.id,
-            user_id=None,
+            user_id=optimized_doc.user_id,
         )
         if cached is not None:
             llm_score = scorecard_to_numeric(cached.scorecard)
@@ -629,13 +635,16 @@ async def _run_llm_scoring_for_row(
             purpose="poll_scoring",
         )
 
-        # Persist analysis and log cost
+        # Persist analysis and log cost. Owned by ``optimized_doc.user_id`` so
+        # the user-facing ``POST /analysis`` flow reuses this exact row (shared
+        # cache key (job, target, optimized_doc_id, user_id)) instead of
+        # re-running the LLM on first view.
         record = await asyncio.to_thread(
             persist_analysis,
             supabase,
             job_posting_id=job_id,
             target_id=target.id,
-            user_id=None,
+            user_id=optimized_doc.user_id,
             optimized_doc_id=optimized_doc.id,
             analysis=analysis,
             llm_result=llm_result,
@@ -1353,6 +1362,10 @@ async def _poll_one_source(
             "last_polled_at": datetime.now(UTC).isoformat(),
             "job_count": len(jobs),
             "consecutive_failures": 0,
+            # A clean poll clears the stored failure cause so last_error
+            # reflects only live problems (queryable signal, not history).
+            "last_error": None,
+            "last_error_at": None,
         }
         # Adaptive cadence: a non-empty upsert batch means this source
         # produced at least one ingestible candidate this cycle. The
@@ -1446,21 +1459,32 @@ async def _poll_one_source(
             per_target_phase1_no or "{}",
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Poll failed for %s", company_name)
         summary["error"] = f"{company_name}: poll failed"
-        await _record_source_failure(supabase, source)
+        await _record_source_failure(supabase, source, error=repr(exc))
 
     return summary
 
 
+# Truncate stored failure text so a giant traceback/HTML body can't bloat
+# the row (the column is queryable signal, not a log store).
+_SOURCE_LAST_ERROR_MAX_LEN = 500
+
+
 async def _record_source_failure(
-    supabase: Client, source: dict[str, Any]
+    supabase: Client, source: dict[str, Any], *, error: str | None = None
 ) -> None:
-    """Failure backoff: count consecutive fetch failures per source and
-    auto-disable at the threshold (a dead board otherwise gets re-fetched
-    every cycle forever). Successful polls reset the counter via the
-    ``last_polled_at`` update. Best-effort — never raises.
+    """Failure backoff: count consecutive fetch failures per source, persist
+    the failure cause, and auto-disable at the threshold (a dead board
+    otherwise gets re-fetched every cycle forever).
+
+    Persists ``last_error`` + ``last_error_at`` on every failure so the cause
+    is queryable in SQL (it was previously only logged — which is why the
+    outage was invisible). When the backoff flips ``enabled=false`` it also
+    stamps ``disabled_at`` (drives auto-recovery) and fires a Sentry alert.
+    Successful polls clear ``last_error``/``last_error_at`` and reset the
+    counter via the ``last_polled_at`` update. Best-effort — never raises.
     """
     threshold = settings.source_failure_disable_threshold
     if threshold <= 0:
@@ -1468,14 +1492,23 @@ async def _record_source_failure(
     source_id = source.get("id")
     if not source_id:
         return
+    company = source.get("company_name", source_id)
     try:
         failures = int(source.get("consecutive_failures") or 0) + 1
-        updates: dict[str, Any] = {"consecutive_failures": failures}
-        if failures >= threshold:
+        now_iso = datetime.now(UTC).isoformat()
+        updates: dict[str, Any] = {
+            "consecutive_failures": failures,
+            "last_error_at": now_iso,
+        }
+        if error:
+            updates["last_error"] = error[:_SOURCE_LAST_ERROR_MAX_LEN]
+        disabling = failures >= threshold
+        if disabling:
             updates["enabled"] = False
+            updates["disabled_at"] = now_iso
             logger.warning(
                 "Source %s disabled after %d consecutive failures",
-                source.get("company_name", source_id),
+                company,
                 failures,
             )
         await asyncio.to_thread(
@@ -1484,10 +1517,80 @@ async def _record_source_failure(
             .eq("id", source_id)
             .execute()
         )
+        if disabling and settings.sentry_dsn:
+            try:
+                import sentry_sdk
+
+                sentry_sdk.capture_message(
+                    f"source auto-disabled after {failures} consecutive "
+                    f"failures: {company} ({source_id}). "
+                    f"last_error={updates.get('last_error') or 'n/a'}",
+                    level="error",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to report source auto-disable to Sentry"
+                )
     except Exception:
         logger.exception(
             "Failed to record source failure for %s", source_id
         )
+
+
+async def recover_stale_sources(
+    supabase: Client, *, now: datetime | None = None
+) -> int:
+    """Auto-recovery: re-enable sources the backoff auto-disabled longer ago
+    than ``source_recovery_after_hours``, resetting their failure counter so
+    they get polled again.
+
+    Without this, a transient ATS-wide outage that trips every source at once
+    (exactly the Sept-2026 failure) keeps ingestion down forever — nobody
+    flips ``enabled`` back. Runs from the poll cycle. Best-effort, never
+    raises; returns the number of sources re-enabled.
+
+    Only touches rows we auto-disabled (``disabled_at IS NOT NULL``), so an
+    operator who manually disables a source (leaving ``disabled_at`` NULL) is
+    never overridden.
+    """
+    cooldown_hours = settings.source_recovery_after_hours
+    if cooldown_hours <= 0:
+        return 0
+    moment = now or datetime.now(UTC)
+    cutoff = (moment - timedelta(hours=cooldown_hours)).isoformat()
+    try:
+        resp = await asyncio.to_thread(
+            lambda: (
+                supabase.table("sources")
+                .update(
+                    {
+                        "enabled": True,
+                        "consecutive_failures": 0,
+                        "disabled_at": None,
+                    }
+                )
+                .eq("enabled", False)
+                .not_.is_("disabled_at", "null")
+                .lt("disabled_at", cutoff)
+                .execute()
+            )
+        )
+    except Exception:
+        logger.exception("source auto-recovery sweep failed")
+        return 0
+    recovered = cast(list[dict[str, Any]], resp.data or [])
+    if recovered:
+        names = ", ".join(
+            str(r.get("company_name") or r.get("id")) for r in recovered[:10]
+        )
+        logger.info(
+            "source auto-recovery: re-enabled %d source(s) disabled > %dh ago: %s%s",
+            len(recovered),
+            cooldown_hours,
+            names,
+            "..." if len(recovered) > 10 else "",
+        )
+    return len(recovered)
 
 
 # Per-process dedup so the "approaching cap" warning fires once per UTC
@@ -1735,6 +1838,12 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     (e.g. every 30 min) without re-hammering boards that have a longer
     configured cadence.
     """
+    # Auto-recovery first, so a source whose cooldown just elapsed is
+    # re-enabled and picked up in THIS cycle rather than waiting a tick.
+    # A transient ATS-wide outage that tripped every source can't keep
+    # ingestion down forever (the Sept-2026 failure mode).
+    await recover_stale_sources(supabase)
+
     sources_query = supabase.table("sources").select("*").eq("enabled", True)
     sources_resp = await asyncio.to_thread(sources_query.execute)
     all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
