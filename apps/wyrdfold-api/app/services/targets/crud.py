@@ -16,6 +16,7 @@ from app.models.targets import (
     JobTargetSummary,
     ScoringProfile,
     TargetCreate,
+    TargetPreferences,
     TargetReferenceJD,
     TargetUpdate,
     UserTarget,
@@ -90,6 +91,25 @@ def _parse_user_target(row: dict[str, Any]) -> UserTarget:
         axis_weights_previous=(AxisWeights.model_validate(awp_raw) if awp_raw else None),
         job_score_threshold=row.get("job_score_threshold"),
         sms_score_threshold=row.get("sms_score_threshold"),
+        # Per-user preferences (#60). Columns may be absent on a row read back
+        # from an older shape; fall back to the model defaults so the parse
+        # never KeyErrors. ``pref_score_cutoff`` NULL (column default applies
+        # at write time) collapses to the 40-point default here too.
+        pref_score_cutoff=(
+            row["pref_score_cutoff"] if row.get("pref_score_cutoff") is not None else 40
+        ),
+        pref_locations=row.get("pref_locations"),
+        pref_remote_ok=(
+            row["pref_remote_ok"] if row.get("pref_remote_ok") is not None else True
+        ),
+        pref_seniority_min=row.get("pref_seniority_min"),
+        pref_seniority_max=row.get("pref_seniority_max"),
+        pref_employment_types=row.get("pref_employment_types"),
+        pref_include_unknown_salary=(
+            row["pref_include_unknown_salary"]
+            if row.get("pref_include_unknown_salary") is not None
+            else True
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -606,6 +626,82 @@ def set_user_target_notification_thresholds(
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return _parse_user_target(rows[0]) if rows else None
+
+
+_PREFERENCE_COLUMNS = (
+    "pref_score_cutoff",
+    "pref_locations",
+    "pref_remote_ok",
+    "pref_seniority_min",
+    "pref_seniority_max",
+    "pref_employment_types",
+    "pref_include_unknown_salary",
+)
+
+
+def preferences_from_user_target(ut: UserTarget) -> TargetPreferences:
+    """Project the per-user preference columns off a ``UserTarget`` row.
+
+    Pure read-shape transform — the columns already live on ``user_targets``,
+    so the GET endpoint reuses the single junction read instead of a second
+    round-trip.
+    """
+    return TargetPreferences(
+        pref_score_cutoff=ut.pref_score_cutoff,
+        pref_locations=ut.pref_locations,
+        pref_remote_ok=ut.pref_remote_ok,
+        pref_seniority_min=cast(Any, ut.pref_seniority_min),
+        pref_seniority_max=cast(Any, ut.pref_seniority_max),
+        pref_employment_types=ut.pref_employment_types,
+        pref_include_unknown_salary=ut.pref_include_unknown_salary,
+    )
+
+
+def get_user_target_preferences(
+    supabase: Client, *, user_id: str, target_id: str
+) -> TargetPreferences | None:
+    """Return the calling user's preferences for a target, or ``None`` when no
+    (user, target) link exists (the router 404s on None)."""
+    ut = get_user_target(supabase, user_id, target_id)
+    if ut is None:
+        return None
+    return preferences_from_user_target(ut)
+
+
+def set_user_target_preferences(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    preferences: TargetPreferences,
+) -> TargetPreferences | None:
+    """Replace the calling user's preferences for a target (#60).
+
+    Full PUT replace: every preference column is written from ``preferences``
+    (omitted fields already carry their model defaults), so the stored row is
+    always a complete, self-describing set. Does NOT re-grade — preferences are
+    a read-time filter over the shared, cached fit score.
+
+    Returns the persisted ``TargetPreferences`` (re-projected off the updated
+    row) or ``None`` when no (user, target) link exists.
+    """
+    current = get_user_target(supabase, user_id, target_id)
+    if current is None:
+        return None
+    payload = preferences.model_dump()
+    updates: dict[str, Any] = {col: payload[col] for col in _PREFERENCE_COLUMNS}
+    updates["updated_at"] = datetime.now(UTC).isoformat()
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return preferences_from_user_target(_parse_user_target(rows[0]))
 
 
 def undo_user_target_axis_weights(
