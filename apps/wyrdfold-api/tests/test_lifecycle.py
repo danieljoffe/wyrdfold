@@ -306,15 +306,25 @@ async def test_source_failure_increments_and_disables_at_threshold(monkeypatch):
 
     sb.table.return_value.update.side_effect = _capture_update
 
+    # Below threshold: increments the counter and stamps last_error_at, but
+    # does NOT disable (no enabled/disabled_at).
     await poller._record_source_failure(
         sb, {"id": "s-1", "company_name": "Dead Co", "consecutive_failures": 3}
     )
-    assert captured[-1] == {"consecutive_failures": 4}
+    below = captured[-1]
+    assert below["consecutive_failures"] == 4
+    assert below["last_error_at"] is not None
+    assert "enabled" not in below
+    assert "disabled_at" not in below
 
+    # At threshold: disables AND stamps disabled_at (drives auto-recovery).
     await poller._record_source_failure(
         sb, {"id": "s-1", "company_name": "Dead Co", "consecutive_failures": 9}
     )
-    assert captured[-1] == {"consecutive_failures": 10, "enabled": False}
+    at = captured[-1]
+    assert at["consecutive_failures"] == 10
+    assert at["enabled"] is False
+    assert at["disabled_at"] is not None
 
 
 @pytest.mark.asyncio

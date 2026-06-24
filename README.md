@@ -135,16 +135,33 @@ email works out of the box for low volume), and the onboarding wizard takes
 it from there: describe your target role, add your experience, and activate
 the target.
 
-### 5. Background polling (pick one)
+### 5. Background polling
 
-Job sources are re-polled on a schedule. Two ways to drive it:
+The **in-process scheduler is the primary poll trigger**. Set
+`POLL_SCHEDULER_ENABLED=true` in the API env (on Railway: the service
+variables — see `apps/wyrdfold-api/railway.toml` for which settings live where)
+and the backend polls due sources itself every `POLL_TICK_MINUTES`. No external
+cron is required.
 
-1. **Vercel cron** (default for the hosted setup) — `apps/wyrdfold/vercel.json`
-   schedules `POST /api/jobs/poll` daily; set `CRON_SECRET` in the Vercel
-   project. Nothing to do on the API side.
-2. **Self-hosted scheduler** — no Vercel required: set
-   `POLL_SCHEDULER_ENABLED=true` in the API env and the in-process
-   APScheduler loop polls due sources every `POLL_TICK_MINUTES`.
+Each scheduled poll takes a Postgres advisory lock
+(`try_poll_advisory_lock`), so it is safe to run with multiple replicas — only
+one poll runs at a time, and job upserts are idempotent regardless. The Vercel
+cron that used to drive polling has been **removed**: it was the single point of
+failure behind a 10-day silent ingestion outage (a broken cron + the
+consecutive-failure backoff disabling every source). If you still want an
+external trigger, point any cron at `POST /poll/due`; the advisory lock means it
+can't double-ingest.
+
+**Resilience built in:**
+
+- **Auto-recovery** — a source the failure-backoff auto-disabled is re-enabled
+  after `SOURCE_RECOVERY_AFTER_HOURS` (default 24h), so a transient ATS-wide
+  outage can't take ingestion down permanently.
+- **Health alerting** — the scheduler alerts (via Sentry) when no new jobs have
+  been ingested in `INGESTION_MAX_JOB_AGE_HOURS` (default 48h) or a majority of
+  sources are disabled (`INGESTION_MASS_DISABLE_RATIO`). The failure cause is
+  also persisted to `sources.last_error` / `sources.disabled_at` so it's
+  queryable in SQL.
 
 You can also trigger a poll manually anytime from the app (or
 `POST /poll` with the `x-api-key` header).

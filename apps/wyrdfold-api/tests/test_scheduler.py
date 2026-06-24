@@ -1,10 +1,33 @@
 """Tests for the in-process APScheduler wiring."""
 
+import contextlib
+from collections.abc import AsyncIterator
 from unittest.mock import patch
 
 import pytest
 
 from app.scheduler import build_scheduler, start_scheduler_if_enabled
+
+
+def _patch_lock_acquired() -> contextlib.AbstractContextManager[object]:
+    """Patch the scheduler's advisory lock to always grant (acquired=True),
+    so a poll-body test doesn't need a real ``.rpc()`` on its client.
+    Dedicated lock semantics live in test_poll_lock.py."""
+
+    @contextlib.asynccontextmanager
+    async def _granted(*_a: object, **_k: object) -> AsyncIterator[bool]:
+        yield True
+
+    return patch("app.scheduler.poll_advisory_lock", _granted)
+
+
+def _patch_health() -> contextlib.AbstractContextManager[object]:
+    """No-op the health check in poll-body tests."""
+
+    async def _noop(*_a: object, **_k: object) -> None:
+        return None
+
+    return patch("app.scheduler.check_ingestion_health", _noop)
 
 
 def test_build_scheduler_registers_single_job() -> None:
@@ -195,6 +218,8 @@ async def test_run_scheduled_poll_invokes_due_poller_with_pool_client() -> None:
     with (
         patch("app.scheduler.get_supabase_pool", return_value=fake_client),
         patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
+        _patch_lock_acquired(),
+        _patch_health(),
     ):
         mock_poll.return_value = fake_result
         await _run_scheduled_poll()
@@ -226,6 +251,8 @@ async def test_run_scheduled_poll_swallows_exceptions() -> None:
     with (
         patch("app.scheduler.get_supabase_pool", return_value=object()),
         patch("app.scheduler.poll_due_sources", side_effect=RuntimeError("kaboom")),
+        _patch_lock_acquired(),
+        _patch_health(),
     ):
         # Must not raise.
         await _run_scheduled_poll()

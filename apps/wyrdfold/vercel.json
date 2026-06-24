@@ -11,11 +11,5 @@
         }
       ]
     }
-  ],
-  "crons": [
-    {
-      "path": "/api/jobs/poll",
-      "schedule": "0 9 * * *"
-    }
   ]
 }

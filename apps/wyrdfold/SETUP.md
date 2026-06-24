@@ -117,7 +117,7 @@ PHASE2_ENABLED=false                         # LLM-based four-axis scoring (requ
 RECENCY_DECAY_ENABLED=false                  # Decay job scores by posting age
 LOGISTICS_EXTRACTION_ENABLED=false           # Pull salary/location/remote from JDs via LLM
 URL_HEALTH_CHECK_ENABLED=false               # Periodic HEAD-check on live jobs (auto-archive 4xx)
-POLL_SCHEDULER_ENABLED=false                 # In-process cron for periodic source polling
+POLL_SCHEDULER_ENABLED=false                 # PRIMARY poll trigger: in-process scheduler (advisory-lock guarded). Set true in prod; the Vercel cron was removed.
 RATE_LIMIT_ENABLED=true                      # slowapi per-user rate limits (turn off in tests)
 ```
 
