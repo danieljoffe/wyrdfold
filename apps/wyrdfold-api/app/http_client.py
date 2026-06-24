@@ -24,21 +24,26 @@ DEFAULT_USER_AGENT = "wyrdfold-jobs/1.0 (+https://wyrdfold.com)"
 
 # Connection-pool ceiling sized to the real fan-out of a poll cycle.
 #
-# The poller runs ``POLL_CONCURRENCY = 10`` source workers concurrently
-# (app/services/poller.py). The SmartRecruiters and Workday fetchers each
-# fan out ``_DETAIL_CONCURRENCY = 5`` per-posting detail fetches through
-# THIS shared client. Worst case is all 10 workers being SR/Workday at
-# once: 10 x 5 = 50 simultaneous detail requests. The previous ceiling of
-# 20 meant ~30 of those queued behind the limit and timed out under the
-# 15 s deadline, silently dropping postings.
+# The poller runs up to 10 source workers concurrently (the historical
+# ``POLL_CONCURRENCY`` upper bound; the live value was later lowered to
+# bound the Supabase write herd — see app/services/poller.py). The
+# SmartRecruiters and Workday fetchers each fan out
+# ``_DETAIL_CONCURRENCY = 5`` per-posting detail fetches through THIS
+# shared client. Worst case is all 10 workers being SR/Workday at once:
+# 10 x 5 = 50 simultaneous detail requests. The previous ceiling of 20
+# meant ~30 of those queued behind the limit and timed out under the 15 s
+# deadline, silently dropping postings.
 #
-# We size for that worst case plus headroom for the other callers that
-# share this client: the scheduler tick, ad-hoc user-paste URL fetches,
-# and source-discovery probes. (Per-user Supabase traffic uses a SEPARATE
-# httpx pool in app/supabase_pool.py and is not counted here.)
+# We deliberately size for the 10-worker upper bound (not the current,
+# lower POLL_CONCURRENCY) so a future bump back to 10 needs no pool
+# resize; a lower live value just leaves more headroom. Plus headroom for
+# the other callers that share this client: the scheduler tick, ad-hoc
+# user-paste URL fetches, and source-discovery probes. (Per-user Supabase
+# traffic uses a SEPARATE httpx pool in app/supabase_pool.py and is not
+# counted here.)
 #
-#   50 (poll detail fan-out) + 14 (headroom) = 64
-_POLL_DETAIL_FANOUT = 10 * 5  # POLL_CONCURRENCY x max(_DETAIL_CONCURRENCY)
+#   50 (poll detail fan-out, 10-worker upper bound) + 14 (headroom) = 64
+_POLL_DETAIL_FANOUT = 10 * 5  # max-POLL_CONCURRENCY x max(_DETAIL_CONCURRENCY)
 MAX_CONNECTIONS = _POLL_DETAIL_FANOUT + 14  # = 64
 MAX_KEEPALIVE_CONNECTIONS = 20
 

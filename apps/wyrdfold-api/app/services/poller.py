@@ -24,6 +24,7 @@ from app.services.analysis.persistence import (
 )
 from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
+from app.services.date_normalize import normalize_posted_at
 from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.extract import extract_salary_from_text
 from app.services.firecrawl import fetch_firecrawl_jobs
@@ -86,8 +87,25 @@ FETCHERS: dict[str, Fetcher] = {
     "crawl": fetch_firecrawl_jobs,
 }
 
-POLL_CONCURRENCY = 10
+# How many sources poll in parallel. Lowered from 10 (audit #29 / live
+# prod broken-pipe storm): combined with the per-source scoring fan-out
+# (each row → an ``asyncio.to_thread`` supabase write), 10 concurrent
+# sources thundering-herd the Supabase pooler. The hard ceiling on
+# concurrent DB writes is now ``DB_WRITE_CONCURRENCY`` below, but a lower
+# source fan-out also keeps the per-source detail/JD fetches civil.
+POLL_CONCURRENCY = 6
 LLM_CONCURRENCY = 3
+
+# Hard ceiling on concurrent supabase write threads across the WHOLE poll
+# cycle. The Stage-1/Stage-2 scoring loops ``asyncio.gather`` one
+# ``to_thread`` per (row x target), unbounded — across POLL_CONCURRENCY
+# sources that is a burst of hundreds of simultaneous writes against a
+# single shared service-role client, which is what drops the Supabase
+# pooler connection (``Broken pipe`` / ``Server disconnected``). Every
+# poll DB call routes through ``_db_to_thread`` so this global semaphore
+# caps the burst regardless of how the fan-out is shaped. HTTP/1.1 (see
+# supabase_pool) makes each write safe; this keeps the herd bounded.
+DB_WRITE_CONCURRENCY = 12
 
 # Minimum keyword score to trigger LLM analysis during polling.
 # Below this threshold, only keyword scoring is used.
@@ -186,6 +204,34 @@ _NON_US_HINTS: tuple[str, ...] = (
     "latam",
     "europe",
 )
+
+
+# Per-event-loop global cap on concurrent supabase write threads. Created
+# lazily and keyed by the running loop so a fresh loop (e.g. each test, or
+# a re-created loop in a worker) gets its own semaphore rather than one
+# bound to a dead loop. Bounds the cycle-wide write burst (see
+# DB_WRITE_CONCURRENCY).
+_db_write_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+def _db_write_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _db_write_sems.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
+        _db_write_sems[loop] = sem
+    return sem
+
+
+async def _db_to_thread(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Run a blocking supabase call in a thread, under the global DB-write
+    semaphore so the poll's scoring/upsert fan-out can't thundering-herd
+    the Supabase pooler. Preserves the #107 ``to_thread`` convention (the
+    blocking call never touches the event loop)."""
+    async with _db_write_semaphore():
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def _title_matches_any_target(title: str, targets: list[JobTarget]) -> bool:
@@ -1037,7 +1083,7 @@ async def _poll_one_source(
                     "absolute_url": job.absolute_url,
                     "score": 0,  # Placeholder — updated by target scoring pipeline
                     "score_breakdown": {},
-                    "greenhouse_updated_at": job.updated_at,
+                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
                 }
             )
@@ -1084,7 +1130,7 @@ async def _poll_one_source(
                     row_data: dict[str, Any], target: JobTarget = active_target
                 ) -> None:
                     try:
-                        await asyncio.to_thread(
+                        await _db_to_thread(
                             target_title_score_and_upsert,
                             supabase,
                             job_posting_id=row_data["id"],
@@ -1147,7 +1193,7 @@ async def _poll_one_source(
                         # pre-confidence rollout's `.get(idx, True)` default).
                         promising = verdict.promising if verdict is not None else True
                         phase1_confidence = verdict.confidence if verdict is not None else None
-                        await asyncio.to_thread(
+                        await _db_to_thread(
                             target_score_and_upsert,
                             supabase,
                             job_posting_id=row_data["id"],
@@ -2025,7 +2071,7 @@ async def _poll_one_source_for_target(
                     "absolute_url": job.absolute_url,
                     "score": 0,  # Updated by target scoring pipeline
                     "score_breakdown": {},
-                    "greenhouse_updated_at": job.updated_at,
+                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
                 }
             )
@@ -2049,7 +2095,7 @@ async def _poll_one_source_for_target(
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
                 try:
-                    await asyncio.to_thread(
+                    await _db_to_thread(
                         target_title_score_and_upsert,
                         supabase,
                         job_posting_id=row_data["id"],
@@ -2089,7 +2135,7 @@ async def _poll_one_source_for_target(
                     phase1_confidence = (
                         verdict.confidence if verdict is not None else None
                     )
-                    await asyncio.to_thread(
+                    await _db_to_thread(
                         target_score_and_upsert,
                         supabase,
                         job_posting_id=row_data["id"],

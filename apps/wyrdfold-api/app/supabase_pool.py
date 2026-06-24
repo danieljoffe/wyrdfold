@@ -16,6 +16,7 @@ Two clients, two trust levels:
 from __future__ import annotations
 
 import httpx
+from postgrest.constants import DEFAULT_POSTGREST_CLIENT_TIMEOUT
 from supabase import Client, ClientOptions, create_client
 
 from app.config import settings
@@ -29,10 +30,47 @@ _client: Client | None = None
 _user_httpx: httpx.Client | None = None
 
 
+def _build_http1_client() -> httpx.Client:
+    """httpx transport for supabase clients — HTTP/1.1, never HTTP/2.
+
+    supabase-py's default postgrest transport sets ``http2=True``. Both
+    the shared service-role singleton and the shared per-request user pool
+    get hit by many *concurrent* requests at once — the service-role
+    client most acutely, since the poller fans out a burst of
+    ``asyncio.to_thread`` upserts/queries against the single shared client.
+
+    httpcore's HTTP/2 connection object is **not** safe for concurrent use
+    from multiple threads: under the poll burst its streams interleave and
+    corrupt, surfacing in prod as
+    ``LocalProtocolError: Received pseudo-header in trailer`` /
+    ``KeyError`` inside ``httpcore/_sync/http2.py`` plus a flood of broken
+    pipes and ``Server disconnected`` once the pooler drops the socket.
+
+    An HTTP/1.1 connection *pool* multiplexes concurrent requests across
+    separate connections, so the burst is safe. We mirror the postgrest-py
+    transport defaults (``follow_redirects=True`` + its default timeout);
+    auth/apikey headers are applied per-request by the postgrest client
+    itself, so they don't need to live on this transport.
+    """
+    return httpx.Client(
+        http2=False,
+        follow_redirects=True,
+        timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
+    )
+
+
 def init_supabase() -> None:
     global _client
     if settings.supabase_url and settings.supabase_service_role_key:
-        _client = create_client(settings.supabase_url, settings.supabase_service_role_key)
+        # Force HTTP/1.1 on the service-role transport (see
+        # _build_http1_client) — the shared singleton must survive the
+        # poller's concurrent to_thread write burst.
+        options = ClientOptions(httpx_client=_build_http1_client())
+        _client = create_client(
+            settings.supabase_url,
+            settings.supabase_service_role_key,
+            options,
+        )
 
 
 def get_supabase_pool() -> Client | None:
@@ -42,7 +80,10 @@ def get_supabase_pool() -> Client | None:
 def _get_user_httpx() -> httpx.Client:
     global _user_httpx
     if _user_httpx is None:
-        _user_httpx = httpx.Client()
+        # HTTP/1.1 here too: this single pool is shared across all
+        # concurrent per-request user clients, so it must be
+        # concurrency-safe under load (see _build_http1_client).
+        _user_httpx = _build_http1_client()
     return _user_httpx
 
 
