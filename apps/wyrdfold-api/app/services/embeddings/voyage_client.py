@@ -9,17 +9,18 @@ Input type
 ----------
 Voyage supports asymmetric embeddings via the `input_type` parameter:
 `"document"` for stored text, `"query"` for search queries. Our chunk
-write path embeds documents; a future tailor-side retrieval path would
-embed queries. This client hardcodes `"document"` — the Protocol
-doesn't expose input_type today, so when retrieval lands we extend the
-Protocol rather than leak vendor-specific vocabulary into every caller.
+write path embeds documents; a retrieval path (e.g. the pre-scan target
+vector) embeds queries. The Protocol now exposes `input_type` (default
+`"document"`), and this client threads it straight to the SDK — callers
+pass the abstract `"document"`/`"query"` hint, not vendor-specific
+vocabulary.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Literal
 
 from voyageai.client_async import AsyncClient
 
@@ -51,12 +52,16 @@ class VoyageEmbeddingsClient:
         )
 
     async def _embed_one_batch(
-        self, *, model: EmbeddingModelId, inputs: list[str]
+        self,
+        *,
+        model: EmbeddingModelId,
+        inputs: list[str],
+        input_type: Literal["document", "query"],
     ) -> tuple[list[list[float]], int]:
         response: Any = await self._client.embed(
             texts=inputs,
             model=model,
-            input_type="document",
+            input_type=input_type,
         )
         return list(response.embeddings), int(response.total_tokens)
 
@@ -66,6 +71,7 @@ class VoyageEmbeddingsClient:
         model: EmbeddingModelId,
         inputs: list[str],
         purpose: str,
+        input_type: Literal["document", "query"] = "document",
     ) -> EmbeddingResult:
         if not inputs:
             # Don't call the API for an empty batch — save a roundtrip.
@@ -81,7 +87,7 @@ class VoyageEmbeddingsClient:
 
         if len(inputs) <= MAX_INPUTS_PER_CALL:
             embeddings, total_tokens = await self._embed_one_batch(
-                model=model, inputs=inputs
+                model=model, inputs=inputs, input_type=input_type
             )
         else:
             sub_batches = [
@@ -90,7 +96,9 @@ class VoyageEmbeddingsClient:
             ]
             results = await asyncio.gather(
                 *(
-                    self._embed_one_batch(model=model, inputs=sub)
+                    self._embed_one_batch(
+                        model=model, inputs=sub, input_type=input_type
+                    )
                     for sub in sub_batches
                 )
             )

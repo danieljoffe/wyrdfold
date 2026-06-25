@@ -2,7 +2,11 @@
 
 Returns vectors derived from a sha256 hash of each input, projected into
 the target dimension as floats in [-1, 1]. Same input always yields the
-same vector — useful for snapshot tests of retrieval.
+same vector — useful for snapshot tests of retrieval. The vector depends
+only on the text, NOT on ``input_type``: the mock stays deterministic so
+a document and its matching query embed identically (cosine 1.0), which
+keeps retrieval snapshots stable. The ``input_type`` is still recorded
+in ``calls`` so a test can assert it was forwarded.
 
 Token estimation: char-count / 4 (matches the LLM mock heuristic).
 """
@@ -10,6 +14,7 @@ Token estimation: char-count / 4 (matches the LLM mock heuristic).
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 from app.models.embeddings import EmbeddingModelId, EmbeddingResult, EmbeddingUsage
 from app.services.embeddings.pricing import calculate_cost
@@ -51,6 +56,7 @@ class MockEmbeddingsClient:
         model: EmbeddingModelId,
         inputs: list[str],
         purpose: str,
+        input_type: Literal["document", "query"] = "document",
     ) -> EmbeddingResult:
         dim = DIMENSIONS[model]
         embeddings = [_deterministic_vector(text, dim) for text in inputs]
@@ -61,6 +67,7 @@ class MockEmbeddingsClient:
                 "model": model,
                 "purpose": purpose,
                 "input_count": len(inputs),
+                "input_type": input_type,
             }
         )
 

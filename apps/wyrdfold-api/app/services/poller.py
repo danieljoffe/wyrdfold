@@ -24,6 +24,8 @@ from app.services.analysis.persistence import (
 from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
+from app.services.embeddings import get_default_client as get_embeddings_client
+from app.services.embeddings.job_embeddings import upsert_job_embedding
 from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.extract import extract_salary_from_text
 from app.services.firecrawl import fetch_firecrawl_jobs
@@ -746,6 +748,45 @@ async def _qualify_jobs(
     )
 
 
+async def _embed_jobs(
+    supabase: Client,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Embed ``rows`` for the #60 pre-scan (best-effort, target-INDEPENDENT).
+
+    PURELY populates ``job_embeddings`` — no gating, no behavior change.
+    ``upsert_job_embedding`` is itself content-hash cached (an unchanged
+    re-poll re-embeds nothing) and fail-soft (it never raises). The fan-out
+    is bounded by a dedicated semaphore sized like the DB-write cap so a
+    large poll's embeds can't thundering-herd the pool; we don't reuse the
+    shared DB-write semaphore because that would also serialize the slow
+    Voyage network call. Resolving the client and the whole step are wrapped
+    so any failure can never break the poll.
+    """
+    try:
+        embeddings_client = get_embeddings_client()
+    except Exception:
+        logger.exception("Pre-scan embed: embeddings client unavailable; skipping")
+        return
+
+    sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
+
+    async def _one(row: dict[str, Any]) -> None:
+        async with sem:
+            await upsert_job_embedding(
+                supabase,
+                embeddings_client,
+                job_id=row["id"],
+                title=row.get("title"),
+                description_html=row.get("description_html"),
+            )
+
+    await asyncio.gather(
+        *(_one(row) for row in rows),
+        return_exceptions=True,
+    )
+
+
 def _resolve_payer_client(
     cache: dict[str | None, LLMClient | None],
     supabase: Client,
@@ -1101,6 +1142,20 @@ async def _poll_one_source(
             # ``qualification_enabled`` is set (no LLM spend by default).
             if settings.qualification_enabled and upsert_resp.data:
                 await _qualify_jobs(
+                    supabase,
+                    [cast(dict[str, Any], r) for r in upsert_resp.data],
+                )
+
+            # ---- Pre-scan job embeddings (#60, Phase 1) ----
+            # Target-INDEPENDENT: embed each upserted job ONCE and cache the
+            # vector for a future semantic pre-filter. PURELY populates
+            # ``job_embeddings`` — no gating, no behavior change. Best-effort
+            # and flag-gated: nothing runs (and no embedding spend) unless
+            # ``prescan_embed_enabled`` is set; an embedding outage is swallowed
+            # so it can never break polling, and the content-hash skips
+            # re-embedding unchanged rows.
+            if settings.prescan_embed_enabled and upsert_resp.data:
+                await _embed_jobs(
                     supabase,
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
@@ -2079,6 +2134,17 @@ async def _poll_one_source_for_target(
             # scoring, flag-gated, best-effort.
             if settings.qualification_enabled and upsert_resp.data:
                 await _qualify_jobs(
+                    supabase,
+                    [cast(dict[str, Any], r) for r in upsert_resp.data],
+                )
+
+            # Pre-scan job embeddings (#60, Phase 1): same target-INDEPENDENT
+            # populate as ``_poll_one_source`` — flag-gated, best-effort. This
+            # path runs per-target, but the embed is content-hash cached, so a
+            # job already embedded for another target is a cheap cache-hit
+            # (one SELECT, no embed, no write).
+            if settings.prescan_embed_enabled and upsert_resp.data:
+                await _embed_jobs(
                     supabase,
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
