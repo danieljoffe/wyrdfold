@@ -195,6 +195,19 @@ class Settings(BaseSettings):
     # rows. Flip per-deploy once validated in DEV.
     qualification_enabled: bool = False
 
+    # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
+    # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
+    # the vector in ``job_embeddings`` via
+    # ``app/services/embeddings/job_embeddings.py``. PURELY the populate
+    # side — no gating, no behavior change: nothing reads these vectors yet.
+    # Ships FALSE so merging the table + hook triggers NO embedding spend;
+    # the write is best-effort (an embedding error never breaks polling) and
+    # content-hash cached (an unchanged re-poll re-embeds nothing). Requires
+    # ``EMBEDDINGS_PROVIDER=voyage`` + ``VOYAGE_API_KEY`` to embed for real;
+    # with the mock provider it writes deterministic fake vectors. Flip
+    # per-deploy once the backfill has populated the table in DEV.
+    prescan_embed_enabled: bool = False
+
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
     # model to emit a `logistics` JSON object (remote_status, salary

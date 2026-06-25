@@ -59,6 +59,44 @@ async def test_embed_passes_model_and_input_type_to_sdk() -> None:
     assert kwargs["texts"] == ["hello"]
 
 
+async def test_embed_forwards_query_input_type_to_sdk() -> None:
+    # Phase 0: the query side threads straight to the Voyage SDK.
+    client, embed_mock = _client_with_mocked_sdk(
+        _fake_response(embeddings=[[0.1]], total_tokens=1)
+    )
+    await client.embed(
+        model="voyage-3",
+        inputs=["a search query"],
+        purpose="test",
+        input_type="query",
+    )
+    assert embed_mock.call_args.kwargs["input_type"] == "query"
+
+
+async def test_input_type_propagates_through_split_batches() -> None:
+    # A batch over the per-call cap fans out; every sub-call must carry the
+    # same input_type (not silently reset to the default).
+    from app.services.embeddings.voyage_client import MAX_INPUTS_PER_CALL
+
+    inputs = [f"q-{i}" for i in range(MAX_INPUTS_PER_CALL + 1)]
+    seen_types: list[str] = []
+
+    async def _fake_embed(*, texts: list[str], input_type: str, **_: Any) -> Any:
+        seen_types.append(input_type)
+        return _fake_response(
+            embeddings=[[0.0]] * len(texts), total_tokens=len(texts)
+        )
+
+    client = VoyageEmbeddingsClient(api_key="test-key")
+    client._client.embed = _fake_embed  # type: ignore[method-assign]
+
+    await client.embed(
+        model="voyage-3", inputs=inputs, purpose="test", input_type="query"
+    )
+    assert len(seen_types) == 2  # split into two sub-batches
+    assert seen_types == ["query", "query"]
+
+
 async def test_embed_passes_voyage_3_lite_model() -> None:
     client, embed_mock = _client_with_mocked_sdk(
         _fake_response(embeddings=[[0.0]], total_tokens=1)
