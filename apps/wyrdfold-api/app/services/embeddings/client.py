@@ -6,7 +6,7 @@ per-token regardless of how many inputs you bundle, and one batch is
 one HTTP roundtrip.
 """
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.models.embeddings import EmbeddingModelId, EmbeddingResult
 
@@ -18,6 +18,7 @@ class EmbeddingsClient(Protocol):
         model: EmbeddingModelId,
         inputs: list[str],
         purpose: str,
+        input_type: Literal["document", "query"] = "document",
     ) -> EmbeddingResult:
         """Embed a batch of strings.
 
@@ -27,5 +28,11 @@ class EmbeddingsClient(Protocol):
                 with empty embeddings and zero cost.
             purpose: Cost-log grouping label (e.g. "experience.chunks",
                 "tailor.retrieval"). Required so spend can be sliced by feature.
+            input_type: Voyage's asymmetric-embedding hint — ``"document"`` for
+                stored text, ``"query"`` for a search query embedded to retrieve
+                against those documents. Defaults to ``"document"`` so every
+                existing caller (the chunk write path) is unaffected; the query
+                side is only used by retrieval callers (e.g. the pre-scan target
+                vector).
         """
         ...
