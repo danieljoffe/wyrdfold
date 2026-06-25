@@ -208,6 +208,20 @@ class Settings(BaseSettings):
     # per-deploy once the backfill has populated the table in DEV.
     prescan_embed_enabled: bool = False
 
+    # Pre-scan SHADOW MODE (#60/#68, Phase 3). When True the poller, AFTER the
+    # live keyword admit decision for each (job, target), ALSO computes the
+    # would-be cosine gate decision (cosine(job_vec, target_vec) >=
+    # target.prescan_cosine_threshold) and appends one ``prescan_shadow`` row
+    # recording BOTH decisions — the disagreement matrix. OBSERVATION ONLY: the
+    # keyword decision still drives what gets graded; this changes no admission
+    # behavior. The actual gate FLIP (cosine driving admission) is a LATER phase
+    # informed by this shadow data and is deliberately not built. Ships FALSE so
+    # merging is inert — flag off ⇒ no shadow rows and no cosine computation; the
+    # write is best-effort (a failure never breaks polling). Even with the flag
+    # on it stays cheap: cosine reuses the cached Phase-1/2 vectors (NO embedding
+    # spend) and yields NULL when those vectors aren't populated yet.
+    prescan_shadow_enabled: bool = False
+
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
     # model to emit a `logistics` JSON object (remote_status, salary
