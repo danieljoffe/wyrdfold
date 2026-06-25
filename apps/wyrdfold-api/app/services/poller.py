@@ -1068,6 +1068,13 @@ async def _poll_one_source(
                 source=company_name,
             )
 
+        # Re-check after dedupe: it can remove EVERY row (a source whose
+        # postings are all cross-posting dupes of existing rows). Calling
+        # ``.upsert([])`` then raises PGRST100 "failed to parse columns
+        # parameter ()", which marks the poll failed and — after
+        # ``source_failure_disable_threshold`` consecutive empties — would
+        # auto-disable a perfectly healthy source. Skip the write instead.
+        if rows_to_upsert:
             upsert_query = supabase.table("jobs").upsert(
                 rows_to_upsert, on_conflict="source_id,external_id"
             )
