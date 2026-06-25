@@ -343,3 +343,55 @@ def test_role_title_does_not_override_negative_keyword():
     )
     assert result.excluded is True
     assert result.score == 0
+
+
+# ---- Role-match guard for JD-keyword boilerplate (#60 interim) -------------
+
+
+def test_off_role_jd_boilerplate_is_discounted():
+    """A target with role keywords + a title matching NONE of them
+    (role_titles == 0) must not be carried by JD keyword matches alone —
+    those are often boilerplate tech-stack mentions in an off-role posting
+    (e.g. an SDR JD listing the stack it's built on). The JD-content axes
+    are halved. Interim guard for the keyword scorer (#60)."""
+    profile = _profile(core={"TypeScript": 3, "Next.js": 3, "React": 3})
+    body = "<p>Sell our platform, built with TypeScript, Next.js and React.</p>"
+    title = "Sales Development Representative"  # matches no frontend role keyword
+    guarded = score_job_with_profile(
+        title, body, profile, search_keywords=["frontend engineer", "ui engineer"]
+    )
+    unguarded = score_job_with_profile(title, body, profile)  # no keywords ⇒ guard off
+    assert guarded.breakdown.role_titles == 0
+    assert unguarded.breakdown.technologies > 0
+    # JD-content axis halved by the guard
+    assert guarded.breakdown.technologies == unguarded.breakdown.technologies * 0.5
+
+
+def test_genuine_role_match_not_discounted():
+    """A genuine role-title match (role_titles > 0) is NOT discounted."""
+    profile = _profile(core={"TypeScript": 3, "Next.js": 3, "React": 3})
+    body = "<p>Build our UI with TypeScript, Next.js and React.</p>"
+    guarded = score_job_with_profile(
+        "Senior Frontend Engineer",
+        body,
+        profile,
+        search_keywords=["frontend engineer", "front-end engineer"],
+    )
+    base = score_job_with_profile("Senior Frontend Engineer", body, profile)
+    assert guarded.breakdown.role_titles > 0
+    # full credit, identical to the no-keyword baseline's technologies axis
+    assert guarded.breakdown.technologies == base.breakdown.technologies
+
+
+def test_title_scorer_applies_role_match_guard():
+    """Stage-1 (title-only) scorer applies the same guard."""
+    from app.services.scoring import score_title_against_profile
+
+    profile = _profile(core={"TypeScript": 3})
+    guarded = score_title_against_profile(
+        "TypeScript Tutor", profile, search_keywords=["frontend engineer"]
+    )
+    unguarded = score_title_against_profile("TypeScript Tutor", profile)
+    assert guarded.breakdown.role_titles == 0
+    assert unguarded.breakdown.technologies > 0
+    assert guarded.breakdown.technologies == unguarded.breakdown.technologies * 0.5
