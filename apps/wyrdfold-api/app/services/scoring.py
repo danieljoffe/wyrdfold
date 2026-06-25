@@ -196,6 +196,18 @@ _DEFAULT_NORMALIZER = 30.0
 # matches genuinely relevant postings push past the 70 threshold.
 _ROLE_TITLE_WEIGHT = 40.0
 
+# Interim guard (#60): when a target HAS role-intent keywords but the job
+# title matches NONE of them (role_titles == 0), discount the JD-content
+# axes (technologies, domain_skills) by this factor. Without it, boilerplate
+# tech-stack mentions in an off-role JD (e.g. a Sales Development Rep posting
+# that lists "TypeScript, Next.js") carry the job to a passing score — the
+# scorer has no requirement that a passing job actually look like the role.
+# 0.5 drops boilerplate-only matches below the default cutoff without zeroing
+# genuine partial matches. Targets without search_keywords are unaffected.
+# The embeddings pre-scan (#60) replaces keyword gating outright; this caps
+# the false positives until it ships.
+_NO_ROLE_MATCH_JD_DISCOUNT = 0.5
+
 # Senior-tier seniority levels. When ``profile.seniority.level`` is one of
 # these, common junior-IC title tokens get auto-prepended to the negative
 # keyword list, so a Director target never scores a Rep / Associate /
@@ -514,6 +526,15 @@ def score_job_with_profile(
         title_lower, profile.seniority.level
     )
 
+    # Role-match guard: a target with role-intent keywords whose title
+    # matched none (role_titles == 0) must not be carried to a passing
+    # score by JD keyword matches alone — those are frequently boilerplate
+    # tech-stack mentions in an off-role posting. Discount the JD-content
+    # axes. Interim; the embeddings pre-scan (#60) is the proper fix.
+    if search_keywords and breakdown.role_titles == 0:
+        breakdown.technologies *= _NO_ROLE_MATCH_JD_DISCOUNT
+        breakdown.domain_skills *= _NO_ROLE_MATCH_JD_DISCOUNT
+
     # Dynamic normalization
     raw = (
         breakdown.role_titles
@@ -609,6 +630,13 @@ def score_title_against_profile(
     breakdown.negative += _seniority_tier_penalty(
         title_lower, profile.seniority.level
     )
+
+    # Role-match guard — see score_job_with_profile: role keywords set but
+    # title matched none ⇒ keyword matches alone must not carry the score
+    # (interim guard, #60).
+    if search_keywords and breakdown.role_titles == 0:
+        breakdown.technologies *= _NO_ROLE_MATCH_JD_DISCOUNT
+        breakdown.domain_skills *= _NO_ROLE_MATCH_JD_DISCOUNT
 
     raw = (
         breakdown.role_titles
