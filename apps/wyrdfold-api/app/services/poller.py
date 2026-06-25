@@ -26,6 +26,8 @@ from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
 from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import upsert_job_embedding
+from app.services.embeddings.prescan_gate import cosine_gate_decision
+from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.extract import extract_salary_from_text
 from app.services.firecrawl import fetch_firecrawl_jobs
@@ -787,6 +789,82 @@ async def _embed_jobs(
     )
 
 
+async def _shadow_observe(
+    supabase: Client,
+    *,
+    job_id: str,
+    target: JobTarget,
+    keyword_admit: bool | None,
+    keyword_score: int | None,
+) -> None:
+    """Log the pre-scan disagreement matrix for one (job, target) (#60/#68 P3).
+
+    SHADOW MODE — OBSERVATION ONLY. The keyword decision passed in
+    (``keyword_admit`` / ``keyword_score``) is what actually drove admission;
+    here we ALSO compute the would-be cosine gate decision and append one
+    ``prescan_shadow`` row recording both, so the keyword↔cosine disagreement can
+    be sized BEFORE any gate flip. This changes NO admission behavior.
+
+    Best-effort and fully fail-soft: the cosine computation returns ``(None,
+    None)`` when the Phase-1/2 vectors aren't populated, and both it and the row
+    write swallow their own errors — a shadow failure can never break polling.
+    Only ever reached behind ``settings.prescan_shadow_enabled`` (the caller
+    gates on the flag; flag off ⇒ this is never invoked, no cosine work, no row).
+    """
+    try:
+        cosine, cosine_admit = await cosine_gate_decision(
+            supabase, job_id=job_id, target=target
+        )
+        threshold = await _shadow_threshold(supabase, target_id=target.id)
+        await record_shadow_observation(
+            supabase,
+            job_id=job_id,
+            target_id=target.id,
+            keyword_admit=keyword_admit,
+            keyword_score=keyword_score,
+            cosine=cosine,
+            cosine_admit=cosine_admit,
+            threshold=threshold,
+        )
+    except Exception:
+        logger.exception(
+            "Pre-scan shadow observation failed for job %s / target %s",
+            job_id,
+            target.id,
+        )
+
+
+async def _shadow_threshold(supabase: Client, *, target_id: str) -> float | None:
+    """Best-effort read of a target's ``prescan_cosine_threshold`` for the shadow
+    row's ``threshold`` column. Returns ``None`` on any miss/error so the shadow
+    log is never blocked by it.
+
+    Read separately from ``cosine_gate_decision`` (which fetches the threshold
+    internally but only returns the cosine + verdict): the matrix wants the raw
+    threshold logged even when cosine is NULL.
+    """
+    try:
+        resp = await asyncio.to_thread(
+            lambda: (
+                supabase.table("targets")
+                .select("prescan_cosine_threshold")
+                .eq("id", target_id)
+                .limit(1)
+                .execute()
+            )
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if not rows:
+            return None
+        raw = rows[0].get("prescan_cosine_threshold")
+        return float(raw) if raw is not None else None
+    except Exception:
+        logger.exception(
+            "Pre-scan shadow threshold read failed for target %s", target_id
+        )
+        return None
+
+
 def _resolve_payer_client(
     cache: dict[str | None, LLMClient | None],
     supabase: Client,
@@ -1230,7 +1308,7 @@ async def _poll_one_source(
                         # pre-confidence rollout's `.get(idx, True)` default).
                         promising = verdict.promising if verdict is not None else True
                         phase1_confidence = verdict.confidence if verdict is not None else None
-                        await _db_to_thread(
+                        stage2 = await _db_to_thread(
                             target_score_and_upsert,
                             supabase,
                             job_posting_id=row_data["id"],
@@ -1242,6 +1320,21 @@ async def _poll_one_source(
                             promising=promising if phase1_verdicts else None,
                             phase1_confidence=phase1_confidence,
                         )
+                        # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
+                        # OBSERVATION ONLY: the keyword decision above already
+                        # drove admission; here we also log the would-be cosine
+                        # gate verdict alongside it (the disagreement matrix).
+                        # Best-effort + flag-gated — nothing happens (no cosine
+                        # work, no row) unless ``prescan_shadow_enabled`` is set,
+                        # and a shadow failure can never break scoring.
+                        if settings.prescan_shadow_enabled:
+                            await _shadow_observe(
+                                supabase,
+                                job_id=row_data["id"],
+                                target=target,
+                                keyword_admit=promising,
+                                keyword_score=stage2.score,
+                            )
                     except Exception:
                         logger.exception(
                             "Stage 2 scoring failed for job %s", row_data.get("id")
@@ -2192,7 +2285,7 @@ async def _poll_one_source_for_target(
                     phase1_confidence = (
                         verdict.confidence if verdict is not None else None
                     )
-                    await _db_to_thread(
+                    stage2 = await _db_to_thread(
                         target_score_and_upsert,
                         supabase,
                         job_posting_id=row_data["id"],
@@ -2204,6 +2297,19 @@ async def _poll_one_source_for_target(
                         promising=promising if target_verdicts else None,
                         phase1_confidence=phase1_confidence,
                     )
+                    # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
+                    # OBSERVATION ONLY: log the would-be cosine gate verdict
+                    # alongside the live keyword decision above. Best-effort +
+                    # flag-gated (no cosine work / no row unless
+                    # ``prescan_shadow_enabled``); never breaks scoring.
+                    if settings.prescan_shadow_enabled:
+                        await _shadow_observe(
+                            supabase,
+                            job_id=row_data["id"],
+                            target=target,
+                            keyword_admit=promising,
+                            keyword_score=stage2.score,
+                        )
                 except Exception:
                     logger.exception(
                         "Stage 2 scoring failed for job %s", row_data.get("id")
