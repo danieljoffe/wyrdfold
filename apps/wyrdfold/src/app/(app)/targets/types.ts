@@ -181,6 +181,34 @@ export interface MatchedSuggestions {
   matches: MatchedSuggestion[];
 }
 
+/** Seniority bands the lateral-suggestion miner returns. Mirrors the API's
+ * `SeniorityHint` enum (services/targets/lateral_discovery.py). */
+export type SeniorityHint =
+  | 'ic'
+  | 'senior'
+  | 'staff'
+  | 'manager'
+  | 'director'
+  | 'vp'
+  | 'c_level';
+
+/** One adjacent ("lateral") target the user is competitive for, mined from
+ * the targets they ALREADY pursue. Shape mirrors the API's `LateralSuggestion`
+ * (POST /targets/suggest-lateral → services/targets/lateral_discovery.py). */
+export interface LateralSuggestion {
+  label: string;
+  one_line_reasoning: string;
+  confidence: number; // 0-100
+  lateral_relationship: string;
+  primary_industry: string | null;
+  seniority_hint: SeniorityHint;
+}
+
+/** Response from POST /targets/suggest-lateral. */
+export interface LateralSuggestions {
+  suggestions: LateralSuggestion[];
+}
+
 export function emptyScoringProfile(): ScoringProfile {
   return {
     categories: {},

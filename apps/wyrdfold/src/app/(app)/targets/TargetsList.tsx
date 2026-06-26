@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Plus, Sparkles } from 'lucide-react';
+import { Plus, Sparkles, Compass } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
@@ -20,6 +20,8 @@ import CreateTargetModal, {
 import PendingTargetCard from './PendingTargetCard';
 import type {
   CreateOrLinkResult,
+  LateralSuggestion,
+  LateralSuggestions,
   MatchedSuggestion,
   MatchedSuggestions,
   UserTarget,
@@ -283,6 +285,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       setPendingTargets(p => [...p, { id: pendingId, label: pendingLabel }]);
       setModalOpen(false);
       setSuggestions([]);
+      setLateralSuggestions([]);
 
       try {
         const res = await fetch(endpoint, {
@@ -437,6 +440,95 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     [toast]
   );
 
+  // Lateral suggestions: adjacent sibling / career-stretch roles mined from
+  // the targets the user ALREADY pursues (POST /targets/suggest-lateral).
+  // Distinct from `handleSuggest` above, which proposes targets from raw
+  // experience during onboarding. Rendered in their own card grid below.
+  const [lateralSuggestions, setLateralSuggestions] = useState<
+    LateralSuggestion[]
+  >([]);
+  const [suggestingLateral, setSuggestingLateral] = useState(false);
+  const [addingLateral, setAddingLateral] = useState<string | null>(null);
+
+  const handleSuggestLateral = useCallback(async () => {
+    setSuggestingLateral(true);
+    setLateralSuggestions([]);
+    try {
+      const res = await fetch('/api/targets/suggest-lateral', {
+        method: 'POST',
+      });
+      if (!res.ok)
+        throw new Error(await extractApiError(res, 'Suggest failed'));
+      const data = (await res.json()) as LateralSuggestions;
+      setLateralSuggestions(data.suggestions);
+      if (data.suggestions.length === 0) {
+        toast({
+          variant: 'info',
+          title: 'No lateral roles found',
+          description:
+            'Add a target or two first, then we can surface adjacent roles to branch into.',
+        });
+      }
+    } catch (err) {
+      toast({
+        variant: 'error',
+        title:
+          err instanceof Error
+            ? err.message
+            : 'Failed to generate lateral suggestions',
+      });
+    } finally {
+      setSuggestingLateral(false);
+    }
+  }, [toast]);
+
+  // A lateral suggestion is slim-shape-compatible (label + reasoning), so
+  // activating one is the same create-or-link path as a new onboarding
+  // suggestion: POST the label (with the reasoning as description) to
+  // /from-manual, which derives the full scoring profile server-side.
+  const handleAddLateral = useCallback(
+    async (suggestion: LateralSuggestion) => {
+      const label = suggestion.label;
+      setAddingLateral(label);
+      try {
+        const res = await fetch('/api/targets/from-manual', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label,
+            description: suggestion.one_line_reasoning,
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(await extractApiError(res, 'Failed to add target'));
+        }
+        const result = (await res.json()) as CreateOrLinkResult;
+        const entry: UserTargetWithSummary = {
+          user_target: result.user_target,
+          target: toSummary(result.target),
+        };
+        toast({ variant: 'success', title: `Added "${label}"` });
+        setLateralSuggestions(prev => prev.filter(s => s.label !== label));
+        setTargets(prev => [
+          entry,
+          ...prev.filter(t => t.target.id !== entry.target.id),
+        ]);
+        // Profile + fit score derive in the background — poll until ready.
+        if (isDeriving(entry)) {
+          setDerivingIds(prev => new Set(prev).add(entry.target.id));
+        }
+      } catch (e) {
+        toast({
+          variant: 'error',
+          title: e instanceof Error ? e.message : 'Failed to add target',
+        });
+      } finally {
+        setAddingLateral(null);
+      }
+    },
+    [toast]
+  );
+
   const hasContent = targets.length > 0 || pendingTargets.length > 0;
 
   return (
@@ -521,6 +613,25 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 </>
               )}
             </Button>
+            <Button
+              name='target-suggest-lateral'
+              variant='outline'
+              size='sm'
+              onClick={handleSuggestLateral}
+              disabled={suggestingLateral}
+            >
+              {suggestingLateral ? (
+                <>
+                  <Spinner size='sm' aria-label='Suggesting lateral roles' />
+                  <span>Suggesting...</span>
+                </>
+              ) : (
+                <>
+                  <Compass className='size-4' aria-hidden />
+                  <span>Suggest lateral roles</span>
+                </>
+              )}
+            </Button>
           </div>
         </>
       )}
@@ -563,6 +674,51 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                     className='mt-1 self-start'
                   >
                     {addingSuggestion === match.suggestion.label
+                      ? 'Adding...'
+                      : 'Add Target'}
+                  </Button>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {lateralSuggestions.length > 0 && (
+        <div className='flex flex-col gap-3'>
+          <Text variant='caption'>
+            Lateral roles to branch into, based on your current targets
+          </Text>
+          <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
+            {lateralSuggestions.map(suggestion => (
+              <Card key={suggestion.label} padding='none'>
+                <CardContent className='p-4 flex flex-col gap-2'>
+                  <div className='flex flex-wrap items-center gap-2'>
+                    <Heading variant='cardTitle'>{suggestion.label}</Heading>
+                    <Badge variant='default' size='sm'>
+                      {suggestion.confidence}% match
+                    </Badge>
+                    {suggestion.primary_industry && (
+                      <Badge variant='default' size='sm'>
+                        {suggestion.primary_industry}
+                      </Badge>
+                    )}
+                  </div>
+                  <Text variant='caption' className='text-text-secondary'>
+                    {suggestion.one_line_reasoning}
+                  </Text>
+                  <Text variant='caption' className='text-text-tertiary'>
+                    {suggestion.lateral_relationship}
+                  </Text>
+                  <Button
+                    name={`add-lateral-${suggestion.label}`}
+                    variant='primary'
+                    size='sm'
+                    onClick={() => handleAddLateral(suggestion)}
+                    disabled={addingLateral === suggestion.label}
+                    className='mt-1 self-start'
+                  >
+                    {addingLateral === suggestion.label
                       ? 'Adding...'
                       : 'Add Target'}
                   </Button>
