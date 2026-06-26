@@ -31,6 +31,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
 from app.services.qualification.heuristics import (
@@ -49,9 +50,12 @@ QUALIFICATION_PURPOSE = "qualification.tagger"
 
 # Cap the description we send. Job bodies run long; the signals the tagger needs
 # (country, seniority cues, "general application" boilerplate, contract/intern
-# wording) are dense near the top. 6000 chars (~1.5K tokens) is plenty and keeps
-# per-call cost flat regardless of a vendor's verbose footer.
-_MAX_DESCRIPTION_CHARS = 6000
+# wording) are dense near the top, so a SHORT snippet preserves tag quality at a
+# fraction of the per-call input cost. The cap lives in config as
+# ``settings.qualification_jd_snippet_chars`` (default 600 ≈ 150 tokens) — the
+# single source of truth; sending the full ~6000-char body burned ~3.4K input
+# tokens/call grinding the backlog and drove the June overspend. ``tag_job``
+# reads it (or an explicit per-call ``description_chars`` override).
 
 RoleFamily = Literal[
     "engineering",
@@ -102,9 +106,7 @@ class QualificationTags(BaseModel):
         description="True if the role is US-based. A multi-location role that "
         "includes ANY US location counts as US."
     )
-    us_confidence: int = Field(
-        ge=0, le=100, description="0-100 certainty in the is_us verdict."
-    )
+    us_confidence: int = Field(ge=0, le=100, description="0-100 certainty in the is_us verdict.")
     role_family: RoleFamily
     seniority: Seniority
     employment_type: EmploymentType
@@ -114,8 +116,7 @@ class QualificationTags(BaseModel):
     )
     is_remote: bool = Field(description="True if the role is remote-eligible.")
     is_genuine_role: bool = Field(
-        description="False for talent-pool / 'general application' / evergreen "
-        "non-roles."
+        description="False for talent-pool / 'general application' / evergreen non-roles."
     )
 
 
@@ -242,6 +243,7 @@ async def tag_job(
     description: str | None,
     model: ModelId = QUALIFICATION_MODEL,
     purpose: str = QUALIFICATION_PURPOSE,
+    description_chars: int | None = None,
 ) -> tuple[QualificationTags | None, LLMResult | None]:
     """Classify ONE job. Returns ``(tags, llm_result)``.
 
@@ -250,10 +252,20 @@ async def tag_job(
     (not-yet-tagged) and a later poll re-attempts it. ``llm_result`` is returned
     for cost logging on success.
 
+    ``description_chars`` caps how much of the cleaned JD is sent. Defaults to
+    ``settings.qualification_jd_snippet_chars`` — a short snippet, since the
+    tagger's signals are dense at the top of a JD and the full body needlessly
+    inflated input cost. Pass an explicit value to override (e.g. in tests).
+
     The caller is responsible for the content-hash cache (``qualified_hash``);
     this function always calls the model when invoked.
     """
-    cleaned = clean_description(description)[:_MAX_DESCRIPTION_CHARS]
+    snippet_chars = (
+        description_chars
+        if description_chars is not None
+        else settings.qualification_jd_snippet_chars
+    )
+    cleaned = clean_description(description)[:snippet_chars]
     user_message = _build_user_message(
         title=title,
         company=company,

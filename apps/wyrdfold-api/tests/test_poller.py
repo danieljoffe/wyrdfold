@@ -108,9 +108,7 @@ def test_overlap_below_threshold_does_not_match():
 
 def test_disjoint_keywords_do_not_match():
     keywords = ["software engineer", "frontend developer"]
-    assert (
-        _title_matches_target("Director of Customer Experience", keywords) is False
-    )
+    assert _title_matches_target("Director of Customer Experience", keywords) is False
 
 
 def test_any_one_of_several_keywords_is_enough():
@@ -230,9 +228,7 @@ def _target_with_keywords(
         label="Director CX",
         scoring_profile=ScoringProfile(
             categories={
-                "core_skills": CategoryProfile(
-                    keywords=core_keywords, weight=2.0
-                ),
+                "core_skills": CategoryProfile(keywords=core_keywords, weight=2.0),
             },
             seniority=SeniorityProfile(signals=["director", "head of"]),
         ),
@@ -346,12 +342,23 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
     ``last_polled_at`` stamp (sources table).
     """
     jobs_table = MagicMock()
+    # Admit path (e.g. the budget re-check tests): a triaged-in job upserts,
+    # so default jobs.upsert to "no rows" rather than a bare MagicMock.
+    jobs_table.upsert.return_value.execute.return_value.data = []
 
     sources_table = MagicMock()
+    # Stage-3 junction, empty (no subscribed users) so the post-triage
+    # scoring path runs to completion when a job is admitted, instead of
+    # KeyError-ing on an unmapped table.
+    user_targets_table = MagicMock()
+    (
+        user_targets_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
+    ) = []
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
+        "user_targets": user_targets_table,
     }[name]
 
     # #93: both the existing-rows read and the stale-archive write are
@@ -451,9 +458,7 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
     # ``archive_jobs_by_ids`` RPC (ids in the jsonb body, archived_at stamped
     # server-side), not a per-user jobs.status UPDATE.
     jobs_table.update.assert_not_called()
-    archive_calls = [
-        c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"
-    ]
+    archive_calls = [c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"]
     assert len(archive_calls) == 1
     assert archive_calls[0].args[1] == {"p_ids": ["job-1"]}
 
@@ -502,9 +507,7 @@ async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
     assert summary["archived"] == 250
     # No client-side jobs UPDATE at all — the archive is the RPC.
     jobs_table.update.assert_not_called()
-    archive_calls = [
-        c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"
-    ]
+    archive_calls = [c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"]
     # Exactly one RPC carrying every stale id in the body, no duplicates.
     assert len(archive_calls) == 1
     archived_ids = archive_calls[0].args[1]["p_ids"]
@@ -561,9 +564,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
     target = _target_with_keywords({"brand": 3}, ["brand new role"])
     # Triage rejects the (only) submitted title. Id 1 = first title in the
     # submitted subset, which must be the NEW job.
-    fake_triage = AsyncMock(
-        return_value=({1: TitleVerdict(id=1, promising=False)}, None)
-    )
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two_job_fetch)
     monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
@@ -588,6 +589,78 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
     # one fails the title prematch), so nothing was scored this cycle.
     assert summary["new"] == 0
     assert summary["updated"] == 0
+
+
+async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> dict:
+    """Drive ``_poll_one_source`` through the Phase-1 triage path with the
+    global-budget re-check stubbed to ``exhausted`` (a predicate or an
+    exception-raiser). Returns the poll summary."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict  # noqa: F401
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    supabase, _jobs, _sources = _make_poll_supabase([])
+
+    async def one_new_job(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role",
+                location_name="Remote",
+                department=None,
+                content="",
+                updated_at="2026-01-01",
+                absolute_url="https://example.com/j/2",
+            )
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", exhausted)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    return await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, budget_gate=open_gate)
+
+
+@pytest.mark.asyncio
+async def test_phase1_triage_defers_when_global_budget_exhausted(monkeypatch):
+    """When the global daily cap is reached, the per-batch re-check stops
+    Phase 1 triage mid-cycle: ``triage_titles`` is never called and the job
+    fails-open ingests (verdict NULL) — same defer semantics as the per-cycle
+    breaker, but enforced WITHIN a long cycle so a backlog can't overshoot."""
+    from unittest.mock import AsyncMock
+
+    fake_triage = AsyncMock()  # must NOT be awaited
+    summary = await _run_triage_with_budget(
+        monkeypatch, exhausted=lambda _sb: True, fake_triage=fake_triage
+    )
+
+    assert summary["error"] is None
+    assert fake_triage.await_count == 0  # gate stopped the spend
+
+
+@pytest.mark.asyncio
+async def test_phase1_triage_fails_open_on_budget_read_error(monkeypatch):
+    """A spend-meter read error during triage must NOT break the poll and must
+    NOT silently drop the precision filter — triage proceeds (fail-open),
+    because the once-per-cycle breaker already bounds the blast radius."""
+    from unittest.mock import AsyncMock
+
+    from app.services.relevance.title_triage import TitleVerdict
+
+    def boom(_sb: object) -> bool:
+        raise RuntimeError("spend meter unreachable")
+
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, None))
+    summary = await _run_triage_with_budget(monkeypatch, exhausted=boom, fake_triage=fake_triage)
+
+    assert summary["error"] is None
+    assert fake_triage.await_count == 1  # fail-open: triage still ran
 
 
 # ---- alert-row refresh ------------------------------------------------------
@@ -656,9 +729,7 @@ async def test_batch_fetch_job_scores_uses_rpc_body() -> None:
 
     scores = await _batch_fetch_job_scores(supabase, job_ids)
 
-    supabase.rpc.assert_called_once_with(
-        "get_job_scores_by_ids", {"p_ids": job_ids}
-    )
+    supabase.rpc.assert_called_once_with("get_job_scores_by_ids", {"p_ids": job_ids})
     # Every id keyed once, identical to the old single-query result.
     assert len(scores) == 450
     assert scores["job-0"] == 0
@@ -724,9 +795,7 @@ async def test_phase1_triage_only_sees_free_gate_survivors(monkeypatch):
             _job("n3", "Director of Customer Experience", "Remote"),  # survivor
         ]
 
-    target = _target_with_keywords(
-        {"Zendesk": 3}, ["director of customer experience"]
-    )
+    target = _target_with_keywords({"Zendesk": 3}, ["director of customer experience"])
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
@@ -748,9 +817,7 @@ async def test_phase1_triage_only_sees_free_gate_survivors(monkeypatch):
     assert summary["error"] is None
     # Exactly one triage call, carrying ONLY the survivor's title.
     assert fake_triage.await_count == 1
-    assert fake_triage.await_args.kwargs["titles"] == [
-        "Director of Customer Experience"
-    ]
+    assert fake_triage.await_args.kwargs["titles"] == ["Director of Customer Experience"]
 
 
 @pytest.mark.asyncio
@@ -831,8 +898,7 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
     sources_table = MagicMock()
     user_targets_table = MagicMock()
     (
-        user_targets_table.select.return_value.eq.return_value.in_.return_value
-        .execute.return_value.data
+        user_targets_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
@@ -915,8 +981,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     # ``get_job_scores_by_ids`` RPC now (#93); the harness defaults it to an
     # empty score set in ``_make_targeted_poll_supabase``.
     (
-        user_targets.select.return_value.eq.return_value.in_.return_value
-        .execute.return_value.data
+        user_targets.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = [{"target_id": "t-1", "user_id": "u1"}]
 
     async def fetch(_token: str) -> list[StandardJob]:
