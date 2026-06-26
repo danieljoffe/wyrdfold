@@ -19,6 +19,7 @@ import ReferenceJDList from './ReferenceJDList';
 import TargetDetailSkeleton from './TargetDetailSkeleton';
 import AxisWeightsEditor from './AxisWeightsEditor';
 import NotificationThresholdsEditor from './NotificationThresholdsEditor';
+import TargetPreferencesEditor from './TargetPreferencesEditor';
 
 interface TargetDetailProps {
   id: string;
@@ -231,6 +232,8 @@ export default function TargetDetail({ id }: TargetDetailProps) {
           onUpdated={setUserTarget}
         />
       )}
+
+      {userTarget && <TargetPreferencesEditor targetId={id} />}
 
       <ReferenceJDList
         targetId={id}
