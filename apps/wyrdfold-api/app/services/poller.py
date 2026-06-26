@@ -120,6 +120,16 @@ DB_WRITE_CONCURRENCY = 12
 # Below this threshold, only keyword scoring is used.
 LLM_SCORE_THRESHOLD = 40
 
+# How many qualification-tagger jobs to fan out between global-budget
+# re-reads (#60 overspend fix). The tagger bills the instance key, so it is
+# invisible to the per-payer ``PayerBudgetGate``; left ungated it ground the
+# whole backlog past ``global_llm_daily_budget_usd`` (the June incident).
+# ``_qualify_jobs`` re-checks the live day-spend before each chunk and stops
+# once the cap is hit, so worst-case overshoot is bounded to ONE chunk's
+# spend (~this many Haiku calls) rather than the entire backlog. Smaller =
+# tighter cap, more meter reads; this balances the two.
+QUALIFICATION_BUDGET_RECHECK_EVERY = 50
+
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
 # ``app/services/qualification/heuristics.py`` so the poller's ingestion gate
 # and the #60 qualification tagger's L1 share ONE implementation (single source
@@ -144,9 +154,7 @@ def _db_write_semaphore() -> asyncio.Semaphore:
     return sem
 
 
-async def _db_to_thread(
-    fn: Callable[..., Any], *args: Any, **kwargs: Any
-) -> Any:
+async def _db_to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Run a blocking supabase call in a thread, under the global DB-write
     semaphore so the poll's scoring/upsert fan-out can't thundering-herd
     the Supabase pooler. Preserves the #107 ``to_thread`` convention (the
@@ -184,9 +192,7 @@ def _title_matches_any_target(title: str, targets: list[JobTarget]) -> bool:
         # Empty search_keywords means we can't gate on role-title intent;
         # fall back to legacy "any keyword match admits" semantics so a
         # draft / legacy profile doesn't ingestion-block itself.
-        if target.search_keywords and not _title_matches_target(
-            title, target.search_keywords
-        ):
+        if target.search_keywords and not _title_matches_target(title, target.search_keywords):
             continue
         return True
     return False
@@ -246,9 +252,7 @@ def _title_matches_target(title: str, keywords: list[str]) -> bool:
             if any(kw_tokens[0] in t for t in title_tokens):
                 return True
             continue
-        hits = sum(
-            1 for kw in kw_tokens if any(kw in t for t in title_tokens)
-        )
+        hits = sum(1 for kw in kw_tokens if any(kw in t for t in title_tokens))
         if hits / len(kw_tokens) >= _MATCH_MIN_OVERLAP_RATIO:
             return True
     return False
@@ -279,9 +283,7 @@ def _passes_free_gates(job: StandardJob, active_targets: list[JobTarget]) -> boo
     return _is_us_location(job.location_name)
 
 
-def _content_dedupe_key(
-    company: str | None, title: str | None
-) -> tuple[str, str]:
+def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, str]:
     """Stable lowercase + collapsed-whitespace key for the
     (company, title) dedupe pass. Whitespace differences ("Director"
     vs "Director " vs "Director\\n") are normalized; punctuation and
@@ -317,9 +319,7 @@ def _dedupe_by_content(
     """
     existing_by_key: dict[tuple[str, str], str] = {}
     for row in existing:
-        key = _content_dedupe_key(
-            row.get("company_name"), row.get("title")
-        )
+        key = _content_dedupe_key(row.get("company_name"), row.get("title"))
         # First-seen wins on the DB side too (existing rows may already
         # contain duplicates from before this dedupe existed — pin to
         # one of them as the canonical entry).
@@ -382,9 +382,7 @@ async def _validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(await asyncio.gather(*(_validate_one_row(r) for r in rows)))
 
 
-async def _batch_fetch_job_scores(
-    supabase: Client, job_ids: list[str]
-) -> dict[str, int]:
+async def _batch_fetch_job_scores(supabase: Client, job_ids: list[str]) -> dict[str, int]:
     """Return ``{job_id: score}`` for the given ids in a single round-trip.
 
     Callers in the poller fan out Stage 3 over N rows; without this batch
@@ -437,9 +435,7 @@ async def _load_alert_rows(
     # The RPC returns SETOF jobs — the same column shape the old
     # ``select("*")`` returned, so alert dispatch reads identical rows.
     try:
-        resp = await asyncio.to_thread(
-            supabase.rpc("get_jobs_by_ids", {"p_ids": new_ids}).execute
-        )
+        resp = await asyncio.to_thread(supabase.rpc("get_jobs_by_ids", {"p_ids": new_ids}).execute)
         refreshed = cast(list[dict[str, Any]], resp.data or [])
         if refreshed:
             return refreshed
@@ -484,11 +480,7 @@ async def _run_llm_scoring_for_row(
         # Single-row fallback for callers without a pre-fetched batch.
         try:
             score_resp = await asyncio.to_thread(
-                supabase.table("jobs")
-                .select("score")
-                .eq("id", job_id)
-                .single()
-                .execute
+                supabase.table("jobs").select("score").eq("id", job_id).single().execute
             )
             current_score = int(cast(dict[str, Any], score_resp.data).get("score", 0))
         except Exception:
@@ -721,9 +713,7 @@ async def _qualify_one_job(
             )
         )
     except Exception:
-        logger.exception(
-            "Qualification tag write failed for job %s", row.get("id")
-        )
+        logger.exception("Qualification tag write failed for job %s", row.get("id"))
 
 
 async def _qualify_jobs(
@@ -737,17 +727,52 @@ async def _qualify_jobs(
     shared DB-write semaphore inside ``_qualify_one_job``; the tagger calls
     themselves fan out together. The whole step is wrapped so a tagger or
     client-resolution failure can never break the poll.
+
+    Global-budget gated (#60 overspend fix): the tagger bills the instance
+    key, so the per-payer ``PayerBudgetGate`` that protects Phase-1/2 work
+    can't see it. Left ungated it ground the backlog clean past
+    ``global_llm_daily_budget_usd``. We re-read the live day-spend before
+    each chunk and stop the moment the cap is reached — bounding overshoot
+    to one chunk instead of the whole backlog. Untagged rows simply stay
+    NULL (fail-soft, exactly like a tagger outage) and re-attempt next cycle
+    once the UTC day rolls over and the meter resets.
     """
+    if not rows:
+        return
     try:
         llm = get_llm_client(supabase, None)
     except Exception:
         logger.exception("Qualification tagger: LLM client unavailable; skipping")
         return
 
-    await asyncio.gather(
-        *(_qualify_one_job(llm, supabase, row) for row in rows),
-        return_exceptions=True,
-    )
+    for start in range(0, len(rows), QUALIFICATION_BUDGET_RECHECK_EVERY):
+        # Re-read the meter between chunks so a long backlog can't blow past
+        # the cap. A meter-read failure fails CLOSED (skip the rest) —
+        # refuse to spend when we can't see the budget, matching the cycle
+        # gate's posture.
+        try:
+            exhausted = await asyncio.to_thread(_global_budget_exhausted, supabase)
+        except Exception:
+            logger.exception(
+                "Qualification tagger: global-budget read failed — "
+                "deferring remaining %d job(s) this cycle",
+                len(rows) - start,
+            )
+            return
+        if exhausted:
+            logger.warning(
+                "Qualification tagger: global daily LLM cap reached "
+                "($%.2f) — deferring %d remaining job(s); they re-tag next "
+                "cycle (rows stay NULL)",
+                settings.global_llm_daily_budget_usd,
+                len(rows) - start,
+            )
+            return
+        chunk = rows[start : start + QUALIFICATION_BUDGET_RECHECK_EVERY]
+        await asyncio.gather(
+            *(_qualify_one_job(llm, supabase, row) for row in chunk),
+            return_exceptions=True,
+        )
 
 
 async def _embed_jobs(
@@ -812,9 +837,7 @@ async def _shadow_observe(
     gates on the flag; flag off ⇒ this is never invoked, no cosine work, no row).
     """
     try:
-        cosine, cosine_admit = await cosine_gate_decision(
-            supabase, job_id=job_id, target=target
-        )
+        cosine, cosine_admit = await cosine_gate_decision(supabase, job_id=job_id, target=target)
         threshold = await _shadow_threshold(supabase, target_id=target.id)
         await record_shadow_observation(
             supabase,
@@ -859,9 +882,7 @@ async def _shadow_threshold(supabase: Client, *, target_id: str) -> float | None
         raw = rows[0].get("prescan_cosine_threshold")
         return float(raw) if raw is not None else None
     except Exception:
-        logger.exception(
-            "Pre-scan shadow threshold read failed for target %s", target_id
-        )
+        logger.exception("Pre-scan shadow threshold read failed for target %s", target_id)
         return None
 
 
@@ -976,9 +997,7 @@ async def _poll_one_source(
         # the same columns existing_rows is read for below.
         existing_resp = await asyncio.to_thread(
             execute_with_retry_sync,
-            supabase.rpc(
-                "source_live_unengaged_jobs", {"p_source_id": source_id}
-            ).execute,
+            supabase.rpc("source_live_unengaged_jobs", {"p_source_id": source_id}).execute,
             label=f"poll existing {company_name}",
         )
         existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
@@ -1028,8 +1047,7 @@ async def _poll_one_source(
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
-            if job.external_id not in known_external_ids
-            and _passes_free_gates(job, active_targets)
+            if job.external_id not in known_external_ids and _passes_free_gates(job, active_targets)
         ]
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             titles = [job.title for _, job in triage_candidates]
@@ -1067,10 +1085,24 @@ async def _poll_one_source(
                 # sources spread cost across multiple calls.
                 target_verdicts: dict[int, TitleVerdict] = {}
                 for start in range(0, len(titles), PHASE1_BATCH_SIZE):
+                    # Re-check the global daily cap before each batch (#60
+                    # overspend fix). The per-cycle gate above trips the
+                    # breaker once at cycle start, but a long backlog cycle
+                    # can cross the cap mid-run; re-reading here bounds
+                    # overshoot to one batch. Stop spending for this target;
+                    # verdicts already collected stand, the rest fail-open
+                    # admit (same defer semantics as ``target_blocked``).
+                    if await _triage_budget_blocks(supabase):
+                        logger.warning(
+                            "Phase 1 triage: global daily LLM cap reached "
+                            "($%.2f) mid-cycle — deferring remaining titles "
+                            "for target %s",
+                            settings.global_llm_daily_budget_usd,
+                            active_target.id,
+                        )
+                        break
                     batch = titles[start : start + PHASE1_BATCH_SIZE]
-                    verdicts, result = await triage_titles(
-                        llm, target=active_target, titles=batch
-                    )
+                    verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
                     if result is not None:
                         try:
                             record_llm_cost(
@@ -1253,26 +1285,17 @@ async def _poll_one_source(
                             target=target,
                         )
                     except Exception:
-                        logger.exception(
-                            "Stage 1 scoring failed for job %s", row_data.get("id")
-                        )
+                        logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
                 await asyncio.gather(
-                    *(
-                        _title_score_one(cast(dict[str, Any], r))
-                        for r in upsert_resp.data or []
-                    )
+                    *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
 
             # Update global scores after stage 1 (batched)
-            stage1_ids = [
-                cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []
-            ]
+            stage1_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if stage1_ids:
                 try:
-                    await asyncio.to_thread(
-                        batch_update_global_scores, supabase, stage1_ids
-                    )
+                    await asyncio.to_thread(batch_update_global_scores, supabase, stage1_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 1")
 
@@ -1299,11 +1322,7 @@ async def _poll_one_source(
                     try:
                         ext_id = row_data.get("external_id", "")
                         phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                        verdict = (
-                            verdicts.get(phase1_idx)
-                            if phase1_idx is not None
-                            else None
-                        )
+                        verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
                         # Fail-open: missing verdict = admit (matches the
                         # pre-confidence rollout's `.get(idx, True)` default).
                         promising = verdict.promising if verdict is not None else True
@@ -1336,26 +1355,17 @@ async def _poll_one_source(
                                 keyword_score=stage2.score,
                             )
                     except Exception:
-                        logger.exception(
-                            "Stage 2 scoring failed for job %s", row_data.get("id")
-                        )
+                        logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
                 await asyncio.gather(
-                    *(
-                        _full_score_one(cast(dict[str, Any], r))
-                        for r in upsert_resp.data or []
-                    )
+                    *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
 
             # Update global scores after stage 2 (batched)
-            stage2_ids = [
-                cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []
-            ]
+            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if stage2_ids:
                 try:
-                    await asyncio.to_thread(
-                        batch_update_global_scores, supabase, stage2_ids
-                    )
+                    await asyncio.to_thread(batch_update_global_scores, supabase, stage2_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 2")
 
@@ -1376,9 +1386,7 @@ async def _poll_one_source(
                 (
                     primary_by_user,
                     user_optimized,
-                ) = await _resolve_user_targets_for_stage3(
-                    supabase, active_targets, company_name
-                )
+                ) = await _resolve_user_targets_for_stage3(supabase, active_targets, company_name)
 
             if settings.phase2_enabled and primary_by_user:
                 # ---- Phase 2: LLM job-fit grading (#6) ----
@@ -1390,17 +1398,14 @@ async def _poll_one_source(
                 # ``jobs.score`` afterwards because Phase 2 rewrites
                 # ``scores.score`` (Stage 2's keyword value was a
                 # placeholder until graded).
-                cycle_rows = [
-                    cast(dict[str, Any], r) for r in upsert_resp.data or []
-                ]
+                cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
                 for uid, p2_target in primary_by_user.items():
                     if gate.user_blocked(uid):
                         # Over monthly allowance — defer. Jobs keep
                         # promising=True/score=NULL and get graded when
                         # the rolling window frees up.
                         logger.info(
-                            "Phase 2 deferred for user %s / target %s "
-                            "(over monthly allowance)",
+                            "Phase 2 deferred for user %s / target %s (over monthly allowance)",
                             uid,
                             p2_target.id,
                         )
@@ -1410,8 +1415,7 @@ async def _poll_one_source(
                     llm = _resolve_payer_client(payer_clients, supabase, uid)
                     if llm is None:
                         logger.info(
-                            "Phase 2 deferred for user %s / target %s "
-                            "(no BYOK key)",
+                            "Phase 2 deferred for user %s / target %s (no BYOK key)",
                             uid,
                             p2_target.id,
                         )
@@ -1433,13 +1437,9 @@ async def _poll_one_source(
                         )
                 if stage2_ids:
                     try:
-                        await asyncio.to_thread(
-                            batch_update_global_scores, supabase, stage2_ids
-                        )
+                        await asyncio.to_thread(batch_update_global_scores, supabase, stage2_ids)
                     except Exception:
-                        logger.exception(
-                            "Global score update failed after Phase 2"
-                        )
+                        logger.exception("Global score update failed after Phase 2")
             elif primary_by_user:
                 llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
 
@@ -1472,9 +1472,7 @@ async def _poll_one_source(
                             doc,
                             client,
                             target,
-                            current_score=score_map.get(
-                                cast(str, row_data.get("id", "")), 0
-                            ),
+                            current_score=score_map.get(cast(str, row_data.get("id", "")), 0),
                             payer_user_id=payer,
                         )
 
@@ -1502,13 +1500,9 @@ async def _poll_one_source(
             # upsert in that case, so the list sort is unaffected.
             if settings.recency_decay_enabled and stage2_ids:
                 try:
-                    await asyncio.to_thread(
-                        refresh_recency_scores, supabase, stage2_ids
-                    )
+                    await asyncio.to_thread(refresh_recency_scores, supabase, stage2_ids)
                 except Exception:
-                    logger.exception(
-                        "Recency refresh failed for %s", company_name
-                    )
+                    logger.exception("Recency refresh failed for %s", company_name)
 
         # Identify stale jobs no longer on the board
         stale_ids: list[str] = []
@@ -1550,9 +1544,7 @@ async def _poll_one_source(
         if rows_to_upsert:
             mark_polled_payload["last_candidate_at"] = datetime.now(UTC).isoformat()
         last_polled_query = (
-            supabase.table("sources")
-            .update(mark_polled_payload)
-            .eq("id", source_id)
+            supabase.table("sources").update(mark_polled_payload).eq("id", source_id)
         )
 
         if stale_ids:
@@ -1571,9 +1563,7 @@ async def _poll_one_source(
             await asyncio.gather(
                 asyncio.to_thread(
                     execute_with_retry_sync,
-                    supabase.rpc(
-                        "archive_jobs_by_ids", {"p_ids": stale_ids}
-                    ).execute,
+                    supabase.rpc("archive_jobs_by_ids", {"p_ids": stale_ids}).execute,
                     label=f"poll archive {company_name}",
                 ),
                 asyncio.to_thread(
@@ -1600,15 +1590,11 @@ async def _poll_one_source(
             try:
                 await notify.send_alerts_for_new_jobs(supabase, alert_rows)
             except Exception:
-                logger.exception(
-                    "Email alert dispatch raised for %s", company_name
-                )
+                logger.exception("Email alert dispatch raised for %s", company_name)
             try:
                 await notify.send_sms_alerts_for_new_jobs(supabase, alert_rows)
             except Exception:
-                logger.exception(
-                    "SMS alert dispatch raised for %s", company_name
-                )
+                logger.exception("SMS alert dispatch raised for %s", company_name)
 
         # Funnel diagnostics for #845. One structured line per source per
         # cycle so an operator can `grep poll_funnel | grep <Company>` in
@@ -1688,10 +1674,7 @@ async def _record_source_failure(
                 failures,
             )
         await asyncio.to_thread(
-            lambda: supabase.table("sources")
-            .update(updates)
-            .eq("id", source_id)
-            .execute()
+            lambda: supabase.table("sources").update(updates).eq("id", source_id).execute()
         )
         if disabling and settings.sentry_dsn:
             try:
@@ -1704,18 +1687,12 @@ async def _record_source_failure(
                     level="error",
                 )
             except Exception:
-                logger.exception(
-                    "Failed to report source auto-disable to Sentry"
-                )
+                logger.exception("Failed to report source auto-disable to Sentry")
     except Exception:
-        logger.exception(
-            "Failed to record source failure for %s", source_id
-        )
+        logger.exception("Failed to record source failure for %s", source_id)
 
 
-async def recover_stale_sources(
-    supabase: Client, *, now: datetime | None = None
-) -> int:
+async def recover_stale_sources(supabase: Client, *, now: datetime | None = None) -> int:
     """Auto-recovery: re-enable sources the backoff auto-disabled longer ago
     than ``source_recovery_after_hours``, resetting their failure counter so
     they get polled again.
@@ -1756,9 +1733,7 @@ async def recover_stale_sources(
         return 0
     recovered = cast(list[dict[str, Any]], resp.data or [])
     if recovered:
-        names = ", ".join(
-            str(r.get("company_name") or r.get("id")) for r in recovered[:10]
-        )
+        names = ", ".join(str(r.get("company_name") or r.get("id")) for r in recovered[:10])
         logger.info(
             "source auto-recovery: re-enabled %d source(s) disabled > %dh ago: %s%s",
             len(recovered),
@@ -1774,6 +1749,46 @@ async def recover_stale_sources(
 # day rollover re-arms it; restart re-arms it (acceptable — one extra
 # warning per restart per day is fine).
 _GLOBAL_APPROACHING_DAY: str | None = None
+
+
+def _global_budget_exhausted(supabase: Client) -> bool:
+    """True when today's total LLM spend (ALL users, since UTC midnight)
+    has reached ``global_llm_daily_budget_usd``. 0 disables (never True).
+
+    The lean predicate behind both the once-per-cycle circuit breaker
+    (:func:`_global_circuit_breaker_tripped`) and the mid-run re-checks
+    in long per-job LLM loops (:func:`_qualify_jobs`, the Phase-1 triage
+    batch loops). One implementation so every LLM-spending path reads the
+    SAME meter against the SAME cap — no parallel budget logic. Carries no
+    side effects (warnings/Sentry live in the breaker) so it's safe to
+    call repeatedly inside a loop.
+    """
+    cap = settings.global_llm_daily_budget_usd
+    if cap <= 0:
+        return False
+    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    return total_llm_spend_all(supabase, since=midnight) >= cap
+
+
+async def _triage_budget_blocks(supabase: Client) -> bool:
+    """Async, fail-OPEN global-budget check for the Phase-1 triage loops.
+
+    Reads the meter off-thread (it's a sync DB call). Returns True only when
+    the global daily cap is provably reached. A meter-read error fails OPEN
+    (returns False → keep triaging) on purpose: triage is already protected
+    by the once-per-cycle ``gate.target_blocked`` breaker, so this per-batch
+    check is a best-effort tightening — a transient read blip must not break
+    a poll or silently drop the precision filter. (Qualification, which has
+    NO other gate, instead fails CLOSED in :func:`_qualify_jobs`.)
+    """
+    try:
+        return await asyncio.to_thread(_global_budget_exhausted, supabase)
+    except Exception:
+        logger.exception(
+            "Phase 1 triage: global-budget read failed — continuing "
+            "(fail-open; the per-cycle breaker still applies)"
+        )
+        return False
 
 
 def _global_circuit_breaker_tripped(supabase: Client) -> bool:
@@ -1803,8 +1818,7 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
             if day_key != _GLOBAL_APPROACHING_DAY:
                 _GLOBAL_APPROACHING_DAY = day_key
                 logger.warning(
-                    "global LLM spend approaching cap: $%.4f / $%.2f "
-                    "(%.0f%%)",
+                    "global LLM spend approaching cap: $%.4f / $%.2f (%.0f%%)",
                     spent,
                     cap,
                     spent / cap * 100,
@@ -1820,9 +1834,7 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
                             level="warning",
                         )
                     except Exception:
-                        logger.exception(
-                            "Failed to report approaching-cap warning to Sentry"
-                        )
+                        logger.exception("Failed to report approaching-cap warning to Sentry")
         return False
     logger.error(
         "global LLM circuit breaker tripped: $%.4f spent today >= $%.2f cap — "
@@ -1866,14 +1878,10 @@ async def _cycle_budget_gate(supabase: Client) -> tuple[PayerBudgetGate, bool]:
         active = await asyncio.to_thread(get_active_target, supabase)
         if await asyncio.to_thread(_global_circuit_breaker_tripped, supabase):
             return PayerBudgetGate(), bool(active)
-        gate = await asyncio.to_thread(
-            build_budget_gate, supabase, [t.id for t in active]
-        )
+        gate = await asyncio.to_thread(build_budget_gate, supabase, [t.id for t in active])
         return gate, bool(active)
     except Exception:
-        logger.exception(
-            "Budget gate build failed — deferring all LLM work this cycle"
-        )
+        logger.exception("Budget gate build failed — deferring all LLM work this cycle")
         return PayerBudgetGate(), True
 
 
@@ -1914,9 +1922,7 @@ def _drop_paid_sources_if_unconsumed(
     kept = [s for s in sources if s.get("provider") != "crawl"]
     skipped = len(sources) - len(kept)
     if skipped:
-        logger.info(
-            "Skipping %d paid crawl source(s): no active targets", skipped
-        )
+        logger.info("Skipping %d paid crawl source(s): no active targets", skipped)
     return kept
 
 
@@ -1933,9 +1939,7 @@ async def poll_all_sources(supabase: Client) -> PollResult:
     )
 
     budget_gate, has_active = await _cycle_budget_gate(supabase)
-    sources = _drop_paid_sources_if_unconsumed(
-        all_sources, has_active_targets=has_active
-    )
+    sources = _drop_paid_sources_if_unconsumed(all_sources, has_active_targets=has_active)
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
     async def _worker(raw_source: Any) -> dict[str, Any]:
@@ -1950,9 +1954,7 @@ async def poll_all_sources(supabase: Client) -> PollResult:
 
     summaries = await asyncio.gather(*(_worker(s) for s in sources))
 
-    result = PollResult(
-        sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
-    )
+    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     for s in summaries:
         if s["polled"]:
             result.sources_polled += 1
@@ -1986,9 +1988,7 @@ def _is_due(source: dict[str, Any], now: datetime) -> bool:
     interval_min = source.get("poll_interval_minutes") or DEFAULT_POLL_INTERVAL_MINUTES
     try:
         last_dt = (
-            datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if isinstance(last, str)
-            else last
+            datetime.fromisoformat(last.replace("Z", "+00:00")) if isinstance(last, str) else last
         )
     except (TypeError, ValueError):
         # Unparseable timestamp — treat as never-polled rather than
@@ -2030,9 +2030,7 @@ async def poll_due_sources(supabase: Client) -> PollResult:
 
     due = filter_due_sources(all_enabled)
     if not due:
-        return PollResult(
-            sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
-        )
+        return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
@@ -2057,9 +2055,7 @@ async def poll_due_sources(supabase: Client) -> PollResult:
 
     summaries = await asyncio.gather(*(_worker(s) for s in due))
 
-    result = PollResult(
-        sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
-    )
+    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     for s in summaries:
         if s["polled"]:
             result.sources_polled += 1
@@ -2131,18 +2127,28 @@ async def _poll_one_source_for_target(
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
         llm = (
             _resolve_payer_client(payer_clients, supabase, payer_user_id)
-            if settings.phase1_triage_enabled
-            and triage_candidates
-            and not payer_over_budget
+            if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget
             else None
         )
         if llm is not None:
             titles = [job.title for _, job in triage_candidates]
             for start in range(0, len(titles), PHASE1_BATCH_SIZE):
+                # Re-check the global daily cap before each batch (#60
+                # overspend fix) — bounds overshoot to one batch when a long
+                # cycle crosses the cap mid-run. Collected verdicts stand;
+                # the rest fail-open admit (same defer semantics as an
+                # over-budget payer).
+                if await _triage_budget_blocks(supabase):
+                    logger.warning(
+                        "Phase 1 triage: global daily LLM cap reached "
+                        "($%.2f) mid-cycle — deferring remaining titles for "
+                        "target %s",
+                        settings.global_llm_daily_budget_usd,
+                        target.id,
+                    )
+                    break
                 batch = titles[start : start + PHASE1_BATCH_SIZE]
-                verdicts, result = await triage_titles(
-                    llm, target=target, titles=batch
-                )
+                verdicts, result = await triage_titles(llm, target=target, titles=batch)
                 if result is not None:
                     try:
                         record_llm_cost(
@@ -2253,9 +2259,7 @@ async def _poll_one_source_for_target(
                         target=target,
                     )
                 except Exception:
-                    logger.exception(
-                        "Stage 1 scoring failed for job %s", row_data.get("id")
-                    )
+                    logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
             await asyncio.gather(
                 *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
@@ -2276,15 +2280,9 @@ async def _poll_one_source_for_target(
                     # Phase 2 candidate selection can rely on it.
                     ext_id = row_data.get("external_id", "")
                     phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                    verdict = (
-                        target_verdicts.get(phase1_idx)
-                        if phase1_idx is not None
-                        else None
-                    )
+                    verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
                     promising = verdict.promising if verdict is not None else True
-                    phase1_confidence = (
-                        verdict.confidence if verdict is not None else None
-                    )
+                    phase1_confidence = verdict.confidence if verdict is not None else None
                     stage2 = await _db_to_thread(
                         target_score_and_upsert,
                         supabase,
@@ -2311,23 +2309,17 @@ async def _poll_one_source_for_target(
                             keyword_score=stage2.score,
                         )
                 except Exception:
-                    logger.exception(
-                        "Stage 2 scoring failed for job %s", row_data.get("id")
-                    )
+                    logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
             await asyncio.gather(
                 *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
             )
 
             # Update global scores after stage 2 (batched)
-            s2_ids = [
-                cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []
-            ]
+            s2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if s2_ids:
                 try:
-                    await asyncio.to_thread(
-                        batch_update_global_scores, supabase, s2_ids
-                    )
+                    await asyncio.to_thread(batch_update_global_scores, supabase, s2_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 2")
 
@@ -2342,8 +2334,7 @@ async def _poll_one_source_for_target(
             )
             if primary_by_user and payer_over_budget:
                 logger.info(
-                    "Stage 3 deferred for target %s (payer %s over "
-                    "monthly allowance)",
+                    "Stage 3 deferred for target %s (payer %s over monthly allowance)",
                     target.id,
                     payer_user_id,
                 )
@@ -2366,9 +2357,7 @@ async def _poll_one_source_for_target(
                         payer_user_id,
                     )
                 else:
-                    cycle_rows = [
-                        cast(dict[str, Any], r) for r in upsert_resp.data or []
-                    ]
+                    cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
                     for uid in primary_by_user:
                         try:
                             await run_phase2_for_jobs(
@@ -2387,13 +2376,9 @@ async def _poll_one_source_for_target(
                             )
                     if s2_ids:
                         try:
-                            await asyncio.to_thread(
-                                batch_update_global_scores, supabase, s2_ids
-                            )
+                            await asyncio.to_thread(batch_update_global_scores, supabase, s2_ids)
                         except Exception:
-                            logger.exception(
-                                "Global score update failed after Phase 2"
-                            )
+                            logger.exception("Global score update failed after Phase 2")
             elif primary_by_user:
                 # BYOK (#5 P3): grade on the payer's own key; no key in
                 # hosted require-mode defers.
@@ -2429,9 +2414,7 @@ async def _poll_one_source_for_target(
                                 doc,
                                 grading_client,
                                 target,
-                                current_score=score_map_t.get(
-                                    cast(str, row_data.get("id", "")), 0
-                                ),
+                                current_score=score_map_t.get(cast(str, row_data.get("id", "")), 0),
                                 payer_user_id=payer_user_id,
                             )
 
@@ -2467,9 +2450,7 @@ async def _poll_one_source_for_target(
         except Exception:
             # Non-fatal — the actual poll already happened, this is just
             # the operator-visibility stamp.
-            logger.exception(
-                "Failed to update last_polled_at for source %s", company_name
-            )
+            logger.exception("Failed to update last_polled_at for source %s", company_name)
 
     return summary
 
@@ -2490,13 +2471,14 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
             target.id,
             target.label,
         )
-        return PollResult(
-            sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
-        )
+        return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
 
     if not target.search_keywords:
         return PollResult(
-            sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0,
+            sources_polled=0,
+            new_jobs=0,
+            updated_jobs=0,
+            archived_jobs=0,
             errors=["Target has no search keywords"],
         )
 
@@ -2543,9 +2525,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
 
     summaries = await asyncio.gather(*(_worker(s) for s in sources))
 
-    result = PollResult(
-        sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
-    )
+    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     for s in summaries:
         if s["polled"]:
             result.sources_polled += 1

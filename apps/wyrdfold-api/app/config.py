@@ -195,6 +195,17 @@ class Settings(BaseSettings):
     # rows. Flip per-deploy once validated in DEV.
     qualification_enabled: bool = False
 
+    # Max characters of the (cleaned) job description sent to the
+    # qualification tagger. The tagger only needs the dense signals near the
+    # top of a JD (country cues, seniority wording, "general application"
+    # boilerplate, contract/intern wording) to produce its target-INDEPENDENT
+    # tags; sending the full body burned ~3.4K input tokens/call grinding the
+    # ~16k backlog (the June overspend). A short snippet (~600 chars ≈ 150
+    # tokens) preserves tag quality at a fraction of the per-call input cost.
+    # Set higher only if a tag-quality regression appears; 0 means "send no
+    # description" (title/company/location only).
+    qualification_jd_snippet_chars: int = Field(default=600, ge=0)
+
     # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
     # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
     # the vector in ``job_embeddings`` via
