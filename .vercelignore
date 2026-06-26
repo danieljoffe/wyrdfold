@@ -1,0 +1,6 @@
+# Claude Code local state. The git worktrees under .claude/worktrees/ each hold
+# a full copy of the monorepo, so uploading them makes Nx see every project
+# (wyrdfold, wyrdfold-api, wyrdfold-e2e) "defined in multiple locations" and
+# `nx build` fails during the Vercel build. Vercel needs none of this.
+.claude
+.claude-flow

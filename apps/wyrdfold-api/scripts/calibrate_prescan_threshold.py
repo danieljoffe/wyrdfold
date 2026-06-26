@@ -97,11 +97,17 @@ def _fetch_target_vectors(supabase: Any) -> dict[str, list[float]]:
     return out
 
 
+# An ``in_(...)`` filter rides in the request URL, so a few hundred UUIDs
+# overflow PostgREST's URL-length limit and 400. Batch ids well under it —
+# independent of ``_PAGE``, which sizes row pagination, not URL length.
+_IN_QUERY_CHUNK = 100
+
+
 def _fetch_job_vectors(supabase: Any, job_ids: list[str], *, model: str) -> dict[str, list[float]]:
     """Job vectors for the given ids at ``model``, keyed by job id."""
     out: dict[str, list[float]] = {}
-    for i in range(0, len(job_ids), _PAGE):
-        chunk = job_ids[i : i + _PAGE]
+    for i in range(0, len(job_ids), _IN_QUERY_CHUNK):
+        chunk = job_ids[i : i + _IN_QUERY_CHUNK]
         resp = (
             supabase.table("job_embeddings")
             .select("job_posting_id, embedding")
@@ -205,20 +211,24 @@ def calibrate(
         logger.info(_report_line(label_by_id.get(target_id, "?"), target_id, res, missing))
 
         if write:
-            supabase.table("targets").update(
-                {"prescan_cosine_threshold": res.threshold}
-            ).eq("id", target_id).execute()
+            supabase.table("targets").update({"prescan_cosine_threshold": res.threshold}).eq(
+                "id", target_id
+            ).execute()
             logger.info("  → wrote prescan_cosine_threshold=%.4f", res.threshold)
 
     if write:
         logger.info("Wrote thresholds for %d target(s).", len(results))
     else:
-        logger.info("Dry run — computed %d threshold(s), wrote nothing. Pass --write to arm.", len(results))
+        logger.info(
+            "Dry run — computed %d threshold(s), wrote nothing. Pass --write to arm.", len(results)
+        )
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Calibrate pre-scan cosine thresholds (#60, Phase 2)")
+    parser = argparse.ArgumentParser(
+        description="Calibrate pre-scan cosine thresholds (#60, Phase 2)"
+    )
     parser.add_argument(
         "--labels",
         type=Path,

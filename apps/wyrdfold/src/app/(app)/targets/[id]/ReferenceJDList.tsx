@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
-import { ExternalLink, Trash2 } from 'lucide-react';
+import { ExternalLink, ThumbsDown, ThumbsUp, Trash2 } from 'lucide-react';
 import {
   Card,
   CardContent,
@@ -31,6 +31,11 @@ export default function ReferenceJDList({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   // Reference JD id awaiting delete confirmation; opens the confirm modal.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  // The caller's own vote per JD (1 up / -1 down / 0 none). Votes are
+  // anonymous so the list endpoint never sends the existing vote — we start
+  // unknown (0) and reflect the server's echoed `your_vote` after each click.
+  const [votes, setVotes] = useState<Record<string, number>>({});
+  const [votingId, setVotingId] = useState<string | null>(null);
   const { toast } = useToast();
 
   const handleDelete = useCallback((refId: string) => {
@@ -61,6 +66,43 @@ export default function ReferenceJDList({
       setDeletingId(null);
     }
   }, [pendingDeleteId, targetId, toast, onChanged]);
+
+  const handleVote = useCallback(
+    async (refId: string, direction: 1 | -1) => {
+      // Clicking the active direction again clears the vote (API treats 0 as
+      // "remove my vote"); otherwise switch to the chosen direction.
+      const value = votes[refId] === direction ? 0 : direction;
+      setVotingId(refId);
+      try {
+        const res = await fetch(
+          `/api/targets/${targetId}/reference-jds/${refId}/vote`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value }),
+          }
+        );
+        if (!res.ok) throw new Error(await extractApiError(res, 'Vote failed'));
+        const result = (await res.json()) as {
+          your_vote: number;
+          profile_version: number | null;
+        };
+        setVotes(prev => ({ ...prev, [refId]: result.your_vote }));
+        // A non-null profile_version means this vote flipped suppression and
+        // the shared scoring profile was re-merged — refresh so the rest of
+        // the detail view reflects it.
+        if (result.profile_version !== null) onChanged();
+      } catch (err) {
+        toast({
+          variant: 'error',
+          title: err instanceof Error ? err.message : 'Failed to record vote',
+        });
+      } finally {
+        setVotingId(null);
+      }
+    },
+    [votes, targetId, toast, onChanged]
+  );
 
   const handleAdded = useCallback(() => {
     setModalOpen(false);
@@ -114,18 +156,54 @@ export default function ReferenceJDList({
                     Added {new Date(jd.created_at).toLocaleDateString()}
                   </Text>
                 </div>
-                <Button
-                  name={`target-ref-jd-delete-${jd.id}`}
-                  variant='bare'
-                  size='sm'
-                  iconOnly
-                  onClick={() => handleDelete(jd.id)}
-                  disabled={deletingId === jd.id}
-                  aria-label='Delete reference JD'
-                  className='text-text-tertiary hover:text-error shrink-0'
-                >
-                  <Trash2 className='size-3.5' />
-                </Button>
+                <div className='flex items-center gap-1 shrink-0'>
+                  <Button
+                    name={`target-ref-jd-upvote-${jd.id}`}
+                    variant='bare'
+                    size='sm'
+                    iconOnly
+                    onClick={() => handleVote(jd.id, 1)}
+                    disabled={votingId === jd.id}
+                    aria-label='Upvote reference JD'
+                    aria-pressed={votes[jd.id] === 1}
+                    className={
+                      votes[jd.id] === 1
+                        ? 'text-success'
+                        : 'text-text-tertiary hover:text-success'
+                    }
+                  >
+                    <ThumbsUp className='size-3.5' />
+                  </Button>
+                  <Button
+                    name={`target-ref-jd-downvote-${jd.id}`}
+                    variant='bare'
+                    size='sm'
+                    iconOnly
+                    onClick={() => handleVote(jd.id, -1)}
+                    disabled={votingId === jd.id}
+                    aria-label='Downvote reference JD'
+                    aria-pressed={votes[jd.id] === -1}
+                    className={
+                      votes[jd.id] === -1
+                        ? 'text-error'
+                        : 'text-text-tertiary hover:text-error'
+                    }
+                  >
+                    <ThumbsDown className='size-3.5' />
+                  </Button>
+                  <Button
+                    name={`target-ref-jd-delete-${jd.id}`}
+                    variant='bare'
+                    size='sm'
+                    iconOnly
+                    onClick={() => handleDelete(jd.id)}
+                    disabled={deletingId === jd.id}
+                    aria-label='Delete reference JD'
+                    className='text-text-tertiary hover:text-error'
+                  >
+                    <Trash2 className='size-3.5' />
+                  </Button>
+                </div>
               </div>
             ))}
           </div>
