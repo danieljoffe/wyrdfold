@@ -139,4 +139,130 @@ describe('ReferenceJDList', () => {
     });
     expect(onChanged).not.toHaveBeenCalled();
   });
+
+  it('renders up/down vote controls for each reference JD', () => {
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD, { ...SAMPLE_JD, id: 'jd-2' }]}
+        onChanged={() => undefined}
+      />
+    );
+    expect(screen.getAllByLabelText('Upvote reference JD')).toHaveLength(2);
+    expect(screen.getAllByLabelText('Downvote reference JD')).toHaveLength(2);
+  });
+
+  it('posts an upvote and reflects the server-echoed vote', async () => {
+    const onChanged = jest.fn();
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({ your_vote: 1, profile_version: null }),
+    } as Response);
+    const user = userEvent.setup();
+
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={onChanged}
+      />
+    );
+    const upvote = screen.getByLabelText('Upvote reference JD');
+    await user.click(upvote);
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/targets/t-1/reference-jds/jd-1/vote',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: 1 }),
+        }
+      );
+    });
+    // The button reflects the recorded vote (aria-pressed) once the response
+    // lands; suppression didn't flip (profile_version null) so no refetch.
+    await waitFor(() => expect(upvote).toHaveAttribute('aria-pressed', 'true'));
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  it('clears the vote by re-clicking the active direction (value 0)', async () => {
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ your_vote: 1, profile_version: null }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ your_vote: 0, profile_version: null }),
+      } as Response);
+    const user = userEvent.setup();
+
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={() => undefined}
+      />
+    );
+    const upvote = screen.getByLabelText('Upvote reference JD');
+    await user.click(upvote);
+    await waitFor(() => expect(upvote).toHaveAttribute('aria-pressed', 'true'));
+
+    // Second click on the now-active upvote sends value 0 to clear it.
+    await user.click(upvote);
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenLastCalledWith(
+        '/api/targets/t-1/reference-jds/jd-1/vote',
+        expect.objectContaining({ body: JSON.stringify({ value: 0 }) })
+      );
+    });
+    await waitFor(() =>
+      expect(upvote).toHaveAttribute('aria-pressed', 'false')
+    );
+  });
+
+  it('refetches when a vote flips suppression (profile re-merged)', async () => {
+    const onChanged = jest.fn();
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({ your_vote: -1, profile_version: 7 }),
+    } as Response);
+    const user = userEvent.setup();
+
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={onChanged}
+      />
+    );
+    await user.click(screen.getByLabelText('Downvote reference JD'));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it('toasts an error when a vote fails and leaves the vote unset', async () => {
+    const onChanged = jest.fn();
+    (global.fetch as jest.Mock).mockResolvedValue({ ok: false } as Response);
+    const user = userEvent.setup();
+
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={onChanged}
+      />
+    );
+    const upvote = screen.getByLabelText('Upvote reference JD');
+    await user.click(upvote);
+
+    await waitFor(() => {
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'error' })
+      );
+    });
+    expect(upvote).toHaveAttribute('aria-pressed', 'false');
+    expect(onChanged).not.toHaveBeenCalled();
+  });
 });
