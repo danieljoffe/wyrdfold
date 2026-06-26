@@ -92,12 +92,8 @@ class TestQualificationHash:
 
     def test_field_boundary_collision_safe(self) -> None:
         # NUL-separated join: ("ab","c") and ("a","bc") must not collide.
-        h1 = qualification_hash(
-            title="ab", company="c", location="x", description="d"
-        )
-        h2 = qualification_hash(
-            title="a", company="bc", location="x", description="d"
-        )
+        h1 = qualification_hash(title="ab", company="c", location="x", description="d")
+        h2 = qualification_hash(title="a", company="bc", location="x", description="d")
         assert h1 != h2
 
     def test_is_sha256_hex(self) -> None:
@@ -161,6 +157,129 @@ class TestUserMessage:
         )
         assert "(unknown)" in msg
         assert "(unstated)" in msg
+
+
+# ---- L2: input trim (cost-control regression, #60 overspend) ----------------
+
+
+def _capture_user_message(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Patch ``complete_json`` to capture the user message ``tag_job`` builds,
+    returning a recorder. The LLM is never called for real."""
+    captured: dict[str, Any] = {}
+
+    async def fake_complete_json(*_a: object, **kwargs: Any) -> object:
+        messages = kwargs["messages"]
+        captured["user_message"] = messages[0].content
+        return QualificationTags(**_GOLDEN_CASES[0]["verdict"]), object()
+
+    monkeypatch.setattr(tagger_mod, "complete_json", fake_complete_json)
+    return captured
+
+
+class TestInputTrim:
+    """The tagger sends only a SHORT JD snippet, not the full body. Sending
+    the full ~6000-char description burned ~3.4K input tokens/call against the
+    backlog and drove the June overspend. These pin the trim so a regression
+    that re-sends the whole JD fails CI."""
+
+    @pytest.mark.asyncio
+    async def test_long_jd_truncated_to_cap_and_keeps_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cap = 600
+        # A long body whose tail carries a unique marker that must NOT be sent.
+        head = "Lead the platform team. " * 30  # ~720 chars, > cap
+        tail_marker = "ZZZ_VENDOR_FOOTER_BOILERPLATE_ZZZ"
+        body = head + tail_marker
+        assert len(body) > cap
+
+        captured = _capture_user_message(monkeypatch)
+        await tag_job(
+            MockLLMClient(),
+            title="Staff Engineer",
+            company="Globex",
+            location="Remote - United States",
+            description=body,
+            description_chars=cap,
+        )
+
+        msg = captured["user_message"]
+        # Header fields are still present.
+        assert "Staff Engineer" in msg
+        assert "Globex" in msg
+        assert "Remote - United States" in msg
+        assert "Heuristic US guess" in msg
+        # The verbose tail past the cap is NOT sent.
+        assert tail_marker not in msg
+        # The whole message stays small: header lines + at most `cap`
+        # description chars. (Header is well under 200 chars.)
+        assert len(msg) <= cap + 200
+        # And the leading slice of the body IS present (we truncate, not drop).
+        assert "Lead the platform team." in msg
+
+    @pytest.mark.asyncio
+    async def test_default_cap_comes_from_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no explicit ``description_chars``, the cap is
+        ``settings.qualification_jd_snippet_chars`` — the single config knob."""
+        from app.config import settings as live_settings
+
+        monkeypatch.setattr(live_settings, "qualification_jd_snippet_chars", 40)
+        tail_marker = "TAIL_PAST_FORTY_CHARS_MUST_BE_DROPPED"
+        body = "A" * 40 + tail_marker
+
+        captured = _capture_user_message(monkeypatch)
+        await tag_job(
+            MockLLMClient(),
+            title="t",
+            company="c",
+            location="z",
+            description=body,
+        )
+
+        msg = captured["user_message"]
+        assert tail_marker not in msg
+        # Exactly 40 'A's of the body made it in (the cap), no more.
+        assert "A" * 40 in msg
+        assert "A" * 41 not in msg
+
+    @pytest.mark.asyncio
+    async def test_short_jd_passes_through_untruncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A body under the cap is sent in full — the trim only bounds the
+        long tail, it doesn't degrade short postings."""
+        body = "Small but complete JD: US-based, senior, full-time."
+        captured = _capture_user_message(monkeypatch)
+        await tag_job(
+            MockLLMClient(),
+            title="t",
+            company="c",
+            location="z",
+            description=body,
+            description_chars=600,
+        )
+        assert body in captured["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_zero_cap_sends_no_description_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``description_chars=0`` sends title/company/location only — the
+        most aggressive cost setting still produces a valid prompt."""
+        captured = _capture_user_message(monkeypatch)
+        await tag_job(
+            MockLLMClient(),
+            title="Engineer",
+            company="Acme",
+            location="NYC",
+            description="<p>This entire body must be dropped.</p>",
+            description_chars=0,
+        )
+        msg = captured["user_message"]
+        assert "Engineer" in msg
+        assert "This entire body must be dropped" not in msg
+        # Empty description renders the placeholder, not raw HTML.
+        assert "(no description provided)" in msg
 
 
 # ---- L2: golden fixture — schema mapping for the issue's hard cases --------
@@ -307,9 +426,7 @@ class TestGoldenSchemaMapping:
         # MockLLMClient.complete_tool_use parses the scripted text as JSON and
         # returns it as the tool-input dict — exactly the shape the real client
         # produces server-side. complete_json then validates it into the schema.
-        llm = MockLLMClient(
-            scripted={QUALIFICATION_PURPOSE: json.dumps(case["verdict"])}
-        )
+        llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(case["verdict"])})
 
         tags, result = await tag_job(
             llm,
@@ -323,8 +440,7 @@ class TestGoldenSchemaMapping:
         assert result is not None  # cost result present on success
         for field, expected in case["expect"].items():
             assert getattr(tags, field) == expected, (
-                f"{case['name']}: {field} expected {expected!r}, "
-                f"got {getattr(tags, field)!r}"
+                f"{case['name']}: {field} expected {expected!r}, got {getattr(tags, field)!r}"
             )
 
     @pytest.mark.asyncio
@@ -357,9 +473,7 @@ class TestSchemaAndFailSoft:
         bad = dict(_GOLDEN_CASES[0]["verdict"])
         bad["role_family"] = "wizardry"  # not in the enum
         llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(bad)})
-        tags, result = await tag_job(
-            llm, title="x", company="y", location="z", description="d"
-        )
+        tags, result = await tag_job(llm, title="x", company="y", location="z", description="d")
         assert tags is None
         assert result is None
 
@@ -368,9 +482,7 @@ class TestSchemaAndFailSoft:
         bad = dict(_GOLDEN_CASES[0]["verdict"])
         bad["us_confidence"] = 250  # > 100
         llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(bad)})
-        tags, _ = await tag_job(
-            llm, title="x", company="y", location="z", description="d"
-        )
+        tags, _ = await tag_job(llm, title="x", company="y", location="z", description="d")
         assert tags is None
 
     @pytest.mark.asyncio

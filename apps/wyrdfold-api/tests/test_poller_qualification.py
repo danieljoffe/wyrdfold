@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.config import settings as live_settings
 from app.services import poller as poller_mod
 from app.services.qualification import QualificationTags, qualification_hash
 
@@ -86,9 +87,7 @@ def _patch_common(
     monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
-    monkeypatch.setattr(
-        poller_mod, "execute_with_retry_sync", fake_execute_with_retry_sync
-    )
+    monkeypatch.setattr(poller_mod, "execute_with_retry_sync", fake_execute_with_retry_sync)
     return rec
 
 
@@ -109,9 +108,7 @@ def _supabase_capturing_updates(rec: dict[str, Any]) -> MagicMock:
 
 class TestQualifyOneJob:
     @pytest.mark.asyncio
-    async def test_new_row_is_tagged_and_written(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_new_row_is_tagged_and_written(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -142,9 +139,7 @@ class TestQualifyOneJob:
         )
 
     @pytest.mark.asyncio
-    async def test_unchanged_row_is_skipped(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_unchanged_row_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -164,9 +159,7 @@ class TestQualifyOneJob:
         assert rec["writes"] == []
 
     @pytest.mark.asyncio
-    async def test_changed_content_is_retagged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_changed_content_is_retagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -219,3 +212,115 @@ class TestQualifyOneJob:
         # Must not raise even though the client can't be resolved.
         await poller_mod._qualify_jobs(MagicMock(), [_row()])
         assert called["n"] == 0
+
+
+def _unique_rows(n: int) -> list[dict[str, Any]]:
+    """``n`` rows with distinct ids/content so each would (absent the gate)
+    miss the content-hash cache and trigger one ``tag_job`` call."""
+    return [_row(id=f"job-{i}", title=f"Engineer {i}") for i in range(n)]
+
+
+class TestQualifyBudgetGate:
+    """Fix 1: the qualification tagger bills the instance key and is invisible
+    to the per-payer ``PayerBudgetGate``. Once today's GLOBAL LLM spend reaches
+    ``global_llm_daily_budget_usd`` the tagger must STOP issuing LLM calls. The
+    re-check runs between chunks, so a backlog can't grind past the cap.
+
+    These are the regression that would have prevented the June overspend:
+    delete the gate in ``_qualify_jobs`` and ``test_*over_budget*`` fail."""
+
+    @pytest.mark.asyncio
+    async def test_stops_when_over_budget_via_real_meter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end wiring: drive the gate through the REAL
+        ``_global_budget_exhausted`` (settings cap + ``total_llm_spend_all``),
+        not a stubbed predicate. Spend over cap → zero tagger calls."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        # Today's spend already over the cap.
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=12.5))
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        # A full chunk-plus of unique rows: absent the gate every one would
+        # be tagged. With the gate, NONE are.
+        rows = _unique_rows(poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY + 5)
+        await poller_mod._qualify_jobs(sb, rows)
+
+        assert rec["tag_calls"] == 0
+        assert rec["cost_calls"] == 0
+        assert rec["writes"] == []
+
+    @pytest.mark.asyncio
+    async def test_runs_normally_when_under_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The gate must not break the happy path: under the cap, every
+        cache-missing row is tagged."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=1.0))
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        rows = _unique_rows(3)
+        await poller_mod._qualify_jobs(sb, rows)
+
+        assert rec["tag_calls"] == 3
+        assert len(rec["writes"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_disabled_cap_never_gates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """cap=0 disables the breaker; even a huge spend reading tags
+        everything (operator opt-out)."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
+        spend = MagicMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, _unique_rows(2))
+
+        assert rec["tag_calls"] == 2
+        # cap<=0 short-circuits before the meter is read.
+        spend.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_overshoot_bounded_to_one_chunk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The cap is crossed AFTER the first chunk: chunk 1 tags, the
+        re-check before chunk 2 sees 'exhausted' and defers the rest. Proves
+        the bound is one chunk, not the whole backlog."""
+        # Gate: under budget for the first check, over for the second.
+        calls = {"n": 0}
+
+        def fake_exhausted(_sb: object) -> bool:
+            calls["n"] += 1
+            return calls["n"] > 1  # first chunk allowed, then deferred
+
+        monkeypatch.setattr(poller_mod, "_global_budget_exhausted", fake_exhausted)
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        chunk = poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY
+        rows = _unique_rows(chunk * 3)  # three chunks' worth
+        await poller_mod._qualify_jobs(sb, rows)
+
+        # Exactly one chunk got tagged before the gate tripped.
+        assert rec["tag_calls"] == chunk
+        assert calls["n"] == 2  # checked before chunk 1 (pass) and chunk 2 (trip)
+
+    @pytest.mark.asyncio
+    async def test_meter_read_failure_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If the spend meter can't be read we refuse to spend (fail closed),
+        matching the cycle gate's posture — no tagger calls, no raise."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        monkeypatch.setattr(
+            poller_mod,
+            "total_llm_spend_all",
+            MagicMock(side_effect=RuntimeError("db down")),
+        )
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        # Must not raise.
+        await poller_mod._qualify_jobs(sb, _unique_rows(3))
+
+        assert rec["tag_calls"] == 0
+        assert rec["writes"] == []
