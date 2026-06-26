@@ -64,6 +64,15 @@ _PAGE = 1000
 # represented (the mid/low bands carry the false-positive examples).
 _STRATA = 5
 
+# Fraction of each target's sample drawn from the TOP keyword-score quartile
+# (where LLM-graded genuine fits concentrate). #60 found the plain even-band
+# sample positive-starved — ~8 fits/target, too few to fix a recall threshold —
+# because the corpus is bottom-heavy, so equal-WIDTH bands leave the top band
+# sparse. Pulling half the sample from the top QUANTILE surfaces many more
+# positives while the even-band remainder still covers the low/mid
+# false-positive band. Tunable via --top-band-fraction; 0 = pure even-band.
+_DEFAULT_TOP_BAND_FRACTION = 0.5
+
 
 def _fetch_scored_jobs(supabase: Any, target_id: str) -> list[dict[str, Any]]:
     """All (job_posting_id, score) rows for a target, paginated.
@@ -91,16 +100,14 @@ def _fetch_scored_jobs(supabase: Any, target_id: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _stratified_sample(
-    rows: list[dict[str, Any]], *, n: int, rng: random.Random
-) -> list[str]:
+def _even_band_sample(rows: list[dict[str, Any]], *, n: int, rng: random.Random) -> list[str]:
     """Pick ~n job ids spread evenly across the keyword-score range.
 
     Buckets the rows into ``_STRATA`` equal-width score bands and draws an even
     quota from each (topping up from the global remainder when a band is thin),
-    so the sample includes both the high-score likely-relevant jobs AND the
-    low/mid-score off-domain-but-keyword-plausible ones (the false-positive band
-    the threshold must learn to reject). Returns at most ``n`` ids.
+    so the sample spans the whole keyword-score range — including the low/mid
+    off-domain-but-keyword-plausible band (the false positives the threshold
+    must learn to reject). Returns at most ``n`` ids.
     """
     if not rows or n <= 0:
         return []
@@ -137,16 +144,62 @@ def _stratified_sample(
     return picked[:n]
 
 
+def _stratified_sample(
+    rows: list[dict[str, Any]],
+    *,
+    n: int,
+    rng: random.Random,
+    top_band_fraction: float = _DEFAULT_TOP_BAND_FRACTION,
+) -> list[str]:
+    """Pick ~n job ids, biased toward high keyword-score jobs.
+
+    ``top_band_fraction`` of ``n`` is drawn from the TOP keyword-score quartile,
+    where the LLM-graded genuine fits concentrate. #60 found the plain even-band
+    sample (:func:`_even_band_sample`) positive-starved: the corpus is
+    bottom-heavy, so equal-WIDTH bands make the top band sparse and the
+    calibration set ends up with only a handful of fits — too few to fix a recall
+    threshold. Taking the top quartile by QUANTILE (always populated) surfaces
+    many more positives. The remaining ``1 - top_band_fraction`` is drawn via the
+    even-band sampler so the low/mid false-positive band the gate must reject
+    stays represented. ``top_band_fraction <= 0`` reproduces the pure even-band
+    sample. Returns at most ``n`` ids.
+    """
+    if not rows or n <= 0:
+        return []
+    if len(rows) <= n:
+        return [r["job_posting_id"] for r in rows]
+
+    frac = max(0.0, min(1.0, top_band_fraction))
+    n_top = round(n * frac)
+
+    picked: list[str] = []
+    picked_set: set[str] = set()
+    if n_top > 0:
+        # Top quartile by keyword score (quantile → populated even on a
+        # bottom-heavy score distribution, unlike an equal-width top band).
+        by_score = sorted(rows, key=lambda r: float(r.get("score") or 0))
+        top_quartile = by_score[int(len(by_score) * 0.75) :]
+        top_ids = [r["job_posting_id"] for r in top_quartile]
+        rng.shuffle(top_ids)
+        picked = top_ids[:n_top]
+        picked_set = set(picked)
+
+    # Remainder: even-band over rows not already taken, so the low/mid bands
+    # (the leakage the gate must reject) stay represented.
+    n_rest = n - len(picked)
+    if n_rest > 0:
+        remaining = [r for r in rows if r["job_posting_id"] not in picked_set]
+        picked.extend(_even_band_sample(remaining, n=n_rest, rng=rng))
+    return picked[:n]
+
+
 def _fetch_jobs(supabase: Any, job_ids: list[str]) -> dict[str, dict[str, Any]]:
     """Fetch (id, title, description_html) for the sampled jobs, keyed by id."""
     out: dict[str, dict[str, Any]] = {}
     for i in range(0, len(job_ids), _PAGE):
         chunk = job_ids[i : i + _PAGE]
         resp = (
-            supabase.table("jobs")
-            .select("id, title, description_html")
-            .in_("id", chunk)
-            .execute()
+            supabase.table("jobs").select("id, title, description_html").in_("id", chunk).execute()
         )
         for row in cast(list[dict[str, Any]], resp.data or []):
             out[row["id"]] = row
@@ -207,6 +260,7 @@ async def bootstrap(
     target_id: str | None,
     dry_run: bool,
     seed: int,
+    top_band_fraction: float = _DEFAULT_TOP_BAND_FRACTION,
 ) -> int:
     init_supabase()
     supabase = get_supabase_pool()
@@ -235,7 +289,9 @@ async def bootstrap(
             logger.info("%s — no scored jobs, skipping", target.label)
             continue
 
-        sampled_ids = _stratified_sample(all_rows, n=per_target, rng=rng)
+        sampled_ids = _stratified_sample(
+            all_rows, n=per_target, rng=rng, top_band_fraction=top_band_fraction
+        )
         pending = [jid for jid in sampled_ids if (jid, target.id) not in done_pairs]
 
         if dry_run:
@@ -265,7 +321,9 @@ async def bootstrap(
 
         jobs = _fetch_jobs(supabase, pending)
 
-        async def _grade(jid: str, *, _payload: Any = payload, _uid: str = user_id) -> dict[str, Any] | None:
+        async def _grade(
+            jid: str, *, _payload: Any = payload, _uid: str = user_id
+        ) -> dict[str, Any] | None:
             job = jobs.get(jid)
             if job is None:
                 return None
@@ -310,7 +368,9 @@ async def bootstrap(
     if dry_run:
         logger.info("Dry run — nothing graded, nothing written.")
     else:
-        logger.info("Done — wrote %d new label(s) to %s (%d total)", newly_written, out_path, len(labels))
+        logger.info(
+            "Done — wrote %d new label(s) to %s (%d total)", newly_written, out_path, len(labels)
+        )
     return newly_written
 
 
@@ -351,6 +411,16 @@ def main() -> None:
         default=1337,
         help="RNG seed for reproducible stratified sampling.",
     )
+    parser.add_argument(
+        "--top-band-fraction",
+        type=float,
+        default=_DEFAULT_TOP_BAND_FRACTION,
+        help=(
+            "Fraction of each target's sample taken from the top keyword-score "
+            "quartile, where genuine fits concentrate "
+            f"(default {_DEFAULT_TOP_BAND_FRACTION}; 0 = pure even-band)."
+        ),
+    )
     args = parser.parse_args()
     asyncio.run(
         bootstrap(
@@ -360,6 +430,7 @@ def main() -> None:
             target_id=args.target,
             dry_run=args.dry_run,
             seed=args.seed,
+            top_band_fraction=args.top_band_fraction,
         )
     )
 
