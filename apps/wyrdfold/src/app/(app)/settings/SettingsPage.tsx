@@ -17,6 +17,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import ApiKeysCard from './ApiKeysCard';
+import DataExportCard from './DataExportCard';
 import LlmUsageCard from './LlmUsageCard';
 import OnboardingResetCard from './OnboardingResetCard';
 import { ResumeStylePreview } from './ResumeStylePreview';
@@ -631,6 +632,8 @@ export default function SettingsPage() {
       <ApiKeysCard />
 
       <LlmUsageCard />
+
+      <DataExportCard />
 
       <OnboardingResetCard />
     </div>
