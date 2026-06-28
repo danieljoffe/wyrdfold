@@ -10,7 +10,7 @@
     "start": "next start"
   },
   "dependencies": {
-    "@danieljoffe/shared-ui": "^0.3.0",
+    "@danieljoffe/shared-ui": "^0.4.0",
     "@supabase/ssr": "^0.12.0",
     "@tiptap/core": "^3.27.1",
     "@tiptap/extension-link": "^3.27.1",
@@ -18,11 +18,11 @@
     "@tiptap/react": "^3.27.1",
     "@tiptap/starter-kit": "^3.27.1",
     "isomorphic-dompurify": "3.18.0",
-    "lucide-react": "1.21.0",
+    "lucide-react": "1.22.0",
     "next": "16.2.9",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "recharts": "^3.8.1",
+    "recharts": "^3.9.0",
     "sharp": "^0.35.2",
     "tiptap-markdown": "^0.9.0"
   }
