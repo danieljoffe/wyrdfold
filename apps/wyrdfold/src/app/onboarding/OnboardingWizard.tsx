@@ -5,7 +5,9 @@ import { useRouter } from 'next/navigation';
 import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
+import { Alert } from '@danieljoffe/shared-ui/Alert';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
+import { completeOnboarding } from './completeOnboarding';
 import ConversationChat from '../_components/ConversationChat';
 import PathChooser from './PathChooser';
 import ResumeUploader from './ResumeUploader';
@@ -54,6 +56,8 @@ export default function OnboardingWizard() {
   const [currentStep, setCurrentStep] = useState<Step>('path-chooser');
   const [selectedPath, setSelectedPath] = useState<OnboardingPath | null>(null);
   const [jobData, setJobData] = useState<JobData | null>(null);
+  const [skipping, setSkipping] = useState(false);
+  const [skipFailed, setSkipFailed] = useState(false);
   const stepRef = useRef<HTMLDivElement>(null);
 
   const steps = selectedPath ? STEPS_BY_PATH[selectedPath] : ['path-chooser'];
@@ -87,23 +91,20 @@ export default function OnboardingWizard() {
     // idempotent (complete_onboarding short-circuits if completed_at is
     // already set) so re-completing after a finish is a no-op.
     //
-    // We MUST await the POST before navigating. Firing it un-awaited and
-    // immediately calling router.push() tore the component down before
-    // the request settled, so in practice the in-flight fetch was
-    // aborted and `onboarding_completed_at` was never written — the next
-    // visit to the dashboard saw a NULL flag and re-fired the wizard
-    // (the "skip doesn't stick" bug). Awaiting guarantees the flag is
-    // persisted before we leave the page.
-    //
-    // On failure we still navigate (degrade gracefully rather than
-    // trapping the user in the wizard); the dashboard guard will bounce
-    // them back on the next visit, which is the pre-fix behaviour — so a
-    // failed POST is never worse than before, and a successful one now
-    // actually sticks.
-    try {
-      await fetch('/api/profile/onboarding/complete', { method: 'POST' });
-    } catch {
-      // Network error — fall through to navigation.
+    // We MUST confirm the write landed (HTTP 2xx) before navigating.
+    // ``completeOnboarding`` checks ``res.ok`` — a non-2xx (expired
+    // session → 401, API down → 503) used to be swallowed, navigating
+    // away while ``onboarding_completed_at`` stayed NULL so the next
+    // dashboard visit re-fired the wizard (the "skip doesn't stick" bug).
+    // On a confirmed failure we keep the user here with a retry
+    // affordance instead of dropping them into that redirect loop.
+    setSkipping(true);
+    setSkipFailed(false);
+    const ok = await completeOnboarding();
+    if (!ok) {
+      setSkipping(false);
+      setSkipFailed(true);
+      return;
     }
     router.push('/targets');
   }, [router]);
@@ -144,6 +145,25 @@ export default function OnboardingWizard() {
               size='sm'
               aria-label={`Step ${stepIndex + 1} of ${totalSteps}`}
             />
+          </div>
+        )}
+
+        {/* Skip failed to persist server-side — surface a retry rather
+            than navigating into the dashboard's redirect loop. */}
+        {skipFailed && (
+          <div className='mb-4'>
+            <Alert variant='error'>
+              We couldn&apos;t save your progress. Check your connection and{' '}
+              <button
+                type='button'
+                onClick={handleSkip}
+                disabled={skipping}
+                className='font-medium underline underline-offset-2 disabled:opacity-60'
+              >
+                try again
+              </button>
+              .
+            </Alert>
           </div>
         )}
 

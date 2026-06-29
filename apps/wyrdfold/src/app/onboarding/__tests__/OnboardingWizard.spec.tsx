@@ -216,9 +216,34 @@ describe('OnboardingWizard — initial state', () => {
     await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
   });
 
-  it('still navigates to /targets if the complete POST fails (graceful degradation)', async () => {
+  it('does NOT navigate and shows a retry when the complete POST fails on every attempt', async () => {
+    // Persistent failure (network down on both the initial call and the
+    // retry) → the flag never landed. Navigating would drop the user into
+    // the dashboard's redirect loop, so we stay on the wizard and surface
+    // a retry affordance instead.
     const user = userEvent.setup();
-    mockFetch.mockRejectedValueOnce(new Error('network down'));
+    mockFetch.mockRejectedValue(new Error('network down'));
+
+    render(<OnboardingWizard />);
+
+    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/couldn.t save your progress/i)
+      ).toBeInTheDocument()
+    );
+    expect(mockPush).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: /try again/i })
+    ).toBeInTheDocument();
+  });
+
+  it('navigates to /targets when a transient 5xx recovers on retry', async () => {
+    const user = userEvent.setup();
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
 
     render(<OnboardingWizard />);
 

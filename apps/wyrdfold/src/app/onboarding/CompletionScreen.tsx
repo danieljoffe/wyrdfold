@@ -6,28 +6,32 @@ import { CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
 import { Card } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
+import { Alert } from '@danieljoffe/shared-ui/Alert';
 import Button from '@/components/Button';
+import { completeOnboarding } from './completeOnboarding';
 
 export default function CompletionScreen() {
   const router = useRouter();
   const [submitting, setSubmitting] = useState(false);
+  const [failed, setFailed] = useState(false);
 
   // Mark onboarding complete server-side, then navigate. The completion
   // call is idempotent on the API, so a double-click or retry from a
   // network hiccup won't overwrite the original timestamp.
   //
-  // If the completion call fails (network blip, API down) we still
-  // navigate — the user has finished the wizard from their perspective,
-  // and Sentry will catch the failure. The downside is the dashboard
-  // gate will redirect them back here once; better than blocking the
-  // happy path on a transient failure.
+  // We only navigate once the write is CONFIRMED (HTTP 2xx).
+  // ``completeOnboarding`` checks ``res.ok`` — previously a swallowed
+  // non-2xx navigated away with ``onboarding_completed_at`` still NULL,
+  // and the dashboard gate bounced the user right back here. On a
+  // confirmed failure we surface a retry instead of looping.
   const handleContinue = useCallback(async () => {
     setSubmitting(true);
-    try {
-      await fetch('/api/profile/onboarding/complete', { method: 'POST' });
-    } catch {
-      // Swallow — Sentry instrumentation covers this; navigation
-      // proceeds so the user doesn't feel stuck.
+    setFailed(false);
+    const ok = await completeOnboarding();
+    if (!ok) {
+      setSubmitting(false);
+      setFailed(true);
+      return;
     }
     router.push('/targets');
   }, [router]);
@@ -54,6 +58,13 @@ export default function CompletionScreen() {
           </div>
         </div>
       </Card>
+
+      {failed && (
+        <Alert variant='error' className='w-full'>
+          We couldn&apos;t finish setting up your account. Check your connection
+          and try again.
+        </Alert>
+      )}
 
       <Button
         name='onboarding-go-to-targets'

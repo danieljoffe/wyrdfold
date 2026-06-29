@@ -51,6 +51,7 @@ def test_start_scheduler_returns_none_when_all_disabled() -> None:
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -65,6 +66,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -86,6 +88,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.url_health_tick_hours = 6
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -108,6 +111,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.url_health_tick_hours = 6
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -128,6 +132,7 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
         mock_settings.retention_purge_enabled = True
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -152,6 +157,7 @@ async def test_start_scheduler_registers_three_when_poll_health_retention_enable
         mock_settings.retention_purge_enabled = True
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -173,6 +179,7 @@ async def test_start_scheduler_registers_only_discovery_when_only_discovery_enab
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -196,14 +203,15 @@ async def test_discovery_scheduler_off_by_default_does_not_register() -> None:
         mock_settings.url_health_check_enabled = False
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
         scheduler = start_scheduler_if_enabled()
     # No flags on → no scheduler at all, so no discovery_run job.
     assert scheduler is None
 
 
 @pytest.mark.asyncio
-async def test_start_scheduler_registers_all_four_when_all_enabled() -> None:
-    """All four flags on — four jobs live on the single shared scheduler."""
+async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
+    """All five flags on — five jobs live on the single shared scheduler."""
     with patch("app.scheduler.settings") as mock_settings:
         mock_settings.poll_scheduler_enabled = True
         mock_settings.poll_tick_minutes = 30
@@ -213,6 +221,8 @@ async def test_start_scheduler_registers_all_four_when_all_enabled() -> None:
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
+        mock_settings.recency_refresh_enabled = True
+        mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -224,7 +234,30 @@ async def test_start_scheduler_registers_all_four_when_all_enabled() -> None:
             "url_health_check",
             "retention_purge",
             "discovery_run",
+            "recency_refresh",
         }
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_start_scheduler_registers_only_recency_when_only_recency_enabled() -> None:
+    """Recency-refresh-only operation — verify only the recency_refresh job lands."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = True
+        mock_settings.recency_refresh_tick_hours = 12
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].id == "recency_refresh"
     finally:
         scheduler.shutdown(wait=False)
 
@@ -275,6 +308,73 @@ async def test_run_scheduled_retention_purge_swallows_exceptions() -> None:
     ):
         # Must not raise.
         await _run_scheduled_retention_purge()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_recency_refresh_invokes_sweep_and_invalidates_cache() -> None:
+    """The tick body must pull the singleton client, run the full sweep in a
+    worker thread, and invalidate the list cache when rows were rewritten."""
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    fake_client = object()
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=fake_client),
+        patch(
+            "app.scheduler.refresh_all_recency_scores", autospec=True
+        ) as mock_sweep,
+        patch("app.scheduler.job_list_cache") as mock_cache,
+    ):
+        mock_sweep.return_value = 12
+        await _run_scheduled_recency_refresh()
+
+    mock_sweep.assert_called_once_with(fake_client)
+    mock_cache.invalidate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_recency_refresh_skips_cache_invalidate_when_nothing_written() -> None:
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch(
+            "app.scheduler.refresh_all_recency_scores", return_value=0
+        ),
+        patch("app.scheduler.job_list_cache") as mock_cache,
+    ):
+        await _run_scheduled_recency_refresh()
+
+    mock_cache.invalidate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_recency_refresh_skips_when_supabase_uninitialized() -> None:
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch(
+            "app.scheduler.refresh_all_recency_scores", autospec=True
+        ) as mock_sweep,
+    ):
+        await _run_scheduled_recency_refresh()
+
+    mock_sweep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_recency_refresh_swallows_exceptions() -> None:
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch(
+            "app.scheduler.refresh_all_recency_scores",
+            side_effect=RuntimeError("kaboom"),
+        ),
+    ):
+        # Must not raise — APScheduler would swallow the trace otherwise.
+        await _run_scheduled_recency_refresh()
 
 
 @pytest.mark.asyncio
