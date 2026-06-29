@@ -41,10 +41,22 @@ export default async function WyrdfoldDashboard() {
   // Primary gate: explicit onboarding_completed_at flag on user_profiles.
   // A NULL flag = user hasn't finished the wizard → redirect to it.
   // See plan-wyrdfold-onboarding-completion-tracking.md.
+  //
+  // Redirect ONLY on a confirmed "not onboarded": a status object whose
+  // completed_at is null. ``fetchJsonFromWyrdfoldAPI`` returns ``null`` on
+  // any read failure (transient auth refresh race, network blip, upstream
+  // 5xx). The old ``onboardingStatus?.completed_at == null`` collapsed that
+  // failure case into "never onboarded" and redirected — so a single flaky
+  // read bounced an *already-onboarded* user back into the wizard (and,
+  // because the wizard restarts at path-chooser, into a redirect loop).
+  // Failing open here is safe: DashboardPage renders a graceful setup CTA
+  // for a genuinely-new user, so the worst case for an un-onboarded user
+  // whose read failed is they see the dashboard's empty state instead of
+  // the wizard for one load.
   const onboardingStatus = await fetchJsonFromWyrdfoldAPI<OnboardingStatus>(
     '/profile/onboarding'
   );
-  if (onboardingStatus?.completed_at == null) {
+  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
     redirect('/onboarding');
   }
 
@@ -83,8 +95,13 @@ export default async function WyrdfoldDashboard() {
   // DashboardPage's ``!hasProfile`` branch already renders a graceful
   // empty state with a "Set up profile" CTA, which is what the user
   // actually needs.
+  //
+  // Only warn when the flag is CONFIRMED set: on the fail-open path above
+  // (onboardingStatus === null, a degraded read) we don't actually know the
+  // flag state, and the same degraded API likely returns no prose too —
+  // firing "flag set but no prose" there would be misleading telemetry.
   const proseAuthored = proseRes != null && hasProse(proseRes);
-  if (!proseAuthored) {
+  if (onboardingStatus?.completed_at != null && !proseAuthored) {
     Sentry.captureMessage('dashboard:onboarding_flag_set_but_no_prose', {
       level: 'warning',
     });

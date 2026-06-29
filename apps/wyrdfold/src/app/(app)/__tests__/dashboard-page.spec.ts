@@ -53,14 +53,23 @@ describe('WyrdfoldDashboard route', () => {
     expect(mockSentryCapture).not.toHaveBeenCalled();
   });
 
-  it('redirects to /onboarding when the onboarding endpoint returns null', async () => {
-    // Degraded API (auth failure, network blip). Safer default is to
-    // route to /onboarding than render a broken empty dashboard.
-    mockFetch.mockResolvedValueOnce(null);
+  it('does NOT redirect when the onboarding read fails (null) — fails open', async () => {
+    // A null *result* means the read itself failed (degraded API: auth
+    // refresh race, network blip, upstream 5xx) — NOT "never onboarded".
+    // The old behaviour redirected here, which bounced an already-
+    // onboarded user into a loop on a single flaky read. We now fail open
+    // and let the dashboard render its own graceful empty/setup states.
+    mockFetch
+      .mockResolvedValueOnce(null) // onboarding status read failed
+      // Promise.all fallthrough: jobs, prose, targets, counts
+      .mockResolvedValueOnce({ postings: [], total: 0, page: 1, page_size: 5 })
+      .mockResolvedValueOnce({ prose: null })
+      .mockResolvedValue({ targets: [], postings: [], total: 0 });
 
-    await expect(WyrdfoldDashboard()).rejects.toThrow('REDIRECT:/onboarding');
+    const result = await WyrdfoldDashboard();
 
-    expect(mockRedirect).toHaveBeenCalledWith('/onboarding');
+    expect(mockRedirect).not.toHaveBeenCalled();
+    expect(result).toBeDefined();
   });
 
   it('renders the empty-state dashboard + emits Sentry warning when flag is set but prose is missing', async () => {
