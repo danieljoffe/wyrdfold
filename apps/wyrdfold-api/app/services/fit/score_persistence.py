@@ -63,6 +63,36 @@ async def score_with_phase2_and_persist(
     UI should pass the requesting user's id so per-user spend audits
     work.
     """
+    # An empty/whitespace JD has nothing to grade — a grade against it is pure
+    # garbage. Drop the job from this target's results instead of spending an
+    # LLM call on it or leaving it to retry every cycle: exclude the row and
+    # mark it terminal at the current profile version, so `_needs_phase2` won't
+    # re-admit it. A later re-poll that fills the JD re-scores the row to
+    # `stage2` and re-admits it for a real grade. (#47)
+    if not jd_text.strip():
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("scores")
+                .update(
+                    {
+                        "excluded": True,
+                        "scoring_status": "complete",
+                        "scored_profile_version": target.profile_version,
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                .eq("job_posting_id", job_posting_id)
+                .eq("target_id", target.id)
+                .execute()
+            )
+        except Exception:
+            logger.exception(
+                "Phase 2 empty-JD drop failed for job %s / target %s",
+                job_posting_id,
+                target.id,
+            )
+        return None
+
     try:
         fit, llm_result = await derive_job_fit(
             llm,
