@@ -173,6 +173,18 @@ class Settings(BaseSettings):
     # flag is a pure sort change, safe to flip per-deploy.
     recency_decay_enabled: bool = False
 
+    # Periodic full recency-score sweep (#5). The poller's per-cycle refresh
+    # only re-derives ``recency_score`` for jobs it re-fetched that tick, so a
+    # posting that ages off the boards freezes at its last-refresh decay while
+    # its true age keeps climbing — the list sort key goes stale relative to
+    # the read-time displayed decay. When enabled, the scheduler ticks every
+    # ``recency_refresh_tick_hours`` and rewrites ``recency_score`` for ALL
+    # live (non-excluded) score rows from the current date, keeping the stored
+    # sort key consistent with what users see. Off by default; pairs with
+    # ``recency_decay_enabled`` (a no-op identity write when decay is off).
+    recency_refresh_enabled: bool = False
+    recency_refresh_tick_hours: int = Field(default=12, ge=1, le=720)
+
     # Phase 2 LLM job-fit grading (#6). When True the poller runs the
     # Sonnet-backed ``score_with_phase2_and_persist`` over promising
     # (Phase 1) jobs in place of the legacy Stage 3 keyword+LLM blend,
