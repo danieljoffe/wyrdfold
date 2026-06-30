@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from supabase import Client
 
+from app.config import settings
 from app.models.ats_lint import LintResult
 from app.models.experience import OptimizedDoc, PreferencesPayload
 from app.models.llm import LLMResult
@@ -38,6 +39,11 @@ from app.services.experience.annotations import (
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.tailor import persistence
+from app.services.tailor.faithfulness import (
+    FAITHFULNESS_REVIEW_PURPOSE,
+    review_resume_faithfulness,
+    review_to_critique,
+)
 from app.services.tailor.markdown_render import (
     to_markdown,
     to_markdown_cover_letter,
@@ -103,30 +109,60 @@ async def run_tailor_pipeline(
     filtered_payload = apply_exclusions(optimized.payload, exclude)
     annotations_text = build_annotations_text(emphasize, de_emph)
 
-    resume, trace_warnings, llm_result = await tailor_resume(
-        llm,
-        optimized=filtered_payload,
-        job_description=job_description,
-        contact=contact,
-        resume_type=resume_type,
-        preferences_rules=(preferences.rules if preferences else None),
-        preferences_avoid=(preferences.avoid if preferences else None),
-        preferences_tone_notes=(preferences.tone_notes if preferences else None),
-        annotations_text=annotations_text,
-        critique=critique,
-        page_budget=page_budget,
-    )
+    async def _generate(
+        crit: str | None,
+    ) -> tuple[TailoredResume, list[str], LLMResult]:
+        """One generation pass + its cost-log. Reused for the corrective
+        regen so the review-pass doesn't duplicate the (long) call."""
+        gen_resume, gen_warnings, gen_result = await tailor_resume(
+            llm,
+            optimized=filtered_payload,
+            job_description=job_description,
+            contact=contact,
+            resume_type=resume_type,
+            preferences_rules=(preferences.rules if preferences else None),
+            preferences_avoid=(preferences.avoid if preferences else None),
+            preferences_tone_notes=(preferences.tone_notes if preferences else None),
+            annotations_text=annotations_text,
+            critique=crit,
+            page_budget=page_budget,
+        )
+        cost_log.record(
+            supabase,
+            user_id=user_id,
+            purpose=DEFAULT_PURPOSE,
+            result=gen_result,
+            metadata={
+                "optimized_doc_id": optimized.id,
+                "job_posting_id": job_posting_id or "",
+            },
+        )
+        return gen_resume, gen_warnings, gen_result
 
-    cost_log.record(
-        supabase,
-        user_id=user_id,
-        purpose=DEFAULT_PURPOSE,
-        result=llm_result,
-        metadata={
-            "optimized_doc_id": optimized.id,
-            "job_posting_id": job_posting_id or "",
-        },
-    )
+    resume, trace_warnings, llm_result = await _generate(critique)
+
+    # Faithfulness review pass (#6b). Flag claims the source doesn't support;
+    # on medium/high-severity flags, regenerate ONCE with the flags folded into
+    # the critique. The corrective run is NOT re-reviewed — a single
+    # generate -> review -> fix cycle, never a loop.
+    if settings.faithfulness_review_enabled:
+        review, review_result = await review_resume_faithfulness(
+            llm, resume=resume, optimized=filtered_payload
+        )
+        cost_log.record(
+            supabase,
+            user_id=user_id,
+            purpose=FAITHFULNESS_REVIEW_PURPOSE,
+            result=review_result,
+            metadata={
+                "optimized_doc_id": optimized.id,
+                "job_posting_id": job_posting_id or "",
+            },
+        )
+        fix_critique = review_to_critique(review)
+        if fix_critique is not None:
+            combined = "\n\n".join(c for c in (critique, fix_critique) if c)
+            resume, trace_warnings, llm_result = await _generate(combined)
 
     payload_md = to_markdown(resume)
     md_lint = lint_markdown(payload_md, document_type="resume")
