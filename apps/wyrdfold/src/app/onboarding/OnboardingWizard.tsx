@@ -51,10 +51,43 @@ const STEPS_BY_PATH: Record<OnboardingPath, Step[]> = {
   C: ['path-chooser', 'identity', 'conversation', 'pick-targets', 'completion'],
 };
 
-export default function OnboardingWizard() {
+/**
+ * Resolve where to start the wizard. A returning user who dropped out
+ * mid-flow resumes at their persisted ``current_step`` (#85); anything
+ * missing, inconsistent (a step that isn't part of the chosen path), or the
+ * initial ``path-chooser`` falls back to a clean start.
+ */
+function resolveResume(
+  initialPath: OnboardingPath | null | undefined,
+  initialStep: string | null | undefined
+): { path: OnboardingPath | null; step: Step } {
+  if (
+    initialPath &&
+    initialStep &&
+    initialStep !== 'path-chooser' &&
+    (STEPS_BY_PATH[initialPath] as string[]).includes(initialStep)
+  ) {
+    return { path: initialPath, step: initialStep as Step };
+  }
+  return { path: null, step: 'path-chooser' };
+}
+
+export default function OnboardingWizard({
+  initialPath = null,
+  initialStep = null,
+}: {
+  /** Persisted onboarding path, fetched server-side. Resumes the wizard. */
+  initialPath?: OnboardingPath | null;
+  /** Persisted ``current_step``; resumes here when valid for the path. */
+  initialStep?: string | null;
+} = {}) {
   const router = useRouter();
-  const [currentStep, setCurrentStep] = useState<Step>('path-chooser');
-  const [selectedPath, setSelectedPath] = useState<OnboardingPath | null>(null);
+  const [currentStep, setCurrentStep] = useState<Step>(
+    () => resolveResume(initialPath, initialStep).step
+  );
+  const [selectedPath, setSelectedPath] = useState<OnboardingPath | null>(
+    () => resolveResume(initialPath, initialStep).path
+  );
   const [jobData, setJobData] = useState<JobData | null>(null);
   const [skipping, setSkipping] = useState(false);
   const [skipFailed, setSkipFailed] = useState(false);
@@ -68,6 +101,25 @@ export default function OnboardingWizard() {
   useEffect(() => {
     stepRef.current?.focus();
   }, [currentStep]);
+
+  // Persist progress so a drop-out resumes where they left off (#85).
+  // Best-effort + fire-and-forget — it's progress tracking, never blocks the
+  // wizard, and a failed write just means resuming from a slightly earlier
+  // step. Skips the initial mount (the resumed/initial state is already
+  // persisted) and the path-chooser (nothing to persist before a path).
+  const didPersistMount = useRef(false);
+  useEffect(() => {
+    if (!didPersistMount.current) {
+      didPersistMount.current = true;
+      return;
+    }
+    if (!selectedPath) return;
+    void fetch('/api/profile/onboarding/step', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: selectedPath, current_step: currentStep }),
+    }).catch(() => undefined);
+  }, [selectedPath, currentStep]);
 
   const goNext = useCallback(() => {
     if (!selectedPath) return;
