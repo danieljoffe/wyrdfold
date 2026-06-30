@@ -116,6 +116,7 @@ class MockLLMClient:
         purpose: str,
         max_tokens: int = 4096,
         cache_system: bool = False,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         """Mock structured-output. Scripted responses are parsed as JSON
         and returned as the tool input dict; echo mode returns a small
