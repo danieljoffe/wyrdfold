@@ -33,6 +33,7 @@ from app.models.llm import LLMResult, Message, ModelId
 from app.models.logistics import LogisticsFilters
 from app.models.targets import JobTarget
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from app.services.targets.suggest import _build_user_message as _profile_summary
 
 logger = logging.getLogger(__name__)
@@ -107,7 +108,10 @@ class JobFitResult(BaseModel):
         return value
 
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You grade how well a job posting fits a specific user pursuing a \
 specific target role. Return a 0-100 overall fit score plus per-axis \
 scores and a short reasoning string.
@@ -179,6 +183,7 @@ which is absent from your e-commerce/healthtech profile."
 }
 
 Return ONLY the JSON object. No prose, no markdown, no code fences."""
+)
 
 
 # Optional addendum appended to the system prompt when
@@ -285,11 +290,17 @@ def _split_user_message(
     parts.append("\n".join(target_lines))
 
     # Job posting (last — cache-unfriendly, varies per call). Kept out
-    # of the static prefix: it lands in the dynamic suffix below.
+    # of the static prefix: it lands in the dynamic suffix below. The
+    # title + JD are scraped, attacker-controllable text, so they go
+    # inside an untrusted fence (the system prompt tells the grader to
+    # analyze/quote but never obey instructions found there). The fence
+    # lives entirely in the dynamic suffix, so the cache split boundary
+    # (len(static_prefix)) is unchanged.
     jd_snippet = jd_text[:_JD_CONTEXT_CHAR_CAP]
     if len(jd_text) > _JD_CONTEXT_CHAR_CAP:
         jd_snippet += " [truncated]"
-    job_part = f"## Job posting\n**Title:** {job_title}\n\n{jd_snippet}"
+    job_block = f"**Title:** {job_title}\n\n{jd_snippet}"
+    job_part = "## Job posting\n" + wrap_untrusted(job_block, name="job_posting")
 
     return "\n\n".join(parts), f"\n\n{job_part}"
 

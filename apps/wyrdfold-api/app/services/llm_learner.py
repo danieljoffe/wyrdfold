@@ -39,6 +39,7 @@ from app.models.targets import ScoringProfile
 from app.services.feedback import _MIN_FEEDBACK_FOR_LEARN, _parse_row
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from app.services.targets.learning_projection import ScoredJobText, project_rescore
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,10 @@ DEFAULT_PURPOSE = "target.learn_from_feedback"
 
 LEARNING_LOG_TABLE = "target_learning_log"
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You are a job-search relevance learner. Given a user's scoring profile \
 for one of their target roles and a batch of relevance feedback signals \
 they have left on individual job postings, return a minimal ``ProfilePatch`` \
@@ -86,6 +90,7 @@ if the feedback batch has no learnable pattern. The system will stamp \
 the rows as consumed without mutating the profile, which is the correct \
 outcome for "everything was misclick".
 """
+)
 
 
 def _build_user_message(
@@ -95,11 +100,20 @@ def _build_user_message(
 ) -> Message:
     rows_payload: list[dict[str, Any]] = []
     for row in feedback:
+        # ``title`` (scraped) and ``reason`` (user-typed) are attacker-
+        # controllable and feed a patch to the SHARED scoring profile, so a
+        # malicious note here could poison every user on the target. Fence both
+        # values — json.dumps then escapes the JSON, and wrap_untrusted defangs
+        # any forged fence inside the value, so it stays inert data.
         rows_payload.append(
             {
                 "signal": row.signal,
-                "title": job_titles.get(row.job_posting_id, "?"),
-                "reason": row.reason or "",
+                "title": wrap_untrusted(
+                    job_titles.get(row.job_posting_id, "?"),
+                    name="feedback",
+                    block=False,
+                ),
+                "reason": wrap_untrusted(row.reason or "", name="feedback", block=False),
             }
         )
     body = {

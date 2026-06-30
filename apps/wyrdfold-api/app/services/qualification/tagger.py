@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from app.services.qualification.heuristics import (
     clean_description,
     is_us_location,
@@ -123,7 +124,10 @@ class QualificationTags(BaseModel):
 # The rules below are baked from a validated dry-run (#60). They are the
 # difference between a tagger that scores 60% and one that scores ~95% on the
 # hard cases, so they live in the SYSTEM prompt (stable, cacheable) verbatim.
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You are a job-posting classifier. Given ONE job posting (title, company, \
 location, and description) you return a single structured verdict describing \
 intrinsic, target-independent facts about the role. You are NOT judging fit for \
@@ -205,6 +209,7 @@ normal specific role.
 
 Be decisive. Use the provided heuristic hints as a prior, but TRUST THE \
 DESCRIPTION when it contradicts them."""
+)
 
 
 def _build_user_message(
@@ -222,14 +227,18 @@ def _build_user_message(
     caller.
     """
     l1_us = is_us_location(location)
+    # The four intrinsic fields are scraped, attacker-controllable text, so each
+    # goes inside an untrusted fence — the short ones inline, the description as
+    # a block. The L1 US guess is OUR computed prior (trusted), so it stays bare
+    # and the prompt keeps treating it as an overridable signal.
     lines = [
-        f"Title: {title}",
-        f"Company: {company or '(unknown)'}",
-        f"Location: {location or '(unstated)'}",
+        f"Title: {wrap_untrusted(title, name='title', block=False)}",
+        f"Company: {wrap_untrusted(company or '(unknown)', name='company', block=False)}",
+        f"Location: {wrap_untrusted(location or '(unstated)', name='location', block=False)}",
         f"Heuristic US guess (permissive prior, override if wrong): {l1_us}",
         "",
         "Description:",
-        description or "(no description provided)",
+        wrap_untrusted(description or "(no description provided)", name="description"),
     ]
     return "\n".join(lines)
 

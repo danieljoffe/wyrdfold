@@ -50,6 +50,7 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("cover_letter.system", "app.services.tailor.prompts:COVER_LETTER_SYSTEM"),
     ("resume_tailor.system", "app.services.tailor.prompts:TAILOR_SYSTEM"),
     ("qualification_tagger.system", "app.services.qualification.tagger:_SYSTEM_PROMPT"),
+    ("feedback_learner.system", "app.services.llm_learner:SYSTEM_PROMPT"),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
@@ -67,6 +68,7 @@ _SCALARS: tuple[tuple[str, str], ...] = (
     ("model.lateral_discovery", "app.services.targets.lateral_discovery:DEFAULT_MODEL"),
     ("model.target_fit_score", "app.services.targets.fit_score:DEFAULT_MODEL"),
     ("model.qualification_tagger", "app.services.qualification.tagger:QUALIFICATION_MODEL"),
+    ("model.feedback_learner", "app.services.llm_learner:DEFAULT_MODEL"),
     ("prompt_version.derive_target_from_jd", "app.services.targets.derive_profile:PROMPT_VERSION"),
 )
 
