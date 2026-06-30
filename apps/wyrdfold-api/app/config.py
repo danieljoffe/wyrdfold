@@ -165,6 +165,14 @@ class Settings(BaseSettings):
     # downstream keyword scoring.
     phase1_triage_enabled: bool = False
 
+    # Phase 1 admission gate on the model's own confidence (0-100). A
+    # ``promising`` verdict the model is only guessing at (confidence below
+    # this) is dropped — the confidence signal gates admission, not just
+    # Phase-2 ordering (#47). 40 drops only the prompt's "you're guessing"
+    # band (0-39); NULL-confidence (legacy / pre-confidence) verdicts are
+    # exempt and still admit, preserving the lean-promising default.
+    phase1_min_confidence: int = Field(default=40, ge=0, le=100)
+
     # Recency decay (#5). When True the /jobs list sorts/paginates by
     # ``scores.recency_score`` (the fit score decayed by posting age via
     # ``app/services/recency.py``) and the poller refreshes that column

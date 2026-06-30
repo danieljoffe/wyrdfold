@@ -31,6 +31,7 @@ from app.services.relevance.title_triage import (
     TitleTriageResponse,
     TitleVerdict,
     _build_user_message,
+    admitted,
     triage_titles,
 )
 
@@ -317,3 +318,26 @@ class TestCacheMarker:
 
         assert len(prefixes) == 2
         assert prefixes[0] == prefixes[1]
+
+
+# ---- admission gate (#47) ------------------------------------------------
+
+
+def test_admitted_gates_promising_below_confidence_floor() -> None:
+    # promising but guessing (< floor) is NOT admitted.
+    assert admitted(TitleVerdict(id=1, promising=True, confidence=30), min_confidence=40) is False
+    # promising at/above the floor admits.
+    assert admitted(TitleVerdict(id=1, promising=True, confidence=40), min_confidence=40) is True
+    assert admitted(TitleVerdict(id=1, promising=True, confidence=95), min_confidence=40) is True
+
+
+def test_admitted_is_fail_open_for_missing_or_legacy_verdicts() -> None:
+    # No verdict at all → admit (fail-open, matches the pre-gate default).
+    assert admitted(None, min_confidence=40) is True
+    # Pre-confidence (NULL confidence) verdict → admit regardless of the floor.
+    assert admitted(TitleVerdict(id=1, promising=True, confidence=None), min_confidence=40) is True
+
+
+def test_admitted_rejects_unpromising_regardless_of_confidence() -> None:
+    assert admitted(TitleVerdict(id=1, promising=False, confidence=95), min_confidence=40) is False
+    assert admitted(TitleVerdict(id=1, promising=False, confidence=10), min_confidence=40) is False

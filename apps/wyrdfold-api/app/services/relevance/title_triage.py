@@ -164,6 +164,28 @@ class TitleTriageResponse(BaseModel):
     verdicts: list[TitleVerdict] = Field(default_factory=list)
 
 
+def admitted(verdict: TitleVerdict | None, *, min_confidence: int) -> bool:
+    """Phase-1 admission decision: promising AND confident enough.
+
+    A ``promising`` verdict the model is only guessing at (confidence below
+    ``min_confidence``) is NOT admitted — the confidence signal gates
+    admission, not just Phase-2 ordering (#47). Fail-open like the rest of
+    Phase 1: a missing verdict (None) or a pre-confidence verdict (NULL
+    confidence) admits, preserving the lean-promising default.
+
+    Returning ``False`` makes the persisted ``promising`` column False, which
+    both excludes the row (``excluded_by_prefilter``) and makes
+    ``_needs_phase2`` skip it — so a low-confidence guess costs no deep grade.
+    """
+    if verdict is None:
+        return True
+    if not verdict.promising:
+        return False
+    if verdict.confidence is None:
+        return True
+    return verdict.confidence >= min_confidence
+
+
 def _split_user_message(target: JobTarget, titles: list[str]) -> tuple[str, str]:
     """Compose the per-call user message as ``(static_prefix, dynamic_suffix)``.
 
