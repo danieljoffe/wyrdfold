@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import settings
+from app.models.targets import AxisWeights
 from app.routers.jobs import (
     _apply_display_recency,
     _list_jobs_across_user_targets,
@@ -225,8 +226,11 @@ def test_target_two_query_orders_by_recency_when_enabled(
     """A high-fit but stale job sorts BELOW a fresher, lower-fit job once
     decay is on — the visible (raw) score still rides along."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
-    # Rows arrive pre-ordered by recency_score desc (what the .order() on
-    # recency_score produces server-side): fresh-70 ranks above stale-95.
+    # The sort now keys on the score each row DISPLAYS — read-time decay from
+    # ``first_seen_at`` (#47), not the stored ``recency_score``: fresh-70 (no
+    # decay) outranks stale-95 (decays to ~66 at 27 days).
+    fresh = datetime.now(UTC).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
     ts_rows = [
         {"job_posting_id": "j-fresh", "score": 70, "recency_score": 70,
          "score_breakdown": {}, "scoring_status": "complete"},
@@ -234,8 +238,8 @@ def test_target_two_query_orders_by_recency_when_enabled(
          "score_breakdown": {}, "scoring_status": "complete"},
     ]
     postings_storage_order = [
-        {"id": "j-stale", "title": "stale high-fit"},
-        {"id": "j-fresh", "title": "fresh"},
+        {"id": "j-stale", "title": "stale high-fit", "first_seen_at": old},
+        {"id": "j-fresh", "title": "fresh", "first_seen_at": fresh},
     ]
     sb = _list_supabase(
         {
@@ -271,7 +275,10 @@ def test_across_targets_orders_by_recency_when_enabled(
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     # Location filter active → forces the Python sort path (not the
-    # scores-layer slice), exercising the _sort_key recency branch.
+    # scores-layer slice), exercising the _sort_key display-value branch.
+    # The sort keys on read-time display decay (#47): fresh-70 > stale-95→66.
+    fresh = datetime.now(UTC).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
     score_rows = [
         {"job_posting_id": "j-fresh", "target_id": "t-1", "score": 70,
          "recency_score": 70, "score_breakdown": {}, "scoring_status": "complete"},
@@ -279,8 +286,8 @@ def test_across_targets_orders_by_recency_when_enabled(
          "recency_score": 48, "score_breakdown": {}, "scoring_status": "complete"},
     ]
     postings = [
-        {"id": "j-stale", "title": "stale", "location": "Remote · US"},
-        {"id": "j-fresh", "title": "fresh", "location": "Remote · US"},
+        {"id": "j-stale", "title": "stale", "location": "Remote · US", "first_seen_at": old},
+        {"id": "j-fresh", "title": "fresh", "location": "Remote · US", "first_seen_at": fresh},
     ]
     sb = _list_supabase(
         {"scores": _ListResp(score_rows), "jobs": _ListResp(postings)}
@@ -303,6 +310,61 @@ def test_across_targets_orders_by_recency_when_enabled(
 
     assert [p["id"] for p in result["postings"]] == ["j-fresh", "j-stale"]
     assert [p["score"] for p in result["postings"]] == [70, 95]
+
+
+def test_two_query_sorts_by_weighted_display_not_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With custom axis weights, the list sorts by the WEIGHTED score the user
+    sees — not the raw fit (#47). A lower-raw job whose weighted score is higher
+    ranks first. (Decay off to isolate the weighting effect.)"""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    ts_rows = [
+        {"job_posting_id": "j-weighted-high", "score": 60,
+         "axis_scores": {"title_fit": 95, "skills_fit": 95,
+                         "seniority_fit": 20, "domain_fit": 20},
+         "score_breakdown": {}, "scoring_status": "complete"},
+        {"job_posting_id": "j-raw-high", "score": 90,
+         "axis_scores": {"title_fit": 20, "skills_fit": 20,
+                         "seniority_fit": 95, "domain_fit": 95},
+         "score_breakdown": {}, "scoring_status": "complete"},
+    ]
+    # Storage order is the inverse of the weighted order, so a passthrough
+    # (raw) sort would leave j-raw-high on top — the bug this guards.
+    postings = [
+        {"id": "j-raw-high", "title": "raw 90"},
+        {"id": "j-weighted-high", "title": "raw 60"},
+    ]
+    sb = _list_supabase(
+        {"scores": _ListResp(ts_rows, count=2), "jobs": _ListResp(postings)}
+    )
+    weights = AxisWeights(
+        title_fit=0.5, skills_fit=0.5, seniority_fit=0.0, domain_fit=0.0
+    )
+
+    result = _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        cursor={},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        axis_weights=weights,
+    )
+
+    # Weighted display ~95 (title+skills) beats ~20, so the raw-60 job ranks
+    # first despite the other's raw 90 — order follows the visible number.
+    assert [p["id"] for p in result["postings"]] == [
+        "j-weighted-high",
+        "j-raw-high",
+    ]
+    assert result["postings"][0]["score"] > result["postings"][1]["score"]
 
 
 # ---- display_recency_score (read-time decay) -------------------------------
