@@ -18,6 +18,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import ApiKeysCard from './ApiKeysCard';
 import DataExportCard from './DataExportCard';
+import DeleteAccountCard from './DeleteAccountCard';
 import LlmUsageCard from './LlmUsageCard';
 import OnboardingResetCard from './OnboardingResetCard';
 import { ResumeStylePreview } from './ResumeStylePreview';
@@ -636,6 +637,8 @@ export default function SettingsPage() {
       <DataExportCard />
 
       <OnboardingResetCard />
+
+      <DeleteAccountCard />
     </div>
   );
 }

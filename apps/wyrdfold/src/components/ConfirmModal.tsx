@@ -21,6 +21,12 @@ interface ConfirmModalProps {
   loading?: boolean;
   /** Label shown beside the spinner while loading (e.g. "Deleting…"). */
   loadingLabel?: string;
+  /**
+   * Disable the confirm button only (cancel stays enabled). Use to gate an
+   * irreversible action behind a typed confirmation — the caller renders the
+   * input in ``message`` and passes ``confirmDisabled`` until it matches.
+   */
+  confirmDisabled?: boolean;
   /** Base name for the rendered buttons (stable a11y/test hooks). */
   name?: string;
 }
@@ -44,6 +50,7 @@ export default function ConfirmModal({
   destructive = false,
   loading = false,
   loadingLabel,
+  confirmDisabled = false,
   name = 'confirm-modal',
 }: ConfirmModalProps) {
   return (
@@ -69,7 +76,7 @@ export default function ConfirmModal({
             variant={destructive ? 'error' : 'primary'}
             size='sm'
             onClick={() => void onConfirm()}
-            disabled={loading}
+            disabled={loading || confirmDisabled}
             aria-busy={loading}
           >
             {loading ? (
