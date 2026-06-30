@@ -184,13 +184,7 @@ export interface MatchedSuggestions {
 /** Seniority bands the lateral-suggestion miner returns. Mirrors the API's
  * `SeniorityHint` enum (services/targets/lateral_discovery.py). */
 export type SeniorityHint =
-  | 'ic'
-  | 'senior'
-  | 'staff'
-  | 'manager'
-  | 'director'
-  | 'vp'
-  | 'c_level';
+  'ic' | 'senior' | 'staff' | 'manager' | 'director' | 'vp' | 'c_level';
 
 /** One adjacent ("lateral") target the user is competitive for, mined from
  * the targets they ALREADY pursue. Shape mirrors the API's `LateralSuggestion`
@@ -216,4 +210,58 @@ export function emptyScoringProfile(): ScoringProfile {
     domain: { signals: [], weight: 0.5 },
     negative: { keywords: [], weight: -10 },
   };
+}
+
+// ---- Feedback learning loop (#79) -----------------------------------------
+// Mirrors app/models/learning.py. The LLM learner turns a user's
+// relevant/irrelevant signals into a `ProfilePatch`; high-confidence patches
+// auto-apply, the rest stage for human review here.
+
+export type LearningStatus = 'applied' | 'staged' | 'rejected';
+
+/** The LLM-emitted diff against a scoring profile (the learning-log `diff`). */
+export interface ProfilePatchDiff {
+  add_negative: string[];
+  remove_negative: string[];
+  /** keyword -> weight (1-3) added to secondary_skills. */
+  add_secondary: Record<string, number>;
+  demote_keywords: string[];
+  confidence: number; // 0-1
+  rationale: string;
+}
+
+/** How much a patch would move the target's existing scores (#5 P4). */
+export interface RescoreProjection {
+  jobs_considered: number;
+  jobs_moved: number;
+  moved_fraction: number; // 0-1
+  max_abs_delta: number;
+  move_threshold: number;
+  max_moved_fraction: number;
+  capped: boolean;
+}
+
+/** One `target_learning_log` row as the API returns it. */
+export interface TargetLearningLogRow {
+  id: string;
+  user_id: string;
+  target_id: string;
+  status: LearningStatus;
+  prev_profile: Partial<ScoringProfile>;
+  next_profile: Partial<ScoringProfile>;
+  diff: Partial<ProfilePatchDiff>;
+  confidence: number;
+  rationale: string | null;
+  signals_consumed: number;
+  applied_run_id: string | null;
+  projection: RescoreProjection | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Return shape for learn-llm and the apply/reject endpoints. */
+export interface LearningRunResult {
+  log: TargetLearningLogRow;
+  applied: boolean;
+  profile_version_after: number | null;
 }
