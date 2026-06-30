@@ -151,6 +151,12 @@ def _seeded() -> _FakeSupabase:
         "user_targets": [{"user_id": _UID}],
         "job_feedback": [{"user_id": _UID}],
         "user_api_keys": [{"user_id": _UID, "provider": "openrouter"}],
+        "contribution_votes": [{"user_id": _UID, "reference_jd_id": "rj1"}],
+        # Shared collective content: anonymized (user link nulled), not deleted.
+        "reference_jds": [
+            {"id": "rj1", "user_id": _UID, "jd_text": "JD A"},
+            {"id": "rj2", "user_id": "other", "jd_text": "someone else's JD"},
+        ],
         "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
         "notifications_sent": [
             {"user_profile_id": _PROFILE_ID},
@@ -169,6 +175,26 @@ def _seeded() -> _FakeSupabase:
 
 
 # ---- service ----------------------------------------------------------
+
+
+def test_reference_jds_anonymized_and_votes_deleted() -> None:
+    """Erasure deletes the user's anonymous votes, and nulls the user link on
+    their shared reference-JD contributions (collective content) rather than
+    deleting the rows — never touching another contributor's JDs (#29)."""
+    sb = _seeded()
+    report = account_deletion.delete_account(sb, user_id=_UID)
+
+    # Votes deleted; reference_jds anonymized via UPDATE, never DELETE.
+    assert ("delete", "contribution_votes", {"user_id": _UID}) in sb.log
+    assert ("update", "reference_jds", {"user_id": _UID}) in sb.log
+    deleted_tables = {table for op, table, _ in sb.log if op == "delete"}
+    assert "reference_jds" not in deleted_tables
+
+    rows = {r["id"]: r for r in sb.tables["reference_jds"]}
+    assert rows["rj1"]["user_id"] is None  # personal link removed
+    assert rows["rj1"]["jd_text"] == "JD A"  # shared content kept
+    assert rows["rj2"]["user_id"] == "other"  # other contributor untouched
+    assert report["reference_jds_anonymized"] == 1
 
 
 def test_deletes_every_per_user_table_by_user_id() -> None:

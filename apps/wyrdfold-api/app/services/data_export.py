@@ -39,9 +39,11 @@ from app.services.tailor import persistence as tailored_storage
 
 logger = logging.getLogger(__name__)
 
-# Per-user tables exported with SELECT *, keyed by ``user_id``. Mirrors
-# account_deletion._USER_ID_TABLES (a lockstep test guards drift) so the
-# export and the erasure cascade always cover the same rows.
+# Per-user tables exported with SELECT *, keyed by ``user_id``. Covers both
+# the deletion inventory (account_deletion._USER_ID_TABLES) and the rows
+# anonymized on erasure (._ANONYMIZED_TABLES) — the user still owns those
+# (their contributions) for right-to-access. A lockstep test guards drift so
+# export and erasure always cover the same user-owned rows.
 _EXPORT_TABLES: tuple[str, ...] = (
     "documents",
     "uploaded_resumes",
@@ -58,6 +60,8 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "status_log",
     "user_targets",
     "user_api_keys",
+    "contribution_votes",  # deleted on erasure
+    "reference_jds",  # anonymized on erasure (the user's shared contributions)
 )
 
 # user_api_keys is exported through this projection only — never the
