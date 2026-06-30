@@ -87,13 +87,15 @@ def test_grouped_uses_rpc_result() -> None:
             {"status": "applied", "count": 5},
         ]
     )
+    # Unfloored counts take the keyset RPC fast path. (A min_score floor instead
+    # routes to the Pending-aware Python path — see test_jobs_pending_floor.) #47
     counts = _pipeline_counts_grouped(
-        sb, target_ids={"t1"}, min_score=70, user_id="u1"
+        sb, target_ids={"t1"}, min_score=None, user_id="u1"
     )
     assert counts == {"new": 12, "applied": 5}
     sb.rpc.assert_called_once_with(
         "pipeline_counts",
-        {"p_target_ids": ["t1"], "p_min_score": 70, "p_user_id": "u1"},
+        {"p_target_ids": ["t1"], "p_min_score": None, "p_user_id": "u1"},
     )
 
 

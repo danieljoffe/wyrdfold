@@ -220,20 +220,21 @@ def _rpc_supabase(rows: list[dict[str, Any]], captured: dict[str, Any]) -> Magic
     return sb
 
 
-def test_rpc_keyset_emits_cursor_and_trims_extra_row(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Pin recency decay OFF: the RPC keyset path is intentionally skipped (it
-    # raises) when RECENCY_DECAY_ENABLED is on, since recency sort is handled
-    # in the two-query path. .env.local sets it on, so pin it for determinism.
-    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+# The RPC keyset path now serves NON-score sorts only: score sort routes to
+# the two-query path for Pending-below-graded bucketing, and a min_score floor
+# routes there for Pending exemption (#47). These pin the keyset emit/trim/
+# consume mechanics on a sort the RPC still handles (created_at).
+def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     # page_size+1 rows come back → there's a next page; the extra row is
-    # dropped and the cursor is the last KEPT row's (score, id).
-    rows = [{"id": f"j{i}", "score": 100 - i} for i in range(3)]  # 3 = 2 + 1
+    # dropped and the cursor is the last KEPT row's (sort_value, id).
+    rows = [
+        {"id": f"j{i}", "score": 100 - i, "created_at": f"2026-06-{30 - i:02d}"}
+        for i in range(3)  # 3 = 2 + 1
+    ]
     captured: dict[str, Any] = {}
     sb = _rpc_supabase(rows, captured)
     result = _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
         min_score=None, status=None, company=None, search=None,
         exclude_terms=[], only_terms=[], cursor={},
     )
@@ -241,39 +242,48 @@ def test_rpc_keyset_emits_cursor_and_trims_extra_row(
     assert captured["params"]["p_after_value"] is None  # first page
     assert captured["params"]["p_after_id"] is None
     assert [p["id"] for p in result["postings"]] == ["j0", "j1"]  # extra trimmed
-    assert _decode_cursor(result["next_cursor"]) == {"v": 99, "id": "j1"}
+    assert _decode_cursor(result["next_cursor"]) == {"v": "2026-06-29", "id": "j1"}
     assert result["total"] is None  # no COUNT on the keyset path
 
 
-def test_rpc_keyset_last_page_has_no_cursor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # See note above — the RPC keyset path requires recency decay off.
-    monkeypatch.setattr(settings, "recency_decay_enabled", False)
-    rows = [{"id": "j0", "score": 100}, {"id": "j1", "score": 99}]  # exactly page_size
+def test_rpc_keyset_last_page_has_no_cursor() -> None:
+    rows = [
+        {"id": "j0", "score": 100, "created_at": "2026-06-30"},
+        {"id": "j1", "score": 99, "created_at": "2026-06-29"},  # exactly page_size
+    ]
     sb = _rpc_supabase(rows, {})
     result = _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
         min_score=None, status=None, company=None, search=None,
         exclude_terms=[], only_terms=[], cursor={},
     )
     assert result["next_cursor"] is None
 
 
-def test_rpc_keyset_consumes_incoming_cursor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # See note above — the RPC keyset path requires recency decay off.
-    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+def test_rpc_keyset_consumes_incoming_cursor() -> None:
     captured: dict[str, Any] = {}
     sb = _rpc_supabase([], captured)
     _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="score", ascending=False,
+        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
         min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={"v": 90, "id": "j-x"},
+        exclude_terms=[], only_terms=[], cursor={"v": "2026-06-20", "id": "j-x"},
     )
-    assert captured["params"]["p_after_value"] == "90"  # stringified for the RPC
+    assert captured["params"]["p_after_value"] == "2026-06-20"  # passed through
     assert captured["params"]["p_after_id"] == "j-x"
+
+
+def test_rpc_skips_score_sort_and_floored_queries() -> None:
+    # Score sort (Pending bucketing) and any min_score floor (Pending exemption)
+    # are handled in the two-query path; the RPC raises so the dispatcher falls
+    # back. (#47)
+    sb = _rpc_supabase([], {})
+    for extra in ({"sort": "score", "min_score": None}, {"sort": "created_at", "min_score": 70}):
+        with pytest.raises(RuntimeError):
+            _list_jobs_for_target_rpc(
+                sb, target_id="t-1", page_size=2, ascending=False,
+                status=None, company=None, search=None,
+                exclude_terms=[], only_terms=[], cursor={}, **extra,
+            )
 
 
 def test_two_query_offset_cursor_advances_when_more_rows() -> None:

@@ -31,4 +31,18 @@ describe('ScoreBadge', () => {
     rerender(<ScoreBadge score={50} />);
     expect(screen.queryByLabelText(/scoring in progress/i)).toBeNull();
   });
+
+  it('hides the placeholder number while ungraded, showing a pending chip', () => {
+    // stage1/stage2 carry only a keyword placeholder — it must NOT be shown as
+    // a graded fit score (#47).
+    render(<ScoreBadge score={80} scoringStatus='stage2' />);
+    expect(screen.queryByText('80')).toBeNull();
+    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+  });
+
+  it('shows the real number once graded (complete)', () => {
+    render(<ScoreBadge score={80} scoringStatus='complete' />);
+    expect(screen.getByText('80')).toBeInTheDocument();
+    expect(screen.getByLabelText('Match score 80')).toBeInTheDocument();
+  });
 });
