@@ -345,15 +345,35 @@ def _seniority_tier_penalty(
     return _TIER_PENALTY_PER_DELTA * abs(delta + 1)
 
 
+# A lone single-word title match (often a generic function word like
+# "engineer"/"manager"/"developer") is an ambiguous intent signal — "engineer"
+# hits "Sales Engineer" just as it hits "Frontend Engineer". It earns this
+# fraction of the full role-title credit so an incidental hit no longer scores
+# like a bullseye (#47); a multi-word role-title match (which pins the
+# discipline) earns the full credit.
+_SINGLE_WORD_TITLE_CREDIT = 0.5
+
+
+def _title_match_specificity(matched: list[str]) -> float:
+    """How strong the best title match is, as a fraction of full credit.
+
+    Stacking matches doesn't multiply (intent is captured by *any* match), but
+    a multi-word role-title match is a far stronger signal than a lone generic
+    word, so the two are no longer scored identically (#47)."""
+    best_words = max((len(kw.split()) for kw in matched), default=0)
+    return 1.0 if best_words >= 2 else _SINGLE_WORD_TITLE_CREDIT
+
+
 def _score_role_titles(
     search_keywords: list[str] | None, title_lower: str
 ) -> tuple[float, list[str]]:
     """Score the target's role-intent keywords against the job title.
 
-    Returns ``(points, matched_keywords)``. Credit is binary: any number
-    of matches earns a single fixed credit. Stacking matches (e.g. a
-    title that hits three near-synonym variants) does not multiply the
-    score — the user's intent is captured by *any* match.
+    Returns ``(points, matched_keywords)``. Credit is GRADED by match
+    specificity (#47): a multi-word role-title match earns the full
+    ``_ROLE_TITLE_WEIGHT * _TITLE_WEIGHT``; a lone single-word match earns a
+    fraction (``_SINGLE_WORD_TITLE_CREDIT``), so an incidental generic-word hit
+    ("engineer" in "Sales Engineer") no longer scores like a bullseye.
     """
     if not search_keywords:
         return 0.0, []
@@ -362,7 +382,8 @@ def _score_role_titles(
     ]
     if not matched:
         return 0.0, []
-    return _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT, matched
+    credit = _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT * _title_match_specificity(matched)
+    return credit, matched
 
 
 def _calc_max_possible(
