@@ -70,9 +70,20 @@ async def create_analysis(
         optimized.get_latest, supabase, user_id=user_id
     )
     if current_optimized is None:
+        # Structured detail (not a raw dev message) so the client renders a
+        # "set up your profile" empty state instead of leaking an internal
+        # endpoint path into the UI. The panel auto-fires this on load, so a
+        # profile-less user would otherwise see "…POST /experience/derive
+        # first." in red on every job they open (#105).
         raise HTTPException(
             status_code=404,
-            detail="No optimized doc found. Derive one via POST /experience/derive first.",
+            detail={
+                "code": "no_profile",
+                "message": (
+                    "Set up your experience profile to generate a "
+                    "job-fit analysis."
+                ),
+            },
         )
 
     # 2. Check cache — keyed on (job, target, optimized version)

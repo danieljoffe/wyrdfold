@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { ChevronDown, Maximize2, MoreVertical } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
@@ -133,6 +134,11 @@ export default function JobDetailPanel({
   );
   const [analyzingElapsedS, setAnalyzingElapsedS] = useState(0);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+  // ``no_profile`` (404) isn't an error — the user just hasn't built their
+  // experience profile yet. Tracked separately so we render a setup CTA
+  // instead of a red error + pointless retry, and so the auto-trigger below
+  // doesn't keep re-firing the (always-404) request. (#105)
+  const [needsProfile, setNeedsProfile] = useState(false);
   const [history, setHistory] = useState<StatusLogEntry[]>([]);
   const { toast } = useToast();
 
@@ -203,6 +209,7 @@ export default function JobDetailPanel({
     setAnalyzing(true);
     setAnalyzingStartedAt(Date.now());
     setAnalysisError(null);
+    setNeedsProfile(false);
     try {
       const res = await fetch(
         `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`,
@@ -226,6 +233,23 @@ export default function JobDetailPanel({
         // ``llm_budget_exceeded`` 429 — the latter previously fell
         // through to a generic "Analysis failed (429)" with no recovery
         // hint.
+        // 404 ``no_profile`` is a setup state, not a failure: the user
+        // hasn't built their experience profile. Render a CTA (below)
+        // rather than a red error + retry that can never succeed. (#105)
+        if (res.status === 404) {
+          let code: unknown;
+          try {
+            code = (
+              (await res.clone().json()) as { detail?: { code?: unknown } }
+            )?.detail?.code;
+          } catch {
+            code = undefined;
+          }
+          if (code === 'no_profile') {
+            setNeedsProfile(true);
+            return;
+          }
+        }
         const message = await extractApiError(res, 'Analysis failed');
         if (res.status === 422 && /no description/i.test(message)) {
           setAnalysisError(
@@ -247,10 +271,16 @@ export default function JobDetailPanel({
   // Cache hit returns instantly; cache miss runs the LLM exactly once
   // per (job, target, optimized version).
   useEffect(() => {
-    if (targetId && !analysis && !analyzing && !analysisError) {
+    if (
+      targetId &&
+      !analysis &&
+      !analyzing &&
+      !analysisError &&
+      !needsProfile
+    ) {
       runAnalysis();
     }
-  }, [targetId, analysis, analyzing, analysisError, runAnalysis]);
+  }, [targetId, analysis, analyzing, analysisError, needsProfile, runAnalysis]);
 
   async function handleDelete() {
     setDeleting(true);
@@ -520,6 +550,18 @@ export default function JobDetailPanel({
                 <div className='h-4 rounded-xs bg-surface-elevated animate-pulse motion-reduce:animate-none' />
                 <div className='h-4 rounded-xs bg-surface-elevated animate-pulse motion-reduce:animate-none' />
                 <div className='h-4 w-3/4 rounded-xs bg-surface-elevated animate-pulse motion-reduce:animate-none' />
+              </div>
+            ) : needsProfile ? (
+              <div className='space-y-2'>
+                <Text variant='body' className='text-text-secondary'>
+                  Set up your experience profile to see how you match this job.
+                </Text>
+                <Link
+                  href='/profile'
+                  className='inline-block text-sm font-medium underline underline-offset-2'
+                >
+                  Set up your profile →
+                </Link>
               </div>
             ) : (
               <div>
