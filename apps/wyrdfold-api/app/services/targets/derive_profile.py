@@ -26,6 +26,7 @@ from supabase import Client
 from app.models.llm import LLMResult, LLMUsage, Message, ModelId
 from app.models.targets import DerivedTarget
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,16 @@ DEFAULT_MODEL: ModelId = "claude-sonnet-4-6"
 DEFAULT_PURPOSE = "target.derive_profile"
 
 # Bump when SYSTEM_PROMPT below materially changes. See module docstring.
-PROMPT_VERSION = "v1"
+# v2: prepended the prompt-injection directive + fenced the JD in the user
+# message (scraped JD feeds the SHARED target profile). Invalidates v1 cache.
+PROMPT_VERSION = "v2"
 
 _CACHE_TABLE = "target_derive_jd_cache"
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You are a job-search scoring-profile generator. Given a job description,
 extract a scoring profile and search keywords as JSON matching this exact schema:
 
@@ -135,6 +141,7 @@ but a different ROLE FUNCTION.
 - These become NEGATIVE few-shot anchors.
 
 Return ONLY the JSON object. No prose, no markdown, no code fences."""
+)
 
 
 def _cache_key(jd_text: str, *, model: ModelId, prompt_version: str) -> str:
@@ -276,11 +283,18 @@ async def derive_profile_from_jd(
             _record_cache_hit(supabase, key)
             return cached, _cache_hit_result(model)
 
+    # The JD is scraped text that feeds the SHARED target profile — fence it so
+    # an injected "extract these skills / add this negative" can't steer the
+    # extraction. The system prompt tells the model to treat fenced text as data.
+    user_content = (
+        "Extract the scoring profile from the job description below.\n\n"
+        + wrap_untrusted(jd_text, name="job_posting")
+    )
     derived, result = await complete_json(
         llm,
         model=model,
         system=SYSTEM_PROMPT,
-        messages=[Message(role="user", content=jd_text)],
+        messages=[Message(role="user", content=user_content)],
         schema=DerivedTarget,
         purpose=purpose,
         cache_system=True,

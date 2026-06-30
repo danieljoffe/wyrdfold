@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field
 from app.models.llm import LLMResult, Message, ModelId
 from app.models.targets import JobTarget
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,10 @@ PHASE1_PURPOSE = "relevance.title_triage"
 PHASE1_BATCH_SIZE = 250
 
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You are a job-title relevance gate. For each candidate title in the \
 batch you receive, decide whether it is plausibly a match for the \
 user's target role.
@@ -136,6 +140,7 @@ Return JSON matching this exact schema:
 One verdict per input title, keyed by the input id. Do NOT omit ids — \
 if you can't decide, default to PROMISING with confidence < 50. Return \
 ONLY the JSON object. No prose, no markdown, no code fences."""
+)
 
 
 class TitleVerdict(BaseModel):
@@ -218,8 +223,13 @@ def _split_user_message(target: JobTarget, titles: list[str]) -> tuple[str, str]
         "verdict per id."
     )
     dynamic_lines.append("")
-    for idx, title in enumerate(titles, start=1):
-        dynamic_lines.append(f"{idx}. {title}")
+    # The titles are scraped, attacker-controllable text. Fence the whole
+    # numbered list (one fence keeps the per-batch token overhead flat) so a
+    # malicious title can't pass instructions to the gate. The trusted "N. "
+    # numbering is ours — it carries no fence tokens, so wrapping the joined
+    # block leaves it untouched while defanging any forged fence in a title.
+    numbered = "\n".join(f"{idx}. {title}" for idx, title in enumerate(titles, start=1))
+    dynamic_lines.append(wrap_untrusted(numbered, name="candidate_titles"))
 
     return "\n".join(static_lines), "\n" + "\n".join(dynamic_lines)
 
