@@ -20,6 +20,7 @@ import TargetDetailSkeleton from './TargetDetailSkeleton';
 import AxisWeightsEditor from './AxisWeightsEditor';
 import NotificationThresholdsEditor from './NotificationThresholdsEditor';
 import TargetPreferencesEditor from './TargetPreferencesEditor';
+import LearningLogPanel from './LearningLogPanel';
 
 interface TargetDetailProps {
   id: string;
@@ -240,6 +241,8 @@ export default function TargetDetail({ id }: TargetDetailProps) {
         referenceJDs={referenceJDs}
         onChanged={handleRefresh}
       />
+
+      <LearningLogPanel targetId={id} onProfileChanged={fetchTarget} />
     </div>
   );
 }
