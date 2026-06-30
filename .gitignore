@@ -72,7 +72,16 @@ audit/
 # commit it. Bring your own set; outputs are regenerated. See
 # apps/wyrdfold-api/README.md ("Evaluation").
 apps/wyrdfold-api/tests/fixtures/eval_set.json
+# #60 prescan calibration labels — built from real job data by
+# scripts/bootstrap_clean_labels.py; consumed by calibrate_prescan_threshold.py
+# at this path. Regenerate locally; never commit real data.
+apps/wyrdfold-api/tests/fixtures/prescan_clean_labels.json
 apps/wyrdfold-api/scripts/eval_results/
+
+# LLM usage / billing exports pulled from provider dashboards (OpenRouter,
+# Claude/Anthropic) for local cost analysis — real account data, never commit.
+claude_api_tokens_*.csv
+openrouter_activity_*.csv
 
 # Next.js
 .next
