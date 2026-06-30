@@ -53,6 +53,7 @@ from app.services.relevance.title_triage import (
     PHASE1_BATCH_SIZE,
     PHASE1_PURPOSE,
     TitleVerdict,
+    admitted,
     triage_titles,
 )
 from app.services.sanitize import sanitize_html
@@ -1323,9 +1324,13 @@ async def _poll_one_source(
                         ext_id = row_data.get("external_id", "")
                         phase1_idx = phase1_idx_by_external_id.get(ext_id)
                         verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
-                        # Fail-open: missing verdict = admit (matches the
-                        # pre-confidence rollout's `.get(idx, True)` default).
-                        promising = verdict.promising if verdict is not None else True
+                        # Gate admission on the model's confidence (#47): a
+                        # promising-but-guessing verdict (confidence below the
+                        # floor) is dropped. Fail-open unchanged — a missing or
+                        # NULL-confidence verdict still admits.
+                        promising = admitted(
+                            verdict, min_confidence=settings.phase1_min_confidence
+                        )
                         phase1_confidence = verdict.confidence if verdict is not None else None
                         stage2 = await _db_to_thread(
                             target_score_and_upsert,
@@ -2281,7 +2286,10 @@ async def _poll_one_source_for_target(
                     ext_id = row_data.get("external_id", "")
                     phase1_idx = phase1_idx_by_external_id.get(ext_id)
                     verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
-                    promising = verdict.promising if verdict is not None else True
+                    # Gate admission on confidence (#47) — see the other poll path.
+                    promising = admitted(
+                        verdict, min_confidence=settings.phase1_min_confidence
+                    )
                     phase1_confidence = verdict.confidence if verdict is not None else None
                     stage2 = await _db_to_thread(
                         target_score_and_upsert,
