@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -224,6 +225,51 @@ def _project_patch_impact(
     )
 
 
+def _core_skill_keywords(profile: dict[str, Any]) -> list[str]:
+    """The target's own ``core_skills`` keyword names from the scoring profile."""
+    cats = profile.get("categories") or {}
+    core = (cats.get("core_skills") or {}).get("keywords") or {}
+    return list(core) if isinstance(core, dict) else []
+
+
+def _strip_self_colliding_negatives(
+    patch: ProfilePatch,
+    *,
+    search_keywords: list[str],
+    core_skills: list[str],
+) -> tuple[ProfilePatch, list[str]]:
+    """Drop any ``add_negative`` that would hard-zero the target's OWN jobs (#47).
+
+    A negative keyword in a job title is a *hard exclude* (score → 0). The
+    learner's prompt says "don't add the user's own role title," but nothing
+    enforced it, so a mis-attributed negative (e.g. "success" learned from
+    "Customer Success" feedback) could nuke a whole slice of legitimate roles
+    that then never resurface. We apply the EXACT rule the negative matcher uses
+    (``scoring.py``: ``\\bkeyword\\b``): a candidate is self-colliding if, word-
+    boundary matched, it hits one of the target's own ``search_keywords`` or
+    ``core_skills``. Returns the cleaned patch + the dropped keywords (for the
+    audit log). Given the asymmetric "lost forever" downside, dropping a
+    borderline negative beats hard-zeroing real jobs — the learner can re-propose.
+    """
+    if not patch.add_negative:
+        return patch, []
+    protected = [s.lower() for s in (*search_keywords, *core_skills) if s]
+    if not protected:
+        return patch, []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for kw in patch.add_negative:
+        norm = kw.strip().lower()
+        pattern = re.compile(rf"\b{re.escape(norm)}\b") if norm else None
+        if pattern is not None and any(pattern.search(p) for p in protected):
+            dropped.append(kw)
+        else:
+            kept.append(kw)
+    if not dropped:
+        return patch, []
+    return patch.model_copy(update={"add_negative": kept}), dropped
+
+
 def _apply_patch_to_profile(
     profile: dict[str, Any], patch: ProfilePatch
 ) -> dict[str, Any]:
@@ -371,6 +417,34 @@ async def run_llm_learner(
     )
     enqueue_llm_cost(user_id, DEFAULT_PURPOSE, llm_result)
 
+    # Before anything else, drop any proposed negative that would hard-zero the
+    # target's OWN jobs (a negative matching its search keywords / core skills).
+    # The prompt asks the model not to, but it's a hard-exclude with a "lost
+    # forever" downside, so enforce it in code (#47).
+    search_keywords = cast(list[str], target_row.get("search_keywords") or [])
+    patch, dropped_negatives = _strip_self_colliding_negatives(
+        patch,
+        search_keywords=search_keywords,
+        core_skills=_core_skill_keywords(prev_profile),
+    )
+    if dropped_negatives:
+        logger.warning(
+            "LLM learner dropped self-colliding negative(s) %s for "
+            "(user=%s, target=%s) — they match the target's own search "
+            "keywords/core skills and would hard-zero legitimate jobs",
+            dropped_negatives,
+            user_id,
+            target_id,
+        )
+        patch = patch.model_copy(
+            update={
+                "rationale": (
+                    f"[dropped self-colliding negatives {dropped_negatives}] "
+                    + patch.rationale
+                )
+            }
+        )
+
     run_id = str(uuid.uuid4())
     feedback_ids = [r.id for r in feedback]
 
@@ -416,7 +490,7 @@ async def run_llm_learner(
     # target's recent scored jobs and stage it instead if it would churn an
     # outlier share of the list (the learning-rate cap, #5 P4). Off-loaded to
     # a thread: it fetches + deterministically re-scores up to N jobs.
-    search_keywords = cast(list[str] | None, target_row.get("search_keywords"))
+    # (``search_keywords`` was resolved above for the negative-collision guard.)
     projection = await asyncio.to_thread(
         _project_patch_impact,
         supabase,

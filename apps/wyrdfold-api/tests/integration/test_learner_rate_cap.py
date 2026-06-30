@@ -80,9 +80,14 @@ def seeded_target(
                 {
                     "external_id": f"p4-{tag}-{i}",
                     "source_id": source_id,
-                    "title": "Python Engineer",
+                    # "Contract" is a non-target title word the learner can
+                    # legitimately negative (it doesn't collide with the
+                    # target's own "python"/"python engineer" terms, #47) — so
+                    # the rate-cap test below can hard-exclude via the title
+                    # without tripping the self-collision guard.
+                    "title": "Contract Python Engineer",
                     "company_name": "P4 Co",
-                    "description_html": "<p>Senior python engineer; python, django.</p>",
+                    "description_html": "<p>Contract python engineer; python, django.</p>",
                 }
             )
             .execute()
@@ -147,9 +152,11 @@ async def test_outlier_patch_is_staged_not_applied(
     service_client: Client, seeded_target: tuple[str, str]
 ) -> None:
     uid, target_id = seeded_target
-    # Adding "python" as a negative hard-excludes every seeded job (title match).
+    # "contract" hard-excludes every seeded job (it's in each title) WITHOUT
+    # colliding with the target's own python terms, so it survives the
+    # self-collision guard and reaches the learning-rate cap (#47).
     patch_obj = ProfilePatch(
-        add_negative=["python"], confidence=0.95, rationale="all irrelevant"
+        add_negative=["contract"], confidence=0.95, rationale="all irrelevant"
     )
     with patch(
         "app.services.llm_learner.complete_json",
@@ -176,6 +183,39 @@ async def test_outlier_patch_is_staged_not_applied(
     assert log["status"] == "staged"
     assert log["projection"]["capped"] is True
     assert log["projection"]["jobs_moved"] == _N_JOBS
+
+
+@pytest.mark.asyncio
+async def test_self_colliding_negative_is_dropped_before_apply(
+    service_client: Client, seeded_target: tuple[str, str]
+) -> None:
+    uid, target_id = seeded_target
+    # "python" is the target's own core skill AND a token of its "python
+    # engineer" search keyword — adding it as a negative would hard-zero every
+    # legitimate job. The guard drops it before apply, so nothing self-harming
+    # lands on the shared profile (#47).
+    patch_obj = ProfilePatch(
+        add_negative=["python"], confidence=0.95, rationale="all irrelevant"
+    )
+    with patch(
+        "app.services.llm_learner.complete_json",
+        return_value=(patch_obj, _llm_result()),
+    ):
+        result = await run_llm_learner(
+            service_client, object(), user_id=uid, target_id=target_id  # type: ignore[arg-type]
+        )
+
+    assert result is not None
+    profile = (
+        service_client.table("targets")
+        .select("scoring_profile")
+        .eq("id", target_id)
+        .single()
+        .execute()
+        .data["scoring_profile"]
+    )
+    # The self-colliding negative never reached the shared profile.
+    assert profile["negative"]["keywords"] == []
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,13 @@ PROMPT_VERSION = "v2"
 
 _CACHE_TABLE = "target_derive_jd_cache"
 
+# Below this many non-whitespace chars a "JD" is almost certainly a failed
+# fetch (404 body, paywall stub, JS-rendered shell), not a real posting. The
+# LLM would hallucinate a profile from nothing AND — worse — it would be cached
+# by content hash and merged into the SHARED target, poisoning every future
+# score (#47). Guard before the cache lookup, the LLM call, and the cache write.
+MIN_JD_CHARS = 50
+
 SYSTEM_PROMPT = (
     UNTRUSTED_CONTENT_DIRECTIVE
     + "\n\n"
@@ -275,7 +282,20 @@ async def derive_profile_from_jd(
     like the pre-cache version: always calls the LLM.
 
     Returns (derived, result) so callers can log cost.
+
+    Raises ``ValueError`` when ``jd_text`` has fewer than ``MIN_JD_CHARS``
+    non-whitespace characters — deriving a profile from an empty/garbage JD
+    would hallucinate signal AND cache it into the shared target. The guard
+    runs before the cache lookup and the LLM call, so nothing is read or
+    written for a junk JD. Callers surface it (API → 422; the background
+    corpus-builder flips the target to ``error``).
     """
+    if len(jd_text.strip()) < MIN_JD_CHARS:
+        raise ValueError(
+            f"JD too short to derive a profile: {len(jd_text.strip())} "
+            f"non-whitespace chars (need >= {MIN_JD_CHARS})"
+        )
+
     if supabase is not None:
         key = _cache_key(jd_text, model=model, prompt_version=PROMPT_VERSION)
         cached = _get_cached(supabase, key)

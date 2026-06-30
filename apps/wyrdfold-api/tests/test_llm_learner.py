@@ -18,10 +18,82 @@ from app.models.learning import ProfilePatch, RescoreProjection
 from app.models.llm import LLMResult, LLMUsage
 from app.services.llm_learner import (
     _apply_patch_to_profile,
+    _core_skill_keywords,
+    _strip_self_colliding_negatives,
     apply_staged_patch,
     reject_staged_patch,
     run_llm_learner,
 )
+
+# ---- Self-colliding-negative guard (#47) ----------------------------------
+
+
+class TestStripSelfCollidingNegatives:
+    def _patch(self, negatives: list[str]) -> ProfilePatch:
+        return ProfilePatch(add_negative=negatives, confidence=0.9, rationale="r")
+
+    def test_drops_negative_matching_a_search_keyword(self) -> None:
+        # "success" learned from "Customer Success" feedback would hard-zero the
+        # user's own "customer success manager" roles.
+        cleaned, dropped = _strip_self_colliding_negatives(
+            self._patch(["success", "intern"]),
+            search_keywords=["customer success manager", "cx lead"],
+            core_skills=[],
+        )
+        assert dropped == ["success"]
+        assert cleaned.add_negative == ["intern"]  # the legit one survives
+
+    def test_drops_negative_matching_a_core_skill(self) -> None:
+        cleaned, dropped = _strip_self_colliding_negatives(
+            self._patch(["React"]),
+            search_keywords=[],
+            core_skills=["React", "TypeScript"],
+        )
+        assert dropped == ["React"]
+        assert cleaned.add_negative == []
+
+    def test_keeps_legit_negative_unrelated_to_own_terms(self) -> None:
+        patch = self._patch(["sales"])
+        cleaned, dropped = _strip_self_colliding_negatives(
+            patch, search_keywords=["frontend engineer"], core_skills=["React"]
+        )
+        assert dropped == []
+        assert cleaned is patch  # untouched, same object
+
+    def test_multiword_negative_phrase_not_word_matching_is_kept(self) -> None:
+        # `\bsales engineer\b` does not occur in "frontend engineer", so the
+        # phrase negative is safe and kept (mirrors the real matcher).
+        _, dropped = _strip_self_colliding_negatives(
+            self._patch(["sales engineer"]),
+            search_keywords=["frontend engineer"],
+            core_skills=[],
+        )
+        assert dropped == []
+
+    def test_collision_is_case_insensitive(self) -> None:
+        _, dropped = _strip_self_colliding_negatives(
+            self._patch(["SUCCESS"]),
+            search_keywords=["Customer Success"],
+            core_skills=[],
+        )
+        assert dropped == ["SUCCESS"]
+
+    def test_noop_when_no_negatives_or_no_protected_terms(self) -> None:
+        p1 = self._patch([])
+        assert _strip_self_colliding_negatives(p1, search_keywords=["x"], core_skills=[]) == (p1, [])
+        p2 = self._patch(["junior"])
+        assert _strip_self_colliding_negatives(p2, search_keywords=[], core_skills=[]) == (p2, [])
+
+
+class TestCoreSkillKeywords:
+    def test_extracts_core_skill_names(self) -> None:
+        profile = {"categories": {"core_skills": {"keywords": {"React": 3, "Go": 2}}}}
+        assert _core_skill_keywords(profile) == ["React", "Go"]
+
+    def test_missing_core_skills_returns_empty(self) -> None:
+        assert _core_skill_keywords({}) == []
+        assert _core_skill_keywords({"categories": {}}) == []
+
 
 # ---- Pure profile-patch arithmetic ----------------------------------------
 
