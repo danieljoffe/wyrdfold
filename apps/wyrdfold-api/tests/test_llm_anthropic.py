@@ -216,6 +216,7 @@ def _fake_tool_use_response(
     tool_input: dict[str, Any],
     input_tokens: int = 100,
     output_tokens: int = 50,
+    stop_reason: str = "tool_use",
 ) -> Any:
     """Build a mock response with a tool_use block matching the Anthropic SDK's shape."""
     tool_block = MagicMock()
@@ -229,7 +230,7 @@ def _fake_tool_use_response(
     response.usage.output_tokens = output_tokens
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = 0
-    response.stop_reason = "tool_use"
+    response.stop_reason = stop_reason
     return response
 
 
@@ -250,6 +251,29 @@ async def test_complete_tool_use_returns_input_dict() -> None:
     assert tool_input == payload
     # Cost-log inspection should still see the structured payload as content.
     assert result.content == '{"name": "Daniel", "value": 42}'
+
+
+async def test_complete_tool_use_raises_on_max_tokens_truncation() -> None:
+    """A forced tool call that stops at ``max_tokens`` truncated the tool input
+    mid-emission — fail loud so the caller's fallback engages instead of
+    persisting silently-incomplete structured data (#47)."""
+    client, _ = _client_with_mocked_sdk(
+        _fake_tool_use_response(
+            tool_name="return_Thing",
+            tool_input={"name": "Dan"},  # present, but cut off at the limit
+            stop_reason="max_tokens",
+        )
+    )
+    with pytest.raises(ValueError, match="truncated"):
+        await client.complete_tool_use(
+            model="claude-sonnet-4-6",
+            system="sys",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_Thing",
+            tool_description="Return a Thing.",
+            tool_input_schema={"type": "object"},
+            purpose="test",
+        )
 
 
 async def test_complete_tool_use_forces_tool_choice() -> None:
