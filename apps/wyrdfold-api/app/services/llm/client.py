@@ -81,8 +81,13 @@ class LLMClient(Protocol):
         purpose: str,
         max_tokens: int = 4096,
         cache_system: bool = False,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         """Run a completion that's forced to call a single tool.
+
+        ``temperature`` is forwarded to the model when set; ``None`` keeps the
+        provider default. Structured-output callers (via ``complete_json``)
+        pin it to 0 for reproducible grading/triage/derive.
 
         The API enforces ``input_schema`` server-side and returns the tool's
         input as a typed dict. This is the reliable path for structured
@@ -148,6 +153,7 @@ async def complete_json(
     purpose: str,
     max_tokens: int = 4096,
     cache_system: bool = False,
+    temperature: float = 0.0,
 ) -> tuple[T, LLMResult]:
     """Call the model with a single forced tool whose ``input_schema`` is
     derived from ``schema``. The API parses + validates the tool input
@@ -167,6 +173,7 @@ async def complete_json(
         purpose=purpose,
         max_tokens=max_tokens,
         cache_system=cache_system,
+        temperature=temperature,
     )
     parsed = schema.model_validate(raw_input)
     return parsed, result

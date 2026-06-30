@@ -207,11 +207,15 @@ class AnthropicLLMClient:
         purpose: str,
         max_tokens: int = 4096,
         cache_system: bool = False,
+        temperature: float | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         """Force the model to call a single tool whose input matches the
         provided JSON schema. The Anthropic API validates the tool input
         server-side before returning it, so we get a typed dict back rather
         than a JSON string the model may have shaped wrong.
+
+        ``temperature`` is forwarded only when set (``None`` = provider
+        default); ``complete_json`` pins it to 0 for deterministic output.
         """
         if not messages:
             raise ValueError(
@@ -239,16 +243,20 @@ class AnthropicLLMClient:
         }
         tool_choice: dict[str, Any] = {"type": "tool", "name": tool_name}
 
+        create_kwargs: dict[str, Any] = {
+            "model": cast(Any, self._resolve_model(model)),
+            "max_tokens": max_tokens,
+            "system": system_param,
+            "messages": cast(Any, api_messages),
+            "tools": cast(Any, [tool]),
+            "tool_choice": cast(Any, tool_choice),
+        }
+        if temperature is not None:
+            create_kwargs["temperature"] = temperature
+
         start = time.perf_counter()
         try:
-            response = await self._client.messages.create(
-                model=cast(Any, self._resolve_model(model)),
-                max_tokens=max_tokens,
-                system=system_param,
-                messages=cast(Any, api_messages),
-                tools=cast(Any, [tool]),
-                tool_choice=cast(Any, tool_choice),
-            )
+            response = await self._client.messages.create(**create_kwargs)
         except APIStatusError as exc:
             self._translate_or_reraise(exc)
             raise  # pragma: no cover - _translate_or_reraise always raises
