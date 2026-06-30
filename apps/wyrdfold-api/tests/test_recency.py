@@ -16,6 +16,7 @@ import pytest
 
 from app.config import settings
 from app.routers.jobs import (
+    _apply_display_recency,
     _list_jobs_across_user_targets,
     _list_jobs_for_target_two_query,
 )
@@ -23,6 +24,8 @@ from app.services.recency import (
     RECENCY_FLOOR,
     compute_recency_multiplier,
     compute_recency_score,
+    display_recency_score,
+    refresh_all_recency_scores,
     refresh_recency_scores,
 )
 
@@ -257,7 +260,9 @@ def test_target_two_query_orders_by_recency_when_enabled(
     )
 
     assert [p["id"] for p in result["postings"]] == ["j-fresh", "j-stale"]
-    # Displayed score is the raw fit score, not the decayed value.
+    # The helper returns the raw fit score; the read-time display decay is
+    # applied one layer up in ``list_jobs`` (see ``_apply_display_recency``),
+    # so at this layer ``score`` is still the undecayed fit.
     assert [p["score"] for p in result["postings"]] == [70, 95]
 
 
@@ -298,3 +303,180 @@ def test_across_targets_orders_by_recency_when_enabled(
 
     assert [p["id"] for p in result["postings"]] == ["j-fresh", "j-stale"]
     assert [p["score"] for p in result["postings"]] == [70, 95]
+
+
+# ---- display_recency_score (read-time decay) -------------------------------
+
+
+def test_display_recency_score_decays_from_first_seen() -> None:
+    now = datetime(2026, 6, 29, tzinfo=UTC)
+    fresh = now.isoformat()
+    old = (now - timedelta(days=27)).isoformat()
+    assert display_recency_score(90, fresh, now) == 90  # inside grace
+    assert display_recency_score(90, old, now) == 63  # round(90 * 0.70)
+
+
+def test_display_recency_score_missing_first_seen_treated_as_fresh() -> None:
+    now = datetime(2026, 6, 29, tzinfo=UTC)
+    assert display_recency_score(90, None, now) == 90
+
+
+# ---- _apply_display_recency (router-level display overlay) -----------------
+
+
+def test_apply_display_recency_decays_score_and_records_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
+    postings = [{"id": "j1", "score": 100, "first_seen_at": old}]
+
+    _apply_display_recency(postings)
+
+    assert postings[0]["score"] == 70  # round(100 * 0.70)
+    assert postings[0]["raw_score"] == 100  # undecayed fit preserved
+
+
+def test_apply_display_recency_noop_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
+    postings = [{"id": "j1", "score": 100, "first_seen_at": old}]
+
+    _apply_display_recency(postings)
+
+    assert postings[0]["score"] == 100
+    assert "raw_score" not in postings[0]
+
+
+def test_apply_display_recency_preserves_overlay_raw_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The score overlay sets ``score`` to the (axis-weighted) blend and
+    ``raw_score`` to the raw fit. Decay must multiply the blend and leave
+    the already-set ``raw_score`` untouched."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
+    postings = [{"id": "j1", "score": 80, "raw_score": 95, "first_seen_at": old}]
+
+    _apply_display_recency(postings)
+
+    assert postings[0]["score"] == 56  # round(80 * 0.70) — the blend decays
+    assert postings[0]["raw_score"] == 95  # untouched
+
+
+def test_apply_display_recency_skips_rows_without_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    postings = [{"id": "j1", "first_seen_at": "2026-01-01T00:00:00+00:00"}]
+
+    _apply_display_recency(postings)
+
+    assert "score" not in postings[0]
+    assert "raw_score" not in postings[0]
+
+
+# ---- refresh_all_recency_scores (full sweep) -------------------------------
+
+
+class _SweepChain:
+    """Minimal paged-query chain: returns a ``.range()`` slice of the table's
+    rows. The sweep fits the test corpus in one page (< 1000 rows)."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+        self._start = 0
+        self._end: int | None = None
+
+    def select(self, *_a: Any, **_kw: Any) -> _SweepChain:
+        return self
+
+    def eq(self, *_a: Any, **_kw: Any) -> _SweepChain:
+        return self
+
+    def is_(self, *_a: Any, **_kw: Any) -> _SweepChain:
+        return self
+
+    def order(self, *_a: Any, **_kw: Any) -> _SweepChain:
+        return self
+
+    def range(self, start: int, end: int) -> _SweepChain:
+        self._start, self._end = start, end
+        return self
+
+    def execute(self) -> _Resp:
+        end = self._end if self._end is not None else len(self._rows)
+        return _Resp(self._rows[self._start : end + 1])
+
+
+def _sweep_supabase(
+    jobs: list[dict[str, Any]],
+    scores: list[dict[str, Any]],
+    rpc_calls: list[tuple[str, dict[str, Any]]],
+) -> MagicMock:
+    by_table = {"jobs": jobs, "scores": scores}
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: _SweepChain(by_table[name])
+
+    def _rpc(name: str, params: dict[str, Any]) -> _RpcChain:
+        rpc_calls.append((name, params))
+        return _RpcChain([])
+
+    sb.rpc.side_effect = _rpc
+    return sb
+
+
+def test_refresh_all_sweeps_live_scores_and_skips_archived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
+    fresh = datetime.now(UTC).isoformat()
+    # Only live (non-archived) jobs come back from the jobs walk.
+    jobs = [
+        {"id": "j-old", "first_seen_at": old},
+        {"id": "j-fresh", "first_seen_at": fresh},
+    ]
+    scores = [
+        {"id": "s1", "job_posting_id": "j-old", "score": 90},
+        {"id": "s2", "job_posting_id": "j-fresh", "score": 80},
+        # Score for a job not in the live set (archived) → must be skipped.
+        {"id": "s3", "job_posting_id": "j-archived", "score": 100},
+    ]
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase(jobs, scores, rpc_calls)
+
+    written = refresh_all_recency_scores(sb)
+
+    assert written == 2  # archived score skipped
+    assert len(rpc_calls) == 1
+    by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
+    assert by_id["s1"] == 63  # round(90 * 0.70)
+    assert by_id["s2"] == 80  # fresh → no decay
+    assert "s3" not in by_id
+
+
+def test_refresh_all_mirrors_score_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+    jobs = [{"id": "j-old", "first_seen_at": old}]
+    scores = [{"id": "s1", "job_posting_id": "j-old", "score": 90}]
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase(jobs, scores, rpc_calls)
+
+    refresh_all_recency_scores(sb)
+
+    by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
+    assert by_id["s1"] == 90  # flag off → recency mirrors raw score
+
+
+def test_refresh_all_noop_when_no_live_scores() -> None:
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase([], [], rpc_calls)
+
+    assert refresh_all_recency_scores(sb) == 0
+    assert rpc_calls == []

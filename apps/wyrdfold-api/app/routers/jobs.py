@@ -48,6 +48,7 @@ from app.services.extract import (
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.jd_parser import parse_jd
+from app.services.recency import display_recency_score
 from app.services.sanitize import sanitize_html
 from app.services.scoring import strip_html
 from app.services.tailor import persistence
@@ -1072,6 +1073,36 @@ def _apply_preferences_filter(
     ]
 
 
+def _apply_display_recency(postings: list[dict[str, Any]]) -> None:
+    """Decay each posting's *displayed* ``score`` by its age at read time.
+
+    The score overlay sets ``score`` to the fit/axis-weighted blend and
+    preserves the undecayed fit in ``raw_score``. Users also expect a stale
+    posting to visibly fade, so we multiply the displayed score by the age
+    decay derived from ``first_seen_at`` *now* — not the stored
+    ``recency_score`` (which the poller only refreshes for jobs it re-touches,
+    so it freezes for postings that age off the boards). ``raw_score`` is left
+    intact — set by the overlay, and defaulted here for any row the overlay
+    didn't touch — so the pure fit stays available to the UI/debugging.
+
+    In-place mutation of the ``postings`` list. No-op when the recency flag is
+    off (the displayed score is then the raw fit, exactly as before). Only the
+    two JWT list paths call this; the operator/api-key view keeps raw scores.
+    """
+    if not settings.recency_decay_enabled:
+        return
+    now = datetime.now(UTC)
+    for p in postings:
+        score = p.get("score")
+        # ``bool`` is an ``int`` subclass — guard so a stray True/False
+        # never gets treated as a score.
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            continue
+        score_int = int(score)
+        p.setdefault("raw_score", score_int)
+        p["score"] = display_recency_score(score_int, p.get("first_seen_at"), now)
+
+
 @router.get("")
 def list_jobs(
     cursor: str | None = Query(None),
@@ -1194,6 +1225,9 @@ def list_jobs(
             preferences=preferences,
             user_id=user_id,
         )
+        # Decay the displayed score by posting age (read-time, never stale).
+        # raw_score keeps the undecayed fit. No-op when the flag is off.
+        _apply_display_recency(result["postings"])
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
         return result
@@ -1225,6 +1259,9 @@ def list_jobs(
             weights_by_target=weights_by_target or None,
             user_id=user_id,
         )
+        # Decay the displayed score by posting age (read-time, never stale).
+        # raw_score keeps the undecayed fit. No-op when the flag is off.
+        _apply_display_recency(result["postings"])
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
         return result
@@ -1953,6 +1990,10 @@ def get_job(
         row["score"] = target_score
     if target_breakdown is not None:
         row["score_breakdown"] = target_breakdown
+    # Decay the displayed score by posting age so the detail view matches
+    # the (now age-decayed) list score; raw_score keeps the undecayed fit.
+    # No-op when the recency flag is off.
+    _apply_display_recency([row])
     # Drop the helper target_id column we only fetched for ownership.
     row.pop("target_id", None)
     # Overlay the per-user pipeline status (#75 C4: jobs.status was dropped).

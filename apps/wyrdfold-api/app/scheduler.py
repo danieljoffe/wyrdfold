@@ -34,6 +34,7 @@ from app.config import settings
 from app.services.ingestion_health import check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import poll_all_sources, poll_due_sources
+from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
 from app.services.url_health import run_url_health_check
@@ -189,6 +190,33 @@ async def _run_scheduled_retention_purge() -> None:
         logger.exception("scheduled retention purge raised")
 
 
+async def _run_scheduled_recency_refresh() -> None:
+    """Tick body — rewrite ``recency_score`` for every live score row from the
+    current date, then invalidate the list cache.
+
+    The poller only refreshes recency for jobs it re-touched that cycle, so
+    postings that age off the boards freeze their decay; this sweep keeps the
+    stored sort key current for ALL live rows (see
+    ``app/services/recency.refresh_all_recency_scores``). Synchronous
+    (service-role client), so it runs in a worker thread to keep the event
+    loop free. Same defensive shape as the other ticks: skip if the client
+    isn't ready, never raise (APScheduler would swallow the trace).
+    """
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            logger.warning("scheduled recency refresh skipped — supabase client not initialized")
+            return
+        written = await asyncio.to_thread(refresh_all_recency_scores, client)
+        if written > 0:
+            # Cached list pages were sorted by the previous recency_score;
+            # drop them so the refreshed ordering surfaces on next load.
+            job_list_cache.invalidate()
+        logger.info("scheduled recency refresh: rewrote %d score rows", written)
+    except Exception:
+        logger.exception("scheduled recency refresh raised")
+
+
 def build_scheduler(
     *, tick_minutes: int, job_func: Callable[[], Awaitable[None]] = _run_scheduled_poll
 ) -> AsyncIOScheduler:
@@ -217,11 +245,12 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
     Called from the FastAPI lifespan; the returned handle is what the
     lifespan must shut down on exit.
 
-    Four independent recurring jobs may run on the same scheduler:
+    Five independent recurring jobs may run on the same scheduler:
       - ``poll_due_sources`` — gated on ``POLL_SCHEDULER_ENABLED``
       - ``url_health_check`` — gated on ``URL_HEALTH_CHECK_ENABLED``
       - ``retention_purge`` — gated on ``RETENTION_PURGE_ENABLED``
       - ``discovery_run`` — gated on ``DISCOVERY_SCHEDULER_ENABLED``
+      - ``recency_refresh`` — gated on ``RECENCY_REFRESH_ENABLED``
 
     If all flags are off, no scheduler is started. If only some are on,
     only those jobs are registered. Sharing one scheduler avoids multiple
@@ -232,11 +261,13 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         or settings.url_health_check_enabled
         or settings.retention_purge_enabled
         or settings.discovery_scheduler_enabled
+        or settings.recency_refresh_enabled
     ):
         logger.info(
             "schedulers disabled (set POLL_SCHEDULER_ENABLED=true, "
-            "URL_HEALTH_CHECK_ENABLED=true, RETENTION_PURGE_ENABLED=true, or "
-            "DISCOVERY_SCHEDULER_ENABLED=true to enable)"
+            "URL_HEALTH_CHECK_ENABLED=true, RETENTION_PURGE_ENABLED=true, "
+            "DISCOVERY_SCHEDULER_ENABLED=true, or RECENCY_REFRESH_ENABLED=true "
+            "to enable)"
         )
         return None
 
@@ -296,6 +327,20 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "discovery scheduler registered (tick every %d h)",
             settings.discovery_tick_hours,
+        )
+
+    if settings.recency_refresh_enabled:
+        scheduler.add_job(
+            _run_scheduled_recency_refresh,
+            IntervalTrigger(hours=settings.recency_refresh_tick_hours),
+            id="recency_refresh",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        logger.info(
+            "recency refresh scheduler registered (tick every %d h)",
+            settings.recency_refresh_tick_hours,
         )
 
     scheduler.start()
