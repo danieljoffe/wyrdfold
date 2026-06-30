@@ -16,6 +16,7 @@ must guarantee:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -380,6 +381,7 @@ class _ScoresChain:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
         self._floor: int | None = None
+        self._exempt_pending = False
 
     def select(self, *_a: Any, **_kw: Any) -> _ScoresChain:
         return self
@@ -391,13 +393,30 @@ class _ScoresChain:
         self._floor = value
         return self
 
+    def or_(self, expr: str, *_a: Any, **_kw: Any) -> _ScoresChain:
+        # Mirrors ``_apply_score_floor`` — the floor exempts Pending rows
+        # (scoring_status != 'complete'). Parse the floor out of the PostgREST
+        # OR expression "...,score.gte.N" and apply the exemption in execute().
+        m = re.search(r"score\.gte\.(\d+)", expr)
+        if m:
+            self._floor = int(m.group(1))
+            self._exempt_pending = True
+        return self
+
     def order(self, *_a: Any, **_kw: Any) -> _ScoresChain:
         return self
 
     def execute(self) -> _Resp:
         rows = self._rows
         if self._floor is not None:
-            rows = [r for r in rows if r["score"] >= self._floor]
+            if self._exempt_pending:
+                rows = [
+                    r
+                    for r in rows
+                    if r.get("scoring_status") != "complete" or r["score"] >= self._floor
+                ]
+            else:
+                rows = [r for r in rows if r["score"] >= self._floor]
         return _Resp(list(rows), count=len(rows))
 
 

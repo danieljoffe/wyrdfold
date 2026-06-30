@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -366,10 +367,17 @@ def _list_jobs_for_target_rpc(
     # whenever the user typed more than one word.
     if search and len(_tokenize_search(search)) > 1:
         raise RuntimeError("RPC path skipped: multi-word search uses OR semantics")
-    # Recency decay sorts by ``scores.recency_score``, which the RPC doesn't
-    # return or order by. The two-query fallback handles that column directly.
-    if settings.recency_decay_enabled and sort == "score":
-        raise RuntimeError("RPC path skipped: recency-decay sort handled in two-query path")
+    # Score sort needs Pending-below-graded bucketing (and, with decay on, the
+    # ``recency_score`` column the RPC doesn't order by) — both handled in the
+    # two-query path. The RPC's single-column keyset can't bucket. (#47/#118)
+    if sort == "score":
+        raise RuntimeError("RPC path skipped: Pending-aware score sort handled in two-query path")
+    # A min_score floor must exempt not-yet-graded rows; the RPC's flat
+    # ``score >= p_min_score`` can't. Route floored queries to the two-query
+    # path, which exempts Pending. Unfloored queries keep the keyset fast path
+    # (Pending rows pass anyway). (#47)
+    if min_score and min_score > 0:
+        raise RuntimeError("RPC path skipped: Pending floor-exemption handled in two-query path")
     """List jobs via server-side keyset RPC (single round-trip)."""
     after_value = cursor.get("v")
     resp = supabase.rpc(
@@ -394,6 +402,10 @@ def _list_jobs_for_target_rpc(
     rows = cast(list[dict[str, Any]], resp.data)
     has_more = len(rows) > page_size
     postings = rows[:page_size]
+    # Mark not-yet-graded rows so the UI badges them Pending, same as the
+    # two-query paths (#47). The RPC returns ``scoring_status`` per row.
+    for p in postings:
+        p["pending"] = _is_pending(p)
     next_cursor = (
         _encode_cursor(_keyset_cursor_from_row(postings[-1], sort))
         if has_more and postings
@@ -442,6 +454,78 @@ def _display_sort_value(
     if not settings.recency_decay_enabled:
         return weighted
     return display_recency_score(weighted, first_seen_at, now)
+
+
+# ---------------------------------------------------------------------------
+# Pending vs graded (#47 finding #4)
+#
+# ``scores.score`` holds TWO things on different scales: a cheap keyword
+# placeholder while a row is ``stage1``/``stage2``, and the real Sonnet
+# fit score once it's ``complete``. Treating them as one number let the
+# ``min_score`` floor admit/exclude a job based only on whether the daily
+# grading cap happened to reach it. We split on ``scoring_status``: only
+# graded rows carry a fit score, so only they are judged by the floor;
+# not-yet-graded ("Pending") rows are always shown, exempt from the floor,
+# and sorted below the graded ones.
+# ---------------------------------------------------------------------------
+
+
+def _is_pending(row: dict[str, Any]) -> bool:
+    """True when a scores/posting row is not yet Sonnet-graded — its ``score``
+    is still a keyword placeholder, not a real fit score. ``complete`` means
+    Phase 2 (or the user-analysis blend) has run; anything else (incl. a missing
+    status) is Pending."""
+    return row.get("scoring_status") != "complete"
+
+
+def _apply_score_floor(query: Any, min_score: int | None) -> Any:
+    """Apply the fit-score floor, exempting Pending rows (#47).
+
+    The floor is a fit-quality bar, so it only applies to rows that actually
+    have a fit score (``scoring_status = 'complete'``). Pending rows hold only a
+    keyword placeholder, so flooring them would hide promising jobs purely
+    because the grading cap hasn't reached them yet — instead they always pass
+    and the list marks them Pending. ``min_score`` is a validated int, so the
+    interpolation below carries no injection surface."""
+    if not min_score or min_score <= 0:
+        return query
+    return query.or_(
+        f"scoring_status.is.null,scoring_status.neq.complete,score.gte.{min_score}"
+    )
+
+
+def _rank_graded_first(
+    rows: list[dict[str, Any]],
+    *,
+    value: Callable[[dict[str, Any]], Any],
+    ascending: bool,
+) -> list[dict[str, Any]]:
+    """Order ``rows`` for the score sort so graded rows always precede Pending
+    ones, each bucket sorted by ``value`` in the requested direction (#47).
+
+    Graded-first holds regardless of sort direction: a Pending row carries only
+    a keyword placeholder, so interleaving by raw value would let an ungraded 80
+    outrank a graded 75. Bucketing keeps the real grades on top and the
+    not-yet-judged queue beneath them."""
+    graded = sorted(
+        (r for r in rows if not _is_pending(r)), key=value, reverse=not ascending
+    )
+    pending = sorted(
+        (r for r in rows if _is_pending(r)), key=value, reverse=not ascending
+    )
+    return graded + pending
+
+
+def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether ``candidate`` is a better per-job representative than ``current``
+    in the untargeted (cross-target) view. A graded row beats a Pending one — a
+    real fit score over a keyword placeholder (#47); among rows of the same
+    gradedness, the higher raw score wins."""
+    cand_graded = not _is_pending(candidate)
+    cur_graded = not _is_pending(current)
+    if cand_graded != cur_graded:
+        return cand_graded
+    return int(candidate.get("score") or 0) > int(current.get("score") or 0)
 
 
 def _list_jobs_for_target_two_query(
@@ -503,8 +587,7 @@ def _list_jobs_for_target_two_query(
         .eq("target_id", target_id)
         .eq("excluded", False)
     )
-    if min_score is not None:
-        ts_query = ts_query.gte("score", min_score)
+    ts_query = _apply_score_floor(ts_query, min_score)
 
     # Push sort + pagination to the scores query when sorting by score.
     # Chain a deterministic ``job_posting_id`` tiebreaker so rows with
@@ -544,9 +627,9 @@ def _list_jobs_for_target_two_query(
         and not search
         and not has_post_fetch_filter
     ):
-        ranked = sorted(
+        ranked = _rank_graded_first(
             ts_rows,
-            key=lambda r: (
+            value=lambda r: (
                 _display_sort_value(
                     r,
                     weights=axis_weights,
@@ -555,7 +638,7 @@ def _list_jobs_for_target_two_query(
                 ),
                 r["job_posting_id"],
             ),
-            reverse=not ascending,
+            ascending=ascending,
         )
         page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
         total = len(ts_rows) if ts_resp.count is None else ts_resp.count
@@ -587,6 +670,9 @@ def _list_jobs_for_target_two_query(
             p["raw_score"] = raw_score
             p["score_breakdown"] = ts.get("score_breakdown")
             p["scoring_status"] = ts.get("scoring_status", "stage1")
+            # Pending = not yet Sonnet-graded (#47). The frontend shows a
+            # "Pending" badge instead of treating ``score`` as a real grade.
+            p["pending"] = _is_pending(ts)
 
     # Sort + paginate in Python only when we couldn't do it server-side
     if total is None or sort_col != "score":
@@ -615,7 +701,13 @@ def _list_jobs_for_target_two_query(
                 return ""
             return val
 
-        postings.sort(key=_sort_key, reverse=not ascending)
+        if sort == "score":
+            # Pending below graded (#47), each bucket by display value.
+            postings = _rank_graded_first(
+                postings, value=_sort_key, ascending=ascending
+            )
+        else:
+            postings.sort(key=_sort_key, reverse=not ascending)
         if total is None:
             total = len(postings)
             postings = postings[offset : offset + page_size]
@@ -743,20 +835,21 @@ def _list_jobs_across_user_targets(
         .in_("target_id", list(user_target_ids))
         .eq("excluded", False)
     )
-    if min_score is not None:
-        score_query = score_query.gte("score", min_score)
+    score_query = _apply_score_floor(score_query, min_score)
     score_resp = score_query.execute()
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
 
     if not score_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
 
-    # Per-job: take the highest score across this user's targets.
+    # Per-job: pick the best representative target. A graded row always beats a
+    # Pending one (a real fit score over a keyword placeholder, #47); among rows
+    # of the same gradedness, the higher score wins.
     best: dict[str, dict[str, Any]] = {}
     for row in score_rows:
         jid = row["job_posting_id"]
         existing = best.get(jid)
-        if existing is None or row["score"] > existing["score"]:
+        if existing is None or _prefer_score_row(row, existing):
             best[jid] = row
 
     has_location_filter = bool(exclude_terms or only_terms)
@@ -792,11 +885,12 @@ def _list_jobs_across_user_targets(
         # stable, but only with respect to the input order, and the
         # input order is itself non-deterministic since ``best.keys()``
         # iterates a dict).
-        ranked_ids = sorted(
-            best.keys(),
-            key=lambda jid: (_mt_display_value(jid), jid),
-            reverse=not ascending,
+        ranked_rows = _rank_graded_first(
+            list(best.values()),
+            value=lambda r: (_mt_display_value(r["job_posting_id"]), r["job_posting_id"]),
+            ascending=ascending,
         )
+        ranked_ids = [r["job_posting_id"] for r in ranked_rows]
         page_ids = ranked_ids[offset : offset + page_size]
         total: int | None = len(ranked_ids)
     else:
@@ -827,6 +921,8 @@ def _list_jobs_across_user_targets(
             p["raw_score"] = raw_score
             p["score_breakdown"] = ts.get("score_breakdown")
             p["scoring_status"] = ts.get("scoring_status", "stage1")
+            # Pending = not yet Sonnet-graded (#47); frontend badges it.
+            p["pending"] = _is_pending(ts)
 
     if total is None or sort_col != "score":
         if has_location_filter:
@@ -846,7 +942,13 @@ def _list_jobs_across_user_targets(
                 return ""
             return val
 
-        postings.sort(key=_sort_key, reverse=not ascending)
+        if sort == "score":
+            # Pending below graded (#47), each bucket by display value.
+            postings = _rank_graded_first(
+                postings, value=_sort_key, ascending=ascending
+            )
+        else:
+            postings.sort(key=_sort_key, reverse=not ascending)
         if total is None:
             total = len(postings)
             postings = postings[offset : offset + page_size]
@@ -1461,8 +1563,8 @@ def _pipeline_counts_python(
         .in_("target_id", list(target_ids))
         .eq("excluded", False)
     )
-    if min_score is not None:
-        score_query = score_query.gte("score", min_score)
+    # Floor exempts Pending rows so the tab counts match the list (#47).
+    score_query = _apply_score_floor(score_query, min_score)
     score_resp = score_query.execute()
     job_ids = sorted(
         {
@@ -1518,6 +1620,14 @@ def _pipeline_counts_grouped(
 ) -> dict[str, int]:
     """Single grouped count via the ``pipeline_counts`` RPC; falls back
     to the client-side two-query variant if the RPC isn't deployed yet."""
+    # The RPC floors on raw ``score``, which can't exempt Pending rows. When a
+    # floor is active, use the Python path (which exempts Pending) so the tab
+    # counts match the Pending-aware list. Unfloored counts keep the RPC —
+    # Pending rows are counted anyway. (#47)
+    if min_score and min_score > 0:
+        return _pipeline_counts_python(
+            supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
+        )
     try:
         resp = supabase.rpc(
             "pipeline_counts",
