@@ -230,3 +230,45 @@ def test_user_set_scores_included_enforces_ownership(
         .data
     )
     assert rows and rows[0]["excluded"] is False
+
+
+def test_anon_cannot_call_score_write_rpcs(
+    seeded_for_blend: tuple[str, str, str, str, str, str],
+    service_client: Client,
+    anon_client: Client,
+) -> None:
+    """#2 audit regression: these score-write DEFINER RPCs carried a leftover
+    `anon` EXECUTE grant (Supabase default privileges; #6 R2's
+    `REVOKE ... FROM PUBLIC` didn't remove the explicit per-role grant). Their
+    in-body guard exempts ``auth.uid() IS NULL`` — which an anon caller is — so
+    an unauthenticated anon-key holder could write the shared `scores` catalog
+    and stamp `jobs.llm_analysis_id`. Anon must now be denied EXECUTE entirely:
+    PostgREST stops exposing the RPC to the `anon` role, so each call errors and
+    the seeded score (50) is untouched.
+    """
+    _uid_a, _uid_b, job_id, target_a, _target_b, analysis_id = seeded_for_blend
+
+    with pytest.raises(APIError):
+        anon_client.rpc(
+            "user_apply_score_blend",
+            {
+                "p_job_posting_id": job_id,
+                "p_target_id": target_a,
+                "p_score": 99,
+                "p_analysis_id": analysis_id,
+            },
+        ).execute()
+
+    with pytest.raises(APIError):
+        anon_client.rpc(
+            "user_upsert_score", {"p_row": _row(job_id, target_a, 99)}
+        ).execute()
+
+    with pytest.raises(APIError):
+        anon_client.rpc(
+            "user_set_scores_included",
+            {"p_job_posting_id": job_id, "p_target_ids": [target_a]},
+        ).execute()
+
+    # None of the rejected calls touched the shared score.
+    assert _score(service_client, job_id, target_a) == 50

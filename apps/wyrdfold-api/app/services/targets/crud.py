@@ -788,6 +788,21 @@ def list_reference_jds(supabase: Client, target_id: str) -> list[TargetReference
     return [_parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
+def count_user_reference_jds(
+    supabase: Client, *, target_id: str, user_id: str
+) -> int:
+    """How many reference JDs this user has contributed to this target.
+    Drives the per-user contribution cap (#47)."""
+    resp = (
+        supabase.table(REF_JDS_TABLE)
+        .select("id", count="exact")  # type: ignore[arg-type]
+        .eq("target_id", target_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return resp.count or 0
+
+
 def delete_reference_jd(
     supabase: Client, ref_jd_id: str, *, target_id: str, user_id: str | None = None
 ) -> bool:

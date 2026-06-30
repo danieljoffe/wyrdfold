@@ -608,7 +608,13 @@ async def test_router_missing_optimized_doc_returns_404(
         tc = TestClient(app)
         resp = tc.post("/analysis/job-1?target_id=tgt-1")
         assert resp.status_code == 404
-        assert "optimized doc" in resp.json()["detail"].lower()
+        # Structured detail so the client can render a "set up your profile"
+        # empty state — and it must NOT leak the internal endpoint path (#105).
+        detail = resp.json()["detail"]
+        assert detail["code"] == "no_profile"
+        assert "profile" in detail["message"].lower()
+        assert "/experience/derive" not in str(detail)
+        assert "POST" not in detail["message"]
     finally:
         app.dependency_overrides.clear()
 

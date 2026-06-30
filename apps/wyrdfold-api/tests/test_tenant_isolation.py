@@ -133,7 +133,9 @@ async def test_analysis_owned_target_passes_gate(
     try:
         resp = tc.post("/analysis/job-1?target_id=tgt-owned")
         assert resp.status_code == 404
-        assert "optimized doc" in resp.json()["detail"].lower()
+        # Past the ownership gate → the later "no profile" 404 (structured
+        # detail, #105), not the ownership "Target not found." string 404.
+        assert resp.json()["detail"]["code"] == "no_profile"
     finally:
         app.dependency_overrides.clear()
 

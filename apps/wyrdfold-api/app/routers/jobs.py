@@ -403,6 +403,47 @@ def _list_jobs_for_target_rpc(
     return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
+def _first_seen_lookup(supabase: Client, job_ids: list[str]) -> dict[str, Any]:
+    """``job_posting_id`` → ``first_seen_at`` for the recency-decay sort.
+
+    Only needed when decay is on: the display sort value otherwise ignores
+    recency, so we skip the round-trip entirely. Chunked to respect the
+    IN-list cap, like ``_fetch_jobs_chunked``.
+    """
+    lookup: dict[str, Any] = {}
+    if not settings.recency_decay_enabled or not job_ids:
+        return lookup
+    for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
+        chunk = job_ids[i : i + _IN_CHUNK_SIZE]
+        resp = (
+            supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
+        )
+        for r in cast(list[dict[str, Any]], resp.data or []):
+            lookup[r["id"]] = r.get("first_seen_at")
+    return lookup
+
+
+def _display_sort_value(
+    ts: dict[str, Any],
+    *,
+    weights: AxisWeights | None,
+    first_seen_at: Any,
+    now: datetime,
+) -> int:
+    """The score a row will actually DISPLAY: the axis-weighted blend, then
+    read-time recency decay. Sorting the list on this — rather than the stored,
+    un-weighted ``recency_score`` (which also freezes for jobs the poller stops
+    re-touching) — keeps the dashboard order matching the visible numbers (#47).
+    ``_apply_display_recency`` later sets each shown ``score`` to exactly this.
+    """
+    weighted = display_score_or_passthrough(
+        ts.get("axis_scores"), int(ts.get("score") or 0), weights
+    )
+    if not settings.recency_decay_enabled:
+        return weighted
+    return display_recency_score(weighted, first_seen_at, now)
+
+
 def _list_jobs_for_target_two_query(
     supabase: Client,
     *,
@@ -490,6 +531,12 @@ def _list_jobs_for_target_two_query(
     # it's active we have to load every candidate posting, filter, and
     # paginate from the filtered set — otherwise pagination would show
     # the pre-filter total and pages would render half-empty.
+    # Sort by the score each row will DISPLAY (axis-weighted + read-time decay),
+    # not the stored un-weighted recency_score, so the page order matches the
+    # numbers the user sees (#47).
+    now = datetime.now(UTC)
+    fs_lookup = _first_seen_lookup(supabase, list(score_lookup.keys()))
+
     if (
         sort_col == "score"
         and not status
@@ -497,7 +544,20 @@ def _list_jobs_for_target_two_query(
         and not search
         and not has_post_fetch_filter
     ):
-        page_ids = [r["job_posting_id"] for r in ts_rows[offset : offset + page_size]]
+        ranked = sorted(
+            ts_rows,
+            key=lambda r: (
+                _display_sort_value(
+                    r,
+                    weights=axis_weights,
+                    first_seen_at=fs_lookup.get(r["job_posting_id"]),
+                    now=now,
+                ),
+                r["job_posting_id"],
+            ),
+            reverse=not ascending,
+        )
+        page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
         total = len(ts_rows) if ts_resp.count is None else ts_resp.count
     else:
         page_ids = list(score_lookup.keys())
@@ -541,11 +601,15 @@ def _list_jobs_for_target_two_query(
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
-                # Order by recency_score (or raw score when decay is off);
-                # read from the scores lookup so we don't leak an internal
-                # column into the postings response.
+                # Same DISPLAY value the scores-layer sort uses, so the order
+                # matches the numbers shown (#47).
                 ts = score_lookup.get(p["id"]) or {}
-                return ts.get(order_col) or 0
+                return _display_sort_value(
+                    ts,
+                    weights=axis_weights,
+                    first_seen_at=fs_lookup.get(p["id"]),
+                    now=now,
+                )
             val = p.get(sort)
             if val is None:
                 return ""
@@ -666,14 +730,9 @@ def _list_jobs_across_user_targets(
     """
     offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
-    # See ``_list_jobs_for_target_two_query``: the "score" sort orders by
-    # the decayed ``recency_score`` when the flag is on; min_score still
-    # filters on the raw fit score.
-    order_col = (
-        "recency_score"
-        if sort_col == "score" and settings.recency_decay_enabled
-        else "score"
-    )
+    # The "score" sort orders by the score each row DISPLAYS (per-target
+    # axis-weighted blend + read-time decay), computed below — not a stored
+    # column. ``min_score`` still filters on the raw fit score.
 
     score_query = (
         supabase.table("scores")
@@ -701,6 +760,22 @@ def _list_jobs_across_user_targets(
             best[jid] = row
 
     has_location_filter = bool(exclude_terms or only_terms)
+    # Sort by the score each row will DISPLAY — its target's axis-weighted blend
+    # then read-time decay — so the page order matches the numbers shown (#47),
+    # not the stored un-weighted recency_score. Weights are per-row here (each
+    # job's best target may differ).
+    weights_by_target = weights_by_target or {}
+    now = datetime.now(UTC)
+    fs_lookup = _first_seen_lookup(supabase, list(best.keys()))
+
+    def _mt_display_value(jid: str) -> int:
+        row = best[jid]
+        tid = cast(str | None, row.get("target_id"))
+        w = weights_by_target.get(tid) if tid else None
+        return _display_sort_value(
+            row, weights=w, first_seen_at=fs_lookup.get(jid), now=now
+        )
+
     if (
         sort_col == "score"
         and not status
@@ -711,7 +786,7 @@ def _list_jobs_across_user_targets(
         # Sort + paginate at the scores layer when no post-fetch filter
         # could drop rows AFTER that pagination (location is post-fetch,
         # so when it's active we have to filter the full set first).
-        # ``(score, job_posting_id)`` tuple key gives a deterministic
+        # ``(value, job_posting_id)`` tuple key gives a deterministic
         # tiebreaker — without the id leg, rows with identical scores
         # could reorder between paginated calls (Python's ``sorted`` is
         # stable, but only with respect to the input order, and the
@@ -719,7 +794,7 @@ def _list_jobs_across_user_targets(
         # iterates a dict).
         ranked_ids = sorted(
             best.keys(),
-            key=lambda jid: (best[jid].get(order_col) or 0, jid),
+            key=lambda jid: (_mt_display_value(jid), jid),
             reverse=not ascending,
         )
         page_ids = ranked_ids[offset : offset + page_size]
@@ -740,7 +815,6 @@ def _list_jobs_across_user_targets(
         search=search,
     )
 
-    weights_by_target = weights_by_target or {}
     for p in postings:
         ts = best.get(p["id"])
         if ts:
@@ -764,11 +838,9 @@ def _list_jobs_across_user_targets(
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
-                # Order by recency_score (or raw score when decay is off);
-                # read from the per-job best-score lookup so we don't leak
-                # an internal column into the postings response.
-                ts = best.get(p["id"]) or {}
-                return ts.get(order_col) or 0
+                # Same DISPLAY value the scores-layer sort uses, so the order
+                # matches the numbers shown (#47).
+                return _mt_display_value(p["id"]) if p["id"] in best else 0
             val = p.get(sort)
             if val is None:
                 return ""

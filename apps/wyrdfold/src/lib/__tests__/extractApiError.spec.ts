@@ -102,4 +102,20 @@ describe('extractApiError — pydantic validation arrays gated by status', () =>
     // Must NOT leak the raw validation msg ("Field required") to the user.
     expect(msg).toBe('Analysis failed (500)');
   });
+
+  it('surfaces the no_profile (404) message and never leaks the internal path (#105)', async () => {
+    const msg = await extractApiError(
+      resWithDetail(404, {
+        code: 'no_profile',
+        message:
+          'Set up your experience profile to generate a job-fit analysis.',
+      }),
+      'Analysis failed'
+    );
+    expect(msg).toBe(
+      'Set up your experience profile to generate a job-fit analysis.'
+    );
+    expect(msg).not.toMatch(/experience\/derive/i);
+    expect(msg).not.toMatch(/POST/);
+  });
 });

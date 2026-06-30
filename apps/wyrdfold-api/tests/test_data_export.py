@@ -136,8 +136,12 @@ def _data_json(blob: bytes) -> dict[str, Any]:
 
 
 def test_export_inventory_in_lockstep_with_deletion() -> None:
-    """Export and erasure must cover the same per-user tables."""
-    assert set(_EXPORT_TABLES) == set(account_deletion._USER_ID_TABLES)
+    """Export and erasure must cover the same per-user tables — those deleted
+    on erasure plus those anonymized (the user's shared contributions)."""
+    assert set(_EXPORT_TABLES) == (
+        set(account_deletion._USER_ID_TABLES)
+        | set(account_deletion._ANONYMIZED_TABLES)
+    )
 
 
 def test_data_json_covers_all_tables_with_rows() -> None:

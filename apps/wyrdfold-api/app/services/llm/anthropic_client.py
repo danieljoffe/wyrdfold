@@ -273,6 +273,19 @@ class AnthropicLLMClient:
                 f"{[b.type for b in response.content]!r}"
             )
 
+        # A forced single-tool call that stopped on ``max_tokens`` truncated the
+        # tool input mid-emission, so the parsed dict is incomplete. Fail loud
+        # rather than return silently-truncated structured data — the caller's
+        # fallback (poller → Pending, triage → fail-open) then engages. Most
+        # truncations already trip the downstream pydantic validate in
+        # ``complete_json``; this also catches the ones that stay schema-valid
+        # (a list cut short, a value clipped). (#47)
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError(
+                f"Tool input for {tool_name!r} was truncated at "
+                f"max_tokens={max_tokens}; the structured response is incomplete"
+            )
+
         usage = LLMUsage(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,

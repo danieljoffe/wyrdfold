@@ -117,5 +117,22 @@ export async function extractApiError(
     return `Daily deep-analysis limit reached${limit} — more tomorrow. Already-analyzed jobs stay free to revisit.`;
   }
 
+  // ``no_profile`` (404) — the user hasn't built their experience profile, so
+  // analysis/tailoring can't run yet. Surface the backend's user-facing
+  // ``message`` (never the raw "…POST /experience/derive first." path the
+  // route used to leak, #105). Callers that want a CTA instead of a flat
+  // error can branch on the code before reaching here.
+  if (
+    detail &&
+    typeof detail === 'object' &&
+    'code' in detail &&
+    (detail as { code: unknown }).code === 'no_profile'
+  ) {
+    const d = detail as { message?: unknown };
+    return typeof d.message === 'string' && d.message.trim()
+      ? d.message
+      : 'Set up your experience profile first.';
+  }
+
   return statusFallback;
 }

@@ -120,6 +120,57 @@ async def test_success_updates_scores_row_with_full_phase2_payload(
 
 
 @pytest.mark.asyncio
+async def test_empty_jd_drops_job_without_grading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-only JD is dropped — the row is excluded + marked terminal
+    with NO LLM grade and NO cost (not graded, not left Pending). (#47)"""
+    supabase = MagicMock()
+    llm = MagicMock()
+
+    derive_calls = 0
+
+    async def fake_derive(*args: object, **kwargs: object) -> object:
+        nonlocal derive_calls
+        derive_calls += 1
+        return (_fake_fit(), MagicMock())
+
+    cost_calls = 0
+
+    def fake_cost(*args: object, **kwargs: object) -> object:
+        nonlocal cost_calls
+        cost_calls += 1
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "app.services.fit.score_persistence.derive_job_fit", fake_derive
+    )
+    monkeypatch.setattr(
+        "app.services.fit.score_persistence.record_llm_cost", fake_cost
+    )
+
+    result = await score_with_phase2_and_persist(
+        supabase,
+        llm,
+        payload=_payload(),
+        target=_target(),
+        job_posting_id="job-1",
+        title="Senior FE",
+        jd_text="   \n\t  ",  # whitespace only
+    )
+
+    assert result is None
+    assert derive_calls == 0  # never graded
+    assert cost_calls == 0  # never spent
+
+    # The row is dropped: excluded + terminal so it neither surfaces nor retries.
+    update_args = supabase.table.return_value.update.call_args.args[0]
+    assert update_args["excluded"] is True
+    assert update_args["scoring_status"] == "complete"
+    assert "updated_at" in update_args
+
+
+@pytest.mark.asyncio
 async def test_llm_failure_returns_none_and_skips_db_and_cost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

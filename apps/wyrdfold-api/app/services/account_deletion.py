@@ -65,7 +65,30 @@ _USER_ID_TABLES: tuple[str, ...] = (
     "user_jobs",
     "status_log",
     "user_targets",
+    "contribution_votes",  # the user's anonymous ref-JD votes (#5 P3)
     "user_api_keys",
+)
+
+# Shared tables that carry a ``user_id`` but whose rows are NOT deleted on
+# erasure — the user link is nulled instead, so the shared content survives.
+# ``reference_jds`` are collective contributions feeding every follower's
+# scoring profile; ``merge_by_contributor`` already treats a NULL-user JD as
+# the anonymous "system" voice (#5 P2), so anonymizing completes erasure (drops
+# the personal link) without perturbing the collective catalog or re-scoring.
+_ANONYMIZED_TABLES: tuple[str, ...] = ("reference_jds",)
+
+# ``user_id`` base tables erased outside the ``_USER_ID_TABLES`` loop: the
+# profile row, deleted in its own ordered step (5) below.
+_OTHER_HANDLED_TABLES: tuple[str, ...] = ("user_profiles",)
+
+# Every ``public`` base table with a ``user_id`` column must fall in exactly
+# one bucket — deleted, anonymized, or the explicitly-handled profile row.
+# ``tests/integration/test_erasure_coverage.py`` asserts the live schema never
+# grows a ``user_id`` table absent from here, so a new per-user table can't
+# silently slip erasure (the gap that left reference_jds/contribution_votes
+# behind, #29).
+ERASURE_HANDLED_USER_ID_TABLES: frozenset[str] = frozenset(
+    _USER_ID_TABLES + _ANONYMIZED_TABLES + _OTHER_HANDLED_TABLES
 )
 
 # Phase-2 LLM grader outputs on the shared ``scores`` row that are derived
@@ -89,6 +112,8 @@ def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
 
     1. storage objects under ``<user_id>/`` in both private buckets;
     2. per-user DB rows (FK-safe; cascades clean up children);
+    2b. anonymize shared ``reference_jds`` (null the user link, keep the JD —
+       collective content, not personal data; see ``_ANONYMIZED_TABLES``);
     3. scrub the user's derived PII from shared ``scores`` rows — the rows
        survive (shared catalog), only the Phase-2 grader fields are nulled
        (see the module docstring);
@@ -107,9 +132,19 @@ def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
     report["resume_uploads_objects"] = resume_storage.purge_user_objects(supabase, user_id)
     report["tailored_resume_objects"] = tailored_storage.purge_user_objects(supabase, user_id)
 
-    # 2. Per-user DB rows.
+    # 2. Per-user DB rows (incl. the user's anonymous ref-JD votes).
     for table in _USER_ID_TABLES:
         report[table] = _delete_by(supabase, table, "user_id", user_id)
+
+    # 2b. Anonymize the user's shared reference-JD contributions: keep the JD
+    #     content in the collective catalog, null only the personal link (merge
+    #     already treats NULL-user JDs as the "system" voice, #5 P2). Deleting
+    #     the votes above can leave a contribution's ``suppressed`` flag
+    #     momentarily stale, but it stays consistent with the already-merged
+    #     profile and self-heals on the next vote (which re-tallies + re-merges).
+    report["reference_jds_anonymized"] = _anonymize_user_id(
+        supabase, "reference_jds", user_id
+    )
 
     # 3. Scrub this user's PII off the shared scores rows for their targets.
     report["scores_scrubbed"] = _scrub_shared_scores(supabase, target_ids)
@@ -141,6 +176,15 @@ def _delete_by(supabase: Client, table: str, column: str, value: Any) -> int:
     ``services.keys.store.delete_key``.
     """
     resp = supabase.table(table).delete().eq(column, value).execute()
+    return len(resp.data or [])
+
+
+def _anonymize_user_id(supabase: Client, table: str, user_id: str) -> int:
+    """NULL the ``user_id`` on a shared table's rows for the user — the row
+    (shared content) survives, only the personal link is removed. Returns the
+    count anonymized. Idempotent: a second run matches nothing (already NULL).
+    """
+    resp = supabase.table(table).update({"user_id": None}).eq("user_id", user_id).execute()
     return len(resp.data or [])
 
 

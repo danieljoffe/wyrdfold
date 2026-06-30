@@ -139,6 +139,62 @@ afterEach(() => {
   global.fetch = originalFetch;
 });
 
+describe('OnboardingWizard — resume mid-flow (#85)', () => {
+  it('resumes at the persisted step when path + step are valid', () => {
+    render(<OnboardingWizard initialPath='A' initialStep='upload-resume' />);
+    // Path A at ``upload-resume`` → the ResumeUploader, not the chooser.
+    expect(screen.getByTestId('resume-uploader-stub')).toBeInTheDocument();
+    expect(
+      screen.queryByText(/how would you like to get started\?/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('falls back to the path chooser when the step is not part of the path', () => {
+    // ``add-job`` exists only in Path A, not Path B → inconsistent → restart.
+    render(<OnboardingWizard initialPath='B' initialStep='add-job' />);
+    expect(
+      screen.getByText(/how would you like to get started\?/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('job-url-input-stub')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the path chooser when no path is persisted', () => {
+    render(<OnboardingWizard initialStep='upload-resume' />);
+    expect(
+      screen.getByText(/how would you like to get started\?/i)
+    ).toBeInTheDocument();
+  });
+
+  it('does not fire a step PATCH just for resuming (no redundant mount write)', () => {
+    render(<OnboardingWizard initialPath='A' initialStep='upload-resume' />);
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      '/api/profile/onboarding/step',
+      expect.anything()
+    );
+  });
+
+  it('persists progress (path + step) on a step transition', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+    // Picking Path A advances to ``identity`` → progress is persisted so a
+    // later drop-out resumes there.
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/profile/onboarding/step',
+        expect.objectContaining({
+          method: 'PATCH',
+          body: JSON.stringify({ path: 'A', current_step: 'identity' }),
+        })
+      )
+    );
+  });
+});
+
 describe('OnboardingWizard — initial state', () => {
   it('renders the path chooser with the welcome heading', () => {
     render(<OnboardingWizard />);

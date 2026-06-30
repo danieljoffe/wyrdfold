@@ -81,4 +81,19 @@ describe('ConfirmModal', () => {
     expect(screen.getByRole('button', { name: /deleting/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /^cancel$/i })).toBeDisabled();
   });
+
+  it('disables only the confirm button when confirmDisabled (cancel stays enabled)', () => {
+    render(
+      <ConfirmModal
+        isOpen
+        onClose={jest.fn()}
+        onConfirm={jest.fn()}
+        title='Delete?'
+        confirmLabel='Delete'
+        confirmDisabled
+      />
+    );
+    expect(screen.getByRole('button', { name: /^delete$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /^cancel$/i })).toBeEnabled();
+  });
 });

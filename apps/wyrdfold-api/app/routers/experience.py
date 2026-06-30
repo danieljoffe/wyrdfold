@@ -73,6 +73,11 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key_or_jwt)],
 )
 
+# Wall-clock bound on resume text extraction (#29 M6). Generous — a normal
+# PDF/DOCX parses in well under a second; this only trips on a corrupt or
+# adversarially-complex file, returning 422 promptly instead of hanging.
+_PARSE_TIMEOUT_SECONDS = 30.0
+
 
 # ---- Prose doc ------------------------------------------------------------
 
@@ -214,7 +219,22 @@ async def upload_resume(
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
 
     try:
-        parsed = await asyncio.to_thread(parse_resume, file_bytes, filename, content_type)
+        # Bound the parse: a pathological PDF/DOCX (already ≤10 MB, authed) must
+        # not hang the request and block the event-loop await indefinitely.
+        # ``wait_for`` frees the request promptly on timeout; the worker thread
+        # can't be hard-killed (only a subprocess could), but for an authed,
+        # capped, infrequent upload that residual isn't worth subprocess
+        # isolation. Normal parses are sub-second, so this only trips on abuse
+        # or a corrupt file. (#29 M6)
+        parsed = await asyncio.wait_for(
+            asyncio.to_thread(parse_resume, file_bytes, filename, content_type),
+            timeout=_PARSE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not parse the file in time — it may be corrupt or too complex.",
+        ) from None
     except ValueError as exc:
         if "too large" in str(exc).lower():
             raise HTTPException(status_code=413, detail=str(exc)) from None

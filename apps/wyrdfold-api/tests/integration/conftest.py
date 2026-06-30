@@ -88,6 +88,13 @@ def service_client(_require_stack: None) -> Client:
 
 
 @pytest.fixture
+def anon_client(_require_stack: None) -> Client:
+    """Anonymous client (anon key, `anon` role) — the public, unauthenticated
+    surface. RLS + grants must deny it everything not explicitly public."""
+    return create_client(LOCAL_URL, ANON_KEY)
+
+
+@pytest.fixture
 def user_client_factory(
     _require_stack: None, monkeypatch: pytest.MonkeyPatch
 ) -> Callable[[str], Client]:
