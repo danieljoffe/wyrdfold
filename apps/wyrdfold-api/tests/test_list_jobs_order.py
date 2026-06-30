@@ -10,6 +10,9 @@ right rows in the wrong order.
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.config import settings
 from app.routers.jobs import (
     _decode_cursor,
     _encode_cursor,
@@ -107,7 +110,14 @@ def test_target_two_query_restores_score_desc_order() -> None:
     assert result["total"] == 3
 
 
-def test_across_user_targets_restores_score_desc_order() -> None:
+def test_across_user_targets_restores_score_desc_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin recency decay OFF: this tests raw-score-desc ordering, which the
+    # recency feature replaces with recency_score ordering when on. The flag
+    # defaults off in CI but RECENCY_DECAY_ENABLED=true in .env.local (loaded
+    # by nx) would otherwise sort by an absent recency_score → storage order.
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same shape, different aggregator (max score across the user's targets).
     score_rows = [
         {"job_posting_id": "j-high", "target_id": "t-1", "score": 80, "score_breakdown": {}, "scoring_status": "complete"},
@@ -210,7 +220,13 @@ def _rpc_supabase(rows: list[dict[str, Any]], captured: dict[str, Any]) -> Magic
     return sb
 
 
-def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
+def test_rpc_keyset_emits_cursor_and_trims_extra_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin recency decay OFF: the RPC keyset path is intentionally skipped (it
+    # raises) when RECENCY_DECAY_ENABLED is on, since recency sort is handled
+    # in the two-query path. .env.local sets it on, so pin it for determinism.
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # page_size+1 rows come back → there's a next page; the extra row is
     # dropped and the cursor is the last KEPT row's (score, id).
     rows = [{"id": f"j{i}", "score": 100 - i} for i in range(3)]  # 3 = 2 + 1
@@ -229,7 +245,11 @@ def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     assert result["total"] is None  # no COUNT on the keyset path
 
 
-def test_rpc_keyset_last_page_has_no_cursor() -> None:
+def test_rpc_keyset_last_page_has_no_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # See note above — the RPC keyset path requires recency decay off.
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
     rows = [{"id": "j0", "score": 100}, {"id": "j1", "score": 99}]  # exactly page_size
     sb = _rpc_supabase(rows, {})
     result = _list_jobs_for_target_rpc(
@@ -240,7 +260,11 @@ def test_rpc_keyset_last_page_has_no_cursor() -> None:
     assert result["next_cursor"] is None
 
 
-def test_rpc_keyset_consumes_incoming_cursor() -> None:
+def test_rpc_keyset_consumes_incoming_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # See note above — the RPC keyset path requires recency decay off.
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
     captured: dict[str, Any] = {}
     sb = _rpc_supabase([], captured)
     _list_jobs_for_target_rpc(
