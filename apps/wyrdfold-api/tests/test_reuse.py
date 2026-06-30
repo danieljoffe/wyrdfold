@@ -1,6 +1,10 @@
 """Tests for resume reuse within targets (#504)."""
 
-from unittest.mock import MagicMock
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from app.models.tailor import TailoredResumeRecord
 from app.models.targets import (
@@ -17,6 +21,17 @@ from app.services.tailor.reuse import (
     find_reusable_resume,
     jd_similarity,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_master_doc_by_default():
+    """Default the master-doc lookup to None so the staleness check (#47) is
+    a no-op for the existing reuse tests. The staleness tests below override
+    this with their own ``patch`` to supply a master with a known created_at."""
+    with patch(
+        "app.services.tailor.reuse.get_latest_optimized", return_value=None
+    ):
+        yield
 
 
 def _profile(keywords_by_cat: dict[str, dict[str, int]]) -> ScoringProfile:
@@ -229,6 +244,47 @@ def test_find_reusable_resume_above_threshold() -> None:
     # Regression guard: the lookup must never touch the vestigial
     # ``jobs.target_id`` column.
     assert all(c.args[0] != "jobs" for c in supabase.table.call_args_list)
+
+
+def test_reuse_refused_when_resume_predates_master_edit() -> None:
+    # The candidate resume was built 2026-04-25; the user re-versioned their
+    # master doc on 2026-05-01 (e.g. fixed a fabrication) — cloning it would
+    # ship pre-edit content, so refuse despite a high JD similarity (#47).
+    resume_row = _record(
+        jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
+    ).model_dump(mode="json")
+    supabase = _reuse_supabase(
+        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
+    )
+    master = SimpleNamespace(created_at=datetime(2026, 5, 1, tzinfo=UTC))
+    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
+        result = find_reusable_resume(
+            supabase,
+            target_id="target-1",
+            job_description="React TypeScript GraphQL Node.js developer needed",
+            profile_keywords={"react", "typescript", "graphql", "node.js"},
+        )
+    assert result is None  # stale → regenerate fresh
+
+
+def test_reuse_allowed_when_resume_newer_than_master_version() -> None:
+    resume_row = _record(
+        jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
+    ).model_dump(mode="json")
+    supabase = _reuse_supabase(
+        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
+    )
+    # Current master last versioned BEFORE the resume was generated → not stale.
+    master = SimpleNamespace(created_at=datetime(2026, 4, 1, tzinfo=UTC))
+    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
+        result = find_reusable_resume(
+            supabase,
+            target_id="target-1",
+            job_description="React TypeScript GraphQL Node.js developer needed",
+            profile_keywords={"react", "typescript", "graphql", "node.js"},
+        )
+    assert result is not None
+    assert result.id == "rec-1"
 
 
 # ---- clone_resume_for_job ----
