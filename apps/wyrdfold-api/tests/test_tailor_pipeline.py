@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from docx import Document
 
+from app.config import settings
 from app.models.ats_lint import LintResult, LintViolation
 from app.models.experience import (
     OptimizedDoc,
@@ -29,6 +30,12 @@ from app.models.tailor import (
 )
 from app.services.llm import cost_log as cost_log_mod
 from app.services.llm.mock import MockLLMClient
+from app.services.tailor.faithfulness import (
+    FAITHFULNESS_REVIEW_PURPOSE,
+    FaithfulnessFlag,
+    FaithfulnessReview,
+    review_to_critique,
+)
 from app.services.tailor.pipeline import (
     PipelineLintFailure,
     PipelineSuccess,
@@ -311,3 +318,113 @@ async def test_rendered_output_opens_as_valid_docx(
     texts = [p.text for p in doc.paragraphs]
     assert "Daniel Joffe" in texts[0]
     assert any("FightCamp" in t for t in texts)
+
+
+# ---- Faithfulness review pass (#6b) ---------------------------------------
+
+
+def test_actionable_flags_filters_to_medium_and_high() -> None:
+    review = FaithfulnessReview(
+        flags=[
+            FaithfulnessFlag(claim="a", issue="exaggeration", severity="low", suggestion="s"),
+            FaithfulnessFlag(claim="b", issue="fabrication", severity="medium", suggestion="s"),
+            FaithfulnessFlag(claim="c", issue="unsupported_skill", severity="high", suggestion="s"),
+        ]
+    )
+    assert [f.claim for f in review.actionable_flags()] == ["b", "c"]
+
+
+def test_review_to_critique_none_when_no_actionable_flags() -> None:
+    review = FaithfulnessReview(
+        flags=[FaithfulnessFlag(claim="a", issue="exaggeration", severity="low", suggestion="s")]
+    )
+    assert review_to_critique(review) is None
+
+
+def test_review_to_critique_renders_actionable_flags() -> None:
+    review = FaithfulnessReview(
+        flags=[
+            FaithfulnessFlag(
+                claim="led a team of 50", issue="exaggeration", severity="high", suggestion="say 5"
+            )
+        ]
+    )
+    crit = review_to_critique(review)
+    assert crit is not None
+    assert "led a team of 50" in crit and "exaggeration" in crit
+
+
+def _scripted_llm(review: FaithfulnessReview) -> MockLLMClient:
+    return MockLLMClient(
+        scripted={
+            DEFAULT_PURPOSE: _valid_resume_json(),
+            FAITHFULNESS_REVIEW_PURPOSE: review.model_dump_json(),
+        }
+    )
+
+
+async def test_review_disabled_skips_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "faithfulness_review_enabled", False)
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    rec = MagicMock()
+    monkeypatch.setattr(cost_log_mod, "record", rec)
+
+    result = await run_tailor_pipeline(
+        supabase,
+        _scripted_llm(FaithfulnessReview(flags=[])),
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="JD",
+        contact=_contact(),
+    )
+    assert isinstance(result, PipelineSuccess)
+    assert rec.call_count == 1  # generate only — no review
+
+
+async def test_review_clean_does_not_regenerate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    rec = MagicMock()
+    monkeypatch.setattr(cost_log_mod, "record", rec)
+
+    # Only a low-severity flag → not actionable → no corrective regen.
+    review = FaithfulnessReview(
+        flags=[FaithfulnessFlag(claim="x", issue="exaggeration", severity="low", suggestion="s")]
+    )
+    result = await run_tailor_pipeline(
+        supabase,
+        _scripted_llm(review),
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="JD",
+        contact=_contact(),
+    )
+    assert isinstance(result, PipelineSuccess)
+    assert rec.call_count == 2  # generate + review, no regen
+
+
+async def test_review_flags_trigger_one_regeneration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    rec = MagicMock()
+    monkeypatch.setattr(cost_log_mod, "record", rec)
+
+    review = FaithfulnessReview(
+        flags=[
+            FaithfulnessFlag(
+                claim="led 50 engineers", issue="exaggeration", severity="high", suggestion="say 5"
+            )
+        ]
+    )
+    result = await run_tailor_pipeline(
+        supabase,
+        _scripted_llm(review),
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="JD",
+        contact=_contact(),
+    )
+    assert isinstance(result, PipelineSuccess)
+    assert rec.call_count == 3  # generate + review + ONE corrective regen

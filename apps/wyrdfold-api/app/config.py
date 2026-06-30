@@ -202,6 +202,15 @@ class Settings(BaseSettings):
     # ``phase1_triage_enabled`` to surface any work.
     phase2_enabled: bool = False
 
+    # Faithfulness review pass for generated resumes (#6b). When True the
+    # tailor pipeline runs a second LLM "review" over the freshly generated
+    # resume, flags claims the source experience doesn't support, and (on
+    # medium/high-severity flags) regenerates ONCE with the flags as a
+    # critique — the corrective run is not re-reviewed. Ships FALSE: it adds
+    # up to ~2 LLM calls per resume, so flip it on per-deploy to A/B the
+    # quality lift against the spend.
+    faithfulness_review_enabled: bool = False
+
     # Job qualification firewall (#60). When True the poller runs the
     # target-INDEPENDENT qualification tagger
     # (``app/services/qualification/``) over each newly-ingested job — one
