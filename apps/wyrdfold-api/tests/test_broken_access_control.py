@@ -322,3 +322,40 @@ def test_reference_jds_strips_contributor_user_id(
         assert "someone-else-private-id" not in resp.text
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Contribution cap (#47) — bound a single user's footprint on a shared target
+# ---------------------------------------------------------------------------
+
+
+async def test_reference_jd_contribution_cap_rejects_over_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-cap reference-JD add is rejected 409 before any LLM derive (#47)."""
+    from fastapi import HTTPException
+
+    from app.config import settings
+    from app.models.targets import ReferenceJDAdd
+    from app.routers import targets
+
+    monkeypatch.setattr(targets, "_require_user_owns_target", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crud, "get", lambda *_a, **_kw: MagicMock())
+    # The caller is already at the cap.
+    monkeypatch.setattr(
+        crud,
+        "count_user_reference_jds",
+        lambda *_a, **_kw: settings.reference_jd_max_per_user_per_target,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await targets.add_reference_jd(
+            request=MagicMock(),
+            target_id="tgt-1",
+            body=ReferenceJDAdd(jd_text="x" * 60),
+            supabase=MagicMock(),
+            llm=MagicMock(),
+            user_id="user-a",
+        )
+    assert exc.value.status_code == 409
+    assert "limit" in str(exc.value.detail).lower()

@@ -1337,6 +1337,28 @@ async def add_reference_jd(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
+    # Cap reference-JD contributions per user per target (#47): bounds a single
+    # (possibly rogue) contributor's footprint on the shared profile, on top of
+    # the per-contributor merge de-bias + downvote suppression. Checked before
+    # the LLM derive so an over-cap add costs nothing. Operator/api-key callers
+    # (user_id None) are exempt. Soft cap — see config.
+    if user_id is not None:
+        contributed = await asyncio.to_thread(
+            crud.count_user_reference_jds,
+            supabase,
+            target_id=target_id,
+            user_id=user_id,
+        )
+        if contributed >= settings.reference_jd_max_per_user_per_target:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "You've reached the limit of "
+                    f"{settings.reference_jd_max_per_user_per_target} reference "
+                    "JDs for this target. Remove one before adding another."
+                ),
+            )
+
     # Validate JD URL if provided (#496)
     if body.jd_url:
         vr = await validate_job_url(body.jd_url)

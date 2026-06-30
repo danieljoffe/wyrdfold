@@ -283,6 +283,13 @@ class Settings(BaseSettings):
     # (down minus up) reach this quorum; re-merged without it.
     contribution_downvote_quorum: int = Field(default=3, ge=1, le=100)
 
+    # Cap on reference-JD contributions a single user can add to one target
+    # (#47). Bounds a rogue contributor's footprint on the shared scoring
+    # profile, on top of the per-contributor merge de-bias + downvote
+    # suppression. Soft cap (count-then-insert; the route's 10/min rate limit
+    # + de-bias make the rare race harmless).
+    reference_jd_max_per_user_per_target: int = Field(default=5, ge=1, le=100)
+
     # Email/SMS notifications — Next.js app URL and shared secret for job alerts.
     next_app_url: str = ""
     job_alert_secret: str = Field(default="", repr=False)
