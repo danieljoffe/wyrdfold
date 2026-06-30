@@ -132,6 +132,37 @@ class TestUploadResumeEndpoint:
         assert "Empty" in exc_info.value.detail
 
     @pytest.mark.asyncio
+    async def test_parse_timeout_returns_422(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A parse that exceeds the wall-clock bound returns 422 promptly
+        instead of hanging the request (#29 M6)."""
+        import time
+
+        from fastapi import HTTPException
+
+        from app.routers import experience as exp_router
+
+        # Tiny bound + a parse that blocks past it -> wait_for raises TimeoutError.
+        monkeypatch.setattr(exp_router, "_PARSE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(
+            exp_router, "parse_resume", lambda *a, **kw: time.sleep(0.5)
+        )
+
+        file = _make_upload_file(b"some resume bytes")
+        with pytest.raises(HTTPException) as exc_info:
+            await exp_router.upload_resume(
+                request=MagicMock(),
+                file=file,
+                auto_derive=False,
+                supabase=MagicMock(),
+                llm=MagicMock(),
+                embeddings=MagicMock(),
+            )
+        assert exc_info.value.status_code == 422
+        assert "in time" in exc_info.value.detail
+
+    @pytest.mark.asyncio
     async def test_unsupported_type_returns_415(self) -> None:
         from fastapi import HTTPException
 
