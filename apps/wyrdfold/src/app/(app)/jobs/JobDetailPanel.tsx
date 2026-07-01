@@ -17,6 +17,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
 import JobFeedbackSection from './JobFeedbackSection';
+import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
 import StatusIndicator from './StatusIndicator';
 import {
@@ -444,6 +445,12 @@ export default function JobDetailPanel({
           />
         )}
       </div>
+
+      <LogisticsChips
+        filters={posting.logistics_filters}
+        variant='full'
+        className='mt-1'
+      />
 
       <ConfirmModal
         isOpen={confirmDeleteOpen}
