@@ -6,25 +6,29 @@ by the system itself (the cron poller, batch grader, and other api-key callers)
 need a real owner rather than the legacy ``user_id IS NULL`` single-tenant marker
 that ``get_current_user_id_optional`` threads through the service layer today.
 
-``SYSTEM_USER_ID`` is that owner: a reserved sentinel the system stamps onto its
-own rows. It is deliberately **not** a row in ``auth.users`` and carries **no**
-``auth.users`` foreign key — consistent with every other per-user table in this
-schema, which enforce the user relationship at the app layer and cascade account
-deletion through the app's erasure flow (#29), not a DB constraint (see the BYOK
-migration ``20260614000000_byok_user_api_keys.sql``). Two properties make the
-sentinel safe:
+``SYSTEM_USER_ID`` is that owner: a **reserved ``auth.users`` row** with this
+fixed id, seeded by migration ``20260701130000_seed_system_principal.sql`` so it
+exists identically in every environment (and a fresh self-host bring-up). It is a
+real row — not a bare sentinel — so the ``user_id -> auth.users(id) ON DELETE
+CASCADE`` foreign key added in Phase 0 step 4 holds for system-owned rows too.
+That FK is **defense-in-depth under** the app's #29 erasure flow (which also
+purges Storage + external state a DB cascade can't) — a backstop against orphaned
+rows, not a replacement. Two properties make the principal safe:
 
-- **It is not a valid v4 UUID** — the version nibble is ``0``, not ``4``. GoTrue
-  mints v4 UUIDs, so it can never issue a real user with this id; no human's
-  ``auth.uid()`` will ever equal it, and RLS (``auth.uid() = user_id``) therefore
-  keeps every SYSTEM-owned row invisible to every logged-in user.
+- **It can never authenticate** and **can never collide with a real user.** The
+  seed row has no password and no ``identities`` row (no password/OAuth login)
+  and a non-routable ``.internal`` email (no magic link). Its id is also not a
+  valid v4 UUID (version nibble ``0``, not ``4``), and GoTrue only mints v4s — so
+  no human's ``auth.uid()`` will ever equal it, and RLS (``auth.uid() =
+  user_id``) keeps every SYSTEM-owned row invisible to every logged-in user.
 - **It is attribution, not authentication.** The system writes through the
-  service-role client (which bypasses RLS regardless); this id only records
-  *which principal* authored the row, so "system" is greppable and explicit
-  instead of an ambiguous NULL that conflates "system", "none", and "unset".
+  service-role client (which bypasses RLS regardless); this id records *which
+  principal* authored the row, so "system" is greppable and explicit instead of
+  an ambiguous NULL that conflates "system", "none", and "unset".
 """
 
 # Reserved owner for system/cron-authored rows (poller gradings in ``analyses``,
-# the ``llm_costs`` ledger, batch output). NOT a real auth user — see the module
-# docstring for why a sentinel (and not an ``auth.users`` row) is the right model.
+# the ``llm_costs`` ledger, batch output). A real, non-loginable ``auth.users``
+# row (see the seed migration + module docstring), so the account-cascade FK
+# holds for it too.
 SYSTEM_USER_ID = "00000000-0000-0000-0000-000000000001"
