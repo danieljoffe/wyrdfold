@@ -131,15 +131,18 @@ Return JSON matching this exact schema:
 
 {
   "verdicts": [
-    {"id": 1, "promising": true,  "confidence": 95},
-    {"id": 2, "promising": false, "confidence": 88},
-    {"id": 3, "promising": true,  "confidence": 55}
+    {"id": 1, "promising": true,  "confidence": 95, "title_prefix": "Frontend Engineer"},
+    {"id": 2, "promising": false, "confidence": 88, "title_prefix": "Account Executive"},
+    {"id": 3, "promising": true,  "confidence": 55, "title_prefix": "Full-Stack Developer"}
   ]
 }
 
 One verdict per input title, keyed by the input id. Do NOT omit ids — \
-if you can't decide, default to PROMISING with confidence < 50. Return \
-ONLY the JSON object. No prose, no markdown, no code fences."""
+if you can't decide, default to PROMISING with confidence < 50. \
+``title_prefix`` is the first two or three words of the title you graded for \
+that id, copied verbatim from the input — it lets the caller confirm the id \
+lines up with the right title (a safeguard against a miscounted/transposed \
+id). Return ONLY the JSON object. No prose, no markdown, no code fences."""
 )
 
 
@@ -161,6 +164,11 @@ class TitleVerdict(BaseModel):
     id: int = Field(ge=1)
     promising: bool
     confidence: int | None = Field(default=None, ge=0, le=100)
+    title_prefix: str = ""
+    """The first few words of the title the model graded for this id, echoed
+    verbatim. Cross-checked against the input title so a transposed/miscounted
+    id is caught and dropped (fail-open) rather than mis-assigned (#47).
+    Optional/back-compat: an empty echo skips the check (trusts the id)."""
 
 
 class TitleTriageResponse(BaseModel):
@@ -189,6 +197,20 @@ def admitted(verdict: TitleVerdict | None, *, min_confidence: int) -> bool:
     if verdict.confidence is None:
         return True
     return verdict.confidence >= min_confidence
+
+
+def _prefix_matches_title(title: str, prefix: str) -> bool:
+    """Whether the model's echoed ``prefix`` is a leading fragment of ``title``.
+
+    Case- and whitespace-normalized so a faithfully-copied prefix always
+    matches, but a prefix copied from a DIFFERENT title (a transposed id) does
+    not. An empty prefix returns True — the check is skipped (back-compat with
+    responses that don't echo, and never a reason to drop a verdict on absence).
+    """
+    p = " ".join(prefix.lower().split())
+    if not p:
+        return True
+    return " ".join(title.lower().split()).startswith(p)
 
 
 def _split_user_message(target: JobTarget, titles: list[str]) -> tuple[str, str]:
@@ -297,9 +319,12 @@ async def triage_titles(
             ],
             schema=TitleTriageResponse,
             purpose=purpose,
-            # Output is ~250 verdicts x~30 tokens each = ~7500 tokens.
-            # 8192 gives us headroom for the JSON envelope.
-            max_tokens=8192,
+            # Output is ~250 verdicts; the per-verdict ``title_prefix`` echo
+            # adds a few tokens each (~34 tok/verdict now), so lift the cap to
+            # keep clear of a mid-JSON truncation (which fails the whole batch
+            # open — #112 raises on a max_tokens stop). The model only emits
+            # what it needs, so the higher ceiling costs nothing unless used.
+            max_tokens=10240,
             cache_system=True,
         )
     except Exception:
@@ -311,7 +336,30 @@ async def triage_titles(
         )
         return {}, None
 
-    # Map verdicts by id. Tolerate the model returning duplicates (last
-    # one wins) or omitting ids (treated as fail-open by the caller's
-    # ``.get(i)``-returns-None pattern).
-    return {v.id: v for v in parsed.verdicts}, result
+    # Map verdicts by id. Tolerate the model returning duplicates (last one
+    # wins) or omitting ids (treated as fail-open by the caller's
+    # ``.get(i)``-returns-None pattern). Additionally, cross-check the echoed
+    # ``title_prefix`` against the id's input title (#47): a transposed or
+    # out-of-range id would mis-assign one title's verdict to another —
+    # admitting an off-topic role and dropping a relevant one — so drop those
+    # and let the caller fail-open (admit) instead.
+    verdicts_by_id: dict[int, TitleVerdict] = {}
+    dropped = 0
+    for v in parsed.verdicts:
+        if not (1 <= v.id <= len(titles)) or not _prefix_matches_title(
+            titles[v.id - 1], v.title_prefix
+        ):
+            dropped += 1
+            continue
+        verdicts_by_id[v.id] = v
+    if dropped:
+        logger.warning(
+            "Phase 1 dropped %d/%d verdict(s) for target %s (%s) — id "
+            "out-of-range or echoed title_prefix didn't match the input title "
+            "(possible transposition); those titles fail-open (admit)",
+            dropped,
+            len(parsed.verdicts),
+            target.id,
+            target.label,
+        )
+    return verdicts_by_id, result
