@@ -181,3 +181,24 @@ def test_md_lint_blocks_empty() -> None:
     result = lint_markdown("", document_type="resume")
     codes = {v.code for v in result.errors}
     assert "empty" in codes
+
+
+def test_md_lint_warns_on_over_long_bullet() -> None:
+    # A 300-char run-on bullet is over the 280 ATS target — warn, don't block (#47).
+    long_bullet = "- " + "Delivered impact. " * 20  # ~360 chars of content
+    md = f"# Resume\n\n## Experience\n\n{long_bullet}\n"
+    result = lint_markdown(md, document_type="resume")
+    assert "bullet_length" in {v.code for v in result.warnings}
+    assert "bullet_length" not in {v.code for v in result.errors}
+    assert result.ok  # a warning never blocks generation
+
+
+def test_md_lint_allows_normal_length_bullets() -> None:
+    md = (
+        "# Resume\n\n## Experience\n\n"
+        "- Led the platform rebuild, cutting p95 latency 40%.\n"
+        "- Mentored 4 engineers; shipped the design system.\n"
+    )
+    result = lint_markdown(md, document_type="resume")
+    all_codes = {v.code for v in result.warnings} | {v.code for v in result.errors}
+    assert "bullet_length" not in all_codes

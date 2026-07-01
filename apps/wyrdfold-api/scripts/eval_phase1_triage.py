@@ -79,6 +79,11 @@ _DEFAULT_MODELS: dict[str, str] = {
 # ~25 × 30 tokens = 750 tokens plus envelope, well under 2K.
 _MAX_OUTPUT_TOKENS = 2048
 
+# Below this fraction of the reference's verdicts answered, a candidate model's
+# agreement number is measured over too small a subset to trust — flagged as a
+# hard fail regardless of how high that agreement is (#47).
+_MIN_COVERAGE = 0.95
+
 # Conservative concurrency: one call per (model, target) batch in
 # parallel is plenty. OpenRouter rate limits are generous but DeepSeek
 # can be slow under load.
@@ -284,6 +289,9 @@ def _agreement_report(
             continue
         tp = fp = tn = fn = total_compared = 0
         missing_in_model = 0
+        # Of the un-answered titles, how many the reference marked PROMISING —
+        # these are the "lost forever" misses a Phase-1 gate most fears (#47).
+        missing_promising = 0
         missing_in_ref = 0
         for tid, ci in chunk_keys:
             ref_v = by_key.get((reference, tid, ci), {})
@@ -292,6 +300,8 @@ def _agreement_report(
             for vid, ref_prom in ref_v.items():
                 if vid not in mod_v:
                     missing_in_model += 1
+                    if ref_prom:
+                        missing_promising += 1
                     continue
                 mod_prom = mod_v[vid]
                 total_compared += 1
@@ -307,13 +317,27 @@ def _agreement_report(
                 if vid not in ref_v:
                     missing_in_ref += 1
         n = max(1, total_compared)
+        graded_by_ref = total_compared + missing_in_model
         per_model[model] = {
             "compared": total_compared,
             "agreement_rate": round((tp + tn) / n, 4),
             "false_positive_rate": round(fp / max(1, fp + tn), 4),
             "false_negative_rate": round(fn / max(1, fn + tp), 4),
+            # Fraction of the reference's verdicts this model actually answered.
+            # Agreement is computed only over answered pairs, so a model that
+            # drops titles can look accurate on the few it graded — coverage is
+            # the honesty check, and low coverage is a hard fail regardless of
+            # agreement (#47).
+            "coverage": round(total_compared / max(1, graded_by_ref), 4),
+            # FNR that treats an un-answered PROMISING title as a miss (fail-open
+            # saves it in prod, but for the eval a gate that can't emit a verdict
+            # is unreliable exactly where it's most dangerous).
+            "false_negative_rate_with_coverage": round(
+                (fn + missing_promising) / max(1, fn + tp + missing_promising), 4
+            ),
             "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
             "missing_verdicts_in_model": missing_in_model,
+            "missing_promising_in_model": missing_promising,
             "missing_verdicts_in_ref": missing_in_ref,
             "total_cost_usd": round(by_model_cost[model], 5),
             "avg_latency_ms": int(
@@ -397,25 +421,43 @@ def _write_report(
     md.append("## Per-model summary")
     md.append("")
     md.append(
-        "| Model | Agreement vs ref | FPR | FNR | Compared | $ total | "
-        "Avg latency | Errors |"
+        "| Model | Agreement vs ref | FPR | FNR | FNR+cov | Coverage | "
+        "Compared | $ total | Avg latency | Errors |"
     )
-    md.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    md.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for model, stats in report["per_model"].items():
         if model == ref:
             md.append(
-                f"| {model} (ref) | — | — | — | — | "
+                f"| {model} (ref) | — | — | — | — | — | — | "
                 f"${stats['total_cost_usd']:.4f} | "
                 f"{stats['avg_latency_ms']}ms | {stats['errored_batches']} |"
             )
         else:
+            cov = stats["coverage"]
+            # Flag low coverage: agreement over a small answered subset is not
+            # trustworthy (#47).
+            cov_cell = f"{cov * 100:.1f}%" + (" ⚠️" if cov < _MIN_COVERAGE else "")
             md.append(
                 f"| {model} | {stats['agreement_rate'] * 100:.1f}% | "
                 f"{stats['false_positive_rate'] * 100:.1f}% | "
                 f"{stats['false_negative_rate'] * 100:.1f}% | "
+                f"{stats['false_negative_rate_with_coverage'] * 100:.1f}% | "
+                f"{cov_cell} | "
                 f"{stats['compared']} | ${stats['total_cost_usd']:.4f} | "
                 f"{stats['avg_latency_ms']}ms | {stats['errored_batches']} |"
             )
+    low_cov = [
+        m
+        for m, s in report["per_model"].items()
+        if m != ref and s.get("coverage", 1.0) < _MIN_COVERAGE
+    ]
+    if low_cov:
+        md.append("")
+        md.append(
+            f"> ⚠️ **Low coverage** (< {_MIN_COVERAGE:.0%}): {', '.join(low_cov)} "
+            "dropped too many titles for the agreement numbers to be trusted — "
+            "treat as a hard fail regardless of agreement."
+        )
     md.append("")
     md.append("## Per-target agreement")
     md.append("")
