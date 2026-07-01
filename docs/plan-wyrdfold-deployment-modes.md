@@ -78,7 +78,7 @@ per-user data path) does not fork.
   paying customers. That is the correct multi-tenant economics and the app already has it.
 - **RLS is mandatory here, not optional.** For a _paid_ host serving the public, a Python-
   authz bug is a cross-customer data breach. RLS as the enforced backstop (#6/#88) is the
-  thing that lets the operator charge money and sleep. So #88 is a **prerequisite for
+  thing that lets the operator charge money and operate with confidence. So #88 is a **prerequisite for
   monetization**, not polish.
 - **Billing:** Stripe subscription and/or usage-metered; a quota/entitlement gate on the
   expensive paths (analysis, tailor, derive).
