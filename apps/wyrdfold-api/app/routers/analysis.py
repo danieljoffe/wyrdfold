@@ -10,6 +10,7 @@ import logging
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from supabase import Client
 
 from app.cache import job_list_cache, jobs_cache_prefix
@@ -41,7 +42,12 @@ router = APIRouter(
 )
 
 
-@router.post("/{job_id}", dependencies=[Depends(enforce_llm_budget)])
+# response_model=None: the handler returns either a JobAnalysisRecord or a 200
+# JSONResponse marker (the no-profile empty state, #105), which FastAPI can't
+# express as a single response model — it serializes each return as-is.
+@router.post(
+    "/{job_id}", response_model=None, dependencies=[Depends(enforce_llm_budget)]
+)
 async def create_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
@@ -54,7 +60,7 @@ async def create_analysis(
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
     s: Settings = Depends(get_settings),
-) -> JobAnalysisRecord:
+) -> JobAnalysisRecord | JSONResponse:
     # 0. Ownership: the blend below WRITES to the shared (job, target)
     # scores row, so a JWT caller must be linked to target_id — otherwise
     # any user could re-rank another target's list (audit #24 F2). 404 not
@@ -70,14 +76,16 @@ async def create_analysis(
         optimized.get_latest, supabase, user_id=user_id
     )
     if current_optimized is None:
-        # Structured detail (not a raw dev message) so the client renders a
-        # "set up your profile" empty state instead of leaking an internal
-        # endpoint path into the UI. The panel auto-fires this on load, so a
-        # profile-less user would otherwise see "…POST /experience/derive
-        # first." in red on every job they open (#105).
-        raise HTTPException(
-            status_code=404,
-            detail={
+        # No optimized profile yet → a 200 empty-state marker, NOT a 4xx. The
+        # panel auto-fires this on first open, so a 404 would both leak an
+        # internal endpoint path into the UI [fixed earlier] AND log a "Failed
+        # to load resource: 404" console error on every profile-less job open.
+        # A 200 with a `no_profile` code lets the client render the "set up your
+        # profile" CTA with no failed request (#105). (Real errors — e.g. the
+        # ownership "Target not found." above — stay 4xx.)
+        return JSONResponse(
+            status_code=200,
+            content={
                 "code": "no_profile",
                 "message": (
                     "Set up your experience profile to generate a "
