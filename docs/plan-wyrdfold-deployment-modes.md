@@ -64,7 +64,7 @@ per-user data path) does not fork.
   password) or a one-time setup screen.
 - The owner **authenticates** like any user → gets a JWT → RLS applies to them. In a
   single-owner instance the owner simply _is_ the only `auth.uid()`, so "their data" is all
-  the data — RLS is a no-op cost but a real safety net.
+  the data — RLS adds minimal overhead but provides a real safety net.
 - Signup is closed in `self_host`; there is exactly one account unless the operator opens it.
 
 ## Monetization (saas mode)
