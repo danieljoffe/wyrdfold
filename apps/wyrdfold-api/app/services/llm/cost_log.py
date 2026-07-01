@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.embeddings import EmbeddingResult
 from app.models.llm import LLMCallRecord, LLMResult
 
@@ -41,7 +42,7 @@ def record(
     return _insert_row(
         supabase,
         {
-            "user_id": user_id,
+            "user_id": resolve_owner(user_id),
             "model": result.model,
             "purpose": purpose,
             "input_tokens": result.usage.input_tokens,
@@ -65,7 +66,7 @@ def record_embedding(
     return _insert_row(
         supabase,
         {
-            "user_id": user_id,
+            "user_id": resolve_owner(user_id),
             "model": result.model,
             "purpose": purpose,
             "input_tokens": result.usage.input_tokens,
@@ -87,7 +88,7 @@ def _row_for(
     metadata: dict[str, str | int | float | bool] | None,
 ) -> dict[str, Any]:
     return {
-        "user_id": user_id,
+        "user_id": resolve_owner(user_id),
         "model": result.model,
         "purpose": purpose,
         "input_tokens": result.usage.input_tokens,
@@ -134,7 +135,7 @@ def list_recent(
     limit: int = 100,
 ) -> list[LLMCallRecord]:
     query = supabase.table(TABLE).select("*").order("created_at", desc=True).limit(limit)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [LLMCallRecord.model_validate(r) for r in rows]
@@ -149,7 +150,7 @@ def _total_spend_python(
     before the migration lands). Selects every row in the window and sums
     in Python — O(rows) on the wire and in memory."""
     query = supabase.table(TABLE).select("cost_usd")
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     if since is not None:
         query = query.gte("created_at", since.isoformat())
     resp = query.execute()
@@ -173,7 +174,7 @@ def total_spend(
         resp = supabase.rpc(
             "total_spend_since",
             {
-                "p_user_id": user_id,
+                "p_user_id": resolve_owner(user_id),
                 "p_since": since.isoformat() if since is not None else None,
             },
         ).execute()
@@ -240,7 +241,7 @@ def _spend_by_purpose_python(
     since: datetime | None,
 ) -> dict[str, float]:
     query = supabase.table(TABLE).select("purpose, cost_usd")
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     if since is not None:
         query = query.gte("created_at", since.isoformat())
     resp = query.execute()
@@ -312,7 +313,7 @@ def spend_by_purpose(
         resp = supabase.rpc(
             "spend_by_purpose_since",
             {
-                "p_user_id": user_id,
+                "p_user_id": resolve_owner(user_id),
                 "p_since": since.isoformat() if since is not None else None,
             },
         ).execute()

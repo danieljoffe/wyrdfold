@@ -32,3 +32,15 @@ rows, not a replacement. Two properties make the principal safe:
 # row (see the seed migration + module docstring), so the account-cascade FK
 # holds for it too.
 SYSTEM_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def resolve_owner(user_id: str | None) -> str:
+    """The owner id to stamp on a row, or filter a read by.
+
+    ``None`` (an api-key / cron caller with no authenticated user) resolves to
+    ``SYSTEM_USER_ID`` — the Phase-0 replacement for the legacy ``user_id IS
+    NULL`` single-tenant marker. A real user passes through unchanged. Use this
+    at every write and per-user read of a table being migrated off the nullable
+    ``user_id`` so "the system" is one explicit owner instead of NULL.
+    """
+    return SYSTEM_USER_ID if user_id is None else user_id
