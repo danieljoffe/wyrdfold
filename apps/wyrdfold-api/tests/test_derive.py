@@ -1,13 +1,15 @@
 """Derivation of OptimizedPayload from prose via a mocked LLM."""
 
 import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.models.experience import OptimizedDoc, OptimizedPayload, ProseDoc
+from app.models.llm import LLMStreamDelta
 from app.services.experience.derive import (
     DEFAULT_MODEL,
     DEFAULT_PURPOSE,
@@ -314,6 +316,22 @@ async def _drain(streaming_response: object) -> bytes:
     return b"".join(chunks)
 
 
+def _request(disconnected: bool = False) -> MagicMock:
+    """A stand-in Request whose async ``is_disconnected()`` resolves to
+    ``disconnected`` (the SSE handler polls it between deltas, #29 M-r2-3)."""
+    req = MagicMock()
+    req.is_disconnected = AsyncMock(return_value=disconnected)
+    return req
+
+
+class _MidStreamErrorLLM:
+    """Yields one delta, then raises — exercises the SSE terminal-error path."""
+
+    async def stream(self, **_kwargs: object) -> AsyncIterator[object]:
+        yield LLMStreamDelta(text='{"summary": "partial')
+        raise RuntimeError("provider boom")
+
+
 class TestDeriveStreamEndpoint:
     @pytest.mark.asyncio
     async def test_404_when_no_prose(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,7 +446,7 @@ class TestDeriveStreamEndpoint:
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
-            request=MagicMock(),
+            request=_request(),
             supabase=MagicMock(),
             llm=llm,
             embeddings=MagicMock(),
@@ -447,3 +465,69 @@ class TestDeriveStreamEndpoint:
         _, done_data = done_events[0]
         assert done_data["cached"] is False
         assert done_data["doc"]["id"] == "opt-2"
+
+    @pytest.mark.asyncio
+    async def test_aborts_when_client_disconnects_mid_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#29 M-r2-3: a disconnected client stops the stream — no done event,
+        nothing persisted — so an abandoned derive stops spending LLM tokens."""
+        from app.routers import experience as exp_router
+
+        prose_doc = ProseDoc(
+            id="prose-1", user_id=None, version=3, content="some prose",
+            created_at=datetime.now(UTC),
+        )
+        monkeypatch.setattr(
+            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
+        )
+        monkeypatch.setattr(
+            "app.services.experience.optimized.get_latest", lambda *a, **kw: None
+        )
+        create = MagicMock()
+        monkeypatch.setattr(
+            "app.services.experience.optimized.create_version", create
+        )
+
+        llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
+        response = await exp_router.derive_optimized_stream(
+            request=_request(disconnected=True),
+            supabase=MagicMock(),
+            llm=llm,
+            embeddings=MagicMock(),
+        )
+        events = _parse_sse(await _drain(response))
+        assert not any(e[0] == "done" for e in events)  # aborted before completion
+        create.assert_not_called()  # nothing persisted for the gone client
+
+    @pytest.mark.asyncio
+    async def test_emits_error_frame_on_midstream_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#29 M-r2-4: a provider error mid-stream closes the SSE with a
+        terminal ``error`` frame, not a truncated stream."""
+        from app.routers import experience as exp_router
+
+        prose_doc = ProseDoc(
+            id="prose-1", user_id=None, version=3, content="some prose",
+            created_at=datetime.now(UTC),
+        )
+        monkeypatch.setattr(
+            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
+        )
+        monkeypatch.setattr(
+            "app.services.experience.optimized.get_latest", lambda *a, **kw: None
+        )
+
+        response = await exp_router.derive_optimized_stream(
+            request=_request(),
+            supabase=MagicMock(),
+            llm=_MidStreamErrorLLM(),
+            embeddings=MagicMock(),
+        )
+        events = _parse_sse(await _drain(response))
+        assert any(e[0] == "delta" for e in events)  # the partial delta arrived first
+        error_events = [e for e in events if e[0] == "error"]
+        assert len(error_events) == 1
+        assert "failed" in error_events[0][1]["detail"]
+        assert not any(e[0] == "done" for e in events)  # never completed
