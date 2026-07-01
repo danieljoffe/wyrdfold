@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -528,6 +529,20 @@ def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> boo
     return int(candidate.get("score") or 0) > int(current.get("score") or 0)
 
 
+@dataclass(frozen=True)
+class _LogisticsFilter:
+    """The three /jobs logistics filter params (#86), bundled so they thread as
+    one argument through the list paths rather than three."""
+
+    remote_only: bool = False
+    min_salary: int | None = None
+    country: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.remote_only or self.min_salary is not None or bool(self.country)
+
+
 def _assemble_jobs_page(
     supabase: Client,
     *,
@@ -545,6 +560,7 @@ def _assemble_jobs_page(
     only_terms: list[str],
     preferences: TargetPreferences | None,
     user_id: str | None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """Shared tail of both two-query list paths (per-target + cross-target).
 
@@ -564,7 +580,8 @@ def _assemble_jobs_page(
     # pre-filter total and render short. The score cutoff is NOT here — it's
     # already folded into min_score at the query layer.
     has_pref_filter = _preferences_have_post_fetch_filter(preferences)
-    has_post_fetch_filter = has_location_filter or has_pref_filter
+    has_logistics_filter = logistics is not None and logistics.active
+    has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
     fs_lookup = _first_seen_lookup(supabase, list(by_id.keys()))
@@ -624,6 +641,9 @@ def _assemble_jobs_page(
             p["score_breakdown"] = ts.get("score_breakdown")
             p["scoring_status"] = ts.get("scoring_status", "stage1")
             p["pending"] = _is_pending(ts)
+            # Filter-only logistics (remote/salary/location) — never affects
+            # score or sort; powers the /jobs chips + filter params (#86).
+            p["logistics_filters"] = ts.get("logistics_filters")
 
     if total is None or sort_col != "score":
         if has_location_filter:
@@ -632,6 +652,8 @@ def _assemble_jobs_page(
             )
         if has_pref_filter:
             postings = _apply_preferences_filter(postings, preferences)
+        if logistics is not None and logistics.active:
+            postings = _apply_logistics_filter(postings, logistics)
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
@@ -677,6 +699,7 @@ def _list_jobs_for_target_two_query(
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
 
@@ -697,7 +720,7 @@ def _list_jobs_for_target_two_query(
         supabase.table("scores")
         .select(
             "job_posting_id, score, recency_score, score_breakdown, "
-            "scoring_status, axis_scores",
+            "scoring_status, axis_scores, logistics_filters",
         )
         .eq("target_id", target_id)
         .eq("excluded", False)
@@ -727,6 +750,7 @@ def _list_jobs_for_target_two_query(
         only_terms=only_terms,
         preferences=preferences,
         user_id=user_id,
+        logistics=logistics,
     )
 
 
@@ -747,6 +771,7 @@ def _list_jobs_for_target(
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
 
@@ -780,16 +805,27 @@ def _list_jobs_for_target(
         "cursor": cursor,
         "user_id": user_id,
     }
-    if axis_weights is not None or _preferences_have_post_fetch_filter(preferences):
+    # Logistics filters (#86) are post-fetch like location/preferences, so an
+    # active one also forces the two-query path — the RPC keyset can't see it.
+    has_logistics = logistics is not None and logistics.active
+    if (
+        axis_weights is not None
+        or _preferences_have_post_fetch_filter(preferences)
+        or has_logistics
+    ):
         return _list_jobs_for_target_two_query(
-            supabase, axis_weights=axis_weights, preferences=preferences, **kwargs
+            supabase,
+            axis_weights=axis_weights,
+            preferences=preferences,
+            logistics=logistics,
+            **kwargs,
         )
     try:
         return _list_jobs_for_target_rpc(supabase, **kwargs)
     except Exception:
         logger.debug("RPC get_target_jobs unavailable, falling back to two-query pattern")
         return _list_jobs_for_target_two_query(
-            supabase, preferences=preferences, **kwargs
+            supabase, preferences=preferences, logistics=logistics, **kwargs
         )
 
 
@@ -809,6 +845,7 @@ def _list_jobs_across_user_targets(
     cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -834,7 +871,7 @@ def _list_jobs_across_user_targets(
         supabase.table("scores")
         .select(
             "job_posting_id, target_id, score, recency_score, "
-            "axis_scores, score_breakdown, scoring_status"
+            "axis_scores, score_breakdown, scoring_status, logistics_filters"
         )
         .in_("target_id", list(user_target_ids))
         .eq("excluded", False)
@@ -881,6 +918,7 @@ def _list_jobs_across_user_targets(
         only_terms=only_terms,
         preferences=None,  # untargeted view has no per-target preference filter
         user_id=user_id,
+        logistics=logistics,
     )
 
 
@@ -986,6 +1024,46 @@ def _apply_location_filter(
             only_terms=only_terms,
         )
     ]
+
+
+def _logistics_passes(logistics: dict[str, Any] | None, f: _LogisticsFilter) -> bool:
+    """One posting's ``logistics_filters`` dict against the active filters.
+
+    Semantics per plan-wyrdfold-logistics-chips.md:
+    - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
+      unknown/``unspecified`` status is dropped; the user explicitly asked for
+      remote, so surfacing unknowns would dilute the filter).
+    - ``min_salary`` — STRICT: keep only when ``salary_max`` is present and
+      ``>= min_salary`` (an undisclosed salary is dropped).
+    - ``country`` — LENIENT: keep when ``location_country`` matches
+      (case-insensitive) OR is absent (a remote role with no country anchor
+      still passes).
+    """
+    log = logistics or {}
+    if f.remote_only and log.get("remote_status") != "remote":
+        return False
+    if f.min_salary is not None:
+        salary_max = log.get("salary_max")
+        if salary_max is None or salary_max < f.min_salary:
+            return False
+    if f.country:
+        country = log.get("location_country")
+        if country is not None and str(country).upper() != f.country.upper():
+            return False
+    return True
+
+
+def _apply_logistics_filter(
+    postings: list[dict[str, Any]], f: _LogisticsFilter
+) -> list[dict[str, Any]]:
+    """Drop postings failing the logistics filters (#86), reading each row's
+    overlaid ``logistics_filters`` dict. Post-fetch like the location filter, so
+    it composes with the status/company/search/preference filters already on the
+    two-query path (and forces that path when active — the RPC keyset can't see
+    it)."""
+    if not f.active:
+        return postings
+    return [p for p in postings if _logistics_passes(p.get("logistics_filters"), f)]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -1210,11 +1288,18 @@ def list_jobs(
     target_id: str | None = Query(None),
     exclude_locations: str | None = Query(None, max_length=500),
     only_locations: str | None = Query(None, max_length=500),
+    remote_only: bool = Query(False),
+    min_salary: int | None = Query(None, ge=0),
+    country: str | None = Query(None, max_length=4),
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, Any]:
     exclude_terms = _parse_location_list(exclude_locations)
     only_terms = _parse_location_list(only_locations)
+    # Logistics filters (#86) — over the grader's scores.logistics_filters data.
+    logistics = _LogisticsFilter(
+        remote_only=remote_only, min_salary=min_salary, country=country
+    )
     cursor_data = _decode_cursor(cursor)
     ascending = order == "asc"
 
@@ -1236,6 +1321,11 @@ def list_jobs(
         # by ``_parse_location_list``.
         exclude_locations=",".join(sorted(exclude_terms)) or None,
         only_locations=",".join(sorted(only_terms)) or None,
+        # Logistics filters vary the result set, so they must vary the key
+        # (country upper-cased since the filter matches case-insensitively).
+        remote_only=remote_only or None,
+        min_salary=min_salary,
+        country=(country or "").upper() or None,
         user_id=user_id,
     )
     cached: dict[str, Any] | None = job_list_cache.get(cache_key)
@@ -1315,6 +1405,7 @@ def list_jobs(
             axis_weights=axis_weights,
             preferences=preferences,
             user_id=user_id,
+            logistics=logistics,
         )
         # Decay the displayed score by posting age (read-time, never stale).
         # raw_score keeps the undecayed fit. No-op when the flag is off.
@@ -1349,6 +1440,7 @@ def list_jobs(
             cursor=cursor_data,
             weights_by_target=weights_by_target or None,
             user_id=user_id,
+            logistics=logistics,
         )
         # Decay the displayed score by posting age (read-time, never stale).
         # raw_score keeps the undecayed fit. No-op when the flag is off.
