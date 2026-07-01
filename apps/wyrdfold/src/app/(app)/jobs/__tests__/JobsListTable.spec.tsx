@@ -113,6 +113,37 @@ describe('JobsListTable', () => {
     expect(header).toHaveAttribute('aria-sort', 'ascending');
   });
 
+  it('renders compact logistics chips inline in the row when present (#86)', () => {
+    // The desktop table row was the gap — mobile card + detail panel already
+    // showed these; surfaced by the release end-to-end UX walkthrough.
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({
+            logistics_filters: {
+              remote_status: 'remote',
+              salary_min: 150000,
+              salary_max: 180000,
+              salary_currency: 'USD',
+              salary_unit: 'year',
+              location_city: null,
+              location_country: 'US',
+            },
+          }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    // Scope to the chip region — "Remote"/"US" also appear in the Location column.
+    const chips = within(screen.getByLabelText('Job logistics'));
+    expect(chips.getByText('Remote')).toBeInTheDocument();
+    expect(chips.getByText('$150k–$180k')).toBeInTheDocument();
+    expect(chips.getByText('US')).toBeInTheDocument();
+  });
+
   it('invokes handleSort with the column key when a header button is clicked', async () => {
     const handleSort = jest.fn();
     const user = userEvent.setup();
