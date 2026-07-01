@@ -16,7 +16,6 @@ must guarantee:
 
 from __future__ import annotations
 
-import re
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -32,6 +31,7 @@ from app.routers.jobs import (
     _preferences_have_post_fetch_filter,
     _seniority_passes,
 )
+from tests.support.fake_supabase import two_query_supabase
 
 
 def _job(**cols: Any) -> dict[str, Any]:
@@ -362,108 +362,11 @@ def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
 
 # ---- integration: cutoff filters low scores + leniency end-to-end ----------
 #
-# These drive the real ``_list_jobs_for_target_two_query`` against a fake that
-# HONORS the server-side ``.gte("score", min_score)`` filter — so a too-low
-# score is dropped by the DB exactly as in production — while leaving the
-# post-fetch preference filter to the real Python code path.
-
-
-class _Resp:
-    def __init__(self, data: list[dict[str, Any]], count: int | None = None) -> None:
-        self.data = data
-        self.count = count
-
-
-class _ScoresChain:
-    """Fake for the ``scores`` query that actually applies the ``gte`` floor,
-    so the cutoff-folded ``min_score`` provably drops low-scoring rows."""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self._rows = rows
-        self._floor: int | None = None
-        self._exempt_pending = False
-
-    def select(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def eq(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def gte(self, _col: str, value: int) -> _ScoresChain:
-        self._floor = value
-        return self
-
-    def or_(self, expr: str, *_a: Any, **_kw: Any) -> _ScoresChain:
-        # Mirrors ``_apply_score_floor`` — the floor exempts Pending rows
-        # (scoring_status != 'complete'). Parse the floor out of the PostgREST
-        # OR expression "...,score.gte.N" and apply the exemption in execute().
-        m = re.search(r"score\.gte\.(\d+)", expr)
-        if m:
-            self._floor = int(m.group(1))
-            self._exempt_pending = True
-        return self
-
-    def order(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def execute(self) -> _Resp:
-        rows = self._rows
-        if self._floor is not None:
-            if self._exempt_pending:
-                rows = [
-                    r
-                    for r in rows
-                    if r.get("scoring_status") != "complete" or r["score"] >= self._floor
-                ]
-            else:
-                rows = [r for r in rows if r["score"] >= self._floor]
-        return _Resp(list(rows), count=len(rows))
-
-
-class _JobsChain:
-    """Fake for the ``jobs`` fetch — returns the postings for the requested ids
-    (order-independent, like Supabase ``in_``)."""
-
-    def __init__(self, postings: dict[str, dict[str, Any]]) -> None:
-        self._postings = postings
-        self._ids: list[str] = []
-
-    def select(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def in_(self, _col: str, ids: list[str]) -> _JobsChain:
-        self._ids = ids
-        return self
-
-    def is_(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def eq(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def ilike(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def or_(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def execute(self) -> _Resp:
-        return _Resp([self._postings[i] for i in self._ids if i in self._postings])
-
-
-def _supabase(scores: list[dict[str, Any]], jobs: dict[str, dict[str, Any]]) -> MagicMock:
-    sb = MagicMock()
-
-    def _table(name: str) -> Any:
-        if name == "scores":
-            return _ScoresChain(scores)
-        if name == "jobs":
-            return _JobsChain(jobs)
-        # user_jobs etc. — return an empty-data chain (no per-user status).
-        return _JobsChain({})
-
-    sb.table.side_effect = _table
-    return sb
+# These drive the real ``_list_jobs_for_target_two_query`` against
+# ``two_query_supabase`` (tests.support.fake_supabase), which HONORS the
+# server-side score floor — so a too-low score is dropped by the DB exactly as
+# in production — while leaving the post-fetch preference filter to the real
+# Python code path.
 
 
 def test_integration_cutoff_drops_low_scores() -> None:
@@ -479,7 +382,7 @@ def test_integration_cutoff_drops_low_scores() -> None:
         "mid": {"id": "mid", "title": "mid", "location": None},
         "lo": {"id": "lo", "title": "lo", "location": None},
     }
-    sb = _supabase(scores, jobs)
+    sb = two_query_supabase(scores, jobs)
 
     # Caller folds pref_score_cutoff=60 into min_score before calling.
     result = _list_jobs_for_target_two_query(
@@ -516,7 +419,7 @@ def test_integration_null_tags_kept_with_active_pref_filter() -> None:
         "a": {"id": "a", "title": "a", "location": None},
         "b": {"id": "b", "title": "b", "location": None},
     }
-    sb = _supabase(scores, jobs)
+    sb = two_query_supabase(scores, jobs)
 
     result = _list_jobs_for_target_two_query(
         sb,
@@ -559,7 +462,7 @@ def test_integration_employment_type_filter_drops_known_mismatch() -> None:
         "ct": {"id": "ct", "title": "ct", "location": None, "employment_type": "contract"},
         "unk": {"id": "unk", "title": "unk", "location": None},  # no tag → kept
     }
-    sb = _supabase(scores, jobs)
+    sb = two_query_supabase(scores, jobs)
 
     result = _list_jobs_for_target_two_query(
         sb,

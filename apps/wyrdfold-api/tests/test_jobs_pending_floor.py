@@ -19,8 +19,6 @@ whether the daily grading cap happened to reach it. These tests pin the fix:
 
 from __future__ import annotations
 
-import re
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +34,7 @@ from app.routers.jobs import (
     _prefer_score_row,
     _rank_graded_first,
 )
+from tests.support.fake_supabase import FakeResponse, two_query_supabase
 
 # --------------------------------------------------------------------------
 # Pure helpers
@@ -119,89 +118,9 @@ def test_prefer_score_row_graded_beats_pending() -> None:
     )
 
 
-# --------------------------------------------------------------------------
-# Filtering supabase mock (the real PostgREST applies the floor server-side)
-# --------------------------------------------------------------------------
-
-
-class _Resp:
-    def __init__(self, data: list[dict[str, Any]], count: int | None = None) -> None:
-        self.data = data
-        self.count = count
-
-
-class _ScoresChain:
-    """Applies the Pending-aware floor the way ``_apply_score_floor`` asks."""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self._rows = rows
-        self._floor: int | None = None
-        self._exempt_pending = False
-
-    def select(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def eq(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def in_(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def order(self, *_a: Any, **_kw: Any) -> _ScoresChain:
-        return self
-
-    def or_(self, expr: str, *_a: Any, **_kw: Any) -> _ScoresChain:
-        m = re.search(r"score\.gte\.(\d+)", expr)
-        if m:
-            self._floor = int(m.group(1))
-            self._exempt_pending = True
-        return self
-
-    def execute(self) -> _Resp:
-        rows = self._rows
-        if self._floor is not None and self._exempt_pending:
-            rows = [
-                r
-                for r in rows
-                if r.get("scoring_status") != "complete" or r["score"] >= self._floor
-            ]
-        return _Resp(list(rows), count=len(rows))
-
-
-class _JobsChain:
-    def __init__(self, postings: dict[str, dict[str, Any]]) -> None:
-        self._postings = postings
-        self._ids: list[str] = []
-
-    def select(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def in_(self, _col: str, ids: list[str]) -> _JobsChain:
-        self._ids = ids
-        return self
-
-    def eq(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def is_(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def ilike(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def or_(self, *_a: Any, **_kw: Any) -> _JobsChain:
-        return self
-
-    def execute(self) -> _Resp:
-        return _Resp([self._postings[i] for i in self._ids if i in self._postings])
-
-
-def _supabase(scores: list[dict[str, Any]], postings: dict[str, dict[str, Any]]) -> MagicMock:
-    sb = MagicMock()
-    sb.table.side_effect = lambda name: (
-        _ScoresChain(scores) if name == "scores" else _JobsChain(postings)
-    )
-    return sb
+# The ``scores``/``jobs`` two-query stubs live in tests.support.fake_supabase
+# (shared with test_jobs_preferences_filter). ``two_query_supabase`` emulates
+# the Pending-aware score floor + the jobs re-fetch.
 
 
 # --------------------------------------------------------------------------
@@ -218,7 +137,7 @@ def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.Monkey
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g90", "g30", "p20")}
     result = _list_jobs_for_target_two_query(
-        _supabase(scores, postings),
+        two_query_supabase(scores, postings),
         target_id="t-1", page_size=10, sort="score", ascending=False,
         min_score=50, status=None, company=None, search=None,
         exclude_terms=[], only_terms=[], cursor={},
@@ -238,7 +157,7 @@ def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPat
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g50", "p80", "g70")}
     result = _list_jobs_for_target_two_query(
-        _supabase(scores, postings),
+        two_query_supabase(scores, postings),
         target_id="t-1", page_size=10, sort="score", ascending=False,
         min_score=None, status=None, company=None, search=None,
         exclude_terms=[], only_terms=[], cursor={},
@@ -264,7 +183,7 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
     ]
     postings = {"j": {"id": "j", "title": "j"}}
     result = _list_jobs_across_user_targets(
-        _supabase(scores, postings),
+        two_query_supabase(scores, postings),
         user_target_ids={"t-1", "t-2"}, page_size=10, sort="score", ascending=False,
         min_score=None, status=None, company=None, search=None,
         exclude_terms=[], only_terms=[], cursor={},
@@ -291,7 +210,7 @@ def test_counts_skip_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_counts_use_rpc_when_unfloored() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = _Resp([{"status": "new", "count": 3}])
+    sb.rpc.return_value.execute.return_value = FakeResponse([{"status": "new", "count": 3}])
     out = _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=None, user_id="u1")
     assert out == {"new": 3}
     sb.rpc.assert_called_once()  # no floor → keyset RPC fast path
