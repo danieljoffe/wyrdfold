@@ -34,6 +34,21 @@ export type ScoringStatus = 'stage1' | 'stage2' | 'complete';
 // Mirrors `MANUAL_SOURCE_ID` in apps/wyrdfold-api/app/services/extract.py.
 export const MANUAL_SOURCE_ID = '00000000-0000-4000-a000-000000000001';
 
+/**
+ * Structured logistics the Phase 2 grader extracts from the JD (#86). Filter-only
+ * — never affects score, recency, or sort. Mirrors the backend
+ * `app/models/logistics.py` shape.
+ */
+export interface LogisticsFilters {
+  remote_status: 'remote' | 'hybrid' | 'onsite' | 'unspecified';
+  salary_min: number | null;
+  salary_max: number | null;
+  salary_currency: string | null;
+  salary_unit: 'year' | 'hour' | null;
+  location_city: string | null;
+  location_country: string | null;
+}
+
 export interface JobPosting {
   id: string;
   external_id: string;
@@ -52,6 +67,12 @@ export interface JobPosting {
    * ``scoring_status !== 'complete'``; sent explicitly by the API.
    */
   pending?: boolean;
+  /**
+   * Structured logistics extracted by the Phase 2 grader (#86): remote status,
+   * salary, location. Filter-only. Null/absent when the job hasn't been graded
+   * since logistics extraction was enabled — chips simply don't render then.
+   */
+  logistics_filters?: LogisticsFilters | null;
   status: string;
   salary_text: string | null;
   greenhouse_updated_at: string | null;
