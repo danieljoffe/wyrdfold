@@ -9,6 +9,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.experience import ProseDoc
 
 TABLE = "experience_prose_docs"
@@ -16,7 +17,7 @@ TABLE = "experience_prose_docs"
 
 def get_latest(supabase: Client, user_id: str | None) -> ProseDoc | None:
     query = supabase.table(TABLE).select("*").order("version", desc=True).limit(1)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -26,7 +27,7 @@ def get_latest(supabase: Client, user_id: str | None) -> ProseDoc | None:
 
 def list_versions(supabase: Client, user_id: str | None, limit: int = 50) -> list[ProseDoc]:
     query = supabase.table(TABLE).select("*").order("version", desc=True).limit(limit)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [ProseDoc.model_validate(r) for r in rows]

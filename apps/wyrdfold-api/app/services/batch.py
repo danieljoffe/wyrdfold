@@ -16,6 +16,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.batch import BatchItem, BatchJob
 from app.models.experience import OptimizedDoc, PreferencesPayload
 from app.models.tailor import ContactInfo, ResumeType
@@ -77,7 +78,7 @@ def get_batch(
     leaked.
     """
     query = supabase.table(TABLE).select("*").eq("id", batch_id)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.execute()
     if not resp.data:
         return None
