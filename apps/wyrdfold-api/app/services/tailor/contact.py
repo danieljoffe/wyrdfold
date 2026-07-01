@@ -14,6 +14,7 @@ from typing import Any, cast
 from fastapi import HTTPException
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.tailor import ContactInfo
 
 _IDENTITY_COLUMNS = "name, email, phone_number, location, linkedin_url, website_url"
@@ -41,7 +42,7 @@ async def resolve_contact(
 
     def _query() -> Any:
         q = supabase.table("user_profiles").select(_IDENTITY_COLUMNS)
-        q = q.eq("user_id", user_id) if user_id else q.is_("user_id", "null")
+        q = q.eq("user_id", resolve_owner(user_id))
         return q.limit(1).execute()
 
     resp = await asyncio.to_thread(_query)

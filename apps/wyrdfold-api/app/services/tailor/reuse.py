@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.tailor import TailoredResumeRecord
 from app.models.targets import ScoringProfile
 from app.services.experience.optimized import get_latest as get_latest_optimized
@@ -135,11 +136,7 @@ def find_reusable_resume(
         .order("created_at", desc=True)
         .limit(_RECENT_RESUMES_WINDOW)
     )
-    docs_query = (
-        docs_query.is_("user_id", "null")
-        if user_id is None
-        else docs_query.eq("user_id", user_id)
-    )
+    docs_query = docs_query.eq("user_id", resolve_owner(user_id))
     rows = cast(list[dict[str, Any]], docs_query.execute().data or [])
     posting_ids = list(
         {

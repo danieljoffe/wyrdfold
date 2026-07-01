@@ -39,7 +39,7 @@ def _mock_supabase() -> MagicMock:
     supabase = MagicMock()
 
     # prose get_latest → None (first upload)
-    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.is_.return_value.execute.return_value.data = (
+    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.eq.return_value.execute.return_value.data = (
         []
     )
 

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
+from app.constants import SYSTEM_USER_ID
 from app.models.tailor import ContactInfo
 from app.services.tailor.contact import resolve_contact
 
@@ -22,7 +23,7 @@ def _profile_supabase(profile_row: dict[str, Any] | None) -> MagicMock:
     chain = MagicMock()
     chain.select.return_value = chain
     chain.eq.return_value = chain
-    chain.is_.return_value = chain
+    chain.eq.return_value = chain
     chain.limit.return_value = chain
     chain.execute.return_value = _ExecuteStub([profile_row] if profile_row else [])
 
@@ -106,12 +107,13 @@ async def test_profile_query_scoped_to_user_id() -> None:
     chain.is_.assert_not_called()
 
 
-async def test_profile_query_scoped_to_null_user_id_for_legacy_caller() -> None:
-    """Legacy api-key / cron caller (user_id=None) reads the NULL-owned row."""
-    supabase = _profile_supabase({"name": "Legacy User"})
+async def test_profile_query_scoped_to_system_for_no_user_caller() -> None:
+    """A no-user (api-key / cron) caller reads the SYSTEM-owned row, not NULL —
+    the retired ``.is_("user_id","null")`` branch (#88 groundwork)."""
+    supabase = _profile_supabase({"name": "System User"})
 
     await resolve_contact(supabase, None, override=None)
 
     chain = supabase.table.return_value
-    chain.is_.assert_called_once_with("user_id", "null")
-    chain.eq.assert_not_called()
+    chain.eq.assert_any_call("user_id", SYSTEM_USER_ID)
+    chain.is_.assert_not_called()
