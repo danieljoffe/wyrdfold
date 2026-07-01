@@ -268,11 +268,16 @@ class Settings(BaseSettings):
     # min/max/currency/unit, location_city/country) alongside the axis
     # scores. The result is persisted to ``scores.logistics_filters``
     # (migration #20260603100000) and consumed by the /jobs logistics
-    # chips. When False the prompt is unchanged and the column stays
-    # NULL — this is the additive shadow that pre-flip rollout uses.
-    # Per ``feedback-prompt-change-shadow-run``: ship behind this flag,
-    # compare axis-score distributions before flipping in production.
-    logistics_extraction_enabled: bool = False
+    # filters/chips (#86). Logistics is FILTER-ONLY — never affects
+    # score / recency_score / sort order.
+    #
+    # Flipped ON 2026-06-30 after the shadow-run check the older comment
+    # asked for: an A/B over 5 JDs across the fit range (base prompt vs
+    # base+addendum) gave fit-score Δ mean +1.4, max |Δ| 4, ranking
+    # preserved — score-neutral within grader sampling noise. Historical
+    # scores are NOT backfilled (per the user); the column populates on
+    # newly-graded jobs going forward.
+    logistics_extraction_enabled: bool = True
 
     # Learner re-score projection / learning-rate cap (#5 P4). Before a
     # high-confidence ``ProfilePatch`` auto-applies, the learner projects the
