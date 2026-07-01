@@ -12,12 +12,14 @@ cost.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, cast
 
 from supabase import Client
 
 from app.models.tailor import TailoredResumeRecord
 from app.models.targets import ScoringProfile
+from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.tailor.persistence import insert_row, jd_hash
 
 SIMILARITY_THRESHOLD = 0.70
@@ -56,6 +58,43 @@ def jd_similarity(
     if not union:
         return 0.0
     return len(hits_a & hits_b) / len(union)
+
+
+def _current_master_created_at(supabase: Client, user_id: str | None) -> datetime | None:
+    """``created_at`` of the user's CURRENT master optimized doc, or None.
+
+    Best-effort: a lookup failure must never block reuse, so any error returns
+    None (which disables the staleness check, falling back to the old behavior)."""
+    try:
+        master = get_latest_optimized(supabase, user_id)
+    except Exception:
+        return None
+    return master.created_at if master else None
+
+
+def _resume_predates_master(row: dict[str, Any], master_created_at: datetime | None) -> bool:
+    """True if a candidate resume was generated BEFORE the current master doc
+    version was created — i.e. it was built from an older master (#47).
+
+    Reuse copies the source's payload/markdown/docx verbatim, so cloning a
+    resume built from a since-edited master would silently ship pre-edit content
+    (e.g. a fabrication the user has since corrected, a fixed date, removed
+    content). We refuse those; the caller regenerates fresh. None master / an
+    unparseable timestamp never refuses (don't drop a reuse on a guess)."""
+    if master_created_at is None:
+        return False
+    raw = row.get("created_at")
+    if not raw:
+        return False
+    try:
+        created = (
+            raw
+            if isinstance(raw, datetime)
+            else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        )
+        return created < master_created_at
+    except (ValueError, TypeError):
+        return False
 
 
 # How many of the caller's most recent resumes we consider for reuse.
@@ -130,10 +169,16 @@ def find_reusable_resume(
         r for r in rows if r.get("job_posting_id") in in_target
     ][:_MAX_CANDIDATES]
 
+    # Resumes built from an older master doc version would clone stale,
+    # pre-edit content — refuse them so the caller regenerates fresh (#47).
+    master_created_at = _current_master_created_at(supabase, user_id)
+
     best_record: TailoredResumeRecord | None = None
     best_sim = 0.0
 
     for row in candidates:
+        if _resume_predates_master(row, master_created_at):
+            continue
         jd_snapshot = row.get("jd_snapshot", "")
         sim = jd_similarity(job_description, jd_snapshot, profile_keywords)
         if sim >= SIMILARITY_THRESHOLD and sim > best_sim:
