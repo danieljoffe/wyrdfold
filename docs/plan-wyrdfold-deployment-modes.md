@@ -41,8 +41,7 @@ Why this is the right call:
 - **RLS becomes uniform** → #88/#6 turn into a clean migration instead of a special-case
   minefield.
 - **A self-hosted instance is secure even if exposed to the internet** (RLS walls it). The
-  current "no-auth single-tenant" mode is _not_ — that's a latent footgun for any dev who
-  points a domain at their instance.
+  current "no-auth single-tenant" mode is _not_ — it creates a significant security risk if a dev points a domain at their instance.
 - **One code path** to test and maintain, instead of two half-tested ones.
 
 ## The mode flag: `DEPLOYMENT_MODE = self_host | saas`
