@@ -147,7 +147,7 @@ The DB surgery is only safe while there's effectively one user's data. Do it fir
 
 ## Risks / notes
 
-- The **backfill + `NOT NULL`** is the risky DB step — irreversible-ish and touches every
+- The **backfill + `NOT NULL`** is the risky DB step — largely irreversible and touches every
   per-user table. Do it **while single-user** (one owner's data), snapshot first, and gate it
   behind the migration-safety guard.
 - The **shared catalog** (`jobs`/`scores`/`targets`) stays shared — genuinely shared data
