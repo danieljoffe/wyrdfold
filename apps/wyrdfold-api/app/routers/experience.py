@@ -8,6 +8,7 @@ doc -> chunks, all cost-logged.
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -66,6 +67,8 @@ from app.services.ingest.parse import ParseError
 from app.services.ingest.storage import upload_file
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient, strip_markdown_fence
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/experience",
@@ -515,78 +518,105 @@ async def derive_optimized_stream(
 
         buffered_text: list[str] = []
         result = None
-        async for event in llm.stream(
+        # Hold the generator so we can close it in ``finally`` (#29 M-r2-4): a
+        # mid-stream failure or a disconnect must not leave the upstream LLM
+        # stream dangling for the GC to reap.
+        stream = llm.stream(
             model=derive.DEFAULT_MODEL,
             system=derive.SYSTEM_PROMPT,
             messages=[Message(role="user", content=prose_doc.content)],
             purpose=derive.DEFAULT_PURPOSE,
             max_tokens=derive.DEFAULT_MAX_TOKENS,
             cache_system=True,
-        ):
-            if event.type == "delta":
-                buffered_text.append(event.text)
-                yield _sse_event("delta", {"text": event.text})
-            else:
-                result = event.result
-
-        if result is None:
-            yield _sse_event(
-                "error", {"detail": "stream ended without a final event"}
-            )
-            return
-
+        )
         try:
-            payload = OptimizedPayload.model_validate_json(
-                strip_markdown_fence(result.content)
-            )
-        except ValidationError as exc:
-            yield _sse_event("error", {"detail": f"invalid payload: {exc}"})
-            return
+            async for event in stream:
+                # Stop burning LLM/BYOK tokens the moment the client goes away
+                # (#29 M-r2-3) — an abandoned derive would otherwise consume the
+                # whole stream + persist a doc nobody is waiting for.
+                if await request.is_disconnected():
+                    logger.info(
+                        "derive/stream: client disconnected mid-stream "
+                        "(user=%s); aborting to stop token spend",
+                        user_id,
+                    )
+                    return
+                if event.type == "delta":
+                    buffered_text.append(event.text)
+                    yield _sse_event("delta", {"text": event.text})
+                else:
+                    result = event.result
 
-        await asyncio.to_thread(
-            lambda: cost_log.record(
+            if result is None:
+                yield _sse_event(
+                    "error", {"detail": "stream ended without a final event"}
+                )
+                return
+
+            try:
+                payload = OptimizedPayload.model_validate_json(
+                    strip_markdown_fence(result.content)
+                )
+            except ValidationError as exc:
+                yield _sse_event("error", {"detail": f"invalid payload: {exc}"})
+                return
+
+            await asyncio.to_thread(
+                lambda: cost_log.record(
+                    supabase,
+                    user_id=user_id,
+                    purpose=derive.DEFAULT_PURPOSE,
+                    result=result,
+                    metadata={
+                        "prose_doc_id": prose_doc.id,
+                        "prose_version": prose_doc.version,
+                        "streamed": True,
+                    },
+                )
+            )
+
+            carried = (
+                annotations.validate_annotation_refs(
+                    previous.payload.annotations, payload
+                )
+                if previous and previous.payload.annotations
+                else []
+            )
+            merged = annotations.merge_annotations(carried, payload.annotations)
+            payload = payload.model_copy(update={"annotations": merged})
+
+            doc = await asyncio.to_thread(
+                lambda: optimized.create_version(
+                    supabase,
+                    user_id=user_id,
+                    payload=payload,
+                    prose_doc_id=prose_doc.id,
+                    source="llm",
+                )
+            )
+            await chunks.upsert_for_optimized(
                 supabase,
+                embeddings,
+                doc,
                 user_id=user_id,
-                purpose=derive.DEFAULT_PURPOSE,
-                result=result,
-                metadata={
-                    "prose_doc_id": prose_doc.id,
-                    "prose_version": prose_doc.version,
-                    "streamed": True,
-                },
             )
-        )
 
-        carried = (
-            annotations.validate_annotation_refs(
-                previous.payload.annotations, payload
+            yield _sse_event(
+                "done",
+                {"doc": doc.model_dump(mode="json"), "cached": False},
             )
-            if previous and previous.payload.annotations
-            else []
-        )
-        merged = annotations.merge_annotations(carried, payload.annotations)
-        payload = payload.model_copy(update={"annotations": merged})
-
-        doc = await asyncio.to_thread(
-            lambda: optimized.create_version(
-                supabase,
-                user_id=user_id,
-                payload=payload,
-                prose_doc_id=prose_doc.id,
-                source="llm",
+        except Exception:
+            # A provider error mid-stream (or a downstream failure) must close
+            # the SSE cleanly with a terminal ``error`` frame rather than a
+            # truncated stream the client can only detect by timeout (#29 M-r2-4).
+            logger.exception("derive/stream failed for user=%s", user_id)
+            yield _sse_event(
+                "error", {"detail": "the derive stream failed; please retry"}
             )
-        )
-        await chunks.upsert_for_optimized(
-            supabase,
-            embeddings,
-            doc,
-            user_id=user_id,
-        )
-
-        yield _sse_event(
-            "done",
-            {"doc": doc.model_dump(mode="json"), "cached": False},
-        )
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     return StreamingResponse(
         generate(),
