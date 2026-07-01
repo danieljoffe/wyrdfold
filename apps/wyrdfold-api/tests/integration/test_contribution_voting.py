@@ -86,6 +86,29 @@ def test_votes_are_anonymous_and_own_row_only(
         ).execute()
 
 
+def test_recompute_rpc_is_service_role_only(
+    user_client_factory: Callable[[str], Client],
+    two_seeded_users: tuple[str, str],
+    target_with_contribution: tuple[str, str],
+) -> None:
+    """The atomic-suppression RPC (#29) is granted to ``service_role`` only.
+
+    It runs SECURITY DEFINER and tallies EVERY user's vote (RLS-bypassing), so it
+    must never be reachable on a user JWT — otherwise a caller could probe the
+    hidden tally or force-toggle a shared contribution's suppression. Postgres
+    denies the un-granted authenticated role, surfaced as a PostgREST APIError.
+    """
+    uid_a, _ = two_seeded_users
+    _, ref_id = target_with_contribution
+    a = user_client_factory(uid_a)
+
+    with pytest.raises(APIError):
+        a.rpc(
+            "recompute_contribution_suppression",
+            {"p_reference_jd_id": ref_id, "p_quorum": 2},
+        ).execute()
+
+
 def test_quorum_suppresses_and_upvote_rescues(
     service_client: Client,
     user_client_factory: Callable[[str], Client],
