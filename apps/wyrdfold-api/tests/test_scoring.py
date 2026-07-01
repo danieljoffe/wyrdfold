@@ -252,3 +252,41 @@ def test_title_search_keywords_lift_role_intent():
     assert with_keywords.breakdown.role_titles > 0
     assert without_keywords.breakdown.role_titles == 0
     assert with_keywords.score > without_keywords.score
+
+
+def test_role_title_credit_graded_by_specificity() -> None:
+    """#47: a multi-word role-title match pins the discipline (full credit); a
+    lone generic single-word match is ambiguous (half credit), so an incidental
+    hit no longer scores like a bullseye."""
+    profile = _profile(core={"React": 3})
+    multi = score_title_against_profile(
+        "Senior Frontend Engineer",
+        profile,
+        search_keywords=["frontend engineer", "ui engineer"],
+    )
+    single = score_title_against_profile(
+        "Sales Engineer",
+        profile,
+        search_keywords=["engineer"],
+    )
+    assert multi.breakdown.role_titles > single.breakdown.role_titles > 0
+    # The single-word (incidental) hit earns exactly half the multi-word credit.
+    assert single.breakdown.role_titles == multi.breakdown.role_titles * 0.5
+
+
+def test_incidental_single_word_title_hit_scores_below_true_match() -> None:
+    """#47: an off-role whose only title signal is a generic word ("engineer"
+    in "Sales Engineer") must score below a true multi-word frontend match,
+    even when both are offered the same keyword set."""
+    profile = _profile(core={"React": 3, "TypeScript": 3})
+    keywords = ["frontend engineer", "ui engineer", "engineer"]
+    true_match = score_title_against_profile(
+        "Frontend Engineer", profile, search_keywords=keywords
+    )
+    off_role = score_title_against_profile(
+        "Sales Engineer", profile, search_keywords=keywords
+    )
+    # True match hits a 2-word keyword (full credit); the off-role hits only the
+    # lone "engineer" (half), so it ranks strictly lower.
+    assert true_match.breakdown.role_titles == off_role.breakdown.role_titles * 2
+    assert true_match.score > off_role.score
