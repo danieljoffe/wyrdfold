@@ -21,9 +21,16 @@ _TABLE_PIPE_RE = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
 _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
 _HTML_TAG_RE = re.compile(r"<[a-zA-Z][^>]*>")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+_BULLET_RE = re.compile(r"^\s*[-*+]\s+(.+?)\s*$", re.MULTILINE)
 
 _PARA_WARN_AT = 80
 _PARA_ERROR_AT = 120
+
+# The tailor prompt asks for <=280-char bullets (an ATS/readability target), but
+# nothing enforced it — a 400-char run-on bullet passed the Pydantic cap clean
+# (#47). We warn (never block) past the target; the 400-char model cap stays a
+# looser hard backstop so an occasional overrun isn't rejected outright.
+_BULLET_CHAR_TARGET = 280
 
 # Required sections for resumes. Cover letters skip these.
 _REQUIRED_RESUME_SECTIONS = {"Experience"}
@@ -132,6 +139,25 @@ def lint_markdown(
                     severity="warning",
                 )
             )
+
+    # bullet_length — a run-on bullet scans poorly and eats the page budget.
+    over = [
+        len(m.group(1))
+        for m in _BULLET_RE.finditer(markdown)
+        if len(m.group(1)) > _BULLET_CHAR_TARGET
+    ]
+    if over:
+        violations.append(
+            LintViolation(
+                code="bullet_length",
+                message=(
+                    f"{len(over)} bullet(s) exceed the {_BULLET_CHAR_TARGET}-char "
+                    f"ATS target (longest {max(over)}). Long run-on bullets scan "
+                    "poorly; tighten them to one crisp accomplishment each."
+                ),
+                severity="warning",
+            )
+        )
 
     # page_count — non-empty line heuristic mirrors the docx linter
     line_count = _non_empty_lines(markdown)
