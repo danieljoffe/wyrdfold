@@ -14,6 +14,7 @@ Postgres or a non-default local setup.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import uuid
@@ -127,10 +128,8 @@ def create_auth_user(service_client: Client) -> str:
 
 def delete_auth_user(service_client: Client, user_id: str) -> None:
     """Delete the auth user; ON DELETE CASCADE clears all their per-user rows."""
-    try:
+    with contextlib.suppress(Exception):
         service_client.auth.admin.delete_user(user_id)
-    except Exception:
-        pass
 
 
 @pytest.fixture
