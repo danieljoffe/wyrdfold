@@ -683,49 +683,27 @@ def _list_jobs_for_target_two_query(
     ``axis_weights`` is the per-(user, target) read-time multiplier on
     Phase 2's axis scores. When non-None, the response's per-row ``score``
     field is replaced with the weighted display score computed from
-    ``axis_scores``. Sort order is unchanged in this iteration —
-    server-side ORDER BY still keys on ``recency_score`` (when decay is
-    on) or ``score`` so pagination stays cheap. A future iteration will
-    push the weighted sort into Python when weights diverge from
-    defaults. See plan-wyrdfold-streamlined-target.md "User-tunable axis
-    weights".
+    ``axis_scores``. Ranking, Pending-below-graded bucketing, and pagination
+    all happen in ``_assemble_jobs_page`` keyed on that display value — this
+    function only builds the candidate ``scores`` rows for the target.
     """
     offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
-    # When recency decay is on, the logical "score" sort orders by the
-    # decayed ``recency_score`` column instead of the raw fit score.
-    # min_score still filters on the raw ``score`` (the user's fit floor
-    # is a quality bar, not a recency bar); only the ORDER BY changes.
-    order_col = (
-        "recency_score"
-        if sort_col == "score" and settings.recency_decay_enabled
-        else "score"
-    )
+    # Fetch every candidate score row for the target (score floor applied at the
+    # DB). No server-side ORDER BY or exact count: _assemble_jobs_page re-ranks
+    # by the DISPLAY value and derives the total from the row set, so both would
+    # be pure waste (an exact count on every list request that nothing reads).
     ts_query = (
         supabase.table("scores")
         .select(
             "job_posting_id, score, recency_score, score_breakdown, "
             "scoring_status, axis_scores",
-            count=CountMethod.exact,
         )
         .eq("target_id", target_id)
         .eq("excluded", False)
     )
     ts_query = _apply_score_floor(ts_query, min_score)
-
-    # Push sort + pagination to the scores query when sorting by score.
-    # Chain a deterministic ``job_posting_id`` tiebreaker so rows with
-    # identical scores (very common at the same-score buckets) keep a
-    # stable position — without this, the last row of page N could
-    # reappear as the first row of page N+1.
-    if sort_col == "score":
-        ts_query = ts_query.order(order_col, desc=not ascending).order(
-            "job_posting_id"
-        )
-    # For non-score sorts we still need all qualifying IDs (sorted in Python after join)
-    # but we can at least get the total count from Supabase
-    ts_resp = ts_query.execute()
-    ts_rows = cast(list[dict[str, Any]], ts_resp.data or [])
+    ts_rows = cast(list[dict[str, Any]], ts_query.execute().data or [])
 
     if not ts_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
