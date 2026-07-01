@@ -49,9 +49,25 @@ the working rhythm above. When asked:
    against real data / a realistic fixture — hunting especially for interactions between the
    merged PRs that no single PR could surface. Record what you validated and the residual
    risk in the release PR body.
+3. **Exercise the running system, not just the suite.** Green tests prove the pieces; they
+   don't prove the assembled app works for a user or that the API is hard to abuse. Scoped to
+   what the release touched: **drive the real app** (browser) through the changed user
+   journeys — the interaction works end-to-end (real clicks → API round-trips → render), not
+   just that a component unit-renders — and **probe the changed API surface** for abuse (authz
+   refuses a non-owner, malformed / oversized / injection input is rejected, rate-limit +
+   cost-bearing paths, IDOR, PII/error leakage). Keep it proportional — the flows/endpoints
+   the release changed, not a full regression or pen-test; a docs-only release skips it.
+4. **Act on what the review surfaces — in a separate PR.** Reading the whole release at once
+   (and using it) exposes what no single PR could: cross-PR duplication, an abstraction the
+   stacked PRs outgrew, a refactor that's now obvious. Open a **new PR into `develop`** with
+   those cleanups for review — never fold them into the release PR, which must keep shipping
+   the _exact_ state you just proved. It rides the next release and doesn't block this one. (A
+   genuine **bug** the review catches is different: it doesn't ride forward — fix it on
+   `develop` and re-run the gate before merging.)
 
-The release PR is where accumulated changes earn their integration-level proof — a gate,
-not a rubber stamp.
+The release PR is a gate, not a rubber stamp — the step proves the release is **correct**
+(tests + integration), **usable** (the real flows work end-to-end), and **safe** (no widened
+abuse surface), and leaves the code **better refactored** than the release found it.
 
 ## Repo & PR governance
 
