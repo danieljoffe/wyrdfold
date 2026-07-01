@@ -94,6 +94,12 @@ export interface JobsFilterState {
   /** Comma-separated location terms — show only postings whose location
    *  contains at least one of them. Empty string = no restriction. */
   onlyLocations: string;
+  /** Logistics filters (#86), over the grader's `logistics_filters`. URL-state
+   *  only (survive reload/share via the query string); intentionally NOT in the
+   *  per-target localStorage persistence for v1. Empty string = inactive. */
+  remoteOnly?: string; // '' | 'true'
+  minSalary?: string; // '' | numeric string (annual USD)
+  country?: string; // '' | ISO country code
 }
 
 export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';

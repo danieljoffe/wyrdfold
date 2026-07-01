@@ -66,8 +66,7 @@ interface JobsListViewProps {
       }
     | undefined;
   onTableSortChange?:
-    | ((sort: JobsSortColumn, order: 'asc' | 'desc') => void)
-    | undefined;
+    ((sort: JobsSortColumn, order: 'asc' | 'desc') => void) | undefined;
 }
 
 export default function JobsListView({
@@ -105,6 +104,11 @@ export default function JobsListView({
     if (filters.excludeLocations)
       params.exclude_locations = filters.excludeLocations;
     if (filters.onlyLocations) params.only_locations = filters.onlyLocations;
+    // Logistics filters (#86) — forwarded to the backend /jobs endpoint, which
+    // filters on scores.logistics_filters (post-fetch, lenient/strict per param).
+    if (filters.remoteOnly) params.remote_only = filters.remoteOnly;
+    if (filters.minSalary) params.min_salary = filters.minSalary;
+    if (filters.country) params.country = filters.country;
     const combined = refreshKey + deleteKey;
     if (combined) params._r = String(combined);
     return params;
