@@ -217,8 +217,16 @@ export default function JobDetailPanel({
         { method: 'POST' }
       );
       if (res.ok) {
-        const data = (await res.json()) as JobAnalysis;
-        setAnalysis(data);
+        const data = (await res.json()) as JobAnalysis | { code?: string };
+        // ``no_profile`` is a setup state, not a failure — the user hasn't
+        // built their experience profile. The route returns it as a 200 marker
+        // (not a 404) so this auto-fired call doesn't log a console error;
+        // render the CTA (below) instead of a red error + doomed retry. (#105)
+        if ((data as { code?: string }).code === 'no_profile') {
+          setNeedsProfile(true);
+          return;
+        }
+        setAnalysis(data as JobAnalysis);
         // Backend blended the LLM score into the per-target ``scores``
         // row + flipped ``scoring_status`` to ``complete``. The
         // ``posting`` prop is now stale (still shows the keyword-only
@@ -228,29 +236,11 @@ export default function JobDetailPanel({
       } else {
         // Distinguish the specific "no description in DB" 422 case (the
         // route surfaces ``Job posting has no description to analyze.``)
-        // from every other failure mode (404, 503, LLM error, network
-        // reset). Everything else routes through ``extractApiError``,
-        // which understands both string ``detail`` and the structured
-        // ``llm_budget_exceeded`` 429 — the latter previously fell
-        // through to a generic "Analysis failed (429)" with no recovery
-        // hint.
-        // 404 ``no_profile`` is a setup state, not a failure: the user
-        // hasn't built their experience profile. Render a CTA (below)
-        // rather than a red error + retry that can never succeed. (#105)
-        if (res.status === 404) {
-          let code: unknown;
-          try {
-            code = (
-              (await res.clone().json()) as { detail?: { code?: unknown } }
-            )?.detail?.code;
-          } catch {
-            code = undefined;
-          }
-          if (code === 'no_profile') {
-            setNeedsProfile(true);
-            return;
-          }
-        }
+        // from every other failure mode (503, LLM error, network reset).
+        // Everything else routes through ``extractApiError``, which
+        // understands both string ``detail`` and the structured
+        // ``llm_budget_exceeded`` 429 — the latter previously fell through
+        // to a generic "Analysis failed (429)" with no recovery hint.
         const message = await extractApiError(res, 'Analysis failed');
         if (res.status === 422 && /no description/i.test(message)) {
           setAnalysisError(

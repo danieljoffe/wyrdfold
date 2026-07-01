@@ -607,14 +607,15 @@ async def test_router_missing_optimized_doc_returns_404(
     try:
         tc = TestClient(app)
         resp = tc.post("/analysis/job-1?target_id=tgt-1")
-        assert resp.status_code == 404
-        # Structured detail so the client can render a "set up your profile"
-        # empty state — and it must NOT leak the internal endpoint path (#105).
-        detail = resp.json()["detail"]
-        assert detail["code"] == "no_profile"
-        assert "profile" in detail["message"].lower()
-        assert "/experience/derive" not in str(detail)
-        assert "POST" not in detail["message"]
+        # A 200 empty-state marker (not a 4xx) so the panel's auto-fired call
+        # doesn't log a console 404; the body carries a structured code and
+        # must NOT leak the internal endpoint path (#105).
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["code"] == "no_profile"
+        assert "profile" in body["message"].lower()
+        assert "/experience/derive" not in str(body)
+        assert "POST" not in body["message"]
     finally:
         app.dependency_overrides.clear()
 
