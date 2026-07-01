@@ -30,17 +30,29 @@ _RANK: dict[str, int] = {
     "c_level": 6,
 }
 
-# Title tokens → the rank they imply. Checked high-to-low; first match wins, so
-# "Senior Director" reads as director, not senior. Word-boundaried to avoid
-# matching inside other words (e.g. "management" must not trip "manager").
+# Title tokens → the rank they imply. Ranks are pulled from ``_RANK`` by name so
+# this mapping can never drift from the canonical ladder (#47: the old table
+# hard-coded staff/principal/lead to 1, contradicting ``_RANK["staff"] == 2`` and
+# derive_profile_from_label's "Lead/Principal -> staff"). Checked high-to-low;
+# first match wins, so "Senior Director" reads as director, and "Senior Staff
+# Engineer" reads as staff (the higher rung), not senior. Word-boundaried so a
+# substring (e.g. "management") can't trip a token (e.g. "manager").
+#
+# NB ``scoring._TITLE_TIERS`` is a deliberately SEPARATE, finer-grained 0-8
+# ladder over title tokens used for keyword-score *penalties* (it distinguishes
+# role-type tiers like analyst/engineer that aren't seniority levels). It is not
+# this gate's enum-aligned ladder; the two are not merged on purpose.
 _TITLE_PATTERNS: tuple[tuple[int, re.Pattern[str]], ...] = (
-    (6, re.compile(r"\b(chief|c[xeofmt]o|c-level|chief officer)\b", re.I)),
-    (5, re.compile(r"\b(vp|svp|evp|vice[\s-]?president)\b", re.I)),
-    (4, re.compile(r"\b(director|head\s+of|global\s+head|group\s+head)\b", re.I)),
-    (3, re.compile(r"\b(manager|mgr)\b", re.I)),
-    (1, re.compile(r"\b(senior|sr\.?|staff|principal|lead)\b", re.I)),
+    (_RANK["c_level"], re.compile(r"\b(chief|c[xeofmt]o|c-level|chief officer)\b", re.I)),
+    (_RANK["vp"], re.compile(r"\b(vp|svp|evp|vice[\s-]?president)\b", re.I)),
+    (_RANK["director"], re.compile(r"\b(director|head\s+of|global\s+head|group\s+head)\b", re.I)),
+    (_RANK["manager"], re.compile(r"\b(manager|mgr)\b", re.I)),
+    # Staff/principal/lead are one rung above plain senior. This pattern must
+    # precede the senior pattern so a title carrying both reads as the higher.
+    (_RANK["staff"], re.compile(r"\b(staff|principal|lead)\b", re.I)),
+    (_RANK["senior"], re.compile(r"\b(senior|sr\.?)\b", re.I)),
     (
-        0,
+        _RANK["ic"],
         re.compile(
             r"\b(coordinator|specialist|associate|analyst|representative|"
             r"rep|agent|intern|assistant|clerk|trainee|apprentice)\b",

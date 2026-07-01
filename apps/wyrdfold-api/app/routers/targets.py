@@ -1380,8 +1380,13 @@ async def add_reference_jd(
     # closure below.
     jd_text = body.jd_text
 
-    # Derive profile from JD via LLM (cached by content hash + prompt version)
-    derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+    # Derive profile from JD via LLM (cached by content hash + prompt version).
+    # An empty/garbage JD (failed fetch, paywall) is rejected before it can
+    # poison the shared target's cached profile (#47).
+    try:
+        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await asyncio.to_thread(
         cost_log.record,
         supabase,

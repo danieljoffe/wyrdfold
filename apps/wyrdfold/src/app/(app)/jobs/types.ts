@@ -45,6 +45,13 @@ export interface JobPosting {
   score: number;
   score_breakdown: Record<string, number> | null;
   scoring_status: ScoringStatus | undefined;
+  /**
+   * True when the row is not yet Sonnet-graded — ``score`` is a keyword
+   * placeholder, not a real fit score (#47). The list still shows these
+   * (exempt from the min-score floor), badged Pending. Mirrors
+   * ``scoring_status !== 'complete'``; sent explicitly by the API.
+   */
+  pending?: boolean;
   status: string;
   salary_text: string | null;
   greenhouse_updated_at: string | null;

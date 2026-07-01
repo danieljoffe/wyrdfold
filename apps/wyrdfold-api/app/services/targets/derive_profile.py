@@ -26,6 +26,7 @@ from supabase import Client
 from app.models.llm import LLMResult, LLMUsage, Message, ModelId
 from app.models.targets import DerivedTarget
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,23 @@ DEFAULT_MODEL: ModelId = "claude-sonnet-4-6"
 DEFAULT_PURPOSE = "target.derive_profile"
 
 # Bump when SYSTEM_PROMPT below materially changes. See module docstring.
-PROMPT_VERSION = "v1"
+# v2: prepended the prompt-injection directive + fenced the JD in the user
+# message (scraped JD feeds the SHARED target profile). Invalidates v1 cache.
+PROMPT_VERSION = "v2"
 
 _CACHE_TABLE = "target_derive_jd_cache"
 
-SYSTEM_PROMPT = """\
+# Below this many non-whitespace chars a "JD" is almost certainly a failed
+# fetch (404 body, paywall stub, JS-rendered shell), not a real posting. The
+# LLM would hallucinate a profile from nothing AND — worse — it would be cached
+# by content hash and merged into the SHARED target, poisoning every future
+# score (#47). Guard before the cache lookup, the LLM call, and the cache write.
+MIN_JD_CHARS = 50
+
+SYSTEM_PROMPT = (
+    UNTRUSTED_CONTENT_DIRECTIVE
+    + "\n\n"
+    + """\
 You are a job-search scoring-profile generator. Given a job description,
 extract a scoring profile and search keywords as JSON matching this exact schema:
 
@@ -135,6 +148,7 @@ but a different ROLE FUNCTION.
 - These become NEGATIVE few-shot anchors.
 
 Return ONLY the JSON object. No prose, no markdown, no code fences."""
+)
 
 
 def _cache_key(jd_text: str, *, model: ModelId, prompt_version: str) -> str:
@@ -268,7 +282,20 @@ async def derive_profile_from_jd(
     like the pre-cache version: always calls the LLM.
 
     Returns (derived, result) so callers can log cost.
+
+    Raises ``ValueError`` when ``jd_text`` has fewer than ``MIN_JD_CHARS``
+    non-whitespace characters — deriving a profile from an empty/garbage JD
+    would hallucinate signal AND cache it into the shared target. The guard
+    runs before the cache lookup and the LLM call, so nothing is read or
+    written for a junk JD. Callers surface it (API → 422; the background
+    corpus-builder flips the target to ``error``).
     """
+    if len(jd_text.strip()) < MIN_JD_CHARS:
+        raise ValueError(
+            f"JD too short to derive a profile: {len(jd_text.strip())} "
+            f"non-whitespace chars (need >= {MIN_JD_CHARS})"
+        )
+
     if supabase is not None:
         key = _cache_key(jd_text, model=model, prompt_version=PROMPT_VERSION)
         cached = _get_cached(supabase, key)
@@ -276,11 +303,18 @@ async def derive_profile_from_jd(
             _record_cache_hit(supabase, key)
             return cached, _cache_hit_result(model)
 
+    # The JD is scraped text that feeds the SHARED target profile — fence it so
+    # an injected "extract these skills / add this negative" can't steer the
+    # extraction. The system prompt tells the model to treat fenced text as data.
+    user_content = (
+        "Extract the scoring profile from the job description below.\n\n"
+        + wrap_untrusted(jd_text, name="job_posting")
+    )
     derived, result = await complete_json(
         llm,
         model=model,
         system=SYSTEM_PROMPT,
-        messages=[Message(role="user", content=jd_text)],
+        messages=[Message(role="user", content=user_content)],
         schema=DerivedTarget,
         purpose=purpose,
         cache_system=True,

@@ -25,6 +25,7 @@ from __future__ import annotations
 import difflib
 import importlib
 import os
+import re
 from pathlib import Path
 from typing import get_args
 
@@ -50,6 +51,7 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("cover_letter.system", "app.services.tailor.prompts:COVER_LETTER_SYSTEM"),
     ("resume_tailor.system", "app.services.tailor.prompts:TAILOR_SYSTEM"),
     ("qualification_tagger.system", "app.services.qualification.tagger:_SYSTEM_PROMPT"),
+    ("feedback_learner.system", "app.services.llm_learner:SYSTEM_PROMPT"),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
@@ -67,6 +69,7 @@ _SCALARS: tuple[tuple[str, str], ...] = (
     ("model.lateral_discovery", "app.services.targets.lateral_discovery:DEFAULT_MODEL"),
     ("model.target_fit_score", "app.services.targets.fit_score:DEFAULT_MODEL"),
     ("model.qualification_tagger", "app.services.qualification.tagger:QUALIFICATION_MODEL"),
+    ("model.feedback_learner", "app.services.llm_learner:DEFAULT_MODEL"),
     ("prompt_version.derive_target_from_jd", "app.services.targets.derive_profile:PROMPT_VERSION"),
 )
 
@@ -142,4 +145,44 @@ def test_llm_behaviour_contract_matches_golden() -> None:
         "  2. If the change is intended, regenerate the golden:\n"
         f"       {_REGEN_HINT}\n\n"
         f"{diff}"
+    )
+
+
+# --- Evidence-first reasoning contract, shared by both 0-100 scorers (#47) ---
+
+# label -> "module:attr" for the two prompts that carry a few-shot ``reasoning``
+# example. Both must model fact-led output, never confidence words.
+_SCORER_PROMPTS: tuple[tuple[str, str], ...] = (
+    ("phase2_fit.system", "app.services.fit.job_fit:_SYSTEM_PROMPT"),
+    ("target_fit_score.system", "app.services.targets.fit_score:SYSTEM_PROMPT"),
+)
+
+_EXAMPLE_REASONING_RE = re.compile(r'"reasoning":\s*"([^"]*)"')
+
+
+def test_scorer_examples_are_evidence_first() -> None:
+    """The two 0-100 scorers must share ONE reasoning contract so their numbers
+    stay comparable (#47 H5). A few-shot example that opens with a confidence
+    word ("Strong …") primes the vague, inflated output the grader bans — so
+    neither scorer's example may contain a banned word."""
+    from app.services.fit.rubric import BANNED_CONFIDENCE_WORDS, rendered_banned_words
+
+    banned_res = [re.compile(rf"\b{re.escape(w)}\b", re.I) for w in BANNED_CONFIDENCE_WORDS]
+    for label, path in _SCORER_PROMPTS:
+        prompt = str(_resolve(path))
+        examples = _EXAMPLE_REASONING_RE.findall(prompt)
+        assert examples, f"{label}: no few-shot reasoning example found to check"
+        for reasoning in examples:
+            for word_re, word in zip(banned_res, BANNED_CONFIDENCE_WORDS, strict=True):
+                assert not word_re.search(reasoning), (
+                    f"{label} few-shot example uses banned confidence word "
+                    f"{word!r}: {reasoning!r}"
+                )
+
+    # The banned list is a single source of truth (rubric.py). Pin that the
+    # grader still enforces exactly that list, so the two prompts can't drift.
+    grader = str(_resolve("app.services.fit.job_fit:_SYSTEM_PROMPT"))
+    assert rendered_banned_words() in grader, (
+        "grader prompt no longer lists exactly BANNED_CONFIDENCE_WORDS — the two "
+        "scorers have drifted; reconcile rubric.py with job_fit.py's ban line"
     )

@@ -463,3 +463,61 @@ async def test_cache_prefix_chars_applies_to_tool_use_path() -> None:
     (msg,) = create_mock.call_args.kwargs["messages"]
     assert msg["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert msg["content"][0]["text"] + msg["content"][1]["text"] == "AB"
+
+
+async def test_temperature_forwarded_to_sdk_when_set() -> None:
+    client, create_mock = _client_with_mocked_sdk(
+        _fake_tool_use_response(tool_name="return_X", tool_input={})
+    )
+    await client.complete_tool_use(
+        model="claude-sonnet-4-6",
+        system="s",
+        messages=[Message(role="user", content="x")],
+        tool_name="return_X",
+        tool_description="d",
+        tool_input_schema={"type": "object", "properties": {}},
+        purpose="test",
+        temperature=0.0,
+    )
+    assert create_mock.call_args.kwargs["temperature"] == 0.0
+
+
+async def test_temperature_omitted_when_none() -> None:
+    """``None`` keeps the provider default — we must not send temperature=None."""
+    client, create_mock = _client_with_mocked_sdk(
+        _fake_tool_use_response(tool_name="return_X", tool_input={})
+    )
+    await client.complete_tool_use(
+        model="claude-sonnet-4-6",
+        system="s",
+        messages=[Message(role="user", content="x")],
+        tool_name="return_X",
+        tool_description="d",
+        tool_input_schema={"type": "object", "properties": {}},
+        purpose="test",
+    )
+    assert "temperature" not in create_mock.call_args.kwargs
+
+
+async def test_complete_json_pins_temperature_to_zero() -> None:
+    """The structured-output path (grading / triage / derive / learner) is
+    deterministic by default — complete_json pins temperature to 0 (#47)."""
+    from pydantic import BaseModel
+
+    from app.services.llm.client import complete_json
+
+    class _Thing(BaseModel):
+        name: str
+
+    client, create_mock = _client_with_mocked_sdk(
+        _fake_tool_use_response(tool_name="return__Thing", tool_input={"name": "x"})
+    )
+    await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="s",
+        messages=[Message(role="user", content="x")],
+        schema=_Thing,
+        purpose="test",
+    )
+    assert create_mock.call_args.kwargs["temperature"] == 0.0

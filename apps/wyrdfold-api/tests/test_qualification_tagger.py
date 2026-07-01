@@ -212,10 +212,15 @@ class TestInputTrim:
         # The verbose tail past the cap is NOT sent.
         assert tail_marker not in msg
         # The whole message stays small: header lines + at most `cap`
-        # description chars. (Header is well under 200 chars.)
-        assert len(msg) <= cap + 200
+        # description chars + the fixed prompt-injection fence overhead
+        # (~160 chars of <untrusted_*> tags). The point is to catch a
+        # regression that re-sends the whole ~6000-char body, which would
+        # blow past this by an order of magnitude.
+        assert len(msg) <= cap + 400
         # And the leading slice of the body IS present (we truncate, not drop).
         assert "Lead the platform team." in msg
+        # Defense-in-depth is wired in: the scraped description is fenced.
+        assert "<untrusted_description>" in msg
 
     @pytest.mark.asyncio
     async def test_default_cap_comes_from_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:

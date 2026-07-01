@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from app.services.fit.seniority_gate import detect_title_rank, passes_seniority_gate
+from app.services.fit.seniority_gate import (
+    _RANK,
+    detect_title_rank,
+    passes_seniority_gate,
+)
 
 
 class TestDetectTitleRank:
@@ -32,6 +36,30 @@ class TestDetectTitleRank:
 
     def test_senior_ic(self) -> None:
         assert detect_title_rank("Senior Machine Learning Engineer") == 1
+
+    def test_staff_principal_lead_rank_above_senior(self) -> None:
+        # #47: these used to collapse to rank 1 (senior); they're a rung above.
+        assert detect_title_rank("Staff Engineer") == _RANK["staff"]  # 2
+        assert detect_title_rank("Principal Engineer") == _RANK["staff"]
+        assert detect_title_rank("Tech Lead") == _RANK["staff"]
+        assert detect_title_rank("Senior Machine Learning Engineer") == _RANK["senior"]  # 1
+        # A title carrying BOTH reads as the higher rung (staff), not senior.
+        assert detect_title_rank("Senior Staff Engineer") == _RANK["staff"]
+
+    def test_detect_rank_agrees_with_canonical_ladder(self) -> None:
+        # Guard against the regex drifting from ``_RANK`` again (#47): a sample
+        # title for each level must detect at exactly that level's canonical rank.
+        samples = {
+            "ic": "Support Coordinator",
+            "senior": "Senior Engineer",
+            "staff": "Staff Engineer",
+            "manager": "Engineering Manager",
+            "director": "Director of Operations",
+            "vp": "VP of Engineering",
+            "c_level": "Chief Technology Officer",
+        }
+        for level, title in samples.items():
+            assert detect_title_rank(title) == _RANK[level], f"{title!r} → {level}"
 
     def test_ambiguous_is_none(self) -> None:
         assert detect_title_rank("Customer Experience") is None
@@ -76,3 +104,17 @@ class TestPassesSeniorityGate:
         # Documented blind spot: the gate is seniority-only, so a wrong-domain
         # director (e.g. eng/product) passes — domain filtering is separate.
         assert passes_seniority_gate("Head of Solutions Engineering", "director") is True
+
+    def test_director_hint_drops_staff_and_principal_ic(self) -> None:
+        # #47: Staff/Principal IC sit below the director (management) bar even at
+        # the default tolerance, so they're dropped — but now via rank 2, not the
+        # old rank-1 collapse. (Previously unpinned.)
+        assert passes_seniority_gate("Staff Engineer", "director") is False
+        assert passes_seniority_gate("Principal Engineer", "director") is False
+
+    def test_staff_hint_is_passthrough(self) -> None:
+        # Only director+ targets gate; a staff target keeps everything — so the
+        # staff-rank fix never changes a live gate decision (the gate is also
+        # flag-disabled by default). This pins the no-regression intent.
+        assert passes_seniority_gate("Support Coordinator", "staff") is True
+        assert passes_seniority_gate("Senior Engineer", "staff") is True

@@ -12,12 +12,19 @@ from pydantic import BaseModel, Field
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, Message, ModelId
 from app.models.targets import JobTarget
+from app.services.fit.rubric import rendered_banned_words
 from app.services.llm.client import LLMClient, complete_json
 
 DEFAULT_MODEL: ModelId = "claude-sonnet-4-6"
 DEFAULT_PURPOSE = "target.fit_score"
 
-SYSTEM_PROMPT = """\
+# Evidence-first reasoning contract shared with the job grader (#47 H5): the
+# few-shot example is fact-led (no confidence words) and the banned-word list
+# is rendered from ``rubric.BANNED_CONFIDENCE_WORDS`` so the two scorers can't
+# drift. The JSON schema braces below rule out an f-string/.format(), so the
+# banned list is concatenated in.
+SYSTEM_PROMPT = (
+    """\
 You are a career fit evaluator. Given a user's experience profile and a \
 job target, evaluate how well the user's experience fits the target role.
 
@@ -25,8 +32,9 @@ Return JSON matching this exact schema:
 
 {
   "fit_score": 82,
-  "reasoning": "Strong React/TypeScript foundation with 6+ years. Missing \
-cloud infrastructure experience that senior roles typically require."
+  "reasoning": "6 years of React and TypeScript cover the target's core_skills; \
+led the FightCamp design-system rebuild (Lighthouse +40). Gap: no AWS or \
+Terraform, which the staff-level infrastructure requirements call for."
 }
 
 Rules:
@@ -36,12 +44,22 @@ Rules:
   - 50-69: Moderate fit — meaningful overlap but notable gaps.
   - 30-49: Weak fit — some transferable skills but significant gaps.
   - 0-29: Poor fit — little relevant experience.
-- "reasoning" is 1-2 sentences explaining the score. Mention what matches \
-AND what's missing. Be specific about skills and experience level.
+- "reasoning" is 1-2 sentences and MUST be fact-led: every sentence names a \
+specific skill, prior company, named target requirement, or number — never a \
+category label or a vibe. Lead with the strongest concrete match; close with \
+the biggest concrete gap.
+- Hard ban on confidence words: """
+    + rendered_banned_words()
+    + """. They assert quality without evidence — replace each with the \
+underlying fact.
+- A fit_score you cannot back up with specific, named evidence is a wrong \
+score; citing evidence is what keeps the number honest and comparable across \
+targets.
 - Evaluate against the target's scoring profile keywords and seniority level, \
-not just the label.
-- Weight core_skills heavily, secondary_skills moderately, nice_to_have lightly.
+not just the label. Weight core_skills heavily, secondary_skills moderately, \
+nice_to_have lightly.
 - Return ONLY the JSON object. No prose, no markdown, no code fences."""
+)
 
 
 class FitScoreResult(BaseModel):
