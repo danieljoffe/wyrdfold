@@ -9,6 +9,7 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
+import LogisticsChips from './LogisticsChips';
 import StatusIndicator from './StatusIndicator';
 import { MANUAL_SOURCE_ID, type JobPosting } from './types';
 
@@ -117,6 +118,8 @@ export default function JobCard({
           />
         </div>
       </header>
+
+      <LogisticsChips filters={job.logistics_filters} className='px-0.5' />
 
       <hr className='-mx-3 border-border' />
 

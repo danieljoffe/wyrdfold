@@ -31,6 +31,7 @@ from app.services.relevance.title_triage import (
     TitleTriageResponse,
     TitleVerdict,
     _build_user_message,
+    _prefix_matches_title,
     admitted,
     triage_titles,
 )
@@ -238,6 +239,97 @@ class TestTriageTitles:
         assert set(verdicts.keys()) == {1}
         assert verdicts[1].promising is True
         assert 2 not in verdicts
+
+    @pytest.mark.asyncio
+    async def test_matching_title_prefix_is_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verdict whose echoed title_prefix leads the id's input title is
+        trusted (#47)."""
+        async def fake(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        TitleVerdict(id=1, promising=True, title_prefix="Frontend"),
+                        TitleVerdict(id=2, promising=False, title_prefix="Sales Rep"),
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr(
+            "app.services.relevance.title_triage.complete_json", fake
+        )
+        verdicts, _ = await triage_titles(
+            MagicMock(), target=_target(), titles=["Frontend Engineer", "Sales Rep"]
+        )
+        assert set(verdicts.keys()) == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_transposed_title_prefix_is_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verdict whose title_prefix matches a DIFFERENT input title (a
+        transposed id) is dropped, so the caller fail-opens rather than
+        assigning the wrong verdict (#47)."""
+        async def fake(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        TitleVerdict(id=1, promising=True, title_prefix="Frontend"),
+                        # id 2's title is "Sales Rep" but the echo describes the
+                        # frontend role — the ids got transposed.
+                        TitleVerdict(id=2, promising=False, title_prefix="Frontend Engineer"),
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr(
+            "app.services.relevance.title_triage.complete_json", fake
+        )
+        verdicts, _ = await triage_titles(
+            MagicMock(), target=_target(), titles=["Frontend Engineer", "Sales Rep"]
+        )
+        assert set(verdicts.keys()) == {1}  # id 2 dropped → fail-open admit
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_id_is_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        TitleVerdict(id=1, promising=True),
+                        TitleVerdict(id=9, promising=True),  # only 1 title
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr(
+            "app.services.relevance.title_triage.complete_json", fake
+        )
+        verdicts, _ = await triage_titles(
+            MagicMock(), target=_target(), titles=["Frontend Engineer"]
+        )
+        assert set(verdicts.keys()) == {1}
+
+
+class TestPrefixMatchesTitle:
+    def test_leading_fragment_matches(self) -> None:
+        assert _prefix_matches_title("Senior Frontend Engineer", "Senior Frontend")
+
+    def test_case_and_whitespace_tolerant(self) -> None:
+        assert _prefix_matches_title("Senior Frontend Engineer", "senior   frontend")
+
+    def test_prefix_from_a_different_title_fails(self) -> None:
+        assert not _prefix_matches_title("Senior Frontend Engineer", "Senior Backend")
+
+    def test_empty_prefix_skips_the_check(self) -> None:
+        # Back-compat: a response with no echo is trusted by id (never dropped).
+        assert _prefix_matches_title("anything at all", "")
 
 
 # AsyncMock is imported for parity with similar tests in the suite; this

@@ -81,6 +81,9 @@ export default function JobsList({
       minScore: urlState.minScore || initialMinScore || '',
       excludeLocations: urlState.excludeLocations,
       onlyLocations: urlState.onlyLocations,
+      remoteOnly: urlState.remoteOnly,
+      minSalary: urlState.minSalary,
+      country: urlState.country,
     }),
     [
       urlState.search,
@@ -88,6 +91,9 @@ export default function JobsList({
       urlState.minScore,
       urlState.excludeLocations,
       urlState.onlyLocations,
+      urlState.remoteOnly,
+      urlState.minSalary,
+      urlState.country,
       initialStatus,
       initialMinScore,
     ]
@@ -101,6 +107,9 @@ export default function JobsList({
         minScore: next.minScore || null,
         excludeLocations: next.excludeLocations || null,
         onlyLocations: next.onlyLocations || null,
+        remoteOnly: next.remoteOnly || null,
+        minSalary: next.minSalary || null,
+        country: next.country || null,
         // No page reset needed: ``useAdminTableFetch`` re-fetches the first
         // page (and drops the accumulated list) whenever filters change.
       });

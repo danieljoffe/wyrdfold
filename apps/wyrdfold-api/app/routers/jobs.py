@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -528,6 +529,159 @@ def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> boo
     return int(candidate.get("score") or 0) > int(current.get("score") or 0)
 
 
+@dataclass(frozen=True)
+class _LogisticsFilter:
+    """The three /jobs logistics filter params (#86), bundled so they thread as
+    one argument through the list paths rather than three."""
+
+    remote_only: bool = False
+    min_salary: int | None = None
+    country: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.remote_only or self.min_salary is not None or bool(self.country)
+
+
+def _assemble_jobs_page(
+    supabase: Client,
+    *,
+    by_id: dict[str, dict[str, Any]],
+    weights_for_row: Callable[[dict[str, Any]], AxisWeights | None],
+    offset: int,
+    page_size: int,
+    sort: str,
+    sort_col: str,
+    ascending: bool,
+    status: str | None,
+    company: str | None,
+    search: str | None,
+    exclude_terms: list[str],
+    only_terms: list[str],
+    preferences: TargetPreferences | None,
+    user_id: str | None,
+    logistics: _LogisticsFilter | None = None,
+) -> dict[str, Any]:
+    """Shared tail of both two-query list paths (per-target + cross-target).
+
+    Given ``by_id`` (the winning ``scores`` row per job) and ``weights_for_row``
+    (the per-row axis weights — a constant for the single-target path, a
+    per-target lookup for the untargeted one), this ranks by the score each row
+    will DISPLAY (axis-weighted blend + read-time decay, Pending below graded,
+    #47), fetches + overlays the postings, applies the post-fetch location /
+    preference filters, and paginates. The two callers differ ONLY in how they
+    build ``by_id`` + ``weights_for_row``; everything from here down was
+    duplicated verbatim between them until this extraction.
+    """
+    has_location_filter = bool(exclude_terms or only_terms)
+    # Per-user preference filters (employment-type / seniority / location) are
+    # post-fetch, so — like the location chip — when active we must materialise
+    # + filter the full candidate set before paginating, or pages carry the
+    # pre-filter total and render short. The score cutoff is NOT here — it's
+    # already folded into min_score at the query layer.
+    has_pref_filter = _preferences_have_post_fetch_filter(preferences)
+    has_logistics_filter = logistics is not None and logistics.active
+    has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
+
+    now = datetime.now(UTC)
+    fs_lookup = _first_seen_lookup(supabase, list(by_id.keys()))
+
+    def _display(row: dict[str, Any]) -> int:
+        return _display_sort_value(
+            row,
+            weights=weights_for_row(row),
+            first_seen_at=fs_lookup.get(row["job_posting_id"]),
+            now=now,
+        )
+
+    # Paginate at the scores layer only when no post-fetch filter can drop rows
+    # AFTER pagination (location/pref are post-fetch), and only for the score
+    # sort (other sorts key on a posting column fetched below). Sort by the
+    # DISPLAY value so the page order matches the numbers the user sees (#47).
+    if (
+        sort_col == "score"
+        and not status
+        and not company
+        and not search
+        and not has_post_fetch_filter
+    ):
+        ranked = _rank_graded_first(
+            list(by_id.values()),
+            value=lambda r: (_display(r), r["job_posting_id"]),
+            ascending=ascending,
+        )
+        page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
+        total: int | None = len(ranked)
+    else:
+        page_ids = list(by_id.keys())
+        total = None  # recomputed after posting-level filters
+
+    if not page_ids:
+        return {"postings": [], "next_cursor": None, "total": total or 0}
+
+    postings: list[dict[str, Any]] = _fetch_jobs_chunked(
+        supabase,
+        page_ids,
+        user_id=user_id,
+        status=status,
+        company=company,
+        search=search,
+    )
+
+    # Overlay the displayed score (axis-weighted when weights are set, else the
+    # raw Sonnet score), keeping ``raw_score`` alongside and flagging Pending.
+    for p in postings:
+        ts = by_id.get(p["id"])
+        if ts:
+            raw_score = int(ts["score"])
+            p["score"] = display_score_or_passthrough(
+                ts.get("axis_scores"), raw_score, weights_for_row(ts)
+            )
+            p["raw_score"] = raw_score
+            p["score_breakdown"] = ts.get("score_breakdown")
+            p["scoring_status"] = ts.get("scoring_status", "stage1")
+            p["pending"] = _is_pending(ts)
+            # Filter-only logistics (remote/salary/location) — never affects
+            # score or sort; powers the /jobs chips + filter params (#86).
+            p["logistics_filters"] = ts.get("logistics_filters")
+
+    if total is None or sort_col != "score":
+        if has_location_filter:
+            postings = _apply_location_filter(
+                postings, exclude_terms=exclude_terms, only_terms=only_terms
+            )
+        if has_pref_filter:
+            postings = _apply_preferences_filter(postings, preferences)
+        if logistics is not None and logistics.active:
+            postings = _apply_logistics_filter(postings, logistics)
+
+        def _sort_key(p: dict[str, Any]) -> Any:
+            if sort == "score":
+                # Same DISPLAY value the scores-layer sort uses (#47).
+                ts = by_id.get(p["id"])
+                return _display(ts) if ts else 0
+            val = p.get(sort)
+            return "" if val is None else val
+
+        if sort == "score":
+            # Pending below graded (#47), each bucket by display value.
+            postings = _rank_graded_first(postings, value=_sort_key, ascending=ascending)
+        else:
+            postings.sort(key=_sort_key, reverse=not ascending)
+        if total is None:
+            total = len(postings)
+            postings = postings[offset : offset + page_size]
+    else:
+        # Restore page_ids order — Supabase's in_() filter doesn't preserve list
+        # order, so the postings come back in storage order despite page_ids
+        # already being score-sorted.
+        order_index = {jid: i for i, jid in enumerate(page_ids)}
+        postings.sort(key=lambda p: order_index.get(p["id"], len(page_ids)))
+
+    next_cursor = _offset_next_cursor(offset, page_size, total or 0)
+    return {"postings": postings, "next_cursor": next_cursor, "total": total}
+
+
 def _list_jobs_for_target_two_query(
     supabase: Client,
     *,
@@ -545,185 +699,59 @@ def _list_jobs_for_target_two_query(
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
 
     ``axis_weights`` is the per-(user, target) read-time multiplier on
     Phase 2's axis scores. When non-None, the response's per-row ``score``
     field is replaced with the weighted display score computed from
-    ``axis_scores``. Sort order is unchanged in this iteration —
-    server-side ORDER BY still keys on ``recency_score`` (when decay is
-    on) or ``score`` so pagination stays cheap. A future iteration will
-    push the weighted sort into Python when weights diverge from
-    defaults. See plan-wyrdfold-streamlined-target.md "User-tunable axis
-    weights".
+    ``axis_scores``. Ranking, Pending-below-graded bucketing, and pagination
+    all happen in ``_assemble_jobs_page`` keyed on that display value — this
+    function only builds the candidate ``scores`` rows for the target.
     """
     offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
-    # When recency decay is on, the logical "score" sort orders by the
-    # decayed ``recency_score`` column instead of the raw fit score.
-    # min_score still filters on the raw ``score`` (the user's fit floor
-    # is a quality bar, not a recency bar); only the ORDER BY changes.
-    order_col = (
-        "recency_score"
-        if sort_col == "score" and settings.recency_decay_enabled
-        else "score"
-    )
-    has_location_filter = bool(exclude_terms or only_terms)
-    # Per-user preference filters (employment-type / seniority / location) are
-    # also post-fetch, so they constrain pagination exactly like the location
-    # chip: when active we must materialise + filter the full candidate set
-    # before paginating, or pages would carry the pre-filter total and render
-    # short. The score cutoff is NOT here — it's already folded into min_score.
-    has_pref_filter = _preferences_have_post_fetch_filter(preferences)
-    has_post_fetch_filter = has_location_filter or has_pref_filter
+    # Fetch every candidate score row for the target (score floor applied at the
+    # DB). No server-side ORDER BY or exact count: _assemble_jobs_page re-ranks
+    # by the DISPLAY value and derives the total from the row set, so both would
+    # be pure waste (an exact count on every list request that nothing reads).
     ts_query = (
         supabase.table("scores")
         .select(
             "job_posting_id, score, recency_score, score_breakdown, "
-            "scoring_status, axis_scores",
-            count=CountMethod.exact,
+            "scoring_status, axis_scores, logistics_filters",
         )
         .eq("target_id", target_id)
         .eq("excluded", False)
     )
     ts_query = _apply_score_floor(ts_query, min_score)
-
-    # Push sort + pagination to the scores query when sorting by score.
-    # Chain a deterministic ``job_posting_id`` tiebreaker so rows with
-    # identical scores (very common at the same-score buckets) keep a
-    # stable position — without this, the last row of page N could
-    # reappear as the first row of page N+1.
-    if sort_col == "score":
-        ts_query = ts_query.order(order_col, desc=not ascending).order(
-            "job_posting_id"
-        )
-    # For non-score sorts we still need all qualifying IDs (sorted in Python after join)
-    # but we can at least get the total count from Supabase
-    ts_resp = ts_query.execute()
-    ts_rows = cast(list[dict[str, Any]], ts_resp.data or [])
+    ts_rows = cast(list[dict[str, Any]], ts_query.execute().data or [])
 
     if not ts_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
 
     score_lookup = {r["job_posting_id"]: r for r in ts_rows}
 
-    # For score-sorted queries, paginate at the scores layer — but only if
-    # no post-fetch filter can drop rows AFTER that pagination. Location
-    # filtering is post-fetch (we don't push it into Supabase), so when
-    # it's active we have to load every candidate posting, filter, and
-    # paginate from the filtered set — otherwise pagination would show
-    # the pre-filter total and pages would render half-empty.
-    # Sort by the score each row will DISPLAY (axis-weighted + read-time decay),
-    # not the stored un-weighted recency_score, so the page order matches the
-    # numbers the user sees (#47).
-    now = datetime.now(UTC)
-    fs_lookup = _first_seen_lookup(supabase, list(score_lookup.keys()))
-
-    if (
-        sort_col == "score"
-        and not status
-        and not company
-        and not search
-        and not has_post_fetch_filter
-    ):
-        ranked = _rank_graded_first(
-            ts_rows,
-            value=lambda r: (
-                _display_sort_value(
-                    r,
-                    weights=axis_weights,
-                    first_seen_at=fs_lookup.get(r["job_posting_id"]),
-                    now=now,
-                ),
-                r["job_posting_id"],
-            ),
-            ascending=ascending,
-        )
-        page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
-        total = len(ts_rows) if ts_resp.count is None else ts_resp.count
-    else:
-        page_ids = list(score_lookup.keys())
-        total = None  # will be computed after posting-level filters
-
-    postings: list[dict[str, Any]] = _fetch_jobs_chunked(
+    # Single-target: the same axis weights apply to every row.
+    return _assemble_jobs_page(
         supabase,
-        page_ids,
-        user_id=user_id,
+        by_id=score_lookup,
+        weights_for_row=lambda _row: axis_weights,
+        offset=offset,
+        page_size=page_size,
+        sort=sort,
+        sort_col=sort_col,
+        ascending=ascending,
         status=status,
         company=company,
         search=search,
+        exclude_terms=exclude_terms,
+        only_terms=only_terms,
+        preferences=preferences,
+        user_id=user_id,
+        logistics=logistics,
     )
-
-    # Overlay target scores. When axis_weights are set for this
-    # (user, target) pairing, the displayed ``score`` is the weighted
-    # combination of axis_scores; otherwise it's the raw Sonnet score.
-    # The original is preserved alongside as ``raw_score`` so the
-    # frontend can show both (and so debugging is easy).
-    for p in postings:
-        ts = score_lookup.get(p["id"])
-        if ts:
-            raw_score = int(ts["score"])
-            p["score"] = display_score_or_passthrough(
-                ts.get("axis_scores"), raw_score, axis_weights
-            )
-            p["raw_score"] = raw_score
-            p["score_breakdown"] = ts.get("score_breakdown")
-            p["scoring_status"] = ts.get("scoring_status", "stage1")
-            # Pending = not yet Sonnet-graded (#47). The frontend shows a
-            # "Pending" badge instead of treating ``score`` as a real grade.
-            p["pending"] = _is_pending(ts)
-
-    # Sort + paginate in Python only when we couldn't do it server-side
-    if total is None or sort_col != "score":
-        if has_location_filter:
-            postings = _apply_location_filter(
-                postings,
-                exclude_terms=exclude_terms,
-                only_terms=only_terms,
-            )
-        if has_pref_filter:
-            postings = _apply_preferences_filter(postings, preferences)
-
-        def _sort_key(p: dict[str, Any]) -> Any:
-            if sort == "score":
-                # Same DISPLAY value the scores-layer sort uses, so the order
-                # matches the numbers shown (#47).
-                ts = score_lookup.get(p["id"]) or {}
-                return _display_sort_value(
-                    ts,
-                    weights=axis_weights,
-                    first_seen_at=fs_lookup.get(p["id"]),
-                    now=now,
-                )
-            val = p.get(sort)
-            if val is None:
-                return ""
-            return val
-
-        if sort == "score":
-            # Pending below graded (#47), each bucket by display value.
-            postings = _rank_graded_first(
-                postings, value=_sort_key, ascending=ascending
-            )
-        else:
-            postings.sort(key=_sort_key, reverse=not ascending)
-        if total is None:
-            total = len(postings)
-            postings = postings[offset : offset + page_size]
-    else:
-        # Restore page_ids order — Supabase's in_() filter doesn't preserve
-        # list order, so even though page_ids was already sorted by score at
-        # the scores layer, the postings query returns rows in storage order.
-        order_index = {jid: i for i, jid in enumerate(page_ids)}
-        postings.sort(
-            key=lambda p: order_index.get(
-                p["id"], len(page_ids)
-            )
-        )
-
-    next_cursor = _offset_next_cursor(offset, page_size, total or 0)
-    return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
 def _list_jobs_for_target(
@@ -743,6 +771,7 @@ def _list_jobs_for_target(
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
 
@@ -776,16 +805,27 @@ def _list_jobs_for_target(
         "cursor": cursor,
         "user_id": user_id,
     }
-    if axis_weights is not None or _preferences_have_post_fetch_filter(preferences):
+    # Logistics filters (#86) are post-fetch like location/preferences, so an
+    # active one also forces the two-query path — the RPC keyset can't see it.
+    has_logistics = logistics is not None and logistics.active
+    if (
+        axis_weights is not None
+        or _preferences_have_post_fetch_filter(preferences)
+        or has_logistics
+    ):
         return _list_jobs_for_target_two_query(
-            supabase, axis_weights=axis_weights, preferences=preferences, **kwargs
+            supabase,
+            axis_weights=axis_weights,
+            preferences=preferences,
+            logistics=logistics,
+            **kwargs,
         )
     try:
         return _list_jobs_for_target_rpc(supabase, **kwargs)
     except Exception:
         logger.debug("RPC get_target_jobs unavailable, falling back to two-query pattern")
         return _list_jobs_for_target_two_query(
-            supabase, preferences=preferences, **kwargs
+            supabase, preferences=preferences, logistics=logistics, **kwargs
         )
 
 
@@ -805,6 +845,7 @@ def _list_jobs_across_user_targets(
     cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -830,7 +871,7 @@ def _list_jobs_across_user_targets(
         supabase.table("scores")
         .select(
             "job_posting_id, target_id, score, recency_score, "
-            "axis_scores, score_breakdown, scoring_status"
+            "axis_scores, score_breakdown, scoring_status, logistics_filters"
         )
         .in_("target_id", list(user_target_ids))
         .eq("excluded", False)
@@ -852,119 +893,33 @@ def _list_jobs_across_user_targets(
         if existing is None or _prefer_score_row(row, existing):
             best[jid] = row
 
-    has_location_filter = bool(exclude_terms or only_terms)
-    # Sort by the score each row will DISPLAY — its target's axis-weighted blend
-    # then read-time decay — so the page order matches the numbers shown (#47),
-    # not the stored un-weighted recency_score. Weights are per-row here (each
-    # job's best target may differ).
+    # Untargeted: each job's displayed score uses the weights of ITS best
+    # target (jobs may resolve to different targets), so the weight resolver is
+    # per-row rather than a constant.
     weights_by_target = weights_by_target or {}
-    now = datetime.now(UTC)
-    fs_lookup = _first_seen_lookup(supabase, list(best.keys()))
 
-    def _mt_display_value(jid: str) -> int:
-        row = best[jid]
+    def _weights_for(row: dict[str, Any]) -> AxisWeights | None:
         tid = cast(str | None, row.get("target_id"))
-        w = weights_by_target.get(tid) if tid else None
-        return _display_sort_value(
-            row, weights=w, first_seen_at=fs_lookup.get(jid), now=now
-        )
+        return weights_by_target.get(tid) if tid else None
 
-    if (
-        sort_col == "score"
-        and not status
-        and not company
-        and not search
-        and not has_location_filter
-    ):
-        # Sort + paginate at the scores layer when no post-fetch filter
-        # could drop rows AFTER that pagination (location is post-fetch,
-        # so when it's active we have to filter the full set first).
-        # ``(value, job_posting_id)`` tuple key gives a deterministic
-        # tiebreaker — without the id leg, rows with identical scores
-        # could reorder between paginated calls (Python's ``sorted`` is
-        # stable, but only with respect to the input order, and the
-        # input order is itself non-deterministic since ``best.keys()``
-        # iterates a dict).
-        ranked_rows = _rank_graded_first(
-            list(best.values()),
-            value=lambda r: (_mt_display_value(r["job_posting_id"]), r["job_posting_id"]),
-            ascending=ascending,
-        )
-        ranked_ids = [r["job_posting_id"] for r in ranked_rows]
-        page_ids = ranked_ids[offset : offset + page_size]
-        total: int | None = len(ranked_ids)
-    else:
-        page_ids = list(best.keys())
-        total = None  # recomputed after posting-level filters
-
-    if not page_ids:
-        return {"postings": [], "next_cursor": None, "total": total or 0}
-
-    postings: list[dict[str, Any]] = _fetch_jobs_chunked(
+    return _assemble_jobs_page(
         supabase,
-        page_ids,
-        user_id=user_id,
+        by_id=best,
+        weights_for_row=_weights_for,
+        offset=offset,
+        page_size=page_size,
+        sort=sort,
+        sort_col=sort_col,
+        ascending=ascending,
         status=status,
         company=company,
         search=search,
+        exclude_terms=exclude_terms,
+        only_terms=only_terms,
+        preferences=None,  # untargeted view has no per-target preference filter
+        user_id=user_id,
+        logistics=logistics,
     )
-
-    for p in postings:
-        ts = best.get(p["id"])
-        if ts:
-            raw_score = int(ts["score"])
-            tid = cast(str | None, ts.get("target_id"))
-            w = weights_by_target.get(tid) if tid else None
-            p["score"] = display_score_or_passthrough(
-                ts.get("axis_scores"), raw_score, w
-            )
-            p["raw_score"] = raw_score
-            p["score_breakdown"] = ts.get("score_breakdown")
-            p["scoring_status"] = ts.get("scoring_status", "stage1")
-            # Pending = not yet Sonnet-graded (#47); frontend badges it.
-            p["pending"] = _is_pending(ts)
-
-    if total is None or sort_col != "score":
-        if has_location_filter:
-            postings = _apply_location_filter(
-                postings,
-                exclude_terms=exclude_terms,
-                only_terms=only_terms,
-            )
-
-        def _sort_key(p: dict[str, Any]) -> Any:
-            if sort == "score":
-                # Same DISPLAY value the scores-layer sort uses, so the order
-                # matches the numbers shown (#47).
-                return _mt_display_value(p["id"]) if p["id"] in best else 0
-            val = p.get(sort)
-            if val is None:
-                return ""
-            return val
-
-        if sort == "score":
-            # Pending below graded (#47), each bucket by display value.
-            postings = _rank_graded_first(
-                postings, value=_sort_key, ascending=ascending
-            )
-        else:
-            postings.sort(key=_sort_key, reverse=not ascending)
-        if total is None:
-            total = len(postings)
-            postings = postings[offset : offset + page_size]
-    else:
-        # Restore page_ids order — Supabase's in_() filter doesn't preserve
-        # list order, so even though page_ids was already sorted by score at
-        # the scores layer, the postings query returns rows in storage order.
-        order_index = {jid: i for i, jid in enumerate(page_ids)}
-        postings.sort(
-            key=lambda p: order_index.get(
-                p["id"], len(page_ids)
-            )
-        )
-
-    next_cursor = _offset_next_cursor(offset, page_size, total or 0)
-    return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
 # Sync `def` so FastAPI runs each request in a threadpool worker. The body
@@ -1069,6 +1024,46 @@ def _apply_location_filter(
             only_terms=only_terms,
         )
     ]
+
+
+def _logistics_passes(logistics: dict[str, Any] | None, f: _LogisticsFilter) -> bool:
+    """One posting's ``logistics_filters`` dict against the active filters.
+
+    Semantics per plan-wyrdfold-logistics-chips.md:
+    - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
+      unknown/``unspecified`` status is dropped; the user explicitly asked for
+      remote, so surfacing unknowns would dilute the filter).
+    - ``min_salary`` — STRICT: keep only when ``salary_max`` is present and
+      ``>= min_salary`` (an undisclosed salary is dropped).
+    - ``country`` — LENIENT: keep when ``location_country`` matches
+      (case-insensitive) OR is absent (a remote role with no country anchor
+      still passes).
+    """
+    log = logistics or {}
+    if f.remote_only and log.get("remote_status") != "remote":
+        return False
+    if f.min_salary is not None:
+        salary_max = log.get("salary_max")
+        if salary_max is None or salary_max < f.min_salary:
+            return False
+    if f.country:
+        country = log.get("location_country")
+        if country is not None and str(country).upper() != f.country.upper():
+            return False
+    return True
+
+
+def _apply_logistics_filter(
+    postings: list[dict[str, Any]], f: _LogisticsFilter
+) -> list[dict[str, Any]]:
+    """Drop postings failing the logistics filters (#86), reading each row's
+    overlaid ``logistics_filters`` dict. Post-fetch like the location filter, so
+    it composes with the status/company/search/preference filters already on the
+    two-query path (and forces that path when active — the RPC keyset can't see
+    it)."""
+    if not f.active:
+        return postings
+    return [p for p in postings if _logistics_passes(p.get("logistics_filters"), f)]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -1293,11 +1288,18 @@ def list_jobs(
     target_id: str | None = Query(None),
     exclude_locations: str | None = Query(None, max_length=500),
     only_locations: str | None = Query(None, max_length=500),
+    remote_only: bool = Query(False),
+    min_salary: int | None = Query(None, ge=0),
+    country: str | None = Query(None, max_length=4),
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, Any]:
     exclude_terms = _parse_location_list(exclude_locations)
     only_terms = _parse_location_list(only_locations)
+    # Logistics filters (#86) — over the grader's scores.logistics_filters data.
+    logistics = _LogisticsFilter(
+        remote_only=remote_only, min_salary=min_salary, country=country
+    )
     cursor_data = _decode_cursor(cursor)
     ascending = order == "asc"
 
@@ -1319,6 +1321,11 @@ def list_jobs(
         # by ``_parse_location_list``.
         exclude_locations=",".join(sorted(exclude_terms)) or None,
         only_locations=",".join(sorted(only_terms)) or None,
+        # Logistics filters vary the result set, so they must vary the key
+        # (country upper-cased since the filter matches case-insensitively).
+        remote_only=remote_only or None,
+        min_salary=min_salary,
+        country=(country or "").upper() or None,
         user_id=user_id,
     )
     cached: dict[str, Any] | None = job_list_cache.get(cache_key)
@@ -1398,6 +1405,7 @@ def list_jobs(
             axis_weights=axis_weights,
             preferences=preferences,
             user_id=user_id,
+            logistics=logistics,
         )
         # Decay the displayed score by posting age (read-time, never stale).
         # raw_score keeps the undecayed fit. No-op when the flag is off.
@@ -1432,6 +1440,7 @@ def list_jobs(
             cursor=cursor_data,
             weights_by_target=weights_by_target or None,
             user_id=user_id,
+            logistics=logistics,
         )
         # Decay the displayed score by posting age (read-time, never stale).
         # raw_score keeps the undecayed fit. No-op when the flag is off.

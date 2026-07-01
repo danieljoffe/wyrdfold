@@ -88,6 +88,30 @@ export default function JobsActiveFilterChips({
     });
   }
 
+  if (filters.remoteOnly) {
+    chips.push({
+      key: 'remoteOnly',
+      label: 'Remote only',
+      onRemove: () => onChange({ ...filters, remoteOnly: '' }),
+    });
+  }
+
+  if (filters.minSalary) {
+    chips.push({
+      key: 'minSalary',
+      label: `$${Math.round(Number(filters.minSalary) / 1000)}k+`,
+      onRemove: () => onChange({ ...filters, minSalary: '' }),
+    });
+  }
+
+  if (filters.country) {
+    chips.push({
+      key: 'country',
+      label: `Country: ${filters.country}`,
+      onRemove: () => onChange({ ...filters, country: '' }),
+    });
+  }
+
   if (chips.length === 0) return null;
 
   const clearAll = () =>
@@ -97,6 +121,9 @@ export default function JobsActiveFilterChips({
       status: '',
       onlyLocations: '',
       excludeLocations: '',
+      remoteOnly: '',
+      minSalary: '',
+      country: '',
     });
 
   return (

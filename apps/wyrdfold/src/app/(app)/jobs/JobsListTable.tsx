@@ -7,6 +7,7 @@ import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
+import LogisticsChips from './LogisticsChips';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import StatusIndicator from './StatusIndicator';
 import {
@@ -207,24 +208,31 @@ export default function JobsListTable({
                     />
                   </td>
                   <td className='px-3 py-2 font-medium'>
-                    <span className='inline-flex items-center gap-2'>
-                      {job.absolute_url ? (
-                        <a
-                          href={job.absolute_url}
-                          target='_blank'
-                          rel='noopener noreferrer'
-                          className='text-brand-500 hover:text-brand-600'
-                          onClick={e => e.stopPropagation()}
-                        >
-                          {job.title}
-                        </a>
-                      ) : (
-                        job.title
-                      )}
-                      {job.source_id === MANUAL_SOURCE_ID && (
-                        <Badge variant='info'>Discovered</Badge>
-                      )}
-                    </span>
+                    <div className='flex flex-col gap-1'>
+                      <span className='inline-flex items-center gap-2'>
+                        {job.absolute_url ? (
+                          <a
+                            href={job.absolute_url}
+                            target='_blank'
+                            rel='noopener noreferrer'
+                            className='text-brand-500 hover:text-brand-600'
+                            onClick={e => e.stopPropagation()}
+                          >
+                            {job.title}
+                          </a>
+                        ) : (
+                          job.title
+                        )}
+                        {job.source_id === MANUAL_SOURCE_ID && (
+                          <Badge variant='info'>Discovered</Badge>
+                        )}
+                      </span>
+                      {/* Compact logistics chips inline under the title (#86) —
+                          the mobile card + detail panel already show these; the
+                          desktop table row was the gap. Renders nothing when the
+                          job has no logistics data. */}
+                      <LogisticsChips filters={job.logistics_filters} />
+                    </div>
                   </td>
                   <td className='px-3 py-2'>{job.company_name}</td>
                   <td className='px-3 py-2 text-text-tertiary'>

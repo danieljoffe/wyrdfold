@@ -30,6 +30,24 @@ const MIN_SCORE_OPTIONS: { value: string; label: string }[] = [
   { value: '85', label: 'Score 85+' },
 ];
 
+// Logistics filters (#86). Presets mirror the min-score pill pattern rather than
+// a free slider/typeahead — consistent with the rest of the bar and enough for
+// the coarse "is the pay/location in range" scan the chips are for.
+const MIN_SALARY_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Any pay' },
+  { value: '100000', label: '$100k+' },
+  { value: '150000', label: '$150k+' },
+  { value: '200000', label: '$200k+' },
+];
+
+const COUNTRY_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Any country' },
+  { value: 'US', label: 'United States' },
+  { value: 'CA', label: 'Canada' },
+  { value: 'GB', label: 'United Kingdom' },
+  { value: 'DE', label: 'Germany' },
+];
+
 const SORT_LABEL: Record<JobsSortColumn, string> = {
   score: 'Score',
   title: 'Title',
@@ -94,6 +112,24 @@ export default function JobsFilter({
     label: opt.label,
     onClick: () => onChange({ ...filters, minScore: opt.value }),
     disabled: filters.minScore === opt.value,
+  }));
+
+  const minSalaryLabel =
+    MIN_SALARY_OPTIONS.find(o => o.value === (filters.minSalary ?? ''))
+      ?.label ?? 'Any pay';
+  const minSalaryItems: DropdownItem[] = MIN_SALARY_OPTIONS.map(opt => ({
+    label: opt.label,
+    onClick: () => onChange({ ...filters, minSalary: opt.value }),
+    disabled: (filters.minSalary ?? '') === opt.value,
+  }));
+
+  const countryLabel =
+    COUNTRY_OPTIONS.find(o => o.value === (filters.country ?? ''))?.label ??
+    'Any country';
+  const countryItems: DropdownItem[] = COUNTRY_OPTIONS.map(opt => ({
+    label: opt.label,
+    onClick: () => onChange({ ...filters, country: opt.value }),
+    disabled: (filters.country ?? '') === opt.value,
   }));
 
   const statusItems: DropdownItem[] = [
@@ -203,6 +239,42 @@ export default function JobsFilter({
               excludeLocations: exclude,
             })
           }
+        />
+        {/* Logistics filters (#86) — remote toggle + salary/country presets. */}
+        <button
+          type='button'
+          onClick={() =>
+            onChange({
+              ...filters,
+              remoteOnly: filters.remoteOnly ? '' : 'true',
+            })
+          }
+          aria-pressed={filters.remoteOnly === 'true'}
+          className={cn(PILL_CLASS, filters.remoteOnly && PILL_ACTIVE_CLASS)}
+        >
+          Remote only
+        </button>
+        <Dropdown
+          trigger={
+            <span
+              className={cn(PILL_CLASS, filters.minSalary && PILL_ACTIVE_CLASS)}
+            >
+              {minSalaryLabel}
+              <ChevronDown className='size-3 text-text-tertiary' aria-hidden />
+            </span>
+          }
+          items={minSalaryItems}
+        />
+        <Dropdown
+          trigger={
+            <span
+              className={cn(PILL_CLASS, filters.country && PILL_ACTIVE_CLASS)}
+            >
+              {countryLabel}
+              <ChevronDown className='size-3 text-text-tertiary' aria-hidden />
+            </span>
+          }
+          items={countryItems}
         />
         {/* Sort pill is mobile-only — desktop uses sortable column headers. */}
         <div className='md:hidden'>
