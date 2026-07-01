@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.experience import (
     ConversationTurn,
     ConversationType,
@@ -18,7 +19,7 @@ TABLE = "experience_conversation_turns"
 
 
 def _scope_user(query: Any, user_id: str | None) -> Any:
-    return query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    return query.eq("user_id", resolve_owner(user_id))
 
 
 def list_turns(

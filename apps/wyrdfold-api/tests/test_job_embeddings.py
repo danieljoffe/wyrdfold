@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.constants import SYSTEM_USER_ID
 from app.services.embeddings.job_embeddings import (
     JOB_EMBED_PURPOSE,
     content_hash,
@@ -171,7 +172,8 @@ async def test_new_job_is_embedded_and_written() -> None:
     assert len(sb.llm_costs.upserts) == 1
     cost_row = sb.llm_costs.upserts[0]
     assert cost_row["purpose"] == JOB_EMBED_PURPOSE
-    assert cost_row["user_id"] is None
+    # Cron-authored embedding cost → the SYSTEM principal, not NULL (#88 groundwork).
+    assert cost_row["user_id"] == SYSTEM_USER_ID
 
 
 async def test_unchanged_content_is_a_cache_hit_no_embed() -> None:

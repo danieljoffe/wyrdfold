@@ -120,8 +120,8 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         updated_record = _make_record()
-        # Chain: update → eq(id) → is_(user_id) → execute (user_id=None path)
-        supabase.table.return_value.update.return_value.eq.return_value.is_.return_value.execute.return_value.data = [
+        # Chain: update → eq(id) → eq(user_id→SYSTEM) → execute (user_id=None path)
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             updated_record.model_dump(mode="json")
         ]
 
@@ -134,7 +134,7 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         updated_record = _make_record()
-        supabase.table.return_value.update.return_value.eq.return_value.is_.return_value.execute.return_value.data = [
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             updated_record.model_dump(mode="json")
         ]
 
@@ -155,7 +155,7 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         approved_record = _make_record(approved_at=_NOW)
-        supabase.table.return_value.update.return_value.eq.return_value.is_.return_value.execute.return_value.data = [
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             approved_record.model_dump(mode="json")
         ]
 
@@ -168,10 +168,10 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         record = _make_record()
-        # Chain: select → eq(job) → eq(doctype) → is_(user_id) → order → limit → execute
+        # Chain: select → eq(job) → eq(doctype) → eq(user_id→SYSTEM) → order → limit → execute
         # (``user_id=None`` legacy path here)
         chain = supabase.table.return_value.select.return_value
-        chain = chain.eq.return_value.eq.return_value.is_.return_value
+        chain = chain.eq.return_value.eq.return_value.eq.return_value
         chain.order.return_value.limit.return_value.execute.return_value.data = [
             record.model_dump(mode="json")
         ]
@@ -185,7 +185,7 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         chain = supabase.table.return_value.select.return_value
-        chain = chain.eq.return_value.eq.return_value.is_.return_value
+        chain = chain.eq.return_value.eq.return_value.eq.return_value
         chain.order.return_value.limit.return_value.execute.return_value.data = []
 
         result = get_by_job(supabase, "nonexistent", user_id=None)
@@ -198,7 +198,7 @@ class TestPersistenceHelpers:
 
         supabase = MagicMock()
         chain = supabase.table.return_value.select.return_value
-        chain = chain.eq.return_value.eq.return_value.is_.return_value
+        chain = chain.eq.return_value.eq.return_value.eq.return_value
         chain.order.return_value.limit.return_value.execute.return_value.data = []
 
         get_by_job(supabase, "job-1", user_id=None, document_type="cover_letter")
@@ -859,7 +859,7 @@ class TestUpdatePayloadMd:
 
         supabase = MagicMock()
         updated = _make_record(payload_md=_GOOD_MD, docx_payload_md_hash=None)
-        supabase.table.return_value.update.return_value.eq.return_value.is_.return_value.execute.return_value.data = [
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             updated.model_dump(mode="json")
         ]
 

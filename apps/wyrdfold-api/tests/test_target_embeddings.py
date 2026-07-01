@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from app.constants import SYSTEM_USER_ID
 from app.models.targets import JobTarget, ScoringProfile
 from app.services.embeddings.mock import MockEmbeddingsClient
 from app.services.embeddings.target_embeddings import (
@@ -175,7 +176,8 @@ async def test_new_target_is_embedded_as_query_and_written() -> None:
     # Cost row logged under the pre-scan purpose, instance key.
     assert len(sb.llm_costs.writes) == 1
     assert sb.llm_costs.writes[0]["purpose"] == TARGET_EMBED_PURPOSE
-    assert sb.llm_costs.writes[0]["user_id"] is None
+    # Cron-authored embedding cost → the SYSTEM principal, not NULL (#88 groundwork).
+    assert sb.llm_costs.writes[0]["user_id"] == SYSTEM_USER_ID
 
 
 async def test_unchanged_target_is_a_cache_hit_no_embed() -> None:

@@ -23,6 +23,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.llm import LLMResult
 from app.models.tailor import (
     DocumentType,
@@ -213,7 +214,7 @@ def get(
     leak the existence of cross-tenant rows.
     """
     query = supabase.table(TABLE).select("*").eq("id", resume_id)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.single().execute()
     if not resp.data:
         return None
@@ -226,9 +227,7 @@ def _scope_to_user(query: Any, user_id: str | None) -> Any:
     the five mutation functions below identical in shape, so a future
     change (e.g., a third tenant mode) only happens in one place.
     """
-    if user_id is None:
-        return query.is_("user_id", "null")
-    return query.eq("user_id", user_id)
+    return query.eq("user_id", resolve_owner(user_id))
 
 
 def update_payload(
@@ -418,7 +417,7 @@ def get_by_job(
         .eq("job_posting_id", job_posting_id)
         .eq("document_type", document_type)
     )
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.order("created_at", desc=True).limit(1).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -434,7 +433,7 @@ def list_recent(
     document_type: DocumentType | None = None,
 ) -> list[TailoredResumeRecord]:
     query = supabase.table(TABLE).select("*").order("created_at", desc=True).limit(limit)
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     if document_type is not None:
         query = query.eq("document_type", document_type)
     resp = query.execute()

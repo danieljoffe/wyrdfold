@@ -17,6 +17,8 @@ import pytest
 from postgrest.exceptions import APIError
 from supabase import Client
 
+from app.constants import SYSTEM_USER_ID
+
 pytestmark = pytest.mark.integration
 
 
@@ -65,6 +67,9 @@ def seeded_for_blend(
             {
                 "job_posting_id": job_id,
                 "target_id": target_a,
+                # analyses.user_id is NOT NULL (Phase 0); this seed exists only to
+                # satisfy jobs.llm_analysis_id, so the system principal owns it.
+                "user_id": SYSTEM_USER_ID,
                 "scorecard": {},
                 "recommendation": "seed",
                 "model": "test",

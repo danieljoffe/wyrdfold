@@ -107,8 +107,8 @@ def _set_mock_data(supabase: MagicMock, data: list[Any]) -> None:
     insert = supabase.table.return_value.insert.return_value
     insert.execute.return_value.data = data
     select = supabase.table.return_value.select.return_value
-    # ``get_batch`` (post user_id scoping): select → eq(id) → is_(user_id) → execute
-    select.eq.return_value.is_.return_value.execute.return_value.data = data
+    # ``get_batch`` (post user_id scoping): select → eq(id) → eq(user_id→SYSTEM) → execute
+    select.eq.return_value.eq.return_value.execute.return_value.data = data
     # Back-compat for the older single-``eq`` chain (kept for any callers
     # that still go through it during refactoring).
     select.eq.return_value.execute.return_value.data = data

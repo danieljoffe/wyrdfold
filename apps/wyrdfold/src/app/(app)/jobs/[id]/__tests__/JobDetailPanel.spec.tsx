@@ -186,25 +186,22 @@ describe('JobDetailPanel', () => {
     ).toHaveAttribute('href', '/jobs/j-1/resume');
   });
 
-  it('renders a "set up your profile" CTA (not a raw error / retry) when analysis 404s with no_profile (#105)', async () => {
+  it('renders a "set up your profile" CTA (not a raw error / retry) when analysis returns a no_profile marker (#105)', async () => {
     // The panel auto-fires the LLM analysis on open. For a user without an
-    // experience profile the backend returns a structured 404
-    // (``{code:'no_profile'}``). The panel must render a setup CTA — never
-    // leak the old "…POST /experience/derive first." dev message, and never
-    // offer a "Retry analysis" that can't succeed.
+    // experience profile the backend returns a 200 empty-state marker
+    // (``{code:'no_profile'}``) — a 200, not a 404, so the auto-fire doesn't
+    // log a console error. The panel must render a setup CTA — never leak the
+    // old "…POST /experience/derive first." dev message, and never offer a
+    // "Retry analysis" that can't succeed.
     const noProfile = {
-      detail: {
-        code: 'no_profile',
-        message:
-          'Set up your experience profile to generate a job-fit analysis.',
-      },
+      code: 'no_profile',
+      message: 'Set up your experience profile to generate a job-fit analysis.',
     };
     global.fetch = jest.fn().mockImplementation((url: string) => {
       if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
         return Promise.resolve({
-          ok: false,
-          status: 404,
-          clone: () => ({ json: async () => noProfile }),
+          ok: true,
+          status: 200,
           json: async () => noProfile,
         });
       }

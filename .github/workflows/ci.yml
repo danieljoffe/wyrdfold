@@ -13,8 +13,65 @@ permissions:
   contents: read
 
 jobs:
+  # Detect whether the PR touches anything other than docs (*.md / docs/ /
+  # .claude/). The heavy jobs below gate on this, so a docs-only PR skips the
+  # full suite instead of waiting minutes on Python/RLS/E2E/Lighthouse/Trivy.
+  # A job skipped via `if:` reports its required check as "skipped", which the
+  # branch-protection ruleset treats as passing — so docs-only PRs stay
+  # mergeable without the checks actually running. Non-PR events (push to main,
+  # i.e. a release merge) always run the full suite.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          filter: tree:0
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect non-docs changes
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Non-PR event ($EVENT) → run full CI."
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed="$(git diff --name-only "$BASE...$HEAD")"
+          echo "Changed files:"; echo "$changed"
+          # Docs-only ⇒ EVERY changed file is *.md / docs/ / .claude/. Any other
+          # file ⇒ code=true (run the full suite). Pure-shell case match (no grep)
+          # so the verdict never depends on a tool's exit-code quirk. A mixed PR
+          # (docs + code) is code=true. Empty diff ⇒ code=true (fail-safe).
+          if [ -z "$changed" ]; then
+            echo "Empty diff → running full CI (fail-safe)."
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            case "$f" in
+              *.md|docs/*|.claude/*) : ;;        # docs-only, ignore
+              *) code=true; break ;;             # any other file → run CI
+            esac
+          done <<< "$changed"
+          if [ "$code" = true ]; then
+            echo "→ code changes present; running full CI."
+          else
+            echo "→ docs-only change; skipping the code checks."
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   js:
     name: JS — lint, typecheck, test, build
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -50,6 +107,8 @@ jobs:
 
   e2e:
     name: E2E — public specs (Playwright)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -102,6 +161,8 @@ jobs:
 
   lighthouse:
     name: Lighthouse — public CWV / a11y
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -146,6 +207,8 @@ jobs:
 
   python:
     name: Python — wyrdfold-api
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -233,6 +296,8 @@ jobs:
   # local Supabase stack and run it, so RLS regressions fail a PR.
   rls-integration:
     name: RLS — integration (live Supabase)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -316,6 +381,8 @@ jobs:
   # by covering the python:3.11-slim base + transitive Python deps.
   image-scan:
     name: Image scan — Trivy
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

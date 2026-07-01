@@ -24,6 +24,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.conversation import (
     LLMTurnResponse,
     ProbeResult,
@@ -341,7 +342,7 @@ def reset_content(
 
     def _scoped(table: str) -> Any:
         q = supabase.table(table).delete()
-        return q.is_("user_id", "null") if user_id is None else q.eq("user_id", user_id)
+        return q.eq("user_id", resolve_owner(user_id))
 
     prose_resp = _scoped("experience_prose_docs").execute()
     optimized_resp = _scoped("experience_optimized_docs").execute()
