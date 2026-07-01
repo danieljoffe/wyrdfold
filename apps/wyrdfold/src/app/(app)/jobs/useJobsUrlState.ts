@@ -25,6 +25,9 @@ const KEYS = {
   minScore: 'score',
   excludeLocations: 'exclude',
   onlyLocations: 'only',
+  remoteOnly: 'remote_only',
+  minSalary: 'min_salary',
+  country: 'country',
   sort: 'sort',
   order: 'order',
   target: 'target',
@@ -38,6 +41,12 @@ interface JobsUrlState {
   minScore: string;
   excludeLocations: string;
   onlyLocations: string;
+  /** '' | 'true' — logistics remote-only filter (#86). */
+  remoteOnly: string;
+  /** '' | numeric string — logistics minimum salary (#86). */
+  minSalary: string;
+  /** '' | ISO country code — logistics country filter (#86). */
+  country: string;
   sort: string;
   order: JobsUrlOrder;
   targetId: string | undefined;
@@ -90,6 +99,9 @@ export function useJobsUrlState({
       minScore: searchParams.get(KEYS.minScore) ?? '',
       excludeLocations: searchParams.get(KEYS.excludeLocations) ?? '',
       onlyLocations: searchParams.get(KEYS.onlyLocations) ?? '',
+      remoteOnly: searchParams.get(KEYS.remoteOnly) ?? '',
+      minSalary: searchParams.get(KEYS.minSalary) ?? '',
+      country: searchParams.get(KEYS.country) ?? '',
       sort: searchParams.get(KEYS.sort) ?? defaultSort,
       order: parseOrder(searchParams.get(KEYS.order)) ?? defaultOrder,
       targetId: target ?? defaultTargetId ?? undefined,
@@ -113,6 +125,9 @@ export function useJobsUrlState({
         apply(KEYS.excludeLocations, patch.excludeLocations);
       if ('onlyLocations' in patch)
         apply(KEYS.onlyLocations, patch.onlyLocations);
+      if ('remoteOnly' in patch) apply(KEYS.remoteOnly, patch.remoteOnly);
+      if ('minSalary' in patch) apply(KEYS.minSalary, patch.minSalary);
+      if ('country' in patch) apply(KEYS.country, patch.country);
       if ('sort' in patch) apply(KEYS.sort, patch.sort);
       if ('order' in patch) apply(KEYS.order, patch.order);
       if ('targetId' in patch) apply(KEYS.target, patch.targetId);

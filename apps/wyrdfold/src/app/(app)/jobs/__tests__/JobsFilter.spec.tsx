@@ -168,4 +168,87 @@ describe('JobsFilter', () => {
     );
     expect(screen.getByText(/all statuses/i)).toBeInTheDocument();
   });
+
+  // ---- logistics filters (#86) --------------------------------------------
+
+  it('toggles the remote-only filter on and off', async () => {
+    const onChange = jest.fn();
+    const { rerender } = render(
+      <JobsFilter
+        filters={baseFilters}
+        onChange={onChange}
+        sort='score'
+        order='desc'
+        handleSort={() => undefined}
+      />
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: /^remote only$/i }));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteOnly: 'true' })
+    );
+
+    onChange.mockClear();
+    rerender(
+      <JobsFilter
+        filters={{ ...baseFilters, remoteOnly: 'true' }}
+        onChange={onChange}
+        sort='score'
+        order='desc'
+        handleSort={() => undefined}
+      />
+    );
+    // The pill is now pressed; clicking clears it.
+    await userEvent
+      .setup()
+      .click(
+        screen.getByRole('button', { name: /^remote only$/i, pressed: true })
+      );
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteOnly: '' })
+    );
+  });
+
+  it('reflects active min-salary and country labels on their pills', () => {
+    render(
+      <JobsFilter
+        filters={{ ...baseFilters, minSalary: '150000', country: 'US' }}
+        onChange={() => undefined}
+        sort='score'
+        order='desc'
+        handleSort={() => undefined}
+      />
+    );
+    expect(
+      screen.getByRole('button', { name: /\$150k\+/i })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /united states/i })
+    ).toBeInTheDocument();
+  });
+
+  it('removes a logistics filter via its chip × button', async () => {
+    const onChange = jest.fn();
+    render(
+      <JobsFilter
+        filters={{
+          ...baseFilters,
+          remoteOnly: 'true',
+          minSalary: '150000',
+          country: 'US',
+        }}
+        onChange={onChange}
+        sort='score'
+        order='desc'
+        handleSort={() => undefined}
+      />
+    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: /remove remoteonly filter/i }));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteOnly: '' })
+    );
+  });
 });
