@@ -14,6 +14,7 @@ Postgres or a non-default local setup.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import uuid
@@ -113,14 +114,32 @@ def user_client_factory(
     return _make
 
 
+def create_auth_user(service_client: Client) -> str:
+    """Create a real ``auth.users`` row (the FK target for per-user data) and
+    return its id. Phase 0 added ``user_id -> auth.users(id) ON DELETE CASCADE``,
+    so a synthetic test user must exist in ``auth.users`` or its inserts fail the
+    FK. Random email keeps parallel/repeat runs from colliding.
+    """
+    email = f"rls-{uuid.uuid4().hex[:12]}@test.local"
+    return service_client.auth.admin.create_user(
+        {"email": email, "email_confirm": True}
+    ).user.id
+
+
+def delete_auth_user(service_client: Client, user_id: str) -> None:
+    """Delete the auth user; ON DELETE CASCADE clears all their per-user rows."""
+    with contextlib.suppress(Exception):
+        service_client.auth.admin.delete_user(user_id)
+
+
 @pytest.fixture
 def two_seeded_users(service_client: Client) -> Iterator[tuple[str, str]]:
-    """Seed two users in `user_profiles` + `llm_costs`, yield their ids,
-    then delete the rows. UUIDs are random so parallel/repeat runs don't
-    collide; cleanup runs even if the test body raises.
+    """Seed two real auth users + a ``user_profiles`` / ``llm_costs`` row each,
+    yield their ids, then delete the auth users (ON DELETE CASCADE clears their
+    rows). Cleanup runs even if the test body raises.
     """
-    uid_a = str(uuid.uuid4())
-    uid_b = str(uuid.uuid4())
+    uid_a = create_auth_user(service_client)
+    uid_b = create_auth_user(service_client)
     try:
         service_client.table("user_profiles").insert(
             [
@@ -136,9 +155,5 @@ def two_seeded_users(service_client: Client) -> Iterator[tuple[str, str]]:
         ).execute()
         yield uid_a, uid_b
     finally:
-        service_client.table("llm_costs").delete().in_(
-            "user_id", [uid_a, uid_b]
-        ).execute()
-        service_client.table("user_profiles").delete().in_(
-            "user_id", [uid_a, uid_b]
-        ).execute()
+        delete_auth_user(service_client, uid_a)
+        delete_auth_user(service_client, uid_b)
