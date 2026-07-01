@@ -124,3 +124,24 @@ def test_no_filter_returns_all_with_logistics_overlaid(
     assert set(by_title) == {"remote_hi", "onsite_hi", "remote_lo", "remote_ca"}
     assert by_title["remote_hi"]["logistics_filters"]["remote_status"] == "remote"
     assert by_title["onsite_hi"]["logistics_filters"]["salary_max"] == 200000
+
+
+def test_rpc_fast_path_also_returns_logistics(
+    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+) -> None:
+    """The keyset RPC fast path (non-score sort, no floor) now carries
+    logistics_filters too (#86), so chips render on created_at/title/company
+    sorts, not just the score-sorted two-query view."""
+    from app.routers.jobs import _list_jobs_for_target_rpc
+
+    target_id, _ = seeded_logistics
+    result = _list_jobs_for_target_rpc(
+        service_client, target_id=target_id, page_size=50,
+        sort="created_at", ascending=False, min_score=None,
+        status=None, company=None, search=None,
+        exclude_terms=[], only_terms=[], cursor={},
+    )
+    by_title = {p["title"]: p for p in result["postings"]}
+    assert set(by_title) == {"remote_hi", "onsite_hi", "remote_lo", "remote_ca"}
+    assert by_title["remote_hi"]["logistics_filters"]["remote_status"] == "remote"
+    assert by_title["onsite_hi"]["logistics_filters"]["salary_max"] == 200000
