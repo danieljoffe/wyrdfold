@@ -13,7 +13,13 @@ dockerfilePath = "apps/wyrdfold-api/Dockerfile"
 #     it is generic by default and only verbose when DEBUG_ERRORS=true.
 
 [deploy]
-startCommand = "uv run --package wyrdfold-api uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8001}"
+# No startCommand on purpose (#29 C1): the start command is the Dockerfile CMD
+# (uvicorn WITH --proxy-headers). A [deploy].startCommand OVERRIDES that CMD,
+# and the previous one ran `uv run …` — uv is builder-only, absent from the
+# runtime image, so it resolved to `uv: not found` — and it dropped
+# --proxy-headers (without which uvicorn trusts the LB IP for every request,
+# collapsing the pre-auth rate-limit buckets). The Dockerfile CMD is the single
+# source of truth; test_deploy_config.py guards this.
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
