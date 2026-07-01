@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.constants import SYSTEM_USER_ID
 from app.models.llm import LLMResult, LLMUsage
 from app.services.llm import cost_log
 from app.services.llm.cost_log_buffer import buffer
@@ -50,14 +51,17 @@ def test_total_spend_uses_rpc_when_available() -> None:
     sb.table.assert_not_called()
 
 
-def test_total_spend_treats_none_user_id_as_null_partition() -> None:
+def test_total_spend_stamps_system_owner_for_none_user_id() -> None:
+    # A caller with no user (cron / api-key) reads the SYSTEM partition — the
+    # Phase-0 replacement for the legacy `user_id IS NULL` marker. The RPC's own
+    # `auth.uid()` authz guard still prevents a JWT user from passing SYSTEM.
     sb = MagicMock()
     sb.rpc.return_value.execute.return_value = _Resp(1.5)
 
     cost_log.total_spend(sb, user_id=None, since=None)
 
     args, _ = sb.rpc.call_args
-    assert args[1]["p_user_id"] is None
+    assert args[1]["p_user_id"] == SYSTEM_USER_ID
     assert args[1]["p_since"] is None
 
 
@@ -77,12 +81,30 @@ def test_total_spend_falls_back_to_python_when_rpc_unavailable() -> None:
     sel.eq.return_value.gte.return_value.execute.return_value = _Resp(
         [{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}]
     )
-    sel.is_.return_value.gte.return_value.execute.return_value = _Resp([])
 
     result = cost_log.total_spend(
         sb, user_id="u1", since=datetime.now(UTC) - timedelta(hours=1)
     )
     assert result == pytest.approx(0.40)
+
+
+def test_total_spend_fallback_reads_system_partition_for_none_user() -> None:
+    # RPC unavailable + no user (cron) → the Python fallback filters on the
+    # SYSTEM partition via eq, NOT the retired is_("user_id","null") branch.
+    sb = MagicMock()
+    sb.rpc.side_effect = Exception("not deployed")
+    sel = sb.table.return_value.select.return_value
+    sel.eq.return_value.gte.return_value.execute.return_value = _Resp(
+        [{"cost_usd": 0.5}]
+    )
+
+    result = cost_log.total_spend(
+        sb, user_id=None, since=datetime.now(UTC) - timedelta(hours=1)
+    )
+
+    assert result == pytest.approx(0.5)
+    sel.eq.assert_called_once_with("user_id", SYSTEM_USER_ID)
+    sel.is_.assert_not_called()
 
 
 def test_total_spend_rounds_to_six_decimals() -> None:
@@ -125,7 +147,6 @@ def test_spend_by_purpose_falls_back_when_rpc_unavailable() -> None:
             {"purpose": "tailor", "cost_usd": 0.05},
         ]
     )
-    sel.is_.return_value.execute.return_value = _Resp([])
 
     result = cost_log.spend_by_purpose(sb, user_id="u1")
     assert result == {"job_analysis": pytest.approx(0.30), "tailor": pytest.approx(0.05)}
@@ -195,4 +216,6 @@ def test_enqueue_carries_metadata_when_provided() -> None:
     )
     drained = buffer._drain()
     assert drained[0]["metadata"] == {"job_id": "abc", "target_id": "xyz"}
-    assert drained[0]["user_id"] is None
+    # user_id=None (a cron enqueue) is stamped SYSTEM at row-build time (#88
+    # groundwork) — the buffered write is no longer a NULL-owner row.
+    assert drained[0]["user_id"] == SYSTEM_USER_ID
