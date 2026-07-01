@@ -3,6 +3,23 @@
 Conventions for AI coding agents (and humans) working in this repo. Kept lean — this
 loads into every session.
 
+## Working rhythm — always propose the next move
+
+Don't end a turn asking whether to stop. There's always worthwhile work; the job is to
+pick the _right_ next thing and name it. When a piece of work lands, propose the next step
+as a short paragraph — **what, why now, and roughly how** — and proceed unless redirected.
+Deliberately alternate two lanes:
+
+- **Build** — the next feature or fix.
+- **Tend** — refactor, restructure, delete, or rethink an approach the code has outgrown.
+  Software is a living set of instructions; it needs periodic revision to stay in working
+  order.
+
+Feature work alone never finishes (a dog chasing its tail), so Tend is a first-class
+choice, not filler — pivot to it deliberately after a run of Build work. The
+proposal-paragraph keeps this honest: it has to justify _why this next_, not "there's
+always more."
+
 ## Validate and stress-test before opening a PR
 
 A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
@@ -18,6 +35,23 @@ A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
   residual risk.
 
 See also `CONTRIBUTING.md` → "Before opening a PR" and "Touching prompts or scoring code".
+
+## Releases are the pause point — and an integration gate
+
+"Create a release" / "open a PR from `develop` → `main`" is the deliberate checkpoint in
+the working rhythm above. When asked:
+
+1. **Finish or cleanly park** the work in flight first, so the release captures a coherent
+   state.
+2. **Review the release itself** — don't just open the merge PR. Read the full
+   `develop`→`main` diff and run the pre-PR bar above ("Validate and stress-test") against
+   the _whole_ release: tests + lint + typecheck green, negative/edge cases, and validation
+   against real data / a realistic fixture — hunting especially for interactions between the
+   merged PRs that no single PR could surface. Record what you validated and the residual
+   risk in the release PR body.
+
+The release PR is where accumulated changes earn their integration-level proof — a gate,
+not a rubber stamp.
 
 ## Repo & PR governance
 
