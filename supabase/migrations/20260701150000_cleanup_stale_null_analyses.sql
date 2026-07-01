@@ -1,0 +1,23 @@
+-- Phase 0 (deployment-modes): remove the stale NULL-owner analyses.
+--
+-- Unlike llm_costs (a live append-only ledger, backfilled to SYSTEM in
+-- 20260701140000), the NULL-owner rows in `analyses` are stale legacy cache
+-- entries, not live system output. Prod evidence (2026-07-01):
+--   * 456 rows, none written since 2026-06-06 — no live path still creates them
+--     (the api-key analysis path short-circuits to `no_profile` because there are
+--     no NULL-owner optimized docs to key on).
+--   * all 456 reference optimized docs that are now USER-owned — so their
+--     `user_id IS NULL` is inconsistent with the doc's real owner (they were
+--     orphaned when the docs were re-owned), and they'd never be read again: the
+--     cache key includes `optimized_doc_id`, so a re-derive produces a new key.
+--
+-- `analyses` is a cache; deleting dead entries just means recompute-on-demand,
+-- which for these (job, target, old-doc-version) keys never happens. Re-owning
+-- them to SYSTEM would mis-attribute a real user's stale gradings to the system
+-- and leave `user_id <> optimized_doc.user_id`. So: delete. This also clears the
+-- table to 0 NULL owners ahead of the `user_id NOT NULL` constraint (step 4).
+--
+-- Paired with the cost_log/persistence change in the same PR that maps a no-user
+-- write to SYSTEM (resolve_owner), so no new NULL-owner rows can appear.
+
+DELETE FROM public.analyses WHERE user_id IS NULL;

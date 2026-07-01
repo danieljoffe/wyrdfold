@@ -14,9 +14,14 @@ once across both paths.
 
 ``optimized_doc_id`` already encodes the owner (the unique constraint
 ``experience_optimized_docs_user_id_version_key`` ties a doc to one user),
-so ``user_id`` is technically redundant with it for non-NULL owners — but
-it's kept in the key as a tenant-isolation backstop and to keep the
-upsert conflict target aligned with the row's natural identity.
+so ``user_id`` is technically redundant with it for real owners — but it's
+kept in the key as a tenant-isolation backstop and to keep the upsert
+conflict target aligned with the row's natural identity.
+
+As of Phase 0 (deployment-modes) a caller with no user resolves to
+``SYSTEM_USER_ID`` via ``resolve_owner`` rather than NULL, so ``user_id`` is
+never NULL on new rows; the stale legacy NULL rows were removed in migration
+``20260701150000``.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.constants import resolve_owner
 from app.models.analysis import JobAnalysis, JobAnalysisRecord
 from app.models.llm import LLMResult
 
@@ -49,7 +55,7 @@ def get_cached(
         .order("created_at", desc=True)
         .limit(1)
     )
-    query = query.is_("user_id", "null") if user_id is None else query.eq("user_id", user_id)
+    query = query.eq("user_id", resolve_owner(user_id))
     resp = query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -60,7 +66,8 @@ def get_cached(
 # Conflict target for the idempotent upsert below. Must match the columns
 # of the ``analyses_cache_key_unique`` constraint (see migration
 # 20260623140000) exactly, in order. The DB constraint is declared
-# ``NULLS NOT DISTINCT`` so legacy ``user_id IS NULL`` rows dedup too.
+# ``NULLS NOT DISTINCT`` — harmless now that Phase 0 no longer writes a NULL
+# owner (resolve_owner maps no-user → SYSTEM before the upsert).
 _CACHE_KEY_COLS = "job_posting_id,target_id,optimized_doc_id,user_id"
 
 
@@ -92,7 +99,7 @@ def persist(
     row: dict[str, Any] = {
         "job_posting_id": job_posting_id,
         "target_id": target_id,
-        "user_id": user_id,
+        "user_id": resolve_owner(user_id),
         "optimized_doc_id": optimized_doc_id,
         "scorecard": analysis.scorecard.model_dump(mode="json"),
         "recommendation": analysis.recommendation,

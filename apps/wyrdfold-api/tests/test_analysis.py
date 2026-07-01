@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.constants import SYSTEM_USER_ID
 from app.models.analysis import (
     JobAnalysis,
     JobAnalysisRecord,
@@ -279,8 +280,9 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
     never returned to another (and so the poller — which now stamps the
     doc's owning user — shares the same cache entry the user view reads).
 
-    For a real user the query ends in ``.eq("user_id", <uuid>)``; for the
-    api-key/legacy ``None`` caller it ends in ``.is_("user_id", "null")``.
+    For a real user the query ends in ``.eq("user_id", <uuid>)``; for a
+    no-user (api-key) caller it ends in ``.eq("user_id", SYSTEM_USER_ID)`` — the
+    Phase-0 SYSTEM partition, replacing the retired ``.is_("user_id","null")``.
     """
     supabase = _make_supabase_mock(select_data=[])
     persistence_mod.get_cached(
@@ -291,7 +293,8 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
     final_eq = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.eq
     final_eq.assert_called_once_with("user_id", "user-A")
 
-    # And the None caller uses the IS NULL branch, never the user .eq.
+    # And a no-user (api-key) caller reads the SYSTEM partition via .eq,
+    # never the retired .is_("user_id","null") branch (#88 groundwork).
     supabase_null = _make_supabase_mock(select_data=[])
     persistence_mod.get_cached(
         supabase_null,
@@ -301,8 +304,8 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
         user_id=None,
     )
     null_chain = supabase_null.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
-    null_chain.is_.assert_called_once_with("user_id", "null")
-    null_chain.eq.assert_not_called()
+    null_chain.eq.assert_called_once_with("user_id", SYSTEM_USER_ID)
+    null_chain.is_.assert_not_called()
 
 
 def test_persist_upserts_and_returns_record() -> None:
@@ -329,8 +332,10 @@ def test_persist_upserts_and_returns_record() -> None:
     # Idempotent upsert (not a blind insert) so concurrent/duplicate
     # computations collapse onto one row via the cache-key conflict target.
     supabase.table.return_value.upsert.assert_called_once()
-    _, kwargs = supabase.table.return_value.upsert.call_args
+    args, kwargs = supabase.table.return_value.upsert.call_args
     assert kwargs["on_conflict"] == persistence_mod._CACHE_KEY_COLS
+    # A no-user (api-key) write is stamped SYSTEM, never NULL (#88 groundwork).
+    assert args[0]["user_id"] == SYSTEM_USER_ID
 
 
 def test_persist_raises_on_empty_upsert() -> None:
