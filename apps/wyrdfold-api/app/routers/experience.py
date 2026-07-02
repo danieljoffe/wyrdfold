@@ -20,7 +20,6 @@ from supabase import Client
 from app.dependencies import (
     enforce_llm_budget,
     get_current_user_id,
-    get_current_user_id_optional,
     get_embeddings_client,
     get_llm_client,
     get_supabase,
@@ -111,8 +110,8 @@ def create_prose(
 
 @router.delete("/prose")
 def delete_master_document(
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Delete the master document and everything derived from it.
 
@@ -120,9 +119,9 @@ def delete_master_document(
     cascade) so the *next* upload starts from a clean slate instead of
     semantically merging the new resume into the old document (see
     ``merge_into_prose``). Conversation turns and preferences are kept — this
-    deletes the document, not the account's experience history. Uses the
-    service-role client like ``conversation/reset``; the wipe is scoped to the
-    caller's ``user_id``.
+    deletes the document, not the account's experience history. Runs on the RLS
+    client (Phase 1): RLS scopes the wipe to the caller's own rows
+    (``auth.uid() = user_id``), backstopping the app-layer ``user_id`` filter.
     """
     return orchestrator.reset_content(supabase, user_id=user_id, include_turns=False)
 
@@ -760,8 +759,8 @@ async def conversation_turn(
 # Sync `def`: blocking supabase wipe runs in the threadpool (#107).
 @router.post("/conversation/reset")
 def conversation_reset(
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Wipe prose, optimized (chunks cascade), and turns. Preferences are
     preserved — delete them via DELETE /experience/preferences if wanted.
