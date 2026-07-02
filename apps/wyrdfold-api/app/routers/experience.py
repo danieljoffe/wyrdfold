@@ -25,6 +25,7 @@ from app.dependencies import (
     get_llm_client,
     get_supabase,
     get_supabase_for_caller,
+    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.models.conversation import (
@@ -90,8 +91,8 @@ _PARSE_TIMEOUT_SECONDS = 30.0
 # the event loop. See #107.
 @router.get("/prose")
 def get_prose(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc | dict[str, None]:
     doc = prose.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -103,8 +104,8 @@ def get_prose(
 @router.post("/prose")
 def create_prose(
     body: ProseDocCreate,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc:
     return prose.create_version(supabase, user_id=user_id, content=body.content)
 
