@@ -1,0 +1,37 @@
+-- Supabase audit (2026-07-02), LOW — normalize grants on the two
+-- "service-role-only" internal tables so the standing intent is enforced by
+-- GRANTS, not merely by "RLS enabled + no policy exists".
+--
+-- job_embeddings (20260624120000) and prescan_shadow (20260624140000) are
+-- GLOBAL, service-role-written internal data with NO per-user owner column.
+-- Both were created with the `experience_chunks` GRANT triple —
+-- GRANT ALL TO anon/authenticated/service_role — and rely on RLS-enabled +
+-- no-policy to deny anon/authenticated. That works today, but it leaves broad
+-- standing grants on internal tables: the moment a SELECT policy is ever added
+-- (accidentally or by a copy-paste of the experience_chunks pattern), those
+-- grants become live access. This is exactly the "grant is wider than intent"
+-- shape that 20260620130000 / 20260621120000 / 20260629120000 had to clean up
+-- elsewhere. Revoke the anon/authenticated table privileges so the tables are
+-- service-role-only by GRANT as well as by RLS (defense in depth). The live
+-- Supabase advisor's `rls_enabled_no_policy` warnings on these two tables are
+-- the same debt.
+--
+-- Confirmed service-role-only in code: the ONLY readers/writers are the poller
+-- path via the service-role client —
+--   app/services/embeddings/job_embeddings.py  (upsert_job_embedding)
+--   app/services/embeddings/prescan_gate.py    (cosine_gate_decision reads job_embeddings)
+--   app/services/embeddings/prescan_shadow.py  (record_shadow_observation)
+-- No frontend or user/anon Supabase client references either table (grep of
+-- apps/wyrdfold/src + apps/wyrdfold-api/app). service_role bypasses RLS and is
+-- unaffected by these REVOKEs.
+--
+-- Idempotent: REVOKE is a no-op once the privilege is already gone, so
+-- re-applying the whole file changes nothing. Non-destructive — REVOKE touches
+-- only ACLs, never row data, so it clears tests/test_migration_safety.py
+-- (no DROP/TRUNCATE, no CREATE INDEX).
+--
+-- Reversible (manual — no down file): re-run the original
+--   GRANT ALL ON TABLE public.<t> TO anon, authenticated;
+
+REVOKE ALL ON TABLE "public"."job_embeddings" FROM "anon", "authenticated";
+REVOKE ALL ON TABLE "public"."prescan_shadow" FROM "anon", "authenticated";
