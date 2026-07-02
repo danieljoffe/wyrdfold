@@ -1292,7 +1292,13 @@ def list_jobs(
     remote_only: bool = Query(False),
     min_salary: int | None = Query(None, ge=0),
     country: str | None = Query(None, max_length=4),
-    supabase: Client = Depends(get_supabase),
+    # #88 dual-auth: JWT callers ride the RLS user client (jobs/scores/targets
+    # are SELECT-true; user_jobs/user_targets/user_profiles self-scoped, and
+    # the get_target_jobs RPC is SECURITY INVOKER with an authenticated EXECUTE
+    # grant, so RLS still governs inside it). Api-key callers (user_id None,
+    # the operator view below) get the service-role client — they have no JWT
+    # to bind. The client choice mirrors get_current_user_id_optional.
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> dict[str, Any]:
     exclude_terms = _parse_location_list(exclude_locations)
@@ -1662,7 +1668,11 @@ def _pipeline_counts_grouped(
 
 @router.get("/pipeline-counts")
 def pipeline_counts(
-    supabase: Client = Depends(get_supabase),
+    # #88 dual-auth: get_current_user_id is JWT-required, so every caller that
+    # reaches the body carries a JWT and rides the RLS user client (the
+    # pipeline_counts RPC is SECURITY INVOKER; user_jobs/user_targets/
+    # user_profiles are self-scoped, scores/jobs SELECT-true).
+    supabase: Client = Depends(get_supabase_for_caller),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, int]:
     """Per-status job counts for the calling user's pipeline.
@@ -2161,7 +2171,10 @@ def _assert_user_owns_posting(
 def get_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #88 dual-auth: JWT-required endpoint, so callers ride the RLS user
+    # client (ownership probe reads jobs/user_targets/scores — SELECT-true or
+    # self-scoped; the status overlay reads the caller's own user_jobs row).
+    supabase: Client = Depends(get_supabase_for_caller),
 ) -> dict[str, Any]:
     # Detail GET pulls ``description_html`` so the UI can render the JD
     # body. The list endpoint deliberately omits it for payload size, but
