@@ -550,6 +550,7 @@ def test_list_jobs_without_target_returns_global_view(
     from app.dependencies import (
         get_current_user_id_optional,
         get_supabase,
+        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
     from app.main import app
@@ -576,6 +577,9 @@ def test_list_jobs_without_target_returns_global_view(
     supabase.table.return_value = jp_mock
 
     app.dependency_overrides[get_supabase] = lambda: supabase
+    # api-key caller (user_id None): dual-auth resolves the caller client to
+    # the service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
 
@@ -599,6 +603,7 @@ def test_list_jobs_with_target_overlays_target_score(
     from app.dependencies import (
         get_current_user_id_optional,
         get_supabase,
+        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
     from app.main import app
@@ -642,6 +647,9 @@ def test_list_jobs_with_target_overlays_target_score(
     )
 
     app.dependency_overrides[get_supabase] = lambda: supabase
+    # api-key caller (user_id None): dual-auth resolves the caller client to
+    # the service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
 

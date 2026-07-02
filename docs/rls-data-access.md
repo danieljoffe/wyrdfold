@@ -39,18 +39,28 @@ Two clients exist (`app/dependencies.py`):
 | **`reference_jds.user_id`** (nullable uuid, FK `ON DELETE SET NULL`)                                                                                                       | Shared-catalog content with **optional attribution** — NULL means "seeded/unattributed" and is load-bearing: the #29 erasure flow anonymizes (keeps the shared JD, drops the link), and the SET NULL FK automates + backstops exactly that. Deliberately NOT NOT-NULL/CASCADE (decision on #6, 2026-07-02, migration `20260702150000`).                                                                                                                                                                                                                                                                                                                                                                                                              |
 | **Background pipeline** (poller, scheduler, batch, learner internals)                                                                                                      | No request context — these run from cron/queue with the service key, charging work to the activating user via explicit `user_id` params.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
-## Dual-auth (JWT → RLS, api-key → service-role): deferred, with reason
+## Dual-auth (JWT → RLS, api-key → service-role): done (#88)
 
-`jobs.py` list/read surfaces (`GET /jobs`, `/pipeline-counts`, `GET /{id}`) and
-`analysis.py` remain on `get_supabase` + `get_current_user_id_optional` even
-though a JWT caller _could_ be routed through the user client via
-`get_supabase_for_caller`:
+`jobs.py` list/read surfaces (`GET /jobs`, `/pipeline-counts`, `GET /{id}`)
+now run on `get_supabase_for_caller`: JWT callers ride the RLS user client,
+api-key callers (the operator view) keep service-role. What the flip
+verified (2026-07-02, live stack + byte-identical before/after responses):
 
-- The list path calls the `get_target_jobs` **RPC** — routing it through the
-  user client needs an EXECUTE grant + in-function scoping audit first.
-- It is the hottest path in the app; flipping its client should be validated
-  against a live stack, not shipped blind.
+- `get_target_jobs` and `pipeline_counts` are **SECURITY INVOKER** with an
+  `authenticated` EXECUTE grant; inside them, `jobs`/`scores` are
+  SELECT-true and the `user_jobs` join is RLS-scoped — so a JWT client
+  passing _another_ user's `p_user_id` reads `'new'`, not their pipeline
+  state (pinned by `tests/integration/test_rls_jobs_reads.py`, which also
+  asserts JWT-vs-service equivalence for both RPCs).
+- Every table on the JWT paths has a covering policy: `user_jobs` /
+  `user_targets` / `user_profiles` self-scoped, shared catalog SELECT-true.
 
-If you pick this up: switch the dependency to `get_supabase_for_caller`,
-verify the RPC grant, and extend `tests/integration/test_rls_jobs_reads.py`
-to run the list through a user JWT.
+`analysis.py` is split rather than wholesale-flipped: the caller client
+(`get_supabase_for_caller`) carries the ownership gate (`user_targets`),
+the optimized-doc read, the target + job fetches, and the scores
+read + blend-RPC write. The **cost-bearing plumbing stays service-role
+deliberately**: the `analyses` cache read/upsert and the `llm_costs`
+write/count. `analyses`/`llm_costs` have no `authenticated` INSERT policy
+by design, and an RLS surprise on the cache read or the daily-count read
+would silently become duplicate LLM spend / a widened budget — that
+failure mode must stay impossible, not merely tested.
