@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_current_user_id, get_supabase, verify_api_key_or_jwt
+from app.dependencies import get_current_user_id, get_user_supabase, verify_api_key_or_jwt
 from app.main import app
 from app.models.targets import TargetPreferences
 from app.services.targets import crud
@@ -213,7 +213,7 @@ def test_set_preferences_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
@@ -223,7 +223,7 @@ def client() -> TestClient:
 def test_get_endpoint_returns_preferences(client: TestClient) -> None:
     supabase = MagicMock()
     _wire_select(supabase, [_row(pref_score_cutoff=55, pref_locations=["berlin"])])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.get("/targets/target-1/preferences")
 
@@ -239,7 +239,7 @@ def test_get_endpoint_404_when_no_link(client: TestClient) -> None:
     target's existence."""
     supabase = MagicMock()
     _wire_select(supabase, [])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.get("/targets/target-1/preferences")
 
@@ -254,7 +254,7 @@ def test_put_endpoint_persists_and_busts_cache(
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
     _wire_update(supabase, [_row(pref_score_cutoff=90, pref_locations=["nyc"])])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     busted: list[str] = []
     monkeypatch.setattr(
@@ -277,7 +277,7 @@ def test_put_endpoint_persists_and_busts_cache(
 def test_put_endpoint_404_when_no_link(client: TestClient) -> None:
     supabase = MagicMock()
     _wire_select(supabase, [])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -293,7 +293,7 @@ def test_put_idor_other_users_link_404(client: TestClient) -> None:
     the service-role client can't be steered onto another user's row."""
     supabase = MagicMock()
     _wire_select(supabase, [])  # no link for this (user, target)
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -313,7 +313,7 @@ def test_put_score_cutoff_boundary_validation(
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
     _wire_update(supabase, [_row(pref_score_cutoff=value if 0 <= value <= 200 else 40)])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -327,7 +327,7 @@ def test_put_rejects_inverted_seniority_range(client: TestClient) -> None:
     boundary (422) instead of storing a confusing no-op."""
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -351,7 +351,7 @@ def test_put_empty_body_uses_defaults(client: TestClient) -> None:
     supabase = MagicMock()
     _wire_select(supabase, [_row(pref_score_cutoff=99)])
     _wire_update(supabase, [_row()])  # reset to defaults
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.put("/targets/target-1/preferences", json={})
 
@@ -372,7 +372,7 @@ def test_preferences_route_does_not_collide_with_get_target(
 
     supabase = MagicMock()
     _wire_select(supabase, [_row(pref_score_cutoff=33)])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
     # GET /targets/{id} ownership-checks the caller; the fixture user owns it.
     monkeypatch.setattr(
         router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"}

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_current_user_id, get_supabase, verify_api_key_or_jwt
+from app.dependencies import get_current_user_id, get_user_supabase, verify_api_key_or_jwt
 from app.main import app
 from app.services.targets import crud
 
@@ -154,7 +154,7 @@ def test_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
@@ -241,7 +241,7 @@ def test_patch_partial_body_preserves_other_channel_end_to_end(
     supabase = MagicMock()
     _wire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
     _wire_update(supabase, [_row(job_score_threshold=90, sms_score_threshold=70)])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -258,7 +258,7 @@ def test_patch_empty_body_is_noop(client: TestClient) -> None:
     """An empty PATCH body issues no UPDATE and 200s with the current row."""
     supabase = MagicMock()
     _wire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.patch("/targets/target-1/notification-thresholds", json={})
 
@@ -272,7 +272,7 @@ def test_patch_idor_other_users_link_404(client: TestClient) -> None:
     the service-role client can't be steered onto another user's row."""
     supabase = MagicMock()
     _wire_select(supabase, [])  # no link for this (user, target)
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -288,7 +288,7 @@ def test_patch_boundary_validation(client: TestClient, value: int, expected: int
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
     _wire_update(supabase, [_row(job_score_threshold=value if value in (0, 200) else None)])
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
