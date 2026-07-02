@@ -113,6 +113,7 @@ async def upsert_for_optimized(
     optimized: OptimizedDoc,
     *,
     user_id: str | None,
+    cost_supabase: Client | None = None,
     model: EmbeddingModelId = "voyage-3",
     purpose: str = DEFAULT_PURPOSE,
 ) -> list[Chunk]:
@@ -120,6 +121,14 @@ async def upsert_for_optimized(
 
     Idempotent: deletes any existing chunks for this doc_id before insert.
     Records embedding cost in llm_costs under `purpose`.
+
+    The chunk delete/insert run on ``supabase`` — which may be an RLS-bound user
+    client (``experience_chunks`` is parent-scoped, so a caller only touches
+    chunks of their own optimized doc). The cost row goes to ``cost_supabase``
+    when given: ``llm_costs`` has no INSERT policy for ``authenticated`` (a user
+    must not write the cost ledger — negative-cost rows would bypass the budget),
+    so an RLS caller passes a service-role client for the cost write. Defaults to
+    ``supabase`` for service-role callers (poller, batch) that pass one directly.
     """
     inputs = chunks_for_optimized(optimized.payload)
     _delete_existing(supabase, optimized.id)
@@ -133,7 +142,7 @@ async def upsert_for_optimized(
         purpose=purpose,
     )
     cost_log.record_embedding(
-        supabase,
+        cost_supabase or supabase,
         user_id=user_id,
         purpose=purpose,
         result=result,
