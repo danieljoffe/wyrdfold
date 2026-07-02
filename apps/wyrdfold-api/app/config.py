@@ -18,6 +18,20 @@ class Settings(BaseSettings):
         env_file=_TEST_ENV_FILE, env_file_encoding="utf-8", extra="ignore"
     )
 
+    # Deployment-modes epic (docs/plan-wyrdfold-deployment-modes.md, Phase 2).
+    # The mode gates ONLY the perimeter (signup/provisioning/billing) — never
+    # the data model, RLS, or auth mechanics, which are identical in both.
+    #   self_host — closed signup; the owner is provisioned at boot from
+    #               OWNER_EMAIL (see app/services/owner_provisioning.py).
+    #   saas      — open signup + billing perimeter (Phase 3; no behavior yet).
+    # Default self_host: the safe posture for anyone who clones the repo.
+    deployment_mode: Literal["self_host", "saas"] = "self_host"
+    # First-run owner bootstrap (self_host only): when set, boot idempotently
+    # creates this auth user (email-confirmed) so the operator can sign in via
+    # magic link without ever opening the Supabase dashboard. Unset = no-op,
+    # so existing deployments are unaffected.
+    owner_email: str = ""
+
     supabase_url: str = ""
     supabase_service_role_key: str = Field(default="", repr=False)
     # Anon (publishable) key — the base for the per-request, JWT-bound
