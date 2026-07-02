@@ -565,7 +565,8 @@ async def delete_account(
 @router.get("/export")
 async def export_account_data(
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
+    service_supabase: Client = Depends(get_supabase),  # RLS-gap reads only
 ) -> Response:
     """Personal-data export / portability (#29 P2).
 
@@ -575,9 +576,14 @@ async def export_account_data(
     inventory mirrors the deletion cascade, so "download everything" and
     "delete everything" cover the same rows.
 
-    Uses the **service-role** client scoped by ``user_id`` (same model as
-    ``DELETE /account``); the router-level ``verify_supabase_jwt`` blocks
-    api-key callers, so only a logged-in user can export their own data.
+    Rides the caller's **RLS user client** for the per-user tables and
+    Storage (#88), with a service-role client threaded alongside (the
+    Phase-1 dual-client pattern) for the three reads RLS would silently
+    truncate: ``user_api_keys`` + ``notifications_sent`` (no policies by
+    design) and ``reference_jds`` (follower-scoped read ≠ contributor
+    scope) — see ``data_export._SERVICE_ROLE_TABLES``. The router-level
+    ``verify_supabase_jwt`` blocks api-key callers, so only a logged-in
+    user can export their own data.
 
     The ZIP is built into a ``SpooledTemporaryFile`` (spills to disk past
     ``_EXPORT_SPOOL_MAX_MEMORY``) and streamed in chunks, so a large export
@@ -591,7 +597,11 @@ async def export_account_data(
     spool = tempfile.SpooledTemporaryFile(max_size=_EXPORT_SPOOL_MAX_MEMORY)  # noqa: SIM115
     try:
         await asyncio.to_thread(
-            data_export.write_export_zip, supabase, spool, user_id=user_id
+            data_export.write_export_zip,
+            supabase,
+            spool,
+            user_id=user_id,
+            service_supabase=service_supabase,
         )
         size = spool.seek(0, os.SEEK_END)
         spool.seek(0)
