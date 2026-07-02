@@ -207,11 +207,16 @@ async def handle_turn(
 ) -> TurnResult:
     """Persist the user turn, run the LLM, persist the assistant reply,
     and optionally append to the prose doc."""
-    history = turns.list_turns(
+    from app.config import settings
+
+    # LLM context window, not history truncation: every turn stays persisted;
+    # only the slice re-sent to the model is capped (#29 — previously the
+    # entire history, unbounded, was resent every turn).
+    history = turns.list_recent_turns(
         supabase,
         user_id=user_id,
         conversation_type=conversation_type,
-        limit=1_000_000,
+        limit=settings.conversation_history_max_turns,
     )
     current_prose = prose.get_latest(supabase, user_id=user_id)
 
