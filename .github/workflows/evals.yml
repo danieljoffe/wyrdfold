@@ -68,8 +68,18 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
-            echo "::warning title=Evals skipped::Set the OPENROUTER_API_KEY repository secret to run the spend-bearing evals."
-            exit 0
+            # A MANUAL run is triggered by a human who wants results — reporting
+            # a green "success" while running zero evals is misleading (CI audit
+            # 2026-07-01, LOW). Fail loudly so the run is unambiguously red and
+            # names the missing secret. The (currently commented) monthly
+            # SCHEDULE path stays non-blocking: a cron with no secret should
+            # warn, not spam failures.
+            if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+              echo "::warning title=Evals skipped::OPENROUTER_API_KEY secret is not set — scheduled eval run performed no evaluation."
+              exit 0
+            fi
+            echo "::error title=Evals not run::OPENROUTER_API_KEY repository secret is not set, so NO evals ran. This manual dispatch is failed deliberately rather than reporting a misleading green. Set the secret (Settings → Secrets → Actions) and re-run."
+            exit 1
           fi
           run_phase1() { uv run python scripts/eval_phase1_triage.py ${MODELS:+--models "$MODELS"}; }
           run_derive() { uv run python scripts/eval_derive_target.py; }
