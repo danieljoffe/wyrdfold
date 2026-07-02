@@ -24,6 +24,7 @@ from app.dependencies import (
     get_current_user_id_optional,
     get_supabase,
     get_supabase_for_caller,
+    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -2206,7 +2207,11 @@ def get_job(
 def delete_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #88 Phase 3: RLS client — the only write is the caller's own user_jobs
+    # row (full CRUD self-policy); the ownership probe reads shared-catalog
+    # tables (SELECT true). RLS makes the cross-tenant-cascade class of bug
+    # (audit #29 r3 H1) structurally impossible, not just guarded.
+    supabase: Client = Depends(get_user_supabase),
 ) -> dict[str, Any]:
     """Per-user "delete" of a job from the caller's pipeline.
 

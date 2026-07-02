@@ -20,6 +20,7 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase,
+    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.services.targets import crud
@@ -95,6 +96,7 @@ def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row(
     tc = _client_with_overrides(
         {
             get_supabase: lambda: supabase,
+            get_user_supabase: lambda: supabase,
             get_current_user_id: lambda: "user-a",
             verify_api_key_or_jwt: lambda: "user-a",
         }
@@ -146,6 +148,7 @@ def test_delete_job_unowned_posting_is_404(
     tc = _client_with_overrides(
         {
             get_supabase: lambda: supabase,
+            get_user_supabase: lambda: supabase,
             get_current_user_id: lambda: "user-b",
             verify_api_key_or_jwt: lambda: "user-b",
         }

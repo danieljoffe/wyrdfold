@@ -119,8 +119,9 @@ def _build_supabase(
 @pytest.fixture
 def client_factory():
     def _make(supabase: MagicMock, *, authed: bool = True) -> TestClient:
-        # Status routes run on the RLS user client (#88 Phase 2); the
-        # DELETE /jobs/{id} route in this file still runs on service-role.
+        # The routes this file exercises moved to the RLS user client across
+        # the #88 phases — override both clients with the same mock so every
+        # route resolves regardless of which dependency it declares.
         app.dependency_overrides[get_user_supabase] = lambda: supabase
         app.dependency_overrides[get_supabase] = lambda: supabase
         if authed:
