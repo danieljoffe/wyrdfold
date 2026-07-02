@@ -177,7 +177,17 @@ jobs:
       - name: Export stack env for the authed tier
         run: |
           set -euo pipefail
-          eval "$(supabase status -o env | grep -E '^(ANON_KEY|SERVICE_ROLE_KEY)=')"
+          # Parse KEY="value" lines explicitly rather than eval-ing CLI
+          # output — no shell interpretation of tool output, and a format
+          # change breaks loudly (empty-var check) instead of executing
+          # something unexpected.
+          STATUS_ENV="$(supabase status -o env)"
+          ANON_KEY="$(printf '%s\n' "$STATUS_ENV" | sed -n 's/^ANON_KEY="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')"
+          SERVICE_ROLE_KEY="$(printf '%s\n' "$STATUS_ENV" | sed -n 's/^SERVICE_ROLE_KEY="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')"
+          if [ -z "$ANON_KEY" ] || [ -z "$SERVICE_ROLE_KEY" ]; then
+            echo "Failed to parse ANON_KEY / SERVICE_ROLE_KEY from 'supabase status -o env'"
+            exit 1
+          fi
           {
             echo "NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321"
             echo "NEXT_PUBLIC_SUPABASE_ANON_ID=${ANON_KEY}"
