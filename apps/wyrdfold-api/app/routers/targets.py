@@ -696,7 +696,9 @@ def deactivate_target(
 def set_axis_weights(
     target_id: str,
     weights: AxisWeights,
-    supabase: Client = Depends(get_supabase),
+    # #88 Phase 2: RLS client — writes only the caller's user_targets row
+    # (full CRUD self-policy), so RLS backstops the crud helper's user_id filter.
+    supabase: Client = Depends(get_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Set the user's per-target axis weights.
@@ -724,7 +726,7 @@ def set_axis_weights(
 @router.delete("/{target_id}/axis-weights", response_model=UserTarget)
 def reset_axis_weights(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Reset axis_weights to defaults (NULL — equal quartile).
@@ -752,7 +754,7 @@ def reset_axis_weights(
 @router.post("/{target_id}/axis-weights/undo", response_model=UserTarget)
 def undo_axis_weights(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Swap ``axis_weights`` and ``axis_weights_previous``.
@@ -776,7 +778,7 @@ def undo_axis_weights(
 def set_notification_thresholds(
     target_id: str,
     body: NotificationThresholdsUpdate,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Set this target's per-channel email/SMS score thresholds (#15).
@@ -819,16 +821,16 @@ def _invalidate_jobs_cache_for_target(target_id: str) -> None:
 # on the user_targets junction and NEVER trigger a re-grade or per-user
 # scoring. JWT-only (no api-key fallback) — there is no "current user" without
 # a JWT, and ownership is enforced exactly like the axis-weights /
-# notification-thresholds routes (the crud helpers 404 via None when the
-# (user, target) link is missing, so the service-role client can't be steered
-# onto another user's row).
+# notification-thresholds routes: the crud helpers 404 via None when the
+# (user, target) link is missing, and (#88 Phase 2) the RLS-bound user client
+# means Postgres itself refuses to surface or mutate another user's row.
 
 
 # Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.get("/{target_id}/preferences", response_model=TargetPreferences)
 def get_target_preferences(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> TargetPreferences:
     """Return the calling user's preferences for a target.
@@ -853,7 +855,7 @@ def get_target_preferences(
 def set_target_preferences(
     target_id: str,
     body: TargetPreferencesUpdate,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> TargetPreferences:
     """Replace the calling user's preferences for a target (PUT semantics).
