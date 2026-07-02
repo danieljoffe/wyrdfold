@@ -30,7 +30,6 @@ from supabase import Client
 from app.dependencies import (
     enforce_llm_budget,
     get_current_user_id,
-    get_current_user_id_optional,
     get_llm_client,
     get_supabase,
     get_user_supabase,
@@ -347,8 +346,8 @@ async def create_tailored_cover_letter(
 @router.get("/resumes")
 def list_documents(
     limit: int = 50,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, list[TailoredResumeRecord]]:
     rows = persistence.list_recent(
         supabase,
@@ -363,8 +362,8 @@ def list_documents(
 @router.get("/cover-letters")
 def list_tailored_cover_letters(
     limit: int = 50,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, list[TailoredResumeRecord]]:
     rows = persistence.list_recent(
         supabase,
@@ -382,8 +381,8 @@ def list_tailored_cover_letters(
 @router.get("/resumes/by-job/{job_posting_id}")
 def get_resume_by_job(
     job_posting_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord | None:
     """Most recent resume for a given job posting, or ``null`` if none exists.
 
@@ -401,8 +400,8 @@ def get_resume_by_job(
 @router.get("/cover-letters/by-job/{job_posting_id}")
 def get_cover_letter_by_job(
     job_posting_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord | None:
     """Most recent cover letter for a given job posting, or ``null``
     if none exists. See ``get_resume_by_job`` for the 200-with-null
@@ -494,8 +493,8 @@ async def export_resumes_zip(
 def edit_tailored_resume(
     resume_id: str,
     body: ResumeEditRequest,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
     """Edit a draft resume's markdown. Rejected if already approved.
 
@@ -529,8 +528,8 @@ def edit_tailored_resume(
 def checkpoint_tailored_resume(
     resume_id: str,
     body: ResumeCheckpointRequest | None = None,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     """Snapshot a draft resume's current markdown into version history.
 
@@ -572,8 +571,8 @@ def checkpoint_tailored_resume(
 @router.post("/resumes/{resume_id}/approve")
 def approve_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
     """Approve (lock) a tailored resume or cover letter. Idempotent if already approved."""
     row = persistence.get(supabase, resume_id, user_id=user_id)
@@ -606,8 +605,8 @@ def approve_tailored_resume(
 @router.post("/resumes/{resume_id}/unapprove")
 def unapprove_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
     """Reopen an approved resume or cover letter for editing. Idempotent if already unlocked."""
     row = persistence.get(supabase, resume_id, user_id=user_id)
@@ -641,8 +640,8 @@ def unapprove_tailored_resume(
 @router.get("/resumes/{resume_id}")
 def get_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
     row = persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
@@ -654,8 +653,8 @@ def get_tailored_resume(
 @router.get("/resumes/{resume_id}/versions")
 def list_resume_versions(
     resume_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     """Return up to FREE_TIER_VERSION_CAP recent payload snapshots (F3-H)."""
     row = persistence.get(supabase, resume_id, user_id=user_id)
@@ -936,8 +935,8 @@ async def create_batch_resumes(
 @router.get("/batch/{batch_id}")
 def get_batch_status(
     batch_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> BatchJob:
     """Poll batch processing progress."""
     batch = get_batch(supabase, batch_id, user_id=user_id)
