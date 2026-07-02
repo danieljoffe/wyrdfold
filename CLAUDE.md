@@ -31,6 +31,18 @@ A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
   validator that rejects the bad input).
 - **Validate against real data or a realistic fixture** where feasible — watch it actually
   run; don't just confirm it imports/compiles.
+- **Live API validation runs the Docker image.** When validation means _running_ the API
+  (release-gate drives, endpoint probes), run the containerized API — the same image CI's
+  Trivy job builds and Railway deploys — pointed at the local stack
+  (`SUPABASE_URL=http://host.docker.internal:54321` on macOS). Host `uvicorn` misses
+  packaging/startup issues (env requirements, pandoc, Python drift) that only the artifact
+  shows. Plain pytest suites stay on the host venv — they don't boot the API.
+- **Grow the LLM mock with every PR that touches LLM surfaces.** A PR touching LLM calls,
+  prompts, or LLM-output parsing must extend the mock's edge battery for the surface it
+  touched (malformed/truncated JSON, fenced output, schema-violating payloads, empty
+  content, injection-looking text echoed as data, mid-stream provider errors, …). Every
+  LLM bug we hit becomes a named mock behavior + regression test — the mock is the
+  accumulated bug corpus, so new endpoints inherit every past failure mode for free.
 - **State what you validated in the PR body** — what ran, what you couldn't test, and the
   residual risk.
 
