@@ -85,6 +85,15 @@ the working rhythm above. When asked:
    migrations are written to be backward-compatible with the running code, so
    migrations-first is the safe order. This step exists because three releases once shipped
    RLS code whose policies never reached prod, breaking status writes live.
+6. **After deploy, smoke the running prod app on the changed surface.** Green CI + applied
+   migrations still don't prove prod's _environment_ is right — env vars and secrets drift
+   independently of code and no pre-merge check sees them. Hit the changed prod endpoints
+   (authed where it matters) and watch the logs. This step exists because a release flipped
+   `GET /jobs` onto the RLS user client whose prod `SUPABASE_ANON_KEY` was a **disabled
+   legacy key** — 500-storming the hottest endpoint, invisible to every local/CI check
+   (which used a working local key). The API now boot-guards its Supabase keys
+   (`_probe_supabase_keys`), but the general lesson stands: prod config is only proven by
+   touching prod.
 
 The release PR is a gate, not a rubber stamp — the step proves the release is **correct**
 (tests + integration), **usable** (the real flows work end-to-end), and **safe** (no widened
