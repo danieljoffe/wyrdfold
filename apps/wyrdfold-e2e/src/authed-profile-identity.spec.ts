@@ -39,7 +39,7 @@ test.describe('profile identity round-trip', () => {
     // Wait for the Profile page to mount. The Name input lives in
     // ProfileIdentityCard; the Skeleton is replaced once GET /identity
     // resolves.
-    const nameInput = page.getByLabel('Name', { exact: true });
+    const nameInput = page.getByRole('textbox', { name: 'Name*' });
     await expect(nameInput).toBeVisible();
 
     // The shared test user should have a name set (created via the
@@ -63,7 +63,7 @@ test.describe('profile identity round-trip', () => {
       // fires fresh against the database.
       await page.reload();
 
-      const reloadedNameInput = page.getByLabel('Name', { exact: true });
+      const reloadedNameInput = page.getByRole('textbox', { name: 'Name*' });
       await expect(reloadedNameInput).toHaveValue(TEST_NAME);
     } finally {
       // Restore. If the previous step crashed mid-test we still
@@ -71,7 +71,7 @@ test.describe('profile identity round-trip', () => {
       // state; otherwise subsequent runs would assert against
       // ``E2E Test User <timestamp>`` and the manual UI would show
       // a confusing stale name.
-      const restoreInput = page.getByLabel('Name', { exact: true });
+      const restoreInput = page.getByRole('textbox', { name: 'Name*' });
       if ((await restoreInput.inputValue()) !== original) {
         await restoreInput.fill(original);
         // Best-effort wait — don't fail the test on cleanup races.

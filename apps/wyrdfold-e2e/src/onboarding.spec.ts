@@ -39,12 +39,15 @@ test.describe('authenticated dashboard smoke', () => {
     ).toBeVisible();
 
     // 3. Sidebar logo a11y: the link's accessible name is
-    //    "WyrdFold home" and its visible text is just "WyrdFold"
-    //    (not "WyrdFoldWyrdFold" — the regression from the SVG
-    //    aria-label fixed in #696).
+    //    "WyrdFold home". The wordmark itself is a decorative
+    //    aria-hidden SVG with no text content — a later Lighthouse
+    //    ``label-content-name-mismatch`` fix removed the visible text
+    //    that this spec originally asserted (the #696
+    //    "WyrdFoldWyrdFold" regression is now impossible by
+    //    construction: the accessible name comes only from aria-label).
     const logo = page.getByRole('link', { name: 'WyrdFold home' });
     await expect(logo).toBeVisible();
-    await expect(logo).toHaveText('WyrdFold');
+    await expect(logo).toHaveText('');
   });
 
   test('sidebar nav lists every (app) route', async ({ page }) => {

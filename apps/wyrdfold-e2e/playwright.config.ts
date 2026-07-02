@@ -56,6 +56,12 @@ export default defineConfig({
         process.env['NEXT_PUBLIC_SUPABASE_URL'] ?? 'http://127.0.0.1:0',
       NEXT_PUBLIC_SUPABASE_ANON_ID:
         process.env['NEXT_PUBLIC_SUPABASE_ANON_ID'] ?? 'e2e-placeholder',
+      // SSR proxy target for the authed tier (CI boots wyrdfold-api against
+      // the local Supabase stack). No fallback on purpose: absent means the
+      // proxy 503s, which is the public tier's documented behavior.
+      ...(process.env['WYRDFOLD_API_URL']
+        ? { WYRDFOLD_API_URL: process.env['WYRDFOLD_API_URL'] }
+        : {}),
     },
   },
   // Project layout:

@@ -44,18 +44,26 @@ pnpm nx e2e wyrdfold-e2e
 
 ## Running in CI
 
-`.github/workflows/ci-full.yml` pipes `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_ID`, `SUPABASE_SERVICE_ROLE_KEY`, and `E2E_TEST_USER_EMAIL` into the e2e step. When all four secrets are populated in the repo settings, the authed tier runs; when any are missing, `auth.setup.ts` calls `setup.skip()` and the authed project's `dependencies: ['setup']` chain means no authed spec executes — the public tier still passes cleanly.
+The `e2e` job in `.github/workflows/ci.yml` runs the **full tier with zero
+secrets**: it boots a throwaway local Supabase stack (`supabase start` — the
+same pattern as the `rls-integration` job), boots `wyrdfold-api` against it
+with the mock LLM, seeds the test user per-run
+(`scripts/seed-e2e-user.mjs`), and exports the four auth env vars from the
+stack's well-known dev keys. The playwright config's `AUTH_ENABLED` gate then
+registers `setup` + `authed-chromium`, so every push exercises the signed-in
+routes against the real assembled stack (Next → wyrdfold-api → Supabase).
 
-To enable the authed tier in CI:
-
-1. Add `SUPABASE_SERVICE_ROLE_KEY` and `E2E_TEST_USER_EMAIL` to the GitHub Actions secrets (`NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_ID` are already there).
-2. The test user account itself stays out of CI — same Supabase identity used locally, shared.
+Nothing here touches the production Supabase project, and no repo secrets
+are required — deliberate for a public repo, where Actions secrets are a
+fork-PR risk surface. If any of the env plumbing is removed, the authed tier
+silently self-skips (that was the pre-2026-07 state — treat a run whose
+authed specs didn't execute as a coverage regression, not a pass).
 
 ## Why OTP via service role (and not password sign-in)
 
 The wyrdfold app's login UI is magic-link only (`signInWithOtp`). A password-sign-in fixture would diverge from the production auth path and only work if the test user happened to have a password set in addition to OTP, which is fragile.
 
-`auth.admin.generateLink({type:'magiclink'})` returns the email OTP token without sending an email; `verifyOtp` then exchanges it for a real session. Same code path as a real user clicking the magic-link in their inbox. The trade-off is the service-role key in CI — broader scope than the anon key, but scoped to a parallel test identity that doesn't touch production users.
+`auth.admin.generateLink({type:'magiclink'})` returns the email OTP token without sending an email; `verifyOtp` then exchanges it for a real session. Same code path as a real user clicking the magic-link in their inbox. In CI the service-role key involved is the local dev stack's public default — no production credential exists in the pipeline.
 
 ## Adding a new authed spec
 
