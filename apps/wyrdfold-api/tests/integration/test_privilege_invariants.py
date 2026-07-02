@@ -95,7 +95,10 @@ def _psql(query: str) -> str | None:
                 "-p", PGPORT,
                 "-U", PGUSER,
                 "-d", PGDATABASE,
-                "-tAqc", query,
+                "-t",  # tuples only (no header/row-count footer)
+                "-A",  # unaligned output
+                "-q",  # quiet
+                "-c", query,
             ],
             env={**os.environ, "PGPASSWORD": PGPASSWORD},
             capture_output=True,
@@ -178,16 +181,18 @@ def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None
     Pins 20260702170000: these internal tables are service-role-only. RLS
     (enabled + no policy) already denies user roles, but standing table grants
     are latent access the moment a policy is ever added — defense in depth.
+    PUBLIC is included because a PUBLIC grant reaches anon/authenticated just
+    the same — omitting it would let that drift slip past the guard.
     """
-    # Pull every anon/authenticated public-table grant and filter to our set in
-    # Python — no SQL string interpolation (keeps it injection-free by
+    # Pull every anon/authenticated/PUBLIC public-table grant and filter to our
+    # set in Python — no SQL string interpolation (keeps it injection-free by
     # construction, not by trusting a constant).
     rows = _psql(
         """
         SELECT table_name || ':' || grantee || ':' || privilege_type
         FROM information_schema.role_table_grants
         WHERE table_schema = 'public'
-          AND grantee IN ('anon', 'authenticated')
+          AND grantee IN ('anon', 'authenticated', 'PUBLIC')
         ORDER BY 1;
         """
     )
@@ -198,8 +203,9 @@ def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None
         if r and r.split(":", 1)[0] in SERVICE_ROLE_ONLY_TABLES
     ]
     assert not offenders, (
-        "Service-role-only table(s) still grant privileges to anon/authenticated "
-        "— REVOKE them (see 20260702170000):\n  - " + "\n  - ".join(offenders)
+        "Service-role-only table(s) still grant privileges to "
+        "anon/authenticated/PUBLIC — REVOKE them (see 20260702170000):\n  - "
+        + "\n  - ".join(offenders)
     )
 
 
