@@ -6,7 +6,7 @@ from supabase import Client
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.dependencies import (
     get_current_user_id,
-    get_supabase,
+    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.schemas import StatusUpdate
@@ -92,7 +92,9 @@ def _assert_user_owns_posting(
 def get_status_history(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #88 Phase 2: RLS client — status_log has a per-user SELECT policy, and
+    # the ownership probe only reads shared-catalog tables (SELECT true).
+    supabase: Client = Depends(get_user_supabase),
 ) -> dict[str, Any]:
     _assert_user_owns_posting(supabase, posting_id, user_id)
     # Scope to the caller's own transitions (#113): a posting is shared catalog,
@@ -118,7 +120,10 @@ def update_status(
     posting_id: str,
     body: StatusUpdate,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #88 Phase 2: RLS client — user_jobs has a full CRUD self-policy and
+    # status_log gained a self-INSERT policy (20260702100000), so RLS pins
+    # both writes to the caller underneath the app-layer user_id values.
+    supabase: Client = Depends(get_user_supabase),
 ) -> dict[str, Any]:
     posting = _assert_user_owns_posting(supabase, posting_id, user_id)
     target_id = posting["target_id"]
