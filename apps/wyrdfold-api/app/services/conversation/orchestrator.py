@@ -199,6 +199,11 @@ async def handle_turn(
     conversation_type: ConversationType,
     user_content: str,
     skipped: bool,
+    # The cost ledger (llm_costs) has no INSERT policy for `authenticated`, so an
+    # RLS caller passes a service-role client for the cost write while `supabase`
+    # stays the RLS client for turns/prose. Defaults to `supabase` for
+    # service-role callers (backward-compatible). #88/Phase-1 dual-client.
+    cost_supabase: Client | None = None,
 ) -> TurnResult:
     """Persist the user turn, run the LLM, persist the assistant reply,
     and optionally append to the prose doc."""
@@ -251,7 +256,7 @@ async def handle_turn(
         cache_system=True,
     )
     cost_log.record(
-        supabase,
+        cost_supabase or supabase,
         user_id=user_id,
         purpose=purpose,
         result=result,
@@ -367,6 +372,7 @@ async def next_probe(
     llm: LLMClient,
     *,
     user_id: str | None,
+    cost_supabase: Client | None = None,  # service-role cost ledger; see handle_turn
 ) -> ProbeResult:
     """Find the top-priority gap and phrase it as a user-facing question."""
     current = optimized.get_latest(supabase, user_id=user_id)
@@ -394,7 +400,7 @@ async def next_probe(
         cache_system=True,
     )
     cost_log.record(
-        supabase,
+        cost_supabase or supabase,
         user_id=user_id,
         purpose=PURPOSE_PROBE,
         result=result,

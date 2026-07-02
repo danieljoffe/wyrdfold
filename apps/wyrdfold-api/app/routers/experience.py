@@ -20,11 +20,10 @@ from supabase import Client
 from app.dependencies import (
     enforce_llm_budget,
     get_current_user_id,
-    get_current_user_id_optional,
     get_embeddings_client,
     get_llm_client,
     get_supabase,
-    get_supabase_for_caller,
+    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.models.conversation import (
@@ -90,8 +89,8 @@ _PARSE_TIMEOUT_SECONDS = 30.0
 # the event loop. See #107.
 @router.get("/prose")
 def get_prose(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc | dict[str, None]:
     doc = prose.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -103,16 +102,16 @@ def get_prose(
 @router.post("/prose")
 def create_prose(
     body: ProseDocCreate,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc:
     return prose.create_version(supabase, user_id=user_id, content=body.content)
 
 
 @router.delete("/prose")
 def delete_master_document(
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Delete the master document and everything derived from it.
 
@@ -120,9 +119,9 @@ def delete_master_document(
     cascade) so the *next* upload starts from a clean slate instead of
     semantically merging the new resume into the old document (see
     ``merge_into_prose``). Conversation turns and preferences are kept — this
-    deletes the document, not the account's experience history. Uses the
-    service-role client like ``conversation/reset``; the wipe is scoped to the
-    caller's ``user_id``.
+    deletes the document, not the account's experience history. Runs on the RLS
+    client (Phase 1): RLS scopes the wipe to the caller's own rows
+    (``auth.uid() = user_id``), backstopping the app-layer ``user_id`` filter.
     """
     return orchestrator.reset_content(supabase, user_id=user_id, include_turns=False)
 
@@ -131,9 +130,10 @@ def delete_master_document(
 @limiter.limit("3/minute")
 async def consolidate_prose(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> ProseConsolidateResponse:
     """LLM-dedupe the latest prose doc and persist as a new version.
 
@@ -158,7 +158,7 @@ async def consolidate_prose(
         if fallback_reason is not None:
             metadata["fallback_reason"] = fallback_reason
         cost_log.record(
-            supabase,
+            cost_supabase,
             user_id=user_id,
             purpose=consolidate.DEFAULT_PURPOSE,
             result=result,
@@ -358,8 +358,8 @@ async def upload_resume(
 
 @router.get("/optimized")
 def get_optimized(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> OptimizedDoc | dict[str, None]:
     doc = optimized.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -370,9 +370,10 @@ def get_optimized(
 @router.post("/optimized")
 async def create_optimized(
     body: OptimizedDocUpsert,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> OptimizedDoc:
     doc = optimized.create_version(
         supabase,
@@ -387,6 +388,7 @@ async def create_optimized(
         embeddings,
         doc,
         user_id=user_id,
+        cost_supabase=cost_supabase,
     )
     return doc
 
@@ -395,10 +397,15 @@ async def create_optimized(
 @limiter.limit("10/minute")
 async def derive_optimized(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    # Per-user data (optimized doc, chunks) goes through the RLS client above;
+    # the cost ledger goes through this service-role client — llm_costs has no
+    # INSERT policy for `authenticated` on purpose (a user must not be able to
+    # write cost rows). #88/Phase-1 dual-client pattern.
+    cost_supabase: Client = Depends(get_supabase),
 ) -> OptimizedDoc:
     """Read the latest prose doc, derive an OptimizedPayload via LLM,
     persist it as a new optimized version, embed its chunks, and log cost.
@@ -425,7 +432,7 @@ async def derive_optimized(
         prose_text=prose_doc.content,
     )
     cost_log.record(
-        supabase,
+        cost_supabase,
         user_id=user_id,
         purpose=derive.DEFAULT_PURPOSE,
         result=result,
@@ -456,6 +463,7 @@ async def derive_optimized(
         embeddings,
         doc,
         user_id=user_id,
+        cost_supabase=cost_supabase,
     )
     return doc
 
@@ -475,10 +483,11 @@ def _sse_event(event: str, data: dict[str, Any]) -> bytes:
 @limiter.limit("10/minute")
 async def derive_optimized_stream(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> StreamingResponse:
     """Streaming variant of /derive.
 
@@ -563,7 +572,7 @@ async def derive_optimized_stream(
 
             await asyncio.to_thread(
                 lambda: cost_log.record(
-                    supabase,
+                    cost_supabase,
                     user_id=user_id,
                     purpose=derive.DEFAULT_PURPOSE,
                     result=result,
@@ -599,6 +608,7 @@ async def derive_optimized_stream(
                 embeddings,
                 doc,
                 user_id=user_id,
+                cost_supabase=cost_supabase,
             )
 
             yield _sse_event(
@@ -633,8 +643,8 @@ async def derive_optimized_stream(
 
 @router.get("/gap-health")
 def get_gap_health(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> GapHealthResult:
     doc = optimized.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -649,8 +659,8 @@ def get_gap_health(
 # threadpool, keeping them off the event loop. See #107.
 @router.get("/preferences")
 def get_preferences(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Preferences | dict[str, None]:
     row = preferences.get(supabase, user_id=user_id)
     if row is None:
@@ -662,8 +672,8 @@ def get_preferences(
 @router.put("/preferences")
 def upsert_preferences(
     body: PreferencesUpsert,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Preferences:
     return preferences.upsert(supabase, user_id=user_id, payload=body.payload)
 
@@ -671,8 +681,8 @@ def upsert_preferences(
 # Sync `def`: blocking supabase delete runs in the threadpool (#107).
 @router.delete("/preferences")
 def reset_preferences(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, bool]:
     preferences.reset(supabase, user_id=user_id)
     return {"success": True}
@@ -686,8 +696,8 @@ def reset_preferences(
 def list_turns(
     conversation_type: ConversationType | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     rows = turns.list_turns(
         supabase,
@@ -702,8 +712,8 @@ def list_turns(
 @router.post("/turns")
 def append_turn(
     body: TurnAppend,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     if body.skipped and body.role != "user":
         raise HTTPException(status_code=400, detail="only user turns can be skipped")
@@ -727,9 +737,10 @@ def append_turn(
 async def conversation_turn(
     request: Request,
     body: TurnRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> TurnResult:
     """Run one orchestrated turn. Persists user + assistant turns,
     appends to prose doc if the LLM determined fresh content was shared.
@@ -741,14 +752,15 @@ async def conversation_turn(
         conversation_type=body.conversation_type,
         user_content=body.content,
         skipped=body.skipped,
+        cost_supabase=cost_supabase,
     )
 
 
 # Sync `def`: blocking supabase wipe runs in the threadpool (#107).
 @router.post("/conversation/reset")
 def conversation_reset(
-    supabase: Client = Depends(get_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Wipe prose, optimized (chunks cascade), and turns. Preferences are
     preserved — delete them via DELETE /experience/preferences if wanted.
@@ -758,9 +770,12 @@ def conversation_reset(
 
 @router.get("/conversation/next-probe", dependencies=[Depends(enforce_llm_budget)])
 async def conversation_next_probe(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> ProbeResult:
     """Top-priority gap phrased as a user-facing question by the LLM."""
-    return await orchestrator.next_probe(supabase, llm, user_id=user_id)
+    return await orchestrator.next_probe(
+        supabase, llm, user_id=user_id, cost_supabase=cost_supabase
+    )
