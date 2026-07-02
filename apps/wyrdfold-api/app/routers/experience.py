@@ -24,7 +24,6 @@ from app.dependencies import (
     get_embeddings_client,
     get_llm_client,
     get_supabase,
-    get_supabase_for_caller,
     get_user_supabase,
     verify_api_key_or_jwt,
 )
@@ -359,8 +358,8 @@ async def upload_resume(
 
 @router.get("/optimized")
 def get_optimized(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> OptimizedDoc | dict[str, None]:
     doc = optimized.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -634,8 +633,8 @@ async def derive_optimized_stream(
 
 @router.get("/gap-health")
 def get_gap_health(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> GapHealthResult:
     doc = optimized.get_latest(supabase, user_id=user_id)
     if doc is None:
@@ -650,8 +649,8 @@ def get_gap_health(
 # threadpool, keeping them off the event loop. See #107.
 @router.get("/preferences")
 def get_preferences(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Preferences | dict[str, None]:
     row = preferences.get(supabase, user_id=user_id)
     if row is None:
@@ -663,8 +662,8 @@ def get_preferences(
 @router.put("/preferences")
 def upsert_preferences(
     body: PreferencesUpsert,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> Preferences:
     return preferences.upsert(supabase, user_id=user_id, payload=body.payload)
 
@@ -672,8 +671,8 @@ def upsert_preferences(
 # Sync `def`: blocking supabase delete runs in the threadpool (#107).
 @router.delete("/preferences")
 def reset_preferences(
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, bool]:
     preferences.reset(supabase, user_id=user_id)
     return {"success": True}
@@ -687,8 +686,8 @@ def reset_preferences(
 def list_turns(
     conversation_type: ConversationType | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     rows = turns.list_turns(
         supabase,
@@ -703,8 +702,8 @@ def list_turns(
 @router.post("/turns")
 def append_turn(
     body: TurnAppend,
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: Client = Depends(get_user_supabase),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     if body.skipped and body.role != "user":
         raise HTTPException(status_code=400, detail="only user turns can be skipped")
