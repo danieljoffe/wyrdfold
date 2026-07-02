@@ -36,7 +36,13 @@ if (error) {
   // Idempotency: a rerun against a stack that already has the user is fine.
   if (/already.*(registered|exists)/i.test(error.message)) {
     console.log(`seed-e2e-user: ${email} already exists — ok.`);
-    const { data: list } = await admin.auth.admin.listUsers();
+    const { data: list, error: listError } = await admin.auth.admin.listUsers();
+    if (listError) {
+      console.error(
+        `seed-e2e-user: listUsers failed while resolving ${email}: ${listError.message}`
+      );
+      process.exit(1);
+    }
     userId = list?.users?.find((u) => u.email === email)?.id;
   } else {
     console.error(`seed-e2e-user: failed to create ${email}: ${error.message}`);
@@ -74,11 +80,17 @@ console.log('seed-e2e-user: profile marked onboarded.');
 // empty-state CTA (no identity card, no Name field) until the user has
 // authored experience content — the authed specs assert the
 // established-user surface. Insert once; reruns skip.
-const { data: existingProse } = await admin
+const { data: existingProse, error: proseSelectError } = await admin
   .from('experience_prose_docs')
   .select('id')
   .eq('user_id', userId)
   .limit(1);
+if (proseSelectError) {
+  console.error(
+    `seed-e2e-user: prose existence check failed: ${proseSelectError.message}`
+  );
+  process.exit(1);
+}
 if (!existingProse?.length) {
   const { error: proseError } = await admin.from('experience_prose_docs').insert({
     user_id: userId,

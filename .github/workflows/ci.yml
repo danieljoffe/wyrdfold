@@ -153,12 +153,16 @@ jobs:
         working-directory: apps/wyrdfold-api
         run: uv sync --frozen
 
+      # Same hardened fetch as the rls-integration job: step timeout +
+      # curl retries/timeouts so a slow mirror can't hang the job, and a
+      # pinned sha256 so a tampered download fails loudly.
       - name: Install Supabase CLI
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
           SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
-          curl -sSfL \
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
           echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -
