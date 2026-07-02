@@ -106,11 +106,14 @@ jobs:
         run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
 
   e2e:
+    # NOTE: the job name is a required check in the protect:develop ruleset —
+    # renaming it needs a ruleset edit first. It now runs the FULL tier
+    # (public + authed) despite the name.
     name: E2E — public specs (Playwright)
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -133,6 +136,85 @@ jobs:
       - name: Install Playwright chromium
         run: pnpm exec playwright install chromium --with-deps
 
+      # ---- Zero-secret authed tier -------------------------------------
+      # The authed Playwright projects need a real auth backend + the API.
+      # Instead of piping prod secrets into a public repo's CI (fork-PR
+      # exposure risk, prod-project pollution), boot the same throwaway
+      # local Supabase stack the rls-integration job uses: its keys are
+      # public dev defaults, the test user is created per-run, and the
+      # whole stack dies with the runner.
+      - name: Install uv (for the wyrdfold-api server)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install wyrdfold-api dependencies
+        working-directory: apps/wyrdfold-api
+        run: uv sync --frozen
+
+      # Same hardened fetch as the rls-integration job: step timeout +
+      # curl retries/timeouts so a slow mirror can't hang the job, and a
+      # pinned sha256 so a tampered download fails loudly.
+      - name: Install Supabase CLI
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          SUPABASE_CLI_VERSION=2.104.0
+          SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
+          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+            -o /tmp/supabase.deb \
+            "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
+          echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -
+          sudo dpkg -i /tmp/supabase.deb
+          supabase --version
+
+      - name: Start Supabase stack
+        run: supabase start
+
+      # NEXT_PUBLIC_* are inlined into the client bundle at BUILD time, so
+      # this export must land before "Build wyrdfold" below.
+      - name: Export stack env for the authed tier
+        run: |
+          set -euo pipefail
+          eval "$(supabase status -o env | grep -E '^(ANON_KEY|SERVICE_ROLE_KEY)=')"
+          {
+            echo "NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321"
+            echo "NEXT_PUBLIC_SUPABASE_ANON_ID=${ANON_KEY}"
+            echo "SUPABASE_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}"
+            echo "E2E_TEST_USER_EMAIL=e2e@wyrdfold.test"
+            echo "WYRDFOLD_API_URL=http://127.0.0.1:8001"
+          } >> "$GITHUB_ENV"
+
+      # Host uvicorn, not the Docker image: this job's API is test
+      # infrastructure for the frontend's authed flows, and uv boots it in
+      # seconds where an image build costs minutes. The artifact itself is
+      # exercised by the image-scan job and the release-gate Docker drives.
+      - name: Boot wyrdfold-api (mock LLM) against the stack
+        working-directory: apps/wyrdfold-api
+        run: |
+          set -euo pipefail
+          SUPABASE_URL=http://127.0.0.1:54321 \
+          SUPABASE_ANON_KEY="${NEXT_PUBLIC_SUPABASE_ANON_ID}" \
+          SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY}" \
+          LLM_PROVIDER=mock EMBEDDINGS_PROVIDER=mock \
+          ALLOWED_HOSTS='*' WYRDFOLD_API_KEY=ci-e2e-key \
+          RATE_LIMIT_ENABLED=false SCHEDULER_ENABLED=false SENTRY_DSN='' \
+          nohup uv run uvicorn app.main:app --port 8001 > /tmp/wyrdfold-api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8001/health >/dev/null; then
+              echo "wyrdfold-api healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "wyrdfold-api failed to become healthy"
+          tail -50 /tmp/wyrdfold-api.log
+          exit 1
+
+      - name: Seed the e2e auth user
+        run: node apps/wyrdfold-e2e/scripts/seed-e2e-user.mjs
+
       # Build once up front so the e2e webServer can boot a production
       # `next start` instead of `next dev`. The previous setup served via
       # `next dev`, which compiles each route on first hit — the
@@ -143,12 +225,12 @@ jobs:
       - name: Build wyrdfold (for e2e production server)
         run: pnpm nx build wyrdfold --prod
 
-      # Zero-secret by design: with no Supabase env, the playwright config
-      # registers only the `public-chromium` project (login form, middleware
-      # redirects, security headers). The `setup`/`authed-chromium` projects
-      # self-skip — they require real Supabase creds and stay local-only
-      # so CI keeps needing no secrets at all.
-      - name: Run public e2e specs
+      # Still zero-secret — but now the FULL tier: the stack env exported
+      # above satisfies the playwright config's AUTH_ENABLED gate, so
+      # `setup` mints a magic-link session for the seeded user and
+      # `authed-chromium` drives the signed-in routes against the real
+      # assembled stack (Next -> wyrdfold-api -> local Supabase).
+      - name: Run e2e specs (public + authed)
         run: pnpm nx e2e wyrdfold-e2e
 
       - name: Upload traces on failure
