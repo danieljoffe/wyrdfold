@@ -114,10 +114,14 @@ async def _probe_supabase_keys(
     *,
     fetch: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> None:
-    """Boot-time *liveness* probe for the Supabase keys.
+    """Boot-time probe for known-bad Supabase keys.
 
-    ``_validate_settings`` proves the keys are present; this proves the gateway
-    accepts them. A key can be set yet **disabled** — Supabase is sunsetting the
+    ``_validate_settings`` proves the keys are present; this additionally
+    detects the one deterministic failure we can identify from a gateway
+    response — the disabled-legacy-key signature — and boot-fails on it.
+    It does NOT prove a key is otherwise valid (a wrong-but-enabled key
+    still surfaces on the first real request). A key can be set yet
+    **disabled** — Supabase is sunsetting the
     legacy anon/service_role JWT keys, and a disabled key makes every request
     through it fail. On 2026-07-02 the ``GET /jobs`` path flipped onto the RLS
     user client (built from the anon key), whose prod anon key was a disabled
