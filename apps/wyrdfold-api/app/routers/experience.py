@@ -131,9 +131,10 @@ def delete_master_document(
 @limiter.limit("3/minute")
 async def consolidate_prose(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> ProseConsolidateResponse:
     """LLM-dedupe the latest prose doc and persist as a new version.
 
@@ -158,7 +159,7 @@ async def consolidate_prose(
         if fallback_reason is not None:
             metadata["fallback_reason"] = fallback_reason
         cost_log.record(
-            supabase,
+            cost_supabase,
             user_id=user_id,
             purpose=consolidate.DEFAULT_PURPOSE,
             result=result,
@@ -737,9 +738,10 @@ def append_turn(
 async def conversation_turn(
     request: Request,
     body: TurnRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> TurnResult:
     """Run one orchestrated turn. Persists user + assistant turns,
     appends to prose doc if the LLM determined fresh content was shared.
@@ -751,6 +753,7 @@ async def conversation_turn(
         conversation_type=body.conversation_type,
         user_content=body.content,
         skipped=body.skipped,
+        cost_supabase=cost_supabase,
     )
 
 
@@ -768,9 +771,12 @@ def conversation_reset(
 
 @router.get("/conversation/next-probe", dependencies=[Depends(enforce_llm_budget)])
 async def conversation_next_probe(
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> ProbeResult:
     """Top-priority gap phrased as a user-facing question by the LLM."""
-    return await orchestrator.next_probe(supabase, llm, user_id=user_id)
+    return await orchestrator.next_probe(
+        supabase, llm, user_id=user_id, cost_supabase=cost_supabase
+    )
