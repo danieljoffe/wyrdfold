@@ -14,13 +14,18 @@ Builds a single ZIP of everything a user has given us:
   documents from both Storage buckets.
 * ``README.txt`` — a manifest with per-table row counts.
 
-Runs with the **service-role** client, scoped by ``user_id`` (and the
-resolved ``user_profiles.id`` for ``notifications_sent``) — same trust
-model as account deletion: the route is JWT-gated and a user only ever
-exports their own rows. The export inventory is kept in lockstep with the
-deletion inventory (see ``app.services.account_deletion`` and
-``test_data_export``) so "download everything" and "delete everything"
-cover the same data.
+Runs on the caller's **RLS user client** for every table with a
+self-scoped ``authenticated`` SELECT policy (and both Storage buckets,
+whose owner-read policies scope to the ``{user_id}/`` prefix) — Postgres
+is the backstop even if a wrong ``user_id`` were ever threaded through.
+Three reads stay on a **service-role** client (the Phase-1 dual-client
+pattern) because under the user client they either hard-fail (no
+``authenticated`` grant) or silently drop the user's own rows — turning
+the export into an outage or a data-loss bug rather than a security
+win — see ``_SERVICE_ROLE_TABLES``.
+The export inventory is kept in lockstep with the deletion inventory
+(see ``app.services.account_deletion`` and ``test_data_export``) so
+"download everything" and "delete everything" cover the same data.
 """
 
 from __future__ import annotations
@@ -64,6 +69,20 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "reference_jds",  # anonymized on erasure (the user's shared contributions)
 )
 
+# Reads that must NOT ride the user client (verified against pg_policies +
+# grants 2026-07-02; pinned by tests/integration/test_rls_export.py):
+#   * user_api_keys — deliberately has NO authenticated grant or policy at
+#     all (key material is service-role-only by design); a user-client read
+#     hard-fails with 42501 and would 500 the whole export.
+#   * reference_jds — its only authenticated SELECT policy is
+#     follower-scoped (reference_jds_follower_read): the user's own
+#     contributions on targets they no longer follow would silently vanish
+#     from their export. Right-to-access covers what they authored, not
+#     what they currently follow.
+# notifications_sent (read separately below) also has no authenticated
+# grant and stays on the service client for the same 42501 reason.
+_SERVICE_ROLE_TABLES: frozenset[str] = frozenset({"user_api_keys", "reference_jds"})
+
 # user_api_keys is exported through this projection only — never the
 # ``ciphertext`` column. Listing the provider + last4 lets the user see
 # which keys are stored without exposing the secret material.
@@ -92,21 +111,32 @@ def _select_all(
     return cast(list[dict[str, Any]], resp.data or [])
 
 
-def collect_user_data(supabase: Client, *, user_id: str) -> dict[str, list[dict[str, Any]]]:
-    """Gather every per-user DB row for ``user_id`` into a JSON-able map."""
+def collect_user_data(
+    supabase: Client, *, user_id: str, service_supabase: Client
+) -> dict[str, list[dict[str, Any]]]:
+    """Gather every per-user DB row for ``user_id`` into a JSON-able map.
+
+    ``supabase`` is the caller's RLS user client (self-scoped policies make
+    Postgres the backstop); ``service_supabase`` covers only the reads RLS
+    would silently truncate (``_SERVICE_ROLE_TABLES`` + notifications_sent).
+    Passing the service client for both restores the pre-#88 all-service
+    behavior — the equivalence the integration suite pins.
+    """
     data: dict[str, list[dict[str, Any]]] = {}
     for table in _EXPORT_TABLES:
         projection = _API_KEYS_PROJECTION if table == "user_api_keys" else "*"
-        data[table] = _select_all(supabase, table, "user_id", user_id, projection)
+        client = service_supabase if table in _SERVICE_ROLE_TABLES else supabase
+        data[table] = _select_all(client, table, "user_id", user_id, projection)
 
     profile_rows = _select_all(supabase, "user_profiles", "user_id", user_id)
     data["user_profiles"] = profile_rows
 
-    # notifications_sent is keyed by user_profiles.id, not the auth uid.
+    # notifications_sent is keyed by user_profiles.id, not the auth uid —
+    # and has no SELECT policy, so it reads via the service client.
     profile_id = str(profile_rows[0]["id"]) if profile_rows else None
     if profile_id is not None:
         data["notifications_sent"] = _select_all(
-            supabase, "notifications_sent", "user_profile_id", profile_id
+            service_supabase, "notifications_sent", "user_profile_id", profile_id
         )
 
     # scores has no user_id; pull the rows for the user's targets (already
@@ -197,7 +227,9 @@ def _readme(
     return "\n".join(lines)
 
 
-def write_export_zip(supabase: Client, fileobj: IO[bytes], *, user_id: str) -> None:
+def write_export_zip(
+    supabase: Client, fileobj: IO[bytes], *, user_id: str, service_supabase: Client
+) -> None:
     """Write the personal-data export ZIP for ``user_id`` into ``fileobj``.
 
     Takes any writable binary file object so the router can hand in a
@@ -206,7 +238,7 @@ def write_export_zip(supabase: Client, fileobj: IO[bytes], *, user_id: str) -> N
     plus the largest single Storage blob — not the full ZIP.
     """
     generated_at = datetime.now(UTC)
-    data = collect_user_data(supabase, user_id=user_id)
+    data = collect_user_data(supabase, user_id=user_id, service_supabase=service_supabase)
 
     with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("data.json", json.dumps(data, indent=2, default=str))
@@ -221,8 +253,10 @@ def write_export_zip(supabase: Client, fileobj: IO[bytes], *, user_id: str) -> N
     )
 
 
-def build_export_zip(supabase: Client, *, user_id: str) -> bytes:
+def build_export_zip(
+    supabase: Client, *, user_id: str, service_supabase: Client
+) -> bytes:
     """In-memory convenience wrapper over ``write_export_zip`` (tests)."""
     buf = io.BytesIO()
-    write_export_zip(supabase, buf, user_id=user_id)
+    write_export_zip(supabase, buf, user_id=user_id, service_supabase=service_supabase)
     return buf.getvalue()
