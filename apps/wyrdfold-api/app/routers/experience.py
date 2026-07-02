@@ -373,6 +373,7 @@ async def create_optimized(
     supabase: Client = Depends(get_user_supabase),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> OptimizedDoc:
     doc = optimized.create_version(
         supabase,
@@ -387,6 +388,7 @@ async def create_optimized(
         embeddings,
         doc,
         user_id=user_id,
+        cost_supabase=cost_supabase,
     )
     return doc
 
@@ -399,6 +401,11 @@ async def derive_optimized(
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
+    # Per-user data (optimized doc, chunks) goes through the RLS client above;
+    # the cost ledger goes through this service-role client — llm_costs has no
+    # INSERT policy for `authenticated` on purpose (a user must not be able to
+    # write cost rows). #88/Phase-1 dual-client pattern.
+    cost_supabase: Client = Depends(get_supabase),
 ) -> OptimizedDoc:
     """Read the latest prose doc, derive an OptimizedPayload via LLM,
     persist it as a new optimized version, embed its chunks, and log cost.
@@ -425,7 +432,7 @@ async def derive_optimized(
         prose_text=prose_doc.content,
     )
     cost_log.record(
-        supabase,
+        cost_supabase,
         user_id=user_id,
         purpose=derive.DEFAULT_PURPOSE,
         result=result,
@@ -456,6 +463,7 @@ async def derive_optimized(
         embeddings,
         doc,
         user_id=user_id,
+        cost_supabase=cost_supabase,
     )
     return doc
 
@@ -479,6 +487,7 @@ async def derive_optimized_stream(
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
+    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> StreamingResponse:
     """Streaming variant of /derive.
 
@@ -563,7 +572,7 @@ async def derive_optimized_stream(
 
             await asyncio.to_thread(
                 lambda: cost_log.record(
-                    supabase,
+                    cost_supabase,
                     user_id=user_id,
                     purpose=derive.DEFAULT_PURPOSE,
                     result=result,
@@ -599,6 +608,7 @@ async def derive_optimized_stream(
                 embeddings,
                 doc,
                 user_id=user_id,
+                cost_supabase=cost_supabase,
             )
 
             yield _sse_event(
