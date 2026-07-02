@@ -30,7 +30,7 @@ import json
 import logging
 import zipfile
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import IO, Any, cast
 
 from supabase import Client
 
@@ -197,13 +197,18 @@ def _readme(
     return "\n".join(lines)
 
 
-def build_export_zip(supabase: Client, *, user_id: str) -> bytes:
-    """Build the personal-data export ZIP for ``user_id``; return its bytes."""
+def write_export_zip(supabase: Client, fileobj: IO[bytes], *, user_id: str) -> None:
+    """Write the personal-data export ZIP for ``user_id`` into ``fileobj``.
+
+    Takes any writable binary file object so the router can hand in a
+    ``SpooledTemporaryFile`` and stream the result instead of holding the
+    whole archive in memory (#29 H-r2-4). Peak memory is the JSON row data
+    plus the largest single Storage blob — not the full ZIP.
+    """
     generated_at = datetime.now(UTC)
     data = collect_user_data(supabase, user_id=user_id)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("data.json", json.dumps(data, indent=2, default=str))
         file_count = _add_storage_files(zf, supabase, user_id)
         zf.writestr("README.txt", _readme(user_id, generated_at, data, file_count))
@@ -214,5 +219,10 @@ def build_export_zip(supabase: Client, *, user_id: str) -> bytes:
         len(data),
         file_count,
     )
-    buf.seek(0)
+
+
+def build_export_zip(supabase: Client, *, user_id: str) -> bytes:
+    """In-memory convenience wrapper over ``write_export_zip`` (tests)."""
+    buf = io.BytesIO()
+    write_export_zip(supabase, buf, user_id=user_id)
     return buf.getvalue()
