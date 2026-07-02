@@ -65,6 +65,10 @@ Output must match this schema:
 
 Rules:
 - Extract only what the prose supports. Do not invent outcomes, metrics, or roles.
+- Blocks that begin with the marker `[unverified - confirm with user]` contain \
+claims the user has not confirmed: do NOT derive outcomes, metrics, or numeric \
+values from them. You may still use such a block to recognize that a role or \
+skill exists if unmarked prose corroborates it.
 - Prefer canonical skill names (React, TypeScript, Next.js) over variants (reactjs, TS).
 - Quantified outcomes (with metric + value) are higher-signal than unquantified ones.
 - If a detail is ambiguous or missing, leave the field null rather than guessing.

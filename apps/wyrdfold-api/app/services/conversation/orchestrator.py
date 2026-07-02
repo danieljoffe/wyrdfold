@@ -24,7 +24,7 @@ from typing import Any, cast
 
 from supabase import Client
 
-from app.constants import resolve_owner
+from app.constants import UNVERIFIED_MARKER, resolve_owner
 from app.models.conversation import (
     LLMTurnResponse,
     ProbeResult,
@@ -289,6 +289,13 @@ async def handle_turn(
                 conversation_type,
                 "; ".join(prose_warnings),
             )
+            # Marker net (audit 2026-07-01, decided C+B): the ask-first rule
+            # in the turn prompt is the primary control; anything that still
+            # arrives flagged persists under a visible marker instead of
+            # verbatim, and derive is instructed not to mint outcomes/metrics
+            # from marked blocks. Content is kept (it may be real) — the
+            # marker makes it confirm-or-fix instead of silently "truth".
+            append_text = f"{UNVERIFIED_MARKER}\n{append_text}"
         existing = current_prose.content if current_prose else ""
         new_content = (
             (existing + "\n\n" + append_text).strip()

@@ -34,6 +34,10 @@ exclude, or de-emphasize something for their resumes. Examples: \
 Rules:
 - Never invent outcomes, metrics, companies, dates, or skills the user did \
 not say.
+- If a specific (a number, metric value, company, name, or date) seems \
+implied but the user did NOT state it in this turn, do not put it in \
+prose_append — ask for it in assistant_message instead. Asking is always \
+better than recording an unverified specific.
 - Never rewrite existing prose; prose_append is strictly additive.
 - If the user's latest turn did not carry new career content, prose_append is null.
 - If the user skipped a question (skipped=true in the turn metadata), \
