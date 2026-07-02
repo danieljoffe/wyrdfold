@@ -487,3 +487,79 @@ def test_default_history_cap_is_fifty() -> None:
     from app.config import Settings
 
     assert Settings(supabase_url="", allowed_hosts="*").conversation_history_max_turns == 50
+
+
+# ---- Unverified-marker net + ask-first prompt (audit C+B decision) ---------
+
+
+async def test_flagged_append_persists_under_unverified_marker(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """A flagged append must persist MARKED, not verbatim: content is kept
+    (may be real) but visibly quarantined, and derive is instructed not to
+    mint outcomes from marked blocks."""
+    from app.constants import UNVERIFIED_MARKER
+    from tests.support.llm_edges import UNSUPPORTED_SPECIFICS_APPEND
+
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append=UNSUPPORTED_SPECIFICS_APPEND
+            )
+        }
+    )
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="I helped grow the business a lot.",
+        skipped=False,
+    )
+    assert result.prose_updated is True
+    assert result.prose_warnings, "the guard must still flag"
+    persisted = mock_service_layer["prose_create_version"].call_args.kwargs["content"]
+    assert persisted.startswith(UNVERIFIED_MARKER), "flagged append must be marked"
+    assert UNSUPPORTED_SPECIFICS_APPEND in persisted, "content kept, not dropped"
+
+
+async def test_faithful_append_persists_verbatim_without_marker(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    from app.constants import UNVERIFIED_MARKER
+
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append="Worked at FightCamp and cut load times to 2s."
+            )
+        }
+    )
+    await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="At FightCamp I cut load times to 2s.",
+        skipped=False,
+    )
+    persisted = mock_service_layer["prose_create_version"].call_args.kwargs["content"]
+    assert UNVERIFIED_MARKER not in persisted, "faithful append must stay verbatim"
+
+
+def test_turn_prompts_carry_the_ask_first_rule() -> None:
+    """C (primary control): both turn systems must instruct asking instead of
+    recording unstated specifics."""
+    from app.services.conversation.prompts import ONBOARDING_SYSTEM, UPDATE_SYSTEM
+
+    for system in (ONBOARDING_SYSTEM, UPDATE_SYSTEM):
+        assert "ask for it in assistant_message instead" in system
+
+
+def test_derive_prompt_pins_the_exact_marker() -> None:
+    """Producer/consumer drift guard: derive's instruction must reference the
+    EXACT marker the orchestrator stamps — if either side changes, this fails."""
+    from app.constants import UNVERIFIED_MARKER
+    from app.services.experience.derive import SYSTEM_PROMPT
+
+    assert UNVERIFIED_MARKER in SYSTEM_PROMPT

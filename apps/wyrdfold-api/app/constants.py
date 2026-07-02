@@ -44,3 +44,13 @@ def resolve_owner(user_id: str | None) -> str:
     ``user_id`` so "the system" is one explicit owner instead of NULL.
     """
     return SYSTEM_USER_ID if user_id is None else user_id
+
+
+# Prefix stamped onto a prose_append whose faithfulness guard flagged
+# unsupported specifics (numbers/names the user never said this turn). The
+# marker is deliberately user-visible in the prose doc — it's the "confirm or
+# fix me" signal — and downstream extraction (derive) is instructed not to
+# mint outcomes/metrics from marked blocks. Producer:
+# app/services/conversation/orchestrator.py; consumer: the SYSTEM_PROMPT in
+# app/services/experience/derive.py (interpolated, so it cannot drift).
+UNVERIFIED_MARKER = "[unverified - confirm with user]"
