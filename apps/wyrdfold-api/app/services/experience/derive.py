@@ -10,6 +10,7 @@ variable content, which is ideal for Anthropic's prompt caching
 becomes a genuine cost-saver.
 """
 
+from app.constants import UNVERIFIED_MARKER
 from app.models.experience import OptimizedPayload, Outcome
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
@@ -65,7 +66,7 @@ Output must match this schema:
 
 Rules:
 - Extract only what the prose supports. Do not invent outcomes, metrics, or roles.
-- Blocks that begin with the marker `[unverified - confirm with user]` contain \
+- Blocks that begin with the marker `__UNVERIFIED_MARKER__` contain \
 claims the user has not confirmed: do NOT derive outcomes, metrics, or numeric \
 values from them. You may still use such a block to recognize that a role or \
 skill exists if unmarked prose corroborates it.
@@ -100,7 +101,14 @@ the outcome description
 - Omit the `id` field — the server generates one.
 - If no inline directives are present, return an empty annotations array.
 
-Return ONLY the JSON object. No prose, no code fences."""
+Return ONLY the JSON object. No prose, no code fences.""".replace(
+    # Interpolated (not hard-coded) so the consumer instruction can never
+    # drift from the marker the orchestrator actually stamps. Placeholder
+    # replace instead of an f-string: the prompt is full of literal JSON
+    # braces that an f-string would require doubling.
+    "__UNVERIFIED_MARKER__",
+    UNVERIFIED_MARKER,
+)
 
 
 def _backfill_outcome_role_refs(payload: OptimizedPayload) -> OptimizedPayload:
