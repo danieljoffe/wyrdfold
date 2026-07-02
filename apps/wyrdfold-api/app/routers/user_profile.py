@@ -11,10 +11,14 @@ row owner (#79 Phases 2 reads / 3 writes).
 """
 
 import asyncio
+import os
+import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from supabase import Client
 
 from app.config import settings
@@ -58,6 +62,11 @@ def _sms_channel_available() -> bool:
 # accessed by cron/poller. Restricting to JWT-only blocks the api-key
 # fallback that would otherwise let a leaked operator key impersonate any
 # user via this surface.
+# Export spool: keep small exports in memory, spill big ones to disk so the
+# archive never has to fit in RAM (#29 H-r2-4).
+_EXPORT_SPOOL_MAX_MEMORY = 32 * 1024 * 1024
+_EXPORT_STREAM_CHUNK_BYTES = 64 * 1024
+
 router = APIRouter(
     prefix="/profile",
     tags=["profile"],
@@ -569,13 +578,42 @@ async def export_account_data(
     Uses the **service-role** client scoped by ``user_id`` (same model as
     ``DELETE /account``); the router-level ``verify_supabase_jwt`` blocks
     api-key callers, so only a logged-in user can export their own data.
+
+    The ZIP is built into a ``SpooledTemporaryFile`` (spills to disk past
+    ``_EXPORT_SPOOL_MAX_MEMORY``) and streamed in chunks, so a large export
+    never holds the whole archive in RAM (#29 H-r2-4) — peak memory is the
+    JSON row data plus the largest single Storage blob.
     """
     from app.services import data_export
 
-    blob = await asyncio.to_thread(data_export.build_export_zip, supabase, user_id=user_id)
+    # SIM115 suppressed: the spool must outlive this handler — it's closed by
+    # the streaming generator's finally once the response body has been sent.
+    spool = tempfile.SpooledTemporaryFile(max_size=_EXPORT_SPOOL_MAX_MEMORY)  # noqa: SIM115
+    try:
+        await asyncio.to_thread(
+            data_export.write_export_zip, supabase, spool, user_id=user_id
+        )
+        size = spool.seek(0, os.SEEK_END)
+        spool.seek(0)
+    except BaseException:
+        spool.close()
+        raise
+
+    def _iter_spool() -> Iterator[bytes]:
+        # Sync generator: Starlette drives it in the threadpool, keeping the
+        # blocking disk reads off the event loop.
+        try:
+            while chunk := spool.read(_EXPORT_STREAM_CHUNK_BYTES):
+                yield chunk
+        finally:
+            spool.close()
+
     filename = f"wyrdfold-export-{user_id}.zip"
-    return Response(
-        content=blob,
+    return StreamingResponse(
+        _iter_spool(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(size),
+        },
     )

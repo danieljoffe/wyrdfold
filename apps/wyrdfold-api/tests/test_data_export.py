@@ -280,12 +280,35 @@ def test_export_endpoint_is_jwt_gated_and_streams_zip() -> None:
     app.dependency_overrides[get_supabase] = lambda: sb
     try:
         client = TestClient(app)
-        resp = client.get("/profile/export")
+        # identity encoding: GZipMiddleware re-chunks gzip-accepting requests
+        # and strips Content-Length, so pin the uncompressed path to assert it.
+        resp = client.get("/profile/export", headers={"accept-encoding": "identity"})
     finally:
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/zip"
     assert "attachment" in resp.headers["content-disposition"]
+    # Streamed with an explicit length (#29 H-r2-4): the header must match
+    # the actual body, or clients see truncated downloads.
+    assert int(resp.headers["content-length"]) == len(resp.content)
     data = _data_json(resp.content)
     assert data["user_profiles"][0]["user_id"] == _UID
+
+
+def test_write_export_zip_valid_after_disk_spill() -> None:
+    """H-r2-4: the export is built into a file object, not RAM. Force the
+    spool to roll over to disk immediately (max_size=1) and prove the
+    disk-backed archive still round-trips as a valid zip."""
+    import tempfile
+
+    from app.services.data_export import write_export_zip
+
+    with tempfile.SpooledTemporaryFile(max_size=1) as spool:
+        write_export_zip(_seeded(), spool, user_id=_UID)
+        assert spool._rolled  # type: ignore[attr-defined]  # actually on disk
+        spool.seek(0)
+        zf = zipfile.ZipFile(spool)
+        assert {"data.json", "README.txt"} <= set(zf.namelist())
+        data = json.loads(zf.read("data.json"))
+        assert data["user_profiles"][0]["user_id"] == _UID
