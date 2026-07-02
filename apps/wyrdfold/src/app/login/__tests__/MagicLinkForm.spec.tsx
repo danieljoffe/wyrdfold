@@ -18,7 +18,9 @@ jest.mock('@/lib/supabase/auth-client', () => ({
 beforeEach(() => {
   jest.clearAllMocks();
   mockSignInWithOtp.mockResolvedValue({ error: null });
-  document.cookie = '';
+  // jsdom persists cookies across tests; expire the redirect cookie so each
+  // case starts from a known-clean state.
+  document.cookie = 'wyrdfold_login_next=; max-age=0; path=/';
 });
 
 describe('MagicLinkForm — idle state', () => {
@@ -104,7 +106,7 @@ describe('MagicLinkForm — idle state', () => {
     });
   });
 
-  it('stashes the next param in a cookie before submitting', async () => {
+  it('stashes the next param in a cookie only after a successful send', async () => {
     const user = userEvent.setup();
     render(<MagicLinkForm next={'/jobs'} authError={undefined} />);
 
@@ -118,6 +120,61 @@ describe('MagicLinkForm — idle state', () => {
       expect(mockSignInWithOtp).toHaveBeenCalled();
     });
     expect(document.cookie).toMatch(/wyrdfold_login_next=%2Fjobs/);
+  });
+
+  it('does NOT stash next when the sign-in fails (no stale redirect)', async () => {
+    mockSignInWithOtp.mockResolvedValueOnce({
+      error: { message: 'Email rate limit exceeded' },
+    });
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={'/jobs'} authError={undefined} />);
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'test@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    await screen.findByText(/rate limit exceeded/i);
+    // The failed attempt never sets the redirect cookie.
+    expect(document.cookie).not.toMatch(/wyrdfold_login_next=%2Fjobs/);
+  });
+
+  it('clears a stale next cookie when a later sign-in fails', async () => {
+    // A prior attempt left a redirect target behind…
+    document.cookie = 'wyrdfold_login_next=%2Fold-target; path=/';
+    expect(document.cookie).toMatch(/wyrdfold_login_next=%2Fold-target/);
+
+    mockSignInWithOtp.mockResolvedValueOnce({
+      error: { message: 'Email rate limit exceeded' },
+    });
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={'/jobs'} authError={undefined} />);
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'test@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    await screen.findByText(/rate limit exceeded/i);
+    // …and the failure scrubs it so it can't poison the next login.
+    expect(document.cookie).not.toMatch(/wyrdfold_login_next/);
+  });
+
+  it('clears a stale next cookie on a successful send with no next', async () => {
+    document.cookie = 'wyrdfold_login_next=%2Fold-target; path=/';
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={undefined} authError={undefined} />);
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'test@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    await screen.findByRole('heading', { name: /check your email/i });
+    expect(document.cookie).not.toMatch(/wyrdfold_login_next/);
   });
 
   it('renders an error alert with aria-describedby on Supabase failure', async () => {

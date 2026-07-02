@@ -29,12 +29,15 @@ function upstreamResponse(
   });
 }
 
-function makeRequest(body: unknown, ip = '10.0.0.1'): NextRequest {
+function makeRequest(
+  body: unknown,
+  headers: Record<string, string> = { 'x-real-ip': '10.0.0.1' }
+): NextRequest {
   return new NextRequest('http://localhost/api/waitlist', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-forwarded-for': ip,
+      ...headers,
     },
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
@@ -70,11 +73,78 @@ describe('POST /api/waitlist (BFF forwarder)', () => {
     });
   });
 
-  it('forwards the real client IP so the backend keys its per-IP limit', async () => {
-    await POST(makeRequest({ email: 'jane@example.com' }, '203.0.113.9'));
+  it('forwards the Vercel-trusted x-real-ip so the backend keys its per-IP limit', async () => {
+    await POST(
+      makeRequest({ email: 'jane@example.com' }, { 'x-real-ip': '203.0.113.9' })
+    );
     const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
     const headers = new Headers(init.headers);
     expect(headers.get('x-forwarded-for')).toBe('203.0.113.9');
+  });
+
+  it('does NOT trust a client-supplied x-forwarded-for (spoof defeat)', async () => {
+    // Attacker prepends a fake IP and omits x-real-ip. The route must not
+    // relay the spoofed value — it forwards no IP at all.
+    await POST(
+      makeRequest(
+        { email: 'spoof@example.com' },
+        { 'x-forwarded-for': '1.2.3.4, 5.6.7.8' }
+      )
+    );
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get('x-forwarded-for')).toBeNull();
+  });
+
+  it('ignores x-forwarded-for even when x-real-ip is also present', async () => {
+    // Vercel sets x-real-ip to the true peer; the (possibly spoofed) XFF chain
+    // must never win over it.
+    await POST(
+      makeRequest(
+        { email: 'jane@example.com' },
+        { 'x-real-ip': '198.51.100.7', 'x-forwarded-for': '1.2.3.4' }
+      )
+    );
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get('x-forwarded-for')).toBe('198.51.100.7');
+  });
+
+  it('forwards no IP when x-real-ip is malformed junk', async () => {
+    await POST(
+      makeRequest(
+        { email: 'jane@example.com' },
+        { 'x-real-ip': 'not-an-ip; DROP TABLE' }
+      )
+    );
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get('x-forwarded-for')).toBeNull();
+  });
+
+  it('rejects an x-real-ip carrying a port or list as untrusted', async () => {
+    for (const bad of [
+      '203.0.113.9:443',
+      '203.0.113.9, 1.2.3.4',
+      '999.1.1.1',
+    ]) {
+      mockFetch.mockClear();
+      await POST(
+        makeRequest({ email: 'jane@example.com' }, { 'x-real-ip': bad })
+      );
+      const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+      const headers = new Headers(init.headers);
+      expect(headers.get('x-forwarded-for')).toBeNull();
+    }
+  });
+
+  it('accepts a clean IPv6 x-real-ip', async () => {
+    await POST(
+      makeRequest({ email: 'jane@example.com' }, { 'x-real-ip': '2001:db8::1' })
+    );
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get('x-forwarded-for')).toBe('2001:db8::1');
   });
 
   it('rejects an invalid email with 400 BEFORE any backend round trip', async () => {

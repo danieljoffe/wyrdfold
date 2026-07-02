@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
@@ -104,9 +106,84 @@ def _validate_settings(s: Settings) -> None:
         )
 
 
+_LEGACY_KEY_DISABLED_SIGNATURE = "Legacy API keys are disabled"
+
+
+async def _probe_supabase_keys(
+    s: Settings,
+    *,
+    fetch: Callable[[str, str], Awaitable[str]] | None = None,
+) -> None:
+    """Boot-time probe for known-bad Supabase keys.
+
+    ``_validate_settings`` proves the keys are present; this additionally
+    detects the one deterministic failure we can identify from a gateway
+    response — the disabled-legacy-key signature — and boot-fails on it.
+    It does NOT prove a key is otherwise valid (a wrong-but-enabled key
+    still surfaces on the first real request). A key can be set yet
+    **disabled** — Supabase is sunsetting the
+    legacy anon/service_role JWT keys, and a disabled key makes every request
+    through it fail. On 2026-07-02 the ``GET /jobs`` path flipped onto the RLS
+    user client (built from the anon key), whose prod anon key was a disabled
+    legacy key — 500-storming the hottest endpoint with no boot-time signal.
+    This turns that class of misconfig into a clear boot failure.
+
+    Only the deterministic disabled-key signature fails the boot; a network blip
+    reaching Supabase warns and continues, so a transient outage can't keep the
+    app from starting. A legacy JWT-format key (not yet disabled) warns.
+    """
+    if not s.supabase_url:
+        return
+
+    async def _default_fetch(url: str, key: str) -> str:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, headers={"apikey": key})
+            return resp.text
+
+    do_fetch = fetch or _default_fetch
+    url = f"{s.supabase_url.rstrip('/')}/rest/v1/"
+    for name, key in (
+        ("SUPABASE_ANON_KEY", s.supabase_anon_key),
+        ("SUPABASE_SERVICE_ROLE_KEY", s.supabase_service_role_key),
+    ):
+        if not key:
+            continue
+        if key.startswith("eyJ"):
+            _log.warning(
+                "%s is a legacy JWT-format Supabase key — these are being sunset; "
+                "rotate to a publishable (anon) / secret (service-role) key (sb_...) "
+                "before Supabase disables it.",
+                name,
+            )
+        try:
+            body = await do_fetch(url, key)
+        except httpx.HTTPError as exc:
+            _log.warning(
+                "Supabase key liveness probe for %s could not reach %s (%r); "
+                "skipping — a real key problem will still surface on the first "
+                "authenticated request.",
+                name,
+                url,
+                exc,
+            )
+            continue
+        if _LEGACY_KEY_DISABLED_SIGNATURE in body:
+            raise RuntimeError(
+                f"{name} is a DISABLED legacy Supabase key: the API gateway rejects "
+                f"it ('{_LEGACY_KEY_DISABLED_SIGNATURE}'), so every request using it "
+                f"fails. Rotate to the new publishable (anon) / secret (service-role) "
+                f"key in the Supabase dashboard -> Settings -> API and update the "
+                f"deploy env. Boot-failing on purpose so the deploy log names the cause."
+            )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _validate_settings(settings)
+    # Skipped under the test flag (no test boots the lifespan; belt-and-braces
+    # so a future `with TestClient(app)` test can't hit the network).
+    if os.environ.get("WYRDFOLD_API_TESTING") != "1":
+        await _probe_supabase_keys(settings)
     init_supabase()
     scheduler = start_scheduler_if_enabled()
     # Background cost-log flush task. Cron paths enqueue rows and the
