@@ -40,12 +40,23 @@ const RESEND_COOLDOWN_S = 30;
  * isn't sent in cleartext on any non-HSTS preview/dev host. Skipped
  * on plain http://localhost in dev.
  */
+function cookieSecureSuffix(): string {
+  return typeof window !== 'undefined' && window.location.protocol === 'https:'
+    ? '; secure'
+    : '';
+}
+
 function stashNextInCookie(next: string): void {
-  const secure =
-    typeof window !== 'undefined' && window.location.protocol === 'https:'
-      ? '; secure'
-      : '';
-  document.cookie = `${NEXT_COOKIE}=${encodeURIComponent(next)}; max-age=${NEXT_COOKIE_MAX_AGE_S}; path=/; samesite=lax${secure}`;
+  document.cookie = `${NEXT_COOKIE}=${encodeURIComponent(next)}; max-age=${NEXT_COOKIE_MAX_AGE_S}; path=/; samesite=lax${cookieSecureSuffix()}`;
+}
+
+/**
+ * Expire the stashed-next cookie immediately. Used so a *failed* sign-in — or
+ * a success with no `next` — can't leave a stale redirect target behind that a
+ * later successful login would silently honor (frontend audit 2026-07-01, LOW).
+ */
+function clearNextCookie(): void {
+  document.cookie = `${NEXT_COOKIE}=; max-age=0; path=/; samesite=lax${cookieSecureSuffix()}`;
 }
 
 // Wyrdfold is invite-only during the beta. The login form sends
@@ -113,10 +124,6 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
     setFormState('loading');
     setError('');
 
-    if (next) {
-      stashNextInCookie(next);
-    }
-
     const supabase = createAuthBrowserClient();
     const { error: authError } = await supabase.auth.signInWithOtp({
       email,
@@ -127,9 +134,21 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
     });
 
     if (authError) {
+      // Sign-in failed — the callback will never run for this attempt, so
+      // scrub any stashed destination (including one a prior attempt left)
+      // rather than letting it poison the next successful login.
+      clearNextCookie();
       setError(friendlyAuthError(authError.message));
       setFormState('error');
     } else {
+      // Persist the post-login destination ONLY now that the link is actually
+      // on its way. A `next`-less success clears any stale cookie so login
+      // lands on the default destination, not a leftover target.
+      if (next) {
+        stashNextInCookie(next);
+      } else {
+        clearNextCookie();
+      }
       setFormState('sent');
       setResendIn(RESEND_COOLDOWN_S);
     }
