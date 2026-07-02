@@ -129,6 +129,14 @@ class Settings(BaseSettings):
     url_health_concurrency: int = Field(default=10, ge=1, le=50)
     url_health_failure_threshold: int = Field(default=3, ge=1, le=10)
 
+    # Conversation-history window sent to the LLM on each orchestrated turn
+    # (#29 audit: handle_turn previously loaded up to 1M turns and re-sent the
+    # whole history every turn — unbounded token growth + eventual context
+    # overflow for long-lived accounts). 50 = ~25 exchanges, comfortably above
+    # any real onboarding conversation today; the full history stays persisted,
+    # only the LLM window is capped.
+    conversation_history_max_turns: int = Field(default=50, ge=1, le=1000)
+
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
     # every row until an operator chooses a window. When on, the scheduler
