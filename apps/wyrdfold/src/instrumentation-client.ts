@@ -9,7 +9,10 @@ if (sentryEnabled) {
     environment: publicEnv.NEXT_PUBLIC_NODE_ENV,
     tracesSampleRate: isProduction() ? 0.1 : 1.0,
     sampleRate: 1.0,
-    enableLogs: true,
+    // OFF (#29 H-r2-5): no Sentry.logger / consoleLoggingIntegration usage,
+    // and the Logs stream (unlike masked replay) ships unscrubbed — see the
+    // rationale in lib/sentry.config.ts.
+    enableLogs: false,
 
     // Heavy integrations are deferred below to avoid blocking LCP
     integrations: [],
