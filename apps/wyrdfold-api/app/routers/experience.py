@@ -370,9 +370,9 @@ def get_optimized(
 @router.post("/optimized")
 async def create_optimized(
     body: OptimizedDocUpsert,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> OptimizedDoc:
     doc = optimized.create_version(
         supabase,
@@ -395,10 +395,10 @@ async def create_optimized(
 @limiter.limit("10/minute")
 async def derive_optimized(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> OptimizedDoc:
     """Read the latest prose doc, derive an OptimizedPayload via LLM,
     persist it as a new optimized version, embed its chunks, and log cost.
@@ -475,10 +475,10 @@ def _sse_event(event: str, data: dict[str, Any]) -> bytes:
 @limiter.limit("10/minute")
 async def derive_optimized_stream(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> StreamingResponse:
     """Streaming variant of /derive.
 
