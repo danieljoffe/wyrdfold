@@ -209,15 +209,17 @@ def test_user_can_update_own_user_target_prefs(
     uid_a, _, target_id = seeded_user_targets
     client_a = user_client_factory(uid_a)
 
+    # pref_remote_ok defaults to TRUE (20260624100000) — write False so the
+    # probe value is distinguishable from an untouched row.
     resp = (
         client_a.table("user_targets")
-        .update({"pref_remote_ok": True})
+        .update({"pref_remote_ok": False})
         .eq("user_id", uid_a)
         .eq("target_id", target_id)
         .execute()
     )
     assert len(resp.data) == 1
-    assert resp.data[0]["pref_remote_ok"] is True
+    assert resp.data[0]["pref_remote_ok"] is False
 
 
 def test_user_update_cannot_touch_other_users_prefs(
@@ -231,9 +233,11 @@ def test_user_update_cannot_touch_other_users_prefs(
     uid_a, uid_b, target_id = seeded_user_targets
     client_a = user_client_factory(uid_a)
 
+    # Attack with False — pref_remote_ok defaults to TRUE, so an untouched
+    # victim row stays True and a mutated one is unambiguous.
     resp = (
         client_a.table("user_targets")
-        .update({"pref_remote_ok": True})
+        .update({"pref_remote_ok": False})
         .eq("user_id", uid_b)
         .eq("target_id", target_id)
         .execute()
@@ -248,4 +252,4 @@ def test_user_update_cannot_touch_other_users_prefs(
         .execute()
         .data
     )
-    assert b_row[0]["pref_remote_ok"] is not True, "B's prefs were mutated"
+    assert b_row[0]["pref_remote_ok"] is True, "B's prefs were mutated"
