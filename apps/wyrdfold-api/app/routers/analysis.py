@@ -52,10 +52,19 @@ async def create_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
     supabase: Client = Depends(get_supabase),
-    # #6 R2: the scores-blend WRITE is gated through a SECURITY DEFINER RPC
-    # called on the caller's client (user JWT → ownership enforced in-DB;
-    # api-key/operator → service-role, exempt). Everything else stays on the
-    # service-role `supabase` (persist/cost_log hit SELECT-only tables).
+    # #6 R2 / #88 dual-client split:
+    # * `caller_supabase` (JWT → RLS user client, api-key → service-role)
+    #   carries every read a JWT caller is entitled to make directly — the
+    #   ownership gate (user_targets, self-scoped), the optimized doc
+    #   (experience_optimized_docs, self-scoped), the target + job posting
+    #   (SELECT-true shared catalog) — plus the scores-blend WRITE, gated
+    #   through a SECURITY DEFINER RPC so Postgres re-checks ownership.
+    # * `supabase` (service-role) keeps the COST-BEARING plumbing: the
+    #   analyses cache read + upsert and the llm_costs write/count.
+    #   `analyses`/`llm_costs` have no INSERT policy for `authenticated` by
+    #   design, and an RLS surprise on the cache read or the daily-count
+    #   read would silently turn into duplicate LLM spend / a widened
+    #   budget — the failure mode must stay impossible, not just tested.
     caller_supabase: Client = Depends(get_supabase_for_caller),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
@@ -67,13 +76,13 @@ async def create_analysis(
     # 403 so non-owners can't enumerate target existence. api-key callers
     # (user_id None) are operators and bypass, matching the targets router.
     if user_id is not None and target_id not in await asyncio.to_thread(
-        targets_crud.get_user_target_ids, supabase, user_id
+        targets_crud.get_user_target_ids, caller_supabase, user_id
     ):
         raise HTTPException(status_code=404, detail="Target not found.")
 
     # 1. Fetch optimized doc (needed for cache key)
     current_optimized = await asyncio.to_thread(
-        optimized.get_latest, supabase, user_id=user_id
+        optimized.get_latest, caller_supabase, user_id=user_id
     )
     if current_optimized is None:
         # No optimized profile yet → a 200 empty-state marker, NOT a 4xx. The
@@ -94,7 +103,9 @@ async def create_analysis(
             },
         )
 
-    # 2. Check cache — keyed on (job, target, optimized version)
+    # 2. Check cache — keyed on (job, target, optimized version). Stays on
+    # the service-role client (see the dependency comment): a false cache
+    # miss here is silent duplicate LLM spend.
     cached = await asyncio.to_thread(
         persistence.get_cached,
         supabase,
@@ -115,7 +126,6 @@ async def create_analysis(
         # the row already has the blended score.
         await asyncio.to_thread(
             _apply_llm_blend,
-            supabase,
             caller_supabase,
             job_posting_id=job_id,
             target_id=target_id,
@@ -137,13 +147,13 @@ async def create_analysis(
         )
 
     # 3. Fetch target (existence check + context for the LLM)
-    target = await asyncio.to_thread(targets_crud.get, supabase, target_id)
+    target = await asyncio.to_thread(targets_crud.get, caller_supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found.")
 
     # 4. Fetch job posting (existence + description in one round-trip)
     resp = await asyncio.to_thread(
-        lambda: supabase.table("jobs")
+        lambda: caller_supabase.table("jobs")
         .select("id, description_html")
         .eq("id", job_id)
         .limit(1)
@@ -205,7 +215,6 @@ async def create_analysis(
     # ``/jobs?target_id=...`` ordering.
     await asyncio.to_thread(
         _apply_llm_blend,
-        supabase,
         caller_supabase,
         job_posting_id=job_id,
         target_id=target_id,
@@ -217,7 +226,6 @@ async def create_analysis(
 
 
 def _apply_llm_blend(
-    supabase: Client,
     caller_supabase: Client,
     *,
     job_posting_id: str,
@@ -227,18 +235,19 @@ def _apply_llm_blend(
 ) -> None:
     """Blend the LLM scorecard into the per-target ``scores`` row.
 
-    Reads the current keyword score (shared-readable), blends with the LLM
-    numeric, then writes back score + scoring_status='complete' via the
-    ``user_apply_score_blend`` SECURITY DEFINER RPC (#6 R2) on the caller's
-    client — Postgres re-checks that the caller follows ``target_id`` before
-    touching the shared row (a service-role/operator caller is exempt). The
-    Python ownership gate in ``create_analysis`` stays for the 404 UX; this is
-    the DB-level backstop. Best-effort: failures are swallowed so an LLM blend
-    hiccup doesn't fail the user's request.
+    Reads the current keyword score (shared-readable: ``scores`` is
+    SELECT-true for ``authenticated``), blends with the LLM numeric, then
+    writes back score + scoring_status='complete' via the
+    ``user_apply_score_blend`` SECURITY DEFINER RPC (#6 R2) — both on the
+    caller's client, so Postgres re-checks that the caller follows
+    ``target_id`` before touching the shared row (a service-role/operator
+    caller is exempt). The Python ownership gate in ``create_analysis`` stays
+    for the 404 UX; this is the DB-level backstop. Best-effort: failures are
+    swallowed so an LLM blend hiccup doesn't fail the user's request.
     """
     try:
         cur_resp = (
-            supabase.table("scores")
+            caller_supabase.table("scores")
             .select("score")
             .eq("job_posting_id", job_posting_id)
             .eq("target_id", target_id)

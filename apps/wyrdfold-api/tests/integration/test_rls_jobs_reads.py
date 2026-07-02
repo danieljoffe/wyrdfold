@@ -5,12 +5,23 @@ caller's ``user_jobs`` row (the new ``p_user_id`` param): two users who
 share the SAME scored job see DIFFERENT statuses, and a NULL ``p_user_id``
 (api-key/cron path) sees ``'new'``. Runs against the live local Supabase
 stack (self-skips when unreachable — see conftest).
+
+#88 dual-auth flip: GET /jobs, /pipeline-counts and GET /{id} now run on the
+caller's RLS user client for JWT callers (``get_supabase_for_caller``). The
+second half of this file proves that flip is loss-free and adds teeth:
+
+* both list RPCs (``get_target_jobs``, ``pipeline_counts``) return
+  IDENTICAL results on a user-JWT client vs the service-role client for
+  the same user — no silently-lost rows on the hottest path; and
+* the RPCs are SECURITY INVOKER, so a JWT client passing ANOTHER user's
+  ``p_user_id`` can no longer read that user's pipeline state — RLS on
+  ``user_jobs`` is the control, not the honesty of the parameter.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 from supabase import Client
@@ -83,6 +94,29 @@ def seeded_shared_job(
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
+def _list_rows(
+    client: Client, target_id: str, user_id: str | None
+) -> list[dict[str, object]]:
+    """The exact ``get_target_jobs`` call the list endpoint makes."""
+    resp = client.rpc(
+        "get_target_jobs",
+        {
+            "p_target_id": target_id,
+            "p_min_score": 0,
+            "p_status": None,
+            "p_company": None,
+            "p_search": None,
+            "p_sort": "score",
+            "p_ascending": False,
+            "p_limit": 20,
+            "p_after_value": None,
+            "p_after_id": None,
+            "p_user_id": user_id,
+        },
+    ).execute()
+    return list(resp.data or [])
+
+
 def _status_for(
     service_client: Client, target_id: str, posting_id: str, user_id: str | None
 ) -> str:
@@ -118,3 +152,61 @@ def test_get_target_jobs_resolves_per_user_status(
     assert _status_for(service_client, target_id, posting_id, uid_b) == "saved"
     # NULL caller (api-key/cron path) has no user_jobs row -> 'new'.
     assert _status_for(service_client, target_id, posting_id, None) == "new"
+
+
+def test_list_rpc_identical_on_user_jwt_client(
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+    seeded_shared_job: tuple[str, str, str, str],
+) -> None:
+    """#88 flip equivalence on the hottest path: the LIST driven through a
+    user JWT returns row-for-row what the service-role client returned for
+    the same user — including the per-user status overlay."""
+    uid_a, _, target_id, posting_id = seeded_shared_job
+    via_jwt = _list_rows(user_client_factory(uid_a), target_id, uid_a)
+    via_service = _list_rows(service_client, target_id, uid_a)
+    assert via_jwt == via_service
+    # Not vacuously equal: the seeded job is present with A's status.
+    mine = [r for r in via_jwt if r["id"] == posting_id]
+    assert len(mine) == 1 and mine[0]["status"] == "applied"
+
+
+def test_pipeline_counts_rpc_identical_on_user_jwt_client(
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+    seeded_shared_job: tuple[str, str, str, str],
+) -> None:
+    """Same equivalence for the /pipeline-counts RPC."""
+    uid_a, _, target_id, _ = seeded_shared_job
+    params = {"p_target_ids": [target_id], "p_min_score": None, "p_user_id": uid_a}
+    via_jwt = user_client_factory(uid_a).rpc("pipeline_counts", params).execute().data
+    via_service = service_client.rpc("pipeline_counts", params).execute().data
+    assert via_jwt == via_service
+    assert {r["status"]: r["count"] for r in via_jwt or []} == {"applied": 1}
+
+
+def test_invoker_rpc_blocks_spoofed_user_id_on_jwt_client(
+    user_client_factory: Callable[[str], Client],
+    seeded_shared_job: tuple[str, str, str, str],
+) -> None:
+    """The flip's payoff: the RPCs are SECURITY INVOKER, so when B's JWT
+    client passes A's ``p_user_id``, RLS on ``user_jobs`` hides A's rows and
+    the status degrades to 'new' — B cannot read A's pipeline state by lying
+    about the parameter. (On the service-role client the same spoofed call
+    WOULD return A's status; the endpoints always derive ``p_user_id`` from
+    the JWT, and this proves the DB now backstops that contract.)"""
+    uid_a, uid_b, target_id, posting_id = seeded_shared_job
+    spoofed = _list_rows(user_client_factory(uid_b), target_id, uid_a)
+    row = next(r for r in spoofed if r["id"] == posting_id)
+    assert row["status"] == "new"  # NOT A's 'applied'
+
+    counts = (
+        user_client_factory(uid_b)
+        .rpc(
+            "pipeline_counts",
+            {"p_target_ids": [target_id], "p_min_score": None, "p_user_id": uid_a},
+        )
+        .execute()
+        .data
+    )
+    assert {r["status"]: r["count"] for r in counts or []} == {"new": 1}
