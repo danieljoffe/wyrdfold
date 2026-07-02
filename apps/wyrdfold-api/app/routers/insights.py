@@ -4,9 +4,10 @@ Three GET endpoints return pre-aggregated analytics for the insights
 dashboard.  Each accepts a ``?period=`` query param (7d/30d/90d/all)
 and delegates to the corresponding service function.
 
-All aggregations are scoped to the JWT subject — the service-role
-Supabase client bypasses RLS, so the router resolves the caller's
-target_ids and passes them down to bound every query.
+All aggregations are scoped to the JWT subject. The router resolves the
+caller's target_ids and passes them down to bound every query; since #88
+Phase 3 the queries also run on the RLS-bound user client, so Postgres
+scopes the per-user tables even if a service-layer filter slips.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -16,7 +17,7 @@ from supabase import Client
 
 from app.dependencies import (
     get_current_user_id,
-    get_supabase,
+    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.insights import PipelineInsights, SkillsCostInsights, TargetInsights
@@ -101,7 +102,10 @@ def _empty_skills_cost() -> SkillsCostInsights:
 def pipeline_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    # #88 Phase 3: read-only over user_jobs/status_log/analyses/llm_costs
+    # (self-SELECT policies) + the shared catalog (SELECT true) — RLS scopes
+    # the per-user tables underneath the service-layer user_id filters.
+    supabase: Client = Depends(get_user_supabase),
 ) -> PipelineInsights:
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
@@ -119,7 +123,7 @@ def pipeline_insights(
 def target_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> TargetInsights:
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
@@ -133,7 +137,7 @@ def target_insights(
 def skills_cost_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> SkillsCostInsights:
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:

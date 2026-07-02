@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_current_user_id,
     get_supabase,
+    get_user_supabase,
     verify_api_key_or_jwt,
     verify_supabase_jwt,
 )
@@ -118,6 +119,10 @@ def _build_supabase(
 @pytest.fixture
 def client_factory():
     def _make(supabase: MagicMock, *, authed: bool = True) -> TestClient:
+        # The routes this file exercises moved to the RLS user client across
+        # the #88 phases — override both clients with the same mock so every
+        # route resolves regardless of which dependency it declares.
+        app.dependency_overrides[get_user_supabase] = lambda: supabase
         app.dependency_overrides[get_supabase] = lambda: supabase
         if authed:
             app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
