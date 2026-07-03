@@ -128,11 +128,16 @@ def assert_safe_host(hostname: str) -> None:
         raise ValueError(f"hostname did not resolve: {hostname}")
     for addr in addrs:
         if _is_disallowed_address(addr):
+            # Log the specific resolved address for operators, but never echo
+            # it back to the caller: returning the internal IP a hostname
+            # resolved to confirms metadata-endpoint reachability and leaks
+            # internal network topology (#29 R3 H8 / #192). The message stays
+            # generic; the hostname is caller-supplied so it isn't a leak.
             logger.warning(
                 "ssrf_block: %s resolved to disallowed address %s", hostname, addr
             )
             raise ValueError(
-                f"hostname {hostname} resolves to a disallowed address ({addr})"
+                f"hostname {hostname} resolves to a disallowed (private/internal) address"
             )
 
 

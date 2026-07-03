@@ -105,6 +105,45 @@ class TestSsrfHostCheck:
             with pytest.raises(ValueError, match="disallowed"):
                 assert_safe_host(f"private-{cidr}")
 
+    def test_rejection_message_does_not_leak_resolved_ip(self, monkeypatch):
+        """#192/#29 R3 H8: the rejection surfaces to the caller
+        (`rejection_reason=f"unsafe_host:{exc}"`), so it must not echo the
+        internal IP the hostname resolved to — only a generic reason."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        secret_ip = "169.254.169.254"
+        monkeypatch.setattr(
+            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)]
+        )
+        with pytest.raises(ValueError) as exc_info:
+            assert_safe_host("metadata.evil")
+        message = str(exc_info.value)
+        assert secret_ip not in message  # the internal IP must not leak
+        assert "metadata.evil" in message  # caller-supplied host is fine
+        assert "disallowed" in message
+
+    async def test_validate_job_url_rejection_reason_has_no_resolved_ip(
+        self, monkeypatch
+    ):
+        """The `rejection_reason` returned by `validate_job_url` is echoed to
+        clients verbatim (POST /jobs/validate-url, `Invalid JD URL: ...`), so
+        the resolved internal IP must not appear in it (#192/#29 R3 H8)."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        secret_ip = "169.254.169.254"
+        monkeypatch.setattr(
+            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)]
+        )
+        result = await v.validate_job_url("https://metadata.evil/job/1")
+        assert result.is_valid is False
+        assert result.rejection_reason is not None
+        assert secret_ip not in result.rejection_reason
+        assert result.rejection_reason.startswith("unsafe_host")
+
     def test_ipv6_loopback_blocked(self, monkeypatch):
         import ipaddress
 
