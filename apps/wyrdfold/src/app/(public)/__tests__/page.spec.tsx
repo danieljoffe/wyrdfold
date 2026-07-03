@@ -8,7 +8,17 @@ jest.mock('next/navigation', () => ({
 
 import WyrdfoldLandingPage from '../page';
 
+// The narrative-funnel specs below document the HOSTED (saas) homepage; the
+// self_host variant swaps the waitlist funnel for a sign-in CTA (Phase 2) and
+// has its own describe at the bottom. deploymentMode() reads the env at call
+// time, so flipping it per-describe works.
 describe('WyrdfoldLandingPage', () => {
+  beforeEach(() => {
+    process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'] = 'saas';
+  });
+  afterEach(() => {
+    delete process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+  });
   it('renders the narrative sections in CTA-building order', () => {
     const { container } = render(<WyrdfoldLandingPage />);
 
@@ -59,6 +69,42 @@ describe('WyrdfoldLandingPage', () => {
     const { container } = render(<WyrdfoldLandingPage />);
     // Mirror the e2e landing-page config: shared-ui Alert renders its title
     // as an <h5>, which trips heading-order; that's third-party markup.
+    await expectNoA11yViolations(container, {
+      disableRules: ['heading-order'],
+    });
+  });
+});
+
+describe('WyrdfoldLandingPage (self_host mode)', () => {
+  // Default mode — no env var set — is self_host: the safe posture for a
+  // cloned repo. The waitlist funnel must be absent and sign-in is the CTA.
+  beforeEach(() => {
+    delete process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+  });
+
+  it('drops the waitlist funnel entirely', () => {
+    render(<WyrdfoldLandingPage />);
+    expect(screen.queryByText(/waitlist/i)).not.toBeInTheDocument();
+    // The WaitlistForm email input is gone at both CTA sites.
+    expect(
+      screen.queryByRole('textbox', { name: /email/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows sign-in CTAs and the self-hosted badge instead', () => {
+    render(<WyrdfoldLandingPage />);
+    expect(screen.getByText('Self-hosted instance')).toBeInTheDocument();
+    const signIns = screen.getAllByRole('link', { name: /sign in/i });
+    expect(signIns.length).toBeGreaterThanOrEqual(2); // hero + closing CTA
+    for (const link of signIns) {
+      expect(link).toHaveAttribute('href', '/login');
+    }
+  });
+
+  it('has no jest-axe a11y violations in self_host mode', async () => {
+    const { container } = render(<WyrdfoldLandingPage />);
+    // Same third-party exception as the saas spec above: shared-ui Alert
+    // renders its title as an <h5> (heading-order), mode-independent.
     await expectNoA11yViolations(container, {
       disableRules: ['heading-order'],
     });
