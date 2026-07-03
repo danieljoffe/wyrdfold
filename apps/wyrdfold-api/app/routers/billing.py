@@ -120,6 +120,41 @@ class BillingUrlResponse(BaseModel):
     url: str
 
 
+class BillingAccountResponse(BaseModel):
+    plan: str
+    #: Whether a Stripe customer exists — drives "Upgrade" vs "Manage
+    #: subscription" in the settings card.
+    has_billing_account: bool
+    #: The user's own usable OpenRouter key pays inference (no managed
+    #: quota applies) — drives the "your key pays" presentation.
+    byok: bool
+
+
+# Sync `def`: blocking supabase reads in the threadpool (#107).
+@router.get(
+    "/account",
+    response_model=BillingAccountResponse,
+    dependencies=[Depends(require_billing)],
+)
+def get_billing_account(
+    user_id: str = Depends(get_current_user_id),
+    supabase: Client = Depends(get_supabase),
+) -> BillingAccountResponse:
+    """The settings card's read: plan + billing/BYOK state in one call."""
+    from app.services.keys import store as keys_store
+    from app.services.llm import budget
+
+    account = budget.get_llm_account(supabase, user_id=user_id)
+    return BillingAccountResponse(
+        plan=account.plan or "free",
+        has_billing_account=_get_stripe_customer_id(supabase, user_id)
+        is not None,
+        byok=keys_store.has_usable_key(
+            supabase, user_id=user_id, provider="openrouter"
+        ),
+    )
+
+
 # Sync `def`: the Stripe SDK and supabase-py are blocking; FastAPI's
 # threadpool keeps them off the event loop (#107).
 @router.post(

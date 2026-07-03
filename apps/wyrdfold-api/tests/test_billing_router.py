@@ -305,3 +305,63 @@ def test_webhook_checkout_completed_links_customer(
         if "stripe_customer_id" in c.args[0]
     ]
     assert saved == [{"stripe_customer_id": "cus_linked"}]
+
+
+# ---- GET /billing/account ----------------------------------------------------
+
+
+def test_billing_account_404_outside_saas(sb: MagicMock) -> None:
+    assert _client(sb).get("/billing/account").status_code == 404
+
+
+def test_billing_account_reports_plan_and_state(
+    saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.keys import store as keys_store
+    from app.services.llm import budget as budget_mod
+
+    monkeypatch.setattr(
+        budget_mod,
+        "get_llm_account",
+        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, "starter"),
+    )
+    monkeypatch.setattr(
+        keys_store, "has_usable_key", lambda s, *, user_id, provider: True
+    )
+    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
+        {"stripe_customer_id": "cus_x"}
+    ]
+
+    r = _client(sb).get("/billing/account")
+
+    assert r.status_code == 200
+    assert r.json() == {
+        "plan": "starter",
+        "has_billing_account": True,
+        "byok": True,
+    }
+
+
+def test_billing_account_defaults_free_no_account(
+    saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.keys import store as keys_store
+    from app.services.llm import budget as budget_mod
+
+    monkeypatch.setattr(
+        budget_mod,
+        "get_llm_account",
+        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, None),
+    )
+    monkeypatch.setattr(
+        keys_store, "has_usable_key", lambda s, *, user_id, provider: False
+    )
+
+    r = _client(sb).get("/billing/account")
+
+    assert r.status_code == 200
+    assert r.json() == {
+        "plan": "free",
+        "has_billing_account": False,
+        "byok": False,
+    }
