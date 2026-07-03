@@ -447,21 +447,22 @@ def enforce_llm_budget(
     JWT users get checked against rolling hourly/daily/monthly cost caps
     from `llm_costs`. API-key callers (cron/poller/batch) bypass here —
     background work is charged to the target's activator and gated in
-    the poller. Limits come from `user_llm_*_budget_usd` settings; the
-    monthly cap honors the per-user `user_profiles` override; 0 disables.
+    the poller. The monthly cap resolves per plan tier in saas mode
+    (`budget.resolve_llm_quota`: BYOK payers skip it, managed tiers get
+    the plan's interactive-only quota, per-user override wins); self_host
+    keeps the settings default + override. 0 disables a window.
     """
     if user_id is None:
         return
     from app.services.llm import budget
 
-    monthly_cap, llm_enabled = budget.get_llm_account(
-        supabase, user_id=user_id, default_usd=s.user_llm_monthly_budget_usd
-    )
-    budget.raise_if_llm_disabled(llm_enabled)
+    quota = budget.resolve_llm_quota(supabase, user_id=user_id)
+    budget.raise_if_llm_disabled(quota.llm_enabled)
     budget.check_user_budget(
         supabase,
         user_id=user_id,
         daily_limit_usd=s.user_llm_daily_budget_usd,
         hourly_limit_usd=s.user_llm_hourly_budget_usd,
-        monthly_limit_usd=monthly_cap,
+        monthly_limit_usd=quota.monthly_cap_usd,
+        monthly_excluded_purposes=quota.monthly_excluded_purposes,
     )

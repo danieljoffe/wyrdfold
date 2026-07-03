@@ -28,6 +28,7 @@ from app.dependencies import (
 )
 from app.http_client import ResponseTooLargeError, UnsafeURLError, get_with_size_cap
 from app.models.diagnostics import TargetFunnelResponse
+from app.models.learning import ProfilePatch
 from app.models.schemas import PollResult
 from app.models.targets import (
     AxisWeights,
@@ -92,8 +93,13 @@ from app.services.targets.lateral_discovery import (
     LateralSuggestions,
     suggest_lateral_targets,
 )
+from app.services.targets.learning_projection import project_profile_impact
 from app.services.targets.match import suggest_and_match
 from app.services.targets.merge import merge_reference_jds
+from app.services.targets.profile_writes import (
+    apply_profile_merge_rpc,
+    apply_profile_patch_rpc,
+)
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
 from app.services.validate import assert_safe_host, validate_job_url
 
@@ -887,7 +893,12 @@ def set_target_preferences(
     status_code=201,
     dependencies=[Depends(enforce_llm_budget)],
 )
+# #191: linking is the gateway to the shared-target contribution surface
+# (a link is what authorizes reference-JD adds, votes, and learner writes
+# on that target) — throttle it like add_reference_jd.
+@limiter.limit("10/minute")
 async def link_target(
+    request: Request,
     target_id: str,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
@@ -1400,7 +1411,7 @@ async def add_reference_jd(
 
     # Store the reference JD, attributed to the contributing user so the
     # merge can de-bias by contributor (#5 refinement layer).
-    await asyncio.to_thread(
+    added_jd = await asyncio.to_thread(
         lambda: crud.add_reference_jd(
             supabase,
             target_id=target_id,
@@ -1411,30 +1422,147 @@ async def add_reference_jd(
         )
     )
 
-    # Merge all reference JD profiles into composite, de-biased by contributor
-    # (each user counts once regardless of how many JDs they've added).
-    all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
-    composite = merge_reference_jds(all_ref_jds)
-
-    # Update target with merged profile + search keywords, bump version for re-scoring.
+    # Operator path (api-key caller): no follower identity to RPC-gate on —
+    # trusted direct write, the documented #191 exception (same convention
+    # as the operator/cron service-role paths in docs/rls-data-access.md).
     # Example title pools come from the LATEST JD only — these are concrete
     # examples not weighted aggregates, and merging across JDs would dilute
     # the few-shot signal. The latest JD overwrites; pools stay coherent.
-    updated = await asyncio.to_thread(
-        crud.update,
-        supabase,
-        target_id,
-        TargetUpdate(
-            scoring_profile=composite,
+    if user_id is None:
+        all_ref_jds = await asyncio.to_thread(
+            crud.list_reference_jds, supabase, target_id
+        )
+        composite = merge_reference_jds(all_ref_jds)
+        updated = await asyncio.to_thread(
+            crud.update,
+            supabase,
+            target_id,
+            TargetUpdate(
+                scoring_profile=composite,
+                search_keywords=derived.search_keywords,
+                example_promising_titles=derived.example_promising_titles,
+                example_unpromising_titles=derived.example_unpromising_titles,
+                profile_version=target.profile_version + 1,
+            ),
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=500, detail="Failed to update target profile"
+            )
+        return updated
+
+    # #191 slice 1b — user contributions to the SHARED profile are bounded
+    # and RPC-gated. Project the merged profile's impact over the target's
+    # recent scored jobs (the same learning-rate cap the learner uses, #5
+    # P4): an outlier contribution is QUARANTINED (suppressed-at-birth, so
+    # every merge excludes it) and staged to the learning-log review rail
+    # instead of applied. Otherwise the write goes through the merge RPC —
+    # in-DB follower re-check + version guard — retried once on a
+    # concurrent-write conflict.
+    current = target
+    for _attempt in range(2):
+        all_ref_jds = await asyncio.to_thread(
+            crud.list_reference_jds, supabase, target_id
+        )
+        composite = merge_reference_jds(all_ref_jds)
+        prev_profile = current.scoring_profile.model_dump()
+        # Project the full "after" state: the merge installs the new JD's
+        # derived search_keywords alongside the profile, and keywords feed
+        # scoring — evaluating the new profile under the OLD keywords would
+        # misjudge outliers (Copilot on #204).
+        projection = await asyncio.to_thread(
+            project_profile_impact,
+            supabase,
+            target_id,
+            prev_profile,
+            composite.model_dump(),
+            current.search_keywords,
+            derived.search_keywords,
+        )
+
+        if projection is not None and projection.capped:
+            note = (
+                f"[staged merge: this reference JD would move "
+                f"{projection.jobs_moved}/{projection.jobs_considered} recent "
+                f"jobs by ≥{projection.move_threshold} pts, over the "
+                f"{projection.max_moved_fraction:.0%} cap]"
+            )
+            staged_diff = ProfilePatch(confidence=0.0, rationale=note)
+            staged_row = {
+                "user_id": user_id,
+                "target_id": target_id,
+                "status": "staged",
+                "kind": "merge",
+                "prev_profile": prev_profile,
+                "next_profile": composite.model_dump(),
+                "diff": staged_diff.model_dump(mode="json"),
+                "confidence": 0.0,
+                "rationale": note,
+                "signals_consumed": 0,
+                "applied_run_id": None,
+                "projection": projection.model_dump(mode="json"),
+                "merge_payload": {
+                    "ref_jd_id": added_jd.id,
+                    "search_keywords": derived.search_keywords,
+                    "example_promising_titles": derived.example_promising_titles,
+                    "example_unpromising_titles": derived.example_unpromising_titles,
+                },
+            }
+            await asyncio.to_thread(
+                lambda: supabase.table("reference_jds")
+                .update({"suppressed": True})
+                .eq("id", added_jd.id)
+                .execute()
+            )
+            def _insert_staged_row(row: dict[str, Any] = staged_row) -> None:
+                supabase.table("target_learning_log").insert(row).execute()
+
+            await asyncio.to_thread(_insert_staged_row)
+            logger.info(
+                "Reference-JD contribution QUARANTINED for (user=%s, "
+                "target=%s): projected to move %d/%d jobs ≥%d pts (cap %.0f%%)",
+                user_id,
+                target_id,
+                projection.jobs_moved,
+                projection.jobs_considered,
+                projection.move_threshold,
+                projection.max_moved_fraction * 100,
+            )
+            # Profile untouched — the staged row is reviewable in the
+            # learning-log panel (apply lifts the quarantine).
+            return current
+
+        outcome, _new_version = await asyncio.to_thread(
+            apply_profile_merge_rpc,
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=composite.model_dump(),
+            expected_version=current.profile_version,
             search_keywords=derived.search_keywords,
-            example_promising_titles=derived.example_promising_titles,
-            example_unpromising_titles=derived.example_unpromising_titles,
-            profile_version=target.profile_version + 1,
-        ),
+            example_promising=derived.example_promising_titles,
+            example_unpromising=derived.example_unpromising_titles,
+        )
+        if outcome == "applied":
+            updated = await asyncio.to_thread(crud.get, supabase, target_id)
+            if updated is None:
+                raise HTTPException(
+                    status_code=500, detail="Failed to update target profile"
+                )
+            return updated
+        if outcome == "version_conflict":
+            refreshed = await asyncio.to_thread(crud.get, supabase, target_id)
+            if refreshed is None:
+                raise HTTPException(status_code=404, detail="Target not found")
+            current = refreshed
+            continue
+        # not_a_follower / target_not_found — the link was severed mid-flight.
+        raise HTTPException(status_code=404, detail="Target not found for user")
+
+    raise HTTPException(
+        status_code=409,
+        detail="Target profile is changing concurrently — retry",
     )
-    if updated is None:
-        raise HTTPException(status_code=500, detail="Failed to update target profile")
-    return updated
 
 
 # Sync `def`: blocking supabase read runs in the threadpool (#107).
@@ -1485,25 +1613,55 @@ def delete_reference_jd(
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
-    # Re-merge remaining profiles, de-biased by contributor.
-    remaining = crud.list_reference_jds(supabase, target_id)
-    if remaining:
-        composite = merge_reference_jds(remaining)
-    else:
-        composite = ScoringProfile()
+    # Operator path (api-key caller): no follower identity to RPC-gate on —
+    # trusted direct write, the documented #191 exception.
+    if user_id is None:
+        remaining = crud.list_reference_jds(supabase, target_id)
+        composite = merge_reference_jds(remaining) if remaining else ScoringProfile()
+        updated = crud.update(
+            supabase,
+            target_id,
+            TargetUpdate(
+                scoring_profile=composite,
+                profile_version=target.profile_version + 1,
+            ),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Target not found")
+        return updated
 
-    # Bump profile_version so lazy re-scoring picks up the change
-    updated = crud.update(
-        supabase,
-        target_id,
-        TargetUpdate(
-            scoring_profile=composite,
-            profile_version=target.profile_version + 1,
-        ),
+    # #191: removal-direction re-merge — RPC-gated (in-DB follower re-check +
+    # version guard), deliberately NOT capped: removing your own contribution
+    # is the correction layer and must never be blocked by the learning-rate
+    # cap. Retried once on a concurrent-write conflict.
+    current = target
+    for _attempt in range(2):
+        remaining = crud.list_reference_jds(supabase, target_id)
+        composite = merge_reference_jds(remaining) if remaining else ScoringProfile()
+        outcome, _new_version = apply_profile_patch_rpc(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=composite.model_dump(),
+            expected_version=current.profile_version,
+        )
+        if outcome == "applied":
+            updated = crud.get(supabase, target_id)
+            if updated is None:
+                raise HTTPException(status_code=404, detail="Target not found")
+            return updated
+        if outcome == "version_conflict":
+            refreshed = crud.get(supabase, target_id)
+            if refreshed is None:
+                raise HTTPException(status_code=404, detail="Target not found")
+            current = refreshed
+            continue
+        raise HTTPException(status_code=404, detail="Target not found for user")
+
+    raise HTTPException(
+        status_code=409,
+        detail="Target profile is changing concurrently — retry",
     )
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Target not found")
-    return updated
 
 
 # Sync `def` (not `async def`): the whole body is blocking supabase work
@@ -1554,20 +1712,40 @@ def vote_on_reference_jd(
     profile_version: int | None = None
     if changed:
         # Suppression flipped — re-merge the shared profile over the now
-        # (un)suppressed set and bump the version so lazy re-scoring picks it up.
-        target = crud.get(supabase, target_id)
-        if target is not None:
-            composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
-            updated = crud.update(
-                supabase,
-                target_id,
-                TargetUpdate(
-                    scoring_profile=composite,
-                    profile_version=target.profile_version + 1,
-                ),
+        # (un)suppressed set and bump the version so lazy re-scoring picks it
+        # up. #191: RPC-gated with the voter's identity (a voter is a
+        # follower by the ownership check above); NOT capped — the flip is a
+        # quorum-approved moderation outcome, and delaying a poisoned
+        # contribution's removal behind the learning-rate cap would be
+        # backwards. Retried once on a concurrent-write conflict; a second
+        # conflict leaves the profile to the next reconciliation (the vote
+        # itself and the suppression flag are already durable).
+        for _attempt in range(2):
+            target = crud.get(supabase, target_id)
+            if target is None:
+                break
+            composite = merge_reference_jds(
+                crud.list_reference_jds(supabase, target_id)
             )
-            if updated is not None:
-                profile_version = updated.profile_version
+            outcome, new_version = apply_profile_patch_rpc(
+                supabase,
+                user_id=user_id,
+                target_id=target_id,
+                next_profile=composite.model_dump(),
+                expected_version=target.profile_version,
+            )
+            if outcome == "applied":
+                profile_version = new_version
+                break
+            if outcome != "version_conflict":
+                logger.warning(
+                    "Vote re-merge refused by RPC (%s) for (user=%s, "
+                    "target=%s)",
+                    outcome,
+                    user_id,
+                    target_id,
+                )
+                break
 
     return ContributionVoteResult(
         reference_jd_id=ref_jd_id,

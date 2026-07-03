@@ -10,6 +10,11 @@ review instead of applying them: a learning-rate cap.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
+from supabase import Client
+
+from app.config import settings
 from app.models.learning import RescoreProjection
 from app.models.targets import ScoringProfile
 
@@ -24,12 +29,77 @@ from app.services.scoring import score_job_with_profile
 ScoredJobText = tuple[str, str]
 
 
+def fetch_recent_scored_jobs(
+    supabase: Client, target_id: str, limit: int
+) -> list[ScoredJobText]:
+    """The (title, description_html) of a target's most recently scored jobs.
+
+    Bounded by ``limit`` to keep the deterministic re-score projection cheap.
+    Returns [] when the target has no scores yet (a brand-new target), which
+    the caller treats as "nothing to project against".
+    """
+    score_resp = (
+        supabase.table("scores")
+        .select("job_posting_id")
+        .eq("target_id", target_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+    job_ids = [r["job_posting_id"] for r in score_rows if r.get("job_posting_id")]
+    if not job_ids:
+        return []
+    jobs_resp = (
+        supabase.table("jobs")
+        .select("id, title, description_html")
+        .in_("id", job_ids)
+        .execute()
+    )
+    job_rows = cast(list[dict[str, Any]], jobs_resp.data or [])
+    return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
+
+
+def project_profile_impact(
+    supabase: Client,
+    target_id: str,
+    prev_profile: dict[str, Any],
+    next_profile: dict[str, Any],
+    search_keywords: list[str] | None,
+    next_search_keywords: list[str] | None = None,
+) -> RescoreProjection | None:
+    """Project how much a profile change would move the target's scores.
+
+    Works for any prev→next profile transition — a learner ProfilePatch or
+    a reference-JD merge (#191 slice 1b) — since it just re-scores recent
+    jobs under both profiles. Returns None when there are no scored jobs to
+    project against — the caller then applies without a learning-rate check
+    (nothing to over-churn yet).
+    """
+    jobs = fetch_recent_scored_jobs(
+        supabase, target_id, settings.learning_rescore_sample_size
+    )
+    if not jobs:
+        return None
+    return project_rescore(
+        ScoringProfile.model_validate(prev_profile or {}),
+        ScoringProfile.model_validate(next_profile or {}),
+        jobs,
+        search_keywords=search_keywords,
+        next_search_keywords=next_search_keywords,
+        move_threshold=settings.learning_rescore_move_threshold,
+        max_moved_fraction=settings.learning_rescore_max_moved_fraction,
+        min_jobs=settings.learning_rescore_min_jobs,
+    )
+
+
 def project_rescore(
     prev_profile: ScoringProfile,
     next_profile: ScoringProfile,
     jobs: list[ScoredJobText],
     *,
     search_keywords: list[str] | None,
+    next_search_keywords: list[str] | None = None,
     move_threshold: int,
     max_moved_fraction: float,
     min_jobs: int,
@@ -43,6 +113,14 @@ def project_rescore(
     ``min_jobs`` floor stops a brand-new target with little history from
     having its first patches blocked on noise.
     """
+    # A profile change can travel with a keyword change (a reference-JD
+    # merge replaces search_keywords too, #191 slice 1b) — score the
+    # "after" side with the keywords that would actually be installed, or
+    # the projection under/over-estimates movement (Copilot on #204). The
+    # learner never changes keywords, so the default keeps both sides equal.
+    after_keywords = (
+        next_search_keywords if next_search_keywords is not None else search_keywords
+    )
     moved = 0
     max_abs_delta = 0
     for title, description_html in jobs:
@@ -60,7 +138,7 @@ def project_rescore(
             description_html,
             next_profile,
             parsed_jd=parsed,
-            search_keywords=search_keywords,
+            search_keywords=after_keywords,
         ).score
         delta = abs(round(_KEYWORD_WEIGHT * (after - before)))
         max_abs_delta = max(max_abs_delta, delta)

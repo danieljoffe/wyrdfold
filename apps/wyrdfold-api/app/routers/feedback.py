@@ -19,7 +19,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+)
 from supabase import Client
 
 from app.dependencies import (
@@ -36,6 +43,7 @@ from app.models.feedback import (
     LearnerPatchSummary,
 )
 from app.models.learning import LearningRunResult, TargetLearningLogRow
+from app.rate_limit import limiter
 from app.services.feedback import (
     delete_feedback,
     list_for_target,
@@ -44,6 +52,7 @@ from app.services.feedback import (
 )
 from app.services.llm.client import LLMClient
 from app.services.llm_learner import (
+    StagedPatchConflictError,
     apply_staged_patch,
     reject_staged_patch,
     run_llm_learner,
@@ -161,7 +170,11 @@ def list_feedback(
     "/targets/{target_id}/learn",
     response_model=LearnerPatchSummary | None,
 )
+# #191: the learner mutates the SHARED target profile — throttle the
+# contribution surface per user so it can't be spammed across targets.
+@limiter.limit("10/minute")
 def run_learner_now(
+    request: Request,
     target_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
@@ -176,7 +189,10 @@ def run_learner_now(
     response_model=LearningRunResult | None,
     dependencies=[Depends(enforce_llm_budget)],
 )
+# #191 + LLM-backed: tighter than the deterministic learner.
+@limiter.limit("5/minute")
 async def run_llm_learner_now(
+    request: Request,
     target_id: str,
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_supabase),
@@ -241,7 +257,9 @@ def list_learning_log(
     "/targets/{target_id}/learn/{run_id}/apply",
     response_model=LearningRunResult,
 )
+@limiter.limit("20/minute")  # #191: shared-profile write surface
 def apply_learning_run(
+    request: Request,
     target_id: str,
     run_id: str,
     user_id: str = Depends(get_current_user_id),
@@ -249,7 +267,16 @@ def apply_learning_run(
 ) -> Any:
     if not _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
-    result = apply_staged_patch(supabase, user_id=user_id, run_id=run_id)
+    try:
+        result = apply_staged_patch(supabase, user_id=user_id, run_id=run_id)
+    except StagedPatchConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The target profile changed while applying this patch — "
+                "re-review it against the current profile and retry."
+            ),
+        ) from e
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -263,7 +290,9 @@ def apply_learning_run(
     "/targets/{target_id}/learn/{run_id}/reject",
     response_model=LearningRunResult,
 )
+@limiter.limit("20/minute")  # #191: shared-profile write surface
 def reject_learning_run(
+    request: Request,
     target_id: str,
     run_id: str,
     user_id: str = Depends(get_current_user_id),

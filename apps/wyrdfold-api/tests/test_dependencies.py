@@ -430,22 +430,30 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
     captured: dict = {}
 
     def _spy(
-        supabase, *, user_id, daily_limit_usd, hourly_limit_usd, monthly_limit_usd
+        supabase,
+        *,
+        user_id,
+        daily_limit_usd,
+        hourly_limit_usd,
+        monthly_limit_usd,
+        monthly_excluded_purposes=None,
     ):
         captured.update(
             user_id=user_id,
             daily_limit_usd=daily_limit_usd,
             hourly_limit_usd=hourly_limit_usd,
             monthly_limit_usd=monthly_limit_usd,
+            monthly_excluded_purposes=monthly_excluded_purposes,
         )
 
     monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
-    # The dep resolves (cap, llm_enabled) from user_profiles before the
-    # check — stub it so no Supabase round-trip happens.
+    # The dep resolves the quota (tier/override/default) before the check
+    # — stub it so no Supabase round-trip happens. The resolution logic
+    # itself is pinned in tests/test_entitlements_tiers.py.
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id, default_usd: (default_usd, True),
+        "resolve_llm_quota",
+        lambda supabase, *, user_id: budget_mod.ResolvedQuota(9.0, True, None),
     )
     enforce_llm_budget(
         user_id=USER_SUB,
@@ -457,12 +465,15 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
         "daily_limit_usd": 7.0,
         "hourly_limit_usd": 2.0,
         "monthly_limit_usd": 9.0,
+        "monthly_excluded_purposes": None,
     }
 
 
-def test_enforce_llm_budget_monthly_honors_profile_override(monkeypatch):
-    """The per-user override (the "add credits" lever) wins over the
-    settings default."""
+def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
+    """The dep forwards whatever the resolver decided — cap AND the
+    managed-tier exclusion set — without re-deriving anything. (The
+    override-wins/tier logic itself is pinned in
+    tests/test_entitlements_tiers.py.)"""
     from app.services.llm import budget as budget_mod
 
     captured: dict = {}
@@ -473,13 +484,16 @@ def test_enforce_llm_budget_monthly_honors_profile_override(monkeypatch):
     monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id, default_usd: (25.0, True),
+        "resolve_llm_quota",
+        lambda supabase, *, user_id: budget_mod.ResolvedQuota(
+            25.0, True, ("fit.job", "poll_scoring")
+        ),
     )
     enforce_llm_budget(
         user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0)
     )
     assert captured["monthly_limit_usd"] == 25.0
+    assert captured["monthly_excluded_purposes"] == ("fit.job", "poll_scoring")
 
 
 def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
@@ -488,8 +502,8 @@ def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
 
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id, default_usd: (default_usd, False),
+        "resolve_llm_quota",
+        lambda supabase, *, user_id: budget_mod.ResolvedQuota(5.0, False, None),
     )
     check_spy = MagicMock()
     monkeypatch.setattr(budget_mod, "check_user_budget", check_spy)

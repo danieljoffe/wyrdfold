@@ -447,7 +447,20 @@ class Settings(BaseSettings):
     # bursts, this for the month). Rolling 30 days; counts ALL of a user's
     # llm_costs — interactive and background alike. Per-user override via
     # user_profiles.llm_monthly_budget_usd (the manual "add credits" lever).
+    # In saas mode this is the fallback for users outside a managed tier;
+    # managed tiers use the plan budgets below (interactive-only counting).
     user_llm_monthly_budget_usd: float = Field(default=5.0, ge=0.0)
+    # Phase 3 tiers (saas mode only; app/services/entitlements.py resolves
+    # user_profiles.plan → these). Managed-tier quotas count INTERACTIVE
+    # purposes only — background (triage/fit-grading/polling) is bounded
+    # structurally by the per-tier active-target caps, not by dollars.
+    # Pricing locked 2026-07-03: Starter $7/mo → $2 quota + 2 targets,
+    # Pro $19/mo → $6 quota + 5 targets; free = BYOK + 1 target.
+    starter_monthly_billable_budget_usd: float = Field(default=2.0, ge=0.0)
+    pro_monthly_billable_budget_usd: float = Field(default=6.0, ge=0.0)
+    free_max_active_targets: int = Field(default=1, ge=1)
+    starter_max_active_targets: int = Field(default=2, ge=1)
+    pro_max_active_targets: int = Field(default=5, ge=1)
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)

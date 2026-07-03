@@ -399,16 +399,32 @@ credits" lever).
 
 
 def effective_active_target_cap(supabase: Client, user_id: str) -> int:
-    """The user's active-target cap: per-user override or global default."""
+    """The user's active-target cap.
+
+    Resolution: per-user ``max_active_targets`` override → the plan
+    tier's cap (saas mode, Phase 3 — the structural bound on background
+    grading cost) → the global default (self_host).
+    """
     resp = (
         supabase.table("user_profiles")
-        .select("max_active_targets")
+        .select("max_active_targets,plan")
         .eq("user_id", user_id)
         .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     override = rows[0].get("max_active_targets") if rows else None
-    return int(override) if override is not None else MAX_ACTIVE_TARGETS_PER_USER
+    if override is not None:
+        return int(override)
+
+    from app.config import settings
+
+    if settings.deployment_mode == "saas":
+        from app.services.entitlements import entitlements_for
+
+        plan = cast("str | None", rows[0].get("plan")) if rows else None
+        return entitlements_for(plan).max_active_targets
+
+    return MAX_ACTIVE_TARGETS_PER_USER
 
 
 class ActiveTargetLimitError(Exception):

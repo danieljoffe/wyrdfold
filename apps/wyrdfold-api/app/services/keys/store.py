@@ -107,6 +107,28 @@ def get_key(
     return crypto.decrypt(rows[0]["ciphertext"])
 
 
+def has_usable_key(
+    supabase: Client, *, user_id: str, provider: Provider
+) -> bool:
+    """Whether ``get_client`` would actually route spend to the user's
+    key — the budget resolver's "who pays" check (Phase 3).
+
+    Mirrors ``_user_byok_key``'s fallback semantics exactly: a stored row
+    that can't be decrypted (rotated/wrong master key) or an unconfigured
+    master key means the HOST key would end up paying, so the caller must
+    treat the user as managed and meter — mere row existence would
+    un-meter exactly the broken-key case (Copilot on #205).
+    """
+    if not crypto.is_configured():
+        return False
+    try:
+        return (
+            get_key(supabase, user_id=user_id, provider=provider) is not None
+        )
+    except crypto.BYOKDecryptError:
+        return False
+
+
 def list_key_meta(supabase: Client, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""
