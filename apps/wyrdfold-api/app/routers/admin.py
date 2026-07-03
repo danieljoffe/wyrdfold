@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from supabase import Client
 
@@ -173,3 +173,116 @@ def purge_retention(
         prescan_shadow_days=settings.prescan_shadow_retention_days,
     )
     return RetentionPurgeResult(**report)
+
+
+# ---- Waitlist → invite funnel (Phase 3 slice 4) -----------------------------
+
+
+class WaitlistEntry(BaseModel):
+    email: str
+    created_at: datetime
+    #: NULL = still pending conversion.
+    invited_at: datetime | None = None
+
+
+class WaitlistListResponse(BaseModel):
+    entries: list[WaitlistEntry]
+
+
+class WaitlistInviteRequest(BaseModel):
+    email: str = Field(max_length=254)
+
+
+class WaitlistInviteResult(BaseModel):
+    email: str
+    invited: bool
+    #: Whether the address came from the waitlist (an operator may also
+    #: invite an address directly; the response makes the distinction
+    #: auditable either way).
+    from_waitlist: bool
+
+
+# Sync `def`: blocking supabase read in the threadpool (#107).
+@router.get("/waitlist", response_model=WaitlistListResponse)
+def list_waitlist(
+    pending: bool = False,
+    supabase: Client = Depends(get_supabase),
+) -> WaitlistListResponse:
+    """The operator's funnel view; ``?pending=true`` = not yet invited."""
+    query = (
+        supabase.table("waitlist_signups")
+        .select("email,created_at,invited_at")
+        .order("created_at")
+    )
+    if pending:
+        query = query.is_("invited_at", "null")
+    rows = query.execute().data or []
+    return WaitlistListResponse(
+        entries=[WaitlistEntry.model_validate(r) for r in rows]
+    )
+
+
+# Sync `def`: blocking supabase + auth-admin work in the threadpool (#107).
+@router.post("/waitlist/invite", response_model=WaitlistInviteResult)
+def invite_from_waitlist(
+    body: WaitlistInviteRequest,
+    supabase: Client = Depends(get_supabase),
+) -> WaitlistInviteResult:
+    """Convert a signup into a beta invite (Phase 3 slice 4).
+
+    Three effects, in a deliberately safe order:
+    1. upsert the address into ``wyrdfold_beta_invites`` — the
+       before-user-created hook's allowlist stays the source of truth
+       even though the admin invite below bypasses the hook;
+    2. ``auth.admin.invite_user_by_email`` — creates the user and sends
+       Supabase's invite email (magic link into ``/auth/callback``).
+       Re-inviting a PENDING (unaccepted) address RESENDS the invite
+       (200 — the operator's lost-email remedy); only a CONFIRMED
+       account refuses, surfaced as 409 with the allowlist upsert
+       already durable (harmless / idempotent);
+    3. stamp ``waitlist_signups.invited_at`` when the address came from
+       the waitlist, so the pending view shrinks — only after the
+       invite actually went out.
+    """
+    from app.routers.waitlist import _EMAIL_RE  # same shape rule as signup
+
+    email = body.email.strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail="Not a valid email address.")
+
+    wl_rows = (
+        supabase.table("waitlist_signups")
+        .select("id")
+        .eq("email", email)
+        .execute()
+        .data
+        or []
+    )
+    from_waitlist = bool(wl_rows)
+
+    supabase.table("wyrdfold_beta_invites").upsert(
+        {"email": email}, on_conflict="email", ignore_duplicates=True
+    ).execute()
+
+    options: dict[str, str] = {}
+    if settings.next_app_url:
+        options["redirect_to"] = f"{settings.next_app_url}/auth/callback"
+    try:
+        supabase.auth.admin.invite_user_by_email(email, options or None)  # type: ignore[arg-type]
+    except Exception as exc:
+        message = str(exc).lower()
+        if "already" in message or "exists" in message or "registered" in message:
+            raise HTTPException(
+                status_code=409,
+                detail="A user with that email is already registered.",
+            ) from exc
+        raise
+
+    if from_waitlist:
+        supabase.table("waitlist_signups").update(
+            {"invited_at": datetime.now(UTC).isoformat()}
+        ).eq("email", email).execute()
+
+    return WaitlistInviteResult(
+        email=email, invited=True, from_waitlist=from_waitlist
+    )
