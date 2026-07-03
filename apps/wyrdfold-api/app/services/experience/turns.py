@@ -37,6 +37,27 @@ def list_turns(
     return [ConversationTurn.model_validate(r) for r in rows]
 
 
+def list_recent_turns(
+    supabase: Client,
+    user_id: str | None,
+    conversation_type: ConversationType | None = None,
+    limit: int = 50,
+) -> list[ConversationTurn]:
+    """The most recent ``limit`` turns, returned oldest-first.
+
+    ``list_turns`` orders ascending, so its ``limit`` takes the *first* N
+    turns — useless as an LLM context window. This fetches newest-first,
+    limits, then reverses back to conversation order.
+    """
+    query = supabase.table(TABLE).select("*").order("created_at", desc=True).limit(limit)
+    query = _scope_user(query, user_id)
+    if conversation_type is not None:
+        query = query.eq("conversation_type", conversation_type)
+    resp = query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return [ConversationTurn.model_validate(r) for r in reversed(rows)]
+
+
 def append(
     supabase: Client,
     user_id: str | None,

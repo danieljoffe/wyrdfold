@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -93,6 +94,8 @@ def mock_service_layer(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     }
 
     monkeypatch.setattr(turns_mod, "list_turns", mocks["turns_list"])
+    # handle_turn reads the capped LLM window via list_recent_turns; same mock.
+    monkeypatch.setattr(turns_mod, "list_recent_turns", mocks["turns_list"])
     monkeypatch.setattr(turns_mod, "append", mocks["turns_append"])
     monkeypatch.setattr(prose_mod, "get_latest", mocks["prose_get_latest"])
     monkeypatch.setattr(prose_mod, "create_version", mocks["prose_create_version"])
@@ -390,3 +393,173 @@ def test_llm_turn_response_contract_is_parseable() -> None:
     assert parsed.prose_append == "Worked at Acme."
     assert parsed.done is False
     assert json.loads(raw)["done"] is False
+
+
+# ---- Conversation-history cap (#29: unbounded LLM context) ----------------
+
+
+class _RecordingQuery:
+    """Stub supabase chain that records order/limit args and returns canned
+    rows — enough to pin list_recent_turns' query shape without a live DB."""
+
+    def __init__(self, rows: list[dict[str, Any]], calls: dict[str, Any]) -> None:
+        self._rows = rows
+        self._calls = calls
+
+    def table(self, _name: str) -> _RecordingQuery:
+        return self
+
+    def select(self, *_a: Any, **_kw: Any) -> _RecordingQuery:
+        return self
+
+    def order(self, column: str, desc: bool = False) -> _RecordingQuery:
+        self._calls["order"] = (column, desc)
+        return self
+
+    def limit(self, n: int) -> _RecordingQuery:
+        self._calls["limit"] = n
+        return self
+
+    def eq(self, *_a: Any, **_kw: Any) -> _RecordingQuery:
+        return self
+
+    def execute(self) -> Any:
+        return SimpleNamespace(data=self._rows)
+
+
+def _turn_row(idx: int) -> dict[str, Any]:
+    return {
+        "id": f"00000000-0000-4000-8000-{idx:012d}",
+        "user_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_type": "onboarding",
+        "turn_index": idx,
+        "role": "user" if idx % 2 == 0 else "assistant",
+        "content": f"turn {idx}",
+        "skipped": False,
+        "prose_doc_id": None,
+        "metadata": {},
+        "created_at": f"2026-07-02T10:{idx:02d}:00Z",
+    }
+
+
+def test_list_recent_turns_queries_newest_first_and_returns_ascending() -> None:
+    """The window must be the LAST N turns (query desc + limit), handed back
+    in conversation order (ascending) for the prompt."""
+    calls: dict[str, Any] = {}
+    # DB answers newest-first, as the desc query would.
+    stub = _RecordingQuery([_turn_row(5), _turn_row(4), _turn_row(3)], calls)
+
+    result = turns_mod.list_recent_turns(
+        cast(Any, stub), user_id="u", conversation_type="onboarding", limit=3
+    )
+
+    assert calls["order"] == ("created_at", True), "must fetch newest-first"
+    assert calls["limit"] == 3
+    assert [t.content for t in result] == ["turn 3", "turn 4", "turn 5"], (
+        "window must be re-reversed to conversation order"
+    )
+
+
+async def test_handle_turn_caps_history_to_the_configured_window(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """handle_turn must request exactly settings.conversation_history_max_turns
+    turns — never the old unbounded 1M (#29)."""
+    from app.config import settings
+
+    llm = MockLLMClient(
+        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response()}
+    )
+    await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="hello",
+        skipped=False,
+    )
+    call = mock_service_layer["turns_list"].call_args
+    assert call.kwargs["limit"] == settings.conversation_history_max_turns
+    assert call.kwargs["limit"] <= 1000, "cap must be bounded, not the old 1M"
+
+
+def test_default_history_cap_is_fifty() -> None:
+    from app.config import Settings
+
+    assert Settings(supabase_url="", allowed_hosts="*").conversation_history_max_turns == 50
+
+
+# ---- Unverified-marker net + ask-first prompt (audit C+B decision) ---------
+
+
+async def test_flagged_append_persists_under_unverified_marker(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """A flagged append must persist MARKED, not verbatim: content is kept
+    (may be real) but visibly quarantined, and derive is instructed not to
+    mint outcomes from marked blocks."""
+    from app.constants import UNVERIFIED_MARKER
+    from tests.support.llm_edges import UNSUPPORTED_SPECIFICS_APPEND
+
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append=UNSUPPORTED_SPECIFICS_APPEND
+            )
+        }
+    )
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="I helped grow the business a lot.",
+        skipped=False,
+    )
+    assert result.prose_updated is True
+    assert result.prose_warnings, "the guard must still flag"
+    persisted = mock_service_layer["prose_create_version"].call_args.kwargs["content"]
+    assert persisted.startswith(UNVERIFIED_MARKER), "flagged append must be marked"
+    assert UNSUPPORTED_SPECIFICS_APPEND in persisted, "content kept, not dropped"
+
+
+async def test_faithful_append_persists_verbatim_without_marker(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    from app.constants import UNVERIFIED_MARKER
+
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append="Worked at FightCamp and cut load times to 2s."
+            )
+        }
+    )
+    await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="At FightCamp I cut load times to 2s.",
+        skipped=False,
+    )
+    persisted = mock_service_layer["prose_create_version"].call_args.kwargs["content"]
+    assert UNVERIFIED_MARKER not in persisted, "faithful append must stay verbatim"
+
+
+def test_turn_prompts_carry_the_ask_first_rule() -> None:
+    """C (primary control): both turn systems must instruct asking instead of
+    recording unstated specifics."""
+    from app.services.conversation.prompts import ONBOARDING_SYSTEM, UPDATE_SYSTEM
+
+    for system in (ONBOARDING_SYSTEM, UPDATE_SYSTEM):
+        assert "ask for it in assistant_message instead" in system
+
+
+def test_derive_prompt_pins_the_exact_marker() -> None:
+    """Producer/consumer drift guard: derive's instruction must reference the
+    EXACT marker the orchestrator stamps — if either side changes, this fails."""
+    from app.constants import UNVERIFIED_MARKER
+    from app.services.experience.derive import SYSTEM_PROMPT
+
+    assert UNVERIFIED_MARKER in SYSTEM_PROMPT

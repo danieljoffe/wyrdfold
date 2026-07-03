@@ -13,6 +13,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
 import WaitlistForm from './WaitlistForm';
+import { deploymentMode } from '@/lib/deployment';
 
 const HERO_SUBTITLE =
   'Job hunting has become a second job — endless boards, postings you miss, your resume rewritten for the 40th time. WyrdFold runs the search for you: relevant roles and ready-to-send, tailored applications, delivered while you get on with your life.';
@@ -104,6 +105,10 @@ const STEPS: Step[] = [
 ];
 
 export default function WyrdfoldLandingPage() {
+  // Phase 2 (deployment modes): self_host drops the waitlist funnel for a
+  // direct sign-in CTA — a self-hosted instance has no waitlist. saas keeps
+  // the hosted funnel byte-for-byte.
+  const mode = deploymentMode();
   return (
     <div className='mx-auto w-full max-w-6xl px-4 md:px-6'>
       {/*
@@ -123,7 +128,9 @@ export default function WyrdfoldLandingPage() {
       <section className='py-16 md:py-24'>
         <div className='max-w-3xl'>
           <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-950 dark:text-brand-300'>
-            Now taking waitlist signups
+            {mode === 'saas'
+              ? 'Now taking waitlist signups'
+              : 'Self-hosted instance'}
           </span>
           <Heading
             variant='detail'
@@ -140,23 +147,34 @@ export default function WyrdfoldLandingPage() {
             {HERO_SUBTITLE}
           </Text>
 
-          {/* Primary CTA: join the waitlist. Secondary: sign in (invited users). */}
+          {/* saas: primary CTA = waitlist, secondary = sign in (invited).
+              self_host: sign-in IS the CTA — there is no waitlist. */}
           <div className='mt-8 flex flex-col gap-4'>
-            <WaitlistForm />
-            <Text variant='helper' as='p' className='text-text-tertiary'>
-              Already invited?{' '}
-              <Button
-                name='wyrdfold-hero-sign-in'
-                as='link'
-                href='/login'
-                variant='bare'
-                size='sm'
-                highlighted
-                className='inline px-0 py-0'
-              >
-                Sign in
-              </Button>
-            </Text>
+            {mode === 'saas' ? (
+              <>
+                <WaitlistForm />
+                <Text variant='helper' as='p' className='text-text-tertiary'>
+                  Already invited?{' '}
+                  <Button
+                    name='wyrdfold-hero-sign-in'
+                    as='link'
+                    href='/login'
+                    variant='bare'
+                    size='sm'
+                    highlighted
+                    className='inline px-0 py-0'
+                  >
+                    Sign in
+                  </Button>
+                </Text>
+              </>
+            ) : (
+              <div>
+                <Button name='wyrdfold-hero-sign-in' as='link' href='/login'>
+                  Sign in
+                </Button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -340,26 +358,40 @@ export default function WyrdfoldLandingPage() {
             Stop chasing the search. Let it come to you.
           </Heading>
           <Text variant='body' as='p' className='max-w-xl text-text-secondary'>
-            Join the waitlist and we&apos;ll email you the moment a spot opens
-            up. WyrdFold is in early access while we get it right, so invites go
-            out in small batches.
+            {mode === 'saas' ? (
+              <>
+                Join the waitlist and we&apos;ll email you the moment a spot
+                opens up. WyrdFold is in early access while we get it right, so
+                invites go out in small batches.
+              </>
+            ) : (
+              <>Your instance is ready — sign in to get started.</>
+            )}
           </Text>
           <div className='flex w-full max-w-md flex-col items-center gap-3'>
-            <WaitlistForm />
-            <Text variant='helper' as='p' className='text-text-tertiary'>
-              Already invited?{' '}
-              <Button
-                name='wyrdfold-footer-sign-in'
-                as='link'
-                href='/login'
-                variant='bare'
-                size='sm'
-                highlighted
-                className='inline px-0 py-0'
-              >
+            {mode === 'saas' ? (
+              <>
+                <WaitlistForm />
+                <Text variant='helper' as='p' className='text-text-tertiary'>
+                  Already invited?{' '}
+                  <Button
+                    name='wyrdfold-footer-sign-in'
+                    as='link'
+                    href='/login'
+                    variant='bare'
+                    size='sm'
+                    highlighted
+                    className='inline px-0 py-0'
+                  >
+                    Sign in
+                  </Button>
+                </Text>
+              </>
+            ) : (
+              <Button name='wyrdfold-footer-sign-in' as='link' href='/login'>
                 Sign in
               </Button>
-            </Text>
+            )}
           </div>
         </div>
       </section>

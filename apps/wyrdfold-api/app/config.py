@@ -18,6 +18,20 @@ class Settings(BaseSettings):
         env_file=_TEST_ENV_FILE, env_file_encoding="utf-8", extra="ignore"
     )
 
+    # Deployment-modes epic (docs/plan-wyrdfold-deployment-modes.md, Phase 2).
+    # The mode gates ONLY the perimeter (signup/provisioning/billing) — never
+    # the data model, RLS, or auth mechanics, which are identical in both.
+    #   self_host — closed signup; the owner is provisioned at boot from
+    #               OWNER_EMAIL (see app/services/owner_provisioning.py).
+    #   saas      — open signup + billing perimeter (Phase 3; no behavior yet).
+    # Default self_host: the safe posture for anyone who clones the repo.
+    deployment_mode: Literal["self_host", "saas"] = "self_host"
+    # First-run owner bootstrap (self_host only): when set, boot idempotently
+    # creates this auth user (email-confirmed) so the operator can sign in via
+    # magic link without ever opening the Supabase dashboard. Unset = no-op,
+    # so existing deployments are unaffected.
+    owner_email: str = ""
+
     supabase_url: str = ""
     supabase_service_role_key: str = Field(default="", repr=False)
     # Anon (publishable) key — the base for the per-request, JWT-bound
@@ -128,6 +142,14 @@ class Settings(BaseSettings):
     url_health_batch_size: int = Field(default=50, ge=1, le=500)
     url_health_concurrency: int = Field(default=10, ge=1, le=50)
     url_health_failure_threshold: int = Field(default=3, ge=1, le=10)
+
+    # Conversation-history window sent to the LLM on each orchestrated turn
+    # (#29 audit: handle_turn previously loaded up to 1M turns and re-sent the
+    # whole history every turn — unbounded token growth + eventual context
+    # overflow for long-lived accounts). 50 = ~25 exchanges, comfortably above
+    # any real onboarding conversation today; the full history stays persisted,
+    # only the LLM window is capped.
+    conversation_history_max_turns: int = Field(default=50, ge=1, le=1000)
 
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps

@@ -76,3 +76,10 @@ def inject_into_strings(valid: dict[str, Any], text: str) -> dict[str, Any]:
     payload stays schema-valid; the assertion is that content survives
     verbatim as data (nothing interprets, strips, or acts on it)."""
     return {k: (text if isinstance(v, str) else v) for k, v in valid.items()}
+
+
+# Turn-level behavior: a prose_append carrying specifics (a number and a
+# proper noun) the user never said — the classic Haiku fabrication the
+# faithfulness guard + unverified-marker net exist for. Pair with a
+# user_content that does NOT contain them.
+UNSUPPORTED_SPECIFICS_APPEND = "At Stripe, grew revenue 40% year over year."
