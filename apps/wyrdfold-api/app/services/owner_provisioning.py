@@ -33,7 +33,10 @@ def provision_owner(supabase: Client, s: Settings) -> None:
     """
     if s.deployment_mode != "self_host":
         return
-    if not s.owner_email:
+    # Normalize BEFORE the emptiness check: a whitespace-only env value must
+    # be a no-op, not a create_user("") call (Copilot catch on #196).
+    email = s.owner_email.strip().lower()
+    if not email:
         # Not fatal: pre-Phase-2 deployments (and the current prod) provision
         # accounts via the invite flow instead. Surface the option once.
         logger.info(
@@ -43,7 +46,6 @@ def provision_owner(supabase: Client, s: Settings) -> None:
         )
         return
 
-    email = s.owner_email.strip().lower()
     try:
         supabase.auth.admin.create_user(
             {"email": email, "email_confirm": True}

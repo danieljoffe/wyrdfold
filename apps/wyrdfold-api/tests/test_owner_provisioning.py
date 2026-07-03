@@ -87,3 +87,11 @@ def test_invalid_deployment_mode_is_rejected_at_settings() -> None:
 
     with pytest.raises(pydantic.ValidationError):
         _settings(deployment_mode="banana")
+
+
+def test_whitespace_only_owner_email_is_a_noop() -> None:
+    """Regression (Copilot on #196): '   ' passed the old truthiness check,
+    normalized to '', and would have called create_user with an empty email."""
+    sb = MagicMock()
+    provision_owner(sb, _settings(owner_email="   "))
+    sb.auth.admin.create_user.assert_not_called()

@@ -189,8 +189,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
     # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
     # saas mode, when OWNER_EMAIL is unset, or when the owner already exists).
+    # Same test-flag guard as the key probe above: provisioning hits the
+    # auth admin API — a future `with TestClient(app)` test must not create
+    # real users or need a live stack.
     supabase_for_owner = get_supabase_pool()
-    if supabase_for_owner is not None:
+    if (
+        supabase_for_owner is not None
+        and os.environ.get("WYRDFOLD_API_TESTING") != "1"
+    ):
         provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
     # Background cost-log flush task. Cron paths enqueue rows and the
