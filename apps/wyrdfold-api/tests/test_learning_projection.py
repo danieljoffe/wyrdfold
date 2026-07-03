@@ -78,3 +78,37 @@ def test_empty_job_list_is_not_capped() -> None:
     assert proj.jobs_considered == 0
     assert proj.moved_fraction == 0.0
     assert proj.capped is False
+
+
+def test_after_side_scores_with_next_search_keywords() -> None:
+    """Copilot on #204: a reference-JD merge replaces search_keywords along
+    with the profile, and keywords gate the role-title intent (a mismatching
+    title is slashed). The projection must score the "after" side with the
+    keywords that would actually be installed — an identical profile whose
+    NEW keywords disown the target's whole job list is a massive movement,
+    invisible if both sides were scored under the old keywords."""
+    profile = _profile({"python": 3})
+
+    # Control: keywords unchanged -> no movement at all.
+    same = project_rescore(
+        profile,
+        profile,
+        [_PY_JOB] * 12,
+        **_kwargs(search_keywords=["python engineer"]),
+    )
+    assert same.jobs_moved == 0
+    assert same.capped is False
+
+    # The merge would install keywords that mismatch every job title ->
+    # every job's title-intent gate flips, the whole list moves, capped.
+    swapped = project_rescore(
+        profile,
+        profile,
+        [_PY_JOB] * 12,
+        **_kwargs(
+            search_keywords=["python engineer"],
+            next_search_keywords=["sales manager"],
+        ),
+    )
+    assert swapped.jobs_moved == 12
+    assert swapped.capped is True

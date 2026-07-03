@@ -146,14 +146,19 @@ def _post(client_body: dict[str, Any] | None = None) -> Any:
 def test_capped_contribution_is_quarantined_not_applied(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    project = MagicMock(name="project", return_value=_capped_projection())
     monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact",
-        lambda *a, **k: _capped_projection(),
+        "app.routers.targets.project_profile_impact", project
     )
     rpc = MagicMock(name="merge_rpc")
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
 
     r = _post()
+
+    # The projection evaluates the full "after" state: old keywords on the
+    # before side, the new JD's derived keywords on the after side.
+    assert project.call_args.args[4] == []  # current target keywords
+    assert project.call_args.args[5] == ["golang engineer"]  # derived
 
     assert r.status_code == 201
     # Profile untouched — the response is the target as it stood.

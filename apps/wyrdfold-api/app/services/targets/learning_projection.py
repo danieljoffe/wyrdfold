@@ -66,6 +66,7 @@ def project_profile_impact(
     prev_profile: dict[str, Any],
     next_profile: dict[str, Any],
     search_keywords: list[str] | None,
+    next_search_keywords: list[str] | None = None,
 ) -> RescoreProjection | None:
     """Project how much a profile change would move the target's scores.
 
@@ -85,6 +86,7 @@ def project_profile_impact(
         ScoringProfile.model_validate(next_profile or {}),
         jobs,
         search_keywords=search_keywords,
+        next_search_keywords=next_search_keywords,
         move_threshold=settings.learning_rescore_move_threshold,
         max_moved_fraction=settings.learning_rescore_max_moved_fraction,
         min_jobs=settings.learning_rescore_min_jobs,
@@ -97,6 +99,7 @@ def project_rescore(
     jobs: list[ScoredJobText],
     *,
     search_keywords: list[str] | None,
+    next_search_keywords: list[str] | None = None,
     move_threshold: int,
     max_moved_fraction: float,
     min_jobs: int,
@@ -110,6 +113,14 @@ def project_rescore(
     ``min_jobs`` floor stops a brand-new target with little history from
     having its first patches blocked on noise.
     """
+    # A profile change can travel with a keyword change (a reference-JD
+    # merge replaces search_keywords too, #191 slice 1b) — score the
+    # "after" side with the keywords that would actually be installed, or
+    # the projection under/over-estimates movement (Copilot on #204). The
+    # learner never changes keywords, so the default keeps both sides equal.
+    after_keywords = (
+        next_search_keywords if next_search_keywords is not None else search_keywords
+    )
     moved = 0
     max_abs_delta = 0
     for title, description_html in jobs:
@@ -127,7 +138,7 @@ def project_rescore(
             description_html,
             next_profile,
             parsed_jd=parsed,
-            search_keywords=search_keywords,
+            search_keywords=after_keywords,
         ).score
         delta = abs(round(_KEYWORD_WEIGHT * (after - before)))
         max_abs_delta = max(max_abs_delta, delta)

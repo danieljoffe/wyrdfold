@@ -1466,6 +1466,10 @@ async def add_reference_jd(
         )
         composite = merge_reference_jds(all_ref_jds)
         prev_profile = current.scoring_profile.model_dump()
+        # Project the full "after" state: the merge installs the new JD's
+        # derived search_keywords alongside the profile, and keywords feed
+        # scoring — evaluating the new profile under the OLD keywords would
+        # misjudge outliers (Copilot on #204).
         projection = await asyncio.to_thread(
             project_profile_impact,
             supabase,
@@ -1473,6 +1477,7 @@ async def add_reference_jd(
             prev_profile,
             composite.model_dump(),
             current.search_keywords,
+            derived.search_keywords,
         )
 
         if projection is not None and projection.capped:

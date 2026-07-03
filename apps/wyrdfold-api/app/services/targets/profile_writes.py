@@ -40,7 +40,7 @@ def _call(
         )
     return (
         cast(str, rows[0]["outcome"]),
-        cast("int | None", rows[0]["new_version"]),
+        cast(int | None, rows[0]["new_version"]),
     )
 
 
