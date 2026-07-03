@@ -5,13 +5,20 @@
 --    pays inference) | 'starter' | 'pro' (managed: host keys + a per-tier
 --    interactive-dollar quota). The plan binds ONLY in saas deployment
 --    mode; self-host ignores it (instance env key = the owner's BYOK).
---    Existing rows are comped to 'pro' — current users are the invited
---    beta cohort, grandfathered until open signup. New rows default 'free'.
+--
+--    Backfill order matters (Copilot on #205): the column is added
+--    WITHOUT a default, so at backfill time `plan IS NULL` identifies
+--    exactly the rows that pre-date the tier model — the invited beta
+--    cohort, comped to 'pro' until open signup. Only then does the
+--    'free' default (for future signups) + NOT NULL + CHECK land. This
+--    can never comp a legitimately-'free' account, even if the
+--    statements are replayed against a DB where free users already
+--    exist.
 --
 -- 2. `total_billable_spend_since` — the managed-tier quota counts
 --    INTERACTIVE spend only (analysis, tailor, derive, …): the ledger
---    attributes catalog/background work (triage, fit-grading, polling) to
---    the triggering user, and counting it would drain a user's quota
+--    attributes catalog/background work (triage, fit-grading, polling)
+--    to the triggering user, and counting it would drain a user's quota
 --    while they sleep. Background cost is bounded structurally by the
 --    per-tier active-target cap instead. Same shape/guard/grants as
 --    total_spend_since (20260620130000): SQL STABLE, pinned search_path,
@@ -20,13 +27,20 @@
 --    the #16 lesson).
 
 ALTER TABLE public.user_profiles
-    ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'free'
-        CONSTRAINT user_profiles_plan_check
-        CHECK (plan IN ('free', 'starter', 'pro'));
+    ADD COLUMN IF NOT EXISTS plan text;
 
--- Beta-cohort comp (see header). Idempotent: only rows still on the
--- fresh-column default are lifted, so a re-run can't downgrade anyone.
-UPDATE public.user_profiles SET plan = 'pro' WHERE plan = 'free';
+-- Beta-cohort comp (see header): rows from before the tier model.
+UPDATE public.user_profiles SET plan = 'pro' WHERE plan IS NULL;
+
+ALTER TABLE public.user_profiles
+    ALTER COLUMN plan SET DEFAULT 'free';
+ALTER TABLE public.user_profiles
+    ALTER COLUMN plan SET NOT NULL;
+ALTER TABLE public.user_profiles
+    DROP CONSTRAINT IF EXISTS user_profiles_plan_check;
+ALTER TABLE public.user_profiles
+    ADD CONSTRAINT user_profiles_plan_check
+    CHECK (plan IN ('free', 'starter', 'pro'));
 
 CREATE OR REPLACE FUNCTION public.total_billable_spend_since(
     p_user_id uuid,

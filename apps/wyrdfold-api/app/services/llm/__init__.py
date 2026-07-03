@@ -144,6 +144,7 @@ def _plan_requires_byok(supabase: "Client", user_id: str) -> bool:
         logger.warning(
             "plan lookup failed for user=%s — treating as free (BYOK required)",
             user_id,
+            exc_info=True,
         )
     return entitlements_for(plan).llm_key_source == "byok"
 

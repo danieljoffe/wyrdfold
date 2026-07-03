@@ -74,7 +74,7 @@ def _quota(
 
     monkeypatch.setattr(settings, "deployment_mode", mode)
     monkeypatch.setattr(
-        keys_store, "has_key", lambda sb, *, user_id, provider: has_key
+        keys_store, "has_usable_key", lambda sb, *, user_id, provider: has_key
     )
     return budget.resolve_llm_quota(_profile_supabase(rows), user_id=_UID)
 
@@ -146,6 +146,74 @@ def test_quota_saas_override_beats_tier_budget(
     )
     assert q.monthly_cap_usd == 50.0
     assert q.monthly_excluded_purposes == ent.NON_BILLABLE_PURPOSES
+
+
+def test_quota_saas_broken_key_row_stays_metered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot on #205: a user_api_keys row that exists but can't be
+    decrypted (rotated master key) makes get_client fall back to the
+    HOST key — so the quota resolver must treat the user as managed,
+    not as a BYOK payer. "Who pays" = key usability, not row existence."""
+    from app.services.keys import BYOKDecryptError
+    from app.services.keys import store as keys_store
+
+    monkeypatch.setattr(settings, "deployment_mode", "saas")
+    monkeypatch.setattr(keys_store.crypto, "is_configured", lambda: True)
+
+    def _broken_get_key(sb: Any, *, user_id: str, provider: str) -> str:
+        raise BYOKDecryptError("wrong master key")
+
+    monkeypatch.setattr(keys_store, "get_key", _broken_get_key)
+    q = budget.resolve_llm_quota(
+        _profile_supabase(
+            [{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}]
+        ),
+        user_id=_UID,
+    )
+    # Managed accounting applies — NOT the unmetered BYOK-payer path.
+    assert q.monthly_cap_usd == settings.pro_monthly_billable_budget_usd
+    assert q.monthly_excluded_purposes == ent.NON_BILLABLE_PURPOSES
+
+
+def test_has_usable_key_mirrors_get_client_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.keys import BYOKDecryptError
+    from app.services.keys import store as keys_store
+
+    # Master key not configured → host pays regardless of rows.
+    monkeypatch.setattr(keys_store.crypto, "is_configured", lambda: False)
+    assert (
+        keys_store.has_usable_key(
+            MagicMock(), user_id=_UID, provider="openrouter"
+        )
+        is False
+    )
+
+    # Configured + decryptable → the user's key pays.
+    monkeypatch.setattr(keys_store.crypto, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        keys_store, "get_key", lambda sb, *, user_id, provider: "sk-x"
+    )
+    assert (
+        keys_store.has_usable_key(
+            MagicMock(), user_id=_UID, provider="openrouter"
+        )
+        is True
+    )
+
+    # Row present but undecryptable → host pays → NOT usable.
+    def _broken(sb: Any, *, user_id: str, provider: str) -> str:
+        raise BYOKDecryptError("rotated")
+
+    monkeypatch.setattr(keys_store, "get_key", _broken)
+    assert (
+        keys_store.has_usable_key(
+            MagicMock(), user_id=_UID, provider="openrouter"
+        )
+        is False
+    )
 
 
 def test_quota_saas_free_without_key_keeps_default_cap(

@@ -112,7 +112,12 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
         )
         return ResolvedQuota(cap, account.llm_enabled, None)
 
-    if keys_store.has_key(supabase, user_id=user_id, provider="openrouter"):
+    # "Who pays" must match what get_client will actually do: only a key
+    # that exists AND decrypts routes spend to the user; a broken row
+    # falls back to the host key and must stay metered.
+    if keys_store.has_usable_key(
+        supabase, user_id=user_id, provider="openrouter"
+    ):
         return ResolvedQuota(0.0, account.llm_enabled, None)
 
     entitlement = ent.entitlements_for(account.plan)
