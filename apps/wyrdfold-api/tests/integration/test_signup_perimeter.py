@@ -52,8 +52,10 @@ def test_invited_otp_signup_is_admitted(
         )
         assert row, "sanity: invite row present"
     finally:
-        users = service_client.auth.admin.list_users()
-        for u in users:
+        listed = service_client.auth.admin.list_users()
+        # supabase-py has returned both a bare list and a paginated object
+        # with .users across versions — accept either.
+        for u in getattr(listed, "users", listed):
             if u.email == email:
                 delete_auth_user(service_client, u.id)
         service_client.table("wyrdfold_beta_invites").delete().eq(
@@ -71,4 +73,6 @@ def test_admin_create_bypasses_the_hook(service_client: Client) -> None:
     try:
         assert resp.user is not None and resp.user.email == email
     finally:
-        delete_auth_user(service_client, resp.user.id)
+        # Guarded so an assertion failure isn't masked by AttributeError here.
+        if resp.user is not None:
+            delete_auth_user(service_client, resp.user.id)

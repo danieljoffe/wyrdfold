@@ -38,10 +38,14 @@ identical in both.
    `owner_provisioning: created owner ...` in the deploy log. Idempotent; reboots
    are no-ops.
 
-3. **Configure the frontend** (`apps/wyrdfold/.env.example`): the same Supabase URL
-   - publishable key, `WYRDFOLD_API_URL` pointing at the API, and
-     `NEXT_PUBLIC_DEPLOYMENT_MODE=self_host` so the public homepage shows a sign-in
-     CTA instead of the hosted waitlist funnel.
+3. **Configure the frontend** (see `apps/wyrdfold/.env.example`):
+
+   ```bash
+   NEXT_PUBLIC_SUPABASE_URL=...       # same project URL as the API
+   NEXT_PUBLIC_SUPABASE_ANON_ID=...   # same publishable key
+   WYRDFOLD_API_URL=https://your.api.host
+   NEXT_PUBLIC_DEPLOYMENT_MODE=self_host   # homepage shows sign-in, not the waitlist
+   ```
 
 4. **Sign in:** open the app, enter `OWNER_EMAIL` in the magic-link form, click the
    link in your inbox. There are no passwords anywhere — auth is magic-link only.
