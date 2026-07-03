@@ -17,6 +17,7 @@ import pytest
 from app.models.learning import ProfilePatch, RescoreProjection
 from app.models.llm import LLMResult, LLMUsage
 from app.services.llm_learner import (
+    StagedPatchConflictError,
     _apply_patch_to_profile,
     _core_skill_keywords,
     _strip_self_colliding_negatives,
@@ -247,6 +248,12 @@ class _FakeSupabase:
     def table(self, name: str) -> _FakeQuery:
         return _FakeQuery(self, name)
 
+    def rpc(self, fn: str, params: dict[str, Any]) -> _FakeQuery:
+        q = _FakeQuery(self, fn)
+        q._op = "rpc"
+        q._payload = params
+        return q
+
 
 def _fb_row(reason: str = "sales role") -> dict[str, Any]:
     now = datetime.now(UTC).isoformat()
@@ -309,8 +316,12 @@ async def test_high_confidence_patch_auto_applies(
     fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
     fake.push("targets", "select", [_target_row(profile_version=1)])
     fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
-    # The mutate path will issue these writes:
-    fake.push("targets", "update", [{"id": "t"}])
+    # The mutate path goes through the #191 RPC, then logs + stamps:
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "applied", "new_version": 2}],
+    )
     fake.push("target_learning_log", "insert", [
         {
             "id": "run-1", "user_id": "u", "target_id": "t",
@@ -340,11 +351,103 @@ async def test_high_confidence_patch_auto_applies(
     assert result.applied is True
     assert result.profile_version_after == 2
 
-    # The target update wrote profile_version=2.
-    target_updates = [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
-    assert target_updates, "expected a targets update"
-    payload = target_updates[0]["payload"]
-    assert payload["profile_version"] == 2
+    # The write went through the RPC — never a raw targets update — carrying
+    # the acting user and the version the patch was computed against.
+    assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
+    rpc_calls = [
+        r for r in fake.log
+        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+    ]
+    assert len(rpc_calls) == 1
+    params = rpc_calls[0]["payload"]
+    assert params["p_user_id"] == "u"
+    assert params["p_target_id"] == "t"
+    assert params["p_expected_version"] == 1
+    assert "sales" in params["p_next_profile"]["negative"]["keywords"]
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_version_conflict_stages_instead(
+    fake: _FakeSupabase,
+) -> None:
+    """#191: if the shared profile moved while the learn ran (concurrent
+    merge / learn), the RPC refuses the stale patch — it must be STAGED for
+    review, never clobber the newer profile, and feedback stays unstamped."""
+    fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
+    fake.push("targets", "select", [_target_row(profile_version=1)])
+    fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "version_conflict", "new_version": 2}],
+    )
+    fake.push("target_learning_log", "insert", [
+        {
+            "id": "race-1", "user_id": "u", "target_id": "t",
+            "status": "staged",
+            "prev_profile": {}, "next_profile": {}, "diff": {},
+            "confidence": 0.9, "rationale": "r", "signals_consumed": 3,
+            "applied_run_id": None,
+            "created_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    ])
+
+    patch_obj = ProfilePatch(
+        add_negative=["sales"], confidence=0.9, rationale="confident"
+    )
+    with patch(
+        "app.services.llm_learner.complete_json",
+        return_value=(patch_obj, _llm_result()),
+    ):
+        result = await run_llm_learner(
+            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+        )
+
+    assert result is not None
+    assert result.applied is False
+    # Staged with the race note; no raw target write, no feedback stamp.
+    log_insert = next(
+        r for r in fake.log
+        if r["table"] == "target_learning_log" and r["op"] == "insert"
+    )
+    assert log_insert["payload"]["status"] == "staged"
+    assert "changed during the learn run" in log_insert["payload"]["rationale"]
+    assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
+    assert [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"] == []
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_refused_for_non_follower_writes_nothing(
+    fake: _FakeSupabase,
+) -> None:
+    """#191: the in-DB follower re-check refusing the write (link severed
+    mid-run, or a caller that skipped the router's ownership check) must
+    leave no trace — no log row, no feedback stamp."""
+    fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
+    fake.push("targets", "select", [_target_row(profile_version=1)])
+    fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "not_a_follower", "new_version": 1}],
+    )
+
+    patch_obj = ProfilePatch(
+        add_negative=["sales"], confidence=0.9, rationale="confident"
+    )
+    with patch(
+        "app.services.llm_learner.complete_json",
+        return_value=(patch_obj, _llm_result()),
+    ):
+        result = await run_llm_learner(
+            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+        )
+
+    assert result is None
+    assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
+    assert [r for r in fake.log if r["table"] == "target_learning_log"] == []
+    assert [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"] == []
 
 
 @pytest.mark.asyncio
@@ -520,3 +623,74 @@ def test_apply_staged_patch_returns_none_when_no_match(
     fake.push("target_learning_log", "select", [])  # single() → None
     result = apply_staged_patch(fake, user_id="u", run_id="missing")  # type: ignore[arg-type]
     assert result is None
+
+
+def _staged_log_row(status: str = "staged") -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": "stage-1", "user_id": "u", "target_id": "t",
+        "status": status,
+        "prev_profile": {}, "next_profile": {"negative": {"keywords": ["sales"]}},
+        "diff": {},
+        "confidence": 0.4, "rationale": "r",
+        "signals_consumed": 3, "applied_run_id": None,
+        "created_at": now, "updated_at": now,
+    }
+
+
+def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
+    """#191: the human-approved apply also writes via the RPC (in-DB
+    follower re-check + version guard), never a raw targets update."""
+    fake.push("target_learning_log", "select", [_staged_log_row()])
+    fake.push("targets", "select", [_target_row(profile_version=3)])
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "applied", "new_version": 4}],
+    )
+    applied_row = _staged_log_row(status="applied")
+    applied_row["applied_run_id"] = "rid-2"
+    fake.push("target_learning_log", "update", [applied_row])
+    fake.push("job_feedback", "select", [{"id": "fb-1"}])
+    fake.push("job_feedback", "update", [{"id": "fb-1"}])
+
+    result = apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+
+    assert result is not None
+    assert result.applied is True
+    assert result.profile_version_after == 4
+    assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
+    rpc_calls = [
+        r for r in fake.log
+        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+    ]
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0]["payload"]["p_expected_version"] == 3
+    assert rpc_calls[0]["payload"]["p_next_profile"] == {
+        "negative": {"keywords": ["sales"]}
+    }
+
+
+def test_apply_staged_patch_conflict_raises_and_stays_staged(
+    fake: _FakeSupabase,
+) -> None:
+    """#191: a concurrent write between the version read and the RPC apply
+    surfaces as StagedPatchConflictError (the router's 409) — and the log
+    row must NOT be flipped to applied."""
+    fake.push("target_learning_log", "select", [_staged_log_row()])
+    fake.push("targets", "select", [_target_row(profile_version=3)])
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "version_conflict", "new_version": 4}],
+    )
+
+    with pytest.raises(StagedPatchConflictError):
+        apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+
+    # No status flip, no feedback stamp — the stage is still reviewable.
+    assert [
+        r for r in fake.log
+        if r["table"] == "target_learning_log" and r["op"] == "update"
+    ] == []
+    assert [r for r in fake.log if r["table"] == "job_feedback"] == []

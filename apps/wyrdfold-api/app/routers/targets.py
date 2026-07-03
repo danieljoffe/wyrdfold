@@ -887,7 +887,12 @@ def set_target_preferences(
     status_code=201,
     dependencies=[Depends(enforce_llm_budget)],
 )
+# #191: linking is the gateway to the shared-target contribution surface
+# (a link is what authorizes reference-JD adds, votes, and learner writes
+# on that target) — throttle it like add_reference_jd.
+@limiter.limit("10/minute")
 async def link_target(
+    request: Request,
     target_id: str,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),

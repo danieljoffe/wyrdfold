@@ -50,6 +50,52 @@ DEFAULT_PURPOSE = "target.learn_from_feedback"
 
 LEARNING_LOG_TABLE = "target_learning_log"
 
+
+class StagedPatchConflictError(Exception):
+    """Applying a staged patch lost a concurrent-write race on the shared
+    target profile (`version_conflict` from the RPC). The caller should
+    re-review the staged patch against the now-current profile."""
+
+
+def _apply_profile_patch_rpc(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    next_profile: dict[str, Any],
+    expected_version: int,
+) -> tuple[str, int | None]:
+    """Write the shared ``targets.scoring_profile`` through the
+    ``apply_target_profile_patch`` SECURITY DEFINER RPC (#191).
+
+    The DB re-checks that ``user_id`` actually follows the target and that
+    ``profile_version`` still equals ``expected_version`` under a row lock —
+    so a Python authz bug can't silently mutate a profile every follower
+    shares, and two concurrent applies can't lose an update.
+
+    Returns ``(outcome, new_version)`` where outcome is one of
+    ``applied | version_conflict | not_a_follower | target_not_found``.
+    """
+    resp = supabase.rpc(
+        "apply_target_profile_patch",
+        {
+            "p_user_id": user_id,
+            "p_target_id": target_id,
+            "p_next_profile": next_profile,
+            "p_expected_version": expected_version,
+        },
+    ).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError(
+            "apply_target_profile_patch returned no row — RPC missing or "
+            "grants misconfigured"
+        )
+    return (
+        cast(str, rows[0]["outcome"]),
+        cast("int | None", rows[0]["new_version"]),
+    )
+
 SYSTEM_PROMPT = (
     UNTRUSTED_CONTENT_DIRECTIVE
     + "\n\n"
@@ -536,20 +582,64 @@ async def run_llm_learner(
         )
         return LearningRunResult(log=log, applied=False)
 
-    # Apply
-    new_version = cast(int, target_row.get("profile_version") or 1) + 1
-    await asyncio.to_thread(
-        lambda: supabase.table("targets")
-        .update(
-            {
-                "scoring_profile": next_profile,
-                "profile_version": new_version,
-                "updated_at": datetime.now(UTC).isoformat(),
-            }
+    # Apply — through the SECURITY DEFINER RPC (#191): the DB re-checks the
+    # follower link and that the profile hasn't moved since we computed the
+    # patch, under a row lock.
+    expected_version = cast(int, target_row.get("profile_version") or 1)
+    outcome, rpc_version = await asyncio.to_thread(
+        lambda: _apply_profile_patch_rpc(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=next_profile,
+            expected_version=expected_version,
         )
-        .eq("id", target_id)
-        .execute()
     )
+    if outcome == "version_conflict":
+        # Another write (reference-JD merge, concurrent learn) landed after
+        # we read the profile — next_profile and the projection are stale.
+        # Stage for review instead of clobbering the newer profile; feedback
+        # stays unstamped so a re-run can revisit it.
+        note = (
+            "[auto-staged: the shared profile changed during the learn run "
+            f"(expected v{expected_version}, found v{rpc_version})] "
+        )
+        staged_patch = patch.model_copy(
+            update={"rationale": note + patch.rationale}
+        )
+        log = _insert_log(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            status="staged",
+            prev_profile=prev_profile,
+            next_profile=next_profile,
+            patch=staged_patch,
+            signals_consumed=len(feedback_ids),
+            applied_run_id=None,
+            projection=projection_json,
+        )
+        logger.warning(
+            "LLM learner apply lost the version race for (user=%s, "
+            "target=%s): expected v%d, found v%s — staged for review",
+            user_id,
+            target_id,
+            expected_version,
+            rpc_version,
+        )
+        return LearningRunResult(log=log, applied=False)
+    if outcome != "applied":
+        # not_a_follower / target_not_found — the router pre-checks both, so
+        # reaching here means the link or target was severed mid-run (or a
+        # future caller skipped the check). Nothing safe to write.
+        logger.warning(
+            "LLM learner apply refused by RPC (%s) for (user=%s, target=%s)",
+            outcome,
+            user_id,
+            target_id,
+        )
+        return None
+    new_version = cast(int, rpc_version)
 
     log = _insert_log(
         supabase,
@@ -610,14 +700,33 @@ def apply_staged_patch(
     if target_row is None:
         return None
 
-    new_version = cast(int, target_row.get("profile_version") or 1) + 1
-    supabase.table("targets").update(
-        {
-            "scoring_profile": log_row["next_profile"],
-            "profile_version": new_version,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", target_id).execute()
+    # Same RPC gate as the auto-apply path (#191). expected_version is read
+    # just above, so a conflict here means a genuinely concurrent write —
+    # not the routine "profile moved since staging" case (the human reviewed
+    # the patch; applying over a legitimately newer profile is their call).
+    expected_version = cast(int, target_row.get("profile_version") or 1)
+    outcome, rpc_version = _apply_profile_patch_rpc(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        next_profile=cast(dict[str, Any], log_row["next_profile"]),
+        expected_version=expected_version,
+    )
+    if outcome == "version_conflict":
+        raise StagedPatchConflictError(
+            f"target {target_id}: profile moved to v{rpc_version} while "
+            f"applying staged run {run_id} (read v{expected_version})"
+        )
+    if outcome != "applied":
+        # not_a_follower / target_not_found — surfaced as the router's 404.
+        logger.warning(
+            "Staged-patch apply refused by RPC (%s) for (user=%s, target=%s)",
+            outcome,
+            user_id,
+            target_id,
+        )
+        return None
+    new_version = cast(int, rpc_version)
 
     # Mark this run as applied + stamp the consumed feedback rows. The run
     # id we generate here is what gets attached to the feedback so the
