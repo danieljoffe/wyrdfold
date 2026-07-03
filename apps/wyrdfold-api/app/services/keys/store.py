@@ -107,6 +107,23 @@ def get_key(
     return crypto.decrypt(rows[0]["ciphertext"])
 
 
+def has_key(supabase: Client, *, user_id: str, provider: Provider) -> bool:
+    """Whether the user has a stored key for ``provider`` — existence
+    only, never touches ciphertext (the budget resolver's "who pays"
+    check, Phase 3). A row that later fails to decrypt still counts as
+    present here; the decrypt failure surfaces loudly at call time."""
+    _validate_provider(provider)
+    resp = (
+        supabase.table(TABLE)
+        .select("provider")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    return bool(resp.data)
+
+
 def list_key_meta(supabase: Client, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""

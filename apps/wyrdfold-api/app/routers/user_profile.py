@@ -467,11 +467,17 @@ async def reset_onboarding(
 async def get_llm_usage(
     supabase: Client = Depends(get_user_supabase),
     user_id: str = Depends(get_current_user_id),
+    # Dual-client (the analysis.py pattern): the quota RESOLUTION needs
+    # the service client — it reads user_api_keys ("who pays"), which has
+    # no authenticated grant by design. The user-visible spend queries
+    # stay on the caller's RLS client.
+    service_supabase: Client = Depends(get_supabase),
 ) -> LlmUsageResponse:
     """The user's allowance state across all budget windows.
 
-    Mirrors exactly what the budget gates enforce (same spend queries),
-    so the FE can render "X of Y used" without guessing.
+    Mirrors exactly what the budget gates enforce (same resolution + same
+    spend queries, incl. the managed tiers' interactive-only monthly
+    accounting), so the FE can render "X of Y used" without guessing.
     """
     from datetime import timedelta
 
@@ -481,11 +487,20 @@ async def get_llm_usage(
     now = datetime.now(UTC)
 
     def _snapshot() -> LlmUsageResponse:
-        monthly_cap = budget.effective_monthly_cap(
-            supabase, user_id=user_id, default_usd=settings.user_llm_monthly_budget_usd
-        )
+        quota = budget.resolve_llm_quota(service_supabase, user_id=user_id)
+        monthly_cap = quota.monthly_cap_usd
         month_since = now - timedelta(days=budget.MONTHLY_WINDOW_DAYS)
-        spent_month = cost_log.total_spend(supabase, user_id=user_id, since=month_since)
+        if quota.monthly_excluded_purposes:
+            spent_month = cost_log.total_billable_spend(
+                supabase,
+                user_id=user_id,
+                since=month_since,
+                excluded_purposes=quota.monthly_excluded_purposes,
+            )
+        else:
+            spent_month = cost_log.total_spend(
+                supabase, user_id=user_id, since=month_since
+            )
 
         # Approximate refill point: oldest cost row in the window + 30d.
         resets_at = None

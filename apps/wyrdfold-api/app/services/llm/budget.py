@@ -13,7 +13,7 @@ hourly window bounds the worst-case overshoot.
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from fastapi import HTTPException
 from supabase import Client
@@ -33,19 +33,26 @@ no first-of-month reset stampede, and it matches how Claude's own usage
 limits behave."""
 
 
-def get_llm_account(
-    supabase: Client, *, user_id: str, default_usd: float
-) -> tuple[float, bool]:
-    """One profile read → (effective monthly cap, llm_enabled).
+class LlmAccount(NamedTuple):
+    """One `user_profiles` read's worth of budget-relevant account state."""
+
+    monthly_override_usd: float | None
+    llm_enabled: bool
+    plan: str | None
+
+
+def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
+    """One profile read → (monthly override, llm_enabled, plan).
 
     ``llm_monthly_budget_usd`` is the manual "add credits" lever — NULL
-    (or no profile row) means the global default. ``llm_enabled`` is the
-    operator kill-switch; missing rows default to enabled.
+    (or no profile row) means "no override". ``llm_enabled`` is the
+    operator kill-switch; missing rows default to enabled. ``plan`` feeds
+    the tier resolution in :func:`resolve_llm_quota` (saas mode only).
     """
     rows = cast(
         list[dict[str, Any]],
         supabase.table("user_profiles")
-        .select("llm_monthly_budget_usd,llm_enabled")
+        .select("llm_monthly_budget_usd,llm_enabled,plan")
         .eq("user_id", user_id)
         .execute()
         .data
@@ -53,16 +60,76 @@ def get_llm_account(
     )
     override = rows[0].get("llm_monthly_budget_usd") if rows else None
     enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
-    cap = float(cast(float, override)) if override is not None else default_usd
-    return cap, enabled
+    plan = cast("str | None", rows[0].get("plan")) if rows else None
+    return LlmAccount(
+        monthly_override_usd=(
+            float(cast(float, override)) if override is not None else None
+        ),
+        llm_enabled=enabled,
+        plan=plan,
+    )
 
 
-def effective_monthly_cap(
-    supabase: Client, *, user_id: str, default_usd: float
-) -> float:
-    """Back-compat wrapper around :func:`get_llm_account` (cap only)."""
-    cap, _ = get_llm_account(supabase, user_id=user_id, default_usd=default_usd)
-    return cap
+class ResolvedQuota(NamedTuple):
+    """The effective monthly quota for one user (see resolve_llm_quota)."""
+
+    monthly_cap_usd: float
+    llm_enabled: bool
+    #: Purposes EXCLUDED from the monthly sum (managed tiers count
+    #: interactive spend only); None = count everything (legacy behavior).
+    monthly_excluded_purposes: tuple[str, ...] | None
+
+
+def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
+    """Resolve the user's effective monthly quota (Phase 3 tiers).
+
+    self_host: exactly the pre-tier behavior — the per-user override or
+    the `user_llm_monthly_budget_usd` default, counting ALL purposes.
+
+    saas:
+    - a user with a stored OpenRouter key pays their own interactive
+      inference (BYOK always wins in ``get_client``) → NO managed monthly
+      quota (0 disables that window); the hourly/daily runaway rails and
+      the operator kill-switch still apply.
+    - managed tiers (starter/pro) → the per-user override if set, else
+      the plan's interactive budget; the monthly sum EXCLUDES background
+      purposes (the ledger attributes catalog work to the triggering
+      user — counting it would drain the quota while they sleep).
+    - free/unknown plan without a key → the legacy default cap; moot in
+      practice because ``get_client`` refuses (402) before any spend.
+    """
+    from app.config import settings as s
+    from app.services import entitlements as ent
+    from app.services.keys import store as keys_store
+
+    account = get_llm_account(supabase, user_id=user_id)
+
+    if s.deployment_mode != "saas":
+        cap = (
+            account.monthly_override_usd
+            if account.monthly_override_usd is not None
+            else s.user_llm_monthly_budget_usd
+        )
+        return ResolvedQuota(cap, account.llm_enabled, None)
+
+    if keys_store.has_key(supabase, user_id=user_id, provider="openrouter"):
+        return ResolvedQuota(0.0, account.llm_enabled, None)
+
+    entitlement = ent.entitlements_for(account.plan)
+    if entitlement.llm_key_source == "host":
+        cap = (
+            account.monthly_override_usd
+            if account.monthly_override_usd is not None
+            else cast(float, entitlement.monthly_billable_budget_usd)
+        )
+        return ResolvedQuota(cap, account.llm_enabled, ent.NON_BILLABLE_PURPOSES)
+
+    cap = (
+        account.monthly_override_usd
+        if account.monthly_override_usd is not None
+        else s.user_llm_monthly_budget_usd
+    )
+    return ResolvedQuota(cap, account.llm_enabled, None)
 
 
 def raise_if_llm_disabled(enabled: bool) -> None:
@@ -164,12 +231,18 @@ def check_user_budget(
     daily_limit_usd: float,
     hourly_limit_usd: float,
     monthly_limit_usd: float = 0.0,
+    monthly_excluded_purposes: tuple[str, ...] | None = None,
 ) -> None:
     """Raise 429 if the user has hit a rolling hourly/daily/monthly cap.
 
     Limits of ``0`` disable that window. Hourly is checked first so a
     spam burst trips the smaller window before exhausting the day; the
     monthly allowance is the overall ceiling.
+
+    ``monthly_excluded_purposes`` scopes the MONTHLY sum to billable
+    (interactive) spend for managed tiers (Phase 3); the hourly/daily
+    runaway rails always count everything — they exist to catch loops,
+    not to meter fairness.
     """
     now = datetime.now(UTC)
 
@@ -204,11 +277,18 @@ def check_user_budget(
         )
 
     if monthly_limit_usd > 0:
-        spent_month = cost_log.total_spend(
-            supabase,
-            user_id=user_id,
-            since=now - timedelta(days=MONTHLY_WINDOW_DAYS),
-        )
+        month_since = now - timedelta(days=MONTHLY_WINDOW_DAYS)
+        if monthly_excluded_purposes:
+            spent_month = cost_log.total_billable_spend(
+                supabase,
+                user_id=user_id,
+                since=month_since,
+                excluded_purposes=monthly_excluded_purposes,
+            )
+        else:
+            spent_month = cost_log.total_spend(
+                supabase, user_id=user_id, since=month_since
+            )
         if spent_month >= monthly_limit_usd:
             _raise_budget_429(
                 "monthly", monthly_limit_usd, spent_month, user_id=user_id

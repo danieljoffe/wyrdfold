@@ -190,6 +190,71 @@ def total_spend(
     return round(float(cast(Any, raw)), 6)
 
 
+def _total_billable_spend_python(
+    supabase: Client,
+    user_id: str | None,
+    since: datetime | None,
+    excluded_purposes: tuple[str, ...],
+) -> float:
+    """Fallback for :func:`total_billable_spend` when the RPC is
+    unavailable (mid-deploy). Selects (cost_usd, purpose) rows in the
+    window and filters/sums in Python."""
+    query = supabase.table(TABLE).select("cost_usd,purpose")
+    query = query.eq("user_id", resolve_owner(user_id))
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    excluded = set(excluded_purposes)
+    return round(
+        sum(
+            float(r["cost_usd"])
+            for r in rows
+            if r.get("purpose") not in excluded
+        ),
+        6,
+    )
+
+
+def total_billable_spend(
+    supabase: Client,
+    user_id: str | None,
+    since: datetime | None = None,
+    *,
+    excluded_purposes: tuple[str, ...],
+) -> float:
+    """Sum of `cost_usd` over the window, excluding background purposes.
+
+    The managed-tier quota accounting (Phase 3): the ledger attributes
+    catalog/background work to the triggering user, and the quota must
+    count only what the user actively clicked for. Tries the
+    `total_billable_spend_since` RPC, falling back client-side like
+    :func:`total_spend` so the guard never fails closed mid-deploy.
+    """
+    try:
+        resp = supabase.rpc(
+            "total_billable_spend_since",
+            {
+                "p_user_id": resolve_owner(user_id),
+                "p_since": since.isoformat() if since is not None else None,
+                "p_excluded_purposes": list(excluded_purposes),
+            },
+        ).execute()
+    except Exception:
+        _log.debug(
+            "total_billable_spend_since RPC unavailable, falling back to "
+            "client-side sum"
+        )
+        return _total_billable_spend_python(
+            supabase, user_id, since, excluded_purposes
+        )
+
+    raw = resp.data
+    if raw is None:
+        return 0.0
+    return round(float(cast(Any, raw)), 6)
+
+
 def _total_spend_all_python(
     supabase: Client,
     since: datetime | None,

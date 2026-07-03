@@ -102,10 +102,50 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
                 timeout=settings.openrouter_timeout_seconds,
                 max_retries=settings.openrouter_max_retries,
             )
-        if settings.byok_require_user_keys:
+        # Global flag (the pre-tier hosted posture) OR the user's plan
+        # requires their own key (saas free tier, Phase 3 slice 2).
+        if settings.byok_require_user_keys or _plan_requires_byok(
+            supabase, user_id
+        ):
             raise MissingUserKeyError("openrouter")
 
     return get_default_client()
+
+
+def _plan_requires_byok(supabase: "Client", user_id: str) -> bool:
+    """saas free tier ⇒ the user's own key is required (Phase 3 slice 2).
+
+    Only consulted when the user has NO stored key (a stored key always
+    wins above). Binds in saas mode only — self_host keeps the env-key
+    fallback untouched (the instance key IS the owner's BYOK). A missing
+    or unreadable profile row resolves to 'free', the safe-for-cost
+    posture: never bill the host key for an unknown account.
+    """
+    from typing import Any, cast
+
+    from app.config import settings
+
+    if settings.deployment_mode != "saas":
+        return False
+
+    from app.services.entitlements import entitlements_for
+
+    plan: str | None = None
+    try:
+        resp = (
+            supabase.table("user_profiles")
+            .select("plan")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        rows = cast("list[dict[str, Any]]", resp.data or [])
+        plan = cast("str | None", rows[0].get("plan")) if rows else None
+    except Exception:
+        logger.warning(
+            "plan lookup failed for user=%s — treating as free (BYOK required)",
+            user_id,
+        )
+    return entitlements_for(plan).llm_key_source == "byok"
 
 
 def _user_byok_key(supabase: "Client", user_id: str) -> str | None:
