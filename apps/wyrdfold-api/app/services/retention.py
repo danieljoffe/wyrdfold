@@ -20,6 +20,12 @@ generous because both logs feed live features:
   history, so the floor is a year.
 * ``notifications_sent.sent_at`` is the alert-dedup ledger; its window
   only needs to outlast a posting's active life.
+* ``prescan_shadow.observed_at`` is the pre-scan disagreement shadow log
+  (#60) — explicitly temporary analysis data, append-only with no other
+  lifecycle (2026-07-02 audit: access-hardened but not lifecycle-hardened,
+  so it accumulated forever while the flag was on). 30 days comfortably
+  covers an analysis window; the off-ramp remains "analyse, then drop the
+  table".
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ logger = logging.getLogger(__name__)
 # (table, age column) pairs purged by this service.
 _LLM_COSTS = ("llm_costs", "created_at")
 _NOTIFICATIONS = ("notifications_sent", "sent_at")
+_PRESCAN_SHADOW = ("prescan_shadow", "observed_at")
 
 
 def _purge_table(supabase: Client, table: str, ts_col: str, days: int) -> int:
@@ -69,12 +76,14 @@ def purge_expired_records(
     *,
     llm_costs_days: int,
     notifications_sent_days: int,
+    prescan_shadow_days: int,
 ) -> dict[str, int]:
-    """Purge expired rows from both logs; return a per-table deleted count.
+    """Purge expired rows from the logs; return a per-table deleted count.
 
     Idempotent — a second run within the same window deletes nothing.
     """
     return {
         _LLM_COSTS[0]: _purge_table(supabase, *_LLM_COSTS, llm_costs_days),
         _NOTIFICATIONS[0]: _purge_table(supabase, *_NOTIFICATIONS, notifications_sent_days),
+        _PRESCAN_SHADOW[0]: _purge_table(supabase, *_PRESCAN_SHADOW, prescan_shadow_days),
     }

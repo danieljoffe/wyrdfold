@@ -276,10 +276,16 @@ async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> N
     ):
         mock_settings.llm_costs_retention_days = 365
         mock_settings.notifications_sent_retention_days = 180
-        mock_purge.return_value = {"llm_costs": 0, "notifications_sent": 0}
+        mock_settings.prescan_shadow_retention_days = 30
+        mock_purge.return_value = {"llm_costs": 0, "notifications_sent": 0, "prescan_shadow": 0}
         await _run_scheduled_retention_purge()
 
-    mock_purge.assert_called_once_with(fake_client, llm_costs_days=365, notifications_sent_days=180)
+    mock_purge.assert_called_once_with(
+        fake_client,
+        llm_costs_days=365,
+        notifications_sent_days=180,
+        prescan_shadow_days=30,
+    )
 
 
 @pytest.mark.asyncio
