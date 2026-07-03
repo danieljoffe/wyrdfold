@@ -392,16 +392,47 @@ def get_target_scores(
 
 # ---- Global score aggregation ----------------------------------------------
 
+# A row is a real (LLM) fit grade only once its scoring_status is "complete";
+# stage1/stage2 rows carry a cheap keyword *placeholder* on a different scale.
+# Mirrors the read-side split in routers/jobs.py (`_is_pending`).
+_GRADED_STATUS = "complete"
+
+
+def _aggregate_global_score(rows: list[dict[str, Any]]) -> int:
+    """Aggregate a job's target-score rows into a single ``jobs.score``.
+
+    ``scores.score`` holds a cheap keyword *placeholder* (0–30 band) while a
+    row is ``stage1``/``stage2`` and the real LLM fit score (0–100 rubric) once
+    it's ``complete``. The two scales are not comparable, so averaging them
+    corrupts the global ranking whenever a job carries both (#194/#47). Instead:
+
+    - drop ``excluded`` rows,
+    - average the **graded** (``complete``) rows when any exist,
+    - fall back to the keyword placeholders only until the job is graded.
+
+    This mirrors exactly what the ``/jobs`` list-view split does at read time
+    (``_is_pending``). Returns 0 when there are no usable rows.
+    """
+    usable = [r for r in rows if not r.get("excluded", False)]
+    if not usable:
+        return 0
+    graded = [
+        int(r["score"]) for r in usable if r.get("scoring_status") == _GRADED_STATUS
+    ]
+    scores = graded or [int(r["score"]) for r in usable]
+    return round(sum(scores) / len(scores))
+
 
 def update_global_score(supabase: Client, job_posting_id: str) -> None:
-    """Recompute jobs.score as average of active-target scores.
+    """Recompute jobs.score from this job's active-target scores.
 
-    Called after any stage updates a target score. Uses a single query
-    to average all non-excluded target scores for this job.
+    Called after any stage updates a target score. Graded (LLM ``complete``)
+    rows define the global score when any exist; keyword placeholders are used
+    only until the job is graded — see :func:`_aggregate_global_score` (#194).
     """
     resp = (
         supabase.table(TABLE)
-        .select("score, excluded, target_id")
+        .select("score, excluded, scoring_status")
         .eq("job_posting_id", job_posting_id)
         .execute()
     )
@@ -409,9 +440,7 @@ def update_global_score(supabase: Client, job_posting_id: str) -> None:
     if not rows:
         return
 
-    scores = [r["score"] for r in rows if not r.get("excluded", False)]
-    avg_score = round(sum(scores) / len(scores)) if scores else 0
-
+    avg_score = _aggregate_global_score(rows)
     supabase.table("jobs").update({"score": avg_score}).eq(
         "id", job_posting_id
     ).execute()
@@ -426,9 +455,10 @@ def batch_update_global_scores(
     """Recompute jobs.score for many jobs in fewer DB round-trips.
 
     Fetches all target scores for the given IDs in one query (chunked to
-    avoid URL length limits), computes averages in Python, then writes
-    every new score in a single `bulk_update_scores` RPC instead of
-    one UPDATE per job.
+    avoid URL length limits), aggregates each job in Python via
+    :func:`_aggregate_global_score` (graded rows win over keyword
+    placeholders — #194), then writes every new score in a single
+    `bulk_update_scores` RPC instead of one UPDATE per job.
     """
     if not job_posting_ids:
         return
@@ -442,25 +472,21 @@ def batch_update_global_scores(
         chunk = unique_ids[i : i + _BATCH_CHUNK_SIZE]
         resp = (
             supabase.table(TABLE)
-            .select("job_posting_id, score, excluded")
+            .select("job_posting_id, score, excluded, scoring_status")
             .in_("job_posting_id", chunk)
             .execute()
         )
         all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
 
-    # Group by job_posting_id and compute averages
+    # Group rows by job_posting_id, then aggregate each (graded-first).
     from collections import defaultdict
 
-    scores_by_job: dict[str, list[int]] = defaultdict(list)
+    rows_by_job: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in all_score_rows:
-        if not row.get("excluded", False):
-            scores_by_job[row["job_posting_id"]].append(row["score"])
+        rows_by_job[row["job_posting_id"]].append(row)
 
     updates: list[dict[str, Any]] = [
-        {
-            "id": job_id,
-            "score": round(sum(scs) / len(scs)) if (scs := scores_by_job.get(job_id, [])) else 0,
-        }
+        {"id": job_id, "score": _aggregate_global_score(rows_by_job.get(job_id, []))}
         for job_id in unique_ids
     ]
     if updates:
