@@ -104,11 +104,33 @@ const STEPS: Step[] = [
   },
 ];
 
-export default function WyrdfoldLandingPage() {
+// Phase 3 slice 5: whether public signup is open (the operator switch,
+// read through the backend's fail-safe probe). Every degraded state —
+// missing env, backend down, junk payload — is 'closed', so the homepage
+// can never advertise signup the perimeter would refuse. Short revalidate:
+// perimeter flips are rare and a minute of staleness is fine.
+async function signupMode(): Promise<'open' | 'closed'> {
+  const baseUrl = process.env['WYRDFOLD_API_URL'];
+  if (!baseUrl) return 'closed';
+  try {
+    const res = await fetch(`${baseUrl}/signup-mode`, {
+      next: { revalidate: 60 },
+    });
+    if (!res.ok) return 'closed';
+    const data = (await res.json()) as { mode?: string };
+    return data.mode === 'open' ? 'open' : 'closed';
+  } catch {
+    return 'closed';
+  }
+}
+
+export default async function WyrdfoldLandingPage() {
   // Phase 2 (deployment modes): self_host drops the waitlist funnel for a
   // direct sign-in CTA — a self-hosted instance has no waitlist. saas keeps
-  // the hosted funnel byte-for-byte.
+  // the hosted funnel. Phase 3 slice 5 adds the third state: open-saas
+  // swaps the waitlist for a sign-up CTA once the operator flips signup.
   const mode = deploymentMode();
+  const signupOpen = mode === 'saas' && (await signupMode()) === 'open';
   return (
     <div className='mx-auto w-full max-w-6xl px-4 md:px-6'>
       {/*
@@ -129,7 +151,9 @@ export default function WyrdfoldLandingPage() {
         <div className='max-w-3xl'>
           <span className='inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-3 py-1 font-mono text-xs uppercase tracking-wider text-brand-950 dark:text-brand-300'>
             {mode === 'saas'
-              ? 'Now taking waitlist signups'
+              ? signupOpen
+                ? 'Signups are open'
+                : 'Now taking waitlist signups'
               : 'Self-hosted instance'}
           </span>
           <Heading
@@ -147,10 +171,12 @@ export default function WyrdfoldLandingPage() {
             {HERO_SUBTITLE}
           </Text>
 
-          {/* saas: primary CTA = waitlist, secondary = sign in (invited).
-              self_host: sign-in IS the CTA — there is no waitlist. */}
+          {/* closed-saas: primary CTA = waitlist, secondary = sign in
+              (invited). open-saas: signup IS the CTA (the login flow
+              creates accounts while the switch is open). self_host:
+              sign-in IS the CTA — there is no waitlist. */}
           <div className='mt-8 flex flex-col gap-4'>
-            {mode === 'saas' ? (
+            {mode === 'saas' && !signupOpen ? (
               <>
                 <WaitlistForm />
                 <Text variant='helper' as='p' className='text-text-tertiary'>
@@ -171,7 +197,7 @@ export default function WyrdfoldLandingPage() {
             ) : (
               <div>
                 <Button name='wyrdfold-hero-sign-in' as='link' href='/login'>
-                  Sign in
+                  {signupOpen ? 'Create your account' : 'Sign in'}
                 </Button>
               </div>
             )}
@@ -358,18 +384,23 @@ export default function WyrdfoldLandingPage() {
             Stop chasing the search. Let it come to you.
           </Heading>
           <Text variant='body' as='p' className='max-w-xl text-text-secondary'>
-            {mode === 'saas' ? (
+            {mode === 'saas' && !signupOpen ? (
               <>
                 Join the waitlist and we&apos;ll email you the moment a spot
                 opens up. WyrdFold is in early access while we get it right, so
                 invites go out in small batches.
+              </>
+            ) : signupOpen ? (
+              <>
+                Create your free account and let the search run — bring your own
+                OpenRouter key, or pick a plan with hosted AI built in.
               </>
             ) : (
               <>Your instance is ready — sign in to get started.</>
             )}
           </Text>
           <div className='flex w-full max-w-md flex-col items-center gap-3'>
-            {mode === 'saas' ? (
+            {mode === 'saas' && !signupOpen ? (
               <>
                 <WaitlistForm />
                 <Text variant='helper' as='p' className='text-text-tertiary'>
@@ -389,7 +420,7 @@ export default function WyrdfoldLandingPage() {
               </>
             ) : (
               <Button name='wyrdfold-footer-sign-in' as='link' href='/login'>
-                Sign in
+                {signupOpen ? 'Create your account' : 'Sign in'}
               </Button>
             )}
           </div>
