@@ -79,6 +79,40 @@ async def close_http_client() -> None:
     _client = None
 
 
+# SSRF-safe pooled client for user-supplied / externally-influenced URL
+# fetches. Same pool/timeout config as the default client, but its transport
+# pins the validated resolved IP at connect time so a DNS rebind between the
+# ``assert_safe_host`` check and the socket connect can't land on an internal
+# address (#29 R1 M2 / #192). Separate from the poller's ``_client`` so the hot
+# poll path is unchanged; used by ``get_with_size_cap``'s gated path.
+_safe_client: httpx.AsyncClient | None = None
+
+
+def get_safe_http_client() -> httpx.AsyncClient:
+    global _safe_client
+    if _safe_client is None or _safe_client.is_closed:
+        from app.services.safe_http import build_ssrf_safe_transport
+
+        _safe_client = httpx.AsyncClient(
+            transport=build_ssrf_safe_transport(),
+            timeout=HTTP_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=MAX_CONNECTIONS,
+                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+            ),
+            follow_redirects=True,
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+        )
+    return _safe_client
+
+
+async def close_safe_http_client() -> None:
+    global _safe_client
+    if _safe_client and not _safe_client.is_closed:
+        await _safe_client.aclose()
+    _safe_client = None
+
+
 # ---- User-URL fetch with size cap ------------------------------------------
 
 # Hard cap on the response-body size we'll accept from a URL the user
@@ -182,14 +216,17 @@ async def get_with_size_cap(
     ``.content`` are empty (stream consumed manually) — use ``body_bytes``.
     ``.status_code``, ``.url``, and ``.headers`` remain valid.
     """
-    client = get_http_client()
-
     if validate_host is None:
         # Back-compat path: no SSRF gating requested (e.g. fixed internal
-        # hosts). Single request; the shared client follows redirects.
-        async with client.stream("GET", url) as resp:
+        # hosts). Single request on the default client; it follows redirects.
+        async with get_http_client().stream("GET", url) as resp:
             return resp, await _read_body_capped(resp, max_bytes)
 
+    # SSRF-gated path: use the IP-pinning client so a rebind between the
+    # per-hop ``validate_host`` check below and the connect can't reach an
+    # internal address (#192 R1 M2). The manual per-hop check stays — it
+    # rejects fast, before any socket, with a clean message.
+    client = get_safe_http_client()
     current = httpx.URL(url)
     for _ in range(max_redirects + 1):
         # Gate each hop BEFORE connecting. With follow_redirects=False httpx

@@ -297,7 +297,13 @@ async def validate_job_url(url: str) -> ValidationResult:
     html = ""
 
     try:
-        async with httpx.AsyncClient(timeout=_VALIDATE_TIMEOUT) as client:
+        # The IP-pinning transport backstops the per-hop ``assert_safe_host``
+        # checks below against a DNS rebind between check and connect (#192).
+        from app.services.safe_http import build_ssrf_safe_transport
+
+        async with httpx.AsyncClient(
+            timeout=_VALIDATE_TIMEOUT, transport=build_ssrf_safe_transport()
+        ) as client:
             # Follow redirects manually (follow_redirects=False) so every hop —
             # including each redirect target — is SSRF/banned-checked BEFORE we
             # connect to it. httpx's built-in following would open a connection
