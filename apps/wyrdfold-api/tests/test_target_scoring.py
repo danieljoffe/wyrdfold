@@ -722,3 +722,148 @@ def test_rescore_endpoint_missing_target_returns_404(
         assert resp.status_code == 404
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Global score aggregation — graded (LLM) rows win over keyword placeholders
+# (#194: stop averaging keyword-heuristic placeholders into LLM fit scores)
+# ---------------------------------------------------------------------------
+
+
+def _score_row(
+    score: int,
+    *,
+    scoring_status: str = "complete",
+    excluded: bool = False,
+    job_posting_id: str = "job-1",
+) -> dict[str, Any]:
+    return {
+        "job_posting_id": job_posting_id,
+        "score": score,
+        "scoring_status": scoring_status,
+        "excluded": excluded,
+    }
+
+
+def test_aggregate_ignores_keyword_placeholder_when_a_grade_exists() -> None:
+    """The #194 regression: a keyword placeholder must not drag a real grade.
+
+    Old behaviour averaged the two mixed scales — avg(80, 10) = 45. The graded
+    row must now stand alone at 80.
+    """
+    from app.services.target_scoring import _aggregate_global_score
+
+    rows = [
+        _score_row(80, scoring_status="complete"),
+        _score_row(10, scoring_status="stage2"),  # keyword placeholder
+    ]
+    assert _aggregate_global_score(rows) == 80
+
+
+def test_aggregate_keyword_placeholder_cannot_inflate_a_grade() -> None:
+    """The inverse: a high keyword placeholder can't lift a low real grade."""
+    from app.services.target_scoring import _aggregate_global_score
+
+    rows = [
+        _score_row(20, scoring_status="complete"),
+        _score_row(95, scoring_status="stage1"),  # keyword placeholder
+    ]
+    assert _aggregate_global_score(rows) == 20  # not avg(20, 95) == 58
+
+
+def test_aggregate_averages_only_graded_rows_when_several_exist() -> None:
+    from app.services.target_scoring import _aggregate_global_score
+
+    rows = [
+        _score_row(80, scoring_status="complete"),
+        _score_row(60, scoring_status="complete"),
+        _score_row(30, scoring_status="stage2"),  # ignored
+    ]
+    assert _aggregate_global_score(rows) == 70  # avg(80, 60), placeholder dropped
+
+
+def test_aggregate_falls_back_to_keyword_rows_when_nothing_graded() -> None:
+    """A not-yet-graded job still gets its keyword placeholder aggregate."""
+    from app.services.target_scoring import _aggregate_global_score
+
+    rows = [
+        _score_row(10, scoring_status="stage1"),
+        _score_row(20, scoring_status="stage2"),
+    ]
+    assert _aggregate_global_score(rows) == 15
+
+
+def test_aggregate_missing_status_is_treated_as_keyword() -> None:
+    """A row without scoring_status is a placeholder (mirrors _is_pending)."""
+    from app.services.target_scoring import _aggregate_global_score
+
+    graded_plus_unknown = [
+        _score_row(90, scoring_status="complete"),
+        {"job_posting_id": "job-1", "score": 25, "excluded": False},  # no status
+    ]
+    assert _aggregate_global_score(graded_plus_unknown) == 90
+
+    only_unknown = [{"job_posting_id": "job-1", "score": 25, "excluded": False}]
+    assert _aggregate_global_score(only_unknown) == 25
+
+
+def test_aggregate_drops_excluded_rows_before_the_graded_split() -> None:
+    from app.services.target_scoring import _aggregate_global_score
+
+    # The only graded row is excluded → fall back to the live keyword row.
+    rows = [
+        _score_row(80, scoring_status="complete", excluded=True),
+        _score_row(12, scoring_status="stage2", excluded=False),
+    ]
+    assert _aggregate_global_score(rows) == 12
+
+    # An excluded keyword row can't drag a live grade either.
+    rows2 = [
+        _score_row(70, scoring_status="complete", excluded=False),
+        _score_row(5, scoring_status="stage1", excluded=True),
+    ]
+    assert _aggregate_global_score(rows2) == 70
+
+
+def test_aggregate_empty_or_all_excluded_is_zero() -> None:
+    from app.services.target_scoring import _aggregate_global_score
+
+    assert _aggregate_global_score([]) == 0
+    assert _aggregate_global_score([_score_row(90, excluded=True)]) == 0
+
+
+def test_update_global_score_writes_graded_first_value() -> None:
+    """End-to-end through the DB path: the write uses the graded-first rule."""
+    from app.services.target_scoring import update_global_score
+
+    supabase = MagicMock()
+    supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
+        _score_row(85, scoring_status="complete"),
+        _score_row(15, scoring_status="stage2"),
+    ]
+    update_global_score(supabase, "job-1")
+
+    update_call = supabase.table.return_value.update
+    update_call.assert_called_once_with({"score": 85})
+
+
+def test_batch_update_global_scores_aggregates_each_job_graded_first() -> None:
+    """The batch path groups by job and applies the same graded-first rule."""
+    from app.services.target_scoring import batch_update_global_scores
+
+    supabase = MagicMock()
+    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
+        # job-1: graded 90 + keyword 10 -> 90
+        _score_row(90, scoring_status="complete", job_posting_id="job-1"),
+        _score_row(10, scoring_status="stage2", job_posting_id="job-1"),
+        # job-2: keyword only -> avg(20, 40) = 30
+        _score_row(20, scoring_status="stage1", job_posting_id="job-2"),
+        _score_row(40, scoring_status="stage2", job_posting_id="job-2"),
+    ]
+    batch_update_global_scores(supabase, ["job-1", "job-2"])
+
+    supabase.rpc.assert_called_once()
+    name, payload = supabase.rpc.call_args.args
+    assert name == "bulk_update_scores"
+    by_id = {u["id"]: u["score"] for u in payload["p_updates"]}
+    assert by_id == {"job-1": 90, "job-2": 30}
