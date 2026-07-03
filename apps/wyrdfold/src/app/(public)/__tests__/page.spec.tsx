@@ -8,6 +8,17 @@ jest.mock('next/navigation', () => ({
 
 import WyrdfoldLandingPage from '../page';
 
+// Restore whatever the runner had (possibly undefined) so these specs stay
+// order-independent even if the environment sets the mode globally.
+const ORIGINAL_MODE = process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+function restoreMode(): void {
+  if (ORIGINAL_MODE === undefined) {
+    delete process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+  } else {
+    process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'] = ORIGINAL_MODE;
+  }
+}
+
 // The narrative-funnel specs below document the HOSTED (saas) homepage; the
 // self_host variant swaps the waitlist funnel for a sign-in CTA (Phase 2) and
 // has its own describe at the bottom. deploymentMode() reads the env at call
@@ -17,7 +28,7 @@ describe('WyrdfoldLandingPage', () => {
     process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'] = 'saas';
   });
   afterEach(() => {
-    delete process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+    restoreMode();
   });
   it('renders the narrative sections in CTA-building order', () => {
     const { container } = render(<WyrdfoldLandingPage />);
@@ -80,6 +91,9 @@ describe('WyrdfoldLandingPage (self_host mode)', () => {
   // cloned repo. The waitlist funnel must be absent and sign-in is the CTA.
   beforeEach(() => {
     delete process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+  });
+  afterEach(() => {
+    restoreMode();
   });
 
   it('drops the waitlist funnel entirely', () => {
