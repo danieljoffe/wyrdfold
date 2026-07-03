@@ -72,6 +72,11 @@ def seeded_target(
         .execute()
         .data[0]["id"]
     )
+    # Link the user to the target — the #191 RPC refuses shared-profile
+    # writes from non-followers, so the apply path needs a real link.
+    service_client.table("user_targets").insert(
+        {"user_id": uid, "target_id": target_id}
+    ).execute()
     job_ids: list[str] = []
     for i in range(_N_JOBS):
         jid = (
@@ -119,6 +124,9 @@ def seeded_target(
         service_client.table("job_feedback").delete().eq("target_id", target_id).execute()
         service_client.table("scores").delete().eq("target_id", target_id).execute()
         service_client.table("jobs").delete().eq("source_id", source_id).execute()
+        service_client.table("user_targets").delete().eq(
+            "target_id", target_id
+        ).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
         service_client.table("sources").delete().eq("id", source_id).execute()
 

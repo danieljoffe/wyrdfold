@@ -159,3 +159,62 @@ def test_learning_log_reads_via_user_client(
     assert r.json() == []
     user_sb.table.assert_called_once_with("target_learning_log")
     service_sb.table.assert_not_called()
+
+
+# ---- #191 hardening wiring: rate limits + staged-apply conflict ------------
+
+
+def test_staged_apply_conflict_maps_to_409(
+    overrides: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A version_conflict from the #191 RPC surfaces as 409, not a 500 —
+    and not a silent 404."""
+    from app.services.llm_learner import StagedPatchConflictError
+
+    monkeypatch.setattr(
+        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
+    )
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise StagedPatchConflictError("profile moved")
+
+    monkeypatch.setattr("app.routers.feedback.apply_staged_patch", _raise)
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
+
+    r = TestClient(app).post(f"/targets/{_TARGET_ID}/learn/run-1/apply")
+
+    assert r.status_code == 409
+    assert "changed while applying" in r.json()["detail"]
+
+
+def test_learner_trigger_rate_limited_at_10_per_minute(
+    overrides: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#191: the learner mutates the SHARED target profile — the trigger
+    endpoint must throttle per user. Limiter is globally disabled in tests
+    (conftest RATE_LIMIT_ENABLED=false); flip it on for this case."""
+    from app.rate_limit import limiter
+
+    monkeypatch.setattr(
+        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        "app.routers.feedback.maybe_run_learner", lambda *a, **k: None
+    )
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
+
+    client = TestClient(app)
+    limiter.enabled = True
+    try:
+        statuses = [
+            client.post(f"/targets/{_TARGET_ID}/learn").status_code
+            for _ in range(11)
+        ]
+    finally:
+        limiter.enabled = False
+        limiter.reset()
+
+    assert statuses[:10] == [200] * 10
+    assert statuses[10] == 429
