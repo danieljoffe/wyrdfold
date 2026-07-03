@@ -257,9 +257,14 @@ def test_verify_supabase_jwt_valid_returns_sub():
     assert verify_supabase_jwt(req, s=_settings()) == USER_SUB
 
 
-def test_verify_api_key_or_jwt_accepts_api_key():
+def test_verify_api_key_or_jwt_rejects_broad_api_key():
+    """#29 R3 H4 / #192: the user-data gate is JWT-only — the broad shared
+    key must NOT authenticate against user routers (a leaked key can't reach
+    user data)."""
     req = _make_request()
-    assert verify_api_key_or_jwt(req, key="testkey", s=_settings()) == "api-key"
+    with pytest.raises(HTTPException) as exc:
+        verify_api_key_or_jwt(req, key="testkey", s=_settings())
+    assert exc.value.status_code == 401
 
 
 def test_verify_api_key_or_jwt_accepts_jwt():
@@ -320,14 +325,15 @@ def test_cron_key_is_rejected_by_user_data_gate():
     assert exc.value.status_code == 401
 
 
-def test_legacy_key_still_accepted_by_user_data_gate():
-    """No regression: the legacy key still passes the user-data gate (so
-    nothing breaks until the operator chooses to retire it)."""
+def test_legacy_key_rejected_by_user_data_gate():
+    """#29 R3 H4 / #192: the broad legacy key is now rejected by the user-data
+    gate too (not just the cron key). Both shared keys are barred from user
+    routers; only a JWT authenticates them. Operator routes keep accepting
+    both keys (see ``verify_api_key`` tests above)."""
     req = _make_request()
-    assert (
+    with pytest.raises(HTTPException) as exc:
         verify_api_key_or_jwt(req, key="legacykey", s=_settings_with_cron())
-        == "api-key"
-    )
+    assert exc.value.status_code == 401
 
 
 def test_cron_key_unset_changes_nothing():
