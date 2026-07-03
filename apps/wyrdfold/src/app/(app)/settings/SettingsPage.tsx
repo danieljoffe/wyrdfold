@@ -19,6 +19,7 @@ import { useToast } from '@/state/Toast/ToastProvider';
 import ApiKeysCard from './ApiKeysCard';
 import DataExportCard from './DataExportCard';
 import DeleteAccountCard from './DeleteAccountCard';
+import BillingCard from './BillingCard';
 import LlmUsageCard from './LlmUsageCard';
 import OnboardingResetCard from './OnboardingResetCard';
 import { ResumeStylePreview } from './ResumeStylePreview';
@@ -633,6 +634,8 @@ export default function SettingsPage() {
       <ApiKeysCard />
 
       <LlmUsageCard />
+
+      <BillingCard />
 
       <DataExportCard />
 
