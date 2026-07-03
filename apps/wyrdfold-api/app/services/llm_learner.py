@@ -700,16 +700,56 @@ def apply_staged_patch(
     if target_row is None:
         return None
 
-    # Same RPC gate as the auto-apply path (#191). expected_version is read
-    # just above, so a conflict here means a genuinely concurrent write —
-    # not the routine "profile moved since staging" case (the human reviewed
-    # the patch; applying over a legitimately newer profile is their call).
+    # Re-apply the PATCH to the CURRENT profile rather than writing the
+    # stage-time `next_profile` snapshot (Copilot on #202): the profile may
+    # have legitimately moved since staging (a reference-JD merge, another
+    # learn), and writing the stale snapshot would wholesale-erase those
+    # changes. The human approved the patch's *edits*, not a revert of
+    # everything that landed since. The log keeps `diff` = the full
+    # ProfilePatch, so this is lossless.
+    prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
+    stage_patch = ProfilePatch.model_validate(log_row["diff"])
+    # Re-run the self-collision guard against the CURRENT target terms —
+    # search keywords / core skills may have changed since staging, and a
+    # negative that now hard-zeros the target's own jobs is the same "lost
+    # forever" hazard the stage-time strip protects against (#47).
+    stage_patch, dropped_negatives = _strip_self_colliding_negatives(
+        stage_patch,
+        search_keywords=cast(
+            list[str], target_row.get("search_keywords") or []
+        ),
+        core_skills=_core_skill_keywords(prev_profile),
+    )
+    if dropped_negatives:
+        logger.warning(
+            "Staged-patch apply dropped now-self-colliding negative(s) %s "
+            "for (user=%s, target=%s)",
+            dropped_negatives,
+            user_id,
+            target_id,
+        )
+        # Make the shrink self-explanatory in the audit log / UI — same
+        # bracketed-note convention as the auto-stage paths.
+        stage_patch = stage_patch.model_copy(
+            update={
+                "rationale": (
+                    f"[apply dropped now-self-colliding negatives "
+                    f"{dropped_negatives}] " + stage_patch.rationale
+                )
+            }
+        )
+    next_profile = _apply_patch_to_profile(prev_profile, stage_patch)
+
+    # Same RPC gate as the auto-apply path (#191). expected_version is the
+    # version prev_profile was read at, so the recompute-to-write window is
+    # fully covered — a conflict means a genuinely concurrent write landed
+    # mid-apply, and retrying (the router's 409) recomputes from fresh state.
     expected_version = cast(int, target_row.get("profile_version") or 1)
     outcome, rpc_version = _apply_profile_patch_rpc(
         supabase,
         user_id=user_id,
         target_id=target_id,
-        next_profile=cast(dict[str, Any], log_row["next_profile"]),
+        next_profile=next_profile,
         expected_version=expected_version,
     )
     if outcome == "version_conflict":
@@ -731,11 +771,23 @@ def apply_staged_patch(
     # Mark this run as applied + stamp the consumed feedback rows. The run
     # id we generate here is what gets attached to the feedback so the
     # audit thread links back to a single applied event even though the
-    # log row was created earlier with status=staged.
+    # log row was created earlier with status=staged. prev/next/diff (and
+    # the rationale, when the strip dropped negatives) are updated to what
+    # was ACTUALLY applied — the UI renders `diff`, and `prev_profile` must
+    # stay a truthful one-row revert (Copilot on #203).
     new_run_id = str(uuid.uuid4())
     update_resp = (
         supabase.table(LEARNING_LOG_TABLE)
-        .update({"status": "applied", "applied_run_id": new_run_id})
+        .update(
+            {
+                "status": "applied",
+                "applied_run_id": new_run_id,
+                "prev_profile": prev_profile,
+                "next_profile": next_profile,
+                "diff": stage_patch.model_dump(mode="json"),
+                "rationale": stage_patch.rationale,
+            }
+        )
         .eq("id", run_id)
         .execute()
     )
