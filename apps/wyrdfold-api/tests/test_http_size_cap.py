@@ -21,7 +21,7 @@ async def test_blocks_redirect_to_unsafe_host(monkeypatch):
         return httpx.Response(200, content=b"internal")
 
     client = _client(handler)
-    monkeypatch.setattr(hc, "get_http_client", lambda: client)
+    monkeypatch.setattr(hc, "get_safe_http_client", lambda: client)
 
     def validate_host(host: str) -> None:
         if host == "10.0.0.5":
@@ -46,7 +46,7 @@ async def test_follows_safe_redirect(monkeypatch):
         return httpx.Response(200, content=b"<html>final</html>")
 
     client = _client(handler)
-    monkeypatch.setattr(hc, "get_http_client", lambda: client)
+    monkeypatch.setattr(hc, "get_safe_http_client", lambda: client)
 
     try:
         resp, body = await hc.get_with_size_cap(
@@ -67,7 +67,7 @@ async def test_size_cap_enforced(monkeypatch):
         return httpx.Response(200, content=b"x" * 2048)
 
     client = _client(handler)
-    monkeypatch.setattr(hc, "get_http_client", lambda: client)
+    monkeypatch.setattr(hc, "get_safe_http_client", lambda: client)
 
     try:
         with pytest.raises(hc.ResponseTooLargeError):

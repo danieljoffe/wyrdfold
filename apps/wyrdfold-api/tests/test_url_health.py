@@ -11,12 +11,31 @@ import pytest
 from app.services.url_health import (
     _STATUS_NETWORK_ERROR,
     _archive_with_data_drop,
+    _head_batch,
     _head_one,
     _merge_check_results,
     run_url_health_check,
 )
 
 # ---- _head_one -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_head_batch_blocks_url_resolving_to_internal(monkeypatch) -> None:
+    """#192: url_health follows redirects, and job URLs come from external
+    boards, so its client uses the IP-pinning transport. A URL that resolves
+    (or redirects) to an internal address is refused at connect and recorded
+    as a network error rather than probed."""
+    import ipaddress
+
+    import app.services.safe_http as sh
+
+    async def _internal(_host: str, _port: int):
+        return [ipaddress.ip_address("169.254.169.254")]
+
+    monkeypatch.setattr(sh, "_resolve_ips", _internal)
+    out = await _head_batch([("j1", "http://internal.evil/latest/meta-data/")], 2)
+    assert out == {"j1": _STATUS_NETWORK_ERROR}
 
 
 @pytest.mark.asyncio

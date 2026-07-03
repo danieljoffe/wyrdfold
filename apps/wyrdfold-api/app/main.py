@@ -16,7 +16,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import Receive, Scope, Send
 
 from app.config import Settings, settings
-from app.http_client import close_http_client
+from app.http_client import close_http_client, close_safe_http_client
 from app.logging_config import init_logging
 from app.observability import init_sentry
 from app.rate_limit import limiter
@@ -216,6 +216,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await cost_log_buffer.stop(supabase_for_buffer)
         close_supabase()
         await close_http_client()
+        await close_safe_http_client()
 
 
 app = FastAPI(

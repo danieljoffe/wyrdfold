@@ -102,7 +102,15 @@ async def _head_batch(urls: list[tuple[str, str]], concurrency: int) -> dict[str
     sem = asyncio.Semaphore(concurrency)
     out: dict[str, int] = {}
 
+    # IP-pinning transport: HEADs here follow redirects (``follow_redirects=
+    # True`` in ``_head_one``), and job URLs come from external boards, so an
+    # attacker-controlled posting could redirect to an internal address. The
+    # pinning backend validates every hop's resolved IP before connecting and
+    # pins it, closing that SSRF gap (#192) with no per-hop loop of our own.
+    from app.services.safe_http import build_ssrf_safe_transport
+
     async with httpx.AsyncClient(
+        transport=build_ssrf_safe_transport(),
         timeout=_HEAD_TIMEOUT,
         headers={"User-Agent": _USER_AGENT},
         # Reasonable default redirect depth; some board URLs chain
