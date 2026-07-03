@@ -16,7 +16,18 @@
 export type DeploymentMode = 'self_host' | 'saas';
 
 export function deploymentMode(): DeploymentMode {
-  return process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'] === 'saas'
-    ? 'saas'
-    : 'self_host';
+  const raw = process.env['NEXT_PUBLIC_DEPLOYMENT_MODE'];
+  // Unset = self_host, the documented default. Anything else must be an
+  // exact mode: a typo ('sass', 'SAAS') silently defaulting would flip the
+  // hosted homepage off the waitlist funnel with no signal — fail loudly
+  // instead, so a bad deploy env 500s and gets caught by the deploy smoke.
+  if (raw === undefined || raw === '') {
+    return 'self_host';
+  }
+  if (raw !== 'saas' && raw !== 'self_host') {
+    throw new Error(
+      `NEXT_PUBLIC_DEPLOYMENT_MODE must be "self_host" or "saas", got "${raw}"`
+    );
+  }
+  return raw;
 }
