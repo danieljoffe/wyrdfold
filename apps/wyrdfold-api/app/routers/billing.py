@@ -51,6 +51,22 @@ def _client() -> stripe.StripeClient:
     return stripe.StripeClient(settings.stripe_secret_key)
 
 
+def _app_url() -> str:
+    """The FE origin for Checkout/Portal redirect URLs.
+
+    Guarded: Stripe rejects relative URLs, so an unset ``NEXT_APP_URL``
+    must be a clear 503 here — not a 500 leaked from Stripe's "Not a
+    valid URL" (bit prod on the #210 release drive: the var was set on
+    Vercel but not Railway).
+    """
+    if not settings.next_app_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Billing is not fully configured (NEXT_APP_URL).",
+        )
+    return settings.next_app_url
+
+
 def _price_for_plan(plan: str) -> str:
     price = {
         "starter": settings.stripe_starter_price_id,
@@ -171,14 +187,15 @@ def create_checkout_session(
 ) -> BillingUrlResponse:
     """Hosted-Checkout URL for subscribing to a managed tier."""
     price = _price_for_plan(body.plan)
+    app_url = _app_url()
     customer_id = _ensure_customer(supabase, user_id)
     session = _client().checkout.sessions.create(
         params={
             "mode": "subscription",
             "customer": customer_id,
             "line_items": [{"price": price, "quantity": 1}],
-            "success_url": f"{settings.next_app_url}/settings?billing=success",
-            "cancel_url": f"{settings.next_app_url}/settings?billing=cancelled",
+            "success_url": f"{app_url}/settings?billing=success",
+            "cancel_url": f"{app_url}/settings?billing=cancelled",
             "client_reference_id": user_id,
             # Stamped onto the subscription so every webhook event carries
             # the user id — no reverse lookup needed on the hot path.
@@ -212,7 +229,7 @@ def create_portal_session(
     session = _client().billing_portal.sessions.create(
         params={
             "customer": customer_id,
-            "return_url": f"{settings.next_app_url}/settings",
+            "return_url": f"{_app_url()}/settings",
         }
     )
     return BillingUrlResponse(url=session.url)
