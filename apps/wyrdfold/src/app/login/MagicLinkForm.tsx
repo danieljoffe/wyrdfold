@@ -111,6 +111,26 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
     authError ? callbackErrorCopy(authError) : ''
   );
   const [resendIn, setResendIn] = useState(0);
+  // Phase 3 slice 5: whether public signup is open (the operator switch).
+  // Fail-safe false — closed presentation unless the probe says otherwise.
+  const [signupOpen, setSignupOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/signup-mode');
+        if (!res.ok) return;
+        const data = (await res.json()) as { mode?: string };
+        if (!cancelled && data.mode === 'open') setSignupOpen(true);
+      } catch {
+        // Probe failure = closed presentation; sign-in still works.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Resend cooldown — counts down from RESEND_COOLDOWN_S after the link is sent.
   useEffect(() => {
@@ -129,7 +149,10 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
       email,
       options: {
         emailRedirectTo: `${window.location.origin}/auth/callback`,
-        shouldCreateUser: false,
+        // Open signup admits new accounts through the same magic-link
+        // flow; when closed, non-existing emails are rejected (and the
+        // DB hook backstops any client tampering with this flag).
+        shouldCreateUser: signupOpen,
       },
     });
 
@@ -210,18 +233,20 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
           <>
             <div className='flex flex-col items-center gap-1 text-center'>
               <Heading variant='hero' as='h1'>
-                Sign in
+                {signupOpen ? 'Sign in or create your account' : 'Sign in'}
               </Heading>
               <Text variant='body' className='text-text-secondary'>
                 Two clicks: enter your email, click the link in your inbox.
               </Text>
             </div>
 
-            <Alert variant='warning' title='Private beta'>
-              WyrdFold is invite-only and under active development. By signing
-              in you accept that your account and data may be reset without
-              notice while we iterate.
-            </Alert>
+            {!signupOpen && (
+              <Alert variant='warning' title='Private beta'>
+                WyrdFold is invite-only and under active development. By signing
+                in you accept that your account and data may be reset without
+                notice while we iterate.
+              </Alert>
+            )}
 
             <form onSubmit={sendLink} className='w-full flex flex-col gap-3'>
               <div className='flex flex-col gap-1'>

@@ -18,6 +18,12 @@ jest.mock('@/lib/supabase/auth-client', () => ({
 beforeEach(() => {
   jest.clearAllMocks();
   mockSignInWithOtp.mockResolvedValue({ error: null });
+  // Phase 3 slice 5: the form probes /api/signup-mode on mount. Default
+  // every spec to the CLOSED perimeter; the open-mode describe overrides.
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({ mode: 'closed' }),
+  }) as jest.Mock;
   // jsdom persists cookies across tests; expire the redirect cookie so each
   // case starts from a known-clean state.
   document.cookie = 'wyrdfold_login_next=; max-age=0; path=/';
@@ -297,5 +303,61 @@ describe('MagicLinkForm — sent state', () => {
       await screen.findByRole('heading', { level: 1, name: /sign in/i })
     ).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: /^email$/i })).toHaveValue('');
+  });
+});
+
+// Phase 3 slice 5: when the operator opens signup, the same form creates
+// accounts (`shouldCreateUser: true`) and drops the invite-only framing.
+describe('MagicLinkForm (signup open)', () => {
+  beforeEach(() => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => ({ mode: 'open' }),
+    });
+  });
+
+  it('signs up with shouldCreateUser: true and open copy', async () => {
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={undefined} authError={undefined} />);
+
+    // The probe flips the presentation.
+    expect(
+      await screen.findByRole('heading', {
+        name: /sign in or create your account/i,
+      })
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/invite-only/i)).not.toBeInTheDocument();
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'new@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    await waitFor(() => expect(mockSignInWithOtp).toHaveBeenCalledTimes(1));
+    expect(mockSignInWithOtp.mock.calls[0][0].options.shouldCreateUser).toBe(
+      true
+    );
+  });
+
+  it('stays closed when the probe fails', async () => {
+    (global.fetch as jest.Mock).mockRejectedValue(new Error('down'));
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={undefined} authError={undefined} />);
+
+    expect(
+      screen.getByRole('heading', { name: /^sign in$/i })
+    ).toBeInTheDocument();
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'x@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    await waitFor(() => expect(mockSignInWithOtp).toHaveBeenCalledTimes(1));
+    expect(mockSignInWithOtp.mock.calls[0][0].options.shouldCreateUser).toBe(
+      false
+    );
   });
 });
