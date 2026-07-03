@@ -365,3 +365,27 @@ def test_billing_account_defaults_free_no_account(
         "has_billing_account": False,
         "byok": False,
     }
+
+
+def test_unset_app_url_is_503_not_stripe_500(
+    saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative (#210 release-drive bug): NEXT_APP_URL unset must be a
+    clear 503 from OUR guard — never a relative URL sent to Stripe (which
+    500s back as "Not a valid URL"). Checked before any Stripe call."""
+    monkeypatch.setattr(settings, "next_app_url", "")
+    stripe_client = MagicMock(name="stripe")
+    monkeypatch.setattr(billing, "_client", lambda: stripe_client)
+
+    r = _client(sb).post("/billing/checkout-session", json={"plan": "pro"})
+    assert r.status_code == 503
+    assert "NEXT_APP_URL" in r.json()["detail"]
+    stripe_client.checkout.sessions.create.assert_not_called()
+
+    # Portal has the same dependency (return_url).
+    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
+        {"stripe_customer_id": "cus_x"}
+    ]
+    r2 = _client(sb).post("/billing/portal-session")
+    assert r2.status_code == 503
+    stripe_client.billing_portal.sessions.create.assert_not_called()
