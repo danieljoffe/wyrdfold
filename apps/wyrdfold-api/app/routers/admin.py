@@ -151,6 +151,7 @@ class RetentionPurgeResult(BaseModel):
 
     llm_costs: int = Field(description="Rows deleted from llm_costs.")
     notifications_sent: int = Field(description="Rows deleted from notifications_sent.")
+    prescan_shadow: int = Field(description="Rows deleted from prescan_shadow.")
 
 
 @router.post("/retention/purge", response_model=RetentionPurgeResult)
@@ -169,5 +170,6 @@ def purge_retention(
         supabase,
         llm_costs_days=settings.llm_costs_retention_days,
         notifications_sent_days=settings.notifications_sent_retention_days,
+        prescan_shadow_days=settings.prescan_shadow_retention_days,
     )
     return RetentionPurgeResult(**report)

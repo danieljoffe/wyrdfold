@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     # cron callers (background spend is gated per payer in the poller).
     byok_require_user_keys: bool = False
 
+    # ---- Stripe billing (Phase 3 slice 3; saas mode only) -------------
+    # Secret API key (sk_test_/sk_live_). Empty disables the billing
+    # routes entirely (they 404) — the self_host default: a self-hosted
+    # instance has no subscriptions.
+    stripe_secret_key: str = Field(default="", repr=False)
+    # Webhook endpoint signing secret (whsec_...). The webhook route
+    # refuses everything until this is set — never process an unsigned
+    # billing event.
+    stripe_webhook_secret: str = Field(default="", repr=False)
+    # Recurring monthly Price ids for the managed tiers (test + live mode
+    # each have their own). Unknown/unmapped prices in webhook events are
+    # ignored, never guessed.
+    stripe_starter_price_id: str = ""
+    stripe_pro_price_id: str = ""
+
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 
@@ -167,6 +182,10 @@ class Settings(BaseSettings):
     # notifications_sent.sent_at is the alert-dedup ledger; 180d is well
     # past any posting's active life. 0 = keep forever.
     notifications_sent_retention_days: int = Field(default=180, ge=0)
+    # prescan_shadow.observed_at — the pre-scan disagreement shadow log
+    # (#60): explicitly TEMPORARY analysis data with no other lifecycle
+    # (2026-07-02 audit). 30d covers an analysis window; 0 = keep forever.
+    prescan_shadow_retention_days: int = Field(default=30, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
