@@ -189,8 +189,15 @@ enabled = false
 authorization_url_path = "/oauth/consent"
 allow_dynamic_registration = false
 
+# Disabled: wyrdfold has no edge functions, and the edge-runtime container
+# fetches Deno std imports from deno.land AT BOOT — a deno.land outage
+# (2026-07-03) broke every `supabase start` (local + both CI stack jobs) with
+# "main worker boot error" / "Import 'https://deno.land/std/http/status.ts'
+# failed". Removing the container from the boot path makes stack startup
+# independent of that external service (and slightly faster). Re-enable only
+# if edge functions are ever actually used.
 [edge_runtime]
-enabled = true
+enabled = false
 policy = "per_worker"
 inspector_port = 8083
 deno_version = 2
