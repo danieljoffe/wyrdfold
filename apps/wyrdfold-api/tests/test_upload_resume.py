@@ -199,6 +199,39 @@ class TestUploadResumeEndpoint:
         assert exc_info.value.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_zip_bomb_returns_422(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """#190: a DOCX that inflates past the ceiling is rejected with a
+        clean 422 (the parser raises ParseError → the router maps it)."""
+        import io
+        import zipfile
+
+        from fastapi import HTTPException
+
+        from app.routers import experience as exp_router
+        from app.services.ingest import parse as parse_mod
+
+        # Small ceiling + a modest bomb keeps the test fast; the guard reads
+        # actual decompressed bytes so this is the same code path as a 50 MB bomb.
+        monkeypatch.setattr(parse_mod, "MAX_DOCX_INFLATED_BYTES", 1 * 1024 * 1024)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("word/document.xml", b"\0" * (2 * 1024 * 1024))
+        bomb = buf.getvalue()
+        assert len(bomb) < 1 * 1024 * 1024  # tiny on the wire
+
+        file = _make_upload_file(bomb, "bomb.docx")
+        with pytest.raises(HTTPException) as exc_info:
+            await exp_router.upload_resume(
+                request=MagicMock(),
+                file=file,
+                auto_derive=False,
+                supabase=MagicMock(),
+                llm=MagicMock(),
+                embeddings=MagicMock(),
+            )
+        assert exc_info.value.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_file_too_large_returns_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi import HTTPException
 
