@@ -25,23 +25,31 @@ from typing import Any, cast
 
 from supabase import Client
 
-from app.config import settings
 from app.models.feedback import FeedbackRow
 from app.models.learning import (
     CONFIDENCE_AUTO_APPLY,
     LearningRunResult,
     LearningStatus,
     ProfilePatch,
-    RescoreProjection,
     TargetLearningLogRow,
 )
 from app.models.llm import Message, ModelId
-from app.models.targets import ScoringProfile
 from app.services.feedback import _MIN_FEEDBACK_FOR_LEARN, _parse_row
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
-from app.services.targets.learning_projection import ScoredJobText, project_rescore
+from app.services.targets import crud as targets_crud
+
+# Imported under the historical private name so existing test patch points
+# (``app.services.llm_learner._project_patch_impact``) keep working.
+from app.services.targets.learning_projection import (
+    project_profile_impact as _project_patch_impact,
+)
+from app.services.targets.merge import merge_reference_jds
+from app.services.targets.profile_writes import (
+    apply_profile_merge_rpc,
+    apply_profile_patch_rpc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,46 +63,6 @@ class StagedPatchConflictError(Exception):
     """Applying a staged patch lost a concurrent-write race on the shared
     target profile (`version_conflict` from the RPC). The caller should
     re-review the staged patch against the now-current profile."""
-
-
-def _apply_profile_patch_rpc(
-    supabase: Client,
-    *,
-    user_id: str,
-    target_id: str,
-    next_profile: dict[str, Any],
-    expected_version: int,
-) -> tuple[str, int | None]:
-    """Write the shared ``targets.scoring_profile`` through the
-    ``apply_target_profile_patch`` SECURITY DEFINER RPC (#191).
-
-    The DB re-checks that ``user_id`` actually follows the target and that
-    ``profile_version`` still equals ``expected_version`` under a row lock —
-    so a Python authz bug can't silently mutate a profile every follower
-    shares, and two concurrent applies can't lose an update.
-
-    Returns ``(outcome, new_version)`` where outcome is one of
-    ``applied | version_conflict | not_a_follower | target_not_found``.
-    """
-    resp = supabase.rpc(
-        "apply_target_profile_patch",
-        {
-            "p_user_id": user_id,
-            "p_target_id": target_id,
-            "p_next_profile": next_profile,
-            "p_expected_version": expected_version,
-        },
-    ).execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        raise RuntimeError(
-            "apply_target_profile_patch returned no row — RPC missing or "
-            "grants misconfigured"
-        )
-    return (
-        cast(str, rows[0]["outcome"]),
-        cast("int | None", rows[0]["new_version"]),
-    )
 
 SYSTEM_PROMPT = (
     UNTRUSTED_CONTENT_DIRECTIVE
@@ -210,65 +178,6 @@ def _fetch_job_titles(
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["id"]: r.get("title", "?") for r in rows}
-
-
-def _fetch_recent_scored_jobs(
-    supabase: Client, target_id: str, limit: int
-) -> list[ScoredJobText]:
-    """The (title, description_html) of a target's most recently scored jobs.
-
-    Bounded by ``limit`` to keep the deterministic re-score projection cheap.
-    Returns [] when the target has no scores yet (a brand-new target), which
-    the caller treats as "nothing to project against".
-    """
-    score_resp = (
-        supabase.table("scores")
-        .select("job_posting_id")
-        .eq("target_id", target_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
-    job_ids = [r["job_posting_id"] for r in score_rows if r.get("job_posting_id")]
-    if not job_ids:
-        return []
-    jobs_resp = (
-        supabase.table("jobs")
-        .select("id, title, description_html")
-        .in_("id", job_ids)
-        .execute()
-    )
-    job_rows = cast(list[dict[str, Any]], jobs_resp.data or [])
-    return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
-
-
-def _project_patch_impact(
-    supabase: Client,
-    target_id: str,
-    prev_profile: dict[str, Any],
-    next_profile: dict[str, Any],
-    search_keywords: list[str] | None,
-) -> RescoreProjection | None:
-    """Project how much a patch would move the target's existing scores.
-
-    Returns None when there are no scored jobs to project against — the caller
-    then applies without a learning-rate check (nothing to over-churn yet).
-    """
-    jobs = _fetch_recent_scored_jobs(
-        supabase, target_id, settings.learning_rescore_sample_size
-    )
-    if not jobs:
-        return None
-    return project_rescore(
-        ScoringProfile.model_validate(prev_profile or {}),
-        ScoringProfile.model_validate(next_profile or {}),
-        jobs,
-        search_keywords=search_keywords,
-        move_threshold=settings.learning_rescore_move_threshold,
-        max_moved_fraction=settings.learning_rescore_max_moved_fraction,
-        min_jobs=settings.learning_rescore_min_jobs,
-    )
 
 
 def _core_skill_keywords(profile: dict[str, Any]) -> list[str]:
@@ -587,7 +496,7 @@ async def run_llm_learner(
     # patch, under a row lock.
     expected_version = cast(int, target_row.get("profile_version") or 1)
     outcome, rpc_version = await asyncio.to_thread(
-        lambda: _apply_profile_patch_rpc(
+        lambda: apply_profile_patch_rpc(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -671,6 +580,97 @@ async def run_llm_learner(
     )
 
 
+def _apply_staged_merge(
+    supabase: Client,
+    *,
+    user_id: str,
+    log_row: dict[str, Any],
+    target_row: dict[str, Any],
+) -> LearningRunResult | None:
+    """Approve a quarantined reference-JD merge (#191 slice 1b).
+
+    The staged row's contribution was inserted suppressed-at-birth because
+    its projected impact tripped the learning-rate cap. Approval means:
+    include it in a FRESH merge over the target's current contributions
+    (never the stage-time snapshot — other contributions may have come or
+    gone since), write through the merge RPC, and only then lift the
+    suppression flag. A refused/crashed write leaves the quarantine intact
+    (the next re-merge self-heals back to the suppressed state).
+    """
+    target_id = cast(str, log_row["target_id"])
+    payload = cast(dict[str, Any], log_row.get("merge_payload") or {})
+    ref_jd_id = payload.get("ref_jd_id")
+
+    ref_jds = targets_crud.list_reference_jds(supabase, target_id)
+    if ref_jd_id is not None and not any(j.id == ref_jd_id for j in ref_jds):
+        # The quarantined contribution was deleted while staged — nothing
+        # to approve. Surfaced as the router's 404.
+        return None
+    # Include the quarantined row in the merge WITHOUT flipping the DB flag
+    # yet — the flag lifts only after the RPC accepts the write.
+    unquarantined = [
+        j.model_copy(update={"suppressed": False}) if j.id == ref_jd_id else j
+        for j in ref_jds
+    ]
+    prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
+    next_profile = merge_reference_jds(unquarantined).model_dump()
+
+    expected_version = cast(int, target_row.get("profile_version") or 1)
+    outcome, rpc_version = apply_profile_merge_rpc(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        next_profile=next_profile,
+        expected_version=expected_version,
+        search_keywords=payload.get("search_keywords"),
+        example_promising=payload.get("example_promising_titles"),
+        example_unpromising=payload.get("example_unpromising_titles"),
+    )
+    if outcome == "version_conflict":
+        raise StagedPatchConflictError(
+            f"target {target_id}: profile moved to v{rpc_version} while "
+            f"applying staged merge {log_row['id']} (read v{expected_version})"
+        )
+    if outcome != "applied":
+        logger.warning(
+            "Staged-merge apply refused by RPC (%s) for (user=%s, target=%s)",
+            outcome,
+            user_id,
+            target_id,
+        )
+        return None
+    new_version = cast(int, rpc_version)
+
+    if ref_jd_id is not None:
+        supabase.table("reference_jds").update({"suppressed": False}).eq(
+            "id", ref_jd_id
+        ).eq("target_id", target_id).execute()
+
+    new_run_id = str(uuid.uuid4())
+    update_resp = (
+        supabase.table(LEARNING_LOG_TABLE)
+        .update(
+            {
+                "status": "applied",
+                "applied_run_id": new_run_id,
+                "prev_profile": prev_profile,
+                "next_profile": next_profile,
+            }
+        )
+        .eq("id", log_row["id"])
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], update_resp.data or [])
+    if not rows:
+        return None
+    # No feedback stamping — a merge consumes no feedback signals.
+    return LearningRunResult(
+        log=TargetLearningLogRow.model_validate(rows[0]),
+        applied=True,
+        profile_version_after=new_version,
+    )
+
+
 def apply_staged_patch(
     supabase: Client, *, user_id: str, run_id: str
 ) -> LearningRunResult | None:
@@ -699,6 +699,16 @@ def apply_staged_patch(
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
+
+    if log_row.get("kind") == "merge":
+        # A quarantined reference-JD merge (#191 slice 1b) — approving it
+        # lifts the contribution's suppression and re-merges fresh.
+        return _apply_staged_merge(
+            supabase,
+            user_id=user_id,
+            log_row=log_row,
+            target_row=target_row,
+        )
 
     # Re-apply the PATCH to the CURRENT profile rather than writing the
     # stage-time `next_profile` snapshot (Copilot on #202): the profile may
@@ -745,7 +755,7 @@ def apply_staged_patch(
     # fully covered — a conflict means a genuinely concurrent write landed
     # mid-apply, and retrying (the router's 409) recomputes from fresh state.
     expected_version = cast(int, target_row.get("profile_version") or 1)
-    outcome, rpc_version = _apply_profile_patch_rpc(
+    outcome, rpc_version = apply_profile_patch_rpc(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -824,7 +834,12 @@ def reject_staged_patch(
     """Mark a staged patch as rejected. Does NOT stamp feedback as
     consumed — those rows stay unapplied so a future learn run can
     revisit them (the user said "no" to this *interpretation*, not to
-    the underlying signal)."""
+    the underlying signal).
+
+    For ``kind='merge'`` rows the status flip is the whole story: the
+    quarantined contribution simply STAYS suppressed (#191 slice 1b) —
+    excluded from every merge — though the vote quorum can still rescue
+    it later through the normal suppression machinery."""
     resp = (
         supabase.table(LEARNING_LOG_TABLE)
         .update({"status": "rejected"})

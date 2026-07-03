@@ -93,6 +93,13 @@ class TargetLearningLogRow(BaseModel):
     # The re-score projection that drove the apply/stage decision (#5 P4).
     # NULL for empty patches, low-confidence stages, and pre-P4 rows.
     projection: dict[str, Any] | None = None
+    # 'patch' = a learner ProfilePatch row; 'merge' = a quarantined
+    # reference-JD merge awaiting review (#191 slice 1b).
+    kind: str = "patch"
+    # For kind='merge': {ref_jd_id, search_keywords, example_promising_
+    # titles, example_unpromising_titles} — what the apply needs to lift the
+    # quarantine and finish the write.
+    merge_payload: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 
