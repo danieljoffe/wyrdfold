@@ -270,23 +270,23 @@ def verify_api_key_or_jwt(
     key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
 ) -> str:
-    """Accept either the shared API key (cron) or a Supabase JWT (user).
+    """Authenticate a user-data route with a Supabase JWT — JWT only.
 
     JWT decode failures are logged at WARNING (no token detail) so a
     spike of invalid tokens is detectable in observability — the
     previous silent swallow was a detection blind spot.
 
-    NOTE (#29 round 3 / H4): this gate intentionally accepts ONLY the legacy
-    ``wyrdfold_api_key`` — NOT ``wyrdfold_cron_key``. The cron key is for
-    the strictly-operator routes (``verify_api_key``) and must never
-    authenticate against the user-data routers this guard protects. Do not
-    add ``wyrdfold_cron_key`` here. (The audit's recommended end-state is to
-    drop api-key acceptance from these user-data routers entirely once cron
-    is migrated to the cron key + the broad key retired — a human-gated
-    config/rollout decision; see the PR body.)
+    NOTE (#29 R3 H4 / #192): this gate NO LONGER accepts any shared API key —
+    neither the broad ``wyrdfold_api_key`` nor the ``wyrdfold_cron_key``. The
+    six user-data routers (jobs / targets / tailor / experience / analysis /
+    sources) are reachable only with a per-user JWT, so a leak of an
+    automation key can no longer authenticate against user data. Shared keys
+    remain valid ONLY on the strictly-operator gate (``verify_api_key``),
+    which accepts both keys. Verified safe: the frontend BFF forwards user
+    routes with the user's Bearer JWT (``lib/api/proxy.ts``) and never the
+    broad key; operator/cron paths hit operator routes. Do not re-add any
+    shared-key branch here.
     """
-    if _api_key_matches(key, s.wyrdfold_api_key):
-        return "api-key"
     if s.supabase_url:
         token = _extract_bearer_token(request)
         if token:
