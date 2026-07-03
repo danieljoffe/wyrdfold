@@ -182,6 +182,10 @@ class Settings(BaseSettings):
     # notifications_sent.sent_at is the alert-dedup ledger; 180d is well
     # past any posting's active life. 0 = keep forever.
     notifications_sent_retention_days: int = Field(default=180, ge=0)
+    # prescan_shadow.observed_at — the pre-scan disagreement shadow log
+    # (#60): explicitly TEMPORARY analysis data with no other lifecycle
+    # (2026-07-02 audit). 30d covers an analysis window; 0 = keep forever.
+    prescan_shadow_retention_days: int = Field(default=30, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
