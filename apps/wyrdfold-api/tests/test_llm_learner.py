@@ -728,13 +728,68 @@ def test_apply_staged_patch_preserves_intervening_changes(
     written = params["p_next_profile"]
     assert written["categories"]["core_skills"]["keywords"] == {"django": 3}
     assert written["negative"]["keywords"] == ["junior", "sales"]
-    # The log flip records the ACTUAL transition, not the stale snapshot.
+    # The log flip records the ACTUAL transition, not the stale snapshot —
+    # including `diff` (the UI renders it; Copilot on #203). No strip
+    # happened here, so it equals the staged patch.
     log_update = next(
         r for r in fake.log
         if r["table"] == "target_learning_log" and r["op"] == "update"
     )["payload"]
     assert log_update["prev_profile"] == current_profile
     assert log_update["next_profile"] == written
+    assert log_update["diff"]["add_negative"] == ["sales"]
+
+
+def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
+    fake: _FakeSupabase,
+) -> None:
+    """Copilot on #203: if the apply-time #47 guard drops a now-self-
+    colliding negative, the applied log row's `diff` (and rationale) must
+    show what was ACTUALLY applied — not the staged edits the UI would
+    otherwise misreport."""
+    fake.push("target_learning_log", "select", [_staged_log_row()])
+    fake.push(
+        "targets",
+        "select",
+        [
+            {
+                "id": "t",
+                "scoring_profile": {
+                    "negative": {"keywords": ["junior"], "weight": -10.0},
+                },
+                "profile_version": 5,
+                # Changed since staging: "sales" now collides with the
+                # target's own search terms → the patch's negative must drop.
+                "search_keywords": ["sales engineer"],
+            }
+        ],
+    )
+    fake.push(
+        "apply_target_profile_patch",
+        "rpc",
+        [{"outcome": "applied", "new_version": 6}],
+    )
+    applied_row = _staged_log_row(status="applied")
+    applied_row["applied_run_id"] = "rid-2"
+    fake.push("target_learning_log", "update", [applied_row])
+    fake.push("job_feedback", "select", [])
+
+    result = apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+
+    assert result is not None
+    # The colliding negative was NOT applied…
+    params = next(
+        r for r in fake.log
+        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+    )["payload"]
+    assert params["p_next_profile"]["negative"]["keywords"] == ["junior"]
+    # …and the audit row says so: diff shrank, rationale carries the note.
+    log_update = next(
+        r for r in fake.log
+        if r["table"] == "target_learning_log" and r["op"] == "update"
+    )["payload"]
+    assert log_update["diff"]["add_negative"] == []
+    assert "self-colliding negatives" in log_update["rationale"]
 
 
 def test_apply_staged_patch_conflict_raises_and_stays_staged(

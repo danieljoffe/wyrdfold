@@ -728,6 +728,16 @@ def apply_staged_patch(
             user_id,
             target_id,
         )
+        # Make the shrink self-explanatory in the audit log / UI — same
+        # bracketed-note convention as the auto-stage paths.
+        stage_patch = stage_patch.model_copy(
+            update={
+                "rationale": (
+                    f"[apply dropped now-self-colliding negatives "
+                    f"{dropped_negatives}] " + stage_patch.rationale
+                )
+            }
+        )
     next_profile = _apply_patch_to_profile(prev_profile, stage_patch)
 
     # Same RPC gate as the auto-apply path (#191). expected_version is the
@@ -761,9 +771,10 @@ def apply_staged_patch(
     # Mark this run as applied + stamp the consumed feedback rows. The run
     # id we generate here is what gets attached to the feedback so the
     # audit thread links back to a single applied event even though the
-    # log row was created earlier with status=staged. prev/next are updated
-    # to the transition that ACTUALLY happened (recomputed against the
-    # current profile) so `prev_profile` stays a truthful one-row revert.
+    # log row was created earlier with status=staged. prev/next/diff (and
+    # the rationale, when the strip dropped negatives) are updated to what
+    # was ACTUALLY applied — the UI renders `diff`, and `prev_profile` must
+    # stay a truthful one-row revert (Copilot on #203).
     new_run_id = str(uuid.uuid4())
     update_resp = (
         supabase.table(LEARNING_LOG_TABLE)
@@ -773,6 +784,8 @@ def apply_staged_patch(
                 "applied_run_id": new_run_id,
                 "prev_profile": prev_profile,
                 "next_profile": next_profile,
+                "diff": stage_patch.model_dump(mode="json"),
+                "rationale": stage_patch.rationale,
             }
         )
         .eq("id", run_id)
