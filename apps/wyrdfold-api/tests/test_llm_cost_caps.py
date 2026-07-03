@@ -96,7 +96,7 @@ def test_hourly_trips_before_monthly(monkeypatch):
     assert exc.value.detail["scope"] == "hourly"
 
 
-# ---- effective_monthly_cap ---------------------------------------------------
+# ---- get_llm_account ---------------------------------------------------------
 
 
 def _supabase_profile(rows: list[dict[str, Any]]) -> MagicMock:
@@ -106,19 +106,27 @@ def _supabase_profile(rows: list[dict[str, Any]]) -> MagicMock:
     return supabase
 
 
-def test_effective_monthly_cap_default_when_no_profile():
+def test_llm_account_defaults_when_no_profile():
     sb = _supabase_profile([])
-    assert budget.effective_monthly_cap(sb, user_id="u-1", default_usd=5.0) == 5.0
+    account = budget.get_llm_account(sb, user_id="u-1")
+    assert account == budget.LlmAccount(None, True, None)
 
 
-def test_effective_monthly_cap_default_when_override_null():
-    sb = _supabase_profile([{"llm_monthly_budget_usd": None}])
-    assert budget.effective_monthly_cap(sb, user_id="u-1", default_usd=5.0) == 5.0
+def test_llm_account_null_override_is_none():
+    sb = _supabase_profile(
+        [{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}]
+    )
+    account = budget.get_llm_account(sb, user_id="u-1")
+    assert account.monthly_override_usd is None
+    assert account.plan == "free"
 
 
-def test_effective_monthly_cap_honors_override():
-    sb = _supabase_profile([{"llm_monthly_budget_usd": 25}])
-    assert budget.effective_monthly_cap(sb, user_id="u-1", default_usd=5.0) == 25.0
+def test_llm_account_reads_override_and_plan():
+    sb = _supabase_profile(
+        [{"llm_monthly_budget_usd": 25, "llm_enabled": False, "plan": "pro"}]
+    )
+    account = budget.get_llm_account(sb, user_id="u-1")
+    assert account == budget.LlmAccount(25.0, False, "pro")
 
 
 # ---- check_daily_count (deep-analysis counter) -------------------------------
