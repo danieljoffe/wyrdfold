@@ -22,8 +22,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from supabase import Client
 
 from app.dependencies import get_supabase
@@ -95,3 +97,40 @@ async def join_waitlist(
         ) from None
 
     return WaitlistSignupResponse(ok=True)
+
+
+class SignupModeResponse(BaseModel):
+    mode: Literal["closed", "open"]
+
+
+# Sync `def`: blocking supabase read in the threadpool (#107).
+@router.get("/signup-mode", response_model=SignupModeResponse)
+@limiter.limit("30/minute")
+def get_signup_mode(
+    request: Request,
+    supabase: Client = Depends(get_supabase),
+) -> SignupModeResponse:
+    """Public perimeter probe (Phase 3 slice 5).
+
+    The FE reads this to decide sign-in vs sign-up presentation
+    (homepage CTA, `shouldCreateUser`). Pre-auth by design — it reveals
+    only whether signup is open, which the signup form itself would
+    reveal anyway. Fail-safe: any read problem reports 'closed', and an
+    unknown value is treated as 'closed' (mirrors the hook's posture).
+    """
+    mode: Literal["closed", "open"] = "closed"
+    try:
+        rows = cast(
+            "list[dict[str, str]]",
+            supabase.table("app_settings")
+            .select("value")
+            .eq("key", "signup_mode")
+            .execute()
+            .data
+            or [],
+        )
+        if rows and rows[0].get("value") == "open":
+            mode = "open"
+    except Exception:
+        logger.warning("signup-mode read failed — reporting closed", exc_info=True)
+    return SignupModeResponse(mode=mode)
