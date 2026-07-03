@@ -40,6 +40,7 @@ from app.routers import (
 from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
 from app.services.llm.errors import LLMServiceError
+from app.services.owner_provisioning import provision_owner
 from app.supabase_pool import close_supabase, get_supabase_pool, init_supabase
 
 _log = logging.getLogger("app")
@@ -185,6 +186,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         await _probe_supabase_keys(settings)
     init_supabase()
+    # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
+    # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
+    # saas mode, when OWNER_EMAIL is unset, or when the owner already exists).
+    # Same test-flag guard as the key probe above: provisioning hits the
+    # auth admin API — a future `with TestClient(app)` test must not create
+    # real users or need a live stack.
+    supabase_for_owner = get_supabase_pool()
+    if (
+        supabase_for_owner is not None
+        and os.environ.get("WYRDFOLD_API_TESTING") != "1"
+    ):
+        provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
     # Background cost-log flush task. Cron paths enqueue rows and the
     # buffer drains them in a single bulk INSERT every few seconds.
