@@ -8,7 +8,9 @@ investigate a warning.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -18,6 +20,8 @@ from app.config import settings
 from app.dependencies import get_supabase, verify_api_key
 from app.services.llm import cost_log
 from app.services.retention import purge_expired_records
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/admin",
@@ -286,3 +290,39 @@ def invite_from_waitlist(
     return WaitlistInviteResult(
         email=email, invited=True, from_waitlist=from_waitlist
     )
+
+
+# ---- Signup-mode switch (Phase 3 slice 5) -----------------------------------
+
+
+class SignupModeRequest(BaseModel):
+    mode: Literal["closed", "open"]
+
+
+class SignupModeResult(BaseModel):
+    mode: str
+
+
+# Sync `def`: blocking supabase write in the threadpool (#107).
+@router.post("/signup-mode", response_model=SignupModeResult)
+def set_signup_mode(
+    body: SignupModeRequest,
+    supabase: Client = Depends(get_supabase),
+) -> SignupModeResult:
+    """The open-signup flip lever (Phase 3 slice 5).
+
+    One operator call switches the before-user-created hook between the
+    beta-invites allowlist ('closed') and public signup ('open') — no
+    Supabase config push, no redeploy. The public `GET /signup-mode`
+    and the FE follow the same row.
+    """
+    supabase.table("app_settings").upsert(
+        {
+            "key": "signup_mode",
+            "value": body.mode,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="key",
+    ).execute()
+    logger.warning("signup_mode set to '%s' by operator", body.mode)
+    return SignupModeResult(mode=body.mode)
