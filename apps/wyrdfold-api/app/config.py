@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     # cron callers (background spend is gated per payer in the poller).
     byok_require_user_keys: bool = False
 
+    # ---- Stripe billing (Phase 3 slice 3; saas mode only) -------------
+    # Secret API key (sk_test_/sk_live_). Empty disables the billing
+    # routes entirely (they 404) — the self_host default: a self-hosted
+    # instance has no subscriptions.
+    stripe_secret_key: str = Field(default="", repr=False)
+    # Webhook endpoint signing secret (whsec_...). The webhook route
+    # refuses everything until this is set — never process an unsigned
+    # billing event.
+    stripe_webhook_secret: str = Field(default="", repr=False)
+    # Recurring monthly Price ids for the managed tiers (test + live mode
+    # each have their own). Unknown/unmapped prices in webhook events are
+    # ignored, never guessed.
+    stripe_starter_price_id: str = ""
+    stripe_pro_price_id: str = ""
+
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 

@@ -23,6 +23,7 @@ from app.rate_limit import limiter
 from app.routers import (
     admin,
     analysis,
+    billing,
     discovery,
     experience,
     feedback,
@@ -397,6 +398,9 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 
 app.include_router(admin.router)
 app.include_router(analysis.router)
+# All /billing routes 404 outside saas mode / without a Stripe key
+# (require_billing) — mounted unconditionally so tests can flip settings.
+app.include_router(billing.router)
 app.include_router(discovery.router)
 app.include_router(experience.router)
 app.include_router(feedback.router)
