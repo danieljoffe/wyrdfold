@@ -391,3 +391,90 @@ async def test_seniority_gate_noop_when_disabled(
     )
     assert n == 2
     assert set(graded) == {"j-dir", "j-coord"}
+
+
+# ---- pre-scan cosine gate (#90 flip) ---------------------------------------
+
+
+def _prom_rows(ids: list[str]) -> list[dict[str, Any]]:
+    return [
+        {"job_posting_id": j, "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1}
+        for j in ids
+    ]
+
+
+def _prom_jobs(ids: list[str]) -> list[dict[str, Any]]:
+    return [{"id": j, "title": "x", "description_html": ""} for j in ids]
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_drops_below_threshold_keeps_admit_and_failopen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
+
+    async def fake_admits(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
+        return {"j-admit": True, "j-drop": False, "j-noop": None}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", fake_admits)
+
+    ids = ["j-admit", "j-drop", "j-noop"]
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)), MagicMock(),
+        target=_target(1), payload=_payload(), jobs=_prom_jobs(ids),
+    )
+    # True admitted, None fail-open admitted, False dropped.
+    assert set(graded) == {"j-admit", "j-noop"}
+    assert "j-drop" not in graded
+    assert n == 2
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_holdout_keeps_a_dropped_job_for_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 1.0)
+
+    async def all_below(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
+        return dict.fromkeys(ids, False)
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", all_below)
+
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])), MagicMock(),
+        target=_target(1), payload=_payload(), jobs=_prom_jobs(["j1"]),
+    )
+    # holdout=1.0 → the would-drop job is graded anyway (to measure FN rate).
+    assert graded == ["j1"]
+    assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_off_is_not_consulted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", False)
+
+    called: list[int] = []
+
+    async def spy(*_a: Any, **_k: Any) -> dict[str, Any]:
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", spy)
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])), MagicMock(),
+        target=_target(1), payload=_payload(), jobs=_prom_jobs(["j1"]),
+    )
+    assert graded == ["j1"]  # ungated
+    assert called == []  # gate never consulted when the flag is off
