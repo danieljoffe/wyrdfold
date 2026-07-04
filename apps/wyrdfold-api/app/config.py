@@ -166,6 +166,16 @@ class Settings(BaseSettings):
     # only the LLM window is capped.
     conversation_history_max_turns: int = Field(default=50, ge=1, le=1000)
 
+    # Default job-list relevance floor (#60 workstream D). When a user hasn't
+    # set their own ``user_profiles.list_min_score`` (NULL), the /jobs list
+    # filters to scores >= this by default so the list surfaces solid matches
+    # rather than the full keyword-noise tail. Not-yet-graded ("Pending") rows
+    # are always exempt (they carry no real fit score yet), and the per-view
+    # ``min_score`` chip always overrides it. An explicit stored 0 opts a user
+    # out entirely; set this to 0 to disable the default floor instance-wide.
+    # 40 = the "solid match" band (aligns with the #89 pre-scan cutoff).
+    default_list_min_score: int = Field(default=40, ge=0, le=100)
+
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
     # every row until an operator chooses a window. When on, the scheduler

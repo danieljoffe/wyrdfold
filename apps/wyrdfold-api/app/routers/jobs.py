@@ -158,18 +158,26 @@ _IN_CHUNK_SIZE = 200
 def _default_min_score_for_user(
     supabase: Client, user_id: str
 ) -> int | None:
-    """Return the user's ``list_min_score`` for use as the default list
-    filter when no ``min_score`` chip is set. ``None`` when:
+    """Return the effective default list floor when no ``min_score`` chip is set.
 
-    - the profile row is missing,
-    - the column is NULL (user hasn't opted in to a default), or
-    - the stored value is 0 (semantic clear — caller wants no floor).
+    Resolution:
+    - a stored positive ``user_profiles.list_min_score`` → that value;
+    - a stored **0** → ``None`` (the user explicitly opted out — no floor);
+    - **NULL / no profile row** (user never set one) → the instance default
+      ``settings.default_list_min_score`` (40 by default; #60 workstream D),
+      so the list surfaces solid matches rather than the full keyword tail.
+
+    Returns ``None`` when the effective floor is 0 (default disabled instance-
+    wide, or user opted out). Not-yet-graded rows are exempt downstream, and
+    the per-view ``min_score`` chip overrides this entirely.
 
     Decoupled from ``job_score_threshold`` (email notifications) and
     ``sms_score_threshold`` (SMS) because those notification UIs are
     disabled until SMTP / Twilio are configured, leaving users no way
     to tune the list view if it were piggybacked on those fields.
     """
+    system_default = settings.default_list_min_score or None
+
     resp = (
         supabase.table("user_profiles")
         .select("list_min_score")
@@ -178,12 +186,16 @@ def _default_min_score_for_user(
         .execute()
     )
     if resp is None:
-        return None
+        return system_default
     row = cast(dict[str, Any] | None, resp.data)
     if row is None:
-        return None
+        return system_default
     value = row.get("list_min_score")
+    if value is None:
+        # Never configured → apply the instance default floor.
+        return system_default
     if not isinstance(value, int) or value <= 0:
+        # Explicit 0 (or a bad value) → the user opted out; no floor.
         return None
     return value
 
