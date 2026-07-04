@@ -38,6 +38,10 @@ from supabase import Client
 from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
+from app.services.embeddings.prescan_gate import (
+    cosine_gate_admits_batch,
+    in_prescan_holdout,
+)
 from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
 from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
@@ -202,6 +206,42 @@ async def run_phase2_for_jobs(
                 len(candidates),
                 target.id,
                 target.seniority_hint,
+            )
+        candidates = kept
+        if not candidates:
+            return 0
+
+    # Pre-scan cosine gate (#90 flip): admit to the LLM grade only where
+    # cosine(job, target) >= the calibrated threshold, replacing the permissive
+    # keyword admission (shadow data: keyword admits ~100%, cosine ~5%). Fail-
+    # open — a None verdict (target uncalibrated / job unvectored) is admitted,
+    # so an unpopulated spine never drops jobs. A deterministic exploration
+    # holdout keeps a small slice of would-drop jobs FOR grading, so the gate's
+    # false-negative rate stays measurable against the shadow log. Flag-off by
+    # default; enabled per-target after calibration (#89).
+    if settings.prescan_gate_enabled:
+        admits = await cosine_gate_admits_batch(supabase, target, candidates)
+        holdout = settings.prescan_gate_holdout_fraction
+        kept = []
+        dropped = held = 0
+        for jid in candidates:
+            if admits.get(jid) is False:
+                if in_prescan_holdout(jid, target.id, holdout):
+                    held += 1
+                    kept.append(jid)  # exploration holdout — grade to measure FN
+                else:
+                    dropped += 1
+                continue
+            kept.append(jid)  # True (>= threshold) or None (fail-open) → admit
+        if dropped or held:
+            logger.info(
+                "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d "
+                "for target %s",
+                dropped,
+                held,
+                len(kept),
+                len(candidates),
+                target.id,
             )
         candidates = kept
         if not candidates:
