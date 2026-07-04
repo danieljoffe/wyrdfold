@@ -128,11 +128,16 @@ def assert_safe_host(hostname: str) -> None:
         raise ValueError(f"hostname did not resolve: {hostname}")
     for addr in addrs:
         if _is_disallowed_address(addr):
+            # Log the specific resolved address for operators, but never echo
+            # it back to the caller: returning the internal IP a hostname
+            # resolved to confirms metadata-endpoint reachability and leaks
+            # internal network topology (#29 R3 H8 / #192). The message stays
+            # generic; the hostname is caller-supplied so it isn't a leak.
             logger.warning(
                 "ssrf_block: %s resolved to disallowed address %s", hostname, addr
             )
             raise ValueError(
-                f"hostname {hostname} resolves to a disallowed address ({addr})"
+                f"hostname {hostname} resolves to a disallowed (private/internal) address"
             )
 
 
@@ -292,7 +297,13 @@ async def validate_job_url(url: str) -> ValidationResult:
     html = ""
 
     try:
-        async with httpx.AsyncClient(timeout=_VALIDATE_TIMEOUT) as client:
+        # The IP-pinning transport backstops the per-hop ``assert_safe_host``
+        # checks below against a DNS rebind between check and connect (#192).
+        from app.services.safe_http import build_ssrf_safe_transport
+
+        async with httpx.AsyncClient(
+            timeout=_VALIDATE_TIMEOUT, transport=build_ssrf_safe_transport()
+        ) as client:
             # Follow redirects manually (follow_redirects=False) so every hop —
             # including each redirect target — is SSRF/banned-checked BEFORE we
             # connect to it. httpx's built-in following would open a connection

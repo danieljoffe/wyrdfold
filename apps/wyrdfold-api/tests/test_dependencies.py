@@ -257,9 +257,14 @@ def test_verify_supabase_jwt_valid_returns_sub():
     assert verify_supabase_jwt(req, s=_settings()) == USER_SUB
 
 
-def test_verify_api_key_or_jwt_accepts_api_key():
+def test_verify_api_key_or_jwt_rejects_broad_api_key():
+    """#29 R3 H4 / #192: the user-data gate is JWT-only — the broad shared
+    key must NOT authenticate against user routers (a leaked key can't reach
+    user data)."""
     req = _make_request()
-    assert verify_api_key_or_jwt(req, key="testkey", s=_settings()) == "api-key"
+    with pytest.raises(HTTPException) as exc:
+        verify_api_key_or_jwt(req, key="testkey", s=_settings())
+    assert exc.value.status_code == 401
 
 
 def test_verify_api_key_or_jwt_accepts_jwt():
@@ -320,14 +325,15 @@ def test_cron_key_is_rejected_by_user_data_gate():
     assert exc.value.status_code == 401
 
 
-def test_legacy_key_still_accepted_by_user_data_gate():
-    """No regression: the legacy key still passes the user-data gate (so
-    nothing breaks until the operator chooses to retire it)."""
+def test_legacy_key_rejected_by_user_data_gate():
+    """#29 R3 H4 / #192: the broad legacy key is now rejected by the user-data
+    gate too (not just the cron key). Both shared keys are barred from user
+    routers; only a JWT authenticates them. Operator routes keep accepting
+    both keys (see ``verify_api_key`` tests above)."""
     req = _make_request()
-    assert (
+    with pytest.raises(HTTPException) as exc:
         verify_api_key_or_jwt(req, key="legacykey", s=_settings_with_cron())
-        == "api-key"
-    )
+    assert exc.value.status_code == 401
 
 
 def test_cron_key_unset_changes_nothing():
@@ -548,7 +554,7 @@ def test_caller_client_jwt_returns_user_client(monkeypatch):
         supabase_anon_key="anon",
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_supabase_for_caller(req, key=None, s=s) is sentinel
+    assert get_supabase_for_caller(req, s=s) is sentinel
 
 
 def test_caller_client_jwt_without_anon_key_503():
@@ -561,35 +567,35 @@ def test_caller_client_jwt_without_anon_key_503():
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, key=None, s=s)
+        get_supabase_for_caller(req, s=s)
     assert exc.value.status_code == 503
 
 
-def test_caller_client_api_key_returns_service_client(monkeypatch):
-    """No bearer + matching api key -> the service-role client."""
+def test_caller_client_api_key_rejected(monkeypatch):
+    """#192 defense-in-depth: an api-key caller (no bearer) gets NO client —
+    401, never the service-role client. A leaked shared key can't obtain an
+    RLS-bypassing client on a user route."""
     import app.supabase_pool as pool
 
-    sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_supabase_pool", lambda: sentinel)
-    req = _make_request()
-    assert get_supabase_for_caller(req, key="testkey", s=_settings()) is sentinel
+    monkeypatch.setattr(pool, "get_supabase_pool", lambda: MagicMock())
+    req = _make_request()  # x-api-key is no longer even read by this dep
+    with pytest.raises(HTTPException) as exc:
+        get_supabase_for_caller(req, s=_settings())
+    assert exc.value.status_code == 401
 
 
-def test_caller_client_invalid_jwt_falls_through_to_api_key(monkeypatch):
-    """A bearer that fails verification doesn't 401 outright if a valid
-    api key is also present — it falls through, matching
-    get_current_user_id_optional."""
-    import app.supabase_pool as pool
-
-    sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_supabase_pool", lambda: sentinel)
+def test_caller_client_invalid_jwt_401():
+    """A bearer that fails verification 401s — there is no api-key fall-back
+    anymore (the user-data gate is JWT-only)."""
     bad = _mint(private_pem=_OTHER_PRIVATE_PEM)  # wrong signature
     req = _make_request({"authorization": f"Bearer {bad}"})
-    assert get_supabase_for_caller(req, key="testkey", s=_settings()) is sentinel
+    with pytest.raises(HTTPException) as exc:
+        get_supabase_for_caller(req, s=_settings())
+    assert exc.value.status_code == 401
 
 
 def test_caller_client_no_auth_401():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, key=None, s=_settings())
+        get_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401

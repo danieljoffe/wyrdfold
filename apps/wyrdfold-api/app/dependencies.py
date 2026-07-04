@@ -62,21 +62,20 @@ def get_user_supabase(
 
 def get_supabase_for_caller(
     request: Request,
-    key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
 ) -> Client:
-    """Pick the right Supabase client for a dual-auth route (#79 Phase 2).
+    """Return the per-request RLS-enforced user client for a JWT caller.
 
-    Mirrors the auth decision in ``get_current_user_id_optional`` so the
-    client and the resolved user id always agree:
+    Used by the dual-auth user routers to scope queries by
+    ``auth.uid() = user_id`` at Postgres (not just in Python). **JWT-only.**
 
-    * Valid JWT  -> per-request RLS-enforced user client (queries scoped
-      by ``auth.uid() = user_id`` at Postgres, not just in Python).
-    * API key    -> service-role client for the legacy single-tenant rows
-      (``user_id IS NULL``); cron/poller/batch have no user token.
-
-    A bearer token that fails verification falls through to the api-key
-    check (and 401s if that also fails), matching the optional-user dep.
+    Since #192 the user-data gate (``verify_api_key_or_jwt``) rejects shared
+    API keys, so no api-key caller reaches the routes that use this. This dep
+    therefore no longer honours the broad key either — defense in depth: a
+    leaked automation key can never obtain a service-role client on a user
+    route, independent of how a future route wires its auth. An absent or
+    unverifiable token 401s (and a JWT with no user client configured 503s,
+    never a silent fall-back to service-role that would bypass RLS).
     """
     if s.supabase_url:
         token = _extract_bearer_token(request)
@@ -97,8 +96,6 @@ def get_supabase_for_caller(
                 from app.supabase_pool import get_user_client
 
                 return get_user_client(token)
-    if _api_key_matches(key, s.wyrdfold_api_key):
-        return get_supabase()
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -270,23 +267,23 @@ def verify_api_key_or_jwt(
     key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
 ) -> str:
-    """Accept either the shared API key (cron) or a Supabase JWT (user).
+    """Authenticate a user-data route with a Supabase JWT — JWT only.
 
     JWT decode failures are logged at WARNING (no token detail) so a
     spike of invalid tokens is detectable in observability — the
     previous silent swallow was a detection blind spot.
 
-    NOTE (#29 round 3 / H4): this gate intentionally accepts ONLY the legacy
-    ``wyrdfold_api_key`` — NOT ``wyrdfold_cron_key``. The cron key is for
-    the strictly-operator routes (``verify_api_key``) and must never
-    authenticate against the user-data routers this guard protects. Do not
-    add ``wyrdfold_cron_key`` here. (The audit's recommended end-state is to
-    drop api-key acceptance from these user-data routers entirely once cron
-    is migrated to the cron key + the broad key retired — a human-gated
-    config/rollout decision; see the PR body.)
+    NOTE (#29 R3 H4 / #192): this gate NO LONGER accepts any shared API key —
+    neither the broad ``wyrdfold_api_key`` nor the ``wyrdfold_cron_key``. The
+    six user-data routers (jobs / targets / tailor / experience / analysis /
+    sources) are reachable only with a per-user JWT, so a leak of an
+    automation key can no longer authenticate against user data. Shared keys
+    remain valid ONLY on the strictly-operator gate (``verify_api_key``),
+    which accepts both keys. Verified safe: the frontend BFF forwards user
+    routes with the user's Bearer JWT (``lib/api/proxy.ts``) and never the
+    broad key; operator/cron paths hit operator routes. Do not re-add any
+    shared-key branch here.
     """
-    if _api_key_matches(key, s.wyrdfold_api_key):
-        return "api-key"
     if s.supabase_url:
         token = _extract_bearer_token(request)
         if token:

@@ -4,7 +4,9 @@ Proves the dedicated cron/automation key (WYRDFOLD_CRON_KEY):
   - authenticates the strictly-operator routes (e.g. POST /poll), and
   - is REJECTED by the user-data routers (e.g. GET /jobs) — the key
     isolation that makes it narrower than the legacy WYRDFOLD_API_KEY.
-And that the legacy key still works on both (no regression).
+The legacy key still authenticates the operator routes, but (#29 R3 H4 /
+#192) is now ALSO rejected by the user-data routers: those are JWT-only, so a
+leak of any shared key can't reach user data.
 """
 
 from __future__ import annotations
@@ -64,12 +66,13 @@ def test_cron_key_is_rejected_on_user_data_router() -> None:
         app.dependency_overrides.clear()
 
 
-def test_legacy_key_still_accepted_on_user_data_router() -> None:
-    """No regression: the legacy key still reaches /jobs (today's behavior).
-    A 200 or any non-401 proves it passed the auth gate."""
+def test_legacy_key_rejected_on_user_data_router() -> None:
+    """#29 R3 H4 / #192: the legacy broad key is now rejected by /jobs too.
+    Both shared keys are barred from user routers — only a JWT gets in — so a
+    leaked automation key can't authenticate against user data."""
     client = _client()
     try:
         res = client.get("/jobs", headers={"x-api-key": "legacykey"})
-        assert res.status_code != 401
+        assert res.status_code == 401
     finally:
         app.dependency_overrides.clear()

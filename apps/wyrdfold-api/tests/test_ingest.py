@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import io
+import zipfile
 
 import pytest
 
+from app.services.ingest import parse as parse_mod
 from app.services.ingest.merge import (
     DEFAULT_PURPOSE as MERGE_PURPOSE,
 )
@@ -18,6 +20,7 @@ from app.services.ingest.parse import (
     MAX_FILE_SIZE,
     ParsedResume,
     ParseError,
+    _assert_docx_within_inflation_limit,
     parse_docx,
     parse_pdf,
     parse_resume,
@@ -79,6 +82,18 @@ def _make_docx_bytes(
     return buf.getvalue()
 
 
+def _make_zip_bomb(inflated_size: int, *, member: str = "word/document.xml") -> bytes:
+    """A zip whose single member decompresses to ``inflated_size`` zero bytes.
+
+    Zeros compress to almost nothing, so this is the classic decompression
+    bomb shape: a few KB on the wire, ``inflated_size`` bytes on parse.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(member, b"\0" * inflated_size)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # PDF parsing
 # ---------------------------------------------------------------------------
@@ -99,6 +114,16 @@ class TestParsePdf:
     def test_corrupt_file_raises(self):
         with pytest.raises(ParseError, match="Failed to parse PDF"):
             parse_pdf(b"not a pdf", "bad.pdf")
+
+    def test_rejects_pdf_over_page_cap(self, monkeypatch: pytest.MonkeyPatch):
+        """#190: a PDF with more pages than the cap is rejected fast, before
+        any per-page text extraction burns CPU — and the rejection surfaces
+        cleanly (not re-wrapped as a generic 'Failed to parse PDF')."""
+        monkeypatch.setattr(parse_mod, "MAX_PDF_PAGES", 0)
+        pdf_bytes = _make_pdf_bytes("one page is already over a cap of 0")
+        with pytest.raises(ParseError, match="too many pages") as exc_info:
+            parse_pdf(pdf_bytes, "many.pdf")
+        assert "Failed to parse PDF" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +146,56 @@ class TestParseDocx:
         assert result.text == ""
 
     def test_corrupt_file_raises(self):
-        with pytest.raises(ParseError, match="Failed to parse DOCX"):
+        # Non-zip bytes are now caught by the inflation guard's zip check
+        # (before python-docx), so the message names the invalid-zip cause.
+        with pytest.raises(ParseError, match="Not a valid DOCX"):
             parse_docx(b"not a docx", "bad.docx")
+
+    def test_normal_docx_passes_inflation_guard(self):
+        """A legitimate résumé-sized DOCX must not trip the guard."""
+        docx_bytes = _make_docx_bytes(["Real resume", "Skills: Python"])
+        # Guard is a no-op (returns None) and the parse succeeds end-to-end.
+        assert _assert_docx_within_inflation_limit(docx_bytes) is None
+        assert "Real resume" in parse_docx(docx_bytes, "ok.docx").text
+
+
+class TestDocxDecompressionBomb:
+    """#190/#29 R1 H3 — reject DOCX zips that inflate past the ceiling."""
+
+    def test_rejects_bomb_over_default_ceiling(self):
+        """A genuine bomb: a few KB compressed, >50 MB inflated → rejected,
+        and parse never materialises the full payload."""
+        inflated = parse_mod.MAX_DOCX_INFLATED_BYTES + (1 * 1024 * 1024)
+        bomb = _make_zip_bomb(inflated)
+        # The tiny-in / huge-out property: the fixture itself is small.
+        assert len(bomb) < 1 * 1024 * 1024
+        with pytest.raises(ParseError, match="zip bomb"):
+            parse_docx(bomb, "bomb.docx")
+
+    def test_ceiling_is_the_decision_boundary(self, monkeypatch: pytest.MonkeyPatch):
+        """Guard rejects just over the ceiling and passes just under it —
+        proving the limit is enforced on *actual* decompressed bytes."""
+        monkeypatch.setattr(parse_mod, "MAX_DOCX_INFLATED_BYTES", 1 * 1024 * 1024)
+
+        over = _make_zip_bomb(2 * 1024 * 1024)
+        with pytest.raises(ParseError, match="zip bomb"):
+            _assert_docx_within_inflation_limit(over)
+
+        under = _make_zip_bomb(512 * 1024)  # half the (patched) ceiling
+        assert _assert_docx_within_inflation_limit(under) is None
+
+    def test_rejects_too_many_members(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(parse_mod, "MAX_DOCX_MEMBERS", 3)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i in range(5):
+                zf.writestr(f"part{i}.xml", b"x")
+        with pytest.raises(ParseError, match="too many parts"):
+            _assert_docx_within_inflation_limit(buf.getvalue())
+
+    def test_non_zip_rejected_by_guard(self):
+        with pytest.raises(ParseError, match="Not a valid DOCX"):
+            _assert_docx_within_inflation_limit(b"definitely not a zip")
 
 
 # ---------------------------------------------------------------------------
