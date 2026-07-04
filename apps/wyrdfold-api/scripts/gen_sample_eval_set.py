@@ -128,26 +128,31 @@ _TARGETS: dict[str, JobTarget] = {
     ),
 }
 
-_TITLES: dict[str, list[str]] = {
+# Each title carries its by-construction ground-truth label
+# (``expected_promising``) — these are deliberately clear-cut on/off-target for
+# the target, so labeling them is making the fixture's designed intent explicit,
+# NOT a subjective judgment. This is what lets the eval measure *correctness*
+# (recall/precision vs truth) and not merely cross-model agreement (#193).
+_TITLES: dict[str, list[tuple[str, bool]]] = {
     "t-fe": [
-        "Staff Frontend Engineer",
-        "Senior React Engineer",
-        "Frontend Engineer, Design Systems",
-        "Senior Software Engineer (Frontend)",
-        "Lead UI Engineer",
-        "Account Executive",
-        "Sales Manager",
-        "Data Scientist",
+        ("Staff Frontend Engineer", True),
+        ("Senior React Engineer", True),
+        ("Frontend Engineer, Design Systems", True),
+        ("Senior Software Engineer (Frontend)", True),
+        ("Lead UI Engineer", True),
+        ("Account Executive", False),
+        ("Sales Manager", False),
+        ("Data Scientist", False),
     ],
     "t-cx": [
-        "Director of CX Operations",
-        "Head of Customer Experience",
-        "Senior Manager, Support Operations",
-        "Director of Customer Success",
-        "Frontend Engineer",
-        "Graphic Designer",
-        "Warehouse Associate",
-        "Sales Development Representative",
+        ("Director of CX Operations", True),
+        ("Head of Customer Experience", True),
+        ("Senior Manager, Support Operations", True),
+        ("Director of Customer Success", True),
+        ("Frontend Engineer", False),
+        ("Graphic Designer", False),
+        ("Warehouse Associate", False),
+        ("Sales Development Representative", False),
     ],
 }
 
@@ -163,7 +168,9 @@ def build_eval_set() -> dict[str, Any]:
         for tid, t in _TARGETS.items()
     }
     cases = [
-        {"target_id": tid, "title": title} for tid, titles in _TITLES.items() for title in titles
+        {"target_id": tid, "title": title, "expected_promising": expected}
+        for tid, titles in _TITLES.items()
+        for title, expected in titles
     ]
     return {"targets": targets, "cases": cases, "synthetic": True}
 

@@ -28,6 +28,15 @@ def test_sample_eval_set_is_consumable_by_the_eval_loaders() -> None:
     for case in fx["cases"]:
         assert case["target_id"] in fx["targets"]
         assert case.get("title")
+        # #193: every synthetic case carries a by-construction ground-truth
+        # label so the eval can measure correctness (recall/precision), not
+        # just cross-model agreement.
+        assert isinstance(case.get("expected_promising"), bool)
+
+    # Both classes present (a labeled set with only one class can't measure
+    # both recall and precision).
+    labels = {c["expected_promising"] for c in fx["cases"]}
+    assert labels == {True, False}
 
     # eval_derive_target: _load_payload reads the first target's payload as
     # an OptimizedPayload.
