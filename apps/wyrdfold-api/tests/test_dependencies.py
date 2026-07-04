@@ -554,7 +554,7 @@ def test_caller_client_jwt_returns_user_client(monkeypatch):
         supabase_anon_key="anon",
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_supabase_for_caller(req, key=None, s=s) is sentinel
+    assert get_supabase_for_caller(req, s=s) is sentinel
 
 
 def test_caller_client_jwt_without_anon_key_503():
@@ -567,35 +567,35 @@ def test_caller_client_jwt_without_anon_key_503():
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, key=None, s=s)
+        get_supabase_for_caller(req, s=s)
     assert exc.value.status_code == 503
 
 
-def test_caller_client_api_key_returns_service_client(monkeypatch):
-    """No bearer + matching api key -> the service-role client."""
+def test_caller_client_api_key_rejected(monkeypatch):
+    """#192 defense-in-depth: an api-key caller (no bearer) gets NO client —
+    401, never the service-role client. A leaked shared key can't obtain an
+    RLS-bypassing client on a user route."""
     import app.supabase_pool as pool
 
-    sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_supabase_pool", lambda: sentinel)
-    req = _make_request()
-    assert get_supabase_for_caller(req, key="testkey", s=_settings()) is sentinel
+    monkeypatch.setattr(pool, "get_supabase_pool", lambda: MagicMock())
+    req = _make_request()  # x-api-key is no longer even read by this dep
+    with pytest.raises(HTTPException) as exc:
+        get_supabase_for_caller(req, s=_settings())
+    assert exc.value.status_code == 401
 
 
-def test_caller_client_invalid_jwt_falls_through_to_api_key(monkeypatch):
-    """A bearer that fails verification doesn't 401 outright if a valid
-    api key is also present — it falls through, matching
-    get_current_user_id_optional."""
-    import app.supabase_pool as pool
-
-    sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_supabase_pool", lambda: sentinel)
+def test_caller_client_invalid_jwt_401():
+    """A bearer that fails verification 401s — there is no api-key fall-back
+    anymore (the user-data gate is JWT-only)."""
     bad = _mint(private_pem=_OTHER_PRIVATE_PEM)  # wrong signature
     req = _make_request({"authorization": f"Bearer {bad}"})
-    assert get_supabase_for_caller(req, key="testkey", s=_settings()) is sentinel
+    with pytest.raises(HTTPException) as exc:
+        get_supabase_for_caller(req, s=_settings())
+    assert exc.value.status_code == 401
 
 
 def test_caller_client_no_auth_401():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, key=None, s=_settings())
+        get_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
