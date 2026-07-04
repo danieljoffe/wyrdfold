@@ -118,6 +118,21 @@ def _titles_by_target(fixture: dict[str, Any]) -> dict[str, list[str]]:
     return dict(groups)
 
 
+def _labels_by_target(fixture: dict[str, Any]) -> dict[str, dict[str, bool]]:
+    """Ground-truth ``{target_id: {title: expected_promising}}`` from the
+    fixture cases. Empty when the fixture carries no labels (e.g. a real-data
+    snapshot) — the correctness report is then simply skipped, so drift-only
+    fixtures keep working. See #193."""
+    labels: dict[str, dict[str, bool]] = defaultdict(dict)
+    for case in fixture["cases"]:
+        tid = case["target_id"]
+        title = case.get("title") or ""
+        expected = case.get("expected_promising")
+        if title and isinstance(expected, bool):
+            labels[tid][title] = expected
+    return {tid: m for tid, m in labels.items() if m}
+
+
 def _chunk(seq: list[str], size: int) -> list[list[str]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
@@ -384,6 +399,70 @@ def _agreement_report(
     }
 
 
+def _correctness_report(
+    results: list[dict[str, Any]],
+    titles_by_target: dict[str, list[str]],
+    labels_by_target: dict[str, dict[str, bool]],
+    *,
+    batch_size: int,
+) -> dict[str, dict[str, Any]]:
+    """Per-model correctness vs the fixture's ground-truth labels (#193).
+
+    Unlike ``_agreement_report`` (model-vs-reference *drift*), this scores each
+    model's PROMISING verdicts against the labeled expectation: recall (of the
+    truly-promising titles, how many the model caught), precision, false-
+    negative rate, and accuracy. Returns ``{}`` when the fixture carries no
+    labels (a real-data snapshot), so drift-only fixtures are unaffected.
+
+    Verdict ids are 1-based positions within each (target, chunk); we rebuild
+    the same chunking to map ``(target, chunk, id) -> title -> label``.
+    """
+    if not labels_by_target:
+        return {}
+
+    label_by_key: dict[tuple[str, int, int], bool] = {}
+    for tid, titles in titles_by_target.items():
+        target_labels = labels_by_target.get(tid, {})
+        for ci, chunk in enumerate(_chunk(titles, batch_size)):
+            for pos, title in enumerate(chunk, start=1):
+                if title in target_labels:
+                    label_by_key[(tid, ci, pos)] = target_labels[title]
+
+    tally: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"tp": 0, "fp": 0, "tn": 0, "fn": 0, "scored": 0, "unlabeled": 0}
+    )
+    for r in results:
+        acc = tally[r["model"]]
+        for vid, pred in (r["verdicts"] or {}).items():
+            label = label_by_key.get((r["target_id"], r["chunk_idx"], vid))
+            if label is None:
+                acc["unlabeled"] += 1
+                continue
+            acc["scored"] += 1
+            if label and pred:
+                acc["tp"] += 1
+            elif label and not pred:
+                acc["fn"] += 1
+            elif (not label) and pred:
+                acc["fp"] += 1
+            else:
+                acc["tn"] += 1
+
+    out: dict[str, dict[str, Any]] = {}
+    for model, c in tally.items():
+        tp, fp, tn, fn = c["tp"], c["fp"], c["tn"], c["fn"]
+        out[model] = {
+            "scored": c["scored"],
+            "recall": round(tp / max(1, tp + fn), 4),
+            "precision": round(tp / max(1, tp + fp), 4),
+            "false_negative_rate": round(fn / max(1, tp + fn), 4),
+            "accuracy": round((tp + tn) / max(1, tp + fp + tn + fn), 4),
+            "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
+            "unlabeled_verdicts": c["unlabeled"],
+        }
+    return out
+
+
 def _write_report(
     *,
     final: dict[str, Any],
@@ -551,6 +630,17 @@ def main() -> None:
     )
 
     report = _agreement_report(final["results"], titles_by_target, models)
+    # Correctness vs ground-truth labels when the fixture carries them (#193):
+    # measures each model against TRUTH, not just cross-model agreement. Skipped
+    # (empty) for unlabeled real-data snapshots.
+    correctness = _correctness_report(
+        final["results"],
+        titles_by_target,
+        _labels_by_target(fixture),
+        batch_size=args.batch_size,
+    )
+    if correctness:
+        report["per_model_correctness"] = correctness
     _write_report(
         final=final,
         report=report,
@@ -567,6 +657,15 @@ def main() -> None:
             deepseek.get("agreement_rate", 0) * 100,
             deepseek.get("false_positive_rate", 0) * 100,
             deepseek.get("false_negative_rate", 0) * 100,
+        )
+    for model, c in correctness.items():
+        logger.info(
+            "%s vs labels: recall=%.1f%% precision=%.1f%% accuracy=%.1f%% (n=%d)",
+            model,
+            c["recall"] * 100,
+            c["precision"] * 100,
+            c["accuracy"] * 100,
+            c["scored"],
         )
 
 
