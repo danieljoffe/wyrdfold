@@ -42,7 +42,13 @@ from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
 from app.services.llm.errors import LLMServiceError
 from app.services.owner_provisioning import provision_owner
-from app.supabase_pool import close_supabase, get_supabase_pool, init_supabase
+from app.supabase_pool import (
+    close_async_supabase,
+    close_supabase,
+    get_supabase_pool,
+    init_async_supabase,
+    init_supabase,
+)
 
 _log = logging.getLogger("app")
 
@@ -187,6 +193,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         await _probe_supabase_keys(settings)
     init_supabase()
+    # Async service-role client (#57), stood up alongside the sync one for the
+    # incremental poller migration. No-op when Supabase isn't configured.
+    await init_async_supabase()
     # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
     # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
     # saas mode, when OWNER_EMAIL is unset, or when the owner already exists).
@@ -215,6 +224,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if supabase_for_buffer is not None:
             await cost_log_buffer.stop(supabase_for_buffer)
         close_supabase()
+        await close_async_supabase()
         await close_http_client()
         await close_safe_http_client()
 
