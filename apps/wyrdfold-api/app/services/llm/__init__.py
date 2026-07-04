@@ -18,6 +18,7 @@ string so cost-log rows can be grouped by feature for spend analysis.
 """
 
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from app.services.llm.anthropic_client import AnthropicLLMClient
@@ -39,7 +40,42 @@ __all__ = [
     "OpenRouterLLMClient",
     "get_client",
     "get_default_client",
+    "reset_llm_client_cache",
 ]
+
+# A provider client wraps an ``httpx`` connection pool; building one per request
+# (the previous behavior) opened a fresh pool + TLS handshake to the provider on
+# every call — the httpx anti-pattern. These memoize the client per
+# ``(api_key, timeout, max_retries)`` so the pool is reused across requests
+# (#192 P-H3). Bounded so a stream of distinct BYOK keys can't grow the cache
+# without limit; the mock is deliberately NOT cached (it holds no pool and tests
+# want a fresh instance). ``reset_llm_client_cache`` clears both — used in test
+# setup so cached clients don't leak across tests.
+_CLIENT_CACHE_SIZE = 32
+
+
+@lru_cache(maxsize=_CLIENT_CACHE_SIZE)
+def _cached_anthropic(
+    api_key: str | None, timeout: float, max_retries: int
+) -> AnthropicLLMClient:
+    return AnthropicLLMClient(
+        api_key=api_key, timeout=timeout, max_retries=max_retries
+    )
+
+
+@lru_cache(maxsize=_CLIENT_CACHE_SIZE)
+def _cached_openrouter(
+    api_key: str | None, timeout: float, max_retries: int
+) -> OpenRouterLLMClient:
+    return OpenRouterLLMClient(
+        api_key=api_key, timeout=timeout, max_retries=max_retries
+    )
+
+
+def reset_llm_client_cache() -> None:
+    """Clear the cached provider clients (test isolation / config changes)."""
+    _cached_anthropic.cache_clear()
+    _cached_openrouter.cache_clear()
 
 
 def get_default_client() -> LLMClient:
@@ -47,21 +83,23 @@ def get_default_client() -> LLMClient:
 
     Reads `settings.llm_provider`. `"anthropic"` and `"openrouter"`
     require their respective API keys to be set (`anthropic_api_key`
-    / `openrouter_api_key`); anything else falls back to the mock.
+    / `openrouter_api_key`); anything else falls back to the mock. Real
+    provider clients are pooled/reused across requests (see
+    ``_cached_*`` — #192 P-H3); the mock is always fresh.
     """
     from app.config import settings
 
     if settings.llm_provider == "anthropic":
-        return AnthropicLLMClient(
-            api_key=settings.anthropic_api_key or None,
-            timeout=settings.anthropic_timeout_seconds,
-            max_retries=settings.anthropic_max_retries,
+        return _cached_anthropic(
+            settings.anthropic_api_key or None,
+            settings.anthropic_timeout_seconds,
+            settings.anthropic_max_retries,
         )
     if settings.llm_provider == "openrouter":
-        return OpenRouterLLMClient(
-            api_key=settings.openrouter_api_key or None,
-            timeout=settings.openrouter_timeout_seconds,
-            max_retries=settings.openrouter_max_retries,
+        return _cached_openrouter(
+            settings.openrouter_api_key or None,
+            settings.openrouter_timeout_seconds,
+            settings.openrouter_max_retries,
         )
     return MockLLMClient()
 
@@ -97,10 +135,10 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
     if user_id and supabase is not None:
         user_key = _user_byok_key(supabase, user_id)
         if user_key:
-            return OpenRouterLLMClient(
-                api_key=user_key,
-                timeout=settings.openrouter_timeout_seconds,
-                max_retries=settings.openrouter_max_retries,
+            return _cached_openrouter(
+                user_key,
+                settings.openrouter_timeout_seconds,
+                settings.openrouter_max_retries,
             )
         # Global flag (the pre-tier hosted posture) OR the user's plan
         # requires their own key (saas free tier, Phase 3 slice 2).
