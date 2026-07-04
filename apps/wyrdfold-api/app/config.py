@@ -176,6 +176,22 @@ class Settings(BaseSettings):
     # 40 = the "solid match" band (aligns with the #89 pre-scan cutoff).
     default_list_min_score: int = Field(default=40, ge=0, le=100)
 
+    # Pre-scan cosine gate — the #90 flip. When True, Phase-2 grading candidacy
+    # is gated on cosine(job, target) >= target.prescan_cosine_threshold,
+    # replacing the permissive keyword admission the shadow data showed admits
+    # ~100% (#60/#90). FAIL-OPEN by construction: a target with no calibrated
+    # threshold / embedding, or a job with no vector, is admitted — an
+    # unpopulated spine never silently drops jobs. Default off; flip per target
+    # once its threshold is calibrated (#89).
+    prescan_gate_enabled: bool = False
+    # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
+    # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
+    # false-negative rate (dropped-but-actually-high-fit) is measurable against
+    # the shadow log (prescan_shadow.cosine_admit=false joined to a resulting
+    # complete grade). 0 disables the holdout. Kept small — it spends grades on
+    # would-drop jobs, but the gate frees ample daily-cap headroom.
+    prescan_gate_holdout_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
+
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
     # every row until an operator chooses a window. When on, the scheduler
