@@ -17,11 +17,21 @@ from __future__ import annotations
 
 import httpx
 from postgrest.constants import DEFAULT_POSTGREST_CLIENT_TIMEOUT
-from supabase import Client, ClientOptions, create_client
+from supabase import AsyncClient, Client, ClientOptions, acreate_client, create_client
+from supabase.lib.client_options import AsyncClientOptions
 
 from app.config import settings
 
 _client: Client | None = None
+
+# Async service-role client (#57). Stood up alongside the sync ``_client`` so the
+# poller's hot DB paths can migrate off ``asyncio.to_thread`` onto native
+# coroutines one module at a time. Created in the app lifespan (``acreate_client``
+# is async) and reused across requests within the single event loop. Not wired
+# into any call path yet — this is the foundation slice; the migration is
+# incremental + load-tested (see #57).
+_async_client: AsyncClient | None = None
+_async_httpx: httpx.AsyncClient | None = None
 
 # Shared httpx connection pool for the per-request user clients. httpx
 # clients are thread-safe for requests, so one pool serves the whole
@@ -57,6 +67,67 @@ def _build_http1_client() -> httpx.Client:
         follow_redirects=True,
         timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
     )
+
+
+# Bound the async client's connection pool so the migrated poller fan-out can't
+# open more sockets to the Supabase pooler (PgBouncer, transaction mode) than it
+# can take. Sized for the poll burst with headroom; the per-op concurrency will
+# also be gated by an asyncio.Semaphore when the hot paths migrate (#57). HTTP/2
+# multiplexes many requests over few connections, so this is generous.
+_ASYNC_MAX_CONNECTIONS = 20
+_ASYNC_MAX_KEEPALIVE = 10
+
+
+def _build_async_http2_client() -> httpx.AsyncClient:
+    """httpx.AsyncClient for the async service-role client — HTTP/2 ON.
+
+    The *sync* client is pinned to HTTP/1.1 because httpcore's sync HTTP/2
+    connection isn't thread-safe under the poller's ``to_thread`` fan-out (see
+    ``_build_http1_client``). The async client has no such problem: it runs
+    entirely in one event loop, where httpx's HTTP/2 IS concurrency-safe. So we
+    re-enable HTTP/2 here (multiplexing → fewer connections to the pooler, fewer
+    handshakes) — the payoff #57 is after. Connection limits keep the pooler
+    safe under the migrated poll burst.
+    """
+    return httpx.AsyncClient(
+        http2=True,
+        follow_redirects=True,
+        timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
+        limits=httpx.Limits(
+            max_connections=_ASYNC_MAX_CONNECTIONS,
+            max_keepalive_connections=_ASYNC_MAX_KEEPALIVE,
+        ),
+    )
+
+
+async def init_async_supabase() -> None:
+    """Create the async service-role client (#57). Await in the app lifespan.
+
+    No-op when Supabase isn't configured (same guard as ``init_supabase``), so
+    local/test runs without a service-role key simply have no async client.
+    """
+    global _async_client, _async_httpx
+    if settings.supabase_url and settings.supabase_service_role_key:
+        _async_httpx = _build_async_http2_client()
+        options = AsyncClientOptions(httpx_client=_async_httpx)
+        _async_client = await acreate_client(
+            settings.supabase_url,
+            settings.supabase_service_role_key,
+            options,
+        )
+
+
+def get_async_supabase() -> AsyncClient | None:
+    """The async service-role client, or None when unconfigured/not yet inited."""
+    return _async_client
+
+
+async def close_async_supabase() -> None:
+    global _async_client, _async_httpx
+    _async_client = None
+    if _async_httpx is not None:
+        await _async_httpx.aclose()
+        _async_httpx = None
 
 
 def init_supabase() -> None:

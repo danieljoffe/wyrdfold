@@ -37,7 +37,7 @@ def _clear_caches():
 
 @pytest.fixture(autouse=True)
 def _reset_http_client():
-    """Reset the module-level cached httpx client between tests.
+    """Reset module-level cached httpx-backed clients between tests.
 
     `app.http_client.get_http_client()` lazily caches an `AsyncClient`
     bound to whichever event loop first triggered creation. With
@@ -46,12 +46,25 @@ def _reset_http_client():
     with `RuntimeError: Event loop is closed`. Clearing the reference
     on entry makes each test create a fresh client on its own loop.
     See #28.
+
+    Also resets the SSRF-safe client (#192) and the pooled LLM/embeddings
+    provider clients (#192 P-H3): those wrap the same loop-bound
+    `AsyncClient`, so a client cached in one test's loop would blow up the
+    next test with `Event loop is closed`.
     """
     import app.http_client as http_mod
+    from app.services.embeddings import reset_embeddings_client_cache
+    from app.services.llm import reset_llm_client_cache
 
-    http_mod._client = None
+    def _reset() -> None:
+        http_mod._client = None
+        http_mod._safe_client = None
+        reset_llm_client_cache()
+        reset_embeddings_client_cache()
+
+    _reset()
     yield
-    http_mod._client = None
+    _reset()
 
 
 @pytest.fixture(autouse=True)

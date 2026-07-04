@@ -1,0 +1,52 @@
+# Docker build context is the monorepo root (railway.toml dockerfilePath =
+# apps/wyrdfold-api/Dockerfile). Without this file the ENTIRE monorepo
+# (node_modules, .git, .nx, every app's build output) is streamed to the
+# builder as context on every build. The API Dockerfile only COPYs the root
+# pyproject.toml + uv.lock, apps/wyrdfold-api/pyproject.toml, and
+# apps/wyrdfold-api/app — so everything below is safe to exclude from the
+# context (excluding it never changes what COPY includes; it only shrinks the
+# upload). Keep those four paths OUT of this list. (#192 / #29 M-r2-2)
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Node / JS tooling (frontend is Vercel-built, never in a Docker build)
+**/node_modules
+**/.next
+**/.turbo
+**/.cache
+.nx
+
+# Python virtualenvs, caches, compiled artifacts
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/coverage
+**/htmlcov
+
+# Tests are never copied into the runtime image
+**/tests
+
+# Secrets / local env — must never enter the build context
+**/.env
+**/.env.*
+!**/.env.example
+
+# Editor / OS cruft
+**/.DS_Store
+**/.idea
+**/.vscode
+
+# Docs, CI, agent scaffolding — irrelevant to the image
+**/*.md
+.github
+.claude
+audit
