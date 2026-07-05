@@ -32,8 +32,46 @@ from app.models.targets import JobTarget
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import record as record_llm_cost
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
+
+
+async def _apply_scores_update(
+    supabase: Client,
+    *,
+    job_posting_id: str,
+    target_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Persist a ``scores`` UPDATE for one (job, target).
+
+    #57 herd migration: when ``POLLER_ASYNC_DB`` is on AND the async
+    service-role client is initialised, run the write natively on the event
+    loop through that pooled HTTP/2 client — its connection pool bounds
+    concurrency without consuming the shared executor's threads, which is the
+    whole point (the poll's write fan-out stops starving interactive requests).
+    Otherwise fall back to the sync client in a thread (the #107 convention).
+    FAIL-SAFE: a missing async client falls back to sync, never drops the write.
+    """
+    if settings.poller_async_db:
+        async_sb = get_async_supabase()
+        if async_sb is not None:
+            await (
+                async_sb.table("scores")
+                .update(payload)
+                .eq("job_posting_id", job_posting_id)
+                .eq("target_id", target_id)
+                .execute()
+            )
+            return
+    await asyncio.to_thread(
+        lambda: supabase.table("scores")
+        .update(payload)
+        .eq("job_posting_id", job_posting_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
 
 
 async def score_with_phase2_and_persist(
@@ -71,19 +109,16 @@ async def score_with_phase2_and_persist(
     # `stage2` and re-admits it for a real grade. (#47)
     if not jd_text.strip():
         try:
-            await asyncio.to_thread(
-                lambda: supabase.table("scores")
-                .update(
-                    {
-                        "excluded": True,
-                        "scoring_status": "complete",
-                        "scored_profile_version": target.profile_version,
-                        "updated_at": datetime.now(UTC).isoformat(),
-                    }
-                )
-                .eq("job_posting_id", job_posting_id)
-                .eq("target_id", target.id)
-                .execute()
+            await _apply_scores_update(
+                supabase,
+                job_posting_id=job_posting_id,
+                target_id=target.id,
+                payload={
+                    "excluded": True,
+                    "scoring_status": "complete",
+                    "scored_profile_version": target.profile_version,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
             )
         except Exception:
             logger.exception(
@@ -156,14 +191,14 @@ async def score_with_phase2_and_persist(
         # rather than blowing away historical logistics data.
         if fit.logistics is not None:
             update_payload["logistics_filters"] = fit.logistics.model_dump()
-        # Offload the blocking supabase round-trip so the persist step
-        # doesn't stall the event loop the Phase-2 fan-out runs on (#107).
-        await asyncio.to_thread(
-            lambda: supabase.table("scores")
-            .update(update_payload)
-            .eq("job_posting_id", job_posting_id)
-            .eq("target_id", target.id)
-            .execute()
+        # Persist via the async client (#57) or the sync thread (#107) —
+        # see ``_apply_scores_update``. Either way the write never stalls the
+        # event loop the Phase-2 fan-out runs on.
+        await _apply_scores_update(
+            supabase,
+            job_posting_id=job_posting_id,
+            target_id=target.id,
+            payload=update_payload,
         )
     except Exception:
         logger.exception(
