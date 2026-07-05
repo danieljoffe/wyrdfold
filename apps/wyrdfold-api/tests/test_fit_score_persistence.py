@@ -244,3 +244,104 @@ async def test_persist_failure_still_records_cost(
 
     assert result is None
     assert cost_calls == [1]
+
+
+# ---- #57: async DB path (POLLER_ASYNC_DB) ----------------------------------
+
+_SP = "app.services.fit.score_persistence"
+
+
+class _AsyncQuery:
+    """Mock async supabase query chain — table/update/eq return self, execute
+    is awaitable. Records the update payload so tests can assert the async path
+    carried it."""
+
+    def __init__(self, sink: dict[str, object]) -> None:
+        self._sink = sink
+
+    def table(self, name: str) -> _AsyncQuery:
+        self._sink["table"] = name
+        return self
+
+    def update(self, payload: dict[str, object]) -> _AsyncQuery:
+        self._sink["update"] = payload
+        return self
+
+    def eq(self, col: str, val: object) -> _AsyncQuery:
+        self._sink.setdefault("eqs", []).append((col, val))  # type: ignore[union-attr]
+        return self
+
+    async def execute(self) -> object:
+        self._sink["executed"] = True
+        return MagicMock(data=[])
+
+
+def _patch_grade(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_derive(*a: object, **k: object) -> object:
+        return (_fake_fit(), MagicMock())
+
+    monkeypatch.setattr(f"{_SP}.derive_job_fit", fake_derive)
+    monkeypatch.setattr(f"{_SP}.record_llm_cost", lambda *a, **k: MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_async_path_used_when_flag_on_and_client_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_grade(monkeypatch)
+    sink: dict[str, object] = {}
+    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", True)
+    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: _AsyncQuery(sink))
+
+    supabase = MagicMock()
+    result = await score_with_phase2_and_persist(
+        supabase, MagicMock(), payload=_payload(), target=_target(),
+        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
+    )
+
+    assert result is not None
+    # The write went through the ASYNC client...
+    assert sink["table"] == "scores"
+    assert sink["update"]["score"] == 82  # type: ignore[index]
+    assert sink["executed"] is True
+    assert ("job_posting_id", "job-1") in sink["eqs"]  # type: ignore[operator]
+    # ...and NOT the sync client.
+    assert supabase.table.return_value.update.called is False
+
+
+@pytest.mark.asyncio
+async def test_flag_on_but_no_async_client_falls_back_to_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_grade(monkeypatch)
+    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", True)
+    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: None)  # not initialised
+
+    supabase = MagicMock()
+    result = await score_with_phase2_and_persist(
+        supabase, MagicMock(), payload=_payload(), target=_target(),
+        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
+    )
+
+    assert result is not None
+    # Fail-safe: the sync client took the write.
+    assert supabase.table.return_value.update.call_args.args[0]["score"] == 82
+
+
+@pytest.mark.asyncio
+async def test_flag_off_uses_sync_and_never_consults_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_grade(monkeypatch)
+    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", False)
+    called = []
+    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: called.append(1))
+
+    supabase = MagicMock()
+    await score_with_phase2_and_persist(
+        supabase, MagicMock(), payload=_payload(), target=_target(),
+        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
+    )
+
+    assert supabase.table.return_value.update.called is True
+    assert called == []  # async client not even looked up when the flag is off

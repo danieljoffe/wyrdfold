@@ -192,6 +192,15 @@ class Settings(BaseSettings):
     # would-drop jobs, but the gate frees ample daily-cap headroom.
     prescan_gate_holdout_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
 
+    # Poller async DB migration (#57). When True, hot poll-cycle DB writes run
+    # on the native async service-role client (HTTP/2, its own bounded pool)
+    # instead of the sync client in an ``asyncio.to_thread`` — so the poll's
+    # write herd stops competing for the shared ~40-thread executor with
+    # interactive requests. FAIL-SAFE: if the async client isn't initialised the
+    # call falls back to the sync/thread path, never dropping the write. Default
+    # off; flipped per the migration rollout after the before/after load test.
+    poller_async_db: bool = False
+
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
     # every row until an operator chooses a window. When on, the scheduler
