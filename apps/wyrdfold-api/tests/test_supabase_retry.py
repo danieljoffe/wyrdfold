@@ -13,7 +13,7 @@ from app.services.supabase_retry import (
 
 
 class _Counter:
-    """Helper to build a function that fails N times then succeeds."""
+    """Helper to build a sync function that fails N times then succeeds."""
 
     def __init__(self, fail_times: int, exc: Exception, success_value: Any = "ok"):
         self.fail_times = fail_times
@@ -28,12 +28,35 @@ class _Counter:
         return self.success_value
 
 
+class _AsyncCounter:
+    """Async callable that fails N times then succeeds — for the loop-native
+    ``execute_with_retry`` (awaits the callable, no thread)."""
+
+    def __init__(self, fail_times: int, exc: Exception, success_value: Any = "ok"):
+        self.fail_times = fail_times
+        self.exc = exc
+        self.success_value = success_value
+        self.calls = 0
+
+    async def __call__(self) -> Any:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise self.exc
+        return self.success_value
+
+
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    """Skip the retry backoff in tests so they don't burn wall-clock."""
+    """Skip the retry backoff in tests so they don't burn wall-clock — both the
+    sync ``time.sleep`` and the async ``asyncio.sleep`` paths."""
     import app.services.supabase_retry as mod
 
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    async def _instant(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(mod.asyncio, "sleep", _instant)
     yield
 
 
@@ -96,8 +119,27 @@ def test_does_not_retry_on_unrelated_exception() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_wrapper_runs_in_thread_and_retries() -> None:
-    fn = _Counter(fail_times=1, exc=httpx.RemoteProtocolError("once"))
+async def test_async_retry_awaits_on_loop_and_retries() -> None:
+    """Loop-native: awaits an async callable and retries transient blips with a
+    non-blocking backoff (no executor thread — the #57 poll-write path)."""
+    fn = _AsyncCounter(fail_times=1, exc=httpx.RemoteProtocolError("once"))
     result = await execute_with_retry(fn, label="async-test", retries=1)
     assert result == "ok"
     assert fn.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_async_retry_raises_after_exhaustion() -> None:
+    fn = _AsyncCounter(fail_times=99, exc=httpx.RemoteProtocolError("persistent"))
+    with pytest.raises(httpx.RemoteProtocolError):
+        await execute_with_retry(fn, label="async-test", retries=2)
+    assert fn.calls == 3  # initial + 2 retries
+
+
+@pytest.mark.asyncio
+async def test_async_retry_does_not_retry_unrelated_exception() -> None:
+    """A builder bug (ValueError) is not transient — surface it immediately."""
+    fn = _AsyncCounter(fail_times=99, exc=ValueError("broken"))
+    with pytest.raises(ValueError):
+        await execute_with_retry(fn, label="async-test", retries=2)
+    assert fn.calls == 1

@@ -34,6 +34,7 @@ from supabase import Client
 
 from app.config import settings
 from app.services import notify
+from app.services.db_write import poll_db_write
 
 logger = logging.getLogger(__name__)
 
@@ -70,20 +71,15 @@ async def run_lifecycle_sweep(supabase: Client) -> dict[str, int]:
 async def _deactivate_idle_targets(supabase: Client) -> int:
     if settings.idle_deactivate_days <= 0:
         return 0
-    cutoff = (
-        datetime.now(UTC) - timedelta(days=settings.idle_deactivate_days)
-    ).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(days=settings.idle_deactivate_days)).isoformat()
 
     idle_resp = await asyncio.to_thread(
-        lambda: supabase.table("user_profiles")
-        .select("user_id")
-        .lt("last_seen_at", cutoff)
-        .execute()
+        lambda: (
+            supabase.table("user_profiles").select("user_id").lt("last_seen_at", cutoff).execute()
+        )
     )
     idle_ids = [
-        r["user_id"]
-        for r in cast(list[dict[str, Any]], idle_resp.data or [])
-        if r.get("user_id")
+        r["user_id"] for r in cast(list[dict[str, Any]], idle_resp.data or []) if r.get("user_id")
     ]
     if not idle_ids:
         return 0
@@ -93,9 +89,10 @@ async def _deactivate_idle_targets(supabase: Client) -> int:
     for uid in idle_ids:
         # Flip + stamp in one filtered update; the returned rows are
         # exactly the links transitioned in this run.
-        def _flip(user_id: str = uid) -> Any:
-            return (
-                supabase.table("user_targets")
+        flip_resp = await poll_db_write(
+            supabase,
+            lambda c, user_id=uid: (
+                c.table("user_targets")
                 .update(
                     {
                         "is_active": False,
@@ -105,10 +102,9 @@ async def _deactivate_idle_targets(supabase: Client) -> int:
                 )
                 .eq("user_id", user_id)
                 .eq("is_active", True)
-                .execute()
-            )
-
-        flip_resp = await asyncio.to_thread(_flip)
+            ),
+            label="lifecycle deactivate idle target",
+        )
         flipped = cast(list[dict[str, Any]], flip_resp.data or [])
         if not flipped:
             continue
@@ -117,9 +113,7 @@ async def _deactivate_idle_targets(supabase: Client) -> int:
         target_ids = [r["target_id"] for r in flipped if r.get("target_id")]
         labels = await _target_labels(supabase, target_ids)
         try:
-            await notify.send_target_paused_email(
-                supabase, user_id=uid, target_labels=labels
-            )
+            await notify.send_target_paused_email(supabase, user_id=uid, target_labels=labels)
         except Exception:
             # The deactivation already happened; a lost email is the
             # accepted trade (mirrors job-alert semantics).
@@ -131,15 +125,9 @@ async def _target_labels(supabase: Client, target_ids: list[str]) -> list[str]:
     if not target_ids:
         return []
     resp = await asyncio.to_thread(
-        lambda: supabase.table("targets")
-        .select("label")
-        .in_("id", target_ids)
-        .execute()
+        lambda: supabase.table("targets").select("label").in_("id", target_ids).execute()
     )
-    return [
-        str(r.get("label") or "")
-        for r in cast(list[dict[str, Any]], resp.data or [])
-    ]
+    return [str(r.get("label") or "") for r in cast(list[dict[str, Any]], resp.data or [])]
 
 
 async def _adjust_source_cadence(supabase: Client) -> tuple[int, int]:
@@ -159,29 +147,35 @@ async def _adjust_source_cadence(supabase: Client) -> tuple[int, int]:
         return 0, 0
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
-    stretch_resp = await asyncio.to_thread(
-        lambda: supabase.table("sources")
-        .update({"poll_interval_minutes": SOURCE_COLD_INTERVAL_MINUTES})
-        .eq("enabled", True)
-        .lt("last_candidate_at", cutoff)
-        # Skip rows already at the cold interval; include NULL-interval
-        # rows (they currently poll at the 4h default via the poller's
-        # fallback, so they're stretchable too).
-        .or_(
-            f"poll_interval_minutes.neq.{SOURCE_COLD_INTERVAL_MINUTES},"
-            "poll_interval_minutes.is.null"
-        )
-        .execute()
+    stretch_resp = await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("sources")
+            .update({"poll_interval_minutes": SOURCE_COLD_INTERVAL_MINUTES})
+            .eq("enabled", True)
+            .lt("last_candidate_at", cutoff)
+            # Skip rows already at the cold interval; include NULL-interval
+            # rows (they currently poll at the 4h default via the poller's
+            # fallback, so they're stretchable too).
+            .or_(
+                f"poll_interval_minutes.neq.{SOURCE_COLD_INTERVAL_MINUTES},"
+                "poll_interval_minutes.is.null"
+            )
+        ),
+        label="lifecycle stretch cold source",
     )
     stretched = len(cast(list[dict[str, Any]], stretch_resp.data or []))
 
-    restore_resp = await asyncio.to_thread(
-        lambda: supabase.table("sources")
-        .update({"poll_interval_minutes": SOURCE_WARM_INTERVAL_MINUTES})
-        .eq("enabled", True)
-        .gte("last_candidate_at", cutoff)
-        .eq("poll_interval_minutes", SOURCE_COLD_INTERVAL_MINUTES)
-        .execute()
+    restore_resp = await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("sources")
+            .update({"poll_interval_minutes": SOURCE_WARM_INTERVAL_MINUTES})
+            .eq("enabled", True)
+            .gte("last_candidate_at", cutoff)
+            .eq("poll_interval_minutes", SOURCE_COLD_INTERVAL_MINUTES)
+        ),
+        label="lifecycle restore warm source",
     )
     restored = len(cast(list[dict[str, Any]], restore_resp.data or []))
 
@@ -190,11 +184,14 @@ async def _adjust_source_cadence(supabase: Client) -> tuple[int, int]:
 
 async def _reap_stuck_batches(supabase: Client) -> int:
     cutoff = (datetime.now(UTC) - timedelta(hours=BATCH_STUCK_HOURS)).isoformat()
-    resp = await asyncio.to_thread(
-        lambda: supabase.table("batch_runs")
-        .update({"status": "failed", "updated_at": datetime.now(UTC).isoformat()})
-        .eq("status", "processing")
-        .lt("updated_at", cutoff)
-        .execute()
+    resp = await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("batch_runs")
+            .update({"status": "failed", "updated_at": datetime.now(UTC).isoformat()})
+            .eq("status", "processing")
+            .lt("updated_at", cutoff)
+        ),
+        label="lifecycle reap stuck batch",
     )
     return len(cast(list[dict[str, Any]], resp.data or []))

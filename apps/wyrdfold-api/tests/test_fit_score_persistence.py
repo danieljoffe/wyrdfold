@@ -13,6 +13,7 @@ Mocks ``derive_job_fit`` to assert:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -49,9 +50,7 @@ def _payload() -> OptimizedPayload:
 def _fake_fit() -> JobFitResult:
     return JobFitResult(
         fit_score=82,
-        axes=AxisScores(
-            title_fit=95, skills_fit=80, seniority_fit=85, domain_fit=70
-        ),
+        axes=AxisScores(title_fit=95, skills_fit=80, seniority_fit=85, domain_fit=70),
         reasoning="Strong title + skills match; missing e-commerce domain.",
     )
 
@@ -72,17 +71,11 @@ async def test_success_updates_scores_row_with_full_phase2_payload(
     cost_calls: list[dict[str, object]] = []
 
     def fake_cost(supabase, *, user_id, purpose, result, metadata=None) -> object:
-        cost_calls.append(
-            {"purpose": purpose, "metadata": metadata, "user_id": user_id}
-        )
+        cost_calls.append({"purpose": purpose, "metadata": metadata, "user_id": user_id})
         return MagicMock()
 
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.derive_job_fit", fake_derive
-    )
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.record_llm_cost", fake_cost
-    )
+    monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
+    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost", fake_cost)
 
     result = await score_with_phase2_and_persist(
         supabase,
@@ -142,12 +135,8 @@ async def test_empty_jd_drops_job_without_grading(
         cost_calls += 1
         return MagicMock()
 
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.derive_job_fit", fake_derive
-    )
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.record_llm_cost", fake_cost
-    )
+    monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
+    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost", fake_cost)
 
     result = await score_with_phase2_and_persist(
         supabase,
@@ -183,9 +172,7 @@ async def test_llm_failure_returns_none_and_skips_db_and_cost(
         raise RuntimeError("anthropic-503")
 
     cost_calls: list[object] = []
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.derive_job_fit", boom
-    )
+    monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", boom)
     monkeypatch.setattr(
         "app.services.fit.score_persistence.record_llm_cost",
         lambda *a, **k: cost_calls.append(1),
@@ -224,9 +211,7 @@ async def test_persist_failure_still_records_cost(
         return (_fake_fit(), MagicMock())
 
     cost_calls: list[int] = []
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.derive_job_fit", fake_derive
-    )
+    monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
     monkeypatch.setattr(
         "app.services.fit.score_persistence.record_llm_cost",
         lambda *a, **k: cost_calls.append(1),
@@ -246,102 +231,110 @@ async def test_persist_failure_still_records_cost(
     assert cost_calls == [1]
 
 
-# ---- #57: async DB path (POLLER_ASYNC_DB) ----------------------------------
+# ---- #57: writes route through the poll-write seam --------------------------
+# The async/sync backend selection, fail-safe, and retry are exhaustively
+# tested in test_db_write.py (the seam's home). Here we assert that
+# score_persistence *uses* the seam correctly — both write sites go through
+# poll_db_write with the right ``scores`` query shape.
 
 _SP = "app.services.fit.score_persistence"
 
 
-class _AsyncQuery:
-    """Mock async supabase query chain — table/update/eq return self, execute
-    is awaitable. Records the update payload so tests can assert the async path
-    carried it."""
+class _FakeQuery:
+    """Records a poll_db_write build closure's table/update/eq chain."""
 
-    def __init__(self, sink: dict[str, object]) -> None:
-        self._sink = sink
+    def __init__(self) -> None:
+        self.table_name: str | None = None
+        self.payload: dict[str, object] | None = None
+        self.eqs: list[tuple[str, object]] = []
 
-    def table(self, name: str) -> _AsyncQuery:
-        self._sink["table"] = name
+    def table(self, name: str) -> _FakeQuery:
+        self.table_name = name
         return self
 
-    def update(self, payload: dict[str, object]) -> _AsyncQuery:
-        self._sink["update"] = payload
+    def update(self, payload: dict[str, object]) -> _FakeQuery:
+        self.payload = payload
         return self
 
-    def eq(self, col: str, val: object) -> _AsyncQuery:
-        self._sink.setdefault("eqs", []).append((col, val))  # type: ignore[union-attr]
+    def eq(self, col: str, val: object) -> _FakeQuery:
+        self.eqs.append((col, val))
         return self
 
-    async def execute(self) -> object:
-        self._sink["executed"] = True
+
+def _spy_seam(monkeypatch: pytest.MonkeyPatch) -> list[tuple[_FakeQuery, str]]:
+    """Patch poll_db_write to run each build closure against a _FakeQuery and
+    record ``(query, label)``. Returns the capture list."""
+    captured: list[tuple[_FakeQuery, str]] = []
+
+    async def _spy(supabase: object, build: Any, *, label: str) -> object:
+        q = _FakeQuery()
+        build(q)
+        captured.append((q, label))
         return MagicMock(data=[])
 
+    monkeypatch.setattr(f"{_SP}.poll_db_write", _spy)
+    return captured
 
-def _patch_grade(monkeypatch: pytest.MonkeyPatch) -> None:
+
+@pytest.mark.asyncio
+async def test_persist_routes_scores_update_through_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def fake_derive(*a: object, **k: object) -> object:
         return (_fake_fit(), MagicMock())
 
     monkeypatch.setattr(f"{_SP}.derive_job_fit", fake_derive)
     monkeypatch.setattr(f"{_SP}.record_llm_cost", lambda *a, **k: MagicMock())
+    captured = _spy_seam(monkeypatch)
 
-
-@pytest.mark.asyncio
-async def test_async_path_used_when_flag_on_and_client_present(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_grade(monkeypatch)
-    sink: dict[str, object] = {}
-    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", True)
-    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: _AsyncQuery(sink))
-
-    supabase = MagicMock()
+    target = _target()
     result = await score_with_phase2_and_persist(
-        supabase, MagicMock(), payload=_payload(), target=_target(),
-        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
+        MagicMock(),
+        MagicMock(),
+        payload=_payload(),
+        target=target,
+        job_posting_id="job-1",
+        title="Senior FE",
+        jd_text="JD body",
     )
 
     assert result is not None
-    # The write went through the ASYNC client...
-    assert sink["table"] == "scores"
-    assert sink["update"]["score"] == 82  # type: ignore[index]
-    assert sink["executed"] is True
-    assert ("job_posting_id", "job-1") in sink["eqs"]  # type: ignore[operator]
-    # ...and NOT the sync client.
-    assert supabase.table.return_value.update.called is False
+    assert len(captured) == 1
+    query, label = captured[0]
+    assert query.table_name == "scores"
+    assert query.payload is not None and query.payload["score"] == 82
+    assert ("job_posting_id", "job-1") in query.eqs
+    assert ("target_id", target.id) in query.eqs
+    assert label == "phase2 scores update"
 
 
 @pytest.mark.asyncio
-async def test_flag_on_but_no_async_client_falls_back_to_sync(
+async def test_empty_jd_drop_routes_through_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_grade(monkeypatch)
-    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", True)
-    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: None)  # not initialised
+    """A whitespace JD is excluded via the seam without spending an LLM call."""
+    derive_called: list[int] = []
+    monkeypatch.setattr(f"{_SP}.derive_job_fit", lambda *a, **k: derive_called.append(1))
+    captured = _spy_seam(monkeypatch)
 
-    supabase = MagicMock()
+    target = _target()
     result = await score_with_phase2_and_persist(
-        supabase, MagicMock(), payload=_payload(), target=_target(),
-        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
+        MagicMock(),
+        MagicMock(),
+        payload=_payload(),
+        target=target,
+        job_posting_id="job-2",
+        title="x",
+        jd_text="   ",
     )
 
-    assert result is not None
-    # Fail-safe: the sync client took the write.
-    assert supabase.table.return_value.update.call_args.args[0]["score"] == 82
-
-
-@pytest.mark.asyncio
-async def test_flag_off_uses_sync_and_never_consults_async_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_grade(monkeypatch)
-    monkeypatch.setattr(f"{_SP}.settings.poller_async_db", False)
-    called = []
-    monkeypatch.setattr(f"{_SP}.get_async_supabase", lambda: called.append(1))
-
-    supabase = MagicMock()
-    await score_with_phase2_and_persist(
-        supabase, MagicMock(), payload=_payload(), target=_target(),
-        job_posting_id="job-1", title="Senior FE", jd_text="JD body",
-    )
-
-    assert supabase.table.return_value.update.called is True
-    assert called == []  # async client not even looked up when the flag is off
+    assert result is None
+    assert derive_called == []  # no grade spent on an empty JD
+    assert len(captured) == 1
+    query, _ = captured[0]
+    assert query.table_name == "scores"
+    assert query.payload is not None
+    assert query.payload["excluded"] is True
+    assert query.payload["scoring_status"] == "complete"
+    assert ("job_posting_id", "job-2") in query.eqs
+    assert ("target_id", target.id) in query.eqs

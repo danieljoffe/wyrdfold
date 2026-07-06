@@ -19,7 +19,6 @@ the UI, retro-backfill scripts).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -29,10 +28,10 @@ from supabase import Client
 from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
+from app.services.db_write import poll_db_write
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import record as record_llm_cost
-from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -44,33 +43,19 @@ async def _apply_scores_update(
     target_id: str,
     payload: dict[str, Any],
 ) -> None:
-    """Persist a ``scores`` UPDATE for one (job, target).
-
-    #57 herd migration: when ``POLLER_ASYNC_DB`` is on AND the async
-    service-role client is initialised, run the write natively on the event
-    loop through that pooled HTTP/2 client — its connection pool bounds
-    concurrency without consuming the shared executor's threads, which is the
-    whole point (the poll's write fan-out stops starving interactive requests).
-    Otherwise fall back to the sync client in a thread (the #107 convention).
-    FAIL-SAFE: a missing async client falls back to sync, never drops the write.
-    """
-    if settings.poller_async_db:
-        async_sb = get_async_supabase()
-        if async_sb is not None:
-            await (
-                async_sb.table("scores")
-                .update(payload)
-                .eq("job_posting_id", job_posting_id)
-                .eq("target_id", target_id)
-                .execute()
-            )
-            return
-    await asyncio.to_thread(
-        lambda: supabase.table("scores")
-        .update(payload)
-        .eq("job_posting_id", job_posting_id)
-        .eq("target_id", target_id)
-        .execute()
+    """Persist a ``scores`` UPDATE for one (job, target) via the poll-write
+    seam (#57): async on the event loop when ``POLLER_ASYNC_DB`` is on, else
+    the sync client in a thread — with transient-blip retry and cycle-wide
+    herd bounding either way. See ``app.services.db_write.poll_db_write``."""
+    await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("scores")
+            .update(payload)
+            .eq("job_posting_id", job_posting_id)
+            .eq("target_id", target_id)
+        ),
+        label="phase2 scores update",
     )
 
 
