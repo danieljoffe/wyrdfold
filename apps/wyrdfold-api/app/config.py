@@ -496,6 +496,17 @@ class Settings(BaseSettings):
     # background spend that per-user allowances can't (many users, or
     # mis-attributed system rows). 0 disables.
     global_llm_daily_budget_usd: float = Field(default=10.0, ge=0.0)
+    # Slice of ``global_llm_daily_budget_usd`` fenced off for live grading
+    # (Phase-1 triage + Phase-2 fit) that the background qualification tagger
+    # must NOT consume. The tagger is the dominant LLM spender and, sharing one
+    # budget meter with grading, repeatedly drained the day's budget (and the
+    # OpenRouter key) before grading ran — starving the product's actual output
+    # (jobs pile up ungraded at ``stage2``). With a reserve the tagger stops at
+    # ``global_llm_daily_budget_usd - reserve`` while grading reads the full
+    # cap, so grading always has at least this much headroom. Must be <
+    # ``global_llm_daily_budget_usd`` to leave the tagger any room; >= it makes
+    # the tagger yield entirely (grading-only). 0 = old shared-pool behavior.
+    grading_budget_reserve_usd: float = Field(default=3.0, ge=0.0)
     user_llm_hourly_budget_usd: float = Field(default=1.0, ge=0.0)
     # The overall allowance (Claude-limits model: small windows above for
     # bursts, this for the month). Rolling 30 days; counts ALL of a user's

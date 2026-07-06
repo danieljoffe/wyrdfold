@@ -290,7 +290,7 @@ class TestQualifyBudgetGate:
         # Gate: under budget for the first check, over for the second.
         calls = {"n": 0}
 
-        def fake_exhausted(_sb: object) -> bool:
+        def fake_exhausted(_sb: object, *, reserve_usd: float = 0.0) -> bool:
             calls["n"] += 1
             return calls["n"] > 1  # first chunk allowed, then deferred
 
@@ -323,4 +323,61 @@ class TestQualifyBudgetGate:
         await poller_mod._qualify_jobs(sb, _unique_rows(3))
 
         assert rec["tag_calls"] == 0
+        assert rec["writes"] == []
+
+
+class TestGradingReserve:
+    """The grading reserve fences off budget the background tagger can't touch,
+    so live grading (Phase-1 triage + Phase-2 fit) is never starved by the
+    tagger — the recurring drain that left new jobs stuck at ``stage2`` (#60).
+    The tagger stops at ``cap - reserve`` while grading reads the full cap."""
+
+    def test_reserve_lowers_the_taggers_effective_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spend sits in the reserved slice (between cap-reserve and cap):
+        exhausted for the tagger (it yields), NOT for grading (full cap)."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        sb = MagicMock()
+        # $8 spent of $10: the tagger's $3 reserve makes it done ($8 >= $7)...
+        assert poller_mod._global_budget_exhausted(sb, reserve_usd=3.0) is True
+        # ...but grading (no reserve) still has room ($8 < $10).
+        assert poller_mod._global_budget_exhausted(sb) is False
+
+    def test_reserve_at_or_above_cap_makes_tagger_yield_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """reserve >= cap → effective cap 0 → the tagger always yields, without
+        even reading the meter (a valid grading-only config)."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        spend = MagicMock(return_value=0.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
+        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=10.0) is True
+        spend.assert_not_called()
+
+    def test_disabled_cap_ignores_reserve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """cap<=0 disables the breaker entirely — reserve is moot, meter unread."""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
+        spend = MagicMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
+        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=5.0) is False
+        spend.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_qualify_jobs_defers_in_the_reserve_zone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: with spend in the reserved slice, the tagger defers even
+        though the full budget isn't spent — leaving the reserve for grading.
+        (With reserve=0 the same spend would let the tagger run.)"""
+        monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
+        monkeypatch.setattr(live_settings, "grading_budget_reserve_usd", 3.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, _unique_rows(3))
+
+        assert rec["tag_calls"] == 0  # tagger yields the reserved slice
         assert rec["writes"] == []
