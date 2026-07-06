@@ -20,6 +20,22 @@ choice, not filler — pivot to it deliberately after a run of Build work. The
 proposal-paragraph keeps this honest: it has to justify _why this next_, not "there's
 always more."
 
+## Reach for the durable solution — and surface the fork
+
+When the approach forks — a quick patch vs. a more durable fix — **default to durable on
+anything the code lives with**: shared abstractions, hot paths, data integrity, auth,
+public surface, anything costly to reverse. Quick is the right call for a spike, a
+throwaway, a genuinely trivial change, or when speed was explicitly asked for — but as a
+_deliberate_ choice, not the reflex.
+
+The part with teeth isn't "always do the most work" — that just gold-plates trivia. It's:
+**never present the quick path as if it were the only one.** When you settle on an approach
+and a materially better long-term option exists, name it — what it is, why it's better,
+what skipping it trades away — and lean toward it unless the surface doesn't warrant it.
+The user can down-scope a fork they can see; they can't down-scope one you never showed
+them. Quietly shipping the easy fix when a better one was on the table is the failure this
+prevents.
+
 ## Validate and stress-test before opening a PR
 
 A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
