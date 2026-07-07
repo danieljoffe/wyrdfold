@@ -96,6 +96,31 @@ railway run uv run --package wyrdfold-api \
 Reports `is_us` accuracy / recall / precision / FNR + `role_family` accuracy, and
 names each miss (title @ location → predicted, confidence). ~1 Haiku call/case.
 
+## Faithfulness judge — committed golden (part CI, part on-demand)
+
+`eval_faithfulness.py` (#193) validates the tailor's anti-hallucination guard
+(`review_resume_faithfulness`): does it actually **catch** fabrications? Against a
+committed golden set (`tests/fixtures/faithfulness_golden.json`) of (source
+experience, tailored resume) pairs — half with a planted fabrication /
+exaggeration / unsupported_skill, half faithful (grounded / rephrased /
+grounded-metric the judge must NOT flag). Positive class = "has a hallucination",
+so **recall is the catch rate** and a false negative is a MISSED fabrication (the
+dangerous class); precision measures over-flagging.
+
+Committed + PII-free, so the metric functions + fixture guards (deserializes into
+the real `OptimizedPayload`/`TailoredResume`, balanced across all issue types,
+each planted claim present in its resume) run **free in CI**
+(`tests/test_eval_faithfulness.py`). The judge-accuracy run is on-demand:
+
+```bash
+railway run uv run --package wyrdfold-api \
+  python apps/wyrdfold-api/scripts/eval_faithfulness.py
+```
+
+Reports catch_rate / precision / miss_rate and names each **missed** hallucination
+
+- each false flag. ~1 review call/case.
+
 ### Handling secrets
 
 Never paste keys into chat, commits, or `eval_results/`. Use env vars (or

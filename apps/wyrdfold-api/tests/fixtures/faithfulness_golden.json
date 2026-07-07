@@ -1,0 +1,361 @@
+{
+  "description": "#193 ground-truth for the tailor faithfulness judge (review_resume_faithfulness). Each case pairs a SOURCE experience (OptimizedPayload) with a TAILORED resume (TailoredResume) whose faithfulness we KNOW. Hallucinated cases plant exactly one fabrication / exaggeration / unsupported_skill (the planted claim appears verbatim in a resume bullet or skill); faithful cases include rephrasing/summarizing/grounded-metric that the judge must NOT flag. Positive class for the metric = 'has a hallucination', so a MISS (judge fails to flag a planted hallucination) is a recall miss — the dangerous class for a product that promises 'never fabricated'. Fabrication of whole roles is out of scope (the deterministic trace validator owns that); this judge catches semantic unfaithfulness within traceable bullets.",
+  "cases": [
+    {
+      "name": "faithful_grounded",
+      "expected_faithful": true,
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Acme",
+            "title": "Software Engineer",
+            "start": "2021",
+            "end": "2023",
+            "skills": ["Python", "React"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Python" }, { "name": "React" }],
+        "outcomes": [
+          {
+            "description": "Built the customer checkout flow in React",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Software engineer who built customer-facing web features.",
+        "contact": { "name": "Jane Doe" },
+        "experience": [
+          {
+            "company": "Acme",
+            "title": "Software Engineer",
+            "start": "2021",
+            "end": "2023",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Built the customer checkout flow in React",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Python", "React"]
+      }
+    },
+    {
+      "name": "faithful_rephrased",
+      "expected_faithful": true,
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Beta",
+            "title": "Backend Engineer",
+            "start": "2020",
+            "end": "2022",
+            "skills": ["Go"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Go" }],
+        "outcomes": [
+          {
+            "description": "Reduced API latency by tuning slow database queries",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Backend engineer focused on performance.",
+        "contact": { "name": "Sam Lee" },
+        "experience": [
+          {
+            "company": "Beta",
+            "title": "Backend Engineer",
+            "start": "2020",
+            "end": "2022",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Improved backend performance through database query optimization",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Go"]
+      }
+    },
+    {
+      "name": "faithful_grounded_metric",
+      "expected_faithful": true,
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Gamma",
+            "title": "SRE",
+            "start": "2019",
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Kubernetes" }],
+        "outcomes": [
+          {
+            "description": "Cut API p95 latency",
+            "metric": "p95 latency",
+            "value": "reduced 30%",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Site reliability engineer.",
+        "contact": { "name": "Alex Kim" },
+        "experience": [
+          {
+            "company": "Gamma",
+            "title": "SRE",
+            "start": "2019",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Reduced API p95 latency by 30% through infrastructure tuning",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Kubernetes"]
+      }
+    },
+    {
+      "name": "fabrication_invented_metric",
+      "expected_faithful": false,
+      "planted": {
+        "issue": "fabrication",
+        "claim": "checkout conversion by 42%"
+      },
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Acme",
+            "title": "Software Engineer",
+            "start": "2021",
+            "end": "2023",
+            "skills": ["React"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "React" }],
+        "outcomes": [
+          {
+            "description": "Built the customer checkout flow in React",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Software engineer.",
+        "contact": { "name": "Jane Doe" },
+        "experience": [
+          {
+            "company": "Acme",
+            "title": "Software Engineer",
+            "start": "2021",
+            "end": "2023",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Built the checkout flow in React, increasing checkout conversion by 42%",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["React"]
+      }
+    },
+    {
+      "name": "fabrication_invented_award",
+      "expected_faithful": false,
+      "planted": {
+        "issue": "fabrication",
+        "claim": "Received the company's Engineering Excellence Award"
+      },
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Delta",
+            "title": "Engineer",
+            "start": "2020",
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Java" }],
+        "outcomes": [
+          { "description": "Maintained the payments service", "role_ref": "r1" }
+        ]
+      },
+      "resume": {
+        "summary": "Engineer on payments systems.",
+        "contact": { "name": "Pat Ray" },
+        "experience": [
+          {
+            "company": "Delta",
+            "title": "Engineer",
+            "start": "2020",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Maintained the payments service and received the company's Engineering Excellence Award",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Java"]
+      }
+    },
+    {
+      "name": "exaggeration_inflated_scope",
+      "expected_faithful": false,
+      "planted": {
+        "issue": "exaggeration",
+        "claim": "Led a team of 12 engineers"
+      },
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Epsilon",
+            "title": "Engineer",
+            "start": "2021",
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Python" }],
+        "outcomes": [
+          {
+            "description": "Collaborated with two other engineers to rebuild the checkout flow",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Engineer.",
+        "contact": { "name": "Robin Fox" },
+        "experience": [
+          {
+            "company": "Epsilon",
+            "title": "Engineer",
+            "start": "2021",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Led a team of 12 engineers to rebuild the checkout flow",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Python"]
+      }
+    },
+    {
+      "name": "exaggeration_inflated_metric",
+      "expected_faithful": false,
+      "planted": {
+        "issue": "exaggeration",
+        "claim": "Reduced API p95 latency by 80%"
+      },
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Gamma",
+            "title": "SRE",
+            "start": "2019",
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "Kubernetes" }],
+        "outcomes": [
+          {
+            "description": "Cut API p95 latency",
+            "metric": "p95 latency",
+            "value": "reduced 30%",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Site reliability engineer.",
+        "contact": { "name": "Alex Kim" },
+        "experience": [
+          {
+            "company": "Gamma",
+            "title": "SRE",
+            "start": "2019",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Reduced API p95 latency by 80% through infrastructure tuning",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["Kubernetes"]
+      }
+    },
+    {
+      "name": "unsupported_skill",
+      "expected_faithful": false,
+      "planted": { "issue": "unsupported_skill", "claim": "Kubernetes" },
+      "source": {
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Zeta",
+            "title": "Frontend Engineer",
+            "start": "2021",
+            "skills": ["React", "TypeScript"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [{ "name": "React" }, { "name": "TypeScript" }],
+        "outcomes": [
+          {
+            "description": "Built the design system component library",
+            "role_ref": "r1"
+          }
+        ]
+      },
+      "resume": {
+        "summary": "Frontend engineer.",
+        "contact": { "name": "Dana Cole" },
+        "experience": [
+          {
+            "company": "Zeta",
+            "title": "Frontend Engineer",
+            "start": "2021",
+            "source_role_ref": "r1",
+            "bullets": [
+              {
+                "text": "Built the design system component library and deployed it on a Kubernetes cluster",
+                "source_outcome_ref": "o1"
+              }
+            ]
+          }
+        ],
+        "skills": ["React", "TypeScript", "Kubernetes"]
+      }
+    }
+  ]
+}
