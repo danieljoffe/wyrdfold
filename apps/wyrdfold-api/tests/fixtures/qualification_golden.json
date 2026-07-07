@@ -1,0 +1,179 @@
+{
+  "description": "#193 ground-truth for the L2 qualification tagger. Hand-labeled OBJECTIVE cases (a location string + title determines is_us / role_family). Deliberately loaded with the failure classes we hit in prod: (1) the conf-95 false-NEGATIVE where an unambiguous US location was tagged non-US ('New York, NY, United States'); (2) 'City, ST' abbrev collisions with foreign ISO codes (Munich DE=Delaware, Bangalore IN=Indiana, Toronto ON CA=California) that are genuinely non-US; (3) a spread of role_family so the eval catches family drift too. is_us positive class = 'is US', so a US job tagged non-US is a RECALL miss. role_family enum: engineering, data_ml, product, design, customer_experience, operations, sales, finance, marketing, people_hr, legal, other.",
+  "cases": [
+    {
+      "title": "Senior React Engineer",
+      "company": "Acme",
+      "location": "New York, NY, United States",
+      "expected_is_us": true,
+      "expected_role_family": "engineering",
+      "note": "the observed conf-95 false-negative"
+    },
+    {
+      "title": "Staff Frontend Engineer",
+      "location": "Austin, TX",
+      "expected_is_us": true,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Software Engineer, iOS/Mobile",
+      "location": "Seattle, WA",
+      "expected_is_us": true,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Backend Engineer",
+      "location": "Remote - United States",
+      "expected_is_us": true,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Director of Customer Experience Operations",
+      "location": "San Francisco, CA",
+      "expected_is_us": true,
+      "expected_role_family": "customer_experience"
+    },
+    {
+      "title": "Customer Support Representative",
+      "location": "Boston, MA",
+      "expected_is_us": true,
+      "expected_role_family": "customer_experience"
+    },
+    {
+      "title": "Senior Sales Development Representative",
+      "location": "Chicago, IL",
+      "expected_is_us": true,
+      "expected_role_family": "sales"
+    },
+    {
+      "title": "Accounts Payable Analyst",
+      "location": "Dallas, TX",
+      "expected_is_us": true,
+      "expected_role_family": "finance"
+    },
+    {
+      "title": "Senior Product Manager",
+      "location": "Denver, CO",
+      "expected_is_us": true,
+      "expected_role_family": "product"
+    },
+    {
+      "title": "Data Scientist",
+      "location": "New York, NY",
+      "expected_is_us": true,
+      "expected_role_family": "data_ml"
+    },
+    {
+      "title": "Product Designer",
+      "location": "Los Angeles, CA",
+      "expected_is_us": true,
+      "expected_role_family": "design"
+    },
+    {
+      "title": "Marketing Manager",
+      "location": "Atlanta, GA",
+      "expected_is_us": true,
+      "expected_role_family": "marketing"
+    },
+    {
+      "title": "People Operations Partner",
+      "location": "Remote, USA",
+      "expected_is_us": true,
+      "expected_role_family": "people_hr"
+    },
+    {
+      "title": "Corporate Counsel",
+      "location": "Miami, FL",
+      "expected_is_us": true,
+      "expected_role_family": "legal"
+    },
+    {
+      "title": "Warehouse Operations Lead",
+      "location": "Columbus, OH",
+      "expected_is_us": true,
+      "expected_role_family": "operations"
+    },
+
+    {
+      "title": "Frontend Developer",
+      "location": "London, UK",
+      "expected_is_us": false,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Customer Success Manager",
+      "location": "Manila, Philippines",
+      "expected_is_us": false,
+      "expected_role_family": "customer_experience"
+    },
+    {
+      "title": "Backend Engineer",
+      "location": "Kuala Lumpur",
+      "expected_is_us": false,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Staff Design Verification Engineer",
+      "location": "United Kingdom, Edinburgh",
+      "expected_is_us": false,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "Software Engineer",
+      "location": "Belfast",
+      "expected_is_us": false,
+      "expected_role_family": "engineering"
+    },
+    {
+      "title": "IAM Specialist",
+      "location": "Bangalore, IN",
+      "expected_is_us": false,
+      "expected_role_family": "engineering",
+      "note": "IN=Indiana abbrev collision — genuinely India"
+    },
+    {
+      "title": "Senior Data Analyst Insurance",
+      "location": "Munich, DE",
+      "expected_is_us": false,
+      "expected_role_family": "data_ml",
+      "note": "DE=Delaware abbrev collision — genuinely Germany"
+    },
+    {
+      "title": "Software Engineer II, Android",
+      "location": "Toronto, ON, CA",
+      "expected_is_us": false,
+      "expected_role_family": "engineering",
+      "note": "CA=California abbrev collision — genuinely Canada"
+    },
+    {
+      "title": "Supplier Service Specialist",
+      "location": "Düsseldorf, de",
+      "expected_is_us": false,
+      "expected_role_family": "operations"
+    },
+    {
+      "title": "Account Management Associate",
+      "location": "Jakarta, id",
+      "expected_is_us": false,
+      "expected_role_family": "sales"
+    },
+    {
+      "title": "Financial Analyst",
+      "location": "Gurugram",
+      "expected_is_us": false,
+      "expected_role_family": "finance"
+    },
+    {
+      "title": "Marketing Execution Associate",
+      "location": "Yogyakarta, id",
+      "expected_is_us": false,
+      "expected_role_family": "marketing"
+    },
+    {
+      "title": "Product Manager",
+      "location": "Kyiv",
+      "expected_is_us": false,
+      "expected_role_family": "product"
+    }
+  ]
+}
