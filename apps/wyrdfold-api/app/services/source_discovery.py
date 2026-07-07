@@ -308,6 +308,8 @@ def _insert_source(supabase: Client, *, detect: DetectResult) -> bool:
 async def run_discovery_for_target(
     supabase: Client,
     target: JobTarget,
+    *,
+    max_queries: int | None = None,
 ) -> DiscoveryRunStats:
     """Discover new sources for one target.
 
@@ -317,7 +319,10 @@ async def run_discovery_for_target(
 
     Caps total Brave queries at ``settings.discovery_query_cap_per_run`` so
     a target with very many keywords can't drain the monthly quota in one
-    run. The remaining keywords roll over to the next run naturally — we
+    run. ``max_queries`` (passed by the bulk path from its run-total budget)
+    tightens that cap further for this target — the effective ceiling is
+    ``min(cap, max_queries)`` — so the caller can bound the whole pass. The
+    remaining keywords roll over to the next run naturally — we
     just walk the keyword list in order and stop when we hit the cap.
     """
     if not settings.brave_search_api_key:
@@ -356,6 +361,8 @@ async def run_discovery_for_target(
     unclassified = 0
     filtered = 0
     cap = settings.discovery_query_cap_per_run
+    if max_queries is not None:
+        cap = min(cap, max_queries)
     per_query_count = settings.discovery_results_per_query
 
     # Build the query plan upfront so we can fan out the Brave fetches
@@ -565,22 +572,61 @@ async def run_discovery_all_targets(
     """Run source discovery for the given targets, sequentially.
 
     Sequential on purpose: each per-target run already fans its Brave
-    queries out under an internal semaphore, and the per-run query cap
-    applies per target — running targets concurrently would multiply the
-    burst against Brave's rate limit without finishing meaningfully sooner.
-    A failed target is recorded in ``errors`` and skipped; the rest still
-    run. The caller decides which targets to pass (active-only for the
-    manual per-request path historically; ALL targets for the scheduled /
-    cron bulk path).
+    queries out under an internal semaphore, and running targets concurrently
+    would multiply the burst against Brave's rate limit without finishing
+    meaningfully sooner. A failed target is recorded in ``errors`` and
+    skipped; the rest still run. The caller decides which targets to pass
+    (active-only for the manual per-request path historically; ALL targets
+    for the scheduled / cron bulk path).
+
+    **Run-total Brave budget.** When ``settings.discovery_query_budget_per_run``
+    is > 0 (the default), the pass spends at most that many Brave queries in
+    total, split across the targets — so monthly usage ~= budget x runs/month,
+    INVARIANT to how many targets exist, keeping the free tier (2,000/month)
+    intact. Targets are shuffled so a budget that can't cover everyone serves
+    a different subset each run (no permanent starvation); once the budget is
+    spent the remaining targets are deferred to the next run. Each target's
+    slice is an even split of the *remaining* budget, so a keyword-poor target
+    that under-spends hands its slack to later targets. Budget 0 disables this
+    — every target then uses only its own per-target cap (legacy behavior).
     """
     result = BulkDiscoveryStats()
-    for target in targets:
+    budget = settings.discovery_query_budget_per_run
+
+    ordered = list(targets)
+    if budget > 0:
+        # Shuffle so a budget-limited run doesn't always serve the same prefix.
+        random.shuffle(ordered)
+
+    remaining = budget
+    for i, target in enumerate(ordered):
+        if budget > 0:
+            if remaining <= 0:
+                logger.info(
+                    "bulk discovery: run budget of %d queries spent after %d/%d "
+                    "targets — the rest are deferred to the next run",
+                    budget,
+                    i,
+                    len(ordered),
+                )
+                break
+            # Even split of what's LEFT, rounded up so a small budget still
+            # gives each served target >= 1 query; a target that under-spends
+            # its slice leaves more ``remaining`` for those after it.
+            targets_left = len(ordered) - i
+            max_queries: int | None = (remaining + targets_left - 1) // targets_left
+        else:
+            max_queries = None  # unbudgeted: per-target cap only
+
         try:
-            stats = await run_discovery_for_target(supabase, target)
+            stats = await run_discovery_for_target(supabase, target, max_queries=max_queries)
         except Exception:
             logger.exception("bulk discovery failed for target %s", target.id)
             result.errors.append(f"{target.id}: discovery failed")
             continue
+
+        if budget > 0:
+            remaining -= stats.queries_issued
         result.targets_processed += 1
         result.queries_issued += stats.queries_issued
         result.urls_examined += stats.urls_examined
@@ -591,11 +637,12 @@ async def run_discovery_all_targets(
         result.per_target.append(stats)
 
     logger.info(
-        "bulk discovery: %d targets, %d queries, %d inserted, %d errors",
+        "bulk discovery: %d targets, %d queries, %d inserted, %d errors (run budget %s)",
         result.targets_processed,
         result.queries_issued,
         result.inserted,
         len(result.errors),
+        budget if budget > 0 else "disabled",
     )
     return result
 

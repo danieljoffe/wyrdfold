@@ -616,13 +616,14 @@ async def test_run_all_targets_preserves_brave_key_gate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_all_targets_caps_queries_per_target(monkeypatch):
-    """The per-target query cap is preserved on the bulk path: each target is
-    independently capped, so two targets at cap=2 fire 2 + 2 = 4 queries, not
-    one shared budget of 2."""
+    """Legacy path (run budget disabled): the per-target cap is applied
+    independently, so two targets at cap=2 fire 2 + 2 = 4 queries — the run
+    total scales with target count when there's no run budget."""
     from app.config import settings as live_settings
 
     monkeypatch.setattr(live_settings, "brave_search_api_key", "test-key")
     monkeypatch.setattr(live_settings, "discovery_query_cap_per_run", 2)
+    monkeypatch.setattr(live_settings, "discovery_query_budget_per_run", 0)
 
     supabase = _make_supabase()
     targets = [_make_target(keywords=["a", "b"]), _make_target(keywords=["c", "d"])]
@@ -639,3 +640,99 @@ async def test_run_all_targets_caps_queries_per_target(monkeypatch):
     assert result.queries_issued == 4
     assert fake_brave.await_count == 4
     assert result.targets_processed == 2
+
+
+@pytest.mark.asyncio
+async def test_run_all_targets_run_budget_bounds_total(monkeypatch):
+    """The run-total budget bounds the WHOLE pass, not each target: a budget
+    of 5 across 3 keyword-rich targets fires exactly 5 Brave queries total
+    (2 + 2 + 1), even though the per-target cap (200) is far higher — so
+    monthly usage is invariant to target count."""
+    from app.config import settings as live_settings
+    from app.services import source_discovery as sd
+
+    monkeypatch.setattr(live_settings, "brave_search_api_key", "test-key")
+    monkeypatch.setattr(live_settings, "discovery_query_cap_per_run", 200)
+    monkeypatch.setattr(live_settings, "discovery_query_budget_per_run", 5)
+    # Deterministic distribution: freeze the fairness shuffle to identity.
+    monkeypatch.setattr(sd.random, "shuffle", lambda seq: None)
+
+    supabase = _make_supabase()
+    # 3 keywords each -> 18 combos/target, so the BUDGET (not the cap) binds.
+    targets = [_make_target(keywords=["a", "b", "c"]) for _ in range(3)]
+
+    fake_brave = AsyncMock(return_value=[])
+    fake_detect = AsyncMock(return_value=None)
+    with (
+        patch("app.services.source_discovery._brave_search", fake_brave),
+        patch("app.services.source_discovery.detect_ats", fake_detect),
+    ):
+        result = await run_discovery_all_targets(supabase, targets)
+
+    assert result.queries_issued == 5
+    assert fake_brave.await_count == 5
+    assert result.targets_processed == 3
+    # ceil-split of the remaining budget: 5/3->2, 3/2->2, 1/1->1.
+    assert [s.queries_issued for s in result.per_target] == [2, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_run_all_targets_run_budget_defers_targets_when_spent(monkeypatch):
+    """When the budget can't cover everyone, later targets are DEFERRED (not
+    run) this pass — the total never exceeds the budget."""
+    from app.config import settings as live_settings
+    from app.services import source_discovery as sd
+
+    monkeypatch.setattr(live_settings, "brave_search_api_key", "test-key")
+    monkeypatch.setattr(live_settings, "discovery_query_cap_per_run", 200)
+    monkeypatch.setattr(live_settings, "discovery_query_budget_per_run", 2)
+    monkeypatch.setattr(sd.random, "shuffle", lambda seq: None)
+
+    supabase = _make_supabase()
+    targets = [_make_target(keywords=["k"]) for _ in range(5)]  # 6 combos each
+
+    fake_brave = AsyncMock(return_value=[])
+    fake_detect = AsyncMock(return_value=None)
+    with (
+        patch("app.services.source_discovery._brave_search", fake_brave),
+        patch("app.services.source_discovery.detect_ats", fake_detect),
+    ):
+        result = await run_discovery_all_targets(supabase, targets)
+
+    # Budget 2 across 5 targets: 2/5->1, 1/4->1, then remaining==0 -> break.
+    assert result.queries_issued == 2
+    assert fake_brave.await_count == 2
+    assert result.targets_processed == 2  # 3 targets deferred to next run
+
+
+@pytest.mark.asyncio
+async def test_run_all_targets_run_budget_reclaims_unused_slice(monkeypatch):
+    """A keyword-poor target that under-spends its slice hands the slack to a
+    later target: budget 20 over [1 keyword (6 combos), 4 keywords], the first
+    fires 6 (all it has), the second reclaims the rest up to the budget."""
+    from app.config import settings as live_settings
+    from app.services import source_discovery as sd
+
+    monkeypatch.setattr(live_settings, "brave_search_api_key", "test-key")
+    monkeypatch.setattr(live_settings, "discovery_query_cap_per_run", 200)
+    monkeypatch.setattr(live_settings, "discovery_query_budget_per_run", 20)
+    monkeypatch.setattr(sd.random, "shuffle", lambda seq: None)
+
+    supabase = _make_supabase()
+    # First target: 1 keyword -> 6 combos (< its slice of 10, so it under-spends).
+    # Second target: 4 keywords -> 24 combos (> the reclaimed remainder).
+    targets = [_make_target(keywords=["one"]), _make_target(keywords=["a", "b", "c", "d"])]
+
+    fake_brave = AsyncMock(return_value=[])
+    fake_detect = AsyncMock(return_value=None)
+    with (
+        patch("app.services.source_discovery._brave_search", fake_brave),
+        patch("app.services.source_discovery.detect_ats", fake_detect),
+    ):
+        result = await run_discovery_all_targets(supabase, targets)
+
+    # Slice 1 = ceil(20/2)=10, but target has only 6 combos -> fires 6.
+    # remaining = 14; slice 2 = ceil(14/1)=14 -> fires 14 (reclaimed the slack).
+    assert [s.queries_issued for s in result.per_target] == [6, 14]
+    assert result.queries_issued == 20  # full budget used, none wasted
+    assert fake_brave.await_count == 20
