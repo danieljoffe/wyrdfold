@@ -73,6 +73,29 @@ Run this when you change a scoring prompt/model and want the true
 quality delta — attach the before/after summary to the PR (see
 `CONTRIBUTING.md` → "Touching prompts or scoring code").
 
+## Qualification-tagger correctness — committed golden (part CI, part on-demand)
+
+`eval_qualification_correctness.py` (#193) scores the L2 qualification tagger's
+`is_us` / `role_family` against a **committed, PII-free** golden set
+(`tests/fixtures/qualification_golden.json`, hand-labeled objective cases) —
+correctness vs ground truth, not drift vs a past run. `is_us` positive class is
+"is US", so the prod failure that motivated it — a conf-95 false NEGATIVE, an
+unambiguous US location tagged non-US ("New York, NY, United States") — surfaces
+as a **recall** miss.
+
+Because the fixture is committed and PII-free, the pure metric functions + the
+golden guards (incl. the conf-95 regression case) run **free in CI**
+(`tests/test_eval_qualification_correctness.py`, tier-1). The model-accuracy run
+is on-demand with the real LLM:
+
+```bash
+railway run uv run --package wyrdfold-api \
+  python apps/wyrdfold-api/scripts/eval_qualification_correctness.py
+```
+
+Reports `is_us` accuracy / recall / precision / FNR + `role_family` accuracy, and
+names each miss (title @ location → predicted, confidence). ~1 Haiku call/case.
+
 ### Handling secrets
 
 Never paste keys into chat, commits, or `eval_results/`. Use env vars (or
