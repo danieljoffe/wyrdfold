@@ -69,10 +69,7 @@ def _cost_by_purpose(
                 counts = {p: int(v["count"]) for p, v in raw.items()}
                 return totals, counts
         except Exception:
-            logger.debug(
-                "cost_by_purpose_since RPC unavailable, falling back to "
-                "client-side group"
-            )
+            logger.debug("cost_by_purpose_since RPC unavailable, falling back to client-side group")
 
     cq = supabase.table("llm_costs").select("purpose, cost_usd")
     if since:
@@ -140,6 +137,7 @@ def _fetch_in_chunks(
         batch = ids[i : i + chunk]
         out.extend(_rows(make_query(batch), label=label))
     return out
+
 
 # Funnel stage ordering (used for consistent display)
 FUNNEL_ORDER = [
@@ -358,9 +356,7 @@ def _pipeline_status_counts(
     client-side count if the RPC isn't deployed yet (mirrors
     ``_pipeline_counts_grouped`` in routers/jobs.py)."""
     if target_ids is None:
-        return _pipeline_status_counts_python(
-            supabase, since, until, target_ids, user_id
-        )
+        return _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
     if not target_ids:
         return Counter()
     try:
@@ -377,14 +373,9 @@ def _pipeline_status_counts(
             label="insights/pipeline_status_counts",
         )
     except Exception:
-        return _pipeline_status_counts_python(
-            supabase, since, until, target_ids, user_id
-        )
+        return _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
     return Counter(
-        {
-            cast(str, row["status"]): int(row["count"])
-            for row in cast(list[Row], resp.data or [])
-        }
+        {cast(str, row["status"]): int(row["count"]) for row in cast(list[Row], resp.data or [])}
     )
 
 
@@ -399,9 +390,7 @@ def _fetch_status_logs_window(
         return []
 
     def _base() -> Any:
-        sq = supabase.table("status_log").select(
-            "posting_id, old_status, new_status, created_at"
-        )
+        sq = supabase.table("status_log").select("posting_id, old_status, new_status, created_at")
         # Per-user scoping (#113): a posting in the shared catalog can sit
         # under several users' targets, so the audit log must be filtered to
         # the caller's own transitions — otherwise one user's response-time
@@ -426,9 +415,7 @@ def _fetch_status_logs_window(
     return _rows(_base(), label="insights/status_logs_window")
 
 
-def _kpis_from(
-    status_counts: Counter[str], status_logs: list[Row]
-) -> PipelinePeriodKpis:
+def _kpis_from(status_counts: Counter[str], status_logs: list[Row]) -> PipelinePeriodKpis:
     """Pure aggregation: derive the 5 top-line KPIs from the per-status counts
     (computed server-side by ``_pipeline_status_counts``, #101) + the
     already-fetched status logs for one window. Used for both the current and
@@ -492,9 +479,7 @@ def compute_pipeline(
     # scale — moving it is risk without payoff, #101).
     posting_ids = _fetch_window_posting_ids(supabase, since, None, target_ids)
     status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids, user_id)
-    status_counts = _pipeline_status_counts(
-        supabase, since, None, target_ids, user_id
-    )
+    status_counts = _pipeline_status_counts(supabase, since, None, target_ids, user_id)
 
     # Fetch tailored resumes for velocity (current window only). The
     # ``documents`` table has no ``target_id`` column (it was renamed
@@ -507,6 +492,7 @@ def compute_pipeline(
     if target_ids is not None and not posting_ids:
         resumes: list[Row] = []
     else:
+
         def _resume_base() -> Any:
             rq = supabase.table("documents").select("job_posting_id, created_at")
             if since:
@@ -626,6 +612,7 @@ def _targets_groupby_python(
     returns the SAME raw aggregates the RPC returns so both feed
     ``_assemble_target_insights`` — guaranteeing the RPC and fallback produce
     byte-identical output (the rounding all happens downstream, in Python)."""
+
     # Postings within the window, hydrated with created_at + per-user status.
     def _postings_base() -> Any:
         q = supabase.table("jobs").select("id, created_at")
@@ -643,15 +630,14 @@ def _targets_groupby_python(
         )
     else:
         postings = []
-    status_map = _user_status_map(
-        supabase, user_id, [str(p["id"]) for p in postings]
-    )
+    status_map = _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
     for p in postings:
         p["status"] = status_map.get(str(p["id"]), "new")
 
     # Per-target score lookup: ``(posting_id, target_id) → score``.
     score_lookup: dict[tuple[str, str], int] = {}
     if posting_ids:
+
         def _scores_base() -> Any:
             return (
                 supabase.table("scores")
@@ -668,9 +654,7 @@ def _targets_groupby_python(
             label="insights/targets_scores",
         )
         for r in score_rows:
-            score_lookup[(r["job_posting_id"], r["target_id"])] = int(
-                r.get("score") or 0
-            )
+            score_lookup[(r["job_posting_id"], r["target_id"])] = int(r.get("score") or 0)
 
     # --- Per-target aggregation (target_labels-filtered) ---
     target_sum: defaultdict[str, int] = defaultdict(int)
@@ -762,8 +746,13 @@ def _targets_groupby(
         )
     except Exception:
         return _targets_groupby_python(
-            supabase, since, target_ids, target_labels, membership,
-            posting_ids, user_id,
+            supabase,
+            since,
+            target_ids,
+            target_labels,
+            membership,
+            posting_ids,
+            user_id,
         )
 
     payload = cast(dict[str, Any], resp.data or {})
@@ -792,9 +781,7 @@ def _targets_groupby(
     return _TargetGroupBy(per_target, distribution, trend, unscored)
 
 
-def _assemble_target_insights(
-    target_labels: dict[str, str], agg: _TargetGroupBy
-) -> TargetInsights:
+def _assemble_target_insights(target_labels: dict[str, str], agg: _TargetGroupBy) -> TargetInsights:
     """Build the ``TargetInsights`` response from the raw GROUP BY aggregates.
 
     This is the ONLY place rounding happens — keeping it in Python (banker's
@@ -817,9 +804,7 @@ def _assemble_target_insights(
                 avg_score=round(score_sum / score_n, 1),
                 applied_count=applied,
                 interview_count=interviews,
-                conversion_rate=round(interviews / applied, 3)
-                if applied > 0
-                else None,
+                conversion_rate=round(interviews / applied, 3) if applied > 0 else None,
             )
         )
 
@@ -832,10 +817,7 @@ def _assemble_target_insights(
     ]
 
     score_trend = sorted(
-        [
-            ScoreTrendPoint(week_start=w, avg_score=round(s / n, 1))
-            for w, s, n in agg.trend
-        ],
+        [ScoreTrendPoint(week_start=w, avg_score=round(s / n, 1)) for w, s, n in agg.trend],
         key=lambda x: x.week_start,
     )
 
@@ -874,9 +856,7 @@ def compute_targets(
         return TargetInsights(
             targets=[],
             score_distribution=[
-                ScoreBucket(
-                    bucket=f"{lo}-{lo + 10 if lo < 90 else 100}", count=0
-                )
+                ScoreBucket(bucket=f"{lo}-{lo + 10 if lo < 90 else 100}", count=0)
                 for lo in range(0, 100, 10)
             ],
             score_trend=[],
@@ -916,9 +896,7 @@ def compute_targets(
         return q
 
     postings = _rows(_postings_base(), label="insights/targets_postings")
-    status_map = _user_status_map(
-        supabase, user_id, [str(p["id"]) for p in postings]
-    )
+    status_map = _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
     for p in postings:
         p["status"] = status_map.get(str(p["id"]), "new")
 
@@ -961,9 +939,7 @@ def compute_targets(
                 avg_score=round(sum(scores) / len(scores), 1),
                 applied_count=applied,
                 interview_count=interviews,
-                conversion_rate=round(interviews / applied, 3)
-                if applied > 0
-                else None,
+                conversion_rate=round(interviews / applied, 3) if applied > 0 else None,
             )
         )
 
@@ -991,9 +967,7 @@ def compute_targets(
         inline = p.get("score")
         if inline is None:
             continue
-        week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(
-            int(inline)
-        )
+        week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(int(inline))
 
     score_trend = sorted(
         [
@@ -1026,97 +1000,67 @@ def compute_skills_cost(
     user's targets. *user_id* scopes ``llm_costs`` which has its own
     direct ``user_id`` column.
     """
-    # Resolve target-scoped posting membership via ``scores`` (the only
-    # table that actually records per-target attribution — ``jobs.target_id``
-    # is a vestigial pre-shared-targets column that's never populated).
-    membership = _posting_target_map(supabase, target_ids)
-    target_scoped_posting_ids = _flatten_posting_ids(membership)
 
-    # Fetch posting scores. ``jobs.llm_score`` is the globally-blended
-    # LLM score the poller writes back to ``jobs`` after analysis —
-    # fine to read directly off the postings row for the missing-skill
-    # priority calculation below.
-    def _postings_base() -> Any:
-        pq = supabase.table("jobs").select("id, llm_score")
-        if since:
-            pq = pq.gte("created_at", since.isoformat())
-        return pq
-
-    if target_scoped_posting_ids is not None:
-        if not target_scoped_posting_ids:
-            posting_rows: list[Row] = []
-        else:
-            # Chunk the id filter so the PostgREST URL stays under safe
-            # limits at multi-thousand-posting scale (#93).
-            posting_rows = _fetch_in_chunks(
-                lambda batch: _postings_base().in_("id", batch),
-                list(target_scoped_posting_ids),
-                label="insights/skills_cost_postings",
-            )
-    else:
-        posting_rows = _rows(_postings_base(), label="insights/skills_cost_postings")
-    posting_scores: dict[str, float] = {}
-    visible_posting_ids: set[str] = set()
-    for p in posting_rows:
-        pid = str(p["id"])
-        visible_posting_ids.add(pid)
-        score = p.get("llm_score")
-        if score is not None:
-            posting_scores[pid] = float(score)
-
-    # Fetch analyses for skill extraction
+    # Skills come ONLY from ``analyses`` (scorecards), and ``analyses.target_id``
+    # is populated for all recent rows — so scope analyses DIRECTLY by target
+    # instead of first resolving the target's posting ids via ``scores`` (tens of
+    # thousands at scale) and fetching every one of their ``jobs`` rows. That
+    # membership pull (~49k rows) + per-posting fetch (~17.5k rows over ~88
+    # chunked round-trips) was the /insights bottleneck (9-41s) for a handful of
+    # analyses. #60-perf
     def _analyses_base() -> Any:
-        aq = supabase.table("analyses").select(
-            "job_posting_id, scorecard, created_at"
-        )
+        aq = supabase.table("analyses").select("job_posting_id, scorecard, created_at")
         if since:
             aq = aq.gte("created_at", since.isoformat())
         return aq
 
+    analyses: list[Row]
     if target_ids is not None:
-        # Target-scope via posting_id so we don't surface analyses for
-        # postings the caller can't see. (analyses.target_id was added
-        # later and may be NULL for older rows.)
-        if not visible_posting_ids:
-            analyses: list[Row] = []
-        else:
-            # Chunk the id filter so the PostgREST URL stays under safe
-            # limits at multi-thousand-posting scale (#93).
-            analyses = _fetch_in_chunks(
-                lambda batch: _analyses_base().in_("job_posting_id", batch),
-                list(visible_posting_ids),
-                label="insights/skills_cost_analyses",
-            )
+        analyses = _rows(
+            _analyses_base().in_("target_id", list(target_ids)),
+            label="insights/skills_cost_analyses",
+        )
     else:
         analyses = _rows(_analyses_base(), label="insights/skills_cost_analyses")
+
+    # ``jobs.llm_score`` weights the missing-skill priority. Only postings that
+    # have an analysis contribute skills, so fetch scores for JUST those (a
+    # handful) — not every posting in the target.
+    analysis_posting_ids = {str(a["job_posting_id"]) for a in analyses if a.get("job_posting_id")}
+    posting_scores: dict[str, float] = {}
+    if analysis_posting_ids:
+        score_rows = _fetch_in_chunks(
+            lambda batch: supabase.table("jobs").select("id, llm_score").in_("id", batch),
+            list(analysis_posting_ids),
+            label="insights/skills_cost_postings",
+        )
+        for p in score_rows:
+            score = p.get("llm_score")
+            if score is not None:
+                posting_scores[str(p["id"])] = float(score)
 
     # Per-purpose LLM spend — aggregated server-side via the
     # cost_by_purpose_since RPC (#105), client-side fallback inside the helper.
     purpose_totals, purpose_counts = _cost_by_purpose(supabase, user_id, since)
 
-    # Fetch tailored resumes for per-resume cost. ``documents`` has no
-    # ``target_id`` column (renamed from ``tailored_resumes`` without
-    # the column ever being added), so target scoping pivots through
-    # ``job_posting_id`` against the membership map.
-    if target_ids is not None and not visible_posting_ids:
-        resume_costs: list[Row] = []
-    else:
-        def _resume_base() -> Any:
-            rq = supabase.table("documents").select("cost_usd, created_at")
-            if since:
-                rq = rq.gte("created_at", since.isoformat())
-            return rq.eq("document_type", "resume")
+    # Tailored-resume costs scope directly by ``documents.user_id`` — documents
+    # has no target_id, and the user's own resumes are exactly the set we want
+    # (the endpoint unions all of the user's targets). Was a fan-out over every
+    # target posting id.
+    def _resume_base() -> Any:
+        rq = supabase.table("documents").select("cost_usd, created_at")
+        if since:
+            rq = rq.gte("created_at", since.isoformat())
+        return rq.eq("document_type", "resume")
 
-        if target_ids is not None:
-            # Chunk the id filter so the PostgREST URL stays under safe
-            # limits at multi-thousand-posting scale (#93).
-            resume_costs = _fetch_in_chunks(
-                lambda batch: _resume_base().in_("job_posting_id", batch),
-                list(visible_posting_ids),
-                label="insights/skills_cost_resumes",
-            )
-        else:
-            resume_costs = _rows(_resume_base(), label="insights/skills_cost_resumes")
+    resume_costs: list[Row]
+    if user_id is not None:
+        resume_costs = _rows(
+            _resume_base().eq("user_id", user_id),
+            label="insights/skills_cost_resumes",
+        )
+    else:
+        resume_costs = _rows(_resume_base(), label="insights/skills_cost_resumes")
 
     # --- Skill frequencies ---
     matched_counts: Counter[str] = Counter()
