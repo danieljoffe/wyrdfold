@@ -87,12 +87,11 @@ def _deserialize_case(case: dict[str, Any]) -> tuple[Any, Any]:
 async def _judge_cases(cases: list[dict[str, Any]]) -> list[Any]:
     """Run the live faithfulness judge over each case, returning the
     ``FaithfulnessReview`` (or ``None`` on failure) aligned to ``cases``."""
-    from app.services.llm import get_client as get_llm_client
+    from app.services.llm import get_default_client as get_llm
     from app.services.tailor.faithfulness import review_resume_faithfulness
-    from app.supabase_pool import get_supabase_pool, init_supabase
 
-    init_supabase()
-    llm = get_llm_client(get_supabase_pool(), None)
+    # No Supabase needed: get_default_client reads only the LLM provider + key.
+    llm = get_llm()
 
     async def _one(case: dict[str, Any]) -> Any:
         try:
