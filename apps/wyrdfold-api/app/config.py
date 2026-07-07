@@ -413,6 +413,17 @@ class Settings(BaseSettings):
     # actual per-source cadence is governed by ``sources.poll_interval_minutes``.
     poll_scheduler_enabled: bool = False
     poll_tick_minutes: int = Field(default=30, ge=1, le=1440)
+    # Watchdog: max wall-time for ONE poll cycle before it's aborted so the
+    # next tick can run. A hung cycle (e.g. a stuck httpx/LLM await during an
+    # upstream outage) otherwise wedges the scheduler indefinitely —
+    # APScheduler's ``max_instances=1`` won't start a new tick while the old
+    # one is still "running", so a hang stops ALL polling until a restart
+    # (exactly the 402-storm incident on 2026-07-06: 68 min of no polls while
+    # the API stayed up). ``asyncio.wait_for`` cancels the cycle at this bound;
+    # the advisory lock unwinds and the next tick recovers. Keep it below the
+    # tick interval so an aborted cycle doesn't overlap the next. 0 disables
+    # (wait forever — the pre-watchdog behavior).
+    poll_cycle_timeout_seconds: int = Field(default=1200, ge=0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,

@@ -1,5 +1,6 @@
 """Tests for the in-process APScheduler wiring."""
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from unittest.mock import patch
@@ -325,9 +326,7 @@ async def test_run_scheduled_recency_refresh_invokes_sweep_and_invalidates_cache
     fake_client = object()
     with (
         patch("app.scheduler.get_supabase_pool", return_value=fake_client),
-        patch(
-            "app.scheduler.refresh_all_recency_scores", autospec=True
-        ) as mock_sweep,
+        patch("app.scheduler.refresh_all_recency_scores", autospec=True) as mock_sweep,
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
         mock_sweep.return_value = 12
@@ -343,9 +342,7 @@ async def test_run_scheduled_recency_refresh_skips_cache_invalidate_when_nothing
 
     with (
         patch("app.scheduler.get_supabase_pool", return_value=object()),
-        patch(
-            "app.scheduler.refresh_all_recency_scores", return_value=0
-        ),
+        patch("app.scheduler.refresh_all_recency_scores", return_value=0),
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
         await _run_scheduled_recency_refresh()
@@ -359,9 +356,7 @@ async def test_run_scheduled_recency_refresh_skips_when_supabase_uninitialized()
 
     with (
         patch("app.scheduler.get_supabase_pool", return_value=None),
-        patch(
-            "app.scheduler.refresh_all_recency_scores", autospec=True
-        ) as mock_sweep,
+        patch("app.scheduler.refresh_all_recency_scores", autospec=True) as mock_sweep,
     ):
         await _run_scheduled_recency_refresh()
 
@@ -436,3 +431,63 @@ async def test_run_scheduled_poll_swallows_exceptions() -> None:
     ):
         # Must not raise.
         await _run_scheduled_poll()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HUNG poll cycle must be aborted by the watchdog so the next tick can
+    run. Without it, ``max_instances=1`` wedges the scheduler until a restart
+    (the 2026-07-06 402-storm incident: 68 min of no polls while the API stayed
+    up). The tick returns cleanly (no raise) after the timeout and skips the
+    post-poll steps."""
+    import app.scheduler as sched
+    from app.scheduler import _run_scheduled_poll
+
+    monkeypatch.setattr(sched.settings, "poll_cycle_timeout_seconds", 0.05)
+
+    async def _hang(*_a: object, **_k: object) -> None:
+        await asyncio.Event().wait()  # never completes
+
+    health_calls = {"n": 0}
+
+    async def _count_health(*_a: object, **_k: object) -> None:
+        health_calls["n"] += 1
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.poll_due_sources", _hang),
+        _patch_lock_acquired(),
+        patch("app.scheduler.check_ingestion_health", _count_health),
+    ):
+        # Bound the test so a regression that drops the watchdog fails loudly
+        # (outer timeout) instead of hanging the suite forever.
+        await asyncio.wait_for(_run_scheduled_poll(), timeout=5)
+
+    assert health_calls["n"] == 0  # a timed-out cycle skips the post-poll work
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_poll_watchdog_disabled_when_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """timeout=0 disables the watchdog (``wait_for(None)``) — a normal cycle
+    still completes end-to-end (the pre-watchdog behavior)."""
+    import app.scheduler as sched
+    from app.models.schemas import PollResult
+    from app.scheduler import _run_scheduled_poll
+
+    monkeypatch.setattr(sched.settings, "poll_cycle_timeout_seconds", 0)
+    result = PollResult(sources_polled=1, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+
+    with (
+        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
+        _patch_lock_acquired(),
+        _patch_health(),
+    ):
+        mock_poll.return_value = result
+        await _run_scheduled_poll()
+
+    mock_poll.assert_awaited_once()
