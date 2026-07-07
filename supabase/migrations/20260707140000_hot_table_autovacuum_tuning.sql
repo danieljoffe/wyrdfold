@@ -1,23 +1,35 @@
--- #260 (perf): keep the insights RPCs fast after bulk re-scoring.
+-- #260 (perf): keep the insights + llm-usage aggregations fast after bulk writes.
 --
--- insights_targets_groupby / insights_pipeline_status_counts do index-only scans
--- over scores (× jobs, × user_jobs). After a bulk write — e.g. a profile change
--- re-scoring a user's tens-of-thousands of `scores`, or a tagging/archiving pass
--- over `jobs` — the DEFAULT autovacuum (autovacuum_vacuum_scale_factor = 0.20)
--- doesn't fire until ~20% of the whole table is dead, so the visibility map goes
--- stale and the index-only scans fall back to tens of thousands of heap fetches.
--- Measured on prod: targets RPC 6.25s / pipeline RPC 3.49s with a stale VM, vs
--- 0.44s / 0.05s immediately after a manual VACUUM ANALYZE.
+-- Several hot read paths scan large per-user row sets in `scores`, `jobs`, and
+-- `llm_costs`:
+--   * insights_targets_groupby / insights_pipeline_status_counts — index-only
+--     scans over scores (× jobs, × user_jobs);
+--   * /profile/llm-usage — SUM(cost_usd) over a user's llm_costs window.
+-- All three tables are bulk-written (a profile change re-scores ~tens of
+-- thousands of `scores`; a tagging/archiving pass rewrites `jobs`; the tagger
+-- logs thousands of `llm_costs` rows). The DEFAULT autovacuum
+-- (autovacuum_vacuum_scale_factor = 0.20) doesn't fire until ~20% of the WHOLE
+-- table is dead, so after a bulk write the visibility map + planner stats go
+-- stale and the scans fall back to tens of thousands of heap fetches.
 --
--- Lower the per-table autovacuum + autoanalyze thresholds on the two hottest
--- write tables so the VM + planner stats stay fresh and the scans stay
--- index-only. Reversible, table-local; no data change.
+-- Measured on prod with a stale VM vs immediately after VACUUM ANALYZE:
+--   insights_targets_groupby 6.25s → 0.44s; pipeline_status_counts 3.49s → 0.05s;
+--   llm-usage month-spend SUM 1.73s → 0.02s.
+--
+-- Lower the per-table autovacuum + autoanalyze thresholds on the three hottest
+-- write tables so the VM + stats stay fresh. Reversible, table-local; no data
+-- change.
 ALTER TABLE public.scores SET (
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.02
 );
 
 ALTER TABLE public.jobs SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.02
+);
+
+ALTER TABLE public.llm_costs SET (
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.02
 );
