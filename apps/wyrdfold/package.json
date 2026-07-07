@@ -18,12 +18,12 @@
     "@tiptap/react": "^3.27.1",
     "@tiptap/starter-kit": "^3.27.1",
     "isomorphic-dompurify": "3.18.0",
-    "lucide-react": "1.22.0",
-    "next": "16.2.9",
+    "lucide-react": "1.23.0",
+    "next": "16.2.10",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "recharts": "^3.9.0",
-    "sharp": "^0.35.2",
+    "recharts": "^3.9.2",
+    "sharp": "^0.35.3",
     "tiptap-markdown": "^0.9.0"
   }
 }
