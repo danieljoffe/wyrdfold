@@ -157,9 +157,7 @@ _NON_US_HINTS: tuple[str, ...] = (
 # Word-boundary pattern over the hints. Plain substring matching produced
 # false drops on US locations that merely *contain* a hint: "india" ⊂
 # "Indianapolis, Indiana", "rome" ⊂ "Rome, GA", etc.
-_NON_US_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(h) for h in _NON_US_HINTS) + r")\b"
-)
+_NON_US_RE = re.compile(r"\b(?:" + "|".join(re.escape(h) for h in _NON_US_HINTS) + r")\b")
 
 # Explicit US markers that short-circuit the non-US rejection. Needed for
 # US cities that share a name with a non-US hint city: "Dublin, OH",
@@ -169,11 +167,56 @@ _US_COUNTRY_RE = re.compile(r"\b(?:usa|u\.s\.a?|united states)\b", re.I)
 
 _US_STATE_ABBREVS: frozenset[str] = frozenset(
     {
-        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+        "AL",
+        "AK",
+        "AZ",
+        "AR",
+        "CA",
+        "CO",
+        "CT",
+        "DE",
+        "FL",
+        "GA",
+        "HI",
+        "ID",
+        "IL",
+        "IN",
+        "IA",
+        "KS",
+        "KY",
+        "LA",
+        "ME",
+        "MD",
+        "MA",
+        "MI",
+        "MN",
+        "MS",
+        "MO",
+        "MT",
+        "NE",
+        "NV",
+        "NH",
+        "NJ",
+        "NM",
+        "NY",
+        "NC",
+        "ND",
+        "OH",
+        "OK",
+        "OR",
+        "PA",
+        "RI",
+        "SC",
+        "SD",
+        "TN",
+        "TX",
+        "UT",
+        "VT",
+        "VA",
+        "WA",
+        "WV",
+        "WI",
+        "WY",
         "DC",
     }
 )
@@ -203,12 +246,33 @@ def is_us_location(location: str | None) -> bool:
         return True
     if _US_COUNTRY_RE.search(location):
         return True
-    if any(
-        m.group(1) in _US_STATE_ABBREVS
-        for m in _US_STATE_ABBREV_RE.finditer(location)
-    ):
+    if any(m.group(1) in _US_STATE_ABBREVS for m in _US_STATE_ABBREV_RE.finditer(location)):
         return True
     return not _NON_US_RE.search(location.lower())
+
+
+def positively_us_location(location: str | None) -> bool:
+    """True only when the location string UNAMBIGUOUSLY names the US — an
+    explicit ``United States`` / ``USA`` marker, or a ``City, ST`` state
+    abbreviation — AND carries no known non-US hint.
+
+    The strict complement of the permissive :func:`is_us_location`: where that
+    returns True for empty / 'Remote' / ambiguous, this returns True *only* on
+    a positive US signal. It's the archive veto (#60 workstream B): even a
+    high-confidence L2 non-US verdict must NOT archive a job whose location
+    plainly says US (a tagger false-negative on ``New York, NY, United States``
+    was observed at confidence 95). The no-foreign-hint clause keeps it from
+    vetoing collision cases the state-abbrev alone would trip — ``Munich, DE``
+    (Delaware), ``Bangalore, IN`` (Indiana), ``Toronto, ON, CA`` (California)
+    all carry a non-US hint, so they still archive.
+    """
+    if not location:
+        return False
+    if _NON_US_RE.search(location.lower()):
+        return False
+    if _US_COUNTRY_RE.search(location):
+        return True
+    return any(m.group(1) in _US_STATE_ABBREVS for m in _US_STATE_ABBREV_RE.finditer(location))
 
 
 # ---------------------------------------------------------------------------

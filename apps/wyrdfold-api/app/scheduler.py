@@ -75,7 +75,24 @@ async def _run_scheduled_poll() -> None:
                     settings.poll_advisory_lock_key,
                 )
                 return
-            result = await poll_due_sources(client)
+            # Watchdog: cap the cycle's wall-time so a HUNG cycle (a stuck
+            # httpx/LLM await during an upstream outage) can't wedge the
+            # scheduler — ``max_instances=1`` blocks the next tick while this
+            # one is still "running", so without this a hang stops ALL polling
+            # until a restart (the 402-storm incident, 2026-07-06). On timeout
+            # the cycle is cancelled, the advisory lock unwinds, and the next
+            # tick recovers. 0 disables.
+            timeout = settings.poll_cycle_timeout_seconds or None
+            try:
+                result = await asyncio.wait_for(poll_due_sources(client), timeout=timeout)
+            except TimeoutError:
+                logger.error(
+                    "scheduled poll: cycle exceeded the %ds watchdog and was "
+                    "aborted so the next tick can recover (a hung cycle "
+                    "otherwise wedges the scheduler until a restart)",
+                    settings.poll_cycle_timeout_seconds,
+                )
+                return
             if result.sources_polled > 0:
                 job_list_cache.invalidate()
             logger.info(
@@ -129,7 +146,20 @@ async def run_force_poll_locked() -> None:
                     settings.poll_advisory_lock_key,
                 )
                 return
-            result = await poll_all_sources(client)
+            # Watchdog: same hung-cycle protection as the scheduled tick — a
+            # force poll holds the SAME advisory lock, so a hang here also
+            # blocks scheduled polls until a restart. 0 disables.
+            timeout = settings.poll_cycle_timeout_seconds or None
+            try:
+                result = await asyncio.wait_for(poll_all_sources(client), timeout=timeout)
+            except TimeoutError:
+                logger.error(
+                    "force poll: cycle exceeded the %ds watchdog and was "
+                    "aborted (a hung cycle otherwise holds the advisory lock "
+                    "and blocks scheduled polls until a restart)",
+                    settings.poll_cycle_timeout_seconds,
+                )
+                return
             job_list_cache.invalidate()
             logger.info(
                 "force poll: polled=%d new=%d updated=%d archived=%d errors=%d",

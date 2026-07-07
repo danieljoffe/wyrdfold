@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     # unpopulated spine never silently drops jobs. Default off; flip per target
     # once its threshold is calibrated (#89).
     prescan_gate_enabled: bool = False
+    # Per-target SCOPE for the gate above — a staged rollout (#90). Comma-separated
+    # target UUIDs the gate applies to. EMPTY = all targets (the global posture);
+    # non-empty = an ALLOWLIST, so the gate acts only on the listed targets while
+    # every other target keeps permissive keyword admission. This lets a
+    # zero-recall-loss target flip first (CX, whose shadow would-drops scored
+    # 0/8229 >= the floor) while a lossier one waits for more data (frontend,
+    # 2.8%). No effect when ``prescan_gate_enabled`` is off. Parsed by
+    # ``prescan_gate_target_ids_set``.
+    prescan_gate_target_ids: str = ""
     # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
     # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
     # false-negative rate (dropped-but-actually-high-fit) is measurable against
@@ -311,6 +320,22 @@ class Settings(BaseSettings):
     # description" (title/company/location only).
     qualification_jd_snippet_chars: int = Field(default=600, ge=0)
 
+    # US-only corpus (#60 workstream B). When on, the qualification tagger
+    # ARCHIVES (stamps ``archived_at``) a job the instant it tags it
+    # high-confidence non-US — closing the loop between the L2 ``is_us``
+    # verdict and the ``archived_at`` gate the display/query layer already
+    # honors, so non-US postings don't linger in a catalog a US-only product
+    # never surfaces (and stop being re-polled/re-graded). Reversible
+    # (``archived_at`` is nullable) and conf-gated by the threshold below to
+    # protect a mistagged US role. OFF by default: a self-host that wants a
+    # global catalog leaves it off, and the tagger still records ``is_us`` for
+    # anyone who'd rather filter on it than archive.
+    qualification_archive_non_us: bool = False
+    # Minimum ``us_confidence`` (0-100) for the archive above to fire. 80 keeps
+    # the tagger's genuinely-uncertain calls (which include most US
+    # false-negatives) live; a prod sample of the >=80 set was 100% non-US.
+    qualification_non_us_archive_min_confidence: int = Field(default=80, ge=0, le=100)
+
     # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
     # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
     # the vector in ``job_embeddings`` via
@@ -413,6 +438,17 @@ class Settings(BaseSettings):
     # actual per-source cadence is governed by ``sources.poll_interval_minutes``.
     poll_scheduler_enabled: bool = False
     poll_tick_minutes: int = Field(default=30, ge=1, le=1440)
+    # Watchdog: max wall-time for ONE poll cycle before it's aborted so the
+    # next tick can run. A hung cycle (e.g. a stuck httpx/LLM await during an
+    # upstream outage) otherwise wedges the scheduler indefinitely —
+    # APScheduler's ``max_instances=1`` won't start a new tick while the old
+    # one is still "running", so a hang stops ALL polling until a restart
+    # (exactly the 402-storm incident on 2026-07-06: 68 min of no polls while
+    # the API stayed up). ``asyncio.wait_for`` cancels the cycle at this bound;
+    # the advisory lock unwinds and the next tick recovers. Keep it below the
+    # tick interval so an aborted cycle doesn't overlap the next. 0 disables
+    # (wait forever — the pre-watchdog behavior).
+    poll_cycle_timeout_seconds: int = Field(default=1200, ge=0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,
@@ -451,13 +487,27 @@ class Settings(BaseSettings):
     # logs a warning and exits cleanly). 2,000 free queries/month is plenty
     # for daily-per-target with a query cap. Get one at https://brave.com/search/api/.
     brave_search_api_key: str = Field(default="", repr=False)
-    # Hard cap on total Brave queries fired per discovery run, across all
-    # targets and keywords. The free tier is 2,000/month; at 200/day across
-    # daily runs we'd burn through it in 10 days, so 200 is the ceiling for a
-    # single run and the per-target loop fans out within that budget.
+    # PER-TARGET ceiling on Brave queries in one discovery run — applied
+    # INDEPENDENTLY inside each ``run_discovery_for_target`` so a single
+    # keyword-rich target can't hog a pass. It does NOT bound total monthly
+    # usage by itself: N targets each fire up to this many, so the run total
+    # scales with target count. The run-TOTAL budget below is the real
+    # monthly-cost control. The target's keyword x site plan is shuffled then
+    # truncated to this, so repeated runs sample the whole space cursorlessly.
     discovery_query_cap_per_run: int = Field(default=200, ge=1, le=2000)
     # Per-keyword result depth — top N URLs we look at from each search.
     discovery_results_per_query: int = Field(default=20, ge=1, le=50)
+    # Run-TOTAL Brave query budget shared across ALL targets in one bulk pass
+    # (``run_discovery_all_targets``) — the monthly-cost control, and INVARIANT
+    # to target count (unlike the per-target cap above). The budget is split
+    # across the run's targets (shuffled for fairness across runs); once spent,
+    # the remaining targets are deferred to the next run. Monthly Brave usage
+    # ~= this x runs/month, so the free tier (2,000/month) holds by
+    # construction: the default 60 with the daily scheduler ≈ 1,800/month —
+    # reaching the free tier with headroom, regardless of how many targets
+    # exist. 0 disables the run budget (each target then uses only its
+    # per-target cap — the legacy behavior that scales with target count).
+    discovery_query_budget_per_run: int = Field(default=60, ge=0, le=20000)
 
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
@@ -470,6 +520,17 @@ class Settings(BaseSettings):
     # (discovery is a daily-cadence job, not minutes like the poll).
     discovery_scheduler_enabled: bool = False
     discovery_tick_hours: int = Field(default=24, ge=1, le=720)
+    # Discovery-staleness alarm — checked on the ingestion-health tick (which
+    # piggybacks the poll cycle). ARMED ONLY when ``discovery_scheduler_enabled``
+    # is on, so a deliberately-off discovery loop never pages; when armed it
+    # raises a Sentry ``warning`` if the newest ``source_discoveries.discovered_at``
+    # is older than this many hours. This is the guard for the exact silent
+    # freeze that motivated #60: discovery stopped producing new sources and
+    # nobody noticed for weeks (the catalog rotted until a user hit an empty
+    # metro). The effective threshold is ``max(this, discovery_tick_hours * 2)``
+    # so a single missed tick never pages and a longer tick auto-relaxes it. 0
+    # disables just this check.
+    discovery_max_age_hours: int = Field(default=48, ge=0, le=8760)
     # Postgres advisory-lock key for the bulk discovery run. A DISTINCT bigint
     # from ``poll_advisory_lock_key`` so a discovery pass and a poll never
     # contend on the same lock — they guard different work. Like the poll key
@@ -482,6 +543,12 @@ class Settings(BaseSettings):
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
+    @property
+    def prescan_gate_target_ids_set(self) -> frozenset[str]:
+        """Parsed ``prescan_gate_target_ids`` — the target IDs the pre-scan gate
+        is scoped to. Empty means "all targets" (see ``_prescan_gate_applies``)."""
+        return frozenset(t.strip() for t in self.prescan_gate_target_ids.split(",") if t.strip())
 
     # Per-user LLM budget (defense-in-depth). Rolling window over llm_costs.
     # Set to 0 to disable a window. API-key callers (cron) bypass the HTTP

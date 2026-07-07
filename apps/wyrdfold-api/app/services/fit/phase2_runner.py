@@ -80,8 +80,7 @@ def _needs_phase2(
     if promising is not True:
         return False
     already_current = (
-        scoring_status == "complete"
-        and (scored_profile_version or 0) >= target_profile_version
+        scoring_status == "complete" and (scored_profile_version or 0) >= target_profile_version
     )
     return not already_current
 
@@ -98,9 +97,7 @@ def _fetch_phase2_state(
     ordering treats None as "lowest priority" so legacy rows still grade
     but newer high-confidence rows go first.
     """
-    state: dict[
-        str, tuple[bool | None, str | None, int | None, int | None]
-    ] = {}
+    state: dict[str, tuple[bool | None, str | None, int | None, int | None]] = {}
     for i in range(0, len(job_ids), _STATE_CHUNK_SIZE):
         chunk = job_ids[i : i + _STATE_CHUNK_SIZE]
         resp = (
@@ -123,9 +120,7 @@ def _fetch_phase2_state(
     return state
 
 
-def _progressive_batches(
-    items: list[str], first: int, rest: int
-) -> list[list[str]]:
+def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[str]]:
     """Split ``items`` into a small first batch then larger chunks."""
     if not items:
         return []
@@ -135,6 +130,20 @@ def _progressive_batches(
         batches.append(items[i : i + rest])
         i += rest
     return batches
+
+
+def _prescan_gate_applies(target_id: str) -> bool:
+    """Whether the pre-scan cosine gate acts on this target (#90 staged rollout).
+
+    The global ``prescan_gate_enabled`` must be on AND the target must be in
+    scope: an EMPTY ``prescan_gate_target_ids`` allowlist means "all targets"
+    (the global posture), a non-empty one restricts the gate to just those
+    targets so a zero-loss target (CX) can flip before a lossier one (frontend).
+    """
+    if not settings.prescan_gate_enabled:
+        return False
+    scope = settings.prescan_gate_target_ids_set
+    return not scope or str(target_id) in scope
 
 
 async def run_phase2_for_jobs(
@@ -218,8 +227,9 @@ async def run_phase2_for_jobs(
     # so an unpopulated spine never drops jobs. A deterministic exploration
     # holdout keeps a small slice of would-drop jobs FOR grading, so the gate's
     # false-negative rate stays measurable against the shadow log. Flag-off by
-    # default; enabled per-target after calibration (#89).
-    if settings.prescan_gate_enabled:
+    # default; enabled per-target (``prescan_gate_target_ids``) after calibration
+    # (#89) so a zero-loss target flips before a lossier one (#90 rollout).
+    if _prescan_gate_applies(target.id):
         admits = await cosine_gate_admits_batch(supabase, target, candidates)
         holdout = settings.prescan_gate_holdout_fraction
         kept = []
@@ -235,8 +245,7 @@ async def run_phase2_for_jobs(
             kept.append(jid)  # True (>= threshold) or None (fail-open) → admit
         if dropped or held:
             logger.info(
-                "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d "
-                "for target %s",
+                "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d for target %s",
                 dropped,
                 held,
                 len(kept),
@@ -305,8 +314,6 @@ async def run_phase2_for_jobs(
 
     graded = 0
     for batch in _progressive_batches(candidates, first_batch_size, batch_size):
-        results = await asyncio.gather(
-            *(_grade_one(jid) for jid in batch), return_exceptions=True
-        )
+        results = await asyncio.gather(*(_grade_one(jid) for jid in batch), return_exceptions=True)
         graded += sum(1 for r in results if r is True)
     return graded

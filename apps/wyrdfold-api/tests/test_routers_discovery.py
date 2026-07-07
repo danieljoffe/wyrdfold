@@ -246,7 +246,13 @@ async def test_run_all_records_error_and_continues() -> None:
     sb = MagicMock()
     t1, t2 = MagicMock(id="t-1"), MagicMock(id="t-2")
     fake_run = AsyncMock(side_effect=[RuntimeError("brave down"), _stats("t-2", inserted=2)])
-    with patch("app.services.source_discovery.run_discovery_for_target", fake_run):
+    with (
+        # Freeze the run-budget target shuffle (added in #245) so the ordered
+        # side_effect maps deterministically: t-1 raises, t-2 succeeds.
+        # Without this the shuffle makes this order-dependent test flaky.
+        patch("app.services.source_discovery.random.shuffle"),
+        patch("app.services.source_discovery.run_discovery_for_target", fake_run),
+    ):
         result = await run_discovery_all_targets(sb, [t1, t2])
 
     assert result.targets_processed == 1

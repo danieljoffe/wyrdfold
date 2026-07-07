@@ -220,6 +220,115 @@ def _unique_rows(n: int) -> list[dict[str, Any]]:
     return [_row(id=f"job-{i}", title=f"Engineer {i}") for i in range(n)]
 
 
+def _non_us_tags(confidence: int) -> QualificationTags:
+    """A non-US verdict at the given ``us_confidence``."""
+    return QualificationTags(
+        is_us=False,
+        us_confidence=confidence,
+        role_family="engineering",
+        seniority="senior_ic",
+        employment_type="full_time",
+        metro=None,
+        is_remote=False,
+        is_genuine_role=True,
+    )
+
+
+class TestNonUsArchive:
+    """#60 workstream B: a high-confidence non-US verdict archives the job in
+    the SAME tag write (``archived_at`` stamped), so non-US postings leave the
+    live catalog a US-only product never surfaces. Conf-gated + reversible +
+    OFF by default (a global-catalog self-host is unaffected)."""
+
+    @pytest.mark.asyncio
+    async def test_high_conf_non_us_is_archived_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+
+        assert len(rec["writes"]) == 1
+        payload = rec["writes"][0]
+        # Tagged non-US AND archived in the same write.
+        assert payload["is_us"] is False
+        assert payload["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_non_us_not_archived_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Clone-safe default: with the flag OFF, a non-US job is still tagged
+        but NOT archived — the tagger records is_us for whoever wants it."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", False)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False
+        assert "archived_at" not in payload
+
+    @pytest.mark.asyncio
+    async def test_us_job_is_not_archived(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))  # is_us=True
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        assert "archived_at" not in rec["writes"][0]
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_non_us_is_not_archived(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Below the confidence floor the tagger's uncertain non-US call is
+        left live — that band carries most US false-negatives."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(50), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="Remote")])
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False
+        assert "archived_at" not in payload
+
+    @pytest.mark.asyncio
+    async def test_positively_us_location_vetoes_archive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Safety veto: even a high-confidence non-US verdict must NOT archive a
+        job whose location plainly says US — the tagger false-negative hedge.
+        (A real 'New York, NY, United States' was seen tagged non-US at 95.)"""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="New York, NY, United States")])
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False  # the (wrong) tag is still recorded
+        assert "archived_at" not in payload  # but the job is NOT archived
+
+    @pytest.mark.asyncio
+    async def test_confidence_threshold_is_inclusive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """confidence == threshold archives (>=)."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(80), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="Toronto, Canada")])
+
+        assert rec["writes"][0]["archived_at"] is not None
+
+
 class TestQualifyBudgetGate:
     """Fix 1: the qualification tagger bills the instance key and is invisible
     to the per-payer ``PayerBudgetGate``. Once today's GLOBAL LLM spend reaches
