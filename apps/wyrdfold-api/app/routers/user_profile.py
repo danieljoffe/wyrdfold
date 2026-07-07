@@ -487,61 +487,83 @@ async def get_llm_usage(
     now = datetime.now(UTC)
 
     def _snapshot() -> LlmUsageResponse:
+        from concurrent.futures import ThreadPoolExecutor
+
         quota = budget.resolve_llm_quota(service_supabase, user_id=user_id)
         monthly_cap = quota.monthly_cap_usd
         month_since = now - timedelta(days=budget.MONTHLY_WINDOW_DAYS)
-        if quota.monthly_excluded_purposes:
-            spent_month = cost_log.total_billable_spend(
+        day_since = now - timedelta(hours=24)
+
+        def _month_spend() -> float:
+            if quota.monthly_excluded_purposes:
+                return cost_log.total_billable_spend(
+                    supabase,
+                    user_id=user_id,
+                    since=month_since,
+                    excluded_purposes=quota.monthly_excluded_purposes,
+                )
+            return cost_log.total_spend(supabase, user_id=user_id, since=month_since)
+
+        def _resets_at() -> datetime | None:
+            # Approximate refill point: oldest cost row in the window + 30d.
+            oldest = cast(
+                list[dict[str, Any]],
+                supabase.table("llm_costs")
+                .select("created_at")
+                .eq("user_id", user_id)
+                .gte("created_at", month_since.isoformat())
+                .order("created_at")
+                .limit(1)
+                .execute()
+                .data
+                or [],
+            )
+            if not oldest:
+                return None
+            oldest_dt = datetime.fromisoformat(str(oldest[0]["created_at"]).replace("Z", "+00:00"))
+            return oldest_dt + timedelta(days=budget.MONTHLY_WINDOW_DAYS)
+
+        def _analysis_used() -> int:
+            return (
+                supabase.table("llm_costs")
+                .select("id", count="exact")  # type: ignore[arg-type]
+                .eq("user_id", user_id)
+                .eq("purpose", DEFAULT_PURPOSE)
+                .gte("created_at", day_since.isoformat())
+                .execute()
+                .count
+                or 0
+            )
+
+        # These five reads are independent PostgREST round-trips. Run them
+        # concurrently — sequentially they were the endpoint's bottleneck
+        # (~7-8 round-trips, ~2-3s on a heavy account even with each query at
+        # <30ms post-VACUUM). The supabase client's httpx pool is safe for
+        # concurrent reads; all five are read-only. #260
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            f_month = pool.submit(_month_spend)
+            f_resets = pool.submit(_resets_at)
+            f_analysis = pool.submit(_analysis_used)
+            f_hourly = pool.submit(
+                cost_log.total_spend,
                 supabase,
                 user_id=user_id,
-                since=month_since,
-                excluded_purposes=quota.monthly_excluded_purposes,
+                since=now - timedelta(hours=1),
             )
-        else:
-            spent_month = cost_log.total_spend(
-                supabase, user_id=user_id, since=month_since
-            )
-
-        # Approximate refill point: oldest cost row in the window + 30d.
-        resets_at = None
-        oldest = cast(
-            list[dict[str, Any]],
-            supabase.table("llm_costs")
-            .select("created_at")
-            .eq("user_id", user_id)
-            .gte("created_at", month_since.isoformat())
-            .order("created_at")
-            .limit(1)
-            .execute()
-            .data
-            or [],
-        )
-        if oldest:
-            oldest_dt = datetime.fromisoformat(str(oldest[0]["created_at"]).replace("Z", "+00:00"))
-            resets_at = oldest_dt + timedelta(days=budget.MONTHLY_WINDOW_DAYS)
-
-        analysis_used = (
-            supabase.table("llm_costs")
-            .select("id", count="exact")  # type: ignore[arg-type]
-            .eq("user_id", user_id)
-            .eq("purpose", DEFAULT_PURPOSE)
-            .gte("created_at", (now - timedelta(hours=24)).isoformat())
-            .execute()
-            .count
-            or 0
-        )
+            f_daily = pool.submit(cost_log.total_spend, supabase, user_id=user_id, since=day_since)
+            spent_month = f_month.result()
+            resets_at = f_resets.result()
+            analysis_used = f_analysis.result()
+            hourly_spent = f_hourly.result()
+            daily_spent = f_daily.result()
 
         return LlmUsageResponse(
             hourly=LlmUsageWindow(
-                spent_usd=cost_log.total_spend(
-                    supabase, user_id=user_id, since=now - timedelta(hours=1)
-                ),
+                spent_usd=hourly_spent,
                 limit_usd=settings.user_llm_hourly_budget_usd,
             ),
             daily=LlmUsageWindow(
-                spent_usd=cost_log.total_spend(
-                    supabase, user_id=user_id, since=now - timedelta(hours=24)
-                ),
+                spent_usd=daily_spent,
                 limit_usd=settings.user_llm_daily_budget_usd,
             ),
             monthly=LlmUsageWindow(spent_usd=spent_month, limit_usd=monthly_cap),

@@ -249,52 +249,6 @@ def _user_status_map(
     return out
 
 
-def _fetch_window_posting_ids(
-    supabase: Client,
-    since: datetime | None,
-    until: datetime | None,
-    target_ids: set[str] | None,
-) -> set[str]:
-    """Resolve the SET of posting ids in the window under the caller's targets.
-
-    Returns the concrete window posting-id set for both the scoped and the
-    unscoped (admin / ``target_ids is None``) paths, and an empty set when the
-    user has targets but no postings in the window. This is exactly the set
-    the old ``{str(p["id"]) for p in postings}`` produced from
-    ``_fetch_postings_window`` — preserved byte-for-byte so the downstream
-    ``status_log`` / resume scoping is unchanged.
-
-    Used only to bound the velocity / response-time follow-up queries
-    (``status_log`` + resume ``documents``), which stay in Python (#101). The
-    per-status FUNNEL/KPI tallies no longer ride on these rows — they come
-    from the ``insights_pipeline_status_counts`` GROUP BY RPC — so this fetch
-    drops the per-posting ``user_jobs`` status overlay the old
-    ``_fetch_postings_window`` carried."""
-    posting_ids = _flatten_posting_ids(_posting_target_map(supabase, target_ids))
-    if posting_ids is not None and not posting_ids:
-        return set()
-
-    def _base() -> Any:
-        q = supabase.table("jobs").select("id")
-        if since:
-            q = q.gte("created_at", since.isoformat())
-        if until:
-            q = q.lt("created_at", until.isoformat())
-        return q
-
-    if posting_ids is not None:
-        # Chunk the id filter so the PostgREST URL stays under safe limits
-        # at multi-thousand-posting scale (#93).
-        rows = _fetch_in_chunks(
-            lambda batch: _base().in_("id", batch),
-            list(posting_ids),
-            label="insights/window_posting_ids",
-        )
-    else:
-        rows = _rows(_base(), label="insights/window_posting_ids")
-    return {str(r["id"]) for r in rows}
-
-
 def _pipeline_status_counts_python(
     supabase: Client,
     since: datetime | None,
@@ -477,38 +431,29 @@ def compute_pipeline(
     # velocity / response-time follow-ups (status_log + resume documents),
     # whose time-series logic stays in Python (status_log is ~1 row at beta
     # scale — moving it is risk without payoff, #101).
-    posting_ids = _fetch_window_posting_ids(supabase, since, None, target_ids)
-    status_logs = _fetch_status_logs_window(supabase, since, None, posting_ids, user_id)
+    # #260-perf: scope the velocity / response-time follow-ups (status_log +
+    # resume documents) by ``user_id`` directly — both tables carry it — instead
+    # of resolving the user's window posting-id SET client-side and chunking over
+    # it. The old `_fetch_window_posting_ids` pulled ~tens of thousands of score
+    # rows to the API to bound two tiny queries (status_log is ~a handful of rows
+    # per user; documents likewise), which dominated /insights at scale.
+    status_logs = _fetch_status_logs_window(supabase, since, None, None, user_id)
     status_counts = _pipeline_status_counts(supabase, since, None, target_ids, user_id)
 
-    # Fetch tailored resumes for velocity (current window only). The
-    # ``documents`` table has no ``target_id`` column (it was renamed
-    # from ``tailored_resumes`` without that column ever being added),
-    # so scoping goes through ``job_posting_id`` against the same
-    # posting set the window query just resolved. Skip the query
-    # entirely when target scoping is requested but the user has zero
-    # matching postings — ``.in_("…", [])`` would otherwise relax to
-    # an unbounded SELECT.
-    if target_ids is not None and not posting_ids:
-        resumes: list[Row] = []
+    # Tailored-resume velocity — scope by ``documents.user_id`` (the user's own
+    # resumes are exactly the set the weekly velocity counts). Was a fan-out over
+    # the window posting-id set.
+    def _resume_base() -> Any:
+        rq = supabase.table("documents").select("job_posting_id, created_at")
+        if since:
+            rq = rq.gte("created_at", since.isoformat())
+        return rq.eq("document_type", "resume")
+
+    resumes: list[Row]
+    if user_id is not None:
+        resumes = _rows(_resume_base().eq("user_id", user_id), label="insights/pipeline_resumes")
     else:
-
-        def _resume_base() -> Any:
-            rq = supabase.table("documents").select("job_posting_id, created_at")
-            if since:
-                rq = rq.gte("created_at", since.isoformat())
-            return rq.eq("document_type", "resume")
-
-        if target_ids is not None:
-            # Chunk the id filter so the PostgREST URL stays under safe
-            # limits at multi-thousand-posting scale (#93).
-            resumes = _fetch_in_chunks(
-                lambda batch: _resume_base().in_("job_posting_id", batch),
-                list(posting_ids),
-                label="insights/pipeline_resumes",
-            )
-        else:
-            resumes = _rows(_resume_base(), label="insights/pipeline_resumes")
+        resumes = _rows(_resume_base(), label="insights/pipeline_resumes")
 
     # --- Funnel counts (from the GROUP BY RPC, #101) ---
     funnel = [FunnelStage(stage=s, count=status_counts.get(s, 0)) for s in FUNNEL_ORDER]
@@ -520,12 +465,7 @@ def compute_pipeline(
     previous: PipelinePeriodKpis | None = None
     if prior_window is not None:
         prior_since, prior_until = prior_window
-        prior_posting_ids = _fetch_window_posting_ids(
-            supabase, prior_since, prior_until, target_ids
-        )
-        prior_logs = _fetch_status_logs_window(
-            supabase, prior_since, prior_until, prior_posting_ids, user_id
-        )
+        prior_logs = _fetch_status_logs_window(supabase, prior_since, prior_until, None, user_id)
         prior_counts = _pipeline_status_counts(
             supabase, prior_since, prior_until, target_ids, user_id
         )

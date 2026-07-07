@@ -179,24 +179,32 @@ function Button(props: AppButtonProps) {
 
   const { onClick, ref, ...restButton } = rest as Omit<AsButtonProps, 'as'>;
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      if (!restButton.disabled && onClick) {
-        onClick(e as unknown as React.MouseEvent<HTMLButtonElement>);
-      }
-    }
-  };
-
   const {
     type = 'button',
     children,
     variant,
     size,
     iconOnly,
+    loading,
     className,
     ...buttonRest
   } = restButton;
+
+  // `loading` is a component prop, NOT a valid <button> DOM attribute — React
+  // errors ("Received `false` for a non-boolean attribute `loading`") if it
+  // reaches the DOM, so pull it out of the spread. It was also completely
+  // unused; wire it up to disable the button (prevents double-submit) and flag
+  // `aria-busy` for assistive tech while an async action is in flight.
+  const isDisabled = Boolean(loading) || Boolean(buttonRest.disabled);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (!isDisabled && onClick) {
+        onClick(e as unknown as React.MouseEvent<HTMLButtonElement>);
+      }
+    }
+  };
 
   const sizeMap = iconOnly ? iconOnlySizeStyles : sizeButtonStyles;
 
@@ -204,9 +212,10 @@ function Button(props: AppButtonProps) {
     <button
       {...buttonRest}
       ref={ref}
-      disabled={restButton.disabled}
+      disabled={isDisabled}
+      aria-busy={loading || undefined}
       type={type}
-      onClick={restButton.disabled ? undefined : onClick}
+      onClick={isDisabled ? undefined : onClick}
       onKeyDown={onKeyDown}
       className={cn(
         baseButtonStyles,

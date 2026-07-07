@@ -1520,27 +1520,30 @@ class TestComputeChunksLargeIdLists:
     """End-to-end: a target-scoped compute over >200 postings issues the
     posting-id ``.in_(...)`` filters in 200-id batches (#93)."""
 
-    def test_compute_pipeline_chunks_posting_id_filters(self):
-        # 250 postings → 2 batches (200 + 50) for every posting-id .in_().
-        n = 250
-        scores = [{"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)]
-        postings = [{"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)]
+    def test_compute_pipeline_scopes_velocity_by_user_not_posting_membership(self):
+        # #260-perf: the velocity / response-time follow-ups (status_log + resume
+        # documents) scope by ``user_id`` directly — no window posting-id
+        # membership pull, no per-posting chunking (both tables carry user_id).
+        status_logs = [
+            {
+                "posting_id": "p1",
+                "old_status": "applied",
+                "new_status": "interviewing",
+                "created_at": _ts(_NOW),
+            }
+        ]
+        resumes = [{"job_posting_id": "p1", "created_at": _ts(_NOW)}]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
-            {"scores": scores, "jobs": postings, "user_jobs": [], "documents": []},
+            {"status_log": status_logs, "documents": resumes, "scores": [], "user_jobs": []},
             in_batches,
         )
 
         compute_pipeline(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
-        # jobs (postings window), status_log, documents (resumes), and
-        # user_jobs all filter by the resolved posting-id set in 200-id
-        # batches. The mock returns the full posting set for every table,
-        # so each of those resolves a 250-id list → [200, 50].
-        for table in ("jobs", "status_log", "documents"):
-            sizes = [len(b) for b in in_batches.get(table, [])]
-            assert sizes and all(s <= 200 for s in sizes), f"{table} not chunked at 200: {sizes}"
-            assert sizes[0] == 200
+        # The follow-ups are scoped by .eq(user_id), never chunked by posting id.
+        assert "status_log" not in in_batches
+        assert "documents" not in in_batches
 
     def test_compute_targets_chunks_posting_id_filters(self):
         n = 250
