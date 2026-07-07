@@ -34,6 +34,7 @@ from app.services.qualification import (
     QualificationTags,
     clean_description,
     is_us_location,
+    positively_us_location,
     qualification_hash,
     tag_job,
 )
@@ -130,6 +131,35 @@ class TestIsUsLocationHeuristic:
     )
     def test_cases(self, loc: str | None, expected: bool) -> None:
         assert is_us_location(loc) is expected
+
+
+class TestPositivelyUsLocation:
+    """The strict complement used to VETO archiving a tagger non-US verdict:
+    True only on an UNAMBIGUOUS US marker with no foreign hint (#60 B)."""
+
+    @pytest.mark.parametrize(
+        ("loc", "expected"),
+        [
+            # Unambiguous US → veto the archive (protects tagger false-negatives).
+            ("New York, NY, United States", True),  # the real conf-95 FN observed
+            ("Austin, TX", True),
+            ("USA", True),
+            ("Remote (USA)", True),
+            # Permissive-US but NOT positively US → do not veto (archive proceeds).
+            (None, False),
+            ("", False),
+            ("Remote", False),
+            # State-abbrev COLLISIONS that carry a foreign hint → not vetoed, so
+            # these genuinely-non-US rows still archive.
+            ("Munich, DE", False),  # DE=Delaware, but 'munich' is a non-US hint
+            ("Bangalore, IN", False),  # IN=Indiana, but 'bangalore' is a hint
+            ("Toronto, ON, CA", False),  # CA=California, but 'toronto' is a hint
+            # Lower-case country code, no marker, no hint → not positively US.
+            ("Jakarta, id", False),
+        ],
+    )
+    def test_cases(self, loc: str | None, expected: bool) -> None:
+        assert positively_us_location(loc) is expected
 
 
 # ---- L2: prompt construction ----------------------------------------------

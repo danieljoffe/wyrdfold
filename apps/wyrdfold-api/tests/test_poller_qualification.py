@@ -299,6 +299,24 @@ class TestNonUsArchive:
         assert "archived_at" not in payload
 
     @pytest.mark.asyncio
+    async def test_positively_us_location_vetoes_archive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Safety veto: even a high-confidence non-US verdict must NOT archive a
+        job whose location plainly says US — the tagger false-negative hedge.
+        (A real 'New York, NY, United States' was seen tagged non-US at 95.)"""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="New York, NY, United States")])
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False  # the (wrong) tag is still recorded
+        assert "archived_at" not in payload  # but the job is NOT archived
+
+    @pytest.mark.asyncio
     async def test_confidence_threshold_is_inclusive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """confidence == threshold archives (>=)."""
         monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
