@@ -27,9 +27,9 @@ and the row is simply re-attempted on a later cycle.
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
@@ -95,6 +95,36 @@ EmploymentType = Literal[
 ]
 
 
+def _coerce_bool(v: Any) -> bool | None:
+    """A tolerant bool: real bool / 0-1 / yes-no-true-false strings map through;
+    anything else (the LLM sometimes emits ``'unknown'`` for a boolean) → None."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "y", "t", "1"):
+            return True
+        if s in ("false", "no", "n", "f", "0"):
+            return False
+    return None
+
+
+def _coerce_confidence(v: Any) -> int | None:
+    """0-100 int, clamped; unparseable → None."""
+    try:
+        return max(0, min(100, int(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_literal(v: Any, literal: Any, fallback: str) -> str:
+    """A value in the Literal's members passes through; anything else (out-of-enum
+    or missing) → the enum's catch-all, so one bad field never fails the tag."""
+    return v if v in get_args(literal) else fallback
+
+
 class QualificationTags(BaseModel):
     """The structured verdict the LLM returns for one job.
 
@@ -103,22 +133,51 @@ class QualificationTags(BaseModel):
     single city is identifiable (remote-only / multi-metro / unstated).
     """
 
-    is_us: bool = Field(
+    # All map to NULLABLE jobs columns; ``_tolerate_malformed`` below degrades any
+    # single malformed field rather than failing the whole tag (#60/#193). So the
+    # bools/confidence may be None ("couldn't determine") and the enums fall back
+    # to their catch-all.
+    is_us: bool | None = Field(
+        default=None,
         description="True if the role is US-based. A multi-location role that "
-        "includes ANY US location counts as US."
+        "includes ANY US location counts as US.",
     )
-    us_confidence: int = Field(ge=0, le=100, description="0-100 certainty in the is_us verdict.")
-    role_family: RoleFamily
-    seniority: Seniority
-    employment_type: EmploymentType
+    us_confidence: int | None = Field(
+        default=None, ge=0, le=100, description="0-100 certainty in the is_us verdict."
+    )
+    role_family: RoleFamily = "other"
+    seniority: Seniority = "unknown"
+    employment_type: EmploymentType = "unknown"
     metro: str | None = Field(
         default=None,
         description="Primary metro/city when identifiable, else null.",
     )
-    is_remote: bool = Field(description="True if the role is remote-eligible.")
-    is_genuine_role: bool = Field(
-        description="False for talent-pool / 'general application' / evergreen non-roles."
+    is_remote: bool | None = Field(default=None, description="True if the role is remote-eligible.")
+    is_genuine_role: bool | None = Field(
+        default=None,
+        description="False for talent-pool / 'general application' / evergreen non-roles.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_malformed(cls, data: Any) -> Any:
+        """The LLM occasionally emits a malformed field — ``'unknown'`` for a
+        bool, an out-of-enum string, a non-int confidence. Degrade the OFFENDING
+        field to a safe value (None for bools/confidence, the enum's catch-all
+        for the rest) instead of rejecting the whole payload, so one bad field
+        never leaves the job untagged (all jobs.* columns are nullable)."""
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        for f in ("is_us", "is_remote", "is_genuine_role"):
+            if f in d:
+                d[f] = _coerce_bool(d[f])
+        if "us_confidence" in d:
+            d["us_confidence"] = _coerce_confidence(d["us_confidence"])
+        d["role_family"] = _coerce_literal(d.get("role_family"), RoleFamily, "other")
+        d["seniority"] = _coerce_literal(d.get("seniority"), Seniority, "unknown")
+        d["employment_type"] = _coerce_literal(d.get("employment_type"), EmploymentType, "unknown")
+        return d
 
 
 # The rules below are baked from a validated dry-run (#60). They are the
