@@ -462,13 +462,27 @@ class Settings(BaseSettings):
     # logs a warning and exits cleanly). 2,000 free queries/month is plenty
     # for daily-per-target with a query cap. Get one at https://brave.com/search/api/.
     brave_search_api_key: str = Field(default="", repr=False)
-    # Hard cap on total Brave queries fired per discovery run, across all
-    # targets and keywords. The free tier is 2,000/month; at 200/day across
-    # daily runs we'd burn through it in 10 days, so 200 is the ceiling for a
-    # single run and the per-target loop fans out within that budget.
+    # PER-TARGET ceiling on Brave queries in one discovery run — applied
+    # INDEPENDENTLY inside each ``run_discovery_for_target`` so a single
+    # keyword-rich target can't hog a pass. It does NOT bound total monthly
+    # usage by itself: N targets each fire up to this many, so the run total
+    # scales with target count. The run-TOTAL budget below is the real
+    # monthly-cost control. The target's keyword x site plan is shuffled then
+    # truncated to this, so repeated runs sample the whole space cursorlessly.
     discovery_query_cap_per_run: int = Field(default=200, ge=1, le=2000)
     # Per-keyword result depth — top N URLs we look at from each search.
     discovery_results_per_query: int = Field(default=20, ge=1, le=50)
+    # Run-TOTAL Brave query budget shared across ALL targets in one bulk pass
+    # (``run_discovery_all_targets``) — the monthly-cost control, and INVARIANT
+    # to target count (unlike the per-target cap above). The budget is split
+    # across the run's targets (shuffled for fairness across runs); once spent,
+    # the remaining targets are deferred to the next run. Monthly Brave usage
+    # ~= this x runs/month, so the free tier (2,000/month) holds by
+    # construction: the default 60 with the daily scheduler ≈ 1,800/month —
+    # reaching the free tier with headroom, regardless of how many targets
+    # exist. 0 disables the run budget (each target then uses only its
+    # per-target cap — the legacy behavior that scales with target count).
+    discovery_query_budget_per_run: int = Field(default=60, ge=0, le=20000)
 
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
