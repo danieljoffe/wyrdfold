@@ -135,15 +135,19 @@ def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[s
 def _prescan_gate_applies(target_id: str) -> bool:
     """Whether the pre-scan cosine gate acts on this target (#90 staged rollout).
 
-    The global ``prescan_gate_enabled`` must be on AND the target must be in
-    scope: an EMPTY ``prescan_gate_target_ids`` allowlist means "all targets"
-    (the global posture), a non-empty one restricts the gate to just those
-    targets so a zero-loss target (CX) can flip before a lossier one (frontend).
+    The global ``prescan_gate_enabled`` must be on AND the target must be in the
+    ``prescan_gate_target_ids`` allowlist. An EMPTY allowlist means **no
+    targets** — NOT "all targets" — so the gate can never be silently applied to
+    an unvalidated target. This matters because cosine gating is only safe
+    per-target, calibrated against live Phase-2 scores: it's a coarse off-domain
+    filter (0% recall loss on CX, an off-cluster exec target) that FAILS on an
+    in-domain one (Frontend drops ~60% of good matches at its calibrated
+    threshold, #90). Enabling the gate with an empty allowlist is therefore a
+    no-op, never a gate-everything that would silently drop good matches.
     """
     if not settings.prescan_gate_enabled:
         return False
-    scope = settings.prescan_gate_target_ids_set
-    return not scope or str(target_id) in scope
+    return str(target_id) in settings.prescan_gate_target_ids_set
 
 
 async def run_phase2_for_jobs(
