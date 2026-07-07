@@ -91,10 +91,11 @@ async def _grade_cases(fixture: dict[str, Any], cases: list[dict[str, Any]]) -> 
     aligned to ``cases`` (``None`` on failure)."""
     from app.services.fit.job_fit import _SYSTEM_PROMPT
     from app.services.llm import get_default_client as get_llm
-    from app.supabase_pool import init_supabase
     from scripts.eval_grading_prompts import _grade_one
 
-    init_supabase()
+    # No Supabase needed: the cases are self-contained and get_default_client
+    # reads only the LLM provider + key. So this runs with just an LLM key
+    # (railway run, or LLM_PROVIDER=openrouter + OPENROUTER_API_KEY).
     banks = {k: _deserialize_target(v) for k, v in fixture["targets"].items()}
     llm = get_llm()
 
