@@ -8,7 +8,7 @@ license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.139.0",
-  "uvicorn[standard]>=0.34",
+  "uvicorn[standard]>=0.50.2",
   "httpx>=0.28",
   "supabase>=2.13",
   "pydantic-settings>=2.7",
