@@ -47,6 +47,7 @@ from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
     is_us_location,
+    positively_us_location,
     qualification_hash,
     tag_job,
 )
@@ -675,6 +676,24 @@ async def _qualify_one_job(
         "qualified_at": datetime.now(UTC).isoformat(),
         "qualified_hash": new_hash,
     }
+    # US-only corpus (#60 workstream B): a high-confidence non-US verdict
+    # archives the job in the SAME write. The poller's ingest gate already
+    # drops clearly-non-US locations, but its L1 heuristic is permissive
+    # (ambiguous / bare-foreign-city rows slip through) — the L2 tagger catches
+    # them here, so we close the loop to the ``archived_at`` gate instead of
+    # leaving non-US jobs live in a US-only catalog. Conf-gated + reversible;
+    # off by default so a global-catalog self-host is unaffected. The
+    # ``positively_us_location`` veto hedges a high-confidence tagger
+    # FALSE-negative on an unambiguously-US location (a real "New York, NY,
+    # United States" was seen tagged non-US at conf 95): never archive when the
+    # location plainly says US.
+    if (
+        settings.qualification_archive_non_us
+        and tags.is_us is False
+        and tags.us_confidence >= settings.qualification_non_us_archive_min_confidence
+        and not positively_us_location(row.get("location"))
+    ):
+        payload["archived_at"] = datetime.now(UTC).isoformat()
     try:
         await _db_to_thread(
             lambda: execute_with_retry_sync(
@@ -1303,9 +1322,7 @@ async def _poll_one_source(
                         # promising-but-guessing verdict (confidence below the
                         # floor) is dropped. Fail-open unchanged — a missing or
                         # NULL-confidence verdict still admits.
-                        promising = admitted(
-                            verdict, min_confidence=settings.phase1_min_confidence
-                        )
+                        promising = admitted(verdict, min_confidence=settings.phase1_min_confidence)
                         phase1_confidence = verdict.confidence if verdict is not None else None
                         stage2 = await _db_to_thread(
                             target_score_and_upsert,
@@ -2276,9 +2293,7 @@ async def _poll_one_source_for_target(
                     phase1_idx = phase1_idx_by_external_id.get(ext_id)
                     verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
                     # Gate admission on confidence (#47) — see the other poll path.
-                    promising = admitted(
-                        verdict, min_confidence=settings.phase1_min_confidence
-                    )
+                    promising = admitted(verdict, min_confidence=settings.phase1_min_confidence)
                     phase1_confidence = verdict.confidence if verdict is not None else None
                     stage2 = await _db_to_thread(
                         target_score_and_upsert,

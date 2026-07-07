@@ -21,6 +21,7 @@ package and migration triggers no LLM spend.
 from app.services.qualification.heuristics import (
     clean_description,
     is_us_location,
+    positively_us_location,
     qualification_hash,
 )
 from app.services.qualification.tagger import (
@@ -42,6 +43,7 @@ __all__ = [
     "Seniority",
     "clean_description",
     "is_us_location",
+    "positively_us_location",
     "qualification_hash",
     "tag_job",
 ]
