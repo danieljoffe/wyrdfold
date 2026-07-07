@@ -311,6 +311,22 @@ class Settings(BaseSettings):
     # description" (title/company/location only).
     qualification_jd_snippet_chars: int = Field(default=600, ge=0)
 
+    # US-only corpus (#60 workstream B). When on, the qualification tagger
+    # ARCHIVES (stamps ``archived_at``) a job the instant it tags it
+    # high-confidence non-US — closing the loop between the L2 ``is_us``
+    # verdict and the ``archived_at`` gate the display/query layer already
+    # honors, so non-US postings don't linger in a catalog a US-only product
+    # never surfaces (and stop being re-polled/re-graded). Reversible
+    # (``archived_at`` is nullable) and conf-gated by the threshold below to
+    # protect a mistagged US role. OFF by default: a self-host that wants a
+    # global catalog leaves it off, and the tagger still records ``is_us`` for
+    # anyone who'd rather filter on it than archive.
+    qualification_archive_non_us: bool = False
+    # Minimum ``us_confidence`` (0-100) for the archive above to fire. 80 keeps
+    # the tagger's genuinely-uncertain calls (which include most US
+    # false-negatives) live; a prod sample of the >=80 set was 100% non-US.
+    qualification_non_us_archive_min_confidence: int = Field(default=80, ge=0, le=100)
+
     # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
     # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
     # the vector in ``job_embeddings`` via
