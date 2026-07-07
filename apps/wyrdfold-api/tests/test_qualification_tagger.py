@@ -24,7 +24,7 @@ the real API) via ``MockLLMClient`` scripted responses and via the
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -500,25 +500,43 @@ class TestGoldenSchemaMapping:
 
 class TestSchemaAndFailSoft:
     @pytest.mark.asyncio
-    async def test_bad_enum_is_rejected_by_schema(self) -> None:
-        """A role_family outside the enum must not silently pass — the schema
-        validation in complete_json raises, and tag_job fails soft to
-        (None, None) so a malformed model response leaves the row NULL rather
-        than writing garbage that the DB CHECK would then reject."""
+    async def test_unknown_bool_degrades_not_drops_the_tag(self) -> None:
+        """The exact prod bug (#60/#193): the tagger returned
+        ``is_genuine_role='unknown'`` (a string for a bool) → the WHOLE payload
+        was rejected + the job left untagged. Now that one field degrades to
+        None and the rest of the classification is still written."""
+        bad = dict(_GOLDEN_CASES[0]["verdict"])
+        bad["is_genuine_role"] = "unknown"
+        llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(bad)})
+        tags, result = await tag_job(llm, title="x", company="y", location="z", description="d")
+        assert tags is not None  # no longer dropped
+        assert tags.is_genuine_role is None  # the offending field degraded
+        assert tags.is_us == _GOLDEN_CASES[0]["verdict"]["is_us"]  # the rest kept
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_bad_enum_degrades_to_catch_all(self) -> None:
+        """A role_family outside the enum no longer drops the whole tag — it
+        degrades to 'other', a value the DB role_family CHECK accepts, so the
+        rest of the classification is still written (was: fail-soft to None)."""
         bad = dict(_GOLDEN_CASES[0]["verdict"])
         bad["role_family"] = "wizardry"  # not in the enum
         llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(bad)})
         tags, result = await tag_job(llm, title="x", company="y", location="z", description="d")
-        assert tags is None
-        assert result is None
+        assert tags is not None
+        assert tags.role_family == "other"  # catch-all, tag preserved
+        assert result is not None
 
     @pytest.mark.asyncio
-    async def test_us_confidence_out_of_range_rejected(self) -> None:
+    async def test_out_of_range_confidence_is_clamped(self) -> None:
+        """An out-of-range us_confidence is clamped into [0,100] (the DB range
+        CHECK) instead of dropping the tag."""
         bad = dict(_GOLDEN_CASES[0]["verdict"])
         bad["us_confidence"] = 250  # > 100
         llm = MockLLMClient(scripted={QUALIFICATION_PURPOSE: json.dumps(bad)})
         tags, _ = await tag_job(llm, title="x", company="y", location="z", description="d")
-        assert tags is None
+        assert tags is not None
+        assert tags.us_confidence == 100
 
     @pytest.mark.asyncio
     async def test_llm_error_fails_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,3 +578,69 @@ class TestSchemaAndFailSoft:
         assert captured["model"] == "claude-haiku-4-5"
         assert captured["purpose"] == QUALIFICATION_PURPOSE
         assert captured["cache_system"] is True
+
+
+class TestMalformedFieldTolerance:
+    """#60/#193: a single malformed LLM field must DEGRADE to a safe value, not
+    fail the whole classification. The prod bug this fixes: the tagger returned
+    ``is_genuine_role='unknown'`` (a string for a bool) → the ENTIRE payload was
+    rejected + the job left untagged. Now the offending field degrades (None for
+    bools/confidence, the enum's catch-all otherwise) and the rest is kept."""
+
+    _VALID: ClassVar[dict[str, object]] = {
+        "is_us": True,
+        "us_confidence": 90,
+        "role_family": "engineering",
+        "seniority": "senior_ic",
+        "employment_type": "full_time",
+        "metro": "New York",
+        "is_remote": False,
+        "is_genuine_role": True,
+    }
+
+    def test_unknown_bool_degrades_to_none_and_keeps_the_rest(self) -> None:
+        # The exact prod regression.
+        tags = QualificationTags.model_validate({**self._VALID, "is_genuine_role": "unknown"})
+        assert tags.is_genuine_role is None  # degraded, not crashed
+        assert tags.is_us is True  # the rest survives
+        assert tags.role_family == "engineering"
+
+    def test_out_of_enum_role_family_falls_back_to_other(self) -> None:
+        tags = QualificationTags.model_validate({**self._VALID, "role_family": "misc"})
+        assert tags.role_family == "other"
+
+    def test_out_of_enum_seniority_and_employment_fall_back_to_unknown(self) -> None:
+        tags = QualificationTags.model_validate(
+            {**self._VALID, "seniority": "lead", "employment_type": "gig"}
+        )
+        assert tags.seniority == "unknown"
+        assert tags.employment_type == "unknown"
+
+    def test_bad_confidence_is_clamped_or_nulled(self) -> None:
+        assert (
+            QualificationTags.model_validate({**self._VALID, "us_confidence": 150}).us_confidence
+            == 100
+        )
+        assert (
+            QualificationTags.model_validate({**self._VALID, "us_confidence": "high"}).us_confidence
+            is None
+        )
+
+    def test_bool_string_forms_are_coerced(self) -> None:
+        tags = QualificationTags.model_validate({**self._VALID, "is_us": "true", "is_remote": "no"})
+        assert tags.is_us is True
+        assert tags.is_remote is False
+
+    def test_valid_payload_passes_through_unchanged(self) -> None:
+        tags = QualificationTags.model_validate(self._VALID)
+        assert tags.is_us is True
+        assert tags.role_family == "engineering"
+        assert tags.is_genuine_role is True
+        assert tags.us_confidence == 90
+
+    def test_missing_fields_default_safely(self) -> None:
+        tags = QualificationTags.model_validate({"is_us": True})
+        assert tags.role_family == "other"  # missing enum → catch-all
+        assert tags.seniority == "unknown"
+        assert tags.is_genuine_role is None  # missing bool → None
+        assert tags.us_confidence is None

@@ -1,0 +1,162 @@
+{
+  "description": "#193 ground-truth for Phase-2 grading (job_fit). Turns the drift-only grading eval (eval_grading_prompts, ρ vs shifting production baseline) into a CORRECTNESS one: a fixed set of (target, resume, job) triples where the correct fit is GROSSLY unambiguous. Only extreme cases are labeled (a warehouse job vs a senior-frontend target+resume MUST score low; a matching senior-frontend job MUST score high) with WIDE bands (high>=50, low<=25) — so it catches gross grading regressions without over-specifying a subtle score. targets are keyed and shared across cases. RATIFIED 2026-07-07 (OpenRouter/Sonnet-4.6): band_accuracy 100% (6/6) — high cases scored 72/92/95, low cases 2/4/4, a clean ~68-point gap, so the wide bands hold with large margin.",
+  "bands": { "high": [50, 100], "low": [0, 25] },
+  "targets": {
+    "frontend": {
+      "target": {
+        "id": "t-frontend",
+        "label": "Senior Frontend Engineer",
+        "is_active": true,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "scoring_profile": {
+          "categories": {
+            "core_skills": {
+              "keywords": {
+                "react": 3,
+                "typescript": 3,
+                "frontend": 3,
+                "javascript": 2,
+                "css": 2
+              },
+              "weight": 2.0
+            }
+          },
+          "seniority": {
+            "level": "senior",
+            "signals": ["senior", "staff", "lead"]
+          },
+          "domain": { "signals": ["web", "frontend", "ui"], "weight": 0.5 },
+          "negative": { "keywords": ["intern", "junior"], "weight": -10.0 }
+        }
+      },
+      "payload": {
+        "summary": "Senior frontend engineer with 7 years building React/TypeScript web apps.",
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Acme",
+            "title": "Senior Frontend Engineer",
+            "start": "2019",
+            "end": "2024",
+            "skills": ["React", "TypeScript", "CSS"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [
+          { "name": "React" },
+          { "name": "TypeScript" },
+          { "name": "CSS" },
+          { "name": "JavaScript" }
+        ],
+        "outcomes": [
+          {
+            "description": "Led the rebuild of the customer web app in React and TypeScript",
+            "role_ref": "r1"
+          }
+        ]
+      }
+    },
+    "cx": {
+      "target": {
+        "id": "t-cx",
+        "label": "Director of Customer Experience Operations",
+        "is_active": true,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "scoring_profile": {
+          "categories": {
+            "core_skills": {
+              "keywords": {
+                "customer": 3,
+                "experience": 2,
+                "operations": 3,
+                "cx": 3,
+                "support": 2
+              },
+              "weight": 2.0
+            }
+          },
+          "seniority": {
+            "level": "director",
+            "signals": ["director", "head", "vp"]
+          },
+          "domain": {
+            "signals": ["customer experience", "operations"],
+            "weight": 0.5
+          },
+          "negative": { "keywords": ["intern", "associate"], "weight": -10.0 }
+        }
+      },
+      "payload": {
+        "summary": "Customer experience operations leader; scaled CX orgs and support operations.",
+        "roles": [
+          {
+            "id": "r1",
+            "company": "Beta",
+            "title": "Head of Customer Experience",
+            "start": "2018",
+            "end": "2024",
+            "skills": ["Customer Experience", "Operations"],
+            "outcome_refs": ["o1"]
+          }
+        ],
+        "skills": [
+          { "name": "Customer Experience" },
+          { "name": "Operations" },
+          { "name": "Support" }
+        ],
+        "outcomes": [
+          {
+            "description": "Built and led the customer experience operations function across support and success",
+            "role_ref": "r1"
+          }
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "frontend_strong_match",
+      "target_key": "frontend",
+      "expected_band": "high",
+      "title": "Senior Frontend Engineer",
+      "jd_text": "We're hiring a Senior Frontend Engineer to build our customer-facing web application in React and TypeScript. You'll own the component library, drive web performance, and mentor other frontend engineers. 6+ years of frontend experience with React, TypeScript, and modern CSS required."
+    },
+    {
+      "name": "frontend_staff_react_match",
+      "target_key": "frontend",
+      "expected_band": "high",
+      "title": "Staff React Engineer",
+      "jd_text": "Staff Software Engineer, Frontend. Lead architecture of our React/TypeScript single-page apps, set frontend standards, and improve web performance and accessibility across the product. Deep expertise in React, TypeScript, and JavaScript expected."
+    },
+    {
+      "name": "warehouse_vs_frontend",
+      "target_key": "frontend",
+      "expected_band": "low",
+      "title": "Warehouse Associate",
+      "jd_text": "Warehouse Associate needed for our distribution center. Responsibilities: picking and packing orders, operating a forklift, loading trucks, and maintaining inventory accuracy. No prior experience required; must be able to lift 50 lbs."
+    },
+    {
+      "name": "accountant_vs_frontend",
+      "target_key": "frontend",
+      "expected_band": "low",
+      "title": "Senior Staff Accountant",
+      "jd_text": "Senior Staff Accountant to manage the monthly close, reconcile general ledger accounts, prepare financial statements, and support the annual audit. CPA and 5+ years of accounting experience required. Proficiency in Excel and NetSuite."
+    },
+    {
+      "name": "cx_director_strong_match",
+      "target_key": "cx",
+      "expected_band": "high",
+      "title": "Director of Customer Experience Operations",
+      "jd_text": "Director of Customer Experience Operations to lead our global support and customer operations organization. You'll own CX strategy, scale the operations function, and drive customer satisfaction across support, success, and onboarding. 8+ years in customer experience/operations leadership."
+    },
+    {
+      "name": "line_cook_vs_cx",
+      "target_key": "cx",
+      "expected_band": "low",
+      "title": "Line Cook",
+      "jd_text": "Line Cook for a busy downtown restaurant. Prepare menu items to spec, keep the station clean and stocked, and work efficiently on a hot line during dinner service. Prior kitchen experience preferred; food handler's card required."
+    }
+  ]
+}

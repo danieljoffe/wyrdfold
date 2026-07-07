@@ -40,6 +40,7 @@ import math
 import random
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -65,9 +66,7 @@ from app.supabase_pool import get_supabase_pool, init_supabase
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_prompts")
 
-_EVAL_FIXTURE = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_EVAL_FIXTURE = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _DEFAULT_EVAL_SIZE = 50
 _PER_TARGET_BAND_SIZE = 10  # top / bottom / middle
 _TOP_K = 10  # for top-K overlap metric
@@ -82,9 +81,7 @@ def _band_query(sb: Any, target_id: str, n: int, order_desc: bool) -> list[dict[
     rows for the target. Used twice for top/bottom bands."""
     resp = (
         sb.table("scores")
-        .select(
-            "job_posting_id, score, axis_scores, fit_reasoning, scored_profile_version"
-        )
+        .select("job_posting_id, score, axis_scores, fit_reasoning, scored_profile_version")
         .eq("target_id", target_id)
         .eq("scoring_status", "complete")
         .eq("promising", True)
@@ -96,15 +93,11 @@ def _band_query(sb: Any, target_id: str, n: int, order_desc: bool) -> list[dict[
     return cast(list[dict[str, Any]], resp.data or [])
 
 
-def _middle_band(
-    sb: Any, target_id: str, n: int, rng: random.Random
-) -> list[dict[str, Any]]:
+def _middle_band(sb: Any, target_id: str, n: int, rng: random.Random) -> list[dict[str, Any]]:
     """Random N from the 30-70 middle band."""
     resp = (
         sb.table("scores")
-        .select(
-            "job_posting_id, score, axis_scores, fit_reasoning, scored_profile_version"
-        )
+        .select("job_posting_id, score, axis_scores, fit_reasoning, scored_profile_version")
         .eq("target_id", target_id)
         .eq("scoring_status", "complete")
         .eq("promising", True)
@@ -119,30 +112,21 @@ def _middle_band(
     return pool[:n]
 
 
-def _hydrate_jobs(
-    sb: Any, job_ids: list[str]
-) -> dict[str, tuple[str, str]]:
+def _hydrate_jobs(sb: Any, job_ids: list[str]) -> dict[str, tuple[str, str]]:
     """Returns ``{job_id: (title, jd_text_first_2000)}``."""
     out: dict[str, tuple[str, str]] = {}
     if not job_ids:
         return out
     for i in range(0, len(job_ids), 500):
         chunk = job_ids[i : i + 500]
-        resp = (
-            sb.table("jobs")
-            .select("id, title, description_html")
-            .in_("id", chunk)
-            .execute()
-        )
+        resp = sb.table("jobs").select("id, title, description_html").in_("id", chunk).execute()
         for r in cast(list[dict[str, Any]], resp.data or []):
             text = strip_html(r.get("description_html") or "")[:_JD_CONTEXT_CAP]
             out[r["id"]] = (r.get("title", ""), text)
     return out
 
 
-def _resolve_user_payload(
-    sb: Any, target_id: str
-) -> tuple[str | None, OptimizedPayload | None]:
+def _resolve_user_payload(sb: Any, target_id: str) -> tuple[str | None, OptimizedPayload | None]:
     """Find an active owner of the target + their latest optimized payload.
 
     Snapshot stores the payload inline (so re-grades are reproducible even
@@ -164,9 +148,7 @@ def _resolve_user_payload(
     return uid, (doc.payload if doc else None)
 
 
-def build_eval_set(
-    sb: Any, *, per_target_band_size: int, seed: int
-) -> dict[str, Any]:
+def build_eval_set(sb: Any, *, per_target_band_size: int, seed: int) -> dict[str, Any]:
     """Pull a balanced eval set across all active targets. Returns the
     fixture dict ready to serialise."""
     rng = random.Random(seed)
@@ -199,15 +181,17 @@ def build_eval_set(
                 if jid in seen:
                     continue
                 seen.add(jid)
-                cases.append({
-                    "band": src,
-                    "target_id": t.id,
-                    "job_posting_id": jid,
-                    "baseline_score": int(r["score"]),
-                    "baseline_axes": r["axis_scores"],
-                    "baseline_reasoning": r.get("fit_reasoning") or "",
-                    "scored_profile_version": r.get("scored_profile_version"),
-                })
+                cases.append(
+                    {
+                        "band": src,
+                        "target_id": t.id,
+                        "job_posting_id": jid,
+                        "baseline_score": int(r["score"]),
+                        "baseline_axes": r["axis_scores"],
+                        "baseline_reasoning": r.get("fit_reasoning") or "",
+                        "scored_profile_version": r.get("scored_profile_version"),
+                    }
+                )
 
     job_ids = [c["job_posting_id"] for c in cases]
     job_data = _hydrate_jobs(sb, job_ids)
@@ -233,8 +217,7 @@ def save_eval_set(eval_set: dict[str, Any], path: Path) -> None:
 def load_eval_set(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise RuntimeError(
-            f"Eval set fixture missing: {path}\n"
-            f"Run --snapshot first to generate it."
+            f"Eval set fixture missing: {path}\nRun --snapshot first to generate it."
         )
     return cast(dict[str, Any], json.loads(path.read_text()))
 
@@ -313,10 +296,15 @@ async def run_eval(
         target = targets.get(case["target_id"])
         payload = payloads.get(case["target_id"])
         if target is None or payload is None:
-            results.append({
-                "case": case, "fit": None,
-                "tok_in": 0, "tok_out": 0, "cost_usd": 0.0,
-            })
+            results.append(
+                {
+                    "case": case,
+                    "fit": None,
+                    "tok_in": 0,
+                    "tok_out": 0,
+                    "cost_usd": 0.0,
+                }
+            )
             continue
         fit, tin, tout, cost = await _grade_one(
             llm,
@@ -328,10 +316,15 @@ async def run_eval(
             jd_text=case["jd_text"],
             max_tokens=max_tokens,
         )
-        results.append({
-            "case": case, "fit": fit,
-            "tok_in": tin, "tok_out": tout, "cost_usd": cost,
-        })
+        results.append(
+            {
+                "case": case,
+                "fit": fit,
+                "tok_in": tin,
+                "tok_out": tout,
+                "cost_usd": cost,
+            }
+        )
         # Optional inter-call pause to avoid bursting Anthropic's rate
         # limit. Production traffic is naturally paced; this harness can
         # otherwise issue 30+ calls in <60s, which trips ANTHROPIC_MAX_RETRIES
@@ -376,9 +369,40 @@ def _spearman(xs: list[float], ys: list[float]) -> float:
     return _pearson(_rank(xs), _rank(ys))
 
 
-def compute_metrics(
-    results: list[dict[str, Any]], model: ModelId
-) -> dict[str, Any]:
+def _bootstrap_ci(
+    xs: list[float],
+    ys: list[float],
+    stat: Callable[[list[float], list[float]], float],
+    *,
+    n_resamples: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for a PAIRED statistic (e.g. Spearman ρ) — #193.
+
+    Resamples the ``(x, y)`` index pairs with replacement ``n_resamples`` times,
+    recomputes ``stat`` on each resample, and returns the ``(alpha/2,
+    1-alpha/2)`` percentiles — so a single-run ρ carries an uncertainty band
+    and a before/after delta isn't read as signal when it's resampling noise.
+    Deterministic via ``seed``. For < 2 pairs the CI degenerates to the point
+    estimate (no resampling possible).
+    """
+    n = len(xs)
+    if n < 2:
+        v = stat(xs, ys)
+        return (v, v)
+    rng = random.Random(seed)
+    samples: list[float] = []
+    for _ in range(n_resamples):
+        idx = [rng.randrange(n) for _ in range(n)]
+        samples.append(stat([xs[i] for i in idx], [ys[i] for i in idx]))
+    samples.sort()
+    lo = samples[int((alpha / 2) * n_resamples)]
+    hi = samples[min(n_resamples - 1, int((1 - alpha / 2) * n_resamples))]
+    return (lo, hi)
+
+
+def compute_metrics(results: list[dict[str, Any]], model: ModelId) -> dict[str, Any]:
     paired = [r for r in results if r["fit"] is not None]
     if not paired:
         return {"n": 0, "n_failed": len(results)}
@@ -386,6 +410,7 @@ def compute_metrics(
     baseline_scores = [float(r["case"]["baseline_score"]) for r in paired]
     new_scores = [float(r["fit"].fit_score) for r in paired]
     spearman = _spearman(baseline_scores, new_scores)
+    spearman_ci = _bootstrap_ci(baseline_scores, new_scores, _spearman)
     pearson = _pearson(baseline_scores, new_scores)
 
     # Top-K overlap (using indices into ``paired`` for both rankings).
@@ -425,6 +450,7 @@ def compute_metrics(
         "n": len(paired),
         "n_failed": len(results) - len(paired),
         "spearman": spearman,
+        "spearman_ci": spearman_ci,
         "pearson": pearson,
         "top_k_overlap": overlap,
         "top_k": _TOP_K,
@@ -452,7 +478,9 @@ def format_report(metrics: dict[str, Any], model: ModelId, prompt_label: str) ->
         f"  n graded: {metrics['n']}  (failed: {metrics['n_failed']})",
         "",
         "  RANKING (baseline vs new)",
-        f"    Spearman ρ: {metrics['spearman']:+.3f}  (1.00 = identical order)",
+        f"    Spearman ρ: {metrics['spearman']:+.3f}  "
+        f"95% CI [{metrics['spearman_ci'][0]:+.3f}, {metrics['spearman_ci'][1]:+.3f}]  "
+        f"(1.00 = identical order)",
         f"    Pearson r:  {metrics['pearson']:+.3f}",
         f"    Top-{metrics['top_k']} overlap: {metrics['top_k_overlap']} / {metrics['top_k']}",
         "",
@@ -489,9 +517,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     if args.snapshot:
         logger.info("Building eval set snapshot ...")
-        eval_set = build_eval_set(
-            sb, per_target_band_size=_PER_TARGET_BAND_SIZE, seed=args.seed
-        )
+        eval_set = build_eval_set(sb, per_target_band_size=_PER_TARGET_BAND_SIZE, seed=args.seed)
         save_eval_set(eval_set, _EVAL_FIXTURE)
         logger.info(
             "Eval set saved: %s  (%d cases, %d targets)",
@@ -527,15 +553,16 @@ async def main_async(args: argparse.Namespace) -> None:
         prompt_label = "baseline"
 
     cases_for_target = [
-        c for c in eval_set["cases"]
-        if not args.target or c["target_id"] == args.target
+        c for c in eval_set["cases"] if not args.target or c["target_id"] == args.target
     ]
     n_to_run = min(len(cases_for_target), args.eval_size)
 
     if args.dry_run:
         logger.info(
             "DRY RUN: would re-grade %d case(s) with model=%s, prompt=%s",
-            n_to_run, args.model, prompt_label,
+            n_to_run,
+            args.model,
+            prompt_label,
         )
         return
 
@@ -547,7 +574,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
     logger.info(
         "Running eval: model=%s  prompt=%s  cases=%d",
-        args.model, prompt_label, n_to_run,
+        args.model,
+        prompt_label,
+        n_to_run,
     )
     results = await run_eval(
         eval_set,
@@ -569,15 +598,17 @@ async def main_async(args: argparse.Namespace) -> None:
         out_rows: list[dict[str, Any]] = []
         for r in results:
             fit = r["fit"]
-            out_rows.append({
-                "case": r["case"],
-                "variant_score": fit.fit_score if fit else None,
-                "variant_axes": fit.axes.model_dump() if fit else None,
-                "variant_reasoning": fit.reasoning if fit else None,
-                "tok_in": r["tok_in"],
-                "tok_out": r["tok_out"],
-                "cost_usd": r["cost_usd"],
-            })
+            out_rows.append(
+                {
+                    "case": r["case"],
+                    "variant_score": fit.fit_score if fit else None,
+                    "variant_axes": fit.axes.model_dump() if fit else None,
+                    "variant_reasoning": fit.reasoning if fit else None,
+                    "tok_in": r["tok_in"],
+                    "tok_out": r["tok_out"],
+                    "cost_usd": r["cost_usd"],
+                }
+            )
         payload = {
             "model": args.model,
             "prompt_label": prompt_label,
@@ -592,9 +623,7 @@ async def main_async(args: argparse.Namespace) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # One-shot write after all LLM calls have finished — pathlib here
         # is fine, the async hot path is already done.
-        out_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True)
-        )
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
         logger.info("Per-row results saved to %s", out_path)
 
 
@@ -631,9 +660,7 @@ def main() -> None:
         action="store_true",
         help="Plan the eval (no LLM calls).",
     )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="RNG seed for middle-band sampling."
-    )
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed for middle-band sampling.")
     parser.add_argument(
         "--save-results",
         default=None,

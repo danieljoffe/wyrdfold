@@ -755,6 +755,7 @@ async def _qualify_one_job(
     if (
         settings.qualification_archive_non_us
         and tags.is_us is False
+        and tags.us_confidence is not None
         and tags.us_confidence >= settings.qualification_non_us_archive_min_confidence
         and not positively_us_location(row.get("location"))
     ):

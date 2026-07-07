@@ -220,7 +220,7 @@ def _unique_rows(n: int) -> list[dict[str, Any]]:
     return [_row(id=f"job-{i}", title=f"Engineer {i}") for i in range(n)]
 
 
-def _non_us_tags(confidence: int) -> QualificationTags:
+def _non_us_tags(confidence: int | None) -> QualificationTags:
     """A non-US verdict at the given ``us_confidence``."""
     return QualificationTags(
         is_us=False,
@@ -297,6 +297,25 @@ class TestNonUsArchive:
         payload = rec["writes"][0]
         assert payload["is_us"] is False
         assert "archived_at" not in payload
+
+    @pytest.mark.asyncio
+    async def test_none_confidence_non_us_is_not_archived_and_does_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After the tolerant-tagger change (#60/#193) us_confidence can be None
+        (a degraded malformed field). The archive comparison must guard against
+        None — the job is simply left unarchived, not crashed."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(None), object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False
+        assert payload["us_confidence"] is None
+        assert "archived_at" not in payload  # None confidence → not archived, no crash
 
     @pytest.mark.asyncio
     async def test_positively_us_location_vetoes_archive(
