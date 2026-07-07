@@ -92,13 +92,14 @@ async def _tag_cases(cases: list[dict[str, Any]]) -> list[Any]:
     """Run the live tagger over each case, returning the ``QualificationTags``
     (or ``None`` on failure) aligned to ``cases``. Uses the instance LLM key +
     prod Supabase, exactly like the poller's target-independent tagging."""
-    from app.services.llm import get_client as get_llm_client
+    from app.services.llm import get_default_client as get_llm
     from app.services.qualification import tag_job
-    from app.supabase_pool import get_supabase_pool, init_supabase
 
-    init_supabase()
-    supabase = get_supabase_pool()
-    llm = get_llm_client(supabase, None)
+    # No Supabase needed: get_default_client reads only the LLM provider + key
+    # (the instance-key path the poller's target-independent tagging uses), so
+    # this runs with just an LLM key (railway run, or LLM_PROVIDER=openrouter +
+    # OPENROUTER_API_KEY).
+    llm = get_llm()
 
     async def _one(case: dict[str, Any]) -> Any:
         tags, _result = await tag_job(
