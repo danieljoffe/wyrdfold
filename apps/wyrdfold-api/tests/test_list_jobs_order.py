@@ -49,6 +49,12 @@ class _Chain:
     def is_(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
+    @property
+    def not_(self) -> "_Chain":
+        # `.not_.is_(...)` negation context — the fake ignores filter args, so
+        # negation is a no-op that just keeps the chain fluent (#60 gate).
+        return self
+
     def gte(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
@@ -75,9 +81,24 @@ def test_target_two_query_restores_score_desc_order() -> None:
     # Scores returned in score-desc order (highest first) — this is what
     # Supabase produces because the query chains .order("score", desc=True).
     ts_rows = [
-        {"job_posting_id": "j-high", "score": 90, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-mid", "score": 60, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-low", "score": 30, "score_breakdown": {}, "scoring_status": "complete"},
+        {
+            "job_posting_id": "j-high",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-mid",
+            "score": 60,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-low",
+            "score": 30,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
     ]
     # Postings returned by .in_("id", page_ids) in DIFFERENT (storage) order.
     # The bug: without an explicit re-sort, the API returned this order.
@@ -120,18 +141,34 @@ def test_across_user_targets_restores_score_desc_order(
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same shape, different aggregator (max score across the user's targets).
     score_rows = [
-        {"job_posting_id": "j-high", "target_id": "t-1", "score": 80, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-mid", "target_id": "t-1", "score": 50, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-low", "target_id": "t-2", "score": 20, "score_breakdown": {}, "scoring_status": "complete"},
+        {
+            "job_posting_id": "j-high",
+            "target_id": "t-1",
+            "score": 80,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-mid",
+            "target_id": "t-1",
+            "score": 50,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-low",
+            "target_id": "t-2",
+            "score": 20,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
     ]
     postings_in_storage_order = [
         {"id": "j-mid", "title": "mid"},
         {"id": "j-low", "title": "low"},
         {"id": "j-high", "title": "high"},
     ]
-    sb = _supabase_with(
-        {"scores": _Resp(score_rows), "jobs": _Resp(postings_in_storage_order)}
-    )
+    sb = _supabase_with({"scores": _Resp(score_rows), "jobs": _Resp(postings_in_storage_order)})
 
     result = _list_jobs_across_user_targets(
         sb,
@@ -159,18 +196,31 @@ def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
     Previously the API returned ``total=3`` for a query that only matched 1
     row after filtering, which made the UI render 4+ near-empty pages."""
     ts_rows = [
-        {"job_posting_id": "j-remote", "score": 90, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-india", "score": 70, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "j-brazil", "score": 50, "score_breakdown": {}, "scoring_status": "complete"},
+        {
+            "job_posting_id": "j-remote",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-india",
+            "score": 70,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
+        {
+            "job_posting_id": "j-brazil",
+            "score": 50,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        },
     ]
     postings = [
         {"id": "j-remote", "title": "remote role", "location": "Remote · US"},
         {"id": "j-india", "title": "india role", "location": "Bangalore, India"},
         {"id": "j-brazil", "title": "brazil role", "location": "São Paulo, Brazil"},
     ]
-    sb = _supabase_with(
-        {"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)}
-    )
+    sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
 
     result = _list_jobs_for_target_two_query(
         sb,
@@ -234,9 +284,18 @@ def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     captured: dict[str, Any] = {}
     sb = _rpc_supabase(rows, captured)
     result = _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     assert captured["params"]["p_limit"] == 3  # page_size + 1
     assert captured["params"]["p_after_value"] is None  # first page
@@ -253,9 +312,18 @@ def test_rpc_keyset_last_page_has_no_cursor() -> None:
     ]
     sb = _rpc_supabase(rows, {})
     result = _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     assert result["next_cursor"] is None
 
@@ -264,9 +332,18 @@ def test_rpc_keyset_consumes_incoming_cursor() -> None:
     captured: dict[str, Any] = {}
     sb = _rpc_supabase([], captured)
     _list_jobs_for_target_rpc(
-        sb, target_id="t-1", page_size=2, sort="created_at", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={"v": "2026-06-20", "id": "j-x"},
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={"v": "2026-06-20", "id": "j-x"},
     )
     assert captured["params"]["p_after_value"] == "2026-06-20"  # passed through
     assert captured["params"]["p_after_id"] == "j-x"
@@ -280,9 +357,17 @@ def test_rpc_skips_score_sort_and_floored_queries() -> None:
     for extra in ({"sort": "score", "min_score": None}, {"sort": "created_at", "min_score": 70}):
         with pytest.raises(RuntimeError):
             _list_jobs_for_target_rpc(
-                sb, target_id="t-1", page_size=2, ascending=False,
-                status=None, company=None, search=None,
-                exclude_terms=[], only_terms=[], cursor={}, **extra,
+                sb,
+                target_id="t-1",
+                page_size=2,
+                ascending=False,
+                status=None,
+                company=None,
+                search=None,
+                exclude_terms=[],
+                only_terms=[],
+                cursor={},
+                **extra,
             )
 
 
@@ -292,23 +377,72 @@ def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     # score fast-path slices page_ids at the scores layer, which the fluent
     # mock — ignoring .in_() — can't represent).
     ts_rows = [
-        {"job_posting_id": f"j{i}", "score": 90 - i, "score_breakdown": {}, "scoring_status": "complete"}
+        {
+            "job_posting_id": f"j{i}",
+            "score": 90 - i,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+        }
         for i in range(3)
     ]
     postings = [{"id": f"j{i}", "title": f"t{i}"} for i in range(3)]
     sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
     result = _list_jobs_for_target_two_query(
-        sb, target_id="t-1", page_size=2, sort="title", ascending=True,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="title",
+        ascending=True,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     assert [p["id"] for p in result["postings"]] == ["j0", "j1"]
     assert _decode_cursor(result["next_cursor"]) == {"o": 2}
     # Following that cursor yields the last row and no further cursor.
     result2 = _list_jobs_for_target_two_query(
-        sb, target_id="t-1", page_size=2, sort="title", ascending=True,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={"o": 2},
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="title",
+        ascending=True,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={"o": 2},
     )
     assert [p["id"] for p in result2["postings"]] == ["j2"]
     assert result2["next_cursor"] is None
+
+
+def test_gate_live_us_applies_archived_and_non_us_filters() -> None:
+    """#60: the display/match gate drops globally-archived jobs (archived_at IS
+    NULL) AND CONFIRMED non-US ones (is_us IS NOT false — keeps US + not-yet-
+    tagged). A spy records the PostgREST filter calls so a dropped gate fails."""
+    from app.routers.jobs import _gate_live_us
+
+    calls: list[tuple[str, ...]] = []
+
+    class _Spy:
+        @property
+        def not_(self) -> "_Spy":
+            calls.append(("not_",))
+            return self
+
+        def is_(self, col: str, val: str) -> "_Spy":
+            calls.append(("is_", col, val))
+            return self
+
+    _gate_live_us(_Spy())
+
+    assert ("is_", "archived_at", "null") in calls  # globally-live gate
+    assert ("is_", "is_us", "false") in calls  # non-US gate
+    # the is_us filter is NEGATED (is_us IS NOT false), so `not_` precedes it
+    assert calls.index(("not_",)) < calls.index(("is_", "is_us", "false"))

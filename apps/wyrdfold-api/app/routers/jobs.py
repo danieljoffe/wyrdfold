@@ -155,9 +155,7 @@ def _tokenize_search(raw: str | None) -> list[str]:
 _IN_CHUNK_SIZE = 200
 
 
-def _default_min_score_for_user(
-    supabase: Client, user_id: str
-) -> int | None:
+def _default_min_score_for_user(supabase: Client, user_id: str) -> int | None:
     """Return the effective default list floor when no ``min_score`` chip is set.
 
     Resolution:
@@ -200,6 +198,20 @@ def _default_min_score_for_user(
     return value
 
 
+def _gate_live_us(query: Any) -> Any:
+    """The display/match liveness gate — both conditions defense-in-depth:
+
+    - ``archived_at IS NULL`` — globally-live (url-health / poller archive dead
+      or high-confidence non-US jobs — #75 C3 / #246).
+    - ``is_us IS NOT false`` — drop CONFIRMED non-US jobs while keeping US
+      (``true``) and not-yet-tagged (``null``). This stops trusting the #246
+      archive to be complete: a non-US job the tagger flagged but the archive
+      missed still can't leak into a user's list/matches (#60). ``IS NOT false``
+      (not ``!= false``) deliberately keeps NULLs.
+    """
+    return query.is_("archived_at", "null").not_.is_("is_us", "false")
+
+
 def _fetch_jobs_chunked(
     supabase: Client,
     page_ids: list[str],
@@ -235,15 +247,9 @@ def _fetch_jobs_chunked(
     out: list[dict[str, Any]] = []
     for i in range(0, len(page_ids), _IN_CHUNK_SIZE):
         chunk = page_ids[i : i + _IN_CHUNK_SIZE]
-        q = (
-            supabase.table("jobs")
-            .select(_JP_SELECT_COLS)
-            .in_("id", chunk)
-            # Global liveness gate (#75 C3): exclude globally-archived/dead
-            # jobs (url-health/poller set jobs.archived_at) regardless of the
-            # caller's per-user status.
-            .is_("archived_at", "null")
-        )
+        # Liveness gate (#75 C3) + non-US gate (#60): exclude globally-archived
+        # jobs AND confirmed non-US ones, regardless of per-user status.
+        q = _gate_live_us(supabase.table("jobs").select(_JP_SELECT_COLS).in_("id", chunk))
         if company:
             q = q.eq("company_name", company)
         q = _apply_title_search(q, search)
@@ -441,9 +447,7 @@ def _first_seen_lookup(supabase: Client, job_ids: list[str]) -> dict[str, Any]:
         return lookup
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        resp = (
-            supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
-        )
+        resp = supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
         for r in cast(list[dict[str, Any]], resp.data or []):
             lookup[r["id"]] = r.get("first_seen_at")
     return lookup
@@ -503,9 +507,7 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     interpolation below carries no injection surface."""
     if not min_score or min_score <= 0:
         return query
-    return query.or_(
-        f"scoring_status.is.null,scoring_status.neq.complete,score.gte.{min_score}"
-    )
+    return query.or_(f"scoring_status.is.null,scoring_status.neq.complete,score.gte.{min_score}")
 
 
 def _rank_graded_first(
@@ -521,12 +523,8 @@ def _rank_graded_first(
     a keyword placeholder, so interleaving by raw value would let an ungraded 80
     outrank a graded 75. Bucketing keeps the real grades on top and the
     not-yet-judged queue beneath them."""
-    graded = sorted(
-        (r for r in rows if not _is_pending(r)), key=value, reverse=not ascending
-    )
-    pending = sorted(
-        (r for r in rows if _is_pending(r)), key=value, reverse=not ascending
-    )
+    graded = sorted((r for r in rows if not _is_pending(r)), key=value, reverse=not ascending)
+    pending = sorted((r for r in rows if _is_pending(r)), key=value, reverse=not ascending)
     return graded + pending
 
 
@@ -1003,14 +1001,9 @@ def _location_passes(
     unknown" with a Sentry log so we know the population at risk.
     """
     loc = (location or "").lower()
-    if only_terms and not any(
-        _term_matches_location(term, loc) for term in only_terms
-    ):
+    if only_terms and not any(_term_matches_location(term, loc) for term in only_terms):
         return False
-    return not (
-        exclude_terms
-        and any(_term_matches_location(term, loc) for term in exclude_terms)
-    )
+    return not (exclude_terms and any(_term_matches_location(term, loc) for term in exclude_terms))
 
 
 def _apply_location_filter(
@@ -1106,9 +1099,7 @@ def _job_tag(posting: dict[str, Any], column: str) -> str | None:
     return text or None
 
 
-def _employment_type_passes(
-    posting: dict[str, Any], allowed: list[str] | None
-) -> bool:
+def _employment_type_passes(posting: dict[str, Any], allowed: list[str] | None) -> bool:
     """Keep the job when its ``employment_type`` tag is in ``allowed``.
 
     Lenient: no preference set → keep; unknown job tag → keep. Only an
@@ -1146,8 +1137,7 @@ def _seniority_passes(
     if seniority_min is not None and rank < SENIORITY_ORDER.index(cast(Any, seniority_min)):
         return False
     return not (
-        seniority_max is not None
-        and rank > SENIORITY_ORDER.index(cast(Any, seniority_max))
+        seniority_max is not None and rank > SENIORITY_ORDER.index(cast(Any, seniority_max))
     )
 
 
@@ -1316,9 +1306,7 @@ def list_jobs(
     exclude_terms = _parse_location_list(exclude_locations)
     only_terms = _parse_location_list(only_locations)
     # Logistics filters (#86) — over the grader's scores.logistics_filters data.
-    logistics = _LogisticsFilter(
-        remote_only=remote_only, min_salary=min_salary, country=country
-    )
+    logistics = _LogisticsFilter(remote_only=remote_only, min_salary=min_salary, country=country)
     cursor_data = _decode_cursor(cursor)
     ascending = order == "asc"
 
@@ -1514,9 +1502,7 @@ def list_jobs(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(operator_sort, desc=not ascending).limit(
-            _OPERATOR_LOCATION_SCAN_CAP
-        )
+        query = query.order(operator_sort, desc=not ascending).limit(_OPERATOR_LOCATION_SCAN_CAP)
         resp = query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
@@ -1534,9 +1520,7 @@ def list_jobs(
             "postings": _finalize_operator_rows(
                 filtered[operator_offset : operator_offset + page_size]
             ),
-            "next_cursor": _offset_next_cursor(
-                operator_offset, page_size, len(filtered)
-            ),
+            "next_cursor": _offset_next_cursor(operator_offset, page_size, len(filtered)),
             "total": len(filtered),
             "applied_min_score": min_score,
         }
@@ -1547,12 +1531,8 @@ def list_jobs(
         resp = query.execute()
         operator_total = resp.count or 0
         operator_result = {
-            "postings": _finalize_operator_rows(
-                cast(list[dict[str, Any]], list(resp.data or []))
-            ),
-            "next_cursor": _offset_next_cursor(
-                operator_offset, page_size, operator_total
-            ),
+            "postings": _finalize_operator_rows(cast(list[dict[str, Any]], list(resp.data or []))),
+            "next_cursor": _offset_next_cursor(operator_offset, page_size, operator_total),
             "total": operator_total,
             "applied_min_score": min_score,
         }
@@ -1595,28 +1575,15 @@ def _pipeline_counts_python(
     score_query = _apply_score_floor(score_query, min_score)
     score_resp = score_query.execute()
     job_ids = sorted(
-        {
-            cast(str, r["job_posting_id"])
-            for r in cast(list[dict[str, Any]], score_resp.data or [])
-        }
+        {cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], score_resp.data or [])}
     )
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        # Global liveness gate (#75 C3): only count jobs that are still
-        # live (archived_at IS NULL). Globally-archived/dead jobs are
-        # excluded regardless of the caller's per-user status.
-        live_resp = (
-            supabase.table("jobs")
-            .select("id")
-            .in_("id", chunk)
-            .is_("archived_at", "null")
-            .execute()
-        )
-        live_ids = [
-            cast(str, r["id"])
-            for r in cast(list[dict[str, Any]], live_resp.data or [])
-        ]
+        # Liveness gate (#75 C3) + non-US gate (#60): count only jobs that are
+        # still live AND not confirmed non-US, so the tab totals match the list.
+        live_resp = _gate_live_us(supabase.table("jobs").select("id").in_("id", chunk)).execute()
+        live_ids = [cast(str, r["id"]) for r in cast(list[dict[str, Any]], live_resp.data or [])]
         # Resolve per-user status for the chunk; jobs with no user_jobs
         # row — and every job when there's no user identity — count as
         # 'new' (#75 "absent = new" rule).
@@ -1666,9 +1633,7 @@ def _pipeline_counts_grouped(
             },
         ).execute()
     except Exception:
-        logger.debug(
-            "pipeline_counts RPC unavailable, falling back to client-side count"
-        )
+        logger.debug("pipeline_counts RPC unavailable, falling back to client-side count")
         return _pipeline_counts_python(
             supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
@@ -1771,9 +1736,7 @@ async def add_manual_job(
         # caller enumerate which internal hostnames resolve to private ranges
         # (recon oracle, audit #29 R3 / H8). Keep specifics server-side.
         logger.warning("ssrf_reject host=%s: %s", hostname, exc)
-        raise HTTPException(
-            status_code=400, detail="This URL cannot be fetched"
-        ) from exc
+        raise HTTPException(status_code=400, detail="This URL cannot be fetched") from exc
 
     # Fetch the page with a hard size cap — without this, a user
     # pasting a URL to a multi-GB payload (CDN downloads, infinite
@@ -1783,9 +1746,7 @@ async def add_manual_job(
     try:
         # validate_host gates every redirect hop (not just the first/final
         # URL) before connecting — closes the SSRF redirect gap (#110).
-        resp, body_bytes = await get_with_size_cap(
-            cleaned, validate_host=assert_safe_host
-        )
+        resp, body_bytes = await get_with_size_cap(cleaned, validate_host=assert_safe_host)
         final_url = str(resp.url)
     except ResponseTooLargeError as exc:
         raise HTTPException(
@@ -1796,9 +1757,7 @@ async def add_manual_job(
         # A redirect hop resolved to an internal address. Don't reflect the
         # resolved host/IP (audit #29 R3 / H8).
         logger.warning("ssrf_reject redirect for %s: %s", cleaned, exc)
-        raise HTTPException(
-            status_code=400, detail="This URL cannot be fetched"
-        ) from exc
+        raise HTTPException(status_code=400, detail="This URL cannot be fetched") from exc
     except httpx.HTTPError:
         raise HTTPException(status_code=400, detail="Failed to fetch URL") from None
 
@@ -1829,11 +1788,7 @@ async def add_manual_job(
     # Extract metadata. ``body_bytes`` came from the size-capped
     # streaming read; ``resp.text`` is empty here because the stream
     # was consumed manually, so decode the bytes ourselves.
-    html = (
-        body_bytes.decode("utf-8", errors="replace")
-        if resp.status_code == 200
-        else ""
-    )
+    html = body_bytes.decode("utf-8", errors="replace") if resp.status_code == 200 else ""
     extraction: ExtractionResult
     if html:
         extraction = extract_job_from_html(html, final_url)
@@ -1905,17 +1860,11 @@ async def add_manual_job(
 
         def _persist() -> Any:
             _ensure_manual_source(supabase)
-            return (
-                supabase.table("jobs")
-                .upsert(row, on_conflict="source_id,external_id")
-                .execute()
-            )
+            return supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
 
         resp_db = await asyncio.to_thread(_persist)
     except APIError as exc:
-        logger.error(
-            "Manual job upsert failed for url=%s: %s", final_url, exc, exc_info=exc
-        )
+        logger.error("Manual job upsert failed for url=%s: %s", final_url, exc, exc_info=exc)
         raise HTTPException(
             status_code=502,
             detail="Couldn't save this job right now — please try again.",
@@ -1937,9 +1886,7 @@ async def add_manual_job(
     # active targets this turns ~10 sequential round-trips into ~1 wall-time.
     if posting_id and title:
         if user_id is not None:
-            active_targets = await asyncio.to_thread(
-                get_active_for_user, supabase, user_id
-            )
+            active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
         else:
             active_targets = await asyncio.to_thread(get_active_target, supabase)
         parsed = parse_jd(description_html)
@@ -2000,9 +1947,7 @@ async def add_manual_job(
                     ).execute()
                 )
             except Exception:
-                logger.exception(
-                    "Force-include update failed for manual job %s", posting_id
-                )
+                logger.exception("Force-include update failed for manual job %s", posting_id)
 
     # Invalidate job list cache after adding a new posting
     job_list_cache.invalidate()
@@ -2082,9 +2027,7 @@ def backfill_salary(
                 updates.append({"id": row["id"], "salary_text": salary})
 
         if updates:
-            supabase.rpc(
-                "bulk_update_salaries", {"p_updates": updates}
-            ).execute()
+            supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()
             updated += len(updates)
 
         if len(rows) < batch_size:
@@ -2120,15 +2063,9 @@ def _assert_user_owns_posting(
     cause, separate copy of the helper.
     """
     # 1. Fetch the posting (and projection).
-    select_cols = (
-        _JP_DETAIL_SELECT_COLS if include_description else _JP_SELECT_COLS
-    )
+    select_cols = _JP_DETAIL_SELECT_COLS if include_description else _JP_SELECT_COLS
     posting_resp = (
-        supabase.table("jobs")
-        .select(select_cols)
-        .eq("id", posting_id)
-        .limit(1)
-        .execute()
+        supabase.table("jobs").select(select_cols).eq("id", posting_id).limit(1).execute()
     )
     rows = posting_resp.data or []
     if not rows or not isinstance(rows[0], dict):
@@ -2137,15 +2074,9 @@ def _assert_user_owns_posting(
 
     # 2. Resolve the caller's target ids.
     user_targets_resp = (
-        supabase.table("user_targets")
-        .select("target_id")
-        .eq("user_id", user_id)
-        .execute()
+        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     )
-    user_target_ids = {
-        cast(dict[str, Any], r)["target_id"]
-        for r in user_targets_resp.data or []
-    }
+    user_target_ids = {cast(dict[str, Any], r)["target_id"] for r in user_targets_resp.data or []}
     if not user_target_ids:
         raise HTTPException(status_code=404, detail="Posting not found")
 
@@ -2191,9 +2122,7 @@ def get_job(
     # Detail GET pulls ``description_html`` so the UI can render the JD
     # body. The list endpoint deliberately omits it for payload size, but
     # there's no rendering of a single posting without the JD text.
-    row = _assert_user_owns_posting(
-        supabase, posting_id, user_id, include_description=True
-    )
+    row = _assert_user_owns_posting(supabase, posting_id, user_id, include_description=True)
     # Overlay the live per-target score + breakdown. The ``jobs.score`` /
     # ``jobs.score_breakdown`` columns are vestigial and never updated
     # by the poller — without this, the detail view reads stale ``0`` /

@@ -41,6 +41,10 @@ class _Chain:
     def is_(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
+    @property
+    def not_(self) -> "_Chain":
+        return self
+
     def gte(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
@@ -73,9 +77,7 @@ def test_python_fallback_dedups_jobs_across_targets() -> None:
     sb = MagicMock()
     sb.table.side_effect = _table
 
-    counts = _pipeline_counts_python(
-        sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
-    )
+    counts = _pipeline_counts_python(sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1")
     assert counts == {"new": 1, "saved": 1}
 
 
@@ -89,9 +91,7 @@ def test_grouped_uses_rpc_result() -> None:
     )
     # Unfloored counts take the keyset RPC fast path. (A min_score floor instead
     # routes to the Pending-aware Python path — see test_jobs_pending_floor.) #47
-    counts = _pipeline_counts_grouped(
-        sb, target_ids={"t1"}, min_score=None, user_id="u1"
-    )
+    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
     assert counts == {"new": 12, "applied": 5}
     sb.rpc.assert_called_once_with(
         "pipeline_counts",
@@ -112,21 +112,15 @@ def test_grouped_falls_back_when_rpc_missing() -> None:
         return _Chain(_Resp([{"job_posting_id": "j1", "status": "interviewing"}]))
 
     sb.table.side_effect = _table
-    counts = _pipeline_counts_grouped(
-        sb, target_ids={"t1"}, min_score=None, user_id="u1"
-    )
+    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
     assert counts == {"interviewing": 1}
 
 
 def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
     import app.routers.jobs as jobs_mod
 
-    monkeypatch.setattr(
-        jobs_mod, "get_user_target_ids", lambda _sb, _uid: {"t1"}
-    )
-    monkeypatch.setattr(
-        jobs_mod, "_default_min_score_for_user", lambda _sb, _uid: None
-    )
+    monkeypatch.setattr(jobs_mod, "get_user_target_ids", lambda _sb, _uid: {"t1"})
+    monkeypatch.setattr(jobs_mod, "_default_min_score_for_user", lambda _sb, _uid: None)
     monkeypatch.setattr(
         jobs_mod,
         "_pipeline_counts_grouped",
@@ -170,9 +164,7 @@ def test_endpoint_caches_per_user() -> None:
     grouped = MagicMock(return_value={"new": 2})
     with (
         patch.object(jobs_mod, "get_user_target_ids", return_value={"t1"}),
-        patch.object(
-            jobs_mod, "_default_min_score_for_user", return_value=None
-        ),
+        patch.object(jobs_mod, "_default_min_score_for_user", return_value=None),
         patch.object(jobs_mod, "_pipeline_counts_grouped", grouped),
     ):
         first = pipeline_counts(supabase=MagicMock(), user_id="u1")

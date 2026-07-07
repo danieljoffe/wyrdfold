@@ -102,6 +102,12 @@ class JobsQuery:
     def is_(self, *_a: Any, **_kw: Any) -> JobsQuery:
         return self
 
+    @property
+    def not_(self) -> JobsQuery:
+        # `.not_.is_("is_us","false")` — the #60 non-US display gate. This fake
+        # keys off ids only, so negation is a no-op that keeps the chain fluent.
+        return self
+
     def ilike(self, *_a: Any, **_kw: Any) -> JobsQuery:
         return self
 
@@ -112,9 +118,7 @@ class JobsQuery:
         return FakeResponse([self._postings[i] for i in self._ids if i in self._postings])
 
 
-def two_query_supabase(
-    scores: list[dict[str, Any]], jobs: dict[str, dict[str, Any]]
-) -> MagicMock:
+def two_query_supabase(scores: list[dict[str, Any]], jobs: dict[str, dict[str, Any]]) -> MagicMock:
     """A supabase stub for the two-query list path: ``scores`` rows (floored)
     and ``jobs`` postings (keyed by id, returned in ``.in_`` order)."""
     sb = MagicMock()

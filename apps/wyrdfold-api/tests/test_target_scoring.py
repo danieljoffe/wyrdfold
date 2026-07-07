@@ -70,8 +70,11 @@ def _upserted_score_row(
         "target_id": target_id,
         "score": score,
         "score_breakdown": ScoreBreakdown(
-            role_titles=0, technologies=12.0, domain_skills=0,
-            seniority_signals=0, negative=0,
+            role_titles=0,
+            technologies=12.0,
+            domain_skills=0,
+            seniority_signals=0,
+            negative=0,
         ).model_dump(),
         "matched_keywords": ["React", "TypeScript"],
         "excluded": False,
@@ -87,9 +90,7 @@ def _make_supabase_mock(
 ) -> MagicMock:
     supabase = MagicMock()
     # upsert chain
-    supabase.table.return_value.upsert.return_value.execute.return_value.data = (
-        upsert_data or []
-    )
+    supabase.table.return_value.upsert.return_value.execute.return_value.data = upsert_data or []
     # select chain (for get_target_scores / bulk_score_for_target)
     supabase.table.return_value.select.return_value.eq.return_value.in_.return_value.execute.return_value.data = (
         select_data or []
@@ -230,9 +231,7 @@ def test_bulk_score_for_target_scores_stage1_jobs(
         return mock
 
     # Chain: .select().eq().lt().range()
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
-        range_side_effect
-    )
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
     supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = (
         jobs
     )
@@ -296,16 +295,12 @@ def test_bulk_score_for_target_preserves_phase1_promising_verdict(
         return mock
 
     # Stale-row paging carries ``promising`` inline: ``.select().eq().lt().range()``.
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
-        range_side_effect
-    )
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
     # The jobs fetch is ``.select().in_()`` — returns the backing job rows.
     supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = (
         jobs
     )
-    supabase.table.return_value.upsert.return_value.execute.return_value.data = (
-        upsert_rows
-    )
+    supabase.table.return_value.upsert.return_value.execute.return_value.data = upsert_rows
 
     target = _target(core={"React": 3})
     count = bulk_score_for_target(supabase, target)
@@ -361,9 +356,7 @@ def test_bulk_score_for_target_streams_multiple_pages_without_holding_all_ids(
         ]
         return m
 
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
-        range_side_effect
-    )
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
 
     # Jobs fetch: ``.select().in_(ids)`` → record the width, return job rows
     # for exactly those ids.
@@ -371,8 +364,7 @@ def test_bulk_score_for_target_streams_multiple_pages_without_holding_all_ids(
         jobs_in_calls.append(list(ids))
         m = MagicMock()
         m.execute.return_value.data = [
-            {"id": jid, "title": "Senior FE", "description_html": "<p>React</p>"}
-            for jid in ids
+            {"id": jid, "title": "Senior FE", "description_html": "<p>React</p>"} for jid in ids
         ]
         return m
 
@@ -431,9 +423,7 @@ def test_bulk_score_for_target_terminates_when_page_has_no_backing_jobs(
         return m
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = (
-        range_side_effect
-    )
+    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
     # No backing jobs for these ids.
     supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
 
@@ -560,18 +550,21 @@ def test_list_jobs_without_target_returns_global_view(
         m.execute.return_value = MagicMock(data=data, count=len(data))
         for method in ("select", "eq", "neq", "gte", "in_", "is_", "ilike", "order", "range"):
             getattr(m, method).return_value = m
+        m.not_ = m  # `.not_.is_(...)` negation is an attribute access (#60 non-US gate)
         return m
 
-    jp_mock = _fluent_mock([
-        {
-            "id": "job-1",
-            "score": 50,
-            "score_breakdown": None,
-            "title": "Engineer",
-            "company_name": "Acme",
-            "created_at": "2026-01-01T00:00:00Z",
-        }
-    ])
+    jp_mock = _fluent_mock(
+        [
+            {
+                "id": "job-1",
+                "score": 50,
+                "score_breakdown": None,
+                "title": "Engineer",
+                "company_name": "Acme",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+    )
 
     supabase = MagicMock()
     supabase.table.return_value = jp_mock
@@ -614,37 +607,47 @@ def test_list_jobs_with_target_overlays_target_score(
         m.execute.return_value = MagicMock(data=data, count=len(data))
         for method in ("select", "eq", "neq", "gte", "in_", "is_", "ilike", "order", "range"):
             getattr(m, method).return_value = m
+        m.not_ = m  # `.not_.is_(...)` negation is an attribute access (#60 non-US gate)
         return m
 
-    ts_mock = _fluent_mock([{
-        "job_posting_id": "job-1",
-        "score": 85,
-        "score_breakdown": {
-            "role_titles": 0, "technologies": 12.0, "domain_skills": 0,
-            "seniority_signals": 0, "negative": 0,
-        },
-    }])
+    ts_mock = _fluent_mock(
+        [
+            {
+                "job_posting_id": "job-1",
+                "score": 85,
+                "score_breakdown": {
+                    "role_titles": 0,
+                    "technologies": 12.0,
+                    "domain_skills": 0,
+                    "seniority_signals": 0,
+                    "negative": 0,
+                },
+            }
+        ]
+    )
 
-    jp_mock = _fluent_mock([{
-        "id": "job-1",
-        "external_id": "ext-1",
-        "source_id": "src-1",
-        "title": "Frontend Engineer",
-        "company_name": "Acme",
-        "location": "Remote",
-        "department": None,
-        "absolute_url": "https://example.com/job-1",
-        "score": 50,
-        "score_breakdown": None,
-        "status": "new",
-        "first_seen_at": None,
-        "created_at": "2026-04-26T00:00:00Z",
-    }])
+    jp_mock = _fluent_mock(
+        [
+            {
+                "id": "job-1",
+                "external_id": "ext-1",
+                "source_id": "src-1",
+                "title": "Frontend Engineer",
+                "company_name": "Acme",
+                "location": "Remote",
+                "department": None,
+                "absolute_url": "https://example.com/job-1",
+                "score": 50,
+                "score_breakdown": None,
+                "status": "new",
+                "first_seen_at": None,
+                "created_at": "2026-04-26T00:00:00Z",
+            }
+        ]
+    )
 
     supabase = MagicMock()
-    supabase.table.side_effect = (
-        lambda name: ts_mock if name == "scores" else jp_mock
-    )
+    supabase.table.side_effect = lambda name: ts_mock if name == "scores" else jp_mock
 
     app.dependency_overrides[get_supabase] = lambda: supabase
     # api-key caller (user_id None): dual-auth resolves the caller client to
