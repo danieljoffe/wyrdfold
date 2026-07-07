@@ -121,6 +121,29 @@ Reports catch_rate / precision / miss_rate and names each **missed** hallucinati
 
 - each false flag. ~1 review call/case.
 
+## Grading correctness — committed golden, GROSS cases (part CI, part on-demand)
+
+`eval_grading_correctness.py` (#193) turns the drift-only grading eval (above,
+ρ vs the shifting production baseline) into a **correctness** one: a committed
+golden set (`tests/fixtures/grading_golden.json`) of (target, resume, job)
+triples where the right fit is UNAMBIGUOUS — a warehouse job vs a senior-frontend
+target+resume must land LOW, a matching job HIGH — with WIDE bands (high≥50,
+low≤25). It catches GROSS regressions (an off-domain job scoring 60 for a
+specific target) without over-specifying a subtle score. Reuses the real grader
+(`_grade_one` → `job_fit`).
+
+CI-free part: pure band metrics + the fixture guard that it deserializes into the
+real `JobTarget`/`OptimizedPayload` (`tests/test_eval_grading_correctness.py`).
+Grader run is on-demand:
+
+```bash
+railway run uv run --package wyrdfold-api \
+  python apps/wyrdfold-api/scripts/eval_grading_correctness.py
+```
+
+Bands **ratified 2026-07-07** against the live grader (Sonnet-4.6): 100% band
+accuracy (6/6) — highs scored 72/92/95, lows 2/4/4 (a clean ~68-pt gap).
+
 ### Handling secrets
 
 Never paste keys into chat, commits, or `eval_results/`. Use env vars (or
