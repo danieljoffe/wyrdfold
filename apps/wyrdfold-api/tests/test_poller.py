@@ -11,6 +11,7 @@ from app.models.targets import (
 )
 from app.services.poller import (
     _is_us_location,
+    _passes_free_gates,
     _title_matches_any_target,
     _title_matches_target,
 )
@@ -126,6 +127,97 @@ def test_empty_keyword_list_does_not_match():
 
 def test_empty_title_does_not_match():
     assert _title_matches_target("", ["director of cx operations"]) is False
+
+
+# ---- distinctive-token precision (the #60 generic-overlap leak) -------------
+#
+# Real prod finding: ~593 off-target jobs/week rode generic-token overlap into
+# the active targets. On a 3-token keyword the 0.6 ratio is met by any 2 tokens,
+# so generic role words (director, operations, engineer) carried the match while
+# the distinctive DOMAIN token was absent. The matcher now also requires ≥1
+# distinctive token in the title.
+
+
+def test_generic_overlap_without_distinctive_token_is_rejected():
+    """ "Finance Operations Director" shares director+operations (2 of 3) with
+    "director of customer operations" but lacks the distinctive "customer"."""
+    kw = ["director of customer operations"]
+    assert _title_matches_target("Senior Director, Finance Operations", kw) is False
+    assert _title_matches_target("Director of Sales Operations", kw) is False
+    assert _title_matches_target("VP of Finance Operations", ["vp of customer operations"]) is False
+
+
+def test_generic_role_type_overlap_is_rejected():
+    """Frontend: "Kubernetes Platform Engineer" shares platform+engineer with
+    "frontend platform engineer" but lacks the distinctive "frontend"."""
+    kw = ["frontend platform engineer"]
+    assert _title_matches_target("Kubernetes Platform Engineer", kw) is False
+    assert _title_matches_target("Machine Learning Platform Engineer", kw) is False
+
+
+def test_distinctive_token_present_still_matches():
+    """Recall preserved: title-word swaps (director↔head↔vp) still match while
+    the distinctive domain token is present."""
+    ops = ["director of customer operations"]
+    assert _title_matches_target("Head of Customer Operations", ops) is True
+    assert _title_matches_target("VP, Customer Operations", ops) is True
+    assert (
+        _title_matches_target("Director, Customer Success", ["director of customer success"])
+        is True
+    )
+    assert _title_matches_target("Staff Frontend Engineer", ["frontend engineer"]) is True
+    assert _title_matches_target("React Developer", ["react developer"]) is True
+
+
+def test_all_generic_keyword_keeps_overlap_only():
+    """A keyword with no distinctive token (all generic) can't gate on one, so
+    it keeps overlap-only behaviour — GIGO for an inherently generic target."""
+    assert _title_matches_target("Finance Operations Manager", ["operations manager"]) is True
+
+
+# ---- ingest hole: no active targets → ingest nothing (#60) ------------------
+
+
+def _search_kw_target(search_keywords: list[str], core: dict[str, int]) -> JobTarget:
+    return JobTarget(
+        id="t-kw",
+        label="KW Target",
+        scoring_profile=ScoringProfile(
+            categories={"core_skills": CategoryProfile(keywords=core, weight=2.0)},
+            seniority=SeniorityProfile(signals=["senior", "staff", "lead"]),
+        ),
+        search_keywords=search_keywords,
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+
+def _us_job(title: str) -> StandardJob:
+    return StandardJob(
+        external_id="e1",
+        title=title,
+        location_name="New York, NY",
+        department=None,
+        content="",
+        updated_at="2026-01-01",
+        absolute_url="https://example.com/j/1",
+    )
+
+
+def test_free_gates_reject_everything_when_no_active_targets():
+    """The whole-board hole: with NO active targets there is nothing to match,
+    so a US, otherwise-ingestable role is dropped instead of ingested."""
+    assert _passes_free_gates(_us_job("Director of Customer Operations"), []) is False
+
+
+def test_free_gates_admit_when_a_target_matches():
+    """Control: the gate still admits a genuine match (so the hole fix didn't
+    just break ingestion)."""
+    target = _search_kw_target(
+        ["director of customer operations"], {"customer": 1, "operations": 1}
+    )
+    assert _passes_free_gates(_us_job("Director of Customer Operations"), [target]) is True
 
 
 class TestIsUsLocation:

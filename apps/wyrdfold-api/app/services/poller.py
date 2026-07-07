@@ -195,6 +195,60 @@ def _content_tokens(text: str) -> list[str]:
     return [t for t in raw if t and t not in _MATCH_STOPWORDS]
 
 
+# Ubiquitous role / seniority tokens that describe a job's LEVEL or generic
+# FUNCTION, not its domain. Excluded from the "distinctive token" requirement
+# below: a match that rides only these (with the keyword's domain token absent)
+# is a false positive — "Senior Director, Finance Operations" sharing
+# director+operations with "director of customer operations" is not a CX role.
+# Kept to genuinely cross-domain words; anything domain-bearing (customer, cx,
+# frontend, react, ui, success, experience, ...) is deliberately NOT here.
+_GENERIC_ROLE_TOKENS: frozenset[str] = frozenset(
+    {
+        # seniority / org level
+        "senior",
+        "junior",
+        "staff",
+        "principal",
+        "lead",
+        "leader",
+        "mid",
+        "entry",
+        "chief",
+        "head",
+        "vp",
+        "svp",
+        "evp",
+        "vice",
+        "president",
+        "director",
+        "manager",
+        "management",
+        "officer",
+        "associate",
+        "intern",
+        "trainee",
+        "deputy",
+        "assistant",
+        "global",
+        "regional",
+        "sr",
+        "jr",
+        # ubiquitous cross-domain function / role-type nouns
+        "operations",
+        "ops",
+        "engineer",
+        "engineering",
+        "developer",
+        "development",
+        "platform",
+        "specialist",
+        "coordinator",
+        "generalist",
+        "professional",
+    }
+)
+
+
 def _title_matches_target(title: str, keywords: list[str]) -> bool:
     """Token-overlap match between a job title and any of the target's
     search keywords.
@@ -203,11 +257,18 @@ def _title_matches_target(title: str, keywords: list[str]) -> bool:
     in title_lower`` — which silently dropped almost every real posting
     because companies rarely include filler words verbatim in their titles
     ("Director, Customer Experience" doesn't contain "director of cx
-    operations"). The new matcher tokenizes both sides on word boundaries,
-    drops stopwords, and accepts the keyword when at least
-    ``_MATCH_MIN_OVERLAP_RATIO`` of its content tokens appear as substrings
-    of the title's tokens. Substring (not exact) so plurals and
-    "Customer-Centric" → "Customer" still match.
+    operations"). The matcher tokenizes both sides on word boundaries, drops
+    stopwords, and accepts the keyword when at least ``_MATCH_MIN_OVERLAP_RATIO``
+    of its content tokens appear as substrings of the title's tokens. Substring
+    (not exact) so plurals and "Customer-Centric" → "Customer" still match.
+
+    Overlap alone over-admits, though: on a 3-token keyword the 0.6 ratio is
+    satisfied by any 2 tokens, so generic role words carry the match —
+    "Senior Director, Finance Operations" hit "director of customer operations"
+    on director+operations with the distinctive "customer" absent. So the match
+    ALSO requires ≥1 ``distinctive`` token (keyword tokens minus
+    ``_GENERIC_ROLE_TOKENS``) in the title. A keyword that is entirely generic
+    keeps the overlap-only behaviour.
     """
     if not keywords:
         return False
@@ -224,8 +285,12 @@ def _title_matches_target(title: str, keywords: list[str]) -> bool:
                 return True
             continue
         hits = sum(1 for kw in kw_tokens if any(kw in t for t in title_tokens))
-        if hits / len(kw_tokens) >= _MATCH_MIN_OVERLAP_RATIO:
-            return True
+        if hits / len(kw_tokens) < _MATCH_MIN_OVERLAP_RATIO:
+            continue
+        distinctive = [t for t in kw_tokens if t not in _GENERIC_ROLE_TOKENS]
+        if distinctive and not any(any(d in t for t in title_tokens) for d in distinctive):
+            continue
+        return True
     return False
 
 
@@ -241,15 +306,15 @@ def _passes_free_gates(job: StandardJob, active_targets: list[JobTarget]) -> boo
 
     Same semantics as the per-job loop in ``_poll_one_source`` — title
     prematch (including the excluded-admits-for-audit rule and the
-    empty-``search_keywords`` fallback inside
-    ``_title_matches_any_target``; skipped entirely when no targets are
-    active) AND the US-location pass. Used to pre-filter the Phase 1
-    triage candidate set so the LLM only ever sees titles that could
-    actually be ingested: a job these gates reject is dropped in the
-    per-job loop regardless of its verdict, so classifying it is pure
-    spend.
+    empty-``search_keywords`` fallback inside ``_title_matches_any_target``)
+    AND the US-location pass. With NO active targets there is nothing to
+    match, so nothing passes — a poll with zero active targets ingests
+    nothing (a target activating re-polls its sources). Used to pre-filter
+    the Phase 1 triage candidate set so the LLM only ever sees titles that
+    could actually be ingested: a job these gates reject is dropped in the
+    per-job loop regardless of its verdict, so classifying it is pure spend.
     """
-    if active_targets and not _title_matches_any_target(job.title, active_targets):
+    if not _title_matches_any_target(job.title, active_targets):
         return False
     return _is_us_location(job.location_name)
 
@@ -1160,8 +1225,11 @@ async def _poll_one_source(
         dropped_title_prematch = 0
         dropped_non_us = 0
         for idx, job in enumerate(jobs):
-            # Filter by target relevance instead of static keyword list
-            if active_targets and not _title_matches_any_target(job.title, active_targets):
+            # Filter by target relevance instead of static keyword list. With
+            # NO active targets there is nothing to match against, so drop
+            # everything (previously the `active_targets and` guard SKIPPED this
+            # gate when empty, ingesting whole boards of untargeted roles).
+            if not _title_matches_any_target(job.title, active_targets):
                 dropped_title_prematch += 1
                 continue
             if not _is_us_location(job.location_name):
