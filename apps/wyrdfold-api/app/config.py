@@ -481,6 +481,17 @@ class Settings(BaseSettings):
     # (discovery is a daily-cadence job, not minutes like the poll).
     discovery_scheduler_enabled: bool = False
     discovery_tick_hours: int = Field(default=24, ge=1, le=720)
+    # Discovery-staleness alarm — checked on the ingestion-health tick (which
+    # piggybacks the poll cycle). ARMED ONLY when ``discovery_scheduler_enabled``
+    # is on, so a deliberately-off discovery loop never pages; when armed it
+    # raises a Sentry ``warning`` if the newest ``source_discoveries.discovered_at``
+    # is older than this many hours. This is the guard for the exact silent
+    # freeze that motivated #60: discovery stopped producing new sources and
+    # nobody noticed for weeks (the catalog rotted until a user hit an empty
+    # metro). The effective threshold is ``max(this, discovery_tick_hours * 2)``
+    # so a single missed tick never pages and a longer tick auto-relaxes it. 0
+    # disables just this check.
+    discovery_max_age_hours: int = Field(default=48, ge=0, le=8760)
     # Postgres advisory-lock key for the bulk discovery run. A DISTINCT bigint
     # from ``poll_advisory_lock_key`` so a discovery pass and a poll never
     # contend on the same lock — they guard different work. Like the poll key

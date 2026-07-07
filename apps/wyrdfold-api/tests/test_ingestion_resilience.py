@@ -6,8 +6,9 @@ Covers:
     failure and stamps disabled_at + alerts when the backoff disables a source.
   - ``recover_stale_sources`` re-enables sources whose disabled_at is older
     than the cooldown.
-  - ``check_ingestion_health`` fires the "no new jobs in N hours" and
-    mass-disable Sentry alerts (and stays quiet when healthy).
+  - ``check_ingestion_health`` fires the "no new jobs in N hours",
+    mass-disable, and discovery-staleness Sentry alerts (and stays quiet when
+    healthy — including staying silent on discovery when discovery is off).
 """
 
 from __future__ import annotations
@@ -206,11 +207,17 @@ async def test_recovery_never_raises(monkeypatch) -> None:
 
 
 def _health_supabase(
-    *, newest_created_at: str | None, total: int, disabled: int
+    *,
+    newest_created_at: str | None,
+    total: int,
+    disabled: int,
+    newest_discovery_at: str | None = None,
 ) -> MagicMock:
     """A supabase mock answering the health-check queries:
-      - jobs: select().order().limit().execute() → newest created_at row
-      - sources: select(count=exact) total, and .eq(enabled,False) disabled
+    - jobs: select().order().limit().execute() → newest created_at row
+    - sources: select(count=exact) total, and .eq(enabled,False) disabled
+    - source_discoveries: select().order().limit().execute() → newest
+      discovered_at row (only read when the discovery-staleness check is armed)
     """
     jobs_leaf = MagicMock()
     jobs_rows = [{"created_at": newest_created_at}] if newest_created_at else []
@@ -226,8 +233,18 @@ def _health_supabase(
     select_handle.eq.return_value.execute.return_value = _Resp(data=[], count=disabled)
     sources_table.select.return_value = select_handle
 
+    disc_leaf = MagicMock()
+    disc_rows = [{"discovered_at": newest_discovery_at}] if newest_discovery_at else []
+    disc_leaf.execute.return_value = _Resp(data=disc_rows)
+    discoveries_table = MagicMock()
+    discoveries_table.select.return_value.order.return_value.limit.return_value = disc_leaf
+
     def _table(name: str) -> MagicMock:
-        return jobs_table if name == "jobs" else sources_table
+        if name == "jobs":
+            return jobs_table
+        if name == "source_discoveries":
+            return discoveries_table
+        return sources_table
 
     sb = MagicMock()
     sb.table.side_effect = _table
@@ -332,3 +349,124 @@ async def test_health_disabled_by_flag(monkeypatch) -> None:
     assert report.alerts == []
     assert captured == []
     sb.table.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# check_ingestion_health — discovery staleness (check #3)
+# ---------------------------------------------------------------------------
+
+
+def _arm_health(monkeypatch, *, discovery_enabled: bool, tick_hours: int = 24) -> None:
+    """Arm the health checks with the other two kept healthy so only the
+    discovery-staleness signal can fire."""
+    monkeypatch.setattr(live_settings, "ingestion_health_check_enabled", True)
+    monkeypatch.setattr(live_settings, "ingestion_max_job_age_hours", 48)
+    monkeypatch.setattr(live_settings, "ingestion_mass_disable_ratio", 0.5)
+    monkeypatch.setattr(live_settings, "discovery_scheduler_enabled", discovery_enabled)
+    monkeypatch.setattr(live_settings, "discovery_max_age_hours", 48)
+    monkeypatch.setattr(live_settings, "discovery_tick_hours", tick_hours)
+
+
+@pytest.mark.asyncio
+async def test_health_alerts_on_stale_discovery(monkeypatch) -> None:
+    """Discovery armed + newest run well past the threshold → the exact #60
+    silent-freeze signal: stale_discovery + a warning alert."""
+    _arm_health(monkeypatch, discovery_enabled=True)
+    captured = _patch_sentry(monkeypatch)
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh_job = (now - timedelta(hours=1)).isoformat()
+    stale_disc = (now - timedelta(days=10)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=fresh_job, total=10, disabled=0, newest_discovery_at=stale_disc
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_discovery is True
+    assert report.stale_job_data is False
+    assert report.mass_disable is False
+    warnings = [(m, lvl) for m, lvl in captured if "no discovery run" in m]
+    assert warnings and warnings[0][1] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_health_alerts_when_discovery_never_ran(monkeypatch) -> None:
+    """Discovery armed but source_discoveries empty → 'NEVER run' warning."""
+    _arm_health(monkeypatch, discovery_enabled=True)
+    captured = _patch_sentry(monkeypatch)
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh_job = (now - timedelta(hours=1)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=fresh_job, total=10, disabled=0, newest_discovery_at=None
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_discovery is True
+    assert any("NEVER run" in m for m, _ in captured)
+
+
+@pytest.mark.asyncio
+async def test_health_discovery_silent_when_scheduler_off(monkeypatch) -> None:
+    """The noise-free property: with discovery intentionally OFF, even
+    ancient discovery data raises no alert and the table is never queried."""
+    _arm_health(monkeypatch, discovery_enabled=False)
+    captured = _patch_sentry(monkeypatch)
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh_job = (now - timedelta(hours=1)).isoformat()
+    ancient_disc = (now - timedelta(days=90)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=fresh_job, total=10, disabled=0, newest_discovery_at=ancient_disc
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_discovery is False
+    assert report.newest_discovery_at is None  # check skipped, never read
+    assert not any("discovery" in m for m, _ in captured)
+    # source_discoveries must not be touched when the check is disarmed.
+    queried = {c.args[0] for c in sb.table.call_args_list}
+    assert "source_discoveries" not in queried
+
+
+@pytest.mark.asyncio
+async def test_health_discovery_fresh_no_alert(monkeypatch) -> None:
+    """Negative control: armed + a recent discovery run → no alert."""
+    _arm_health(monkeypatch, discovery_enabled=True)
+    captured = _patch_sentry(monkeypatch)
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh_job = (now - timedelta(hours=1)).isoformat()
+    fresh_disc = (now - timedelta(hours=6)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=fresh_job, total=10, disabled=0, newest_discovery_at=fresh_disc
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_discovery is False
+    assert report.alerts == []
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_health_discovery_threshold_floors_at_two_ticks(monkeypatch) -> None:
+    """A longer tick auto-relaxes the alarm: with a weekly (168h) tick the
+    effective threshold is max(48, 336)=336h, so a 3-day-old run is fine."""
+    _arm_health(monkeypatch, discovery_enabled=True, tick_hours=168)
+    captured = _patch_sentry(monkeypatch)
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh_job = (now - timedelta(hours=1)).isoformat()
+    disc_3d = (now - timedelta(days=3)).isoformat()  # 72h < 336h effective
+    sb = _health_supabase(
+        newest_created_at=fresh_job, total=10, disabled=0, newest_discovery_at=disc_3d
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_discovery is False
+    assert not any("discovery" in m for m, _ in captured)

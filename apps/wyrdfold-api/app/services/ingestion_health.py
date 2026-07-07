@@ -10,8 +10,13 @@ when ingestion looks dead, so an operator finds out in hours, not weeks:
      that was invisible.
   2. **Mass source disable** — a majority (configurable fraction) of all
      sources currently disabled, i.e. the whole fleet backed off at once.
+  3. **Discovery stalled** — ``max(source_discoveries.discovered_at)`` older
+     than ``discovery_max_age_hours``, but ONLY when discovery is meant to be
+     running (``discovery_scheduler_enabled``). The same silent-freeze class
+     one layer up: discovery quietly stopped producing sources and the
+     catalog rotted for weeks (#60) before anyone noticed.
 
-Both are best-effort and never raise into the caller: a health-check
+All are best-effort and never raise into the caller: a health-check
 query failure must not crash a poll cycle.
 """
 
@@ -30,9 +35,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-def _capture_alert(
-    message: str, *, level: Literal["error", "warning", "info"] = "error"
-) -> None:
+def _capture_alert(message: str, *, level: Literal["error", "warning", "info"] = "error") -> None:
     """Emit a Sentry alert. No-op when Sentry isn't configured; the log
     line is always written so the signal exists even without Sentry."""
     if not settings.sentry_dsn:
@@ -56,6 +59,8 @@ class IngestionHealthReport:
     total_sources: int = 0
     disabled_sources: int = 0
     mass_disable: bool = False
+    newest_discovery_at: datetime | None = None
+    stale_discovery: bool = False
     alerts: list[str] = field(default_factory=list)
 
 
@@ -102,6 +107,31 @@ async def _source_counts(supabase: Client) -> tuple[int, int]:
         )
     )
     return int(total_resp.count or 0), int(disabled_resp.count or 0)
+
+
+async def _newest_discovery_at(supabase: Client) -> datetime | None:
+    """``max(source_discoveries.discovered_at)`` via a 1-row keyset read on
+    the ``discovered_at DESC`` index — the timestamp of the most recent
+    discovery attempt of any outcome (inserted / duplicate / filtered)."""
+    resp = await asyncio.to_thread(
+        lambda: (
+            supabase.table("source_discoveries")
+            .select("discovered_at")
+            .order("discovered_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    raw = rows[0].get("discovered_at")
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 async def check_ingestion_health(
@@ -169,11 +199,49 @@ async def check_ingestion_health(
         except Exception:
             logger.exception("ingestion health: source-count check failed")
 
+    # --- 3. Discovery stalled ----------------------------------------------
+    # Armed ONLY when discovery is meant to be running, so a deliberately-off
+    # discovery loop (the default posture) never pages. When on, this catches
+    # the silent freeze where discovery stops producing sources and the
+    # catalog rots (#60). The effective threshold floors at 2x the tick so a
+    # single missed run never false-alarms and a longer tick auto-relaxes it.
+    if settings.discovery_scheduler_enabled and settings.discovery_max_age_hours > 0:
+        threshold_h = max(settings.discovery_max_age_hours, settings.discovery_tick_hours * 2)
+        try:
+            newest_disc = await _newest_discovery_at(supabase)
+            report.newest_discovery_at = newest_disc
+            cutoff = moment - timedelta(hours=threshold_h)
+            if newest_disc is None:
+                report.stale_discovery = True
+                msg = (
+                    "ingestion health: discovery is enabled but has NEVER run — "
+                    "source_discoveries is empty; the source catalog will not "
+                    "grow (check BRAVE_SEARCH_API_KEY and the scheduler)."
+                )
+                report.alerts.append(msg)
+                logger.warning(msg)
+                _capture_alert(msg, level="warning")
+            elif newest_disc < cutoff:
+                report.stale_discovery = True
+                age_h = (moment - newest_disc).total_seconds() / 3600.0
+                msg = (
+                    f"ingestion health: no discovery run in {age_h:.1f}h "
+                    f"(threshold {threshold_h}h) — newest source_discoveries."
+                    f"discovered_at {newest_disc.isoformat()}. Discovery may be "
+                    "stalled (Brave quota exhausted, key unset, or scheduler down)."
+                )
+                report.alerts.append(msg)
+                logger.warning(msg)
+                _capture_alert(msg, level="warning")
+        except Exception:
+            logger.exception("ingestion health: discovery-staleness check failed")
+
     if not report.alerts:
         logger.info(
-            "ingestion health OK: newest_job_at=%s sources=%d disabled=%d",
+            "ingestion health OK: newest_job_at=%s sources=%d disabled=%d newest_discovery_at=%s",
             report.newest_job_at.isoformat() if report.newest_job_at else "none",
             report.total_sources,
             report.disabled_sources,
+            report.newest_discovery_at.isoformat() if report.newest_discovery_at else "n/a",
         )
     return report
