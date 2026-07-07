@@ -157,15 +157,11 @@ class TestComputePipeline:
                 },
             ]
         }
-        mine = _fetch_status_logs_window(
-            _faithful_supabase(seed), None, None, {"p1"}, _USER
-        )
+        mine = _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, _USER)
         assert [r["posting_id"] for r in mine] == ["p1"]
         assert len(mine) == 1
 
-        everyone = _fetch_status_logs_window(
-            _faithful_supabase(seed), None, None, {"p1"}, None
-        )
+        everyone = _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, None)
         assert len(everyone) == 2
 
     def test_empty_data(self):
@@ -275,9 +271,7 @@ class _FaithfulQuery:
         return resp
 
 
-def _rpc_status_counts(
-    seed: dict[str, list[dict]], params: dict
-) -> list[dict]:
+def _rpc_status_counts(seed: dict[str, list[dict]], params: dict) -> list[dict]:
     """Simulate the `insights_pipeline_status_counts` GROUP BY exactly as the
     Postgres function does: scores JOIN jobs LEFT JOIN user_jobs, scoped to
     p_target_ids + the created_at window, COUNT(DISTINCT job_posting_id)
@@ -454,12 +448,13 @@ class TestPipelineGroupByRpcByteIdentical:
 
         # --- Independent Python recompute of funnel + KPIs ---
         ref_counts = _reference_status_counts(
-            seed, win_since=since, win_until=None,
-            target_ids=targets, user_id=_USER,
+            seed,
+            win_since=since,
+            win_until=None,
+            target_ids=targets,
+            user_id=_USER,
         )
-        ref_funnel = [
-            FunnelStage(stage=s, count=ref_counts.get(s, 0)) for s in FUNNEL_ORDER
-        ]
+        ref_funnel = [FunnelStage(stage=s, count=ref_counts.get(s, 0)) for s in FUNNEL_ORDER]
         # status_log scoping is unchanged code — drive it through the faithful
         # mock against the same window posting-id set the production path uses.
         member = {
@@ -468,14 +463,8 @@ class TestPipelineGroupByRpcByteIdentical:
             if s["target_id"] in targets and not s["excluded"]
         }
         jobs_by_id = {j["id"]: j for j in seed["jobs"]}
-        win_pids = {
-            pid
-            for pid in member
-            if jobs_by_id[pid]["created_at"] >= since.isoformat()
-        }
-        ref_logs = _fetch_status_logs_window(
-            _faithful_supabase(seed), since, None, win_pids, _USER
-        )
+        win_pids = {pid for pid in member if jobs_by_id[pid]["created_at"] >= since.isoformat()}
+        ref_logs = _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
         ref_current = _kpis_from(ref_counts, ref_logs)
 
         # Funnel is byte-identical to the Python recompute.
@@ -485,8 +474,13 @@ class TestPipelineGroupByRpcByteIdentical:
         # window, p8 excluded. → new1 saved1 applied2 interviewing1 offer1.
         funnel_map = {f.stage: f.count for f in result.funnel}
         assert funnel_map == {
-            "new": 1, "saved": 1, "resume_draft": 0, "resume_ready": 0,
-            "applied": 2, "interviewing": 1, "offer": 1,
+            "new": 1,
+            "saved": 1,
+            "resume_draft": 0,
+            "resume_ready": 0,
+            "applied": 2,
+            "interviewing": 1,
+            "offer": 1,
         }
 
         # Top-line KPIs byte-identical to the recompute.
@@ -533,15 +527,20 @@ class TestPipelineGroupByRpcByteIdentical:
         since = _NOW - timedelta(days=30)
 
         rpc_result = compute_pipeline(
-            _faithful_supabase(seed), since,
-            target_ids={"t1", "t2"}, user_id=_USER,
+            _faithful_supabase(seed),
+            since,
+            target_ids={"t1", "t2"},
+            user_id=_USER,
         )
 
         # Same faithful table behaviour, but the RPC raises (not deployed).
         sb = _faithful_supabase(seed)
         sb.rpc.side_effect = Exception("function not found")
         fallback_result = compute_pipeline(
-            sb, since, target_ids={"t1", "t2"}, user_id=_USER,
+            sb,
+            since,
+            target_ids={"t1", "t2"},
+            user_id=_USER,
         )
 
         assert fallback_result.funnel == rpc_result.funnel
@@ -563,9 +562,21 @@ class TestComputeTargets:
             {"id": "t2", "label": "Backend"},
         ]
         postings = [
-            {"id": "1", "target_id": "t1", "score": 80, "status": "applied", "created_at": _ts(_NOW)},
+            {
+                "id": "1",
+                "target_id": "t1",
+                "score": 80,
+                "status": "applied",
+                "created_at": _ts(_NOW),
+            },
             {"id": "2", "target_id": "t1", "score": 60, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "3", "target_id": "t2", "score": 90, "status": "interviewing", "created_at": _ts(_NOW)},
+            {
+                "id": "3",
+                "target_id": "t2",
+                "score": 90,
+                "status": "interviewing",
+                "created_at": _ts(_NOW),
+            },
         ]
         sb = _mock_supabase(
             {"targets": targets, "jobs": postings, "user_jobs": _user_jobs(postings)}
@@ -640,7 +651,13 @@ class TestComputeTargets:
     def test_score_trend(self):
         postings = [
             {"id": "1", "target_id": None, "score": 60, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "2", "target_id": None, "score": 80, "status": "new", "created_at": _ts(_NOW - timedelta(days=8))},
+            {
+                "id": "2",
+                "target_id": None,
+                "score": 80,
+                "status": "new",
+                "created_at": _ts(_NOW - timedelta(days=8)),
+            },
         ]
         sb = _mock_supabase({"jobs": postings})
         result = compute_targets(sb, since=None)
@@ -689,8 +706,7 @@ class TestComputeTargets:
 
         # At least one .eq("excluded", False) on the scores table path.
         assert ("excluded", False) in eq_calls, (
-            f"expected scores query to filter excluded=False, "
-            f"got eq() calls: {eq_calls}"
+            f"expected scores query to filter excluded=False, got eq() calls: {eq_calls}"
         )
 
     def test_per_user_path_pivots_through_scores_table(self):
@@ -724,9 +740,7 @@ class TestComputeTargets:
                 "user_jobs": _user_jobs(postings),
             }
         )
-        result = compute_targets(
-            sb, since=None, target_ids={"t1", "t2"}, user_id=_USER
-        )
+        result = compute_targets(sb, since=None, target_ids={"t1", "t2"}, user_id=_USER)
 
         assert len(result.targets) == 2
         fe = next(t for t in result.targets if t.target_label == "Frontend")
@@ -839,17 +853,15 @@ def _rpc_targets_groupby(seed: dict[str, list[dict]], params: dict) -> dict:
     # unscored postings (target_labels-filtered): saw no nonzero score.
     seen_nonzero: dict[str, bool] = {}
     for r in base:
-        seen_nonzero[r["posting_id"]] = seen_nonzero.get(
-            r["posting_id"], False
-        ) or (r["score"] != 0)
+        seen_nonzero[r["posting_id"]] = seen_nonzero.get(r["posting_id"], False) or (
+            r["score"] != 0
+        )
     unscored = sum(1 for v in seen_nonzero.values() if not v)
 
     # trend: per posting best RAW-membership score; group by ISO week.
     best_by_posting: dict[str, dict] = {}
     for m in member:
-        b = best_by_posting.setdefault(
-            m["posting_id"], {"best": 0, "created_at": m["created_at"]}
-        )
+        b = best_by_posting.setdefault(m["posting_id"], {"best": 0, "created_at": m["created_at"]})
         b["best"] = max(b["best"], m["score"])
     week_sum: dict[str, int] = {}
     week_n: dict[str, int] = {}
@@ -865,12 +877,9 @@ def _rpc_targets_groupby(seed: dict[str, list[dict]], params: dict) -> dict:
 
     return {
         "targets": list(pt.values()),
-        "distribution": [
-            {"bucket_idx": k, "count": v} for k, v in dist.items()
-        ],
+        "distribution": [{"bucket_idx": k, "count": v} for k, v in dist.items()],
         "trend": [
-            {"week_start": w, "score_sum": week_sum[w], "score_n": week_n[w]}
-            for w in week_sum
+            {"week_start": w, "score_sum": week_sum[w], "score_n": week_n[w]} for w in week_sum
         ],
         "unscored": unscored,
     }
@@ -912,9 +921,7 @@ def _reference_target_insights(
     )
 
     label_by_target = {
-        t["id"]: t["label"]
-        for t in seed.get("targets", [])
-        if t["id"] in target_ids
+        t["id"]: t["label"] for t in seed.get("targets", []) if t["id"] in target_ids
     }
     since_iso = since.isoformat() if since else None
 
@@ -925,9 +932,7 @@ def _reference_target_insights(
         if s["target_id"] not in target_ids or s.get("excluded"):
             continue
         membership.setdefault(s["job_posting_id"], set()).add(s["target_id"])
-        score_lookup[(s["job_posting_id"], s["target_id"])] = int(
-            s.get("score") or 0
-        )
+        score_lookup[(s["job_posting_id"], s["target_id"])] = int(s.get("score") or 0)
     posting_ids = set(membership.keys())
 
     # postings in window.
@@ -938,9 +943,7 @@ def _reference_target_insights(
         if job is None:
             continue
         created = job.get("created_at")
-        if since_iso is not None and not (
-            created is not None and created >= since_iso
-        ):
+        if since_iso is not None and not (created is not None and created >= since_iso):
             continue
         postings.append(job)
 
@@ -989,9 +992,7 @@ def _reference_target_insights(
                 avg_score=round(sum(scores) / len(scores), 1),
                 applied_count=applied,
                 interview_count=interviews,
-                conversion_rate=round(interviews / applied, 3)
-                if applied > 0
-                else None,
+                conversion_rate=round(interviews / applied, 3) if applied > 0 else None,
             )
         )
 
@@ -1048,14 +1049,14 @@ class TestTargetsGroupByRpcByteIdentical:
         last_week = _ts(_NOW - timedelta(days=8))
         old = _ts(_NOW - timedelta(days=120))
         jobs = [
-            {"id": "p1", "created_at": recent},   # t1 score 15
-            {"id": "p2", "created_at": recent},   # t1 score 85, applied
-            {"id": "p3", "created_at": recent},   # t2 score 90, interviewing
-            {"id": "p4", "created_at": recent},   # t1=40 t2=80 (best 80), offer
-            {"id": "p5", "created_at": recent},   # t1 score 0 → unscored
+            {"id": "p1", "created_at": recent},  # t1 score 15
+            {"id": "p2", "created_at": recent},  # t1 score 85, applied
+            {"id": "p3", "created_at": recent},  # t2 score 90, interviewing
+            {"id": "p4", "created_at": recent},  # t1=40 t2=80 (best 80), offer
+            {"id": "p5", "created_at": recent},  # t1 score 0 → unscored
             {"id": "p6", "created_at": last_week},  # t2 score 60, new
-            {"id": "p7", "created_at": old},      # out of window → dropped
-            {"id": "p8", "created_at": recent},   # only excluded score → drop
+            {"id": "p7", "created_at": old},  # out of window → dropped
+            {"id": "p8", "created_at": recent},  # only excluded score → drop
         ]
         scores = [
             {"job_posting_id": "p1", "target_id": "t1", "score": 15, "excluded": False},
@@ -1098,9 +1099,7 @@ class TestTargetsGroupByRpcByteIdentical:
             target_ids=targets,
             user_id=_USER,
         )
-        ref = _reference_target_insights(
-            seed, since=since, target_ids=targets, user_id=_USER
-        )
+        ref = _reference_target_insights(seed, since=since, target_ids=targets, user_id=_USER)
 
         # Byte-identical to the independent Python recompute, field for field.
         assert result == ref
@@ -1190,9 +1189,8 @@ class TestTargetsGroupByRpcByteIdentical:
         assert round(0.25, 1) == 0.2  # the Python semantics we rely on
         # Confirm the divergence is real: half-away-from-zero would be 0.3.
         from decimal import ROUND_HALF_UP, Decimal
-        assert Decimal("0.25").quantize(
-            Decimal("0.1"), rounding=ROUND_HALF_UP
-        ) == Decimal("0.3")
+
+        assert Decimal("0.25").quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) == Decimal("0.3")
 
     def test_rpc_equals_python_fallback(self):
         """RPC-backed output == client-side fallback output (mid-deploy safety:
@@ -1212,9 +1210,7 @@ class TestTargetsGroupByRpcByteIdentical:
         # Same faithful table behaviour, but the RPC raises (not deployed).
         sb = _faithful_targets_supabase(seed)
         sb.rpc.side_effect = Exception("function not found")
-        fallback_result = compute_targets(
-            sb, since, target_ids=targets, user_id=_USER
-        )
+        fallback_result = compute_targets(sb, since, target_ids=targets, user_id=_USER)
 
         assert fallback_result == rpc_result
 
@@ -1224,9 +1220,7 @@ class TestTargetsGroupByRpcByteIdentical:
         (only the membership probe via the `scores` table remains)."""
         seed = self._seed()
         sb = _faithful_targets_supabase(seed)
-        compute_targets(
-            sb, _NOW - timedelta(days=30), target_ids={"t1", "t2"}, user_id=_USER
-        )
+        compute_targets(sb, _NOW - timedelta(days=30), target_ids={"t1", "t2"}, user_id=_USER)
         called = [c.args[0] for c in sb.rpc.call_args_list]
         assert "insights_targets_groupby" in called
         # The RPC path must NOT re-read jobs/user_jobs (only `targets` for
@@ -1364,10 +1358,12 @@ class TestComputeSkillsCost:
         cost_logs = [
             {"purpose": "tailor", "cost_usd": "0.0080", "created_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase({
-            "documents": resume_costs,
-            "llm_costs": cost_logs,
-        })
+        sb = _mock_supabase(
+            {
+                "documents": resume_costs,
+                "llm_costs": cost_logs,
+            }
+        )
         result = compute_skills_cost(sb, since=None)
 
         assert result.total_cost == 0.008
@@ -1527,12 +1523,8 @@ class TestComputeChunksLargeIdLists:
     def test_compute_pipeline_chunks_posting_id_filters(self):
         # 250 postings → 2 batches (200 + 50) for every posting-id .in_().
         n = 250
-        scores = [
-            {"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)
-        ]
-        postings = [
-            {"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)
-        ]
+        scores = [{"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)]
+        postings = [{"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
             {"scores": scores, "jobs": postings, "user_jobs": [], "documents": []},
@@ -1547,18 +1539,13 @@ class TestComputeChunksLargeIdLists:
         # so each of those resolves a 250-id list → [200, 50].
         for table in ("jobs", "status_log", "documents"):
             sizes = [len(b) for b in in_batches.get(table, [])]
-            assert sizes and all(s <= 200 for s in sizes), (
-                f"{table} not chunked at 200: {sizes}"
-            )
+            assert sizes and all(s <= 200 for s in sizes), f"{table} not chunked at 200: {sizes}"
             assert sizes[0] == 200
 
     def test_compute_targets_chunks_posting_id_filters(self):
         n = 250
         targets = [{"id": "t1", "label": "Frontend"}]
-        scores = [
-            {"job_posting_id": f"p{i}", "target_id": "t1", "score": 50}
-            for i in range(n)
-        ]
+        scores = [{"job_posting_id": f"p{i}", "target_id": "t1", "score": 50} for i in range(n)]
         postings = [{"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
@@ -1577,41 +1564,48 @@ class TestComputeChunksLargeIdLists:
         for table in ("jobs", "scores"):
             sizes = [len(b) for b in in_batches.get(table, [])]
             big = [s for s in sizes if s > 1]  # ignore the small target_id in_()
-            assert big and all(s <= 200 for s in big), (
-                f"{table} not chunked at 200: {sizes}"
-            )
+            assert big and all(s <= 200 for s in big), f"{table} not chunked at 200: {sizes}"
 
-    def test_compute_skills_cost_chunks_posting_id_filters(self):
-        n = 250
-        scores = [
-            {"job_posting_id": f"p{i}", "target_id": "t1"} for i in range(n)
+    def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
+        """#60-perf: skills-cost no longer resolves posting membership via
+        ``scores`` (tens of thousands of rows) + fetches every target posting.
+        It scopes analyses by ``target_id`` directly and fetches ``jobs.llm_score``
+        for ONLY the handful of analysis-bearing postings."""
+        analyses = [
+            {
+                "job_posting_id": "p1",
+                "target_id": "t1",
+                "created_at": _ts(_NOW),
+                "scorecard": {
+                    "skills_matched": [{"name": "React", "matched": True}],
+                    "skills_missing": ["Rust"],
+                },
+            },
+            {
+                "job_posting_id": "p2",
+                "target_id": "t1",
+                "created_at": _ts(_NOW),
+                "scorecard": {"skills_missing": ["Go"]},
+            },
         ]
-        postings = [
-            {"id": f"p{i}", "llm_score": 50.0, "created_at": _ts(_NOW)}
-            for i in range(n)
-        ]
+        postings = [{"id": "p1", "llm_score": 80.0}, {"id": "p2", "llm_score": 60.0}]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
-            {
-                "scores": scores,
-                "jobs": postings,
-                "analyses": [],
-                "llm_costs": [],
-                "documents": [],
-            },
+            {"analyses": analyses, "jobs": postings, "documents": [], "llm_costs": []},
             in_batches,
         )
 
-        compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+        result = compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
-        # jobs (id), analyses (job_posting_id), documents (job_posting_id)
-        # all chunked at 200.
-        for table in ("jobs", "analyses", "documents"):
-            sizes = [len(b) for b in in_batches.get(table, [])]
-            assert sizes and all(s <= 200 for s in sizes), (
-                f"{table} not chunked at 200: {sizes}"
-            )
-            assert sizes[0] == 200
+        # No membership pull: skills-cost must not touch the ``scores`` table.
+        assert "scores" not in in_batches
+        # ``jobs`` fetched for ONLY the two analysis-bearing postings, not a
+        # target-wide membership set.
+        job_ids = sorted(i for batch in in_batches.get("jobs", []) for i in batch)
+        assert job_ids == ["p1", "p2"]
+        # Skills flow through from the scorecards.
+        skills = {s.skill for s in result.top_skills}
+        assert {"React", "Rust", "Go"} <= skills
 
 
 # ===========================================================================
