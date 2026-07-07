@@ -524,6 +524,8 @@ async def test_prescan_gate_drops_below_threshold_keeps_admit_and_failopen(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 100)
     monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    # Explicit per-target opt-in (#90): the gate no longer acts on an empty scope.
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
     monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
 
     async def fake_admits(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
@@ -658,26 +660,33 @@ async def test_prescan_gate_skipped_when_target_not_in_scope(
 
 
 @pytest.mark.asyncio
-async def test_prescan_gate_empty_scope_applies_to_all(
+async def test_prescan_gate_empty_scope_is_a_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Empty allowlist = all targets — the backward-compatible global posture."""
+    """Empty allowlist = NO targets (a safe no-op), NOT all (#90). Cosine gating
+    is only safe per-target, so the gate needs explicit opt-in — an empty scope
+    never drops anything, even with the gate globally enabled. (Guards the
+    landmine: an accidentally-empty scope silently gating unvalidated targets.)"""
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 100)
     monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
     monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
     monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "")
 
-    async def fake_admits(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
-        return {"j-drop": False}
+    called: list[int] = []
 
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", fake_admits)
+    async def spy(*_a: Any, **_k: Any) -> dict[str, Any]:
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", spy)
 
     await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j-drop"])),
+        _supabase(_prom_rows(["j1"])),
         MagicMock(),
         target=_target(1),
         payload=_payload(),
-        jobs=_prom_jobs(["j-drop"]),
+        jobs=_prom_jobs(["j1"]),
     )
-    assert graded == []  # empty scope still applies the gate → dropped
+    assert graded == ["j1"]  # empty scope → ungated, graded normally
+    assert called == []  # gate never consulted
