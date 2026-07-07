@@ -18,9 +18,9 @@ JobTarget/OptimizedPayload models). The grader run is on-demand:
     railway run uv run --package wyrdfold-api \
         python apps/wyrdfold-api/scripts/eval_grading_correctness.py
 
-NB: the bands are hand-set and NOT yet ratified against the live grader — run
-this and adjust before treating any threshold as a gate. Cost ≈ one grade per
-case. READ-ONLY (no DB writes).
+Bands ratified 2026-07-07 against the live grader (Sonnet-4.6): band_accuracy
+100% (6/6) — highs scored 72/92/95, lows 2/4/4 (a clean ~68-pt gap). Cost ≈ one
+grade per case. READ-ONLY (no DB writes).
 """
 
 from __future__ import annotations

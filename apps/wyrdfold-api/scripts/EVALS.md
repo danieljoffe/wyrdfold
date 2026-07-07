@@ -141,8 +141,8 @@ railway run uv run --package wyrdfold-api \
   python apps/wyrdfold-api/scripts/eval_grading_correctness.py
 ```
 
-**⚠ The bands are hand-set and NOT yet ratified against the live grader** — run
-it once and adjust the fixture before treating any threshold as a gate.
+Bands **ratified 2026-07-07** against the live grader (Sonnet-4.6): 100% band
+accuracy (6/6) — highs scored 72/92/95, lows 2/4/4 (a clean ~68-pt gap).
 
 ### Handling secrets
 
