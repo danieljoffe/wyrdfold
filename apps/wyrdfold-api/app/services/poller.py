@@ -24,6 +24,8 @@ from app.services.analysis.persistence import (
 from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
+from app.services.db_write import DB_WRITE_CONCURRENCY
+from app.services.db_write import db_to_thread as _db_to_thread
 from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import upsert_job_embedding
 from app.services.embeddings.prescan_gate import cosine_gate_decision
@@ -106,16 +108,9 @@ FETCHERS: dict[str, Fetcher] = {
 POLL_CONCURRENCY = 6
 LLM_CONCURRENCY = 3
 
-# Hard ceiling on concurrent supabase write threads across the WHOLE poll
-# cycle. The Stage-1/Stage-2 scoring loops ``asyncio.gather`` one
-# ``to_thread`` per (row x target), unbounded — across POLL_CONCURRENCY
-# sources that is a burst of hundreds of simultaneous writes against a
-# single shared service-role client, which is what drops the Supabase
-# pooler connection (``Broken pipe`` / ``Server disconnected``). Every
-# poll DB call routes through ``_db_to_thread`` so this global semaphore
-# caps the burst regardless of how the fan-out is shaped. HTTP/1.1 (see
-# supabase_pool) makes each write safe; this keeps the herd bounded.
-DB_WRITE_CONCURRENCY = 12
+# DB_WRITE_CONCURRENCY, the per-loop write semaphore, and _db_to_thread now
+# live in ``app.services.db_write`` (imported above) so the service modules
+# that issue poll writes can share the seam without importing the poller.
 
 # Minimum keyword score to trigger LLM analysis during polling.
 # Below this threshold, only keyword scoring is used.
@@ -136,32 +131,6 @@ QUALIFICATION_BUDGET_RECHECK_EVERY = 50
 # and the #60 qualification tagger's L1 share ONE implementation (single source
 # of truth). ``_is_us_location`` is re-exported below for back-compat with
 # callers/tests that import it from this module.
-
-
-# Per-event-loop global cap on concurrent supabase write threads. Created
-# lazily and keyed by the running loop so a fresh loop (e.g. each test, or
-# a re-created loop in a worker) gets its own semaphore rather than one
-# bound to a dead loop. Bounds the cycle-wide write burst (see
-# DB_WRITE_CONCURRENCY).
-_db_write_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
-
-
-def _db_write_semaphore() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    sem = _db_write_sems.get(loop)
-    if sem is None:
-        sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
-        _db_write_sems[loop] = sem
-    return sem
-
-
-async def _db_to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Run a blocking supabase call in a thread, under the global DB-write
-    semaphore so the poll's scoring/upsert fan-out can't thundering-herd
-    the Supabase pooler. Preserves the #107 ``to_thread`` convention (the
-    blocking call never touches the event loop)."""
-    async with _db_write_semaphore():
-        return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def _title_matches_any_target(title: str, targets: list[JobTarget]) -> bool:
@@ -752,7 +721,11 @@ async def _qualify_jobs(
         # refuse to spend when we can't see the budget, matching the cycle
         # gate's posture.
         try:
-            exhausted = await asyncio.to_thread(_global_budget_exhausted, supabase)
+            exhausted = await asyncio.to_thread(
+                _global_budget_exhausted,
+                supabase,
+                reserve_usd=settings.grading_budget_reserve_usd,
+            )
         except Exception:
             logger.exception(
                 "Qualification tagger: global-budget read failed — "
@@ -762,10 +735,12 @@ async def _qualify_jobs(
             return
         if exhausted:
             logger.warning(
-                "Qualification tagger: global daily LLM cap reached "
-                "($%.2f) — deferring %d remaining job(s); they re-tag next "
-                "cycle (rows stay NULL)",
+                "Qualification tagger: tagger LLM budget reached "
+                "($%.2f cap − $%.2f grading reserve) — deferring %d remaining "
+                "job(s); they re-tag next cycle (rows stay NULL). The reserve "
+                "stays available for Phase-1/Phase-2 grading.",
                 settings.global_llm_daily_budget_usd,
+                settings.grading_budget_reserve_usd,
                 len(rows) - start,
             )
             return
@@ -1756,9 +1731,18 @@ async def recover_stale_sources(supabase: Client, *, now: datetime | None = None
 _GLOBAL_APPROACHING_DAY: str | None = None
 
 
-def _global_budget_exhausted(supabase: Client) -> bool:
+def _global_budget_exhausted(supabase: Client, *, reserve_usd: float = 0.0) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``. 0 disables (never True).
+
+    ``reserve_usd`` fences off the top slice of the cap for higher-priority
+    spenders: a caller that passes a reserve (the background qualification
+    tagger) is "exhausted" once spend reaches ``cap - reserve_usd``, leaving
+    that reserve in the daily meter for grading (Phase-1 triage + Phase-2 fit),
+    which read the full cap. This is why the heavy background tagger can no
+    longer drain the budget that live grading needs — the recurring starvation
+    that left new jobs stuck at ``stage2`` (#60). It stays one meter / one cap;
+    the reserve is just a lower effective ceiling for the low-priority spender.
 
     The lean predicate behind both the once-per-cycle circuit breaker
     (:func:`_global_circuit_breaker_tripped`) and the mid-run re-checks
@@ -1771,8 +1755,13 @@ def _global_budget_exhausted(supabase: Client) -> bool:
     cap = settings.global_llm_daily_budget_usd
     if cap <= 0:
         return False
+    effective_cap = cap - reserve_usd
+    if effective_cap <= 0:
+        # The grading reserve consumes the whole cap → this low-priority
+        # spender yields entirely, leaving the budget for grading.
+        return True
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    return total_llm_spend_all(supabase, since=midnight) >= cap
+    return total_llm_spend_all(supabase, since=midnight) >= effective_cap
 
 
 async def _triage_budget_blocks(supabase: Client) -> bool:

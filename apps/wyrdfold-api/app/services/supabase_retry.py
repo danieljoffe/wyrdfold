@@ -20,7 +20,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 import httpx
@@ -66,9 +66,7 @@ def execute_with_retry_sync(
         except _TRANSIENT_HTTP as exc:
             last_exc = exc
             if attempt == retries:
-                logger.warning(
-                    "supabase %s exhausted %d retries: %s", label, retries, exc
-                )
+                logger.warning("supabase %s exhausted %d retries: %s", label, retries, exc)
                 raise
             delay = _backoff_delay(attempt, backoff_base, backoff_cap)
             # Down-ranked to debug (was warning): under a concurrent poll
@@ -89,22 +87,41 @@ def execute_with_retry_sync(
 
 
 async def execute_with_retry(
-    fn: Callable[[], T],
+    fn: Callable[[], Awaitable[T]],
     *,
     label: str,
     retries: int = 2,
     backoff_base: float = 0.4,
     backoff_cap: float = 4.0,
 ) -> T:
-    """Async retry wrapper — runs the sync supabase-py call in a thread
-    so the event loop isn't blocked during the backoff. Use this from
-    async code that doesn't already own an ``asyncio.to_thread`` frame.
+    """Await an async supabase-py call, retrying transient transport blips
+    natively on the event loop (no executor thread). ``fn`` is the bound
+    ``.execute`` of a built ``AsyncClient`` query — awaiting it does the I/O
+    on the loop, which is the point for the #57 poll-write path (see
+    ``app.services.db_write.poll_db_write``). The backoff is non-blocking
+    (``asyncio.sleep``).
+
+    To retry a *sync* call from async code, wrap ``execute_with_retry_sync``
+    in ``db_to_thread`` instead — that path keeps the blocking call in a
+    thread. Same transient/permanent split as the sync variant.
     """
-    return await asyncio.to_thread(
-        execute_with_retry_sync,
-        fn,
-        label=label,
-        retries=retries,
-        backoff_base=backoff_base,
-        backoff_cap=backoff_cap,
-    )
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await fn()
+        except _TRANSIENT_HTTP as exc:
+            last_exc = exc
+            if attempt == retries:
+                logger.warning("supabase %s exhausted %d retries: %s", label, retries, exc)
+                raise
+            delay = _backoff_delay(attempt, backoff_base, backoff_cap)
+            logger.debug(
+                "supabase %s: %s (attempt %d/%d), retrying in %.2fs",
+                label,
+                exc,
+                attempt + 1,
+                retries + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc or RuntimeError("unreachable")

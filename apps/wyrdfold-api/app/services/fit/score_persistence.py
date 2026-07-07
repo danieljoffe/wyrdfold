@@ -19,7 +19,6 @@ the UI, retro-backfill scripts).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -29,11 +28,35 @@ from supabase import Client
 from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
+from app.services.db_write import poll_db_write
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import record as record_llm_cost
 
 logger = logging.getLogger(__name__)
+
+
+async def _apply_scores_update(
+    supabase: Client,
+    *,
+    job_posting_id: str,
+    target_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Persist a ``scores`` UPDATE for one (job, target) via the poll-write
+    seam (#57): async on the event loop when ``POLLER_ASYNC_DB`` is on, else
+    the sync client in a thread — with transient-blip retry and cycle-wide
+    herd bounding either way. See ``app.services.db_write.poll_db_write``."""
+    await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("scores")
+            .update(payload)
+            .eq("job_posting_id", job_posting_id)
+            .eq("target_id", target_id)
+        ),
+        label="phase2 scores update",
+    )
 
 
 async def score_with_phase2_and_persist(
@@ -71,19 +94,16 @@ async def score_with_phase2_and_persist(
     # `stage2` and re-admits it for a real grade. (#47)
     if not jd_text.strip():
         try:
-            await asyncio.to_thread(
-                lambda: supabase.table("scores")
-                .update(
-                    {
-                        "excluded": True,
-                        "scoring_status": "complete",
-                        "scored_profile_version": target.profile_version,
-                        "updated_at": datetime.now(UTC).isoformat(),
-                    }
-                )
-                .eq("job_posting_id", job_posting_id)
-                .eq("target_id", target.id)
-                .execute()
+            await _apply_scores_update(
+                supabase,
+                job_posting_id=job_posting_id,
+                target_id=target.id,
+                payload={
+                    "excluded": True,
+                    "scoring_status": "complete",
+                    "scored_profile_version": target.profile_version,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
             )
         except Exception:
             logger.exception(
@@ -156,14 +176,14 @@ async def score_with_phase2_and_persist(
         # rather than blowing away historical logistics data.
         if fit.logistics is not None:
             update_payload["logistics_filters"] = fit.logistics.model_dump()
-        # Offload the blocking supabase round-trip so the persist step
-        # doesn't stall the event loop the Phase-2 fan-out runs on (#107).
-        await asyncio.to_thread(
-            lambda: supabase.table("scores")
-            .update(update_payload)
-            .eq("job_posting_id", job_posting_id)
-            .eq("target_id", target.id)
-            .execute()
+        # Persist via the async client (#57) or the sync thread (#107) —
+        # see ``_apply_scores_update``. Either way the write never stalls the
+        # event loop the Phase-2 fan-out runs on.
+        await _apply_scores_update(
+            supabase,
+            job_posting_id=job_posting_id,
+            target_id=target.id,
+            payload=update_payload,
         )
     except Exception:
         logger.exception(
