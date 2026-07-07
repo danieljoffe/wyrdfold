@@ -87,9 +87,7 @@ def test_needs_phase2_regrades_stale_complete() -> None:
 
 
 def test_progressive_batches_small_set_single_batch() -> None:
-    assert _progressive_batches(["a", "b"], PHASE2_FIRST_BATCH, PHASE2_BATCH_SIZE) == [
-        ["a", "b"]
-    ]
+    assert _progressive_batches(["a", "b"], PHASE2_FIRST_BATCH, PHASE2_BATCH_SIZE) == [["a", "b"]]
 
 
 def test_progressive_batches_first_small_then_large() -> None:
@@ -134,9 +132,7 @@ def _supabase(state_rows: list[dict[str, Any]]) -> MagicMock:
 def _patch_grader(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     graded: list[str] = []
 
-    async def fake_score(
-        _sb: Any, _llm: Any, *, job_posting_id: str, **_kw: Any
-    ) -> JobFitResult:
+    async def fake_score(_sb: Any, _llm: Any, *, job_posting_id: str, **_kw: Any) -> JobFitResult:
         graded.append(job_posting_id)
         return _fit()
 
@@ -145,9 +141,7 @@ def _patch_grader(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _patch_quota(monkeypatch: pytest.MonkeyPatch, quota: int) -> None:
-    monkeypatch.setattr(
-        f"{_RUNNER}.phase2_quota_remaining", lambda *_a, **_kw: quota
-    )
+    monkeypatch.setattr(f"{_RUNNER}.phase2_quota_remaining", lambda *_a, **_kw: quota)
 
 
 @pytest.mark.asyncio
@@ -157,12 +151,24 @@ async def test_grades_only_promising_pending(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 100)
     rows = [
-        {"job_posting_id": "j-yes", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1},
-        {"job_posting_id": "j-no-prom", "promising": False, "scoring_status": "stage2",
-         "scored_profile_version": 1},
-        {"job_posting_id": "j-done", "promising": True, "scoring_status": "complete",
-         "scored_profile_version": 1},
+        {
+            "job_posting_id": "j-yes",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        },
+        {
+            "job_posting_id": "j-no-prom",
+            "promising": False,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        },
+        {
+            "job_posting_id": "j-done",
+            "promising": True,
+            "scoring_status": "complete",
+            "scored_profile_version": 1,
+        },
         # No scores row at all for j-missing (Phase 1 dropped it).
     ]
     jobs = [
@@ -187,16 +193,40 @@ async def test_daily_cap_trims_to_quota_newest_first(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 2)  # only two grades left today
     rows = [
-        {"job_posting_id": f"j{i}", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1}
+        {
+            "job_posting_id": f"j{i}",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        }
         for i in range(4)
     ]
     # j3 newest, j0 oldest — cap should pick the two freshest.
     jobs = [
-        {"id": "j0", "title": "a", "description_html": "", "first_seen_at": "2026-01-01T00:00:00+00:00"},
-        {"id": "j1", "title": "b", "description_html": "", "first_seen_at": "2026-02-01T00:00:00+00:00"},
-        {"id": "j2", "title": "c", "description_html": "", "first_seen_at": "2026-03-01T00:00:00+00:00"},
-        {"id": "j3", "title": "d", "description_html": "", "first_seen_at": "2026-04-01T00:00:00+00:00"},
+        {
+            "id": "j0",
+            "title": "a",
+            "description_html": "",
+            "first_seen_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "id": "j1",
+            "title": "b",
+            "description_html": "",
+            "first_seen_at": "2026-02-01T00:00:00+00:00",
+        },
+        {
+            "id": "j2",
+            "title": "c",
+            "description_html": "",
+            "first_seen_at": "2026-03-01T00:00:00+00:00",
+        },
+        {
+            "id": "j3",
+            "title": "d",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        },
     ]
 
     n = await run_phase2_for_jobs(
@@ -214,8 +244,12 @@ async def test_zero_quota_grades_nothing(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 0)
     rows = [
-        {"job_posting_id": "j0", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1}
+        {
+            "job_posting_id": "j0",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        }
     ]
     jobs = [{"id": "j0", "title": "a", "description_html": ""}]
 
@@ -256,18 +290,42 @@ async def test_orders_candidates_by_confidence_desc(
     _patch_quota(monkeypatch, 2)  # only two grades allowed
     # 4 promising candidates at the same first_seen_at; confidences differ.
     rows = [
-        {"job_posting_id": "j-low-1", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 30},
-        {"job_posting_id": "j-high", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 95},
-        {"job_posting_id": "j-mid", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 70},
-        {"job_posting_id": "j-low-2", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 40},
+        {
+            "job_posting_id": "j-low-1",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 30,
+        },
+        {
+            "job_posting_id": "j-high",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 95,
+        },
+        {
+            "job_posting_id": "j-mid",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 70,
+        },
+        {
+            "job_posting_id": "j-low-2",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 40,
+        },
     ]
     jobs = [
-        {"id": jid, "title": "x", "description_html": "",
-         "first_seen_at": "2026-04-01T00:00:00+00:00"}
+        {
+            "id": jid,
+            "title": "x",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        }
         for jid in ("j-low-1", "j-high", "j-mid", "j-low-2")
     ]
     n = await run_phase2_for_jobs(
@@ -287,16 +345,34 @@ async def test_null_confidence_sorts_below_any_real_value(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 1)
     rows = [
-        {"job_posting_id": "j-legacy", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": None},
-        {"job_posting_id": "j-confident", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 50},
+        {
+            "job_posting_id": "j-legacy",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": None,
+        },
+        {
+            "job_posting_id": "j-confident",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 50,
+        },
     ]
     jobs = [
-        {"id": "j-legacy", "title": "a", "description_html": "",
-         "first_seen_at": "2026-04-02T00:00:00+00:00"},  # NEWER
-        {"id": "j-confident", "title": "b", "description_html": "",
-         "first_seen_at": "2026-04-01T00:00:00+00:00"},  # OLDER but has confidence
+        {
+            "id": "j-legacy",
+            "title": "a",
+            "description_html": "",
+            "first_seen_at": "2026-04-02T00:00:00+00:00",
+        },  # NEWER
+        {
+            "id": "j-confident",
+            "title": "b",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        },  # OLDER but has confidence
     ]
     n = await run_phase2_for_jobs(
         _supabase(rows), MagicMock(), target=_target(1), payload=_payload(), jobs=jobs
@@ -314,16 +390,34 @@ async def test_confidence_ties_break_by_first_seen_at_desc(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 1)
     rows = [
-        {"job_posting_id": "j-old", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 80},
-        {"job_posting_id": "j-new", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 80},
+        {
+            "job_posting_id": "j-old",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 80,
+        },
+        {
+            "job_posting_id": "j-new",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 80,
+        },
     ]
     jobs = [
-        {"id": "j-old", "title": "a", "description_html": "",
-         "first_seen_at": "2026-01-01T00:00:00+00:00"},
-        {"id": "j-new", "title": "b", "description_html": "",
-         "first_seen_at": "2026-04-01T00:00:00+00:00"},
+        {
+            "id": "j-old",
+            "title": "a",
+            "description_html": "",
+            "first_seen_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "id": "j-new",
+            "title": "b",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        },
     ]
     n = await run_phase2_for_jobs(
         _supabase(rows), MagicMock(), target=_target(1), payload=_payload(), jobs=jobs
@@ -343,8 +437,13 @@ def _director_target() -> JobTarget:
 
 def _gate_rows(ids: list[str]) -> list[dict[str, Any]]:
     return [
-        {"job_posting_id": jid, "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 90}
+        {
+            "job_posting_id": jid,
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 90,
+        }
         for jid in ids
     ]
 
@@ -365,8 +464,11 @@ async def test_seniority_gate_skips_below_level_when_enabled(
         {"id": "j-eng", "title": "Senior Sales Engineer", "description_html": ""},
     ]
     n = await run_phase2_for_jobs(
-        _supabase(rows), MagicMock(), target=_director_target(),
-        payload=_payload(), jobs=jobs,
+        _supabase(rows),
+        MagicMock(),
+        target=_director_target(),
+        payload=_payload(),
+        jobs=jobs,
     )
     # Director + (tolerance=1) Manager grade; Coordinator + senior-IC dropped.
     assert n == 2
@@ -386,8 +488,11 @@ async def test_seniority_gate_noop_when_disabled(
         {"id": "j-coord", "title": "CX Coordinator", "description_html": ""},
     ]
     n = await run_phase2_for_jobs(
-        _supabase(rows), MagicMock(), target=_director_target(),
-        payload=_payload(), jobs=jobs,
+        _supabase(rows),
+        MagicMock(),
+        target=_director_target(),
+        payload=_payload(),
+        jobs=jobs,
     )
     assert n == 2
     assert set(graded) == {"j-dir", "j-coord"}
@@ -398,8 +503,12 @@ async def test_seniority_gate_noop_when_disabled(
 
 def _prom_rows(ids: list[str]) -> list[dict[str, Any]]:
     return [
-        {"job_posting_id": j, "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1}
+        {
+            "job_posting_id": j,
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        }
         for j in ids
     ]
 
@@ -424,8 +533,11 @@ async def test_prescan_gate_drops_below_threshold_keeps_admit_and_failopen(
 
     ids = ["j-admit", "j-drop", "j-noop"]
     n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(ids)), MagicMock(),
-        target=_target(1), payload=_payload(), jobs=_prom_jobs(ids),
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(ids),
     )
     # True admitted, None fail-open admitted, False dropped.
     assert set(graded) == {"j-admit", "j-noop"}
@@ -448,8 +560,11 @@ async def test_prescan_gate_holdout_keeps_a_dropped_job_for_measurement(
     monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", all_below)
 
     n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])), MagicMock(),
-        target=_target(1), payload=_payload(), jobs=_prom_jobs(["j1"]),
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(["j1"]),
     )
     # holdout=1.0 → the would-drop job is graded anyway (to measure FN rate).
     assert graded == ["j1"]
@@ -473,8 +588,96 @@ async def test_prescan_gate_off_is_not_consulted(
     monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", spy)
 
     await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])), MagicMock(),
-        target=_target(1), payload=_payload(), jobs=_prom_jobs(["j1"]),
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(["j1"]),
     )
     assert graded == ["j1"]  # ungated
     assert called == []  # gate never consulted when the flag is off
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_acts_when_target_in_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#90 staged rollout: with the target in the allowlist the gate acts —
+    drops below-threshold, same as the global posture."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
+
+    async def fake_admits(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
+        return {"j-admit": True, "j-drop": False}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", fake_admits)
+
+    ids = ["j-admit", "j-drop"]
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(ids),
+    )
+    assert set(graded) == {"j-admit"}
+    assert "j-drop" not in graded
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_skipped_when_target_not_in_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollout guard: gate ENABLED but this target isn't in the allowlist →
+    the gate is never consulted and nothing is dropped (keyword admission)."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "some-other-target")
+
+    called: list[int] = []
+
+    async def spy(*_a: Any, **_k: Any) -> dict[str, Any]:
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", spy)
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(["j1"]),
+    )
+    assert graded == ["j1"]  # out-of-scope target → ungated
+    assert called == []  # gate never consulted
+
+
+@pytest.mark.asyncio
+async def test_prescan_gate_empty_scope_applies_to_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty allowlist = all targets — the backward-compatible global posture."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
+    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "")
+
+    async def fake_admits(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, Any]:
+        return {"j-drop": False}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_admits_batch", fake_admits)
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-drop"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=_prom_jobs(["j-drop"]),
+    )
+    assert graded == []  # empty scope still applies the gate → dropped

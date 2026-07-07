@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     # unpopulated spine never silently drops jobs. Default off; flip per target
     # once its threshold is calibrated (#89).
     prescan_gate_enabled: bool = False
+    # Per-target SCOPE for the gate above — a staged rollout (#90). Comma-separated
+    # target UUIDs the gate applies to. EMPTY = all targets (the global posture);
+    # non-empty = an ALLOWLIST, so the gate acts only on the listed targets while
+    # every other target keeps permissive keyword admission. This lets a
+    # zero-recall-loss target flip first (CX, whose shadow would-drops scored
+    # 0/8229 >= the floor) while a lossier one waits for more data (frontend,
+    # 2.8%). No effect when ``prescan_gate_enabled`` is off. Parsed by
+    # ``prescan_gate_target_ids_set``.
+    prescan_gate_target_ids: str = ""
     # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
     # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
     # false-negative rate (dropped-but-actually-high-fit) is measurable against
@@ -534,6 +543,12 @@ class Settings(BaseSettings):
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
+
+    @property
+    def prescan_gate_target_ids_set(self) -> frozenset[str]:
+        """Parsed ``prescan_gate_target_ids`` — the target IDs the pre-scan gate
+        is scoped to. Empty means "all targets" (see ``_prescan_gate_applies``)."""
+        return frozenset(t.strip() for t in self.prescan_gate_target_ids.split(",") if t.strip())
 
     # Per-user LLM budget (defense-in-depth). Rolling window over llm_costs.
     # Set to 0 to disable a window. API-key callers (cron) bypass the HTTP
