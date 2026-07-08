@@ -347,12 +347,6 @@ class UserTargetWithSummary(BaseModel):
     target: JobTargetSummary
 
 
-class TargetsSummaryListResponse(BaseModel):
-    """Response shape for the shared-targets list (summary projection)."""
-
-    targets: list[JobTargetSummary]
-
-
 class MyTargetsSummaryListResponse(BaseModel):
     """Response shape for the per-user targets list (summary projection)."""
 

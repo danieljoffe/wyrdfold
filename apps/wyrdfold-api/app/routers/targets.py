@@ -49,7 +49,6 @@ from app.models.targets import (
     TargetPreferences,
     TargetPreferencesUpdate,
     TargetsListResponse,
-    TargetsSummaryListResponse,
     TargetStatusResponse,
     TargetUpdate,
     UserTarget,
@@ -399,14 +398,6 @@ async def create_target_from_url(
         label_override=body.label,
         payload=doc.payload,
     )
-
-
-@router.get("", response_model=TargetsSummaryListResponse)
-def list_targets(
-    supabase: Client = Depends(get_supabase),
-) -> TargetsSummaryListResponse:
-    targets = crud.list_all_summary(supabase)
-    return TargetsSummaryListResponse(targets=targets)
 
 
 @router.post(
