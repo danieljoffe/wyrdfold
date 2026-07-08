@@ -16,14 +16,16 @@ All 422 responses carry the LintFailureResponse shape.
 """
 
 import asyncio
-import io
 import logging
+import os
 import re
+import tempfile
 import zipfile
+from collections.abc import Iterator
 from typing import Any, cast
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from supabase import Client
 
@@ -99,10 +101,7 @@ def _resolve_target_for_posting(
     target_ids: list[str] | None = None
     if user_id is not None:
         ut_resp = (
-            supabase.table("user_targets")
-            .select("target_id")
-            .eq("user_id", user_id)
-            .execute()
+            supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
         )
         target_ids = [
             cast(dict[str, Any], r)["target_id"]
@@ -112,19 +111,14 @@ def _resolve_target_for_posting(
         if not target_ids:
             return None
 
-    score_query = (
-        supabase.table("scores")
-        .select("target_id")
-        .eq("job_posting_id", job_posting_id)
-    )
+    score_query = supabase.table("scores").select("target_id").eq("job_posting_id", job_posting_id)
     if target_ids is not None:
         score_query = score_query.in_("target_id", target_ids)
-    rows = (
-        score_query.order("score", desc=True).limit(1).execute().data or []
-    )
+    rows = score_query.order("score", desc=True).limit(1).execute().data or []
     if not rows:
         return None
     return cast(str, cast(dict[str, Any], rows[0])["target_id"])
+
 
 @router.post(
     "/resume",
@@ -145,9 +139,7 @@ async def create_tailored_resume(
     # it stays `async def`. supabase-py is synchronous, so each blocking
     # round-trip is offloaded via asyncio.to_thread to keep it off the event
     # loop. See #107.
-    current_optimized = await asyncio.to_thread(
-        optimized.get_latest, supabase, user_id=user_id
-    )
+    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -179,18 +171,18 @@ async def create_tailored_resume(
         )
         if target_id:
             target_resp = await asyncio.to_thread(
-                lambda: supabase.table("targets")
-                .select("scoring_profile")
-                .eq("id", target_id)
-                .execute()
+                lambda: (
+                    supabase.table("targets")
+                    .select("scoring_profile")
+                    .eq("id", target_id)
+                    .execute()
+                )
             )
             if target_resp.data:
                 from app.models.targets import ScoringProfile
 
                 target_row = cast(dict[str, Any], target_resp.data[0])
-                profile = ScoringProfile.model_validate(
-                    target_row["scoring_profile"]
-                )
+                profile = ScoringProfile.model_validate(target_row["scoring_profile"])
                 keywords = extract_profile_keywords(profile)
                 if keywords:
                     reusable = await asyncio.to_thread(
@@ -281,9 +273,7 @@ async def create_tailored_cover_letter(
     # Genuinely async (awaits the LLM cover-letter pipeline + contact
     # resolve), so it stays `async def`; the blocking supabase round-trips are
     # offloaded via asyncio.to_thread to keep them off the event loop. See #107.
-    current_optimized = await asyncio.to_thread(
-        optimized.get_latest, supabase, user_id=user_id
-    )
+    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -412,6 +402,13 @@ def get_cover_letter_by_job(
     )
 
 
+# Bulk resume export streams from a SpooledTemporaryFile (spills to disk past
+# _EXPORT_SPOOL_MAX_MEMORY) so a large export never holds the whole zip in RAM
+# (#192 P-H2), mirroring the account-data export.
+_EXPORT_SPOOL_MAX_MEMORY = 32 * 1024 * 1024
+_EXPORT_STREAM_CHUNK_BYTES = 64 * 1024
+
+
 @router.post("/resumes/export-zip")
 async def export_resumes_zip(
     body: BulkExportRequest,
@@ -427,9 +424,10 @@ async def export_resumes_zip(
     supabase-py is synchronous, so every blocking round-trip is offloaded via
     ``asyncio.to_thread`` to keep it off the event loop. The per-file Storage
     downloads — the dominant, network-bound cost — run concurrently via
-    ``asyncio.gather`` instead of a serial blocking loop (#107). The full
-    streaming-export refactor is out of scope; this just stops the loop from
-    blocking.
+    ``asyncio.gather`` instead of a serial blocking loop (#107). The zip itself
+    is built into a ``SpooledTemporaryFile`` (spills to disk past
+    ``_EXPORT_SPOOL_MAX_MEMORY``) and streamed in chunks (#192 P-H2), so a large
+    bulk export never holds the whole archive in RAM.
     """
     rows = await asyncio.gather(
         *(
@@ -466,25 +464,44 @@ async def export_resumes_zip(
         )
     )
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rec, docx_bytes in zip(to_download, downloaded, strict=True):
-            resume = rec.as_resume()
-            # Build a descriptive filename from the first experience entry
-            company = "unknown"
-            title = "resume"
-            if resume.experience:
-                company = resume.experience[0].company
-                title = resume.experience[0].title
-            safe = re.sub(r"[^\w\s-]", "", f"{company}_{title}")
-            safe = re.sub(r"\s+", "_", safe).strip("_")[:80]
-            zf.writestr(f"{safe}.docx", docx_bytes)
+    # SIM115 suppressed: the spool must outlive this handler — it's closed by
+    # the streaming generator's finally once the response body has been sent.
+    spool = tempfile.SpooledTemporaryFile(max_size=_EXPORT_SPOOL_MAX_MEMORY)  # noqa: SIM115
+    try:
+        with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rec, docx_bytes in zip(to_download, downloaded, strict=True):
+                resume = rec.as_resume()
+                # Build a descriptive filename from the first experience entry
+                company = "unknown"
+                title = "resume"
+                if resume.experience:
+                    company = resume.experience[0].company
+                    title = resume.experience[0].title
+                safe = re.sub(r"[^\w\s-]", "", f"{company}_{title}")
+                safe = re.sub(r"\s+", "_", safe).strip("_")[:80]
+                zf.writestr(f"{safe}.docx", docx_bytes)
+        size = spool.seek(0, os.SEEK_END)
+        spool.seek(0)
+    except BaseException:
+        spool.close()
+        raise
 
-    buf.seek(0)
-    return Response(
-        content=buf.getvalue(),
+    def _iter_spool() -> Iterator[bytes]:
+        # Sync generator: Starlette drives it in the threadpool, keeping the
+        # blocking disk reads off the event loop.
+        try:
+            while chunk := spool.read(_EXPORT_STREAM_CHUNK_BYTES):
+                yield chunk
+        finally:
+            spool.close()
+
+    return StreamingResponse(
+        _iter_spool(),
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="resumes.zip"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="resumes.zip"',
+            "Content-Length": str(size),
+        },
     )
 
 
@@ -517,9 +534,7 @@ def edit_tailored_resume(
             },
         )
 
-    record = persistence.update_payload_md(
-        supabase, resume_id, body.markdown, user_id=user_id
-    )
+    record = persistence.update_payload_md(supabase, resume_id, body.markdown, user_id=user_id)
     return TailorResponse(record=record, lint_warnings=lint_result.warnings)
 
 
@@ -559,9 +574,7 @@ def checkpoint_tailored_resume(
                     "violations": [v.model_dump() for v in lint_result.violations],
                 },
             )
-        persistence.update_payload_md(
-            supabase, resume_id, body.markdown, user_id=user_id
-        )
+        persistence.update_payload_md(supabase, resume_id, body.markdown, user_id=user_id)
 
     recorded = versions.checkpoint(supabase, resume_id)
     return {"recorded": recorded}
@@ -667,9 +680,7 @@ def list_resume_versions(
     }
 
 
-def _fetch_user_resume_style(
-    supabase: Client, user_id: str
-) -> ResumeStyleSettings | None:
+def _fetch_user_resume_style(supabase: Client, user_id: str) -> ResumeStyleSettings | None:
     """Read the user's saved default resume style, or None if unset/malformed."""
     resp = (
         supabase.table("user_profiles")
@@ -717,16 +728,12 @@ async def download_tailored_resume(
     # Genuinely async (awaits the pandoc render via to_thread), so it stays
     # `async def`; each blocking supabase round-trip is offloaded via
     # asyncio.to_thread to keep it off the event loop. See #107.
-    row = await asyncio.to_thread(
-        persistence.get, supabase, resume_id, user_id=user_id
-    )
+    row = await asyncio.to_thread(persistence.get, supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored resume not found")
 
     style = await asyncio.to_thread(_resolve_render_style, supabase, row, user_id)
-    expected_hash = (
-        md_payload_hash(row.payload_md, style) if row.payload_md else None
-    )
+    expected_hash = md_payload_hash(row.payload_md, style) if row.payload_md else None
     cache_fresh = (
         row.storage_path is not None
         and expected_hash is not None
@@ -736,9 +743,7 @@ async def download_tailored_resume(
     if not cache_fresh:
         if not row.payload_md:
             if not row.storage_path:
-                raise HTTPException(
-                    status_code=404, detail="no .docx persisted for this resume"
-                )
+                raise HTTPException(status_code=404, detail="no .docx persisted for this resume")
             # Legacy row with cached docx but no markdown — serve cached bytes.
             try:
                 data = await asyncio.to_thread(
@@ -747,9 +752,7 @@ async def download_tailored_resume(
             except Exception as exc:
                 # Generic client message — the raw exception (Storage path,
                 # internal errors) stays server-side only (audit #29 R3 / M4).
-                _log.exception(
-                    "docx storage fetch failed for resume_id=%s", resume_id
-                )
+                _log.exception("docx storage fetch failed for resume_id=%s", resume_id)
                 raise HTTPException(
                     status_code=502, detail="failed to fetch resume document"
                 ) from exc
@@ -766,14 +769,10 @@ async def download_tailored_resume(
             # Server misconfiguration — don't echo the raw error (which can
             # name internal paths) to the client (audit #29 R3 / M4).
             _log.exception("pandoc not installed while rendering resume_id=%s", resume_id)
-            raise HTTPException(
-                status_code=500, detail="failed to render resume document"
-            ) from exc
+            raise HTTPException(status_code=500, detail="failed to render resume document") from exc
         except PandocRenderError as exc:
             _log.exception("docx render failed for resume_id=%s", resume_id)
-            raise HTTPException(
-                status_code=500, detail="failed to render resume document"
-            ) from exc
+            raise HTTPException(status_code=500, detail="failed to render resume document") from exc
 
         try:
             storage_path = await asyncio.to_thread(
@@ -803,17 +802,15 @@ async def download_tailored_resume(
     else:
         try:
             data = await asyncio.to_thread(
-                persistence.download_docx, user_supabase, row.storage_path  # type: ignore[arg-type]
+                persistence.download_docx,
+                user_supabase,
+                row.storage_path,  # type: ignore[arg-type]
             )
         except Exception as exc:
             # Generic client message — raw exception stays server-side only
             # (audit #29 R3 / M4).
-            _log.exception(
-                "docx storage fetch failed for resume_id=%s", resume_id
-            )
-            raise HTTPException(
-                status_code=502, detail="failed to fetch resume document"
-            ) from exc
+            _log.exception("docx storage fetch failed for resume_id=%s", resume_id)
+            raise HTTPException(status_code=502, detail="failed to fetch resume document") from exc
 
     filename = f"{row.id}.docx"
     return Response(
@@ -848,9 +845,7 @@ async def create_batch_resumes(
     `async def`; the blocking supabase round-trips are offloaded via
     asyncio.to_thread to keep them off the event loop. See #107.
     """
-    current_optimized = await asyncio.to_thread(
-        optimized.get_latest, supabase, user_id=user_id
-    )
+    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -862,14 +857,15 @@ async def create_batch_resumes(
     # by id to preserve the input ordering (downstream processes jobs in
     # request order).
     resp = await asyncio.to_thread(
-        lambda: supabase.table("jobs")
-        .select("id, title, description_html")
-        .in_("id", body.job_posting_ids)
-        .execute()
+        lambda: (
+            supabase.table("jobs")
+            .select("id, title, description_html")
+            .in_("id", body.job_posting_ids)
+            .execute()
+        )
     )
     fetched = {
-        cast(dict[str, Any], row)["id"]: cast(dict[str, Any], row)
-        for row in (resp.data or [])
+        cast(dict[str, Any], row)["id"]: cast(dict[str, Any], row) for row in (resp.data or [])
     }
 
     warnings: list[str] = []
