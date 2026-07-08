@@ -133,9 +133,7 @@ def assert_safe_host(hostname: str) -> None:
             # resolved to confirms metadata-endpoint reachability and leaks
             # internal network topology (#29 R3 H8 / #192). The message stays
             # generic; the hostname is caller-supplied so it isn't a leak.
-            logger.warning(
-                "ssrf_block: %s resolved to disallowed address %s", hostname, addr
-            )
+            logger.warning("ssrf_block: %s resolved to disallowed address %s", hostname, addr)
             raise ValueError(
                 f"hostname {hostname} resolves to a disallowed (private/internal) address"
             )
@@ -259,6 +257,15 @@ class ValidationResult(BaseModel):
     final_url: str
     warnings: list[str] = []
     rejection_reason: str | None = None
+    # Final HTTP status after following redirects — None if no body was ever
+    # fetched (malformed/banned/SSRF-rejected, or a network error). The #285
+    # backfill sweep reads this to decide live (200) vs dead (4xx) vs uncertain.
+    final_status: int | None = None
+    # Content-verification verdict for the fetched body: True if it looks like a
+    # job posting, False if not (a 200 "position filled" / listing page), None
+    # if no body was fetched. Separates a live canonical redirect from a dead
+    # one that still answers 200.
+    looks_like_job: bool | None = None
 
 
 async def validate_job_url(url: str) -> ValidationResult:
@@ -295,6 +302,8 @@ async def validate_job_url(url: str) -> ValidationResult:
     warnings: list[str] = []
     final_url = cleaned
     html = ""
+    final_status: int | None = None
+    looks_like_job: bool | None = None
 
     try:
         # The IP-pinning transport backstops the per-hop ``assert_safe_host``
@@ -318,8 +327,7 @@ async def validate_job_url(url: str) -> ValidationResult:
                         is_valid=False,
                         final_url=str(current),
                         rejection_reason=(
-                            f"banned_domain_after_redirect:"
-                            f"{registrable_domain(hop_host)}"
+                            f"banned_domain_after_redirect:{registrable_domain(hop_host)}"
                         ),
                     )
                 try:
@@ -347,6 +355,7 @@ async def validate_job_url(url: str) -> ValidationResult:
 
             if resp is not None:
                 final_url = str(resp.url)
+                final_status = resp.status_code
 
                 # Detect domain change via redirect
                 final_hostname = urlparse(final_url).hostname or ""
@@ -363,8 +372,7 @@ async def validate_job_url(url: str) -> ValidationResult:
                         is_valid=False,
                         final_url=final_url,
                         rejection_reason=(
-                            f"banned_domain_after_redirect:"
-                            f"{registrable_domain(final_hostname)}"
+                            f"banned_domain_after_redirect:{registrable_domain(final_hostname)}"
                         ),
                     )
 
@@ -391,6 +399,7 @@ async def validate_job_url(url: str) -> ValidationResult:
     # Layer 4: Content verification (only if we got HTML)
     if html:
         is_job, content_warnings = _verify_content(html)
+        looks_like_job = is_job
         warnings.extend(content_warnings)
         if not is_job:
             warnings.append("content_verification:not_a_job_posting")
@@ -399,4 +408,32 @@ async def validate_job_url(url: str) -> ValidationResult:
         is_valid=True,
         final_url=final_url,
         warnings=warnings,
+        final_status=final_status,
+        looks_like_job=looks_like_job,
     )
+
+
+def liveness_verdict(result: ValidationResult) -> str:
+    """Classify a validated URL for the #285 backfill sweep — ``"live"`` (tag
+    it), ``"dead"`` (archive it), or ``"unknown"`` (leave for a later cycle).
+
+    ``validate_job_url`` returns ``is_valid=True`` even for a 404, so deadness
+    is read from ``final_status`` / ``looks_like_job``, never ``is_valid``
+    (which only flags format/SSRF/banned rejects):
+
+    * LIVE    — a 200 whose body isn't flagged as a non-job page.
+    * DEAD    — a 4xx (a confident "gone"). Archival is a sticky data mutation
+      (a re-poll won't undo it), so ONLY this hard signal triggers it.
+    * UNKNOWN — everything else: a 200 whose body doesn't verify as a job (a
+      "position filled" / listing page) — ``_verify_content`` is a soft
+      ingest-time signal, so we decline to TAG such a row but don't hard-archive
+      on it — plus 5xx / timeout / too-many-redirects / security rejects. Never
+      archived on a blip; simply retried next cycle.
+    """
+    if not result.is_valid:
+        return "unknown"
+    if result.final_status == 200 and result.looks_like_job is not False:
+        return "live"
+    if result.final_status is not None and 400 <= result.final_status < 500:
+        return "dead"
+    return "unknown"

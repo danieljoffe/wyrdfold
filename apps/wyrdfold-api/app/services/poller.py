@@ -78,7 +78,7 @@ from app.services.target_scoring import (
 )
 from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
-from app.services.validate import validate_job_url
+from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
 
 logger = logging.getLogger(__name__)
@@ -834,6 +834,92 @@ async def _qualify_jobs(
             *(_qualify_one_job(llm, supabase, row) for row in chunk),
             return_exceptions=True,
         )
+
+
+async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
+    """Liveness-check + tag a bounded batch of the OLDEST untagged, unarchived
+    jobs (#285); archive the ones whose listing is gone.
+
+    ``_qualify_jobs`` only sees jobs re-upserted THIS cycle. A job that fell
+    off its source's feed without being archived is never re-visited, so it
+    stays untagged forever and slips through the is_us (#257) / role_family
+    (#278) read gates on the NULL benefit-of-the-doubt (~half the unarchived
+    catalog on prod when this landed). This sweep re-selects the oldest such
+    rows, cheaply checks each listing is still live (SSRF-safe, via
+    ``validate_job_url``), then:
+
+    * LIVE  → tag through the SAME budget-gated ``_qualify_jobs`` (it stops the
+      instant the global LLM meter minus the grading reserve is reached, so the
+      backlog drains over cycles without overspending or starving grading).
+    * DEAD  → archive: a 4xx (a confident "gone") shouldn't linger in the gates
+      OR cost a tag (also clears the stale-but-shown postings #285 found).
+    * UNKNOWN (a 200 that isn't a job, timeout, 5xx) → left untouched, retried
+      next cycle — archival is sticky, so it needs the hard 4xx signal.
+
+    Oldest-first, and every selected row is genuinely never-tagged
+    (``role_family`` NULL ⇒ no ``qualified_hash``/``qualified_at`` on prod), so
+    the content-hash skip inside ``_qualify_one_job`` can't turn the batch into
+    a no-op. A row the tagger can't parse stays NULL and is re-selected next
+    cycle — wasting at most a couple of slots, never blocking the rest.
+    """
+    if limit <= 0:
+        return
+    try:
+        resp = await asyncio.to_thread(
+            supabase.table("jobs")
+            .select(
+                "id, absolute_url, title, company_name, location, "
+                "description_html, qualified_hash, qualified_at"
+            )
+            .is_("role_family", "null")
+            .is_("archived_at", "null")
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute
+        )
+    except Exception:
+        logger.exception("Qualification backfill: select failed; skipping this cycle")
+        return
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return
+
+    # Liveness gate before spending a tag. A fresh semaphore (sized like the
+    # DB-write cap) bounds the HTTP fan-out; each check is timeout-capped inside
+    # ``validate_job_url`` — also the ONLY SSRF-safe way to fetch these
+    # arbitrary posting URLs.
+    sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
+    live: list[dict[str, Any]] = []
+    dead: list[str] = []
+
+    async def _check(row: dict[str, Any]) -> None:
+        url = row.get("absolute_url")
+        if not url:
+            return  # no URL to verify — leave untagged, spend nothing
+        async with sem:
+            try:
+                verdict = liveness_verdict(await validate_job_url(cast(str, url)))
+            except Exception:
+                return  # transient — retry next cycle
+        if verdict == "live":
+            live.append(row)
+        elif verdict == "dead":
+            dead.append(cast(str, row["id"]))
+
+    await asyncio.gather(*(_check(r) for r in rows), return_exceptions=True)
+
+    if dead:
+        logger.info("Qualification backfill: archiving %d dead listing(s)", len(dead))
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                supabase.table("jobs")
+                .update({"archived_at": datetime.now(UTC).isoformat()})
+                .in_("id", dead)
+                .execute
+            )
+    if live:
+        logger.info("Qualification backfill: tagging %d live job(s)", len(live))
+        await _qualify_jobs(supabase, live)
 
 
 async def _embed_jobs(
@@ -2144,6 +2230,14 @@ async def poll_due_sources(supabase: Client) -> PollResult:
         result.archived_jobs += s["archived"]
         if s["error"]:
             result.errors.append(s["error"])
+
+    # Drain a slice of the untagged backlog (#285): jobs orphaned when a source
+    # stopped re-appearing in its feed never re-enter ``_qualify_jobs`` above,
+    # so they'd bypass the read gates forever. Best-effort + budget-gated; once
+    # per scheduled cycle, after the live sources are polled.
+    if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
+        await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
+
     return result
 
 

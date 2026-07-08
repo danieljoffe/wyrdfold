@@ -337,6 +337,18 @@ class Settings(BaseSettings):
     # false-negatives) live; a prod sample of the >=80 set was 100% non-US.
     qualification_non_us_archive_min_confidence: int = Field(default=80, ge=0, le=100)
 
+    # Backfill sweep (#285): the per-cycle tagger only sees jobs re-upserted
+    # THIS cycle, so a job that fell off its source's feed without being
+    # archived stays untagged forever and slips through the is_us (#257) /
+    # role_family (#278) read gates on the NULL benefit-of-the-doubt. Each
+    # scheduled cycle, liveness-check up to this many of the OLDEST untagged,
+    # unarchived jobs, then TAG the live ones (budget-gated inside the same
+    # tagger path — respects the grading reserve, so it can't starve grading)
+    # and ARCHIVE the dead ones. Each row costs one HTTP liveness check, so keep
+    # the batch modest to bound the poll cycle's added latency. 0 disables. Only
+    # runs when ``qualification_enabled``.
+    qualification_backfill_batch: int = Field(default=50, ge=0, le=1000)
+
     # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
     # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
     # the vector in ``job_embeddings`` via
