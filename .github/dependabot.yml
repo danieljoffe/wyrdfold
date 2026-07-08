@@ -40,3 +40,12 @@ updates:
     target-branch: develop
     schedule:
       interval: weekly
+
+  # Keeps the pinned python:3.11-slim base-image digest in apps/wyrdfold-api/
+  # Dockerfile fresh, so the pin (added for reproducible Trivy scans, #192)
+  # auto-bumps for CVE patches instead of going stale.
+  - package-ecosystem: docker
+    directory: /apps/wyrdfold-api
+    target-branch: develop
+    schedule:
+      interval: weekly

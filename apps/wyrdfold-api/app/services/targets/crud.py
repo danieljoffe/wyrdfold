@@ -159,16 +159,6 @@ def list_all(supabase: Client) -> list[JobTarget]:
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def list_all_summary(supabase: Client) -> list[JobTargetSummary]:
-    """List-view projection of :func:`list_all` (#863).
-
-    Still selects the full row (counts are derived from ``scoring_profile``),
-    but returns the light summary so the JSONB never crosses the wire.
-    """
-    resp = supabase.table(TARGETS_TABLE).select("*").order("created_at", desc=True).execute()
-    return [_summarize_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
-
-
 def get_active(supabase: Client) -> list[JobTarget]:
     """Return all globally active targets (active for any user).
 
@@ -186,7 +176,7 @@ def get_all(supabase: Client) -> list[JobTarget]:
     discovery uses this one so a target nobody currently has active still has
     its ATS boards refreshed — an inactive target the user re-activates later
     should already have fresh sources rather than starting cold. Returns the
-    full target (unlike :func:`list_all_summary`) because discovery needs
+    full target (unlike the ``*_summary`` list projections) because discovery needs
     ``search_keywords``.
     """
     resp = supabase.table(TARGETS_TABLE).select("*").execute()
