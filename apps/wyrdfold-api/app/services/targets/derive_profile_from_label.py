@@ -91,7 +91,8 @@ Return JSON matching this exact schema:
   ],
   "description": "Frontend IC at scale: production React + TypeScript work on customer surfaces.",
   "seniority_hint": "staff",
-  "domain_hints": ["SaaS", "DTC e-commerce", "developer tools"]
+  "domain_hints": ["SaaS", "DTC e-commerce", "developer tools"],
+  "role_family": "engineering"
 }
 
 Rules for scoring_profile:
@@ -167,6 +168,12 @@ Phase 2's seniority_fit axis grades against.
 commonly spans (e.g. ["SaaS", "DTC", "healthtech"]). Empty array if the \
 role is genuinely domain-agnostic. This feeds Phase 2's domain_fit axis — \
 be specific enough to penalise off-domain matches.
+- ``role_family``: the coarse role FUNCTION, EXACTLY one of — engineering, \
+data_ml, product, design, customer_experience, sales, marketing, finance, \
+operations, people_hr, legal, other. Pick the single best fit for the role \
+itself (a "Frontend Engineer" is engineering; a "Director of CX Operations" \
+is customer_experience; use "other" only when none fit). This GATES which \
+jobs appear for the target, so be accurate.
 
 Return ONLY the JSON object. No prose, no markdown, no code fences."""
 

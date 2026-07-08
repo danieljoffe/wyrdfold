@@ -50,6 +50,26 @@ class ScoringProfile(BaseModel):
 
 SeniorityHint = Literal["ic", "senior", "staff", "manager", "director", "vp", "c_level"]
 
+# The target's role FAMILY — the SAME closed vocabulary the L2 job tagger emits
+# on jobs (``qualification.tagger.RoleFamily``), so the off-family read gate
+# (#277/#278) can compare ``job.role_family`` to ``target.role_family`` directly.
+# Kept models-side (like ``SeniorityHint``) to avoid a models→services import;
+# a drift test asserts it stays in lockstep with the tagger's list.
+RoleFamily = Literal[
+    "engineering",
+    "data_ml",
+    "product",
+    "design",
+    "customer_experience",
+    "sales",
+    "marketing",
+    "finance",
+    "operations",
+    "people_hr",
+    "legal",
+    "other",
+]
+
 
 class JobTarget(BaseModel):
     id: str
@@ -87,6 +107,7 @@ class JobTarget(BaseModel):
     # creation alongside the legacy scoring_profile.
     seniority_hint: SeniorityHint | None = None
     domain_hints: list[str] = Field(default_factory=list)
+    role_family: RoleFamily | None = None  # off-family gate (#278)
     created_at: datetime
     updated_at: datetime
 
@@ -229,9 +250,7 @@ class TargetPreferences(BaseModel):
             lo = SENIORITY_ORDER.index(self.pref_seniority_min)
             hi = SENIORITY_ORDER.index(self.pref_seniority_max)
             if lo > hi:
-                raise ValueError(
-                    "pref_seniority_min must not rank above pref_seniority_max"
-                )
+                raise ValueError("pref_seniority_min must not rank above pref_seniority_max")
         return self
 
 
@@ -258,9 +277,7 @@ class TargetPreferencesUpdate(BaseModel):
             lo = SENIORITY_ORDER.index(self.pref_seniority_min)
             hi = SENIORITY_ORDER.index(self.pref_seniority_max)
             if lo > hi:
-                raise ValueError(
-                    "pref_seniority_min must not rank above pref_seniority_max"
-                )
+                raise ValueError("pref_seniority_min must not rank above pref_seniority_max")
         return self
 
 
@@ -396,6 +413,7 @@ class TargetUpdate(BaseModel):
     # Update partials: None leaves the column unchanged on the DB side.
     seniority_hint: SeniorityHint | None = None
     domain_hints: list[str] | None = None
+    role_family: RoleFamily | None = None  # off-family gate (#278)
 
 
 class TargetFromManual(BaseModel):
@@ -499,6 +517,10 @@ class DerivedTarget(BaseModel):
     description: str | None = Field(default=None, max_length=_DERIVED_DESCRIPTION_MAX)
     seniority_hint: SeniorityHint | None = None
     domain_hints: list[str] = Field(default_factory=list, max_length=8)
+    # The target's role FUNCTION — same taxonomy as the job tagger's
+    # ``role_family``, so the off-family gate (#278) matches them. Optional +
+    # coerced (below) so a legacy/oddball LLM output never rejects the derivation.
+    role_family: RoleFamily | None = None
 
     @field_validator("seniority_hint", mode="before")
     @classmethod
@@ -516,6 +538,17 @@ class DerivedTarget(BaseModel):
         if isinstance(value, str):
             normalized = value.strip().lower()
             return normalized if normalized in get_args(SeniorityHint) else None
+        return value
+
+    @field_validator("role_family", mode="before")
+    @classmethod
+    def _coerce_role_family(cls, value: object) -> object:
+        """Safety net (#278): drop an out-of-vocabulary role_family to None
+        (unclassified → the off-family gate stays a no-op for this target)
+        rather than reject the whole derivation. Mirrors ``seniority_hint``."""
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized if normalized in get_args(RoleFamily) else None
         return value
 
     @field_validator("description", mode="before")

@@ -46,6 +46,7 @@ def _parse_target(row: dict[str, Any]) -> JobTarget:
         # Slim shape (NULL on legacy rows until PR B backfill).
         seniority_hint=row.get("seniority_hint"),
         domain_hints=row.get("domain_hints") or [],
+        role_family=row.get("role_family"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -99,9 +100,7 @@ def _parse_user_target(row: dict[str, Any]) -> UserTarget:
             row["pref_score_cutoff"] if row.get("pref_score_cutoff") is not None else 40
         ),
         pref_locations=row.get("pref_locations"),
-        pref_remote_ok=(
-            row["pref_remote_ok"] if row.get("pref_remote_ok") is not None else True
-        ),
+        pref_remote_ok=(row["pref_remote_ok"] if row.get("pref_remote_ok") is not None else True),
         pref_seniority_min=row.get("pref_seniority_min"),
         pref_seniority_max=row.get("pref_seniority_max"),
         pref_employment_types=row.get("pref_employment_types"),
@@ -211,6 +210,8 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["seniority_hint"] = payload.seniority_hint
     if payload.domain_hints is not None:
         updates["domain_hints"] = payload.domain_hints
+    if payload.role_family is not None:
+        updates["role_family"] = payload.role_family
 
     resp = supabase.table(TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
@@ -794,9 +795,7 @@ def list_reference_jds(supabase: Client, target_id: str) -> list[TargetReference
     return [_parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def count_user_reference_jds(
-    supabase: Client, *, target_id: str, user_id: str
-) -> int:
+def count_user_reference_jds(supabase: Client, *, target_id: str, user_id: str) -> int:
     """How many reference JDs this user has contributed to this target.
     Drives the per-user contribution cap (#47)."""
     resp = (

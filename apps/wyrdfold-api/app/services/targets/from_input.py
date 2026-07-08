@@ -135,9 +135,7 @@ async def derive_manual_target_bg(
     """
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
-            derived, derive_result = await derive_profile_from_label(
-                llm, label=label
-            )
+            derived, derive_result = await derive_profile_from_label(llm, label=label)
             cost_log.record(
                 supabase,
                 user_id=user_id,
@@ -159,15 +157,14 @@ async def derive_manual_target_bg(
                     description=derived.description,
                     seniority_hint=derived.seniority_hint,
                     domain_hints=derived.domain_hints or None,
+                    role_family=derived.role_family,
                     activation_status="idle",
                 ),
             )
             if updated is None:
                 logger.error("Failed to update target %s after deferred derive", target_id)
                 return
-            await _apply_fit_score(
-                supabase, llm, user_id=user_id, target=updated, payload=payload
-            )
+            await _apply_fit_score(supabase, llm, user_id=user_id, target=updated, payload=payload)
     except TimeoutError:
         logger.error(
             "Deferred manual-target derivation timed out after %ss for target %s",
@@ -228,9 +225,7 @@ async def derive_url_target_bg(
 
             current = crud.get(supabase, target_id)
             next_version = (
-                (current.profile_version + 1)
-                if (not is_new and current is not None)
-                else None
+                (current.profile_version + 1) if (not is_new and current is not None) else None
             )
             updated = crud.update(
                 supabase,
@@ -246,9 +241,7 @@ async def derive_url_target_bg(
             if target is None:
                 logger.error("Target %s vanished during deferred URL derive", target_id)
                 return
-            await _apply_fit_score(
-                supabase, llm, user_id=user_id, target=target, payload=payload
-            )
+            await _apply_fit_score(supabase, llm, user_id=user_id, target=target, payload=payload)
     except TimeoutError:
         logger.error(
             "Deferred URL-target derivation timed out after %ss for target %s",
@@ -303,9 +296,7 @@ async def _normalize_suggestion(
             label,
             exc,
         )
-        raise HTTPException(
-            status_code=502, detail=_MALFORMED_SUGGESTION_DETAIL
-        ) from exc
+        raise HTTPException(status_code=502, detail=_MALFORMED_SUGGESTION_DETAIL) from exc
 
 
 async def from_manual(
