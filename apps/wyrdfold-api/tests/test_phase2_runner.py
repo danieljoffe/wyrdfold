@@ -690,3 +690,33 @@ async def test_prescan_gate_empty_scope_is_a_noop(
     )
     assert graded == ["j1"]  # empty scope → ungated, graded normally
     assert called == []  # gate never consulted
+
+
+@pytest.mark.asyncio
+async def test_us_gate_skips_confirmed_non_us_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#60: a CONFIRMED non-US job (is_us=False) is never (re-)graded — the write
+    side of the display read gate. US (True) and not-yet-tagged (None) jobs still
+    grade, so a job's FIRST grade (before the tagger runs) is unaffected; only
+    re-grades of confirmed-non-US jobs are dropped (they burned a fresh LLM grade
+    every cycle since archived_at doesn't gate grading)."""
+    ids = ["j-us", "j-nonus", "j-untagged"]
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+
+    jobs = [
+        {"id": "j-us", "title": "x", "description_html": "", "is_us": True},
+        {"id": "j-nonus", "title": "x", "description_html": "", "is_us": False},
+        {"id": "j-untagged", "title": "x", "description_html": "", "is_us": None},
+    ]
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=jobs,
+    )
+    assert set(graded) == {"j-us", "j-untagged"}  # confirmed non-US dropped
+    assert "j-nonus" not in graded
+    assert n == 2
