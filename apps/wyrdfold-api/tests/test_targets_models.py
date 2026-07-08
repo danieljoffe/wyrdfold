@@ -227,6 +227,36 @@ def test_derived_target_coerces_out_of_vocab_seniority_hint_to_none():
     assert d3.seniority_hint is None
 
 
+def test_derived_target_coerces_out_of_vocab_role_family_to_none():
+    """#278 safety net: a role_family outside the tagger's closed set degrades
+    to None (unclassified → the off-family gate no-ops for this target) instead
+    of rejecting the whole derivation. Mirrors seniority_hint."""
+    from app.models.targets import DerivedTarget
+
+    d = DerivedTarget.model_validate(
+        {"scoring_profile": {"categories": {}}, "role_family": "software_engineering"}
+    )
+    assert d.role_family is None
+    d2 = DerivedTarget.model_validate(
+        {"scoring_profile": {"categories": {}}, "role_family": "Engineering"}
+    )
+    assert d2.role_family == "engineering"
+    d3 = DerivedTarget.model_validate({"scoring_profile": {"categories": {}}})
+    assert d3.role_family is None
+
+
+def test_target_role_family_taxonomy_matches_the_job_tagger():
+    """The off-family gate compares job.role_family (the tagger's) to
+    target.role_family (the model's) as strings, so the two closed vocabularies
+    MUST stay identical — guards against drift if either list changes (#278)."""
+    from typing import get_args
+
+    from app.models.targets import RoleFamily
+    from app.services.qualification.tagger import RoleFamily as TaggerRoleFamily
+
+    assert set(get_args(RoleFamily)) == set(get_args(TaggerRoleFamily))
+
+
 def test_derived_target_truncates_oversized_description():
     """#27 safety net: a description over the cap is truncated, not rejected
     (verbose leadership roles overshoot the prompt's 80-600 char target)."""
@@ -292,9 +322,7 @@ def test_target_from_url_rejects_oversized_url():
         TargetFromUrl(jd_url=url)
     # The failure is specifically the length bound on jd_url.
     errors = exc.value.errors()
-    assert any(
-        e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors
-    ), errors
+    assert any(e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors), errors
 
 
 def test_reference_jd_add_accepts_max_length_url():
@@ -308,9 +336,7 @@ def test_reference_jd_add_rejects_oversized_url():
     with pytest.raises(ValidationError) as exc:
         ReferenceJDAdd(jd_url=url)
     errors = exc.value.errors()
-    assert any(
-        e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors
-    ), errors
+    assert any(e["loc"] == ("jd_url",) and e["type"] == "string_too_long" for e in errors), errors
 
 
 def test_reference_jd_add_still_requires_text_or_url():
