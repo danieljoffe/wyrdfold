@@ -36,7 +36,7 @@ DEFAULT_PURPOSE = "target.derive_profile"
 # Bump when SYSTEM_PROMPT below materially changes. See module docstring.
 # v2: prepended the prompt-injection directive + fenced the JD in the user
 # message (scraped JD feeds the SHARED target profile). Invalidates v1 cache.
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"  # v3: de-bias — ignore company-specific noise (#5 refinement)
 
 _CACHE_TABLE = "target_derive_jd_cache"
 
@@ -120,6 +120,12 @@ Rules for scoring_profile:
 - Use canonical skill names (React not reactjs, TypeScript not TS, Node.js \
 not nodejs).
 - Only extract what the JD explicitly supports. Do not invent skills.
+- Extract only ROLE-GENERIC requirements — the skills, seniority, and domain \
+that define this KIND of role at any company. IGNORE company-specific noise: \
+perks, benefits, compensation, culture/values statements, office location or \
+remote policy, team size, funding stage, and HR/EEO boilerplate. A single JD \
+skews toward one company's idiosyncrasies; extracting only the role essence \
+keeps the shared rubric clean as many contributions merge (#5 refinement layer).
 
 Rules for search_keywords:
 - 5-15 lowercase role title variations derived from the JD's role title.

@@ -13,7 +13,7 @@ model.lateral_discovery = claude-sonnet-4-6
 model.target_fit_score = claude-sonnet-4-6
 model.qualification_tagger = claude-haiku-4-5
 model.feedback_learner = claude-sonnet-4-6
-prompt_version.derive_target_from_jd = v2
+prompt_version.derive_target_from_jd = v3
 model_allowlist = claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5
 
 ===== PROMPT: phase1_triage.system =====
@@ -306,6 +306,7 @@ Rules for scoring_profile:
 - Negative keywords: terms that indicate the JD is NOT for this persona (e.g., role is too junior, wrong tech stack entirely).
 - Use canonical skill names (React not reactjs, TypeScript not TS, Node.js not nodejs).
 - Only extract what the JD explicitly supports. Do not invent skills.
+- Extract only ROLE-GENERIC requirements — the skills, seniority, and domain that define this KIND of role at any company. IGNORE company-specific noise: perks, benefits, compensation, culture/values statements, office location or remote policy, team size, funding stage, and HR/EEO boilerplate. A single JD skews toward one company's idiosyncrasies; extracting only the role essence keeps the shared rubric clean as many contributions merge (#5 refinement layer).
 
 Rules for search_keywords:
 - 5-15 lowercase role title variations derived from the JD's role title.
