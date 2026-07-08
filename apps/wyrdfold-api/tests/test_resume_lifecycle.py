@@ -744,8 +744,11 @@ class TestExportZip:
             )
 
         assert result.media_type == "application/zip"
+        # StreamingResponse now (#192 P-H2): consume the spooled body.
+        body = b"".join([chunk async for chunk in result.body_iterator])
+        assert result.headers["Content-Length"] == str(len(body))
         # Verify it's a valid zip
-        with zf.ZipFile(BytesIO(result.body)) as z:
+        with zf.ZipFile(BytesIO(body)) as z:
             assert len(z.namelist()) == 1
             name = z.namelist()[0]
             assert name.endswith(".docx")
