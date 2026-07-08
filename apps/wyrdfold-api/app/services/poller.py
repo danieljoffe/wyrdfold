@@ -2195,6 +2195,16 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     await _maybe_run_lifecycle_sweep(supabase)
 
     due = filter_due_sources(all_enabled)
+
+    # Drain a slice of the untagged backlog (#285) EVERY cycle — jobs orphaned
+    # when a source stopped re-appearing in its feed never re-enter
+    # ``_qualify_jobs`` below, so they'd bypass the read gates forever. Runs
+    # independent of whether any source is due (a quiet cycle still drains it),
+    # and BEFORE the ``not due`` early-exit so it isn't skipped. Self-budget-
+    # gated (respects the grading reserve); best-effort.
+    if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
+        await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
+
     if not due:
         return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
 
@@ -2230,13 +2240,6 @@ async def poll_due_sources(supabase: Client) -> PollResult:
         result.archived_jobs += s["archived"]
         if s["error"]:
             result.errors.append(s["error"])
-
-    # Drain a slice of the untagged backlog (#285): jobs orphaned when a source
-    # stopped re-appearing in its feed never re-enter ``_qualify_jobs`` above,
-    # so they'd bypass the read gates forever. Best-effort + budget-gated; once
-    # per scheduled cycle, after the live sources are polled.
-    if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
-        await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
 
     return result
 
