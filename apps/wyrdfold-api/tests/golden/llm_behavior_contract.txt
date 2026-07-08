@@ -196,7 +196,8 @@ Return JSON matching this exact schema:
   ],
   "description": "Frontend IC at scale: production React + TypeScript work on customer surfaces.",
   "seniority_hint": "staff",
-  "domain_hints": ["SaaS", "DTC e-commerce", "developer tools"]
+  "domain_hints": ["SaaS", "DTC e-commerce", "developer tools"],
+  "role_family": "engineering"
 }
 
 Rules for scoring_profile:
@@ -233,6 +234,7 @@ Rules for the slim shape (``description`` / ``seniority_hint`` / ``domain_hints`
 - ``description`` (80-600 chars): 1-2 paragraphs capturing WHAT THIS ROLE IS in general (don't echo the label). Mention the flavor of work — operations-heavy? IC craft? transformation-led? — and the kind of companies that hire for it. Avoid vague phrases like "great team player". This feeds Phase 2's ``## Target`` block in the fit-grading prompt, so concreteness pays off.
 - ``seniority_hint``: MUST be EXACTLY one of these seven values — ic, senior, staff, manager, director, vp, c_level — never any other word. Map the title's nomenclature onto the closest one (Lead / Principal -> staff, Sr -> senior, Head of -> director, EVP / SVP -> vp, Chief _ Officer -> c_level). Pick the level the label implies. This is what Phase 2's seniority_fit axis grades against.
 - ``domain_hints``: 3-6 industries / verticals / product types this role commonly spans (e.g. ["SaaS", "DTC", "healthtech"]). Empty array if the role is genuinely domain-agnostic. This feeds Phase 2's domain_fit axis — be specific enough to penalise off-domain matches.
+- ``role_family``: the coarse role FUNCTION, EXACTLY one of — engineering, data_ml, product, design, customer_experience, sales, marketing, finance, operations, people_hr, legal, other. Pick the single best fit for the role itself (a "Frontend Engineer" is engineering; a "Director of CX Operations" is customer_experience; use "other" only when none fit). This GATES which jobs appear for the target, so be accurate.
 
 Return ONLY the JSON object. No prose, no markdown, no code fences.
 

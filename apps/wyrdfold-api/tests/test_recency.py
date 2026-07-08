@@ -218,7 +218,9 @@ class _ListChain:
 
 def _list_supabase(table_resps: dict[str, _ListResp]) -> MagicMock:
     sb = MagicMock()
-    sb.table.side_effect = lambda name: _ListChain(table_resps[name])
+    # Unstubbed tables (e.g. the #278 off-family gate's ``targets`` lookup) read
+    # as empty, leaving the gate a no-op for tests that don't set role_family.
+    sb.table.side_effect = lambda name: _ListChain(table_resps.get(name, _ListResp([])))
     return sb
 
 
