@@ -16,6 +16,7 @@ from app.config import settings
 from app.routers.jobs import (
     _decode_cursor,
     _encode_cursor,
+    _gate_off_family,
     _list_jobs_across_user_targets,
     _list_jobs_for_target_rpc,
     _list_jobs_for_target_two_query,
@@ -73,7 +74,10 @@ class _Chain:
 
 def _supabase_with(table_resps: dict[str, _Resp]) -> MagicMock:
     sb = MagicMock()
-    sb.table.side_effect = lambda name: _Chain(table_resps[name])
+    # Unstubbed tables read as empty (e.g. the #278 off-family gate's `targets`
+    # lookup) — an empty `targets` read leaves the gate a no-op, so tests that
+    # don't care about role_family are unaffected.
+    sb.table.side_effect = lambda name: _Chain(table_resps.get(name, _Resp([])))
     return sb
 
 
@@ -188,6 +192,43 @@ def test_across_user_targets_restores_score_desc_order(
     assert [p["id"] for p in result["postings"]] == ["j-high", "j-mid", "j-low"]
     assert [p["score"] for p in result["postings"]] == [80, 50, 20]
     assert result["total"] == 3
+
+
+def test_gate_off_family_drops_family_mismatches() -> None:
+    """#278: strict off-family gate — keep a match only when the job's family
+    equals the target's, the job is untagged (NULL), or the target is
+    unclassified. t-1 is engineering, so finance is dropped; eng + untagged
+    are kept."""
+    by_id = {
+        "j-eng": {"job_posting_id": "j-eng", "target_id": "t-1"},
+        "j-fin": {"job_posting_id": "j-fin", "target_id": "t-1"},
+        "j-null": {"job_posting_id": "j-null", "target_id": "t-1"},
+    }
+    sb = _supabase_with(
+        {
+            "targets": _Resp([{"id": "t-1", "role_family": "engineering"}]),
+            "jobs": _Resp(
+                [
+                    {"id": "j-eng", "role_family": "engineering"},
+                    {"id": "j-fin", "role_family": "finance"},
+                    {"id": "j-null", "role_family": None},
+                ]
+            ),
+        }
+    )
+    assert set(_gate_off_family(sb, by_id)) == {"j-eng", "j-null"}
+
+
+def test_gate_off_family_noop_when_target_unclassified() -> None:
+    """A target with no role_family never hides anything (the safe default)."""
+    by_id = {"j-fin": {"job_posting_id": "j-fin", "target_id": "t-1"}}
+    sb = _supabase_with(
+        {
+            "targets": _Resp([{"id": "t-1", "role_family": None}]),
+            "jobs": _Resp([{"id": "j-fin", "role_family": "finance"}]),
+        }
+    )
+    assert set(_gate_off_family(sb, by_id)) == {"j-fin"}
 
 
 def test_target_two_query_location_filter_paginates_post_filter_set() -> None:

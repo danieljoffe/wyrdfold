@@ -554,6 +554,57 @@ class _LogisticsFilter:
         return self.remote_only or self.min_salary is not None or bool(self.country)
 
 
+def _gate_off_family(
+    supabase: Client, by_id: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Drop matches whose job ``role_family`` mismatches its target's family.
+
+    The write side of the ``get_target_jobs`` family gate (#277), for the
+    two-query list paths (the untargeted dashboard + the per-target two-query
+    fallback) — ``get_target_jobs`` gates in SQL, but these paths assemble in
+    Python and the check is RELATIONAL (job's family vs the family of the target
+    its score belongs to), so it can't be a column filter like ``_gate_live_us``.
+
+    Strict, keep-null (mirrors #277): keep a match only when the job's family
+    EQUALS the target's, the job is untagged (``role_family`` NULL — benefit of
+    the doubt, like ``is_us IS NOT FALSE``), or the target is unclassified
+    (family NULL → ungated). ``by_id`` maps job_posting_id -> the winning
+    ``scores`` row (carrying ``target_id``).
+
+    Cheap: one ``targets`` read + chunked ``jobs.role_family`` reads, then an
+    in-memory filter — no per-row round-trips. #60 / #278.
+    """
+    if not by_id:
+        return by_id
+    target_ids = {r["target_id"] for r in by_id.values() if r.get("target_id")}
+    if not target_ids:
+        return by_id
+    tf = supabase.table("targets").select("id, role_family").in_("id", list(target_ids)).execute()
+    target_family: dict[str, str | None] = {
+        r["id"]: r.get("role_family") for r in cast(list[dict[str, Any]], tf.data or [])
+    }
+    # Nothing to enforce when none of these targets is classified.
+    if not any(target_family.values()):
+        return by_id
+
+    job_family: dict[str, str | None] = {}
+    ids = list(by_id.keys())
+    for i in range(0, len(ids), _IN_CHUNK_SIZE):
+        chunk = ids[i : i + _IN_CHUNK_SIZE]
+        jf = supabase.table("jobs").select("id, role_family").in_("id", chunk).execute()
+        for r in cast(list[dict[str, Any]], jf.data or []):
+            job_family[r["id"]] = r.get("role_family")
+
+    gated: dict[str, dict[str, Any]] = {}
+    for pid, s in by_id.items():
+        tid = s.get("target_id")
+        tfam = target_family.get(tid) if tid is not None else None
+        jfam = job_family.get(pid)
+        if tfam is None or jfam is None or jfam == tfam:
+            gated[pid] = s
+    return gated
+
+
 def _assemble_jobs_page(
     supabase: Client,
     *,
@@ -584,6 +635,11 @@ def _assemble_jobs_page(
     build ``by_id`` + ``weights_for_row``; everything from here down was
     duplicated verbatim between them until this extraction.
     """
+    # Off-role-family gate (#60/#278): drop matches whose job family mismatches
+    # its target's family BEFORE ranking/paginating — a post-fetch drop would
+    # render short pages. Mirrors the get_target_jobs SQL gate for these paths.
+    by_id = _gate_off_family(supabase, by_id)
+
     has_location_filter = bool(exclude_terms or only_terms)
     # Per-user preference filters (employment-type / seniority / location) are
     # post-fetch, so — like the location chip — when active we must materialise
