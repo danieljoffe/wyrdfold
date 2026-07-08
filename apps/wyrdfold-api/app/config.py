@@ -185,13 +185,14 @@ class Settings(BaseSettings):
     # once its threshold is calibrated (#89).
     prescan_gate_enabled: bool = False
     # Per-target SCOPE for the gate above — a staged rollout (#90). Comma-separated
-    # target UUIDs the gate applies to. EMPTY = all targets (the global posture);
-    # non-empty = an ALLOWLIST, so the gate acts only on the listed targets while
-    # every other target keeps permissive keyword admission. This lets a
-    # zero-recall-loss target flip first (CX, whose shadow would-drops scored
-    # 0/8229 >= the floor) while a lossier one waits for more data (frontend,
-    # 2.8%). No effect when ``prescan_gate_enabled`` is off. Parsed by
-    # ``prescan_gate_target_ids_set``.
+    # target UUIDs the gate applies to. EMPTY = NO targets (a safe no-op) — the gate
+    # requires EXPLICIT per-target opt-in, so it can never be silently applied to an
+    # unvalidated target. Cosine gating is only safe per-target, calibrated on live
+    # Phase-2 scores: it's a coarse off-domain filter (0% recall loss on CX, an
+    # off-cluster exec target) that FAILS in-domain (Frontend loses ~60% of good
+    # matches at its threshold — the fixture-based "2.8%" was measured on the
+    # keyword proxy, not real scores). No effect when ``prescan_gate_enabled`` is
+    # off. Parsed by ``prescan_gate_target_ids_set``.
     prescan_gate_target_ids: str = ""
     # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
     # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
@@ -547,7 +548,8 @@ class Settings(BaseSettings):
     @property
     def prescan_gate_target_ids_set(self) -> frozenset[str]:
         """Parsed ``prescan_gate_target_ids`` — the target IDs the pre-scan gate
-        is scoped to. Empty means "all targets" (see ``_prescan_gate_applies``)."""
+        is scoped to. Empty means NO targets (a safe no-op requiring explicit
+        opt-in), NOT "all targets" (see ``_prescan_gate_applies``)."""
         return frozenset(t.strip() for t in self.prescan_gate_target_ids.split(",") if t.strip())
 
     # Per-user LLM budget (defense-in-depth). Rolling window over llm_costs.

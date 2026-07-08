@@ -135,15 +135,19 @@ def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[s
 def _prescan_gate_applies(target_id: str) -> bool:
     """Whether the pre-scan cosine gate acts on this target (#90 staged rollout).
 
-    The global ``prescan_gate_enabled`` must be on AND the target must be in
-    scope: an EMPTY ``prescan_gate_target_ids`` allowlist means "all targets"
-    (the global posture), a non-empty one restricts the gate to just those
-    targets so a zero-loss target (CX) can flip before a lossier one (frontend).
+    The global ``prescan_gate_enabled`` must be on AND the target must be in the
+    ``prescan_gate_target_ids`` allowlist. An EMPTY allowlist means **no
+    targets** — NOT "all targets" — so the gate can never be silently applied to
+    an unvalidated target. This matters because cosine gating is only safe
+    per-target, calibrated against live Phase-2 scores: it's a coarse off-domain
+    filter (0% recall loss on CX, an off-cluster exec target) that FAILS on an
+    in-domain one (Frontend drops ~60% of good matches at its calibrated
+    threshold, #90). Enabling the gate with an empty allowlist is therefore a
+    no-op, never a gate-everything that would silently drop good matches.
     """
     if not settings.prescan_gate_enabled:
         return False
-    scope = settings.prescan_gate_target_ids_set
-    return not scope or str(target_id) in scope
+    return str(target_id) in settings.prescan_gate_target_ids_set
 
 
 async def run_phase2_for_jobs(
@@ -171,6 +175,26 @@ async def run_phase2_for_jobs(
     are swallowed there (return ``None``), so one bad grade never sinks
     the batch.
     """
+    if not jobs:
+        return 0
+
+    # US-only corpus (#60): never (re-)grade a CONFIRMED non-US job — the write
+    # side of the display read gate (``jobs.py`` ``_gate_live_us``: is_us IS NOT
+    # FALSE). The L2 tagger sets ``is_us`` only AFTER a job's first grade, so
+    # first grades still happen (is_us NULL passes); once a job is confirmed
+    # non-US it's never re-graded. Without this a re-polled non-US job burns a
+    # fresh LLM grade every cycle — ``archived_at`` does NOT gate grading (134
+    # non-US jobs were graded *after* being archived in one 7-day window). Keep
+    # true + null (``is not False``); drop only confirmed-false.
+    us_jobs = [j for j in jobs if j.get("is_us") is not False]
+    non_us_skipped = len(jobs) - len(us_jobs)
+    if non_us_skipped:
+        logger.info(
+            "Phase 2 US gate: skipped %d confirmed-non-US job(s) for target %s",
+            non_us_skipped,
+            target.id,
+        )
+    jobs = us_jobs
     if not jobs:
         return 0
 
