@@ -41,11 +41,21 @@ from tests.support.fake_supabase import FakeResponse, two_query_supabase
 # --------------------------------------------------------------------------
 
 
-def test_is_pending_only_complete_is_graded() -> None:
+def test_is_pending_uses_fit_reasoning_not_status() -> None:
+    # A genuine grade is signalled by persisted fit_reasoning — the only reliable
+    # marker. scoring_status is NOT trusted: 'complete' is set on rows that were
+    # never actually graded (deferred / reset), which leaked the keyword
+    # placeholder as a fit score (~2,300 such rows in prod).
+    assert _is_pending({"fit_reasoning": "Title: matches. Gap: seniority."}) is False
     assert _is_pending({"scoring_status": "stage1"}) is True
     assert _is_pending({"scoring_status": "stage2"}) is True
-    assert _is_pending({}) is True  # missing status → Pending
-    assert _is_pending({"scoring_status": "complete"}) is False
+    assert _is_pending({}) is True  # nothing → Pending
+    # THE regression: 'complete' with no real grade → Pending, never graded.
+    assert _is_pending({"scoring_status": "complete"}) is True
+    assert _is_pending({"scoring_status": "complete", "fit_reasoning": ""}) is True
+    assert _is_pending({"scoring_status": "complete", "fit_reasoning": "  "}) is True
+    # A real grade → graded, regardless of the status text.
+    assert _is_pending({"scoring_status": "complete", "fit_reasoning": "graded"}) is False
 
 
 class _RecordingQuery:
@@ -83,9 +93,9 @@ def test_apply_score_floor_is_noop_without_a_floor(floor: int | None) -> None:
 
 def test_rank_graded_first_buckets_pending_below_graded() -> None:
     rows = [
-        {"id": "g50", "scoring_status": "complete", "v": 50},
+        {"id": "g50", "scoring_status": "complete", "fit_reasoning": "graded", "v": 50},
         {"id": "p80", "scoring_status": "stage2", "v": 80},
-        {"id": "g70", "scoring_status": "complete", "v": 70},
+        {"id": "g70", "scoring_status": "complete", "fit_reasoning": "graded", "v": 70},
         {"id": "p10", "scoring_status": "stage1", "v": 10},
     ]
     ranked = _rank_graded_first(rows, value=lambda r: r["v"], ascending=False)
@@ -96,9 +106,9 @@ def test_rank_graded_first_buckets_pending_below_graded() -> None:
 
 def test_rank_graded_first_keeps_pending_last_even_ascending() -> None:
     rows = [
-        {"id": "g50", "scoring_status": "complete", "v": 50},
+        {"id": "g50", "scoring_status": "complete", "fit_reasoning": "graded", "v": 50},
         {"id": "p10", "scoring_status": "stage1", "v": 10},
-        {"id": "g70", "scoring_status": "complete", "v": 70},
+        {"id": "g70", "scoring_status": "complete", "fit_reasoning": "graded", "v": 70},
     ]
     ranked = _rank_graded_first(rows, value=lambda r: r["v"], ascending=True)
     # Ascending sorts each bucket low→high, but Pending stays beneath graded.
@@ -106,15 +116,15 @@ def test_rank_graded_first_keeps_pending_last_even_ascending() -> None:
 
 
 def test_prefer_score_row_graded_beats_pending() -> None:
-    graded_low = {"scoring_status": "complete", "score": 40}
+    graded_low = {"scoring_status": "complete", "fit_reasoning": "graded", "score": 40}
     pending_high = {"scoring_status": "stage2", "score": 95}
     # A real grade represents the job even when a placeholder is numerically higher.
     assert _prefer_score_row(graded_low, pending_high) is True
     assert _prefer_score_row(pending_high, graded_low) is False
     # Same gradedness → higher score wins.
     assert _prefer_score_row(
-        {"scoring_status": "complete", "score": 80},
-        {"scoring_status": "complete", "score": 70},
+        {"scoring_status": "complete", "fit_reasoning": "graded", "score": 80},
+        {"scoring_status": "complete", "fit_reasoning": "graded", "score": 70},
     )
 
 
@@ -131,8 +141,8 @@ def test_prefer_score_row_graded_beats_pending() -> None:
 def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
-        {"job_posting_id": "g90", "score": 90, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "g30", "score": 30, "score_breakdown": {}, "scoring_status": "complete"},
+        {"job_posting_id": "g90", "score": 90, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
+        {"job_posting_id": "g30", "score": 30, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
         {"job_posting_id": "p20", "score": 20, "score_breakdown": {}, "scoring_status": "stage2"},
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g90", "g30", "p20")}
@@ -151,9 +161,9 @@ def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.Monkey
 def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
-        {"job_posting_id": "g50", "score": 50, "score_breakdown": {}, "scoring_status": "complete"},
+        {"job_posting_id": "g50", "score": 50, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
         {"job_posting_id": "p80", "score": 80, "score_breakdown": {}, "scoring_status": "stage2"},
-        {"job_posting_id": "g70", "score": 70, "score_breakdown": {}, "scoring_status": "complete"},
+        {"job_posting_id": "g70", "score": 70, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g50", "p80", "g70")}
     result = _list_jobs_for_target_two_query(
@@ -178,7 +188,7 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same job scored on two targets: a graded 60 and a Pending 90.
     scores = [
-        {"job_posting_id": "j", "target_id": "t-1", "score": 60, "score_breakdown": {}, "scoring_status": "complete"},
+        {"job_posting_id": "j", "target_id": "t-1", "score": 60, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
         {"job_posting_id": "j", "target_id": "t-2", "score": 90, "score_breakdown": {}, "scoring_status": "stage2"},
     ]
     postings = {"j": {"id": "j", "title": "j"}}

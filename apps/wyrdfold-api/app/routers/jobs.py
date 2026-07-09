@@ -489,11 +489,19 @@ def _display_sort_value(
 
 
 def _is_pending(row: dict[str, Any]) -> bool:
-    """True when a scores/posting row is not yet Sonnet-graded — its ``score``
-    is still a keyword placeholder, not a real fit score. ``complete`` means
-    Phase 2 (or the user-analysis blend) has run; anything else (incl. a missing
-    status) is Pending."""
-    return row.get("scoring_status") != "complete"
+    """True when a row is not yet Sonnet-graded — its ``score`` is still a
+    keyword placeholder, not a real fit score.
+
+    The genuine-grade signal is a persisted ``fit_reasoning`` — the evidence-first
+    reasoning a real Phase-2 grade always produces, and Phase 2 is the only writer
+    of the per-(job, target) fit score. ``scoring_status`` is NOT reliable here:
+    'complete' is set on rows that were never actually graded (deferred / reset),
+    so keying Pending off ``scoring_status != 'complete'`` surfaced ~2,300 keyword
+    placeholders in prod as if they were fit scores. A missing/blank reasoning ⇒
+    Pending regardless of status; the chip then shows a neutral symbol, not the
+    placeholder number."""
+    reasoning = row.get("fit_reasoning")
+    return not (isinstance(reasoning, str) and reasoning.strip())
 
 
 def _apply_score_floor(query: Any, min_score: int | None) -> Any:
