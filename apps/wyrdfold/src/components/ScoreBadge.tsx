@@ -21,7 +21,7 @@ interface ScoreBadgeProps {
    * placeholder. Authoritative from the API (derived from `fit_reasoning`); when
    * omitted, falls back to `scoring_status !== 'complete'`.
    */
-  pending?: boolean;
+  pending?: boolean | undefined;
   /** Native tooltip on the chip (e.g. the fit-score reasoning). */
   title?: string | undefined;
   className?: string;
