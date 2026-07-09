@@ -1295,12 +1295,16 @@ async def _poll_one_source(
                         )
                         break
                     batch = titles[start : start + PHASE1_BATCH_SIZE]
-                    # Past the budget check → these titles ARE triaged; a dropped
-                    # verdict for them is an LLM hiccup (fail-open), not a defer.
-                    for sp in range(start, min(start + len(batch), len(triage_candidates))):
-                        attempted_here.add(triage_candidates[sp][0] + 1)
                     verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
                     if result is not None:
+                        # A REAL LLM response → mark these titles attempted (a dropped
+                        # verdict is a hiccup, so it still fail-opens). A FAILED call
+                        # (result None: OpenRouter 401 / spent credit-limit / error)
+                        # leaves them UN-attempted → they DEFER, not fail-open admit,
+                        # and re-triage once the LLM is healthy. A dead key / spent cap
+                        # must PAUSE the pipeline, never flood 100% admit.
+                        for sp in range(start, min(start + len(batch), len(triage_candidates))):
+                            attempted_here.add(triage_candidates[sp][0] + 1)
                         try:
                             record_llm_cost(
                                 supabase,
@@ -2401,11 +2405,14 @@ async def _poll_one_source_for_target(
                     )
                     break
                 batch = titles[start : start + PHASE1_BATCH_SIZE]
-                # Past the budget check → these titles ARE triaged (attempted).
-                for sp in range(start, min(start + len(batch), len(triage_candidates))):
-                    phase1_attempted.add(triage_candidates[sp][0] + 1)
                 verdicts, result = await triage_titles(llm, target=target, titles=batch)
                 if result is not None:
+                    # A REAL LLM response → attempted. A FAILED call (result None:
+                    # OpenRouter 401 / spent limit / error) leaves these un-attempted
+                    # → they DEFER, not fail-open admit (a dead key must PAUSE the
+                    # pipeline, never flood 100% admit).
+                    for sp in range(start, min(start + len(batch), len(triage_candidates))):
+                        phase1_attempted.add(triage_candidates[sp][0] + 1)
                     try:
                         record_llm_cost(
                             supabase,

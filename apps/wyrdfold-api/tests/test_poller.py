@@ -754,16 +754,43 @@ async def test_phase1_triage_fails_open_on_budget_read_error(monkeypatch):
     because the once-per-cycle breaker already bounds the blast radius."""
     from unittest.mock import AsyncMock
 
+    from app.models.llm import LLMResult, LLMUsage
     from app.services.relevance.title_triage import TitleVerdict
 
     def boom(_sb: object) -> bool:
         raise RuntimeError("spend meter unreachable")
 
-    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, None))
-    summary, _jobs = await _run_triage_with_budget(monkeypatch, exhausted=boom, fake_triage=fake_triage)
+    # A real result (not None): the read error doesn't stop the LLM call, which
+    # succeeds and returns a promising verdict → the job ingests as before.
+    ok = LLMResult(
+        content="{}", model="claude-haiku-4-5", usage=LLMUsage(), cost_usd=0.0, latency_ms=1
+    )
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, ok))
+    summary, jobs_table = await _run_triage_with_budget(
+        monkeypatch, exhausted=boom, fake_triage=fake_triage
+    )
 
     assert summary["error"] is None
     assert fake_triage.await_count == 1  # fail-open: triage still ran
+    jobs_table.upsert.assert_called()  # real result → attempted → promising job ingests
+
+
+@pytest.mark.asyncio
+async def test_phase1_triage_defers_when_the_llm_call_fails(monkeypatch):
+    """Budget is fine so triage RUNS, but the LLM call FAILS (result None — e.g.
+    OpenRouter 401 / spent credit-limit / error): the un-triaged job DEFERS, not
+    fail-open admits. A dead key / spent cap must PAUSE the pipeline, never flood
+    100% admit — the exact prod incident that motivated this."""
+    from unittest.mock import AsyncMock
+
+    fake_triage = AsyncMock(return_value=({}, None))  # attempted, but FAILED
+    summary, jobs_table = await _run_triage_with_budget(
+        monkeypatch, exhausted=lambda _sb: False, fake_triage=fake_triage
+    )
+
+    assert summary["error"] is None
+    assert fake_triage.await_count == 1  # the call WAS made
+    jobs_table.upsert.assert_not_called()  # failed → deferred, NOT a fail-open flood
 
 
 # ---- alert-row refresh ------------------------------------------------------
@@ -953,13 +980,18 @@ async def test_phase1_verdicts_keyed_by_original_indices_after_free_gates(monkey
     target = _target_with_keywords(
         {"Zendesk": 3}, ["director of customer experience", "head of cx"]
     )
+    from app.models.llm import LLMResult, LLMUsage
+
+    ok = LLMResult(
+        content="{}", model="claude-haiku-4-5", usage=LLMUsage(), cost_usd=0.0, latency_ms=1
+    )
     fake_triage = AsyncMock(
         return_value=(
             {
                 1: TitleVerdict(id=1, promising=False),
                 2: TitleVerdict(id=2, promising=True),
             },
-            None,
+            ok,  # a real result -> the batch is attempted -> verdicts apply
         )
     )
 
