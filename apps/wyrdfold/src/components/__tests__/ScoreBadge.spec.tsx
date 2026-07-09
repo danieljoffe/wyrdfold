@@ -45,4 +45,20 @@ describe('ScoreBadge', () => {
     expect(screen.getByText('80')).toBeInTheDocument();
     expect(screen.getByLabelText('Match score 80')).toBeInTheDocument();
   });
+
+  it('shows a symbol when pending=true even if status is complete (ungraded row)', () => {
+    // The 'complete'-but-never-graded case: status says complete but there's no
+    // real fit grade. `pending` (fit_reasoning-derived) is authoritative — the
+    // keyword placeholder must never surface as a fit score, and no spinner
+    // since the row isn't actively scoring.
+    render(<ScoreBadge score={100} scoringStatus='complete' pending={true} />);
+    expect(screen.queryByText('100')).toBeNull();
+    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/scoring in progress/i)).toBeNull();
+  });
+
+  it('shows the number when pending=false (a real grade)', () => {
+    render(<ScoreBadge score={72} scoringStatus='complete' pending={false} />);
+    expect(screen.getByText('72')).toBeInTheDocument();
+  });
 });

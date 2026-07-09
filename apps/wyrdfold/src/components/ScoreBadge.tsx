@@ -16,6 +16,12 @@ interface ScoreBadgeProps {
   size?: CircleBadgeSize;
   /** When scoring is in flight, render a spinner beside the chip. */
   scoringStatus?: string | null | undefined;
+  /**
+   * True when the row has no real Sonnet fit grade — `score` is only a keyword
+   * placeholder. Authoritative from the API (derived from `fit_reasoning`); when
+   * omitted, falls back to `scoring_status !== 'complete'`.
+   */
+  pending?: boolean | undefined;
   /** Native tooltip on the chip (e.g. the fit-score reasoning). */
   title?: string | undefined;
   className?: string;
@@ -30,14 +36,19 @@ export default function ScoreBadge({
   variant,
   size = 'md',
   scoringStatus,
+  pending,
   title,
   className,
 }: ScoreBadgeProps) {
   // A not-yet-graded row carries only a keyword placeholder, not a real fit
-  // score (#47). Show a neutral "pending" chip — never the placeholder number,
-  // which would read as a graded fit score — plus the in-flight spinner. So the
-  // number the user sees on a chip is always a real Sonnet grade.
-  const isPending = !!scoringStatus && scoringStatus !== 'complete';
+  // score (#47). Show a neutral symbol — never the placeholder number, which
+  // would read as a graded fit score. `pending` (fit_reasoning-derived) is
+  // authoritative; fall back to the scoring_status heuristic when it's absent.
+  // scoring_status alone is unreliable — 'complete' is set on ungraded rows.
+  const isPending =
+    pending ?? (!!scoringStatus && scoringStatus !== 'complete');
+  // Spinner only while actively scoring — not for a done-but-ungraded row.
+  const isScoring = !!scoringStatus && scoringStatus !== 'complete';
   return (
     <span className='inline-flex shrink-0 items-center gap-1'>
       <CircleBadge
@@ -49,7 +60,7 @@ export default function ScoreBadge({
       >
         {isPending ? '·' : score}
       </CircleBadge>
-      {isPending && (
+      {isPending && isScoring && (
         <Spinner
           size='sm'
           aria-label={`Scoring in progress (${scoringStatus})`}
