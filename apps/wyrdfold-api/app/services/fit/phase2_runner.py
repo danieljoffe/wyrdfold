@@ -40,6 +40,7 @@ from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
 from app.services.embeddings.prescan_gate import (
     cosine_gate_admits_batch,
+    cosine_scores_batch,
     in_prescan_holdout,
 )
 from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
@@ -280,21 +281,25 @@ async def run_phase2_for_jobs(
         if not candidates:
             return 0
 
-    # Order candidates so the Phase 2 daily cap goes to the highest-leverage
-    # jobs first:
-    #   1) phase1_confidence DESC — Haiku's certainty in the promising
-    #      verdict (None sorts last; legacy rows get graded eventually).
-    #   2) first_seen_at DESC — among equal-confidence rows, prefer the
-    #      freshest.
+    # Order candidates so the Phase 2 daily cap goes to the highest-FIT-
+    # PROBABILITY jobs first. cosine(job, target) is the strongest cheap
+    # predictor of the eventual fit score — live grades show avg fit climbing
+    # monotonically with cosine (≈7 → 67 across the FE band), whereas
+    # phase1_confidence does NOT correlate (every confidence band grades to avg
+    # fit < 20). So order by (#9):
+    #   1) cosine DESC — the fit-predictive signal (missing → -1: sorts last,
+    #      for an un-embedded job or an un-calibrated target).
+    #   2) phase1_confidence DESC, then 3) first_seen_at DESC — tie-breakers.
     # ``first_seen_at`` is an ISO-8601 string, sortable lexically; missing
     # values sort last.
-    def _priority(jid: str) -> tuple[int, str]:
+    cosines = await cosine_scores_batch(supabase, target, candidates)
+
+    def _priority(jid: str) -> tuple[float, int, str]:
+        cos = cosines.get(jid, -1.0)
         conf = state[jid][3]  # phase1_confidence
-        # Treat None as -1 so any real confidence wins; combined with
-        # reverse=True the highest confidence comes first.
         c = int(conf) if conf is not None else -1
         seen = job_by_id[jid].get("first_seen_at") or ""
-        return (c, seen)
+        return (cos, c, seen)
 
     candidates.sort(key=_priority, reverse=True)
 
