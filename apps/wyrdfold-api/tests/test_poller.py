@@ -683,7 +683,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
     assert summary["updated"] == 0
 
 
-async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> dict:
+async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> tuple[dict, MagicMock]:
     """Drive ``_poll_one_source`` through the Phase-1 triage path with the
     global-budget re-check stubbed to ``exhausted`` (a predicate or an
     exception-raiser). Returns the poll summary."""
@@ -716,24 +716,35 @@ async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> dic
 
     open_gate = MagicMock()
     open_gate.target_blocked.return_value = False
-    return await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, budget_gate=open_gate)
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+    )
+    return summary, _jobs
 
 
 @pytest.mark.asyncio
 async def test_phase1_triage_defers_when_global_budget_exhausted(monkeypatch):
     """When the global daily cap is reached, the per-batch re-check stops
-    Phase 1 triage mid-cycle: ``triage_titles`` is never called and the job
-    fails-open ingests (verdict NULL) — same defer semantics as the per-cycle
-    breaker, but enforced WITHIN a long cycle so a backlog can't overshoot."""
+    Phase 1 triage mid-cycle: ``triage_titles`` is never called AND the
+    un-triaged job is DEFERRED, not ingested (#285 f/u). It re-polls and
+    re-triages next cycle once the budget resets — there is no admit-everything
+    fallback on budget exhaustion (prod was ~55% fail-open on budget, all
+    off-target)."""
     from unittest.mock import AsyncMock
 
     fake_triage = AsyncMock()  # must NOT be awaited
-    summary = await _run_triage_with_budget(
+    summary, jobs_table = await _run_triage_with_budget(
         monkeypatch, exhausted=lambda _sb: True, fake_triage=fake_triage
     )
 
     assert summary["error"] is None
     assert fake_triage.await_count == 0  # gate stopped the spend
+    # THE fix, end-to-end: a budget-deferred (never-triaged) job is DROPPED
+    # from the upsert — nothing is written, so it re-polls + re-triages next
+    # cycle. Under the old fail-open it WOULD have been upserted (admitted
+    # blind). (summary["new"] is mock-gated to 0 here regardless, so we assert
+    # on the upsert call itself — that's what the gate actually controls.)
+    jobs_table.upsert.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -749,7 +760,7 @@ async def test_phase1_triage_fails_open_on_budget_read_error(monkeypatch):
         raise RuntimeError("spend meter unreachable")
 
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, None))
-    summary = await _run_triage_with_budget(monkeypatch, exhausted=boom, fake_triage=fake_triage)
+    summary, _jobs = await _run_triage_with_budget(monkeypatch, exhausted=boom, fake_triage=fake_triage)
 
     assert summary["error"] is None
     assert fake_triage.await_count == 1  # fail-open: triage still ran
