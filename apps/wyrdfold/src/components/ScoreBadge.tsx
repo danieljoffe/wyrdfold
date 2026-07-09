@@ -3,11 +3,7 @@ import CircleBadge, {
   type CircleBadgeVariant,
   type CircleBadgeSize,
 } from '@/components/CircleBadge';
-
-/** Default score → semantic colour, shared by the jobs surfaces. */
-function defaultVariant(score: number): CircleBadgeVariant {
-  return score >= 70 ? 'success' : score >= 40 ? 'warning' : 'error';
-}
+import { fitScoreVariant } from '@/lib/fitScore';
 
 interface ScoreBadgeProps {
   score: number;
@@ -52,7 +48,7 @@ export default function ScoreBadge({
   return (
     <span className='inline-flex shrink-0 items-center gap-1'>
       <CircleBadge
-        variant={isPending ? 'default' : (variant ?? defaultVariant(score))}
+        variant={isPending ? 'default' : (variant ?? fitScoreVariant(score))}
         size={size}
         title={isPending ? 'Not yet scored — pending a full fit grade' : title}
         ariaLabel={isPending ? 'Fit score pending' : `Match score ${score}`}

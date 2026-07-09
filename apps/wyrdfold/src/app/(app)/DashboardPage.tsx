@@ -93,12 +93,6 @@ const PIPELINE_STATS: PipelineStat[] = [
   },
 ];
 
-function scoreBadgeVariant(score: number): 'success' | 'brand' | 'default' {
-  if (score >= 80) return 'success';
-  if (score >= 60) return 'brand';
-  return 'default';
-}
-
 // -- Component ----------------------------------------------------------------
 
 interface DashboardPageProps {
@@ -258,11 +252,7 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                 href={`/jobs/${posting.id}`}
                 className='group flex min-w-0 items-start gap-3 rounded-xl border border-border bg-surface-elevated p-3 transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
               >
-                <ScoreBadge
-                  score={posting.score}
-                  variant={scoreBadgeVariant(posting.score)}
-                  size='sm'
-                />
+                <ScoreBadge score={posting.score} size='sm' />
                 <div className='min-w-0 flex-1'>
                   <Text
                     variant='body'
