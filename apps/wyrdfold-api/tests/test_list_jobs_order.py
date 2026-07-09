@@ -90,18 +90,21 @@ def test_target_two_query_restores_score_desc_order() -> None:
             "score": 90,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-mid",
             "score": 60,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-low",
             "score": 30,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
     ]
     # Postings returned by .in_("id", page_ids) in DIFFERENT (storage) order.
@@ -151,6 +154,7 @@ def test_across_user_targets_restores_score_desc_order(
             "score": 80,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-mid",
@@ -158,6 +162,7 @@ def test_across_user_targets_restores_score_desc_order(
             "score": 50,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-low",
@@ -165,6 +170,7 @@ def test_across_user_targets_restores_score_desc_order(
             "score": 20,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
     ]
     postings_in_storage_order = [
@@ -242,18 +248,21 @@ def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
             "score": 90,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-india",
             "score": 70,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
         {
             "job_posting_id": "j-brazil",
             "score": 50,
             "score_breakdown": {},
             "scoring_status": "complete",
+            "fit_reasoning": "graded match",
         },
     ]
     postings = [
@@ -487,3 +496,85 @@ def test_gate_live_us_applies_archived_and_non_us_filters() -> None:
     assert ("is_", "is_us", "false") in calls  # non-US gate
     # the is_us filter is NEGATED (is_us IS NOT false), so `not_` precedes it
     assert calls.index(("not_",)) < calls.index(("is_", "is_us", "false"))
+
+
+# ── Pending-tier recency sort (#47 f/u) ─────────────────────────────────────
+
+
+def test_rank_graded_first_orders_pending_by_recency_key() -> None:
+    """The Pending bucket sorts by ``pending_value`` (recency), graded by
+    ``value`` (fit score): a stale Pending row with a HIGH keyword score sinks
+    below a fresh Pending row with a LOW one. Without ``pending_value`` it falls
+    back to ``value`` (the old keyword-score ordering)."""
+    from app.routers.jobs import _rank_graded_first
+
+    rows = [
+        {"id": "g-hi", "fit_reasoning": "x", "disp": 80, "fs": "2026-07-05"},
+        {"id": "g-lo", "fit_reasoning": "x", "disp": 60, "fs": "2026-07-04"},
+        {"id": "p-old", "fit_reasoning": None, "disp": 90, "fs": "2026-07-01"},
+        {"id": "p-new", "fit_reasoning": None, "disp": 40, "fs": "2026-07-09"},
+    ]
+    ranked = _rank_graded_first(
+        rows,
+        value=lambda r: (r["disp"], r["id"]),
+        ascending=False,
+        pending_value=lambda r: (r["fs"], r["id"]),
+    )
+    # graded by score, then Pending NEWEST-first (07-09 before 07-01) even though
+    # the fresh one's keyword score (40) is lower than the stale one's (90).
+    assert [r["id"] for r in ranked] == ["g-hi", "g-lo", "p-new", "p-old"]
+
+    # Fallback (no pending_value) keeps the old behavior: Pending by `value`, so
+    # the high-keyword stale row leads its bucket.
+    ranked_fallback = _rank_graded_first(
+        rows, value=lambda r: (r["disp"], r["id"]), ascending=False
+    )
+    assert [r["id"] for r in ranked_fallback] == ["g-hi", "g-lo", "p-old", "p-new"]
+
+
+def test_two_query_pending_sorts_by_recency_not_keyword_score(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through the score-sorted two-query path: within the Pending
+    tier, fresh ungraded jobs outrank stale ones by first_seen_at — NOT by the
+    hidden keyword placeholder. Decay is OFF, so this also exercises the forced
+    first-seen fetch (the case the ``force`` flag exists for)."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    ts_rows = [
+        {"job_posting_id": "g-hi", "score": 80, "score_breakdown": {},
+         "scoring_status": "complete", "fit_reasoning": "strong match"},
+        {"job_posting_id": "g-lo", "score": 60, "score_breakdown": {},
+         "scoring_status": "complete", "fit_reasoning": "ok match"},
+        # Pending (no fit_reasoning) with keyword placeholders: the stale one
+        # carries the HIGHER keyword score.
+        {"job_posting_id": "p-old-hi", "score": 90, "score_breakdown": {},
+         "scoring_status": "stage2", "fit_reasoning": None},
+        {"job_posting_id": "p-new-lo", "score": 40, "score_breakdown": {},
+         "scoring_status": "stage2", "fit_reasoning": None},
+    ]
+    jobs_rows = [
+        {"id": "g-hi", "title": "graded hi", "first_seen_at": "2026-07-05"},
+        {"id": "g-lo", "title": "graded lo", "first_seen_at": "2026-07-04"},
+        {"id": "p-old-hi", "title": "pending old high-keyword", "first_seen_at": "2026-07-01"},
+        {"id": "p-new-lo", "title": "pending new low-keyword", "first_seen_at": "2026-07-09"},
+    ]
+    sb = _supabase_with({"scores": _Resp(ts_rows, count=4), "jobs": _Resp(jobs_rows)})
+
+    result = _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        cursor={},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+    )
+
+    # graded first (fit score), then Pending newest-first: p-new-lo (07-09) ABOVE
+    # p-old-hi (07-01) despite 40 < 90 keyword scores.
+    assert [p["id"] for p in result["postings"]] == ["g-hi", "g-lo", "p-new-lo", "p-old-hi"]

@@ -435,15 +435,19 @@ def _list_jobs_for_target_rpc(
     return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
-def _first_seen_lookup(supabase: Client, job_ids: list[str]) -> dict[str, Any]:
-    """``job_posting_id`` → ``first_seen_at`` for the recency-decay sort.
+def _first_seen_lookup(
+    supabase: Client, job_ids: list[str], *, force: bool = False
+) -> dict[str, Any]:
+    """``job_posting_id`` → ``first_seen_at``, for recency-aware ordering.
 
-    Only needed when decay is on: the display sort value otherwise ignores
-    recency, so we skip the round-trip entirely. Chunked to respect the
-    IN-list cap, like ``_fetch_jobs_chunked``.
+    Two callers need it: the recency-decay display value (when decay is on), and
+    the Pending-tier recency sort (``force=True``, used on the score sort so fresh
+    ungraded rows surface even with decay off — #47 f/u). Skipped otherwise; the
+    round-trip isn't free. Chunked to respect the IN-list cap, like
+    ``_fetch_jobs_chunked``.
     """
     lookup: dict[str, Any] = {}
-    if not settings.recency_decay_enabled or not job_ids:
+    if (not settings.recency_decay_enabled and not force) or not job_ids:
         return lookup
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
@@ -523,16 +527,22 @@ def _rank_graded_first(
     *,
     value: Callable[[dict[str, Any]], Any],
     ascending: bool,
+    pending_value: Callable[[dict[str, Any]], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Order ``rows`` for the score sort so graded rows always precede Pending
-    ones, each bucket sorted by ``value`` in the requested direction (#47).
+    ones. Graded rows sort by ``value`` (the display fit score); Pending rows
+    sort by ``pending_value`` when supplied — recency (first_seen_at), so fresh
+    ungraded postings surface at the top of the Pending tier instead of being
+    ranked by the hidden keyword placeholder ``value`` returns for them. Falls
+    back to ``value`` for Pending when ``pending_value`` is None (#47 f/u).
 
     Graded-first holds regardless of sort direction: a Pending row carries only
     a keyword placeholder, so interleaving by raw value would let an ungraded 80
     outrank a graded 75. Bucketing keeps the real grades on top and the
     not-yet-judged queue beneath them."""
     graded = sorted((r for r in rows if not _is_pending(r)), key=value, reverse=not ascending)
-    pending = sorted((r for r in rows if _is_pending(r)), key=value, reverse=not ascending)
+    pkey = pending_value if pending_value is not None else value
+    pending = sorted((r for r in rows if _is_pending(r)), key=pkey, reverse=not ascending)
     return graded + pending
 
 
@@ -659,7 +669,11 @@ def _assemble_jobs_page(
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
-    fs_lookup = _first_seen_lookup(supabase, list(by_id.keys()))
+    # Force the first-seen fetch on the score sort even with decay off — the
+    # Pending-tier recency sort keys on it (#47 f/u).
+    fs_lookup = _first_seen_lookup(
+        supabase, list(by_id.keys()), force=(sort == "score" or sort_col == "score")
+    )
 
     def _display(row: dict[str, Any]) -> int:
         return _display_sort_value(
@@ -684,6 +698,13 @@ def _assemble_jobs_page(
             list(by_id.values()),
             value=lambda r: (_display(r), r["job_posting_id"]),
             ascending=ascending,
+            # Pending rows have no real fit score; order them by recency
+            # (first_seen_at) so fresh ungraded jobs surface, not by the hidden
+            # keyword placeholder _display returns for them (#47 f/u).
+            pending_value=lambda r: (
+                fs_lookup.get(r["job_posting_id"]) or "",
+                r["job_posting_id"],
+            ),
         )
         page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
         total: int | None = len(ranked)
@@ -739,8 +760,14 @@ def _assemble_jobs_page(
             return "" if val is None else val
 
         if sort == "score":
-            # Pending below graded (#47), each bucket by display value.
-            postings = _rank_graded_first(postings, value=_sort_key, ascending=ascending)
+            # Pending below graded (#47); graded by display value, Pending by
+            # recency (first_seen_at) so fresh ungraded jobs surface (#47 f/u).
+            postings = _rank_graded_first(
+                postings,
+                value=_sort_key,
+                ascending=ascending,
+                pending_value=lambda p: (fs_lookup.get(p["id"]) or "", p["id"]),
+            )
         else:
             postings.sort(key=_sort_key, reverse=not ascending)
         if total is None:

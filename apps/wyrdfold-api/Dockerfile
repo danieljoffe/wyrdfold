@@ -4,7 +4,7 @@
 # Resolves the uv-managed virtualenv into /app/.venv. uv + the lockfile + the
 # build-context pyproject files only live in this stage; the runtime image
 # never sees them.
-FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS builder
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -29,7 +29,7 @@ COPY apps/wyrdfold-api/pyproject.toml ./apps/wyrdfold-api/pyproject.toml
 RUN uv sync --frozen --no-dev --no-editable --package wyrdfold-api
 
 # ---- runtime ----------------------------------------------------------------
-FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS runtime
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS runtime
 
 # pandoc is shelled out to by the DOCX render pipeline; the rest of the
 # runtime stays bare (no uv, no apt cache, no monorepo lockfiles).
