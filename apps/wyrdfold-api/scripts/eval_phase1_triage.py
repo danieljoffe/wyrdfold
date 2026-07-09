@@ -68,16 +68,26 @@ _FIXTURE_PATH = (
 )
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
-# The three slugs we want — overrideable via --models if needed.
+# Candidate slugs — select a subset via --models. sonnet-4.6 is the usual
+# oracle (--reference sonnet-4.6); the rest are triage-swap candidates weighed
+# on agreement-with-oracle, FNR (dropping real matches is unrecoverable),
+# cost, and latency.
 _DEFAULT_MODELS: dict[str, str] = {
     "haiku-4.5": "anthropic/claude-haiku-4.5",
     "sonnet-4.6": MODELS["sonnet-4.6"],
     "deepseek-v3.2": MODELS["deepseek-v3.2"],
+    "gemini-2.5-flash": "google/gemini-2.5-flash",
+    "gemini-flash-lite": "google/gemini-2.5-flash-lite",
+    "llama-3.3-70b": "meta-llama/llama-3.3-70b-instruct",
+    "qwen3-235b": "qwen/qwen3-235b-a22b-2507",
+    "mistral-small-3.2": "mistralai/mistral-small-3.2-24b-instruct",
 }
 
-# Phase 1 emits one TitleVerdict per id. Output for a 25-title batch is
-# ~25 × 30 tokens = 750 tokens plus envelope, well under 2K.
-_MAX_OUTPUT_TOKENS = 2048
+# Phase 1 emits one TitleVerdict per id. A 25-title batch is ~750 tokens, but a
+# prod-size 250-title batch is ~7.5K — size the cap to match prod so large-batch
+# runs don't silently truncate (a 2K cap dropped verdicts → 0% coverage, an
+# eval-only artifact; prod's triage_titles already uses 10240).
+_MAX_OUTPUT_TOKENS = 10240
 
 # Below this fraction of the reference's verdicts answered, a candidate model's
 # agreement number is measured over too small a subset to trust — flagged as a
@@ -580,6 +590,13 @@ def main() -> None:
         help="Comma-separated subset of {haiku-4.5,sonnet-4.6,deepseek-v3.2}.",
     )
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--reference",
+        type=str,
+        default="haiku-4.5",
+        help="Reference/oracle model to score agreement against (default haiku-4.5). "
+        "Use e.g. sonnet-4.6 to treat the strongest model as ground truth.",
+    )
     args = parser.parse_args()
 
     fixture = _load_fixture()
@@ -593,6 +610,12 @@ def main() -> None:
             raise SystemExit(f"No matching models in --models={args.models!r}.")
     else:
         models = _DEFAULT_MODELS
+
+    # Fail fast BEFORE spending on the eval run if the oracle isn't in the set.
+    if args.reference not in models:
+        raise SystemExit(
+            f"--reference={args.reference!r} must be one of the run's models: {sorted(models)}"
+        )
 
     n_titles = sum(len(v) for v in titles_by_target.values())
     n_batches = sum(
@@ -629,7 +652,9 @@ def main() -> None:
         )
     )
 
-    report = _agreement_report(final["results"], titles_by_target, models)
+    report = _agreement_report(
+        final["results"], titles_by_target, models, reference=args.reference
+    )
     # Correctness vs ground-truth labels when the fixture carries them (#193):
     # measures each model against TRUTH, not just cross-model agreement. Skipped
     # (empty) for unlabeled real-data snapshots.
