@@ -232,6 +232,44 @@ async def cosine_gate_admits_batch(
         return dict.fromkeys(ids, None)  # fail-open on any error
 
 
+async def cosine_scores_batch(
+    supabase: Client,
+    target: JobTarget,
+    job_ids: list[str],
+    *,
+    model: EmbeddingModelId = DEFAULT_MODEL,
+) -> dict[str, float]:
+    """Cosine(job, target) VALUES for many jobs of ONE target — for
+    fit-predictive Phase-2 grading priority (#9).
+
+    Same two reads as :func:`cosine_gate_admits_batch` (one target vector, one
+    job-vectors batch), but returns the raw similarity per job instead of the
+    gate verdict, so the runner can order the daily grade quota by the signal
+    that actually predicts fit: live grades show avg fit climbing monotonically
+    with cosine, while ``phase1_confidence`` does not correlate. A missing job
+    vector, an un-embedded target, or a dim mismatch omits that job — the caller
+    treats an absent score as lowest priority. Never raises (best-effort
+    ordering; the sort just falls back to its tie-breakers).
+    """
+    ids = list(dict.fromkeys(j for j in job_ids if j))
+    if not ids:
+        return {}
+    try:
+        target_vec, _threshold = await _fetch_target_gate(supabase, target_id=target.id)
+        if target_vec is None:
+            return {}
+        job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
+        out: dict[str, float] = {}
+        for jid in ids:
+            jv = job_vecs.get(jid)
+            if jv is not None and len(jv) == len(target_vec):
+                out[jid] = cosine(jv, target_vec)
+        return out
+    except Exception:
+        logger.exception("Pre-scan cosine scores failed for target %s", target.id)
+        return {}
+
+
 def in_prescan_holdout(job_id: str, target_id: str, fraction: float) -> bool:
     """Deterministic membership in the #90 exploration holdout.
 
