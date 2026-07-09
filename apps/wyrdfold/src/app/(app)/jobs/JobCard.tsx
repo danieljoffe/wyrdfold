@@ -101,7 +101,11 @@ export default function JobCard({
             aria-label={`Select ${job.title}`}
             className='mt-0.5 shrink-0 accent-brand-500'
           />
-          <ScoreBadge score={job.score} scoringStatus={job.scoring_status} />
+          <ScoreBadge
+            score={job.score}
+            scoringStatus={job.scoring_status}
+            pending={job.pending}
+          />
           <span className='truncate text-sm font-medium leading-tight text-text-primary'>
             {job.title}
           </span>
