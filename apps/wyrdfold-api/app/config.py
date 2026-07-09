@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.models.llm import ModelId
+
 # Tests set WYRDFOLD_API_TESTING=1 in conftest before importing the app
 # so the developer's real `.env` (with experimental flags like
 # RECENCY_DECAY_ENABLED / PHASE1_TRIAGE_ENABLED) can't leak into the
@@ -258,6 +260,13 @@ class Settings(BaseSettings):
     # band (0-39); NULL-confidence (legacy / pre-confidence) verdicts are
     # exempt and still admit, preserving the lean-promising default.
     phase1_min_confidence: int = Field(default=40, ge=0, le=100)
+
+    # Which model backs Phase-1 title triage. Default Haiku (proven incumbent,
+    # Anthropic-shaped via OpenRouter). Set PHASE1_TRIAGE_MODEL=deepseek-v3-2 to
+    # route triage through OpenRouter's OpenAI-compatible path — 13x cheaper and
+    # higher agreement-with-oracle in the bake-off, but slower. A safe env flip:
+    # revert instantly by unsetting it, no deploy. Grading (Sonnet) is unaffected.
+    phase1_triage_model: ModelId = "claude-haiku-4-5"
 
     # Recency decay (#5). When True the /jobs list sorts/paginates by
     # ``scores.recency_score`` (the fit score decayed by posting age via

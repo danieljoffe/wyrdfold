@@ -152,6 +152,7 @@ async def test_poll_due_sources_polls_only_due_rows() -> None:
         result = await poll_due_sources(supabase)
 
     assert poll_one.await_count == 1
+    assert poll_one.await_args is not None
     polled_source = poll_one.await_args.args[0]
     assert polled_source["company_name"] == "Due Co"
     assert result.sources_polled == 1
@@ -190,3 +191,30 @@ async def test_poll_due_sources_aggregates_errors() -> None:
 
     assert result.sources_polled == 1
     assert result.errors == ["B: poll failed"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#285 regression: the untagged-backlog sweep must run every cycle —
+    including one where no source is due. It's independent of source polling and
+    sits BEFORE the ``not due`` early-exit, so a quiet cycle still drains it."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "qualification_enabled", True)
+    monkeypatch.setattr(live_settings, "qualification_backfill_batch", 50)
+
+    just_now = datetime.now(UTC).isoformat()
+    supabase = _supabase_returning([_src(last_polled_at=just_now, poll_interval_minutes=240)])
+
+    with (
+        patch("app.services.poller.get_latest_optimized", return_value=None),
+        patch("app.services.poller._poll_one_source") as poll_one,
+        patch("app.services.poller._backfill_qualify_stale", new_callable=AsyncMock) as backfill,
+    ):
+        result = await poll_due_sources(supabase)
+
+    assert result.sources_polled == 0
+    poll_one.assert_not_called()  # nothing was due to poll
+    backfill.assert_awaited_once()  # ...but the sweep still ran
+    assert backfill.await_args is not None
+    assert backfill.await_args.args[1] == 50  # with the configured batch

@@ -319,6 +319,37 @@ def _passes_free_gates(job: StandardJob, active_targets: list[JobTarget]) -> boo
     return _is_us_location(job.location_name)
 
 
+def _phase1_promising(
+    verdict: TitleVerdict | None,
+    *,
+    attempted: bool,
+    gate_active: bool,
+    min_confidence: int,
+) -> bool | None:
+    """Phase-1 admission decision WITH budget-deferral (#285 follow-on).
+
+    Replaces the blanket fail-open. A missing verdict means one of two very
+    different things, and we must not conflate them:
+
+    - ``attempted`` — this target actually SENT this title to the triage LLM
+      this cycle. A verdict present → use it; a missing verdict is a genuine
+      LLM hiccup (dropped id) and still fail-opens to admit, so a rare model
+      glitch can't drop a relevant posting.
+    - NOT ``attempted`` — the target never triaged this title because the
+      daily LLM budget / payer allowance was exhausted (poller breaks out of
+      triage mid-cycle). Returns ``None`` = DEFER: the job is excluded now
+      (not shown, not Phase-2 graded) and re-triaged once the budget resets.
+      There is NO admit-everything fallback on budget exhaustion — the whole
+      point of this fix (prod was ~55% fail-open on budget, all off-target).
+
+    ``gate_active`` False (triage disabled / no targets) keeps the legacy
+    admit-all behavior so turning the gate off is unchanged.
+    """
+    if not gate_active or attempted:
+        return admitted(verdict, min_confidence=min_confidence)
+    return None
+
+
 def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, str]:
     """Stable lowercase + collapsed-whitespace key for the
     (company, title) dedupe pass. Whitespace differences ("Director"
@@ -1191,11 +1222,23 @@ async def _poll_one_source(
         # simply have no verdict entry — fail-open admit at the Phase 1
         # gate, then dropped at the free gates exactly as before.
         phase1_verdicts: dict[str, dict[int, TitleVerdict]] = {}
+        # Per target, the set of global job idxs actually SENT to triage this
+        # cycle. Drives the budget-defer decision in _phase1_promising: a
+        # missing verdict for an attempted job fail-opens (LLM hiccup); a
+        # missing verdict for a NON-attempted job was budget-deferred → defer.
+        phase1_attempted: dict[str, set[int]] = {}
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
             if job.external_id not in known_external_ids and _passes_free_gates(job, active_targets)
         ]
+        # Grade the most RECENT first (#285 f/u): if the daily budget truncates
+        # triage mid-cycle, the deferred tail should be the OLDEST postings, not
+        # the newest. Global idx travels with each row, so verdict mapping is
+        # unaffected. Undated rows sort last.
+        triage_candidates.sort(
+            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+        )
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             titles = [job.title for _, job in triage_candidates]
             for active_target in active_targets:
@@ -1206,6 +1249,7 @@ async def _poll_one_source(
                     # graded once the payer's window frees up. Same defer
                     # semantics as the Phase 2 daily cap.
                     phase1_verdicts[active_target.id] = {}
+                    phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
                         "Phase 1 deferred for target %s (payer %s over "
                         "monthly allowance or unknown)",
@@ -1221,6 +1265,7 @@ async def _poll_one_source(
                 llm = _resolve_payer_client(payer_clients, supabase, payer)
                 if llm is None:
                     phase1_verdicts[active_target.id] = {}
+                    phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
                         "Phase 1 deferred for target %s (payer %s has no BYOK key)",
                         active_target.id,
@@ -1231,6 +1276,7 @@ async def _poll_one_source(
                 # return well under one batch (10-200 jobs); larger
                 # sources spread cost across multiple calls.
                 target_verdicts: dict[int, TitleVerdict] = {}
+                attempted_here: set[int] = set()
                 for start in range(0, len(titles), PHASE1_BATCH_SIZE):
                     # Re-check the global daily cap before each batch (#60
                     # overspend fix). The per-cycle gate above trips the
@@ -1249,6 +1295,10 @@ async def _poll_one_source(
                         )
                         break
                     batch = titles[start : start + PHASE1_BATCH_SIZE]
+                    # Past the budget check → these titles ARE triaged; a dropped
+                    # verdict for them is an LLM hiccup (fail-open), not a defer.
+                    for sp in range(start, min(start + len(batch), len(triage_candidates))):
+                        attempted_here.add(triage_candidates[sp][0] + 1)
                     verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
                     if result is not None:
                         try:
@@ -1277,17 +1327,23 @@ async def _poll_one_source(
                             global_idx = triage_candidates[subset_pos][0] + 1
                             target_verdicts[global_idx] = verdict
                 phase1_verdicts[active_target.id] = target_verdicts
+                phase1_attempted[active_target.id] = attempted_here
 
         def _any_target_admits(global_job_idx: int) -> bool:
             """``global_job_idx`` is 1-based (matches Phase 1's id contract).
 
-            Fail-open: a missing verdict (LLM didn't return an id) is
-            treated as PROMISING. Same semantics as before the
-            confidence rollout.
+            Admit iff a target that ACTUALLY TRIAGED this job admits it — a
+            real promising verdict, or a missing verdict for a job we DID send
+            to triage (an LLM hiccup, still fail-open). A target that
+            budget-DEFERRED the job (never triaged it) does NOT contribute an
+            admit, so a job deferred by every target is dropped from the upsert
+            and re-triaged next cycle rather than admitted blind (#285 f/u).
             """
             if not phase1_verdicts:
                 return True  # gate disabled or no targets — admit
-            for target_verdicts in phase1_verdicts.values():
+            for tid, target_verdicts in phase1_verdicts.items():
+                if global_job_idx not in phase1_attempted.get(tid, set()):
+                    continue  # budget-deferred for this target → no admit
                 v = target_verdicts.get(global_job_idx)
                 if v is None or v.promising:
                     return True
@@ -1473,11 +1529,22 @@ async def _poll_one_source(
                         ext_id = row_data.get("external_id", "")
                         phase1_idx = phase1_idx_by_external_id.get(ext_id)
                         verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
-                        # Gate admission on the model's confidence (#47): a
-                        # promising-but-guessing verdict (confidence below the
-                        # floor) is dropped. Fail-open unchanged — a missing or
-                        # NULL-confidence verdict still admits.
-                        promising = admitted(verdict, min_confidence=settings.phase1_min_confidence)
+                        # Gate admission on confidence (#47) AND budget-deferral
+                        # (#285 f/u): a missing verdict fail-opens ONLY if this
+                        # target actually triaged the job; a job the budget
+                        # deferred (never triaged) → promising=None = defer
+                        # (excluded now, re-triaged after the budget resets),
+                        # never admit-blind.
+                        attempted_here = (
+                            phase1_idx is not None
+                            and phase1_idx in phase1_attempted.get(target.id, set())
+                        )
+                        promising = _phase1_promising(
+                            verdict,
+                            attempted=attempted_here,
+                            gate_active=bool(phase1_verdicts),
+                            min_confidence=settings.phase1_min_confidence,
+                        )
                         phase1_confidence = verdict.confidence if verdict is not None else None
                         stage2 = await _db_to_thread(
                             target_score_and_upsert,
@@ -2195,6 +2262,16 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     await _maybe_run_lifecycle_sweep(supabase)
 
     due = filter_due_sources(all_enabled)
+
+    # Drain a slice of the untagged backlog (#285) EVERY cycle — jobs orphaned
+    # when a source stopped re-appearing in its feed never re-enter
+    # ``_qualify_jobs`` below, so they'd bypass the read gates forever. Runs
+    # independent of whether any source is due (a quiet cycle still drains it),
+    # and BEFORE the ``not due`` early-exit so it isn't skipped. Self-budget-
+    # gated (respects the grading reserve); best-effort.
+    if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
+        await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
+
     if not due:
         return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
 
@@ -2230,13 +2307,6 @@ async def poll_due_sources(supabase: Client) -> PollResult:
         result.archived_jobs += s["archived"]
         if s["error"]:
             result.errors.append(s["error"])
-
-    # Drain a slice of the untagged backlog (#285): jobs orphaned when a source
-    # stopped re-appearing in its feed never re-enter ``_qualify_jobs`` above,
-    # so they'd bypass the read gates forever. Best-effort + budget-gated; once
-    # per scheduled cycle, after the live sources are polled.
-    if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
-        await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
 
     return result
 
@@ -2290,12 +2360,21 @@ async def _poll_one_source_for_target(
         # by ORIGINAL 1-based job index via the candidate mapping;
         # non-survivors have no entry (fail-open, then free-gate drop).
         target_verdicts: dict[int, TitleVerdict] = {}
+        # Global idxs actually sent to triage (before any budget defer). Missing
+        # verdict for these = LLM hiccup (fail-open); missing for others = budget
+        # defer → defer, don't admit (#285 f/u). See _phase1_promising.
+        phase1_attempted: set[int] = set()
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
             if _title_matches_target(job.title, target.search_keywords)
             and _is_us_location(job.location_name)
         ]
+        # Grade the most RECENT first (#285 f/u): budget truncation defers the
+        # oldest tail, not the newest. Undated rows sort last.
+        triage_candidates.sort(
+            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+        )
         # BYOK (#5 P3): triage on the payer's own key. ``None`` means
         # triage is off / over-budget / no BYOK key in require-mode — all
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
@@ -2322,6 +2401,9 @@ async def _poll_one_source_for_target(
                     )
                     break
                 batch = titles[start : start + PHASE1_BATCH_SIZE]
+                # Past the budget check → these titles ARE triaged (attempted).
+                for sp in range(start, min(start + len(batch), len(triage_candidates))):
+                    phase1_attempted.add(triage_candidates[sp][0] + 1)
                 verdicts, result = await triage_titles(llm, target=target, titles=batch)
                 if result is not None:
                     try:
@@ -2359,11 +2441,14 @@ async def _poll_one_source_for_target(
                 continue
             if not _is_us_location(job.location_name):
                 continue
-            # Phase 1 ids are 1-based. Fail-open when no verdict (gate
-            # disabled or LLM dropped the entry).
-            if target_verdicts:
-                v = target_verdicts.get(idx + 1)
-                if v is not None and not v.promising:
+            # Phase 1 ids are 1-based. A missing verdict fail-opens ONLY for a
+            # job we actually triaged (LLM dropped an id). A job the budget
+            # DEFERRED (never triaged) is dropped from the upsert here — deferred,
+            # re-triaged next cycle, not admitted blind (#285 f/u).
+            if settings.phase1_triage_enabled:
+                gj = idx + 1
+                v = target_verdicts.get(gj)
+                if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
             salary = job.salary_text or extract_salary_from_text(strip_html(job.content))
@@ -2455,8 +2540,15 @@ async def _poll_one_source_for_target(
                     ext_id = row_data.get("external_id", "")
                     phase1_idx = phase1_idx_by_external_id.get(ext_id)
                     verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
-                    # Gate admission on confidence (#47) — see the other poll path.
-                    promising = admitted(verdict, min_confidence=settings.phase1_min_confidence)
+                    # Confidence gate (#47) + budget-deferral (#285 f/u): defer a
+                    # never-triaged job instead of admitting it blind.
+                    attempted_here = phase1_idx is not None and phase1_idx in phase1_attempted
+                    promising = _phase1_promising(
+                        verdict,
+                        attempted=attempted_here,
+                        gate_active=settings.phase1_triage_enabled,
+                        min_confidence=settings.phase1_min_confidence,
+                    )
                     phase1_confidence = verdict.confidence if verdict is not None else None
                     stage2 = await _db_to_thread(
                         target_score_and_upsert,
