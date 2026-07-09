@@ -36,12 +36,17 @@ Batching
   parallelization isn't needed — the model handles 250 inputs
   comfortably within its context window.
 
-Fail-open
-- Any LLM/network error returns an empty verdict map. The poller
-  reads "no verdict" as "fail-open admit" so a Phase 1 outage
-  doesn't stop ingestion — it just removes the precision filter
-  for that poll cycle. Symmetric with the cosine prefilter's
-  prior contract.
+Failure vs dropped verdict — two different fail modes
+- A FAILED call (network / auth / daily-limit error) returns ``({}, None)``.
+  The poller marks titles "attempted" only on a REAL result, so a failed call
+  leaves them un-attempted → they DEFER and re-triage next cycle. A dead key or
+  spent daily limit therefore PAUSES admission rather than flooding 100% admit
+  (#285/#294). This replaced the old "any error fail-opens" contract.
+- A SUCCESSFUL call that DROPS a verdict (the model omits an id, or the
+  ``title_prefix`` cross-check rejects a transposition) leaves that one
+  attempted title with no verdict → the poller fail-opens it (admits) so a
+  relevant posting isn't lost. That per-title hiccup is the only fail-open left,
+  and it's intentional (false positives are cheap; Phase 2 catches them).
 """
 
 from __future__ import annotations
@@ -335,9 +340,13 @@ async def triage_titles(
             cache_system=True,
         )
     except Exception:
-        # Fail-open: log and return empty so the caller admits everything.
+        # Return ({}, None). The caller (poller) marks titles "attempted" only on
+        # a real LLM result, so a failed call leaves them un-attempted → they
+        # DEFER (re-triaged next cycle), NOT fail-open admit. A dead key / spent
+        # daily limit must PAUSE admission, never flood 100% admit (#285/#294).
         logger.exception(
-            "Phase 1 title triage failed for target %s (%s); admitting all",
+            "Phase 1 title triage call failed for target %s (%s); returning no "
+            "verdicts — the poller DEFERS these un-attempted titles (not admit)",
             target.id,
             target.label,
         )
