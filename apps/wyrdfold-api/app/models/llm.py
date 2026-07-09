@@ -14,6 +14,10 @@ ModelId = Literal[
     "claude-opus-4-7",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
+    # Non-Anthropic, reached via OpenRouter's OpenAI-compatible endpoint
+    # (see OpenRouterLLMClient's OpenAI-shaped path). DeepSeek V3.2 backs
+    # Phase-1 triage when phase1_triage_model selects it.
+    "deepseek-v3-2",
 ]
 """Models this workspace targets. Extend as new models land."""
 
