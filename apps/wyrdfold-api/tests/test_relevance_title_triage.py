@@ -433,3 +433,25 @@ def test_admitted_is_fail_open_for_missing_or_legacy_verdicts() -> None:
 def test_admitted_rejects_unpromising_regardless_of_confidence() -> None:
     assert admitted(TitleVerdict(id=1, promising=False, confidence=95), min_confidence=40) is False
     assert admitted(TitleVerdict(id=1, promising=False, confidence=10), min_confidence=40) is False
+
+
+@pytest.mark.asyncio
+async def test_triage_defaults_to_configured_phase1_model(monkeypatch) -> None:
+    """With no explicit ``model=``, triage_titles resolves it from
+    ``settings.phase1_triage_model`` — so PHASE1_TRIAGE_MODEL=deepseek-v3-2 routes
+    triage to deepseek without changing any call site (deepseek trial)."""
+    from app.config import settings
+    from app.models.llm import LLMResult, LLMUsage
+
+    monkeypatch.setattr(settings, "phase1_triage_model", "deepseek-v3-2")
+    captured: dict[str, object] = {}
+
+    async def _fake_complete_json(client: object, *, model: str, **kwargs: object):
+        captured["model"] = model
+        return TitleTriageResponse(verdicts=[]), LLMResult(
+            content="{}", model=model, usage=LLMUsage(), cost_usd=0.0, latency_ms=1
+        )
+
+    monkeypatch.setattr("app.services.relevance.title_triage.complete_json", _fake_complete_json)
+    await triage_titles(MagicMock(), target=_target(), titles=["Senior Frontend Engineer"])
+    assert captured["model"] == "deepseek-v3-2"

@@ -35,6 +35,10 @@ PRICING: dict[ModelId, ModelPricing] = {
     "claude-opus-4-7": ModelPricing(input=15.00, output=75.00),
     "claude-sonnet-4-6": ModelPricing(input=3.00, output=15.00),
     "claude-haiku-4-5": ModelPricing(input=0.80, output=4.00),
+    # DeepSeek V3.2 via OpenRouter (USD/Mtok, approx — verify against the
+    # OpenRouter model page). ~13x cheaper than Haiku on input; the cache_read
+    # 0.1x ratio is Anthropic's, close enough for internal cost tracking.
+    "deepseek-v3-2": ModelPricing(input=0.27, output=0.40),
 }
 
 

@@ -50,6 +50,7 @@ import logging
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
 from app.models.targets import JobTarget
 from app.services.llm.client import LLMClient, complete_json
@@ -57,11 +58,11 @@ from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrust
 
 logger = logging.getLogger(__name__)
 
-# Haiku 4.5 — the cheap-fast tier. At ~$1/1M input tokens it's two
-# orders of magnitude under Sonnet for what's a binary classification
-# task. Switching back to Sonnet would just inflate cost without
-# moving precision in any test I've run; Phase 2 is where Sonnet
-# earns its keep.
+# The DEFAULT Phase-1 model — Haiku 4.5, the cheap-fast tier (~$1/1M input,
+# two orders under Sonnet for a binary classification task). The RUNTIME model
+# is ``settings.phase1_triage_model`` (env PHASE1_TRIAGE_MODEL), which can select
+# deepseek-v3-2. Keep this constant in sync with that config default —
+# test_prompt_regression snapshots it as the documented default.
 PHASE1_MODEL: ModelId = "claude-haiku-4-5"
 PHASE1_PURPOSE = "relevance.title_triage"
 
@@ -267,7 +268,7 @@ async def triage_titles(
     *,
     target: JobTarget,
     titles: list[str],
-    model: ModelId = PHASE1_MODEL,
+    model: ModelId | None = None,
     purpose: str = PHASE1_PURPOSE,
 ) -> tuple[dict[int, TitleVerdict], LLMResult | None]:
     """Grade up to ``PHASE1_BATCH_SIZE`` titles against one target.
@@ -297,6 +298,12 @@ async def triage_titles(
             f"triage_titles batch size {len(titles)} exceeds "
             f"PHASE1_BATCH_SIZE={PHASE1_BATCH_SIZE}. Chunk the input."
         )
+
+    # Default to the configured Phase-1 model (Haiku, or deepseek-v3-2 when
+    # PHASE1_TRIAGE_MODEL is set). Resolved at call time so an env flip / test
+    # override takes effect without re-import. An explicit ``model=`` still wins.
+    if model is None:
+        model = settings.phase1_triage_model
 
     static_prefix, dynamic_suffix = _split_user_message(target, titles)
     user_message = static_prefix + dynamic_suffix
