@@ -1,7 +1,7 @@
 import type { ComponentType, ReactNode, SVGProps } from 'react';
 import Link from 'next/link';
 import { Mail } from 'lucide-react';
-import Button from '@/components/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';
 
 // lucide-react 1.x removed its deprecated brand icons; these are the same
@@ -117,15 +117,14 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
               Beta
             </span>
           </Link>
-          <Button
+          <LinkButton
             name='wyrdfold-public-header-sign-in'
-            as='link'
             href='/login'
             variant='outline'
             size='sm'
           >
             Sign in
-          </Button>
+          </LinkButton>
         </div>
       </header>
       <main id='main-content' className='flex-1'>

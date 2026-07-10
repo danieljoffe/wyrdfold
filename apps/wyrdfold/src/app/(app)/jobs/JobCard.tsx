@@ -9,6 +9,7 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
+import { timeAgo } from '@/lib/timeAgo';
 import LogisticsChips from './LogisticsChips';
 import StatusIndicator from './StatusIndicator';
 import { MANUAL_SOURCE_ID, type JobPosting } from './types';
@@ -18,15 +19,6 @@ interface JobCardProps {
   selected: boolean;
   onSelectToggle: () => void;
   onDelete: () => void;
-}
-
-function timeAgo(dateStr: string | null): string {
-  if (!dateStr) return '—';
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const days = Math.floor(diff / 86400000);
-  if (days === 0) return 'today';
-  if (days === 1) return '1d ago';
-  return `${days}d ago`;
 }
 
 export default function JobCard({

@@ -16,7 +16,7 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
@@ -631,7 +631,8 @@ export default function ResumeReviewPage({
                     {!isApproved && (
                       <Button
                         name={`restore-version-${v.id}`}
-                        variant='ghost'
+                        variant='bare'
+                        className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
                         size='sm'
                         // "Load" by itself is ambiguous to SR users
                         // when several versions are listed — they'd
@@ -690,7 +691,8 @@ export default function ResumeReviewPage({
           <div className='flex items-center gap-1'>
             <Button
               name='download-docx'
-              variant='ghost'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
               size='sm'
               iconOnly
               aria-label='Download resume as .docx'

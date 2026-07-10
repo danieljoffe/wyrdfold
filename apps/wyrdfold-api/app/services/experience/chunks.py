@@ -114,7 +114,10 @@ async def upsert_for_optimized(
     *,
     user_id: str | None,
     cost_supabase: Client | None = None,
-    model: EmbeddingModelId = "voyage-3",
+    # voyage-3 retired by Voyage 2026-07; 3.5 = same dims/price. Chunks are
+    # model-tagged rows, so old v3 chunks coexist — but retrieval that mixes
+    # spaces is meaningless; re-embed on next doc regeneration.
+    model: EmbeddingModelId = "voyage-3.5",
     purpose: str = DEFAULT_PURPOSE,
 ) -> list[Chunk]:
     """Generate, embed, and persist chunks for an optimized doc.

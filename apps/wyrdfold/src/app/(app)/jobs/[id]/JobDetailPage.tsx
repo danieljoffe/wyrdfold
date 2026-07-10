@@ -9,10 +9,11 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import { useJobDelete } from '../useJobDelete';
 import type { UserTargetWithSummary } from '../../targets/types';
 import JobDetailPanel from '../JobDetailPanel';
 import { MANUAL_SOURCE_ID, type JobPosting } from '../types';
@@ -26,7 +27,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
   const [posting, setPosting] = useState<JobPosting | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const { deleteJob, deleting } = useJobDelete();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [fallbackTargetId, setFallbackTargetId] = useState<string | undefined>(
     undefined
@@ -122,22 +123,11 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
 
   const handleDelete = useCallback(async () => {
     if (!posting) return;
-    setDeleting(true);
-    try {
-      const res = await fetch(`/api/jobs/${posting.id}`, { method: 'DELETE' });
-      if (res.ok) {
-        toast({ variant: 'success', title: 'Job deleted' });
-        setConfirmDeleteOpen(false);
-        router.push('/jobs');
-      } else {
-        toast({ variant: 'error', title: 'Failed to delete job' });
-        setDeleting(false);
-      }
-    } catch {
-      toast({ variant: 'error', title: 'Failed to delete job' });
-      setDeleting(false);
+    if (await deleteJob(posting.id)) {
+      setConfirmDeleteOpen(false);
+      router.push('/jobs');
     }
-  }, [posting, router, toast]);
+  }, [posting, router, deleteJob]);
 
   if (loading) {
     return (

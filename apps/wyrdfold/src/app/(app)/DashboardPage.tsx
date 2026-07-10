@@ -16,7 +16,7 @@ import {
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import ScoreBadge from '@/components/ScoreBadge';
 import type { JobPosting } from './jobs/types';
 
@@ -93,12 +93,6 @@ const PIPELINE_STATS: PipelineStat[] = [
   },
 ];
 
-function scoreBadgeVariant(score: number): 'success' | 'brand' | 'default' {
-  if (score >= 80) return 'success';
-  if (score >= 60) return 'brand';
-  return 'default';
-}
-
 // -- Component ----------------------------------------------------------------
 
 interface DashboardPageProps {
@@ -129,26 +123,24 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
               Build your profile so we can score and match incoming jobs.
             </Text>
             <div className='flex items-center gap-3'>
-              <Button
+              <LinkButton
                 name='dashboard-go-profile'
                 variant='primary'
                 size='sm'
-                as='link'
                 href='/profile'
               >
                 <span>Set up profile</span>
                 <ArrowRight className='size-4' aria-hidden />
-              </Button>
-              <Button
+              </LinkButton>
+              <LinkButton
                 name='dashboard-start-conversation'
                 variant='outline'
                 size='sm'
-                as='link'
                 href='/onboarding'
               >
                 <Sparkles className='size-4' aria-hidden />
                 <span>Start with AI</span>
-              </Button>
+              </LinkButton>
             </div>
           </CardContent>
         </Card>
@@ -175,16 +167,15 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
               Activate a target so we can match incoming jobs to the roles
               you&apos;re actually pursuing.
             </Text>
-            <Button
+            <LinkButton
               name='dashboard-go-targets'
               variant='primary'
               size='sm'
-              as='link'
               href='/targets'
             >
               <span>Manage targets</span>
               <ArrowRight className='size-4' aria-hidden />
-            </Button>
+            </LinkButton>
           </CardContent>
         </Card>
       </div>
@@ -258,11 +249,7 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                 href={`/jobs/${posting.id}`}
                 className='group flex min-w-0 items-start gap-3 rounded-xl border border-border bg-surface-elevated p-3 transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
               >
-                <ScoreBadge
-                  score={posting.score}
-                  variant={scoreBadgeVariant(posting.score)}
-                  size='sm'
-                />
+                <ScoreBadge score={posting.score} size='sm' />
                 <div className='min-w-0 flex-1'>
                   <Text
                     variant='body'

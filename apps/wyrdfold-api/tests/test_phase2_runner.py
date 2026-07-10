@@ -426,6 +426,81 @@ async def test_confidence_ties_break_by_first_seen_at_desc(
     assert graded == ["j-new"]
 
 
+# ---- cosine grading priority (#9) -----------------------------------------
+# NB the confidence tests above mock no embeddings, so cosine_scores_batch
+# returns {} and cosine defaults uniformly to -1 — confidence/recency become
+# the effective sort (backward-compatible fallback). These pin the PRIMARY key:
+# cosine, the fit-predictive signal, which overrides confidence when present.
+
+
+@pytest.mark.asyncio
+async def test_orders_candidates_by_cosine_desc_over_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cosine is the primary key: when the cap bites, the highest-cosine jobs
+    grade first — beating a higher phase1_confidence (which doesn't predict
+    fit). cosine is INVERTED vs confidence here to prove which wins."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 2)
+    rows = [
+        {"job_posting_id": "j-hicos", "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1, "phase1_confidence": 30},
+        {"job_posting_id": "j-midcos", "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1, "phase1_confidence": 90},
+        {"job_posting_id": "j-locos", "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1, "phase1_confidence": 95},
+    ]
+    jobs = [
+        {"id": jid, "title": "x", "description_html": "",
+         "first_seen_at": "2026-04-01T00:00:00+00:00"}
+        for jid in ("j-hicos", "j-midcos", "j-locos")
+    ]
+
+    async def fake_cosines(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, float]:
+        return {"j-hicos": 0.60, "j-midcos": 0.45, "j-locos": 0.20}
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_scores_batch", fake_cosines)
+
+    n = await run_phase2_for_jobs(
+        _supabase(rows), MagicMock(), target=_target(1), payload=_payload(), jobs=jobs
+    )
+    assert n == 2
+    # Top-2 by cosine — NOT j-locos, despite its confidence 95.
+    assert set(graded) == {"j-hicos", "j-midcos"}
+
+
+@pytest.mark.asyncio
+async def test_missing_cosine_sorts_below_a_scored_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job with a cosine score outranks one without (un-embedded / absent from
+    the batch → -1, sorts last), even at higher confidence."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 1)
+    rows = [
+        {"job_posting_id": "j-scored", "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1, "phase1_confidence": 50},
+        {"job_posting_id": "j-unscored", "promising": True, "scoring_status": "stage2",
+         "scored_profile_version": 1, "phase1_confidence": 99},
+    ]
+    jobs = [
+        {"id": jid, "title": "x", "description_html": "",
+         "first_seen_at": "2026-04-01T00:00:00+00:00"}
+        for jid in ("j-scored", "j-unscored")
+    ]
+
+    async def fake_cosines(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> dict[str, float]:
+        return {"j-scored": 0.40}  # j-unscored omitted (no vector)
+
+    monkeypatch.setattr(f"{_RUNNER}.cosine_scores_batch", fake_cosines)
+
+    n = await run_phase2_for_jobs(
+        _supabase(rows), MagicMock(), target=_target(1), payload=_payload(), jobs=jobs
+    )
+    assert n == 1
+    assert graded == ["j-scored"]
+
+
 # ---- seniority pre-gate (#902) --------------------------------------------
 
 

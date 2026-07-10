@@ -1,10 +1,9 @@
 'use client';
 
-import { useState } from 'react';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
-import { useToast } from '@/state/Toast/ToastProvider';
+import Button from '@/components/kit/Button';
+import { useAddJobByUrl } from './useAddJobByUrl';
 
 interface JobsThinResultsCalloutProps {
   jobsCount: number;
@@ -33,39 +32,7 @@ export default function JobsThinResultsCallout({
   targetLabel,
   onJobAdded,
 }: JobsThinResultsCalloutProps) {
-  const [submitting, setSubmitting] = useState(false);
-  const { toast } = useToast();
-
-  async function handleAdd() {
-    // eslint-disable-next-line no-alert -- personal tool, native prompt matches the codebase
-    const url = window.prompt('Paste a job posting URL:');
-    const trimmed = url?.trim() ?? '';
-    if (!trimmed) return;
-    setSubmitting(true);
-    try {
-      const res = await fetch('/api/jobs/manual', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed }),
-      });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as {
-          detail?: string;
-        } | null;
-        toast({
-          variant: 'error',
-          title: body?.detail || `Could not add job (${res.status})`,
-        });
-        return;
-      }
-      toast({ variant: 'success', title: 'Job added' });
-      onJobAdded();
-    } catch {
-      toast({ variant: 'error', title: 'Network error adding job' });
-    } finally {
-      setSubmitting(false);
-    }
-  }
+  const { addJobByUrl, submitting } = useAddJobByUrl(onJobAdded);
 
   const jobsLabel = jobsCount === 1 ? 'posting' : 'postings';
   return (
@@ -80,7 +47,7 @@ export default function JobsThinResultsCallout({
           name='jobs-thin-results-add'
           variant='outline'
           size='sm'
-          onClick={handleAdd}
+          onClick={addJobByUrl}
           disabled={submitting}
         >
           {submitting ? 'Adding...' : 'Paste URL'}

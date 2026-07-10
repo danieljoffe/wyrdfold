@@ -3,7 +3,7 @@
 import { useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { LogOut, X, type LucideIcon } from 'lucide-react';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { cn } from '@/lib/cn';
 import { useFocusTrap } from '@/hooks/useFocusTrap';

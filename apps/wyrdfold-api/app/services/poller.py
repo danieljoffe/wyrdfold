@@ -27,6 +27,9 @@ from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY
 from app.services.db_write import db_to_thread as _db_to_thread
 from app.services.embeddings import get_default_client as get_embeddings_client
+from app.services.embeddings.job_embeddings import (
+    DEFAULT_MODEL as EMBED_DEFAULT_MODEL,
+)
 from app.services.embeddings.job_embeddings import upsert_job_embedding
 from app.services.embeddings.prescan_gate import cosine_gate_decision
 from app.services.embeddings.prescan_shadow import record_shadow_observation
@@ -990,6 +993,56 @@ async def _embed_jobs(
         *(_one(row) for row in rows),
         return_exceptions=True,
     )
+
+
+async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
+    """Embed a bounded batch of jobs with NO ``job_embeddings`` row (#21 sweep).
+
+    The on-ingest hook (``_embed_jobs`` above) only sees jobs upserted THIS
+    cycle, and it's fail-soft per row — so a job whose embed silently failed
+    (provider hiccup, cancelled cycle) is only retried if its source re-lists
+    it, and a job ingested before the embed pipeline armed is never visited at
+    all. On prod that left ~5.6k jobs (1.3k of them Phase-2 candidates)
+    permanently vector-less, where the cosine gate fails OPEN and burns a blind
+    Sonnet grade (#90). Same stranding the qualification sweep
+    (``_backfill_qualify_stale``) fixes for the tagger — this is its embedding
+    twin, minus the liveness check: a Voyage embed costs ~$0.00005, far less
+    than the HTTP probe that would guard it, and ARCHIVED jobs stay included
+    because they remain gradeable (click-through re-grades ignore
+    ``archived_at``) and threshold calibration reads their vectors.
+
+    Selection is the PostgREST anti-join (``job_embeddings=is.null`` on the
+    embedded resource), NEWEST first: the drip this drains is dominated by
+    recently-ingested jobs whose first embed failed — exactly the rows about
+    to face the gate. A row that persistently can't embed (e.g. no title and
+    no description → ``skipped_empty`` writes nothing) is re-selected and
+    re-skipped each cycle, wasting one slot — bounded and harmless. Batch cost
+    is ``limit`` embeds ≈ $0.01 at the default, so no budget gate.
+    """
+    if limit <= 0:
+        return
+    try:
+        # Model-aware anti-join: a job counts as vector-less iff it has no
+        # ``job_embeddings`` row for the CURRENT model — a stale row from a
+        # retired model (voyage-3) must not mask the missing current-space
+        # vector, or a model migration would strand the whole old corpus.
+        resp = await asyncio.to_thread(
+            supabase.table("jobs")
+            .select("id, title, description_html, job_embeddings(job_posting_id)")
+            .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
+            .is_("job_embeddings", "null")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute
+        )
+    except Exception:
+        logger.exception("Embed backfill: select failed; skipping this cycle")
+        return
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return
+    logger.info("Embed backfill: embedding %d vector-less job(s)", len(rows))
+    await _embed_jobs(supabase, rows)
 
 
 async def _shadow_observe(
@@ -2275,6 +2328,14 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     # gated (respects the grading reserve); best-effort.
     if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
         await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
+
+    # Same stranding fix for the embedding spine (#21): jobs whose on-ingest
+    # embed silently failed (or that predate the embed pipeline) never get a
+    # vector, so the cosine gate fails open and burns blind grades. Drain a
+    # bounded, newest-first slice of the vector-less backlog every cycle.
+    # Cheap (~$0.00005/job), so no budget gate; 0 disables.
+    if settings.prescan_embed_enabled and settings.prescan_embed_backfill_batch > 0:
+        await _backfill_embed_missing(supabase, settings.prescan_embed_backfill_batch)
 
     if not due:
         return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])

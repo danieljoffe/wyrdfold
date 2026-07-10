@@ -1,10 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
-import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { promptForMissingContactName } from './promptForMissingContactName';
@@ -12,26 +11,19 @@ import type { TailoredResumeRecord, TailorResponse } from './types';
 
 interface ResumeSectionProps {
   jobPostingId: string;
-  /** Compact pill mode — drops the caption/status-badge stack and renders
-   *  just the action button (Generate / Review / View). Used in the inline
-   *  preview panel's top toolbar where a full section would crowd the row. */
-  compact?: boolean;
 }
 
 /**
  * Mirror of ``CoverLetterSection`` for the resume artifact. Distinguishes
  * "no record yet" → renders a Generate button, from "record exists" →
- * renders a Review (or View / Download for approved) button.
+ * renders a Review (or View, once approved) button.
  *
  * The previous inline rendering inside ``JobDetailPanel`` always linked
  * to ``/jobs/{id}/resume`` regardless of whether a tailored doc actually
  * existed, leaving the user staring at a "Resume not found" dead-end
  * page with nowhere to generate one.
  */
-export default function ResumeSection({
-  jobPostingId,
-  compact = false,
-}: ResumeSectionProps) {
+export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
   const [record, setRecord] = useState<TailoredResumeRecord | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -160,117 +152,46 @@ export default function ResumeSection({
   }
 
   if (loading) {
-    if (compact) {
-      return (
-        <Button name='resume-loading' variant='secondary' size='sm' disabled>
-          Resume…
-        </Button>
-      );
-    }
     return (
-      <div className='flex flex-col gap-2'>
-        <div className='flex items-center gap-2'>
-          <Text variant='caption'>Resume</Text>
-          <Badge variant='default' size='sm'>
-            Loading...
-          </Badge>
-        </div>
-      </div>
-    );
-  }
-
-  const isApproved = record?.approved_at != null;
-  const statusLabel = generating
-    ? 'Generating...'
-    : !record
-      ? 'Not started'
-      : isApproved
-        ? 'Approved'
-        : 'Draft';
-  const statusVariant = generating
-    ? 'info'
-    : !record
-      ? 'default'
-      : isApproved
-        ? 'success'
-        : 'info';
-
-  // Compact mode: single button that conveys both state and action via its
-  // label. No caption row, no status pill — the toolbar context handles
-  // labeling and the button verb is enough ("Review Resume" implies a draft
-  // exists; "Generate Resume" implies it doesn't).
-  if (compact) {
-    if (generating) {
-      return (
-        <Button name='resume-generating' variant='secondary' size='sm' disabled>
-          <Spinner size='sm' aria-label='Generating resume' />
-          <span>Generating…</span>
-        </Button>
-      );
-    }
-    if (!record) {
-      return (
-        <Button
-          name='generate-resume'
-          variant='primary'
-          size='sm'
-          onClick={handleGenerate}
-        >
-          Generate Resume
-        </Button>
-      );
-    }
-    return (
-      <Button
-        as='link'
-        href={`/jobs/${jobPostingId}/resume`}
-        variant={isApproved ? 'secondary' : 'primary'}
-        size='sm'
-        name={isApproved ? 'view-approved-resume' : 'review-resume'}
-      >
-        {isApproved ? 'View Resume' : 'Review Resume'}
+      <Button name='resume-loading' variant='secondary' size='sm' disabled>
+        Resume…
       </Button>
     );
   }
 
-  return (
-    <div className='flex flex-col gap-2'>
-      <div className='flex items-center gap-2'>
-        <Text variant='caption'>Resume</Text>
-        <Badge variant={statusVariant} size='sm'>
-          {statusLabel}
-        </Badge>
-      </div>
+  const isApproved = record?.approved_at != null;
 
-      {generating ? (
-        <div className='flex items-center gap-2'>
-          <Spinner size='sm' />
-          <Text variant='meta'>Generating resume...</Text>
-        </div>
-      ) : !record ? (
-        <div>
-          <Button
-            name='generate-resume'
-            variant='primary'
-            size='sm'
-            onClick={handleGenerate}
-          >
-            Generate Resume
-          </Button>
-        </div>
-      ) : (
-        <div>
-          <Button
-            as='link'
-            href={`/jobs/${jobPostingId}/resume`}
-            variant={isApproved ? 'secondary' : 'primary'}
-            size='sm'
-            name={isApproved ? 'view-approved-resume' : 'review-resume'}
-          >
-            {isApproved ? 'View / Download' : 'Review Resume'}
-          </Button>
-        </div>
-      )}
-    </div>
+  // Single toolbar pill: the button verb conveys both state and action
+  // ("Generate Resume" implies no draft exists; "Review Resume" implies one
+  // does; "View Resume" once approved).
+  if (generating) {
+    return (
+      <Button name='resume-generating' variant='secondary' size='sm' disabled>
+        <Spinner size='sm' aria-label='Generating resume' />
+        <span>Generating…</span>
+      </Button>
+    );
+  }
+  if (!record) {
+    return (
+      <Button
+        name='generate-resume'
+        variant='primary'
+        size='sm'
+        onClick={handleGenerate}
+      >
+        Generate Resume
+      </Button>
+    );
+  }
+  return (
+    <LinkButton
+      href={`/jobs/${jobPostingId}/resume`}
+      variant={isApproved ? 'secondary' : 'primary'}
+      size='sm'
+      name={isApproved ? 'view-approved-resume' : 'review-resume'}
+    >
+      {isApproved ? 'View Resume' : 'Review Resume'}
+    </LinkButton>
   );
 }

@@ -46,7 +46,11 @@ TABLE = "targets"
 # "qualification.tagger", etc. on the spend dashboard.
 TARGET_EMBED_PURPOSE = "prescan.target_embed"
 
-DEFAULT_MODEL: EmbeddingModelId = "voyage-3"
+# voyage-3 retired by Voyage 2026-07 → voyage-3.5 (same 1024 dims). NB
+# ``targets.embedding`` is a single un-keyed column: after this flip every
+# target must be RE-embedded before the gate's cosines mean anything, and
+# ``prescan_cosine_threshold`` re-derived in 3.5 space (see #21).
+DEFAULT_MODEL: EmbeddingModelId = "voyage-3.5"
 
 UpsertStatus = Literal["embedded", "cache_hit", "skipped_empty", "error"]
 

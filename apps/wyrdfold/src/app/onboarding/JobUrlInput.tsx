@@ -8,7 +8,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 
 export interface JobData {
@@ -164,7 +164,8 @@ export default function JobUrlInput({ onComplete, onSkip }: JobUrlInputProps) {
       <div className='text-center'>
         <Button
           name='onboarding-skip-job'
-          variant='ghost'
+          variant='bare'
+          className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
           size='sm'
           onClick={onSkip}
           disabled={submitting}

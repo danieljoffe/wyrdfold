@@ -14,7 +14,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Select } from '@danieljoffe/shared-ui/Select';
 import { Switch } from '@danieljoffe/shared-ui/Switch';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 
@@ -360,7 +360,8 @@ export default function TargetPreferencesEditor({
         <div className='flex flex-wrap items-center justify-end gap-2'>
           <Button
             name='target-preferences-reset'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={handleReset}
             disabled={saving || !isCustom}

@@ -9,13 +9,15 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
+import { useJobDelete } from './useJobDelete';
 import JobFeedbackSection from './JobFeedbackSection';
 import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
@@ -126,7 +128,7 @@ export default function JobDetailPanel({
 }: JobDetailPanelProps) {
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const { deleteJob, deleting } = useJobDelete();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -274,23 +276,9 @@ export default function JobDetailPanel({
   }, [targetId, analysis, analyzing, analysisError, needsProfile, runAnalysis]);
 
   async function handleDelete() {
-    setDeleting(true);
-    try {
-      const res = await fetch(`/api/jobs/${posting.id}`, { method: 'DELETE' });
-      if (res.ok) {
-        toast({ variant: 'success', title: 'Job deleted' });
-        setConfirmDeleteOpen(false);
-        onDelete?.();
-      } else {
-        toast({
-          variant: 'error',
-          title: await extractApiError(res, 'Failed to delete job'),
-        });
-      }
-    } catch {
-      toast({ variant: 'error', title: 'Network error deleting job' });
-    } finally {
-      setDeleting(false);
+    if (await deleteJob(posting.id)) {
+      setConfirmDeleteOpen(false);
+      onDelete?.();
     }
   }
 
@@ -378,18 +366,16 @@ export default function JobDetailPanel({
         />
         <ScoreBadge score={posting.score} size='sm' />
 
-        {/* Resume + Cover Letter as compact pills in the toolbar. Only when
-            a target is selected — tailoring requires one. The components
-            keep all their generate/review/view state internally; passing
-            ``compact`` switches them to a single-button render. */}
+        {/* Resume + Cover Letter as single-button pills in the toolbar. Only
+            when a target is selected — tailoring requires one. The components
+            keep all their generate/review/view state internally. */}
         {targetId && (
           <>
-            <ResumeSection jobPostingId={posting.id} compact />
+            <ResumeSection jobPostingId={posting.id} />
             <CoverLetterSection
               jobPostingId={posting.id}
               companyName={posting.company_name}
               roleTitle={posting.title}
-              compact
             />
           </>
         )}
@@ -399,17 +385,16 @@ export default function JobDetailPanel({
             on narrow viewports without splitting Status/Score from the
             tailor buttons. */}
         {viewFullHref && (
-          <Button
-            as='link'
+          <LinkButton
             href={viewFullHref}
-            variant='ghost'
+            variant='bare'
             size='sm'
             name='view-full-job'
             aria-label='Open full view'
-            className='ml-auto'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary ml-auto'
           >
             <Maximize2 className='size-4' aria-hidden />
-          </Button>
+          </LinkButton>
         )}
         {!hideDelete && (
           <Dropdown

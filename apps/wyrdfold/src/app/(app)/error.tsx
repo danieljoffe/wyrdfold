@@ -5,7 +5,8 @@ import { useEffect } from 'react';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 
 export default function AppError({
   error,
@@ -44,15 +45,14 @@ export default function AppError({
             >
               Try again
             </Button>
-            <Button
+            <LinkButton
               name='wyrdfold-error-home'
               variant='outline'
               size='sm'
-              as='link'
               href='/dashboard'
             >
               Back to dashboard
-            </Button>
+            </LinkButton>
           </div>
         </CardContent>
       </Card>

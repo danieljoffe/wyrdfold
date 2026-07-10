@@ -13,6 +13,7 @@ from typing import Any
 
 from app.constants import SYSTEM_USER_ID
 from app.services.embeddings.job_embeddings import (
+    DEFAULT_MODEL,
     JOB_EMBED_PURPOSE,
     content_hash,
     embed_text_for_job,
@@ -163,7 +164,9 @@ async def test_new_job_is_embedded_and_written() -> None:
     assert len(sb.job_embeddings.upserts) == 1
     row = sb.job_embeddings.upserts[0]
     assert row["job_posting_id"] == "job-1"
-    assert row["model"] == "voyage-3"
+    # Tracks the module default (voyage-3.5 since the voyage-3 retirement) —
+    # the row must be keyed by whatever model actually embedded it.
+    assert row["model"] == DEFAULT_MODEL
     assert row["content_hash"] == content_hash(
         embed_text_for_job("Frontend Engineer", "<p>React, TypeScript</p>")
     )

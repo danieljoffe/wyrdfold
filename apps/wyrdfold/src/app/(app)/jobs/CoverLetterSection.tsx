@@ -1,10 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
-import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { promptForMissingContactName } from './promptForMissingContactName';
@@ -14,16 +13,12 @@ interface CoverLetterSectionProps {
   jobPostingId: string;
   companyName: string;
   roleTitle: string;
-  /** Compact pill mode — drops the caption/status-badge stack and renders
-   *  just the action button. Used in the inline preview panel's toolbar. */
-  compact?: boolean;
 }
 
 export default function CoverLetterSection({
   jobPostingId,
   companyName,
   roleTitle,
-  compact = false,
 }: CoverLetterSectionProps) {
   const [record, setRecord] = useState<TailoredResumeRecord | null>(null);
   const [loading, setLoading] = useState(true);
@@ -148,125 +143,55 @@ export default function CoverLetterSection({
   }
 
   if (loading) {
-    if (compact) {
-      return (
-        <Button
-          name='cover-letter-loading'
-          variant='secondary'
-          size='sm'
-          disabled
-        >
-          Cover letter…
-        </Button>
-      );
-    }
-    return (
-      <div className='flex flex-col gap-2'>
-        <div className='flex items-center gap-2'>
-          <Text variant='caption'>Cover Letter</Text>
-          <Badge variant='default' size='sm'>
-            Loading...
-          </Badge>
-        </div>
-      </div>
-    );
-  }
-
-  const isApproved = record?.approved_at != null;
-  const statusLabel = generating
-    ? 'Generating...'
-    : !record
-      ? 'Not started'
-      : isApproved
-        ? 'Approved'
-        : 'Generated';
-  const statusVariant = generating
-    ? 'info'
-    : !record
-      ? 'default'
-      : isApproved
-        ? 'success'
-        : 'info';
-
-  // Compact mode: single button that conveys both state and action via its
-  // label. See ResumeSection for the rationale.
-  if (compact) {
-    if (generating) {
-      return (
-        <Button
-          name='cover-letter-generating'
-          variant='secondary'
-          size='sm'
-          disabled
-        >
-          <Spinner size='sm' aria-label='Generating cover letter' />
-          <span>Generating…</span>
-        </Button>
-      );
-    }
-    if (!record) {
-      return (
-        <Button
-          name='generate-cover-letter'
-          variant='secondary'
-          size='sm'
-          onClick={handleGenerate}
-        >
-          Generate Cover Letter
-        </Button>
-      );
-    }
     return (
       <Button
-        as='link'
-        href={`/jobs/${jobPostingId}/cover-letter`}
-        variant={isApproved ? 'secondary' : 'primary'}
+        name='cover-letter-loading'
+        variant='secondary'
         size='sm'
-        name='review-cover-letter'
+        disabled
       >
-        {isApproved ? 'View Cover Letter' : 'Review Cover Letter'}
+        Cover letter…
       </Button>
     );
   }
 
-  return (
-    <div className='flex flex-col gap-2'>
-      <div className='flex items-center gap-2'>
-        <Text variant='caption'>Cover Letter</Text>
-        <Badge variant={statusVariant} size='sm'>
-          {statusLabel}
-        </Badge>
-      </div>
+  const isApproved = record?.approved_at != null;
 
-      {generating ? (
-        <div className='flex items-center gap-2'>
-          <Spinner size='sm' />
-          <Text variant='meta'>Generating cover letter...</Text>
-        </div>
-      ) : !record ? (
-        <div>
-          <Button
-            name='generate-cover-letter'
-            variant='secondary'
-            size='sm'
-            onClick={handleGenerate}
-          >
-            Generate Cover Letter
-          </Button>
-        </div>
-      ) : (
-        <div>
-          <Button
-            as='link'
-            href={`/jobs/${jobPostingId}/cover-letter`}
-            variant={isApproved ? 'secondary' : 'primary'}
-            size='sm'
-            name='review-cover-letter'
-          >
-            {isApproved ? 'View / Download' : 'Review Cover Letter'}
-          </Button>
-        </div>
-      )}
-    </div>
+  // Single toolbar pill: the button verb conveys both state and action.
+  // See ResumeSection for the rationale.
+  if (generating) {
+    return (
+      <Button
+        name='cover-letter-generating'
+        variant='secondary'
+        size='sm'
+        disabled
+      >
+        <Spinner size='sm' aria-label='Generating cover letter' />
+        <span>Generating…</span>
+      </Button>
+    );
+  }
+  if (!record) {
+    return (
+      <Button
+        name='generate-cover-letter'
+        variant='secondary'
+        size='sm'
+        onClick={handleGenerate}
+      >
+        Generate Cover Letter
+      </Button>
+    );
+  }
+  return (
+    <LinkButton
+      href={`/jobs/${jobPostingId}/cover-letter`}
+      variant={isApproved ? 'secondary' : 'primary'}
+      size='sm'
+      name='review-cover-letter'
+    >
+      {isApproved ? 'View Cover Letter' : 'Review Cover Letter'}
+    </LinkButton>
   );
 }

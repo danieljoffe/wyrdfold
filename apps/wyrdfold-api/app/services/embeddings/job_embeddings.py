@@ -39,7 +39,14 @@ TABLE = "job_embeddings"
 # "experience.chunks", etc. on the spend dashboard.
 JOB_EMBED_PURPOSE = "prescan.job_embed"
 
-DEFAULT_MODEL: EmbeddingModelId = "voyage-3"
+# voyage-3 was retired by Voyage (2026-07, rolling InvalidRequestError) —
+# voyage-3.5 is the drop-in successor: same 1024-dim default (matches the
+# vector(1024) columns) and the same $0.06/M price. NB the two vector spaces
+# are NOT comparable: never cosine a voyage-3 job vector against a voyage-3.5
+# target vector — the model-keyed reads below + the model-aware backfill
+# anti-join keep the spaces separate, and thresholds must be re-derived in
+# 3.5 space (see #21).
+DEFAULT_MODEL: EmbeddingModelId = "voyage-3.5"
 
 # The validated body window (#60): title + the first 4000 chars of the cleaned
 # description. Voyage-3 reads far more, but 4000 chars captured the relevance
