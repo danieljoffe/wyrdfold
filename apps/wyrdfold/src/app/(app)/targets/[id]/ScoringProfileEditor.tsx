@@ -12,7 +12,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { FormFieldError } from '@danieljoffe/shared-ui/FormFieldError';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import CircleBadge from '@/components/CircleBadge';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';

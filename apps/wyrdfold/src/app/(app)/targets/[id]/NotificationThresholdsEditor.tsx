@@ -12,7 +12,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Input } from '@danieljoffe/shared-ui/Input';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { UserTarget } from '../types';
@@ -283,7 +283,8 @@ export default function NotificationThresholdsEditor({
         <div className='flex flex-wrap items-center justify-end gap-2'>
           <Button
             name='notification-thresholds-reset'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={handleReset}
             disabled={anyBusy || !anyCustom}

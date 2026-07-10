@@ -11,7 +11,7 @@ import {
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import {
@@ -254,7 +254,8 @@ export default function AxisWeightsEditor({
         <div className='flex flex-wrap items-center justify-end gap-2'>
           <Button
             name='axis-weights-undo'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={handleUndo}
             disabled={!canUndo || anyBusy}
@@ -273,7 +274,8 @@ export default function AxisWeightsEditor({
           </Button>
           <Button
             name='axis-weights-reset'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={handleReset}
             disabled={anyBusy || userTarget.axis_weights === null}

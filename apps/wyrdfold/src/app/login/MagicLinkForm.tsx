@@ -12,7 +12,7 @@ import {
   FIELD_PLACEHOLDER,
 } from '@danieljoffe/shared-ui/styles/formStyles';
 import { cn } from '@/lib/cn';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
 import { createAuthBrowserClient } from '@/lib/supabase/auth-client';
 
@@ -216,9 +216,9 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
               </Button>
               <Button
                 name='wyrdfold-back-to-login'
-                variant='ghost'
+                variant='bare'
                 size='sm'
-                className='w-full'
+                className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary w-full'
                 onClick={() => {
                   setFormState('idle');
                   setEmail('');

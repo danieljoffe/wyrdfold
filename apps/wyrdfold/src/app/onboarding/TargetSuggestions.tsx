@@ -8,7 +8,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { cn } from '@/lib/cn';
 import type {
@@ -397,7 +397,8 @@ export default function TargetSuggestions({
         <div className='flex items-center justify-between'>
           <Button
             name='onboarding-skip-targets'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={onSkip}
           >
@@ -475,7 +476,8 @@ export default function TargetSuggestions({
       <div className='text-center'>
         <Button
           name='onboarding-skip-targets'
-          variant='ghost'
+          variant='bare'
+          className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
           size='sm'
           onClick={onSkip}
         >

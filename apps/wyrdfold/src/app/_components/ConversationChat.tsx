@@ -8,7 +8,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 
 interface ConversationChatProps {
@@ -379,7 +379,8 @@ export default function ConversationChat({
           </Button>
           <Button
             name='onboarding-skip-conversation'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             onClick={onSkip}
             disabled={sending || deriving}

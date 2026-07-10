@@ -6,7 +6,8 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -606,15 +607,14 @@ export default function JobsList({
             <Text variant='body' as='p'>
               No active targets. Activate a target to start seeing matched jobs.
             </Text>
-            <Button
+            <LinkButton
               name='jobs-go-to-targets'
               variant='primary'
               size='sm'
-              as='link'
               href='/targets'
             >
               Go to Targets
-            </Button>
+            </LinkButton>
           </CardContent>
         </Card>
       ) : (

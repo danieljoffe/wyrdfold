@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import { Modal } from '@danieljoffe/shared-ui/Modal';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 
 interface ConfirmModalProps {
   isOpen: boolean;

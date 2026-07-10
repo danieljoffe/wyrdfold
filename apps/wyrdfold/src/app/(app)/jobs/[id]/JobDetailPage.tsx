@@ -9,7 +9,7 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';

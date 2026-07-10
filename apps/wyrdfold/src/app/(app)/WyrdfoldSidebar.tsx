@@ -14,7 +14,7 @@ import {
   MoreHorizontal,
   LogOut,
 } from 'lucide-react';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { cn } from '@/lib/cn';
 import DarkModeToggle from '@/components/Nav/DarkModeToggle';
 import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';

@@ -1,7 +1,7 @@
 'use client';
 
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { cn } from '@/lib/cn';
 import JobCard from './JobCard';
 import { useJobDelete } from './useJobDelete';

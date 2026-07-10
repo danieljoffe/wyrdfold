@@ -5,7 +5,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
-import Button from '@/components/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import { fetchJsonFromWyrdfoldAPI } from '@/lib/api/proxy';
 import { hasProse, type ProseResponse } from '../profile/types';
 import TargetsList from './TargetsList';
@@ -67,26 +67,24 @@ function NoProfileZeroState() {
           profile, so targets can't be created until there's prose to draw from.
         </Text>
         <div className='flex items-center gap-3'>
-          <Button
+          <LinkButton
             name='targets-go-profile'
             variant='primary'
             size='sm'
-            as='link'
             href='/profile'
           >
             <span>Set up profile</span>
             <ArrowRight className='size-4' aria-hidden />
-          </Button>
-          <Button
+          </LinkButton>
+          <LinkButton
             name='targets-start-onboarding'
             variant='outline'
             size='sm'
-            as='link'
             href='/onboarding'
           >
             <Sparkles className='size-4' aria-hidden />
             <span>Start with AI</span>
-          </Button>
+          </LinkButton>
         </div>
       </CardContent>
     </Card>

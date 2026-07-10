@@ -16,7 +16,7 @@ import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
@@ -599,7 +599,8 @@ export default function CoverLetterReviewPage({
                     {!isApproved && (
                       <Button
                         name={`restore-version-${v.id}`}
-                        variant='ghost'
+                        variant='bare'
+                        className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
                         size='sm'
                         // Disambiguate "Load" for SR users when
                         // multiple versions exist — see the same
@@ -651,7 +652,8 @@ export default function CoverLetterReviewPage({
           <div className='flex items-center gap-1'>
             <Button
               name='download-cover-letter-docx'
-              variant='ghost'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
               size='sm'
               iconOnly
               aria-label='Download cover letter as .docx'
