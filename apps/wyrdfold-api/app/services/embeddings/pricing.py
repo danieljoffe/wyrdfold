@@ -8,8 +8,10 @@ Revisit quarterly.
 from app.models.embeddings import EmbeddingModelId, EmbeddingUsage
 
 PRICING: dict[EmbeddingModelId, float] = {
-    "voyage-3": 0.06,
-    "voyage-3-lite": 0.02,
+    "voyage-3": 0.06,  # RETIRED by Voyage 2026-07 — kept for historical rows
+    "voyage-3-lite": 0.02,  # RETIRED — ditto
+    "voyage-3.5": 0.06,
+    "voyage-3.5-lite": 0.02,
 }
 
 

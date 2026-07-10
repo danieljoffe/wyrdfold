@@ -371,6 +371,17 @@ class Settings(BaseSettings):
     # per-deploy once the backfill has populated the table in DEV.
     prescan_embed_enabled: bool = False
 
+    # Per-cycle cap for the vector-less-job sweep (#21). The on-ingest embed
+    # hook is fail-soft per row, so a job whose embed silently failed — or one
+    # ingested before the pipeline armed / while its source was delisting —
+    # never gets a vector, and the cosine gate (#90) fails OPEN on it, burning
+    # a blind Sonnet grade. Each scheduled cycle, embed up to this many of the
+    # NEWEST jobs with no ``job_embeddings`` row (archived included — they stay
+    # gradeable via click-through, and calibration reads their vectors).
+    # ~$0.00005/job, so the default costs ≈ $0.01/cycle worst case. 0 disables.
+    # Only runs when ``prescan_embed_enabled``.
+    prescan_embed_backfill_batch: int = Field(default=200, ge=0, le=2000)
+
     # Pre-scan SHADOW MODE (#60/#68, Phase 3). When True the poller, AFTER the
     # live keyword admit decision for each (job, target), ALSO computes the
     # would-be cosine gate decision (cosine(job_vec, target_vec) >=
