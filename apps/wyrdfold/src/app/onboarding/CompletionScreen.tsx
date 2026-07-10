@@ -7,7 +7,7 @@ import { Card } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { completeOnboarding } from './completeOnboarding';
 
 export default function CompletionScreen() {

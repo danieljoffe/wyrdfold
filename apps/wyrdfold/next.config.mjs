@@ -82,24 +82,35 @@ const nextConfig = {
           },
         ],
       },
-      {
-        source: '/_next/static/:path*',
-        headers: [
-          {
-            key: 'Cache-Control',
-            value: 'public, max-age=31536000, immutable',
-          },
-        ],
-      },
-      {
-        source: '/_next/image',
-        headers: [
-          {
-            key: 'Cache-Control',
-            value: 'public, max-age=86400, stale-while-revalidate=604800',
-          },
-        ],
-      },
+      // Long-lived asset caching is PRODUCTION-only. Prod chunk names are
+      // content-hashed so `immutable` is safe; dev (turbopack) chunk names
+      // are path-based, so an immutable year-long cache serves stale module
+      // graphs after any dependency change — observed as "module factory is
+      // not available" crashes after the shared-ui 0.4→0.5 bump, healed only
+      // by a manual cache clear. Next itself warns custom Cache-Control on
+      // /_next/static breaks dev.
+      ...(isDev
+        ? []
+        : [
+            {
+              source: '/_next/static/:path*',
+              headers: [
+                {
+                  key: 'Cache-Control',
+                  value: 'public, max-age=31536000, immutable',
+                },
+              ],
+            },
+            {
+              source: '/_next/image',
+              headers: [
+                {
+                  key: 'Cache-Control',
+                  value: 'public, max-age=86400, stale-while-revalidate=604800',
+                },
+              ],
+            },
+          ]),
       {
         source: '/:file(favicon.ico|sitemap.xml|robots.txt)',
         headers: [

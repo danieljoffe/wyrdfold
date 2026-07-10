@@ -9,7 +9,7 @@ import {
   FIELD_PLACEHOLDER,
 } from '@danieljoffe/shared-ui/styles/formStyles';
 import { cn } from '@/lib/cn';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 
 type FormState = 'idle' | 'loading' | 'success' | 'error';
 

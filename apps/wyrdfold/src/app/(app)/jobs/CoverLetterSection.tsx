@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { promptForMissingContactName } from './promptForMissingContactName';
@@ -184,14 +185,13 @@ export default function CoverLetterSection({
     );
   }
   return (
-    <Button
-      as='link'
+    <LinkButton
       href={`/jobs/${jobPostingId}/cover-letter`}
       variant={isApproved ? 'secondary' : 'primary'}
       size='sm'
       name='review-cover-letter'
     >
       {isApproved ? 'View Cover Letter' : 'Review Cover Letter'}
-    </Button>
+    </LinkButton>
   );
 }

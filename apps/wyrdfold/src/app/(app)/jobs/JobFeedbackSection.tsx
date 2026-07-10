@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { Info, ThumbsDown, ThumbsUp } from 'lucide-react';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { useToast } from '@/state/Toast/ToastProvider';
 
 interface JobFeedbackSectionProps {
@@ -149,7 +149,8 @@ export default function JobFeedbackSection({
           <div className='flex justify-end gap-2'>
             <Button
               name='feedback-skip'
-              variant='ghost'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
               size='sm'
               onClick={() => {
                 setActiveSignal(null);
@@ -195,7 +196,8 @@ export default function JobFeedbackSection({
           {lastSubmittedSignal !== null && (
             <Button
               name='feedback-undo'
-              variant='ghost'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
               size='sm'
               onClick={undo}
             >

@@ -11,7 +11,7 @@ import {
 import { Badge, type BadgeVariant } from '@danieljoffe/shared-ui/Badge';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type {

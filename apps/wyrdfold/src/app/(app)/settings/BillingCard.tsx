@@ -10,7 +10,7 @@ import {
 } from '@danieljoffe/shared-ui/Card';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { navigateTo } from '@/lib/navigate';
 import { useToast } from '@/state/Toast/ToastProvider';

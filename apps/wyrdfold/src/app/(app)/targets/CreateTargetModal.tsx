@@ -5,7 +5,7 @@ import { Modal } from '@danieljoffe/shared-ui/Modal';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 
 export interface ManualSubmission {
   label: string;

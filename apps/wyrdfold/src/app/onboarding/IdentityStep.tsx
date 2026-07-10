@@ -6,7 +6,7 @@ import { Card } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 
 interface IdentityStepProps {
@@ -132,7 +132,8 @@ export default function IdentityStep({
         <div className='flex items-center justify-between'>
           <Button
             name='onboarding-identity-skip'
-            variant='ghost'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
             size='sm'
             type='button'
             onClick={onSkip}

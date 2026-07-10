@@ -1,7 +1,7 @@
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import LinkButton from '@/components/kit/LinkButton';
 
 export default function AppNotFound() {
   return (
@@ -15,15 +15,14 @@ export default function AppNotFound() {
             We couldn&apos;t find that page. It may have been moved or the URL
             is incorrect.
           </Text>
-          <Button
+          <LinkButton
             name='wyrdfold-not-found-home'
             variant='primary'
             size='sm'
-            as='link'
             href='/dashboard'
           >
             Back to dashboard
-          </Button>
+          </LinkButton>
         </CardContent>
       </Card>
     </div>

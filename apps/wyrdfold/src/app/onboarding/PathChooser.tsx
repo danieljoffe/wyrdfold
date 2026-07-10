@@ -4,7 +4,7 @@ import { FileText, Search, MessageCircle } from 'lucide-react';
 import { Card } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import type { OnboardingPath } from './OnboardingWizard';
 
 interface PathChooserProps {
@@ -72,7 +72,8 @@ export default function PathChooser({ onSelect, onSkip }: PathChooserProps) {
       <div className='mt-4 text-center'>
         <Button
           name='onboarding-skip'
-          variant='ghost'
+          variant='bare'
+          className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
           size='sm'
           onClick={onSkip}
         >

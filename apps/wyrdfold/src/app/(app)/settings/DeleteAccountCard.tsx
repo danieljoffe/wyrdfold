@@ -11,7 +11,7 @@ import {
 } from '@danieljoffe/shared-ui/Card';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';

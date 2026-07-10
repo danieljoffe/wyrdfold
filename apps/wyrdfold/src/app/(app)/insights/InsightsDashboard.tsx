@@ -13,7 +13,7 @@ import {
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { StatsCard } from '@danieljoffe/shared-ui/StatsCard';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { useInsights, type InsightsInitial } from '@/hooks/useInsights';
 import { cn } from '@/lib/cn';
 import { downloadInsightsCsv } from './exportCsv';

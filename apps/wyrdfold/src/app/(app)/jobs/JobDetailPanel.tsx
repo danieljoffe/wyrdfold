@@ -9,7 +9,8 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
@@ -384,17 +385,16 @@ export default function JobDetailPanel({
             on narrow viewports without splitting Status/Score from the
             tailor buttons. */}
         {viewFullHref && (
-          <Button
-            as='link'
+          <LinkButton
             href={viewFullHref}
-            variant='ghost'
+            variant='bare'
             size='sm'
             name='view-full-job'
             aria-label='Open full view'
-            className='ml-auto'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary ml-auto'
           >
             <Maximize2 className='size-4' aria-hidden />
-          </Button>
+          </LinkButton>
         )}
         {!hideDelete && (
           <Dropdown

@@ -1,7 +1,7 @@
 'use client';
 
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import { useAddJobByUrl } from './useAddJobByUrl';
 
 interface JobsEmptyStateProps {

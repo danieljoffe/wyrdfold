@@ -22,7 +22,8 @@ import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import CircleBadge from '@/components/CircleBadge';
 import { consumeSse } from '@/lib/consumeSse';
 import { extractApiError } from '@/lib/extractApiError';
@@ -458,16 +459,15 @@ export default function ProfilePage() {
                   </>
                 )}
               </Button>
-              <Button
+              <LinkButton
                 name='profile-start-conversation'
                 variant='outline'
                 size='sm'
-                as='link'
                 href='/onboarding'
               >
                 <Sparkles className='size-4' aria-hidden />
                 <span>Start with AI</span>
-              </Button>
+              </LinkButton>
             </div>
           </CardContent>
         </Card>

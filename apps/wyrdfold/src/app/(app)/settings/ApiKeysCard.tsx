@@ -11,7 +11,7 @@ import {
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -218,7 +218,8 @@ export default function ApiKeysCard() {
                   {meta && (
                     <Button
                       name='settings-cancel-openrouter-key'
-                      variant='ghost'
+                      variant='bare'
+                      className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
                       size='sm'
                       onClick={() => {
                         setEditing(false);

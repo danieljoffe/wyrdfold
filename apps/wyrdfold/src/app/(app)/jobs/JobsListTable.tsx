@@ -2,7 +2,7 @@
 
 import { Fragment, useState } from 'react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
-import Button from '@/components/Button';
+import Button from '@/components/kit/Button';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';

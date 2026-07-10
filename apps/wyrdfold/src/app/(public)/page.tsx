@@ -11,7 +11,7 @@ import { Alert } from '@danieljoffe/shared-ui/Alert';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import WaitlistForm from './WaitlistForm';
 import { deploymentMode } from '@/lib/deployment';
 
@@ -181,24 +181,22 @@ export default async function WyrdfoldLandingPage() {
                 <WaitlistForm />
                 <Text variant='helper' as='p' className='text-text-tertiary'>
                   Already invited?{' '}
-                  <Button
+                  <LinkButton
                     name='wyrdfold-hero-sign-in'
-                    as='link'
                     href='/login'
                     variant='bare'
                     size='sm'
-                    highlighted
-                    className='inline px-0 py-0'
+                    className='inline px-0 py-0 text-brand-700 underline underline-offset-4 dark:text-brand-300'
                   >
                     Sign in
-                  </Button>
+                  </LinkButton>
                 </Text>
               </>
             ) : (
               <div>
-                <Button name='wyrdfold-hero-sign-in' as='link' href='/login'>
+                <LinkButton name='wyrdfold-hero-sign-in' href='/login'>
                   {signupOpen ? 'Create your account' : 'Sign in'}
-                </Button>
+                </LinkButton>
               </div>
             )}
           </div>
@@ -405,23 +403,21 @@ export default async function WyrdfoldLandingPage() {
                 <WaitlistForm />
                 <Text variant='helper' as='p' className='text-text-tertiary'>
                   Already invited?{' '}
-                  <Button
+                  <LinkButton
                     name='wyrdfold-footer-sign-in'
-                    as='link'
                     href='/login'
                     variant='bare'
                     size='sm'
-                    highlighted
-                    className='inline px-0 py-0'
+                    className='inline px-0 py-0 text-brand-700 underline underline-offset-4 dark:text-brand-300'
                   >
                     Sign in
-                  </Button>
+                  </LinkButton>
                 </Text>
               </>
             ) : (
-              <Button name='wyrdfold-footer-sign-in' as='link' href='/login'>
+              <LinkButton name='wyrdfold-footer-sign-in' href='/login'>
                 {signupOpen ? 'Create your account' : 'Sign in'}
-              </Button>
+              </LinkButton>
             )}
           </div>
         </div>
