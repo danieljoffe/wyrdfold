@@ -34,15 +34,6 @@ interface TargetCardProps {
   onViewJobs: (id: string) => void;
 }
 
-function fitScoreVariant(
-  score: number
-): 'success' | 'brand' | 'warning' | 'default' {
-  if (score >= 85) return 'success';
-  if (score >= 70) return 'brand';
-  if (score >= 50) return 'warning';
-  return 'default';
-}
-
 export default function TargetCard({
   target,
   isActive,
@@ -120,7 +111,6 @@ export default function TargetCard({
             {fitScore !== null && (
               <ScoreBadge
                 score={fitScore}
-                variant={fitScoreVariant(fitScore)}
                 size='sm'
                 title={fitScoreReasoning ?? undefined}
               />
