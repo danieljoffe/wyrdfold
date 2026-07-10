@@ -30,13 +30,17 @@ from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import (
     DEFAULT_MODEL as EMBED_DEFAULT_MODEL,
 )
-from app.services.embeddings.job_embeddings import upsert_job_embedding
+from app.services.embeddings.job_embeddings import (
+    embed_jobs_batch,
+    upsert_job_embedding,
+)
 from app.services.embeddings.prescan_gate import cosine_gate_decision
 from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.extract import extract_salary_from_text
 from app.services.firecrawl import fetch_firecrawl_jobs
 from app.services.fit import run_phase2_for_jobs
+from app.services.fit.phase2_runner import _prescan_gate_applies
 from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs
@@ -1090,7 +1094,15 @@ async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
     if not rows:
         return
     logger.info("Embed backfill: embedding %d vector-less job(s)", len(rows))
-    await _embed_jobs(supabase, rows)
+    # Batched path: the anti-join above guarantees these rows have no
+    # current-model vector, so we can skip the per-job hash probes and use
+    # ~15 IO operations per 200 jobs instead of ~800 (2026-07-10 incident).
+    try:
+        embeddings_client = get_embeddings_client()
+    except Exception:
+        logger.exception("Embed backfill: embeddings client unavailable; skipping")
+        return
+    await embed_jobs_batch(supabase, embeddings_client, rows)
 
 
 async def _shadow_observe(
@@ -1114,7 +1126,16 @@ async def _shadow_observe(
     write swallow their own errors — a shadow failure can never break polling.
     Only ever reached behind ``settings.prescan_shadow_enabled`` (the caller
     gates on the flag; flag off ⇒ this is never invoked, no cosine work, no row).
+
+    Once the gate is LIVE for a target (``_prescan_gate_applies``), the
+    disagreement matrix is moot for it — cosine already drives admission — so
+    the shadow is skipped. This isn't just tidiness: each shadow observation
+    costs two full-vector reads (~8-16KB each) plus a row write, per
+    (job, target), per cycle — a steady IO stream the 2026-07-10 disk-budget
+    incident taught us to account for.
     """
+    if _prescan_gate_applies(target.id):
+        return
     try:
         cosine, cosine_admit = await cosine_gate_decision(supabase, job_id=job_id, target=target)
         threshold = await _shadow_threshold(supabase, target_id=target.id)

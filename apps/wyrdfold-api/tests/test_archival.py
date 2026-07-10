@@ -224,3 +224,4 @@ class TestPollerPurgeGuard:
         poller_mod._ARCHIVAL_LAST_RUN = 0.0
         await poller_mod._maybe_run_archival_sweep(object())
         assert called is False
+
