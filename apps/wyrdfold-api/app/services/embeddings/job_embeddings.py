@@ -158,3 +158,91 @@ async def upsert_job_embedding(
     except Exception:
         logger.exception("Job embedding failed for job %s", job_id)
         return "error"
+
+
+# Batched-path chunk sizes. The Voyage client sub-batches API calls at 128
+# internally; 96 keeps one call per batch with headroom. Vector writes go in
+# 24-row statements — a 96-row upsert of 1024-dim vectors is a 1-2MB statement
+# that exceeded the Postgres statement timeout under load on prod (57014,
+# 2026-07-10); 24 rows stays comfortably under it.
+_BATCH_EMBED_SIZE = 96
+_BATCH_WRITE_CHUNK = 24
+
+
+async def embed_jobs_batch(
+    supabase: Client,
+    embeddings_client: EmbeddingsClient,
+    rows: list[dict[str, Any]],
+    *,
+    model: EmbeddingModelId = DEFAULT_MODEL,
+) -> dict[str, int]:
+    """Embed many KNOWN-VECTORLESS jobs with batched IO (best-effort).
+
+    The per-job path above costs ~4 round trips per job (hash probe, embed
+    call, cost row, single-row upsert) — fine for the on-ingest trickle,
+    ruinous for the sweep (200 jobs/cycle ≈ 800 operations; the 2026-07-10
+    disk-budget incident). This path assumes the caller ALREADY knows the
+    rows have no current-model vector (the sweep's anti-join guarantees it),
+    so it skips the hash probes and does one Voyage call per
+    ``_BATCH_EMBED_SIZE`` texts, one cost row per call, and chunked bulk
+    upserts — ~15 operations for a 200-job sweep.
+
+    Returns status counts (``embedded`` / ``skipped_empty`` / ``error``).
+    Never raises; a failed batch loses only its own rows.
+    """
+    counts = {"embedded": 0, "skipped_empty": 0, "error": 0}
+    for i in range(0, len(rows), _BATCH_EMBED_SIZE):
+        batch = rows[i : i + _BATCH_EMBED_SIZE]
+        texts: list[tuple[dict[str, Any], str]] = []
+        for row in batch:
+            text = embed_text_for_job(row.get("title"), row.get("description_html"))
+            if text.strip():
+                texts.append((row, text))
+            else:
+                counts["skipped_empty"] += 1
+        if not texts:
+            continue
+        try:
+            result = await embeddings_client.embed(
+                model=model,
+                inputs=[t for _, t in texts],
+                purpose=JOB_EMBED_PURPOSE,
+                input_type="document",
+            )
+            cost_log.record_embedding(
+                supabase,
+                user_id=None,
+                purpose=JOB_EMBED_PURPOSE,
+                result=result,
+                metadata={"batched": len(texts), "model": model},
+            )
+            to_write = [
+                {
+                    "job_posting_id": row["id"],
+                    "model": model,
+                    "content_hash": content_hash(text),
+                    "embedding": vec,
+                }
+                for (row, text), vec in zip(texts, result.embeddings, strict=True)
+            ]
+            def _write(c: list[dict[str, Any]]) -> Any:
+                return (
+                    supabase.table(TABLE)
+                    .upsert(c, on_conflict="job_posting_id,model")
+                    .execute()
+                )
+
+            for w in range(0, len(to_write), _BATCH_WRITE_CHUNK):
+                chunk = to_write[w : w + _BATCH_WRITE_CHUNK]
+                try:
+                    await asyncio.to_thread(_write, chunk)
+                    counts["embedded"] += len(chunk)
+                except Exception:
+                    logger.exception(
+                        "Batched embed write failed for %d row(s)", len(chunk)
+                    )
+                    counts["error"] += len(chunk)
+        except Exception:
+            logger.exception("Batched embed failed for %d job(s)", len(texts))
+            counts["error"] += len(texts)
+    return counts
