@@ -9,6 +9,7 @@ cycle.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -47,10 +48,14 @@ def _sweep_supabase(rows: list[dict[str, Any]], calls: dict[str, Any]) -> MagicM
 def _patch_embed(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     rec: dict[str, Any] = {"embedded": []}
 
-    async def fake_embed_jobs(_sb: object, rows: list[dict[str, Any]]) -> None:
+    async def fake_embed_batch(
+        _sb: object, _client: object, rows: list[dict[str, Any]], **_: Any
+    ) -> dict[str, int]:
         rec["embedded"].extend(r["id"] for r in rows)
+        return {"embedded": len(rows), "skipped_empty": 0, "error": 0}
 
-    monkeypatch.setattr(poller_mod, "_embed_jobs", fake_embed_jobs)
+    monkeypatch.setattr(poller_mod, "embed_jobs_batch", fake_embed_batch)
+    monkeypatch.setattr(poller_mod, "get_embeddings_client", lambda: object())
     return rec
 
 
@@ -128,3 +133,52 @@ class TestBackfillEmbedMissing:
         await poller_mod._backfill_embed_missing(sb, 50)  # must not raise
 
         assert rec["embedded"] == []
+
+
+class TestShadowSkipWhenGateLive:
+    @pytest.mark.asyncio
+    async def test_shadow_skipped_for_gate_enforced_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Once cosine drives admission for a target, the shadow's
+        # keyword-vs-cosine matrix is moot — and each observation costs two
+        # full-vector reads + a row write per (job, target) per cycle.
+        recorded: list[str] = []
+
+        async def fake_record(*a: Any, **k: Any) -> None:
+            recorded.append("row")
+
+        monkeypatch.setattr(poller_mod, "record_shadow_observation", fake_record)
+        monkeypatch.setattr(poller_mod, "_prescan_gate_applies", lambda _tid: True)
+
+        target = SimpleNamespace(id="t-live")
+        await poller_mod._shadow_observe(
+            object(), job_id="j1", target=target, keyword_admit=True, keyword_score=50
+        )
+        assert recorded == []  # no cosine reads, no shadow row
+
+    @pytest.mark.asyncio
+    async def test_shadow_still_runs_for_unenforced_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        async def fake_record(_sb: Any, **kwargs: Any) -> None:
+            recorded.append(kwargs)
+
+        async def fake_gate_decision(*_a: Any, **_k: Any) -> tuple[None, None]:
+            return None, None
+
+        async def fake_threshold(*_a: Any, **_k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(poller_mod, "record_shadow_observation", fake_record)
+        monkeypatch.setattr(poller_mod, "cosine_gate_decision", fake_gate_decision)
+        monkeypatch.setattr(poller_mod, "_shadow_threshold", fake_threshold)
+        monkeypatch.setattr(poller_mod, "_prescan_gate_applies", lambda _tid: False)
+
+        target = SimpleNamespace(id="t-shadowed")
+        await poller_mod._shadow_observe(
+            object(), job_id="j1", target=target, keyword_admit=True, keyword_score=50
+        )
+        assert len(recorded) == 1
