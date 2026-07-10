@@ -3,8 +3,8 @@
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import Button from '@/components/Button';
 import { cn } from '@/lib/cn';
-import { useToast } from '@/state/Toast/ToastProvider';
 import JobCard from './JobCard';
+import { useJobDelete } from './useJobDelete';
 import JobsEmptyState from './JobsEmptyState';
 import type { JobPosting } from './types';
 
@@ -29,7 +29,7 @@ export default function JobsListMobile({
   onSelectionChange,
   onRefetch,
 }: JobsListMobileProps) {
-  const { toast } = useToast();
+  const { deleteJob } = useJobDelete();
 
   function toggleSelect(id: string) {
     const next = new Set(selectedIds);
@@ -42,17 +42,7 @@ export default function JobsListMobile({
   }
 
   async function handleDelete(jobId: string) {
-    try {
-      const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
-      if (res.ok) {
-        toast({ variant: 'success', title: 'Job deleted' });
-        onRefetch();
-      } else {
-        toast({ variant: 'error', title: 'Failed to delete job' });
-      }
-    } catch {
-      toast({ variant: 'error', title: 'Failed to delete job' });
-    }
+    if (await deleteJob(jobId)) onRefetch();
   }
 
   if (loading && postings.length === 0) {

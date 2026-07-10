@@ -10,6 +10,7 @@ import Button from '@/components/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import { useJobDelete } from './useJobDelete';
 import { cn } from '@/lib/cn';
 import BatchActionBar from './BatchActionBar';
 import JobsListView from './JobsListView';
@@ -213,7 +214,7 @@ export default function JobsList({
   >(undefined);
   const [exporting, setExporting] = useState(false);
   const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
-  const [batchDeleting, setBatchDeleting] = useState(false);
+  const { deleteJobs, deleting: batchDeleting } = useJobDelete();
   const [visiblePostings, setVisiblePostings] = useState<JobPosting[]>([]);
   const [activationStatus, setActivationStatus] = useState<string>('idle');
   // Total job count for the active target, sourced from
@@ -577,30 +578,11 @@ export default function JobsList({
 
   const handleBatchDelete = useCallback(async () => {
     if (selectedIds.size === 0) return;
-
-    setBatchDeleting(true);
-    try {
-      const deleteResults = await Promise.allSettled(
-        [...selectedIds].map(id =>
-          fetch(`/api/jobs/${id}`, { method: 'DELETE' })
-        )
-      );
-      const deleted = deleteResults.filter(
-        r => r.status === 'fulfilled' && r.value.ok
-      ).length;
-
-      toast({
-        variant: deleted > 0 ? 'success' : 'error',
-        title:
-          deleted > 0 ? `Deleted ${deleted} jobs` : 'Failed to delete jobs',
-      });
-      setSelectedIds(new Set());
-      setRefreshKey(k => k + 1);
-      setConfirmBatchDeleteOpen(false);
-    } finally {
-      setBatchDeleting(false);
-    }
-  }, [selectedIds, toast]);
+    await deleteJobs([...selectedIds]);
+    setSelectedIds(new Set());
+    setRefreshKey(k => k + 1);
+    setConfirmBatchDeleteOpen(false);
+  }, [selectedIds, deleteJobs]);
 
   // When the action bar is visible it overlaps the bottom of the table /
   // pagination. Mobile bar is two-row (~5.5rem) + gap, desktop is single-row

@@ -16,6 +16,7 @@ import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
+import { useJobDelete } from './useJobDelete';
 import JobFeedbackSection from './JobFeedbackSection';
 import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
@@ -126,7 +127,7 @@ export default function JobDetailPanel({
 }: JobDetailPanelProps) {
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const { deleteJob, deleting } = useJobDelete();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -274,23 +275,9 @@ export default function JobDetailPanel({
   }, [targetId, analysis, analyzing, analysisError, needsProfile, runAnalysis]);
 
   async function handleDelete() {
-    setDeleting(true);
-    try {
-      const res = await fetch(`/api/jobs/${posting.id}`, { method: 'DELETE' });
-      if (res.ok) {
-        toast({ variant: 'success', title: 'Job deleted' });
-        setConfirmDeleteOpen(false);
-        onDelete?.();
-      } else {
-        toast({
-          variant: 'error',
-          title: await extractApiError(res, 'Failed to delete job'),
-        });
-      }
-    } catch {
-      toast({ variant: 'error', title: 'Network error deleting job' });
-    } finally {
-      setDeleting(false);
+    if (await deleteJob(posting.id)) {
+      setConfirmDeleteOpen(false);
+      onDelete?.();
     }
   }
 
