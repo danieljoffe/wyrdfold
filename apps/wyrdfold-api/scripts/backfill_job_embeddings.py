@@ -103,6 +103,26 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _page_ids(
+    sb: Any, *, table: str, cols: str, order_col: str, page_size: int, **filters: Any
+) -> list[dict[str, Any]]:
+    """Range-page a cheap id-level select (PostgREST caps un-paged responses
+    at ~1000 rows, which would silently truncate the diff sets). ``filters``
+    map onto ``eq``/``is_`` (value ``None`` → ``is.null``)."""
+    out: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        q = sb.table(table).select(cols)
+        for col, val in filters.items():
+            q = q.is_(col, "null") if val is None else q.eq(col, val)
+        resp = q.order(order_col, desc=False).range(start, start + page_size - 1).execute()
+        rows = resp.data or []
+        out.extend(rows)
+        if len(rows) < page_size:
+            return out
+        start += page_size
+
+
 def _iter_jobs(
     sb: Any,
     *,
@@ -111,46 +131,60 @@ def _iter_jobs(
     include_archived: bool,
     missing_only: bool,
 ) -> list[dict[str, Any]]:
-    """Page through jobs to consider, oldest first.
+    """Collect the jobs to consider, oldest first.
 
-    ``missing_only`` (the default) anti-joins ``job_embeddings`` server-side
-    (``job_embeddings=is.null`` on the embedded resource — the same selection
-    the poller's per-cycle sweep uses), so an already-populated corpus pages
-    almost nothing. Without it, every selected job is fetched and the per-job
-    content-hash check decides. Keyset would scale better, but a backfill over
-    a beta-scale corpus is fine with range pagination + a stable ``created_at``
-    order. Stops early once ``limit`` rows are collected (0 = no cap).
-
-    NB with ``missing_only`` the predicate would shrink under range pagination
-    if vectors were written between page fetches — safe here because ALL pages
-    are collected up front and embedding only starts afterwards.
+    ``missing_only`` (the default) computes the missing set CLIENT-side: page
+    all job ids, page all ``job_embeddings.job_posting_id`` for the CURRENT
+    model (model-aware — a stale voyage-3 row must not mask the missing 3.5
+    vector), set-difference in Python, then hydrate title/description for just
+    the missing ids in keyed chunks. The obvious server-side anti-join
+    (``job_embeddings=is.null``) is what the poller's LIMIT-bounded sweep
+    uses, but UNBOUNDED over a 31k-row corpus it exceeds the Postgres
+    statement timeout (observed on prod, error 57014) — id paging + client
+    diff is three cheap scans instead. Stops once ``limit`` rows are
+    collected (0 = no cap).
     """
-    cols = _COLS + (",job_embeddings(job_posting_id)" if missing_only else "")
-    out: list[dict[str, Any]] = []
-    start = 0
-    while True:
-        end = start + page_size - 1
-        q = sb.table("jobs").select(cols)
-        if not include_archived:
-            q = q.is_("archived_at", "null")
-        if missing_only:
-            # Model-aware: a stale row from a retired model (voyage-3) must
-            # not mask the missing current-space vector — same predicate as
-            # the poller's per-cycle sweep.
-            q = q.eq("job_embeddings.model", DEFAULT_MODEL).is_(
-                "job_embeddings", "null"
-            )
-        resp = q.order("created_at", desc=False).range(start, end).execute()
-        rows = resp.data or []
-        if not rows:
-            break
-        out.extend(rows)
-        if limit and len(out) >= limit:
-            return out[:limit]
-        if len(rows) < page_size:
-            break
-        start += page_size
-    return out
+    if not missing_only:
+        out: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            end = start + page_size - 1
+            q = sb.table("jobs").select(_COLS)
+            if not include_archived:
+                q = q.is_("archived_at", "null")
+            resp = q.order("created_at", desc=False).range(start, end).execute()
+            rows = resp.data or []
+            if not rows:
+                break
+            out.extend(rows)
+            if limit and len(out) >= limit:
+                return out[:limit]
+            if len(rows) < page_size:
+                break
+            start += page_size
+        return out
+
+    job_filters: dict[str, Any] = {} if include_archived else {"archived_at": None}
+    job_ids = _page_ids(
+        sb, table="jobs", cols="id", order_col="created_at",
+        page_size=page_size, **job_filters,
+    )
+    embedded_rows = _page_ids(
+        sb, table="job_embeddings", cols="job_posting_id",
+        order_col="job_posting_id",  # no created_at on this table
+        page_size=page_size, model=DEFAULT_MODEL,
+    )
+    embedded = {r["job_posting_id"] for r in embedded_rows}
+    missing = [r["id"] for r in job_ids if r["id"] not in embedded]
+    if limit:
+        missing = missing[:limit]
+
+    out2: list[dict[str, Any]] = []
+    for i in range(0, len(missing), 200):
+        chunk = missing[i : i + 200]
+        resp = sb.table("jobs").select(_COLS).in_("id", chunk).execute()
+        out2.extend(resp.data or [])
+    return out2
 
 
 async def main() -> None:
