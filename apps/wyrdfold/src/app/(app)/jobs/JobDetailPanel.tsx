@@ -378,18 +378,16 @@ export default function JobDetailPanel({
         />
         <ScoreBadge score={posting.score} size='sm' />
 
-        {/* Resume + Cover Letter as compact pills in the toolbar. Only when
-            a target is selected — tailoring requires one. The components
-            keep all their generate/review/view state internally; passing
-            ``compact`` switches them to a single-button render. */}
+        {/* Resume + Cover Letter as single-button pills in the toolbar. Only
+            when a target is selected — tailoring requires one. The components
+            keep all their generate/review/view state internally. */}
         {targetId && (
           <>
-            <ResumeSection jobPostingId={posting.id} compact />
+            <ResumeSection jobPostingId={posting.id} />
             <CoverLetterSection
               jobPostingId={posting.id}
               companyName={posting.company_name}
               roleTitle={posting.title}
-              compact
             />
           </>
         )}

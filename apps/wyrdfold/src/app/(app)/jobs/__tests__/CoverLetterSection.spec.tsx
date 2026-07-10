@@ -97,7 +97,6 @@ describe('CoverLetterSection', () => {
     expect(
       await screen.findByRole('button', { name: /generate cover letter/i })
     ).toBeInTheDocument();
-    expect(screen.getByText(/not started/i)).toBeInTheDocument();
   });
 
   it('renders a Review link for an unapproved cover letter', async () => {
@@ -119,10 +118,9 @@ describe('CoverLetterSection', () => {
       name: /review cover letter/i,
     });
     expect(reviewLink).toHaveAttribute('href', '/jobs/j-1/cover-letter');
-    expect(screen.getByText(/^generated$/i)).toBeInTheDocument();
   });
 
-  it('renders a View / Download link when the cover letter is approved', async () => {
+  it('renders a View link when the cover letter is approved', async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -137,10 +135,10 @@ describe('CoverLetterSection', () => {
       />
     );
 
-    expect(
-      await screen.findByRole('link', { name: /view \/ download/i })
-    ).toBeInTheDocument();
-    expect(screen.getByText(/^approved$/i)).toBeInTheDocument();
+    const viewLink = await screen.findByRole('link', {
+      name: /view cover letter/i,
+    });
+    expect(viewLink).toHaveAttribute('href', '/jobs/j-1/cover-letter');
   });
 
   it('toasts an error when the generation request fails (non-2xx)', async () => {

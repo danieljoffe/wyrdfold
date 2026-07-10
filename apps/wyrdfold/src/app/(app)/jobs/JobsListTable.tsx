@@ -5,6 +5,7 @@ import { Badge } from '@danieljoffe/shared-ui/Badge';
 import Button from '@/components/Button';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
+import { timeAgo } from '@/lib/timeAgo';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
 import LogisticsChips from './LogisticsChips';
@@ -30,15 +31,6 @@ interface JobsListTableProps {
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
   onRefetch: () => void;
-}
-
-function timeAgo(dateStr: string | null): string {
-  if (!dateStr) return '—';
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const days = Math.floor(diff / 86400000);
-  if (days === 0) return 'today';
-  if (days === 1) return '1d ago';
-  return `${days}d ago`;
 }
 
 const COLUMNS: { key: JobsSortColumn; label: string }[] = [
