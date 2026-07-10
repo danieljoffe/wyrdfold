@@ -2,12 +2,13 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Check, Pencil } from 'lucide-react';
+import { Check, Pencil } from 'lucide-react';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
 import type {
   JobTarget,
   TargetReferenceJD,
@@ -148,13 +149,12 @@ export default function TargetDetail({ id }: TargetDetailProps) {
 
   return (
     <div className='flex flex-col gap-6'>
-      <Link
-        href='/targets'
-        className='flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary transition-colors w-fit'
-      >
-        <ArrowLeft className='size-4' aria-hidden />
-        <span>Back to targets</span>
-      </Link>
+      <Breadcrumbs
+        items={[
+          { label: 'Targets', href: '/targets' },
+          { label: crumbLabel(target.label) },
+        ]}
+      />
 
       <div className='flex items-center gap-3'>
         {editingLabel ? (

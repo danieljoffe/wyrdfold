@@ -159,11 +159,16 @@ describe('JobDetailPage — happy path', () => {
     expect(screen.getByText('$180k–$220k')).toBeInTheDocument();
   });
 
-  it('renders a "Back to jobs" link and an external posting link', async () => {
+  it('renders a breadcrumb trail back to Jobs and an external posting link', async () => {
     render(<JobDetailPage id='job-42' targetId='target-xyz' />);
 
     await screen.findByRole('heading', { name: /senior frontend engineer/i });
-    expect(screen.getByRole('link', { name: /back to jobs/i })).toHaveAttribute(
+    // Deep routes carry a Breadcrumb trail (UX/IA §2.1) instead of the old
+    // ad-hoc "Back to jobs" arrow.
+    expect(
+      screen.getByRole('navigation', { name: /breadcrumb/i })
+    ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Jobs' })).toHaveAttribute(
       'href',
       '/jobs'
     );

@@ -21,6 +21,7 @@ import ConfirmModal from '@/components/ConfirmModal';
 import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
 import type {
   JobPosting,
   LintViolation,
@@ -485,12 +486,13 @@ export default function CoverLetterReviewPage({
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
-        <Link
-          href={`/jobs/${jobPostingId}`}
-          className='inline-flex items-center gap-1 text-text-secondary hover:text-text-primary'
-        >
-          <ArrowLeft className='h-4 w-4' /> Back to job
-        </Link>
+        <Breadcrumbs
+          items={[
+            { label: 'Jobs', href: '/jobs' },
+            { label: crumbLabel(posting.title), href: `/jobs/${jobPostingId}` },
+            { label: 'Cover letter' },
+          ]}
+        />
         {isApproved && (
           <Badge variant='success' size='sm'>
             Locked
