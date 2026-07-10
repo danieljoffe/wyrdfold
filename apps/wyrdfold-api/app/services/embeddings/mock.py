@@ -22,6 +22,8 @@ from app.services.embeddings.pricing import calculate_cost
 DIMENSIONS: dict[EmbeddingModelId, int] = {
     "voyage-3": 1024,
     "voyage-3-lite": 512,
+    "voyage-3.5": 1024,
+    "voyage-3.5-lite": 1024,
 }
 
 
