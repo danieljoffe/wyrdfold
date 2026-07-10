@@ -1,10 +1,8 @@
 'use client';
 
-import { useState } from 'react';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/Button';
-import { extractApiError } from '@/lib/extractApiError';
-import { useToast } from '@/state/Toast/ToastProvider';
+import { useAddJobByUrl } from './useAddJobByUrl';
 
 interface JobsEmptyStateProps {
   /**
@@ -31,36 +29,7 @@ interface JobsEmptyStateProps {
  * justified for what amounts to one input.
  */
 export default function JobsEmptyState({ onJobAdded }: JobsEmptyStateProps) {
-  const [submitting, setSubmitting] = useState(false);
-  const { toast } = useToast();
-
-  async function handleAdd() {
-    // eslint-disable-next-line no-alert -- personal tool, native prompt matches the codebase
-    const url = window.prompt('Paste a job posting URL:');
-    const trimmed = url?.trim() ?? '';
-    if (!trimmed) return;
-    setSubmitting(true);
-    try {
-      const res = await fetch('/api/jobs/manual', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed }),
-      });
-      if (!res.ok) {
-        toast({
-          variant: 'error',
-          title: await extractApiError(res, 'Could not add job'),
-        });
-        return;
-      }
-      toast({ variant: 'success', title: 'Job added' });
-      onJobAdded();
-    } catch {
-      toast({ variant: 'error', title: 'Network error adding job' });
-    } finally {
-      setSubmitting(false);
-    }
-  }
+  const { addJobByUrl, submitting } = useAddJobByUrl(onJobAdded);
 
   return (
     <div className='flex flex-col items-center gap-3 py-12 text-center'>
@@ -72,7 +41,7 @@ export default function JobsEmptyState({ onJobAdded }: JobsEmptyStateProps) {
         name='jobs-add-manual'
         variant='outline'
         size='sm'
-        onClick={handleAdd}
+        onClick={addJobByUrl}
         disabled={submitting}
       >
         {submitting ? 'Adding...' : 'Paste URL'}
