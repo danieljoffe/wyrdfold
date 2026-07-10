@@ -995,6 +995,51 @@ async def _embed_jobs(
     )
 
 
+async def _drop_purged_rows(
+    supabase: Client, source_id: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Filter out rows whose (source, external_id) was TOMBSTONED (archival
+    Stage 2, option B).
+
+    The jobs upsert conflicts on (source_id, external_id) — without this
+    guard, a re-poll of a purged posting would UPDATE the tombstone back to
+    life (fresh description, re-triage, re-grade), defeating the purge. One
+    indexed id-level read per source poll; fail-soft (on error, upsert
+    everything — a resurrected tombstone is recoverable, a broken poll isn't).
+    """
+    if not rows:
+        return rows
+    try:
+        ext_ids = [r["external_id"] for r in rows if r.get("external_id")]
+        purged: set[str] = set()
+        for i in range(0, len(ext_ids), 200):
+            chunk = ext_ids[i : i + 200]
+            resp = await asyncio.to_thread(
+                supabase.table("jobs")
+                .select("external_id")
+                .eq("source_id", source_id)
+                .not_.is_("purged_at", "null")
+                .in_("external_id", chunk)
+                .execute
+            )
+            purged.update(
+                cast(str, r["external_id"])
+                for r in cast(list[dict[str, Any]], resp.data or [])
+            )
+        if not purged:
+            return rows
+        kept = [r for r in rows if r.get("external_id") not in purged]
+        logger.info(
+            "Purge guard: refused re-insert of %d tombstoned job(s) for source %s",
+            len(rows) - len(kept),
+            source_id,
+        )
+        return kept
+    except Exception:
+        logger.exception("Purge guard failed for source %s; upserting all", source_id)
+        return rows
+
+
 async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
     """Embed a bounded batch of jobs with NO ``job_embeddings`` row (#21 sweep).
 
@@ -1031,6 +1076,9 @@ async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
             .select("id, title, description_html, job_embeddings(job_posting_id)")
             .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
             .is_("job_embeddings", "null")
+            # Tombstoned rows have their payload stripped — embedding them
+            # would return skipped_empty forever, wasting sweep slots.
+            .is_("purged_at", "null")
             .order("created_at", desc=True)
             .limit(limit)
             .execute
@@ -1480,6 +1528,13 @@ async def _poll_one_source(
                 rows_to_upsert,
                 existing=existing_rows,
                 source=company_name,
+            )
+
+        # Tombstoned (purged) postings must not be resurrected by the
+        # conflict-update (archival Stage 2).
+        if rows_to_upsert:
+            rows_to_upsert = await _drop_purged_rows(
+                supabase, source_id, rows_to_upsert
             )
 
         # Re-check after dedupe: it can remove EVERY row (a source whose
@@ -2199,6 +2254,32 @@ async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
         logger.exception("Lifecycle sweep failed — continuing with poll cycle")
 
 
+_ARCHIVAL_LAST_RUN: float = 0.0
+
+
+async def _maybe_run_archival_sweep(supabase: Client) -> None:
+    """Run the archival lifecycle sweep at most every 6h (UX/IA §5).
+
+    Same throttle shape as the idle-account sweep above: piggybacks the
+    scheduler tick, never blocks or fails a poll, flag-gated so it ships
+    inert until the operator flips ``ARCHIVAL_SWEEP_ENABLED``.
+    """
+    global _ARCHIVAL_LAST_RUN
+    import time
+
+    from app.services.archival import run_archival_sweep
+
+    if not settings.archival_sweep_enabled:
+        return
+    now = time.monotonic()
+    if _ARCHIVAL_LAST_RUN and now - _ARCHIVAL_LAST_RUN < LIFECYCLE_SWEEP_INTERVAL_S:
+        return
+    _ARCHIVAL_LAST_RUN = now
+    # ``run_archival_sweep`` is fail-soft internally; this wrapper only
+    # exists for the throttle + flag gate.
+    await run_archival_sweep(supabase)
+
+
 def _drop_paid_sources_if_unconsumed(
     sources: list[dict[str, Any]], *, has_active_targets: bool
 ) -> list[dict[str, Any]]:
@@ -2317,6 +2398,10 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     # Idle-account housekeeping piggybacks the cron tick (throttled to
     # ~6h inside; never blocks or fails the poll).
     await _maybe_run_lifecycle_sweep(supabase)
+
+    # Archival lifecycle (UX/IA §5): 30d soft-archive + 60d purge, same
+    # piggyback/throttle shape, flag-gated.
+    await _maybe_run_archival_sweep(supabase)
 
     due = filter_due_sources(all_enabled)
 
@@ -2541,6 +2626,13 @@ async def _poll_one_source_for_target(
 
         if settings.validate_poll_urls and rows_to_upsert:
             rows_to_upsert = await _validate_rows(rows_to_upsert)
+
+        # Tombstoned (purged) postings must not be resurrected by the
+        # conflict-update (archival Stage 2) — same guard as _poll_one_source.
+        if rows_to_upsert:
+            rows_to_upsert = await _drop_purged_rows(
+                supabase, source_id, rows_to_upsert
+            )
 
         if rows_to_upsert:
             upsert_resp = await asyncio.to_thread(
