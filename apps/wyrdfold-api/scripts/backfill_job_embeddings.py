@@ -164,7 +164,11 @@ def _iter_jobs(
             start += page_size
         return out
 
-    job_filters: dict[str, Any] = {} if include_archived else {"archived_at": None}
+    # Tombstoned rows (archival Stage 2) have their payload stripped —
+    # nothing meaningful to embed, so always exclude them.
+    job_filters: dict[str, Any] = {"purged_at": None}
+    if not include_archived:
+        job_filters["archived_at"] = None
     job_ids = _page_ids(
         sb, table="jobs", cols="id", order_col="created_at",
         page_size=page_size, **job_filters,
