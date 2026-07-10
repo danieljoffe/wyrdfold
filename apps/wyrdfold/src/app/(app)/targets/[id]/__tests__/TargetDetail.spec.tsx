@@ -9,6 +9,11 @@ jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
 }));
 
+// The kit Breadcrumbs uses useRouter for client-nav interception.
+jest.mock('next/navigation', () => ({
+  useRouter: () => ({ push: jest.fn(), prefetch: jest.fn() }),
+}));
+
 // Children are exercised in their own specs; stub them so this spec only
 // proves the section composition + loading / not-found switch.
 jest.mock('../ScoringProfileEditor', () => ({
@@ -92,10 +97,14 @@ describe('TargetDetail', () => {
     expect(screen.getByTestId('reference-jd-list-stub')).toBeInTheDocument();
     // Active badge
     expect(screen.getByText(/^active$/i)).toBeInTheDocument();
-    // Back link
+    // Breadcrumb trail (UX/IA §2.1) replaced the old "Back to targets" link.
     expect(
-      screen.getByRole('link', { name: /back to targets/i })
-    ).toHaveAttribute('href', '/targets');
+      screen.getByRole('navigation', { name: /breadcrumb/i })
+    ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Targets' })).toHaveAttribute(
+      'href',
+      '/targets'
+    );
   });
 
   it('renders the "Target not found" state when the target fetch fails', async () => {

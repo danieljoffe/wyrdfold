@@ -78,7 +78,12 @@ class TestBackfillEmbedMissing:
         calls["chain"].eq.assert_called_once_with(
             "job_embeddings.model", poller_mod.EMBED_DEFAULT_MODEL
         )
-        calls["chain"].is_.assert_called_once_with("job_embeddings", "null")
+        # Two is-null filters: the anti-join itself, plus the purge exclusion
+        # (tombstoned rows have no payload — embedding them would return
+        # skipped_empty forever, wasting sweep slots).
+        is_calls = [c.args for c in calls["chain"].is_.call_args_list]
+        assert ("job_embeddings", "null") in is_calls
+        assert ("purged_at", "null") in is_calls
         # Newest first: the drip is dominated by recent jobs about to face
         # the gate.
         calls["chain"].order.assert_called_once_with("created_at", desc=True)

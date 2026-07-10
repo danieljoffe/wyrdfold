@@ -244,12 +244,25 @@ def _fetch_jobs_chunked(
     """
     if not page_ids:
         return []
+    # The archived VIEW (status='archived') must show globally-archived rows —
+    # the 30d sweep's output (UX/IA §5 Stage 1: "archived but still
+    # reachable") — alongside per-user-archived ones, so it swaps the
+    # liveness gate for a purge gate (tombstones stay hidden: their payload
+    # is stripped) and carries ``archived_at`` through for the overlay below.
+    archived_view = status == "archived"
+    for_view_cols = (
+        _JP_SELECT_COLS + ", archived_at" if archived_view else _JP_SELECT_COLS
+    )
     out: list[dict[str, Any]] = []
     for i in range(0, len(page_ids), _IN_CHUNK_SIZE):
         chunk = page_ids[i : i + _IN_CHUNK_SIZE]
         # Liveness gate (#75 C3) + non-US gate (#60): exclude globally-archived
         # jobs AND confirmed non-US ones, regardless of per-user status.
-        q = _gate_live_us(supabase.table("jobs").select(_JP_SELECT_COLS).in_("id", chunk))
+        q = supabase.table("jobs").select(for_view_cols).in_("id", chunk)
+        if archived_view:
+            q = q.is_("purged_at", "null").not_.is_("is_us", "false")
+        else:
+            q = _gate_live_us(q)
         if company:
             q = q.eq("company_name", company)
         q = _apply_title_search(q, search)
@@ -277,8 +290,19 @@ def _fetch_jobs_chunked(
 
         # Apply the status filter on the per-user value, mirroring the old
         # global-status semantics: explicit status keeps only matches;
-        # default view drops archived.
-        if status:
+        # default view drops archived. The archived view additionally
+        # admits globally-archived rows (the 30d sweep's output) whatever
+        # their per-user status, displaying them as 'archived'.
+        if archived_view:
+            kept: list[dict[str, Any]] = []
+            for r in rows:
+                globally_archived = r.get("archived_at") is not None
+                if r["status"] == "archived" or globally_archived:
+                    r["status"] = "archived"
+                    r.pop("archived_at", None)
+                    kept.append(r)
+            rows = kept
+        elif status:
             rows = [r for r in rows if r["status"] == status]
         else:
             rows = [r for r in rows if r["status"] != "archived"]
@@ -909,11 +933,15 @@ def _list_jobs_for_target(
     }
     # Logistics filters (#86) are post-fetch like location/preferences, so an
     # active one also forces the two-query path — the RPC keyset can't see it.
+    # The archived view does too: ``get_target_jobs`` gates to live rows in
+    # SQL, so only the two-query path can surface globally-archived rows
+    # (UX/IA §5 Stage 1 "still reachable").
     has_logistics = logistics is not None and logistics.active
     if (
         axis_weights is not None
         or _preferences_have_post_fetch_filter(preferences)
         or has_logistics
+        or status == "archived"
     ):
         return _list_jobs_for_target_two_query(
             supabase,

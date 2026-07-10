@@ -164,7 +164,11 @@ def _iter_jobs(
             start += page_size
         return out
 
-    job_filters: dict[str, Any] = {} if include_archived else {"archived_at": None}
+    # Tombstoned rows (archival Stage 2) have their payload stripped —
+    # nothing meaningful to embed, so always exclude them.
+    job_filters: dict[str, Any] = {"purged_at": None}
+    if not include_archived:
+        job_filters["archived_at"] = None
     job_ids = _page_ids(
         sb, table="jobs", cols="id", order_col="created_at",
         page_size=page_size, **job_filters,
@@ -265,10 +269,22 @@ async def main() -> None:
                             texts, result.embeddings, strict=True
                         )
                     ]
-                    sb.table("job_embeddings").upsert(
-                        rows_to_write, on_conflict="job_posting_id,model"
-                    ).execute()
-                    counts["embedded"] = counts.get("embedded", 0) + len(rows_to_write)
+                    # Write in small sub-chunks: one 96-row upsert of 1024-dim
+                    # vectors is a 1-2MB statement that exceeds the Postgres
+                    # statement timeout under load (observed on prod: 57014 on
+                    # ~200 consecutive batches, losing the already-spent
+                    # embeds). 24 rows/statement keeps each write well under
+                    # the timeout; a failed sub-chunk only loses that slice.
+                    for w in range(0, len(rows_to_write), 24):
+                        chunk = rows_to_write[w : w + 24]
+                        try:
+                            sb.table("job_embeddings").upsert(
+                                chunk, on_conflict="job_posting_id,model"
+                            ).execute()
+                            counts["embedded"] = counts.get("embedded", 0) + len(chunk)
+                        except Exception as exc:
+                            print(f"  write chunk failed ({len(chunk)} rows): {exc}")
+                            counts["error"] = counts.get("error", 0) + len(chunk)
                 except Exception as exc:  # keep going — later batches may succeed
                     print(f"  batch failed ({len(texts)} jobs): {exc}")
                     counts["error"] = counts.get("error", 0) + len(texts)

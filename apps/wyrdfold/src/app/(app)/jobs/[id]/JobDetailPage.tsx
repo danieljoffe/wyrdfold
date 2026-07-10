@@ -13,6 +13,7 @@ import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
 import { useJobDelete } from '../useJobDelete';
 import type { UserTargetWithSummary } from '../../targets/types';
 import JobDetailPanel from '../JobDetailPanel';
@@ -200,14 +201,13 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
 
   return (
     <div className='flex flex-col gap-6'>
+      <Breadcrumbs
+        items={[
+          { label: 'Jobs', href: '/jobs' },
+          { label: crumbLabel(posting.title) },
+        ]}
+      />
       <div className='flex items-start gap-3'>
-        <Link
-          href='/jobs'
-          className='mt-1 p-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-tertiary transition-colors'
-          aria-label='Back to jobs'
-        >
-          <ArrowLeft className='size-5' aria-hidden />
-        </Link>
         <div className='flex-1 min-w-0'>
           {posting.absolute_url ? (
             <a

@@ -358,6 +358,27 @@ class Settings(BaseSettings):
     # runs when ``qualification_enabled``.
     qualification_backfill_batch: int = Field(default=50, ge=0, le=1000)
 
+    # ---- Archival lifecycle (UX/IA §5; Stage 1 + Stage 2 A/B) ----------
+    # Ships OFF like every sweep — the operator flips ARCHIVAL_SWEEP_ENABLED
+    # per-deploy. When on, a throttled (~6h) sweep piggybacks the poll cycle:
+    #   Stage 1: jobs older than ``archival_archive_after_days`` that NO user
+    #     has engaged with (every user_jobs status is new/archived — absent
+    #     rows count as 'new') get ``archived_at`` stamped. Reversible; the
+    #     default list views already exclude archived rows, and the existing
+    #     ``status='archived'`` view + direct links keep them reachable.
+    #   Stage 2: rows archived longer than ``archival_purge_after_days`` are
+    #     either HARD-DELETED (no engagement, no graded history, and delisted
+    #     by their source for ``archival_delist_grace_days`` — pure noise; FK
+    #     children cascade) or TOMBSTONED (``purged_at`` + payload stripped)
+    #     when anything is worth keeping or the source still lists them —
+    #     a tombstone blocks poller re-insert, so purged jobs can't reappear.
+    # Batches are bounded per phase per run (IO discipline, 2026-07-10).
+    archival_sweep_enabled: bool = False
+    archival_archive_after_days: int = Field(default=30, ge=7, le=365)
+    archival_purge_after_days: int = Field(default=60, ge=30, le=730)
+    archival_delist_grace_days: int = Field(default=14, ge=1, le=90)
+    archival_sweep_batch: int = Field(default=500, ge=0, le=5000)
+
     # Pre-scan job embeddings (#60, Phase 1). When True the poller embeds
     # each newly-ingested / changed job ONCE (target-INDEPENDENT) and caches
     # the vector in ``job_embeddings`` via
