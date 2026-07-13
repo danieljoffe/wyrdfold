@@ -39,7 +39,7 @@ from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
 from app.services.embeddings.prescan_gate import (
-    cosine_gate_admits_batch,
+    cosine_gate_batch,
     cosine_scores_batch,
     in_prescan_holdout,
 )
@@ -247,27 +247,45 @@ async def run_phase2_for_jobs(
 
     # Pre-scan cosine gate (#90 flip): admit to the LLM grade only where
     # cosine(job, target) >= the calibrated threshold, replacing the permissive
-    # keyword admission (shadow data: keyword admits ~100%, cosine ~5%). Fail-
-    # open — a None verdict (target uncalibrated / job unvectored) is admitted,
-    # so an unpopulated spine never drops jobs. A deterministic exploration
-    # holdout keeps a small slice of would-drop jobs FOR grading, so the gate's
-    # false-negative rate stays measurable against the shadow log. Flag-off by
-    # default; enabled per-target (``prescan_gate_target_ids``) after calibration
-    # (#89) so a zero-loss target flips before a lossier one (#90 rollout).
+    # keyword admission (shadow data: keyword admits ~100%, cosine ~5%).
+    # DATA absence fails open — a None verdict (target uncalibrated / job
+    # unvectored) is admitted, so an unpopulated spine never drops jobs.
+    # INFRA errors fail CLOSED — a failed vector read DEFERS the whole batch
+    # to the next cycle instead of grading it ungated ("defer, never
+    # admit-blind", the same contract as the Phase-1 budget gate). The
+    # 2026-07-12 gated-cycle audit is why: the old error→admit-all path
+    # converted IO timeouts into ~20% of a 48h sample being graded ungated.
+    # A deterministic exploration holdout keeps a small slice of would-drop
+    # jobs FOR grading, so the gate's false-negative rate stays measurable.
+    # Flag-off by default; enabled per-target (``prescan_gate_target_ids``)
+    # after calibration (#89) so a zero-loss target flips before a lossier
+    # one (#90 rollout).
+    cosines: dict[str, float]
     if _prescan_gate_applies(target.id):
-        admits = await cosine_gate_admits_batch(supabase, target, candidates)
+        try:
+            gate = await cosine_gate_batch(supabase, target, candidates)
+        except Exception:
+            logger.warning(
+                "Phase 2 pre-scan gate: vector read failed for target %s — "
+                "deferring %d candidate(s) to the next cycle (fail-closed; "
+                "an IO error must not buy ungated grades)",
+                target.id,
+                len(candidates),
+                exc_info=True,
+            )
+            return 0
         holdout = settings.prescan_gate_holdout_fraction
         kept = []
         dropped = held = 0
         for jid in candidates:
-            if admits.get(jid) is False:
+            if gate.admit(jid) is False:
                 if in_prescan_holdout(jid, target.id, holdout):
                     held += 1
                     kept.append(jid)  # exploration holdout — grade to measure FN
                 else:
                     dropped += 1
                 continue
-            kept.append(jid)  # True (>= threshold) or None (fail-open) → admit
+            kept.append(jid)  # True (>= threshold) or None (data absence) → admit
         if dropped or held:
             logger.info(
                 "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d for target %s",
@@ -280,6 +298,13 @@ async def run_phase2_for_jobs(
         candidates = kept
         if not candidates:
             return 0
+        # Reuse the gate's cosines for ordering — no second vector fetch.
+        cosines = gate.cosines
+    else:
+        # Gate not enforced for this target: cosines are fetched for ORDERING
+        # only, best-effort ({} on error) — a read failure here degrades
+        # priority order but cannot change what gets admitted or spent.
+        cosines = await cosine_scores_batch(supabase, target, candidates)
 
     # Order candidates so the Phase 2 daily cap goes to the highest-FIT-
     # PROBABILITY jobs first. cosine(job, target) is the strongest cheap
@@ -292,7 +317,6 @@ async def run_phase2_for_jobs(
     #   2) phase1_confidence DESC, then 3) first_seen_at DESC — tie-breakers.
     # ``first_seen_at`` is an ISO-8601 string, sortable lexically; missing
     # values sort last.
-    cosines = await cosine_scores_batch(supabase, target, candidates)
 
     def _priority(jid: str) -> tuple[float, int, str]:
         cos = cosines.get(jid, -1.0)

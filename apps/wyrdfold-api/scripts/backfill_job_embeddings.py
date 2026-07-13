@@ -53,16 +53,13 @@ from typing import Any
 from app.services.embeddings import get_default_client
 from app.services.embeddings.job_embeddings import (
     DEFAULT_MODEL,
-    JOB_EMBED_PURPOSE,
-    content_hash,
-    embed_text_for_job,
+    embed_jobs_batch,
     upsert_job_embedding,
 )
-from app.services.llm import cost_log
 from app.supabase_pool import get_supabase_pool, init_supabase
 
-# Batched-mode chunk size: the Voyage client sub-batches at 128 internally;
-# 96 keeps one script batch inside a single API call with headroom.
+# Progress-reporting granularity for the batched path (embed_jobs_batch does
+# its own Voyage batching + chunked writes internally).
 _EMBED_BATCH_SIZE = 96
 
 # Only the fields the embed text needs (id + title + description). Keep the
@@ -228,70 +225,27 @@ async def main() -> None:
 
     if not args.all_jobs:
         # Missing-only mode: every selected job provably has no current-model
-        # row (server-side anti-join), so skip the per-job hash probe and
-        # embed in BATCHES — one Voyage call + one bulk upsert per chunk.
-        # ~100x fewer API round-trips than the per-job path; a 30k-job
-        # re-embed (model migration) finishes in minutes instead of hours.
+        # row (server-side anti-join), so reuse the sweep's batched path —
+        # one Voyage call per 96 texts, 8-row write chunks, and the write
+        # circuit breaker (2 consecutive failed chunks abort the run rather
+        # than re-buying embeds against a throttled disk; re-run to resume,
+        # the anti-join makes it idempotent). ~100x fewer API round-trips
+        # than the per-job path.
         for i in range(0, total, _EMBED_BATCH_SIZE):
             batch = jobs[i : i + _EMBED_BATCH_SIZE]
-            texts: list[tuple[dict[str, Any], str]] = []
-            for row in batch:
-                text = embed_text_for_job(
-                    row.get("title"), row.get("description_html")
-                )
-                if text.strip():
-                    texts.append((row, text))
-                else:
-                    counts["skipped_empty"] = counts.get("skipped_empty", 0) + 1
-            if texts:
-                try:
-                    result = await client.embed(
-                        model=DEFAULT_MODEL,
-                        inputs=[t for _, t in texts],
-                        purpose=JOB_EMBED_PURPOSE,
-                        input_type="document",
-                    )
-                    cost_log.record_embedding(
-                        sb,
-                        user_id=None,
-                        purpose=JOB_EMBED_PURPOSE,
-                        result=result,
-                        metadata={"batched": len(texts), "model": DEFAULT_MODEL},
-                    )
-                    rows_to_write = [
-                        {
-                            "job_posting_id": row["id"],
-                            "model": DEFAULT_MODEL,
-                            "content_hash": content_hash(text),
-                            "embedding": vec,
-                        }
-                        for (row, text), vec in zip(
-                            texts, result.embeddings, strict=True
-                        )
-                    ]
-                    # Write in small sub-chunks: one 96-row upsert of 1024-dim
-                    # vectors is a 1-2MB statement that exceeds the Postgres
-                    # statement timeout under load (observed on prod: 57014 on
-                    # ~200 consecutive batches, losing the already-spent
-                    # embeds). 24 rows/statement keeps each write well under
-                    # the timeout; a failed sub-chunk only loses that slice.
-                    for w in range(0, len(rows_to_write), 24):
-                        chunk = rows_to_write[w : w + 24]
-                        try:
-                            sb.table("job_embeddings").upsert(
-                                chunk, on_conflict="job_posting_id,model"
-                            ).execute()
-                            counts["embedded"] = counts.get("embedded", 0) + len(chunk)
-                        except Exception as exc:
-                            print(f"  write chunk failed ({len(chunk)} rows): {exc}")
-                            counts["error"] = counts.get("error", 0) + len(chunk)
-                except Exception as exc:  # keep going — later batches may succeed
-                    print(f"  batch failed ({len(texts)} jobs): {exc}")
-                    counts["error"] = counts.get("error", 0) + len(texts)
+            batch_counts = await embed_jobs_batch(sb, client, batch)
+            for key, val in batch_counts.items():
+                counts[key] = counts.get(key, 0) + val
             done += len(batch)
             elapsed = time.perf_counter() - started
             rate = done / elapsed if elapsed else 0.0
             print(f"  {done}/{total} ({rate:.1f}/s) ...")
+            if batch_counts.get("aborted"):
+                print(
+                    "  write circuit breaker tripped — stopping (DB is "
+                    "IO-throttled; re-run later to resume where this left off)"
+                )
+                break
     else:
         sem = asyncio.Semaphore(args.concurrency)
 
