@@ -644,3 +644,74 @@ class TestMalformedFieldTolerance:
         assert tags.seniority == "unknown"
         assert tags.is_genuine_role is None  # missing bool → None
         assert tags.us_confidence is None
+
+
+# ---- runtime model resolution (QUALIFICATION_MODEL env flip, task #31) ------
+
+
+class TestModelResolution:
+    """The runtime model comes from ``settings.qualification_model`` — resolved
+    at call time so the QUALIFICATION_MODEL env flip (the deepseek cost swap)
+    takes effect without re-import — while the module constant stays the
+    documented default pinned by the prompt-regression golden contract."""
+
+    def _capture_model(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+
+        async def fake_complete_json(*_a: object, **kwargs: Any) -> object:
+            captured["model"] = kwargs["model"]
+            return QualificationTags(**_GOLDEN_CASES[0]["verdict"]), object()
+
+        monkeypatch.setattr(tagger_mod, "complete_json", fake_complete_json)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_configured_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured = self._capture_model(monkeypatch)
+        await tag_job(
+            MockLLMClient(), title="T", company=None, location=None, description=None
+        )
+        assert captured["model"] == tagger_mod.QUALIFICATION_MODEL
+
+    @pytest.mark.asyncio
+    async def test_env_flip_takes_effect_without_reimport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "qualification_model", "deepseek-v3-2")
+        captured = self._capture_model(monkeypatch)
+        await tag_job(
+            MockLLMClient(), title="T", company=None, location=None, description=None
+        )
+        assert captured["model"] == "deepseek-v3-2"
+
+    @pytest.mark.asyncio
+    async def test_explicit_model_wins_over_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "qualification_model", "deepseek-v3-2")
+        captured = self._capture_model(monkeypatch)
+        await tag_job(
+            MockLLMClient(),
+            title="T",
+            company=None,
+            location=None,
+            description=None,
+            model="claude-haiku-4-5",
+        )
+        assert captured["model"] == "claude-haiku-4-5"
+
+    def test_setting_default_matches_golden_constant(self) -> None:
+        # The prompt-regression contract pins the CONSTANT; this pins the
+        # SETTING default to it, so neither can drift silently.
+        from app.config import Settings
+
+        assert (
+            Settings.model_fields["qualification_model"].default
+            == tagger_mod.QUALIFICATION_MODEL
+        )

@@ -335,6 +335,18 @@ class Settings(BaseSettings):
     # rows. Flip per-deploy once validated in DEV.
     qualification_enabled: bool = False
 
+    # Which model backs the qualification tagger. Default Haiku — the proven
+    # incumbent, pinned into the prompt-regression golden contract so a swap
+    # can't merge silently. Set QUALIFICATION_MODEL=deepseek-v3-2 to route
+    # through OpenRouter's OpenAI-compatible path: the tagger is the single
+    # largest LLM spender (41% / ~$52 of the 2026-07 30-day anatomy) and its
+    # one-job-per-call output (~170 tokens) sits far inside deepseek's
+    # ceilings, so unlike Phase-1 triage it needs no batch clamp. Tagging is
+    # best-effort per job (a failed call leaves tags NULL for a later
+    # re-attempt), so a model hiccup degrades gracefully, never breaks
+    # polling.
+    qualification_model: ModelId = "claude-haiku-4-5"
+
     # Max characters of the (cleaned) job description sent to the
     # qualification tagger. The tagger only needs the dense signals near the
     # top of a JD (country cues, seniority wording, "general application"
