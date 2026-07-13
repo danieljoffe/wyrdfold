@@ -78,6 +78,24 @@ PHASE1_PURPOSE = "relevance.title_triage"
 # context keeps the marginal cost of additional batches low.
 PHASE1_BATCH_SIZE = 250
 
+# Model-specific batch caps, applied on top of PHASE1_BATCH_SIZE. DeepSeek's
+# OpenAI-shaped path caps completion output near 8K tokens — BELOW the 10,240
+# this module requests — so a full 250-verdict batch (~34 output tokens per
+# verdict ≈ 8.5K) can truncate mid-JSON on deepseek where Haiku is fine. The
+# parser raises on truncation (safe: the batch defers, never admit-blind), but
+# a batch that ALWAYS overflows would defer-retry forever, paying input tokens
+# every cycle for zero verdicts — the paid retry loop again (cf. the
+# 2026-07-12 embed-write loop). 150 verdicts ≈ 5.1K output leaves ~40%
+# headroom under the 8K ceiling.
+_MODEL_MAX_BATCH: dict[ModelId, int] = {"deepseek-v3-2": 150}
+
+
+def phase1_batch_size(model: ModelId | None = None) -> int:
+    """Effective per-call title-batch cap for ``model`` (default: the
+    configured ``settings.phase1_triage_model``). Callers chunk to this."""
+    resolved = model or settings.phase1_triage_model
+    return min(PHASE1_BATCH_SIZE, _MODEL_MAX_BATCH.get(resolved, PHASE1_BATCH_SIZE))
+
 
 _SYSTEM_PROMPT = (
     UNTRUSTED_CONTENT_DIRECTIVE
@@ -294,21 +312,23 @@ async def triage_titles(
     """
     if not titles:
         return {}, None
-    if len(titles) > PHASE1_BATCH_SIZE:
-        # Defensive: callers are expected to chunk to PHASE1_BATCH_SIZE.
-        # We don't truncate silently because losing the tail would be a
-        # confusing data loss; raise loudly so the caller's batching
-        # bug is visible.
-        raise ValueError(
-            f"triage_titles batch size {len(titles)} exceeds "
-            f"PHASE1_BATCH_SIZE={PHASE1_BATCH_SIZE}. Chunk the input."
-        )
 
     # Default to the configured Phase-1 model (Haiku, or deepseek-v3-2 when
     # PHASE1_TRIAGE_MODEL is set). Resolved at call time so an env flip / test
     # override takes effect without re-import. An explicit ``model=`` still wins.
     if model is None:
         model = settings.phase1_triage_model
+
+    cap = phase1_batch_size(model)
+    if len(titles) > cap:
+        # Defensive: callers are expected to chunk to phase1_batch_size().
+        # We don't truncate silently because losing the tail would be a
+        # confusing data loss; raise loudly so the caller's batching
+        # bug is visible.
+        raise ValueError(
+            f"triage_titles batch size {len(titles)} exceeds the {cap}-title "
+            f"cap for model {model}. Chunk the input with phase1_batch_size()."
+        )
 
     static_prefix, dynamic_suffix = _split_user_message(target, titles)
     user_message = static_prefix + dynamic_suffix

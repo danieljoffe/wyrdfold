@@ -107,11 +107,18 @@ def _parse_openai_tool_response(
 def _openai_usage(data: dict[str, Any]) -> LLMUsage:
     """Map OpenAI-shaped usage onto our LLMUsage. ``cached_tokens`` (when the
     provider reports it) counts as a cache read; OpenAI-shaped providers don't
-    surface a separate cache-write line, so creation stays 0."""
+    surface a separate cache-write line, so creation stays 0.
+
+    OpenAI semantics: ``prompt_tokens`` INCLUDES the cached subset, while our
+    pricing meters input and cache reads as disjoint pools (Anthropic
+    convention — ``calculate_cost`` charges input at full rate PLUS cache
+    reads at 0.1x). Subtract the cached subset from input so a cache hit is
+    billed once at the discount, not full rate + discount again."""
     u = data.get("usage") or {}
     cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+    prompt = int(u.get("prompt_tokens", 0) or 0)
     return LLMUsage(
-        input_tokens=int(u.get("prompt_tokens", 0) or 0),
+        input_tokens=max(0, prompt - cached),
         output_tokens=int(u.get("completion_tokens", 0) or 0),
         cache_read_input_tokens=cached,
         cache_creation_input_tokens=0,

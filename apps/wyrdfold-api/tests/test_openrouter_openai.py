@@ -89,6 +89,10 @@ def test_parse_empty_arguments_raises() -> None:
 
 
 def test_usage_maps_openai_shape_with_cache() -> None:
+    # OpenAI semantics: prompt_tokens INCLUDES the cached subset. Our pricing
+    # meters input and cache reads as DISJOINT pools (Anthropic convention),
+    # so the cached 40 must be carved OUT of input — recording 100+40 would
+    # bill the cached tokens at full rate and again at the 0.1x discount.
     data = {
         "usage": {
             "prompt_tokens": 100,
@@ -97,8 +101,48 @@ def test_usage_maps_openai_shape_with_cache() -> None:
         }
     }
     assert _openai_usage(data) == LLMUsage(
-        input_tokens=100, output_tokens=20, cache_read_input_tokens=40
+        input_tokens=60, output_tokens=20, cache_read_input_tokens=40
     )
+
+
+def test_usage_fully_cached_prompt_floors_input_at_zero() -> None:
+    data = {
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 100},
+        }
+    }
+    usage = _openai_usage(data)
+    assert usage.input_tokens == 0
+    assert usage.cache_read_input_tokens == 100
+
+
+def test_usage_no_cache_details_charges_full_input() -> None:
+    data = {"usage": {"prompt_tokens": 100, "completion_tokens": 20}}
+    assert _openai_usage(data) == LLMUsage(input_tokens=100, output_tokens=20)
+
+
+def test_usage_cache_decomposition_prices_hit_cheaper_than_miss() -> None:
+    # End-to-end guard on the double-count: the SAME 1,000-token prompt must
+    # cost LESS when 900 of it came from cache than when none did.
+    from app.services.llm.pricing import calculate_cost
+
+    miss = _openai_usage(
+        {"usage": {"prompt_tokens": 1000, "completion_tokens": 100}}
+    )
+    hit = _openai_usage(
+        {
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            }
+        }
+    )
+    cost_miss = calculate_cost("deepseek-v3-2", miss)
+    cost_hit = calculate_cost("deepseek-v3-2", hit)
+    assert cost_hit < cost_miss
 
 
 def test_usage_missing_fields_default_zero() -> None:
