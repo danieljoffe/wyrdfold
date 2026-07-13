@@ -26,6 +26,7 @@ import ast
 import asyncio
 import hashlib
 import logging
+from dataclasses import dataclass
 from typing import Any, cast
 
 from supabase import Client
@@ -190,46 +191,73 @@ async def _fetch_job_vectors_batch(
     return out
 
 
-async def cosine_gate_admits_batch(
+@dataclass(frozen=True)
+class GateBatch:
+    """One-fetch gate + ordering data for a target's Phase-2 candidates.
+
+    ``cosines`` carries every candidate with a usable vector (missing key =
+    the job has no vector / a dim mismatch — DATA absence). ``threshold`` is
+    the target's calibrated cutoff, ``None`` when the target isn't calibrated.
+    ``admit`` distinguishes the two kinds of "yes":
+
+    - ``True``/``False`` — a real gate verdict (cosine vs threshold).
+    - ``None`` — no opinion, from data absence only. Callers MUST treat it as
+      admit: an unpopulated spine never silently drops jobs.
+
+    What this type deliberately does NOT model is an infrastructure error —
+    :func:`cosine_gate_batch` RAISES on those instead of manufacturing a batch
+    of Nones. The 2026-07-12 gated-cycle audit showed why: under disk-IO
+    throttling the old error→all-None fail-open converted every timed-out
+    vector read into a full batch of UNGATED Sonnet grades (~20% of a 48h
+    sample graded ungated). Errors must defer, not spend.
+    """
+
+    cosines: dict[str, float]
+    threshold: float | None
+
+    def admit(self, job_id: str) -> bool | None:
+        if self.threshold is None:
+            return None
+        cos = self.cosines.get(job_id)
+        if cos is None:
+            return None
+        return cos >= self.threshold
+
+
+async def cosine_gate_batch(
     supabase: Client,
     target: JobTarget,
     job_ids: list[str],
     *,
     model: EmbeddingModelId = DEFAULT_MODEL,
-) -> dict[str, bool | None]:
-    """Batch cosine-gate verdicts for many jobs of ONE target — the #90 flip.
+) -> GateBatch:
+    """Fetch gate verdicts AND ordering cosines in one pass — the #90 flip.
 
-    Returns ``{job_id: admit}`` where ``admit`` is ``True`` (cosine >=
-    threshold), ``False`` (cosine < threshold), or ``None`` — "no opinion"
-    (fail-open): the target isn't calibrated (no embedding / threshold), the job
-    has no vector, or a dim mismatch. **Callers MUST treat ``None`` as admit** —
-    an unpopulated spine never silently drops jobs.
+    One target read + one job-vectors read for the whole candidate batch; the
+    same cosines drive both admission (vs ``threshold``) and the runner's
+    fit-probability ordering, so the enforced path costs half the vector IO
+    of the old two-call shape (separate gate + ordering fetches).
 
-    Costs one target read + one job-vectors read (cosines computed in Python),
-    so a whole Phase-2 candidate batch is 2 queries, not N.
+    FAIL-CLOSED on infrastructure errors: any exception from the reads
+    propagates to the caller, which should DEFER the batch to the next cycle
+    (same "defer, never admit-blind" contract as the Phase-1 budget gate).
+    Data absence still fails open per-job via ``GateBatch.admit`` — a job
+    with no vector or a target with no threshold is admitted, never dropped.
     """
     ids = list(dict.fromkeys(j for j in job_ids if j))
     if not ids:
-        return {}
-    try:
-        target_vec, threshold = await _fetch_target_gate(supabase, target_id=target.id)
-        if target_vec is None or threshold is None:
-            # Target not calibrated → no opinion for any job (fail-open admit).
-            return dict.fromkeys(ids, None)
-        job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
-        out: dict[str, bool | None] = {}
-        for jid in ids:
-            jv = job_vecs.get(jid)
-            if jv is None or len(jv) != len(target_vec):
-                out[jid] = None  # missing / mismatched vector → fail-open admit
-            else:
-                out[jid] = cosine(jv, target_vec) >= threshold
-        return out
-    except Exception:
-        logger.exception(
-            "Pre-scan batch cosine gate failed for target %s", target.id
-        )
-        return dict.fromkeys(ids, None)  # fail-open on any error
+        return GateBatch(cosines={}, threshold=None)
+    target_vec, threshold = await _fetch_target_gate(supabase, target_id=target.id)
+    if target_vec is None:
+        # Target not embedded → no cosines derivable, no verdicts (admit-all).
+        return GateBatch(cosines={}, threshold=None)
+    job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
+    cosines = {
+        jid: cosine(jv, target_vec)
+        for jid, jv in job_vecs.items()
+        if len(jv) == len(target_vec)
+    }
+    return GateBatch(cosines=cosines, threshold=threshold)
 
 
 async def cosine_scores_batch(

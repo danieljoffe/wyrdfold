@@ -162,11 +162,19 @@ async def upsert_job_embedding(
 
 # Batched-path chunk sizes. The Voyage client sub-batches API calls at 128
 # internally; 96 keeps one call per batch with headroom. Vector writes go in
-# 24-row statements — a 96-row upsert of 1024-dim vectors is a 1-2MB statement
-# that exceeded the Postgres statement timeout under load on prod (57014,
-# 2026-07-10); 24 rows stays comfortably under it.
+# 8-row statements (~160KB of 1024-dim vectors): 24-row (~500KB) chunks still
+# hit the statement timeout on the small prod instance under load — the
+# 2026-07-12 audit found ~80% of sweep writes failing 57014 and the same jobs
+# being re-embedded every cycle.
 _BATCH_EMBED_SIZE = 96
-_BATCH_WRITE_CHUNK = 24
+_BATCH_WRITE_CHUNK = 8
+
+# Circuit breaker: consecutive failed write chunks before the WHOLE run
+# aborts. Chunk failures here mean the DB is IO-throttled — grinding on
+# (and worse, sending MORE Voyage batches whose writes will also fail) is
+# exactly the hammer-loop the incident memory says to break: abort on the
+# signal, let the next cycle retry when the disk has recovered.
+_WRITE_BREAKER_LIMIT = 2
 
 
 async def embed_jobs_batch(
@@ -185,12 +193,21 @@ async def embed_jobs_batch(
     rows have no current-model vector (the sweep's anti-join guarantees it),
     so it skips the hash probes and does one Voyage call per
     ``_BATCH_EMBED_SIZE`` texts, one cost row per call, and chunked bulk
-    upserts — ~15 operations for a 200-job sweep.
+    upserts.
 
-    Returns status counts (``embedded`` / ``skipped_empty`` / ``error``).
-    Never raises; a failed batch loses only its own rows.
+    Write failures trip a circuit breaker: after ``_WRITE_BREAKER_LIMIT``
+    consecutive failed chunks the ENTIRE run aborts — no further writes and,
+    critically, no further Voyage calls. Without it, a throttled disk turns
+    the sweep into a paid retry loop: embeds succeed (spend), writes fail,
+    the anti-join re-selects the same jobs next cycle, repeat (observed
+    2026-07-12: 3,550 embeds bought for ~680 landed vectors).
+
+    Returns status counts (``embedded`` / ``skipped_empty`` / ``error`` /
+    ``aborted`` — rows never attempted after the breaker tripped). Never
+    raises.
     """
-    counts = {"embedded": 0, "skipped_empty": 0, "error": 0}
+    counts = {"embedded": 0, "skipped_empty": 0, "error": 0, "aborted": 0}
+    consecutive_write_failures = 0
     for i in range(0, len(rows), _BATCH_EMBED_SIZE):
         batch = rows[i : i + _BATCH_EMBED_SIZE]
         texts: list[tuple[dict[str, Any], str]] = []
@@ -225,6 +242,7 @@ async def embed_jobs_batch(
                 }
                 for (row, text), vec in zip(texts, result.embeddings, strict=True)
             ]
+
             def _write(c: list[dict[str, Any]]) -> Any:
                 return (
                     supabase.table(TABLE)
@@ -237,11 +255,32 @@ async def embed_jobs_batch(
                 try:
                     await asyncio.to_thread(_write, chunk)
                     counts["embedded"] += len(chunk)
+                    consecutive_write_failures = 0
                 except Exception:
+                    consecutive_write_failures += 1
                     logger.exception(
-                        "Batched embed write failed for %d row(s)", len(chunk)
+                        "Batched embed write failed for %d row(s) "
+                        "(consecutive failure %d/%d)",
+                        len(chunk),
+                        consecutive_write_failures,
+                        _WRITE_BREAKER_LIMIT,
                     )
                     counts["error"] += len(chunk)
+                    if consecutive_write_failures >= _WRITE_BREAKER_LIMIT:
+                        remaining = len(to_write) - (w + len(chunk))
+                        counts["aborted"] = remaining + max(
+                            0, len(rows) - (i + len(batch))
+                        )
+                        logger.warning(
+                            "Batched embed: write circuit breaker tripped "
+                            "(%d consecutive chunk failures) — aborting the "
+                            "run, %d row(s) deferred to the next cycle. The "
+                            "DB is IO-throttled; retrying now would re-buy "
+                            "embeds whose writes keep failing.",
+                            consecutive_write_failures,
+                            counts["aborted"],
+                        )
+                        return counts
         except Exception:
             logger.exception("Batched embed failed for %d job(s)", len(texts))
             counts["error"] += len(texts)
