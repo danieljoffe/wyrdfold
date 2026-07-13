@@ -1,10 +1,14 @@
-"""Pre-scan cosine gate FLIP (#90): batch verdicts + exploration holdout.
+"""Pre-scan cosine gate FLIP (#90): one-fetch batch verdicts + holdout.
 
-`cosine_gate_admits_batch` returns per-job admit/drop/None ("no opinion",
-fail-open) for one target in two queries. `in_prescan_holdout` is the
-deterministic slice of would-drop jobs kept for grading so the false-negative
-rate stays measurable. The poller-side wiring is exercised in
-`test_phase2_runner.py`.
+`cosine_gate_batch` returns cosines + threshold from a single vector fetch;
+`GateBatch.admit` yields True/False (real verdict) or None ("no opinion" —
+DATA absence only, callers admit). Infrastructure errors RAISE so the caller
+defers the batch instead of grading it ungated — the 2026-07-12 audit found
+the old error→all-None fail-open converting IO timeouts into ungated Sonnet
+spend (~20% of a 48h gated sample). `in_prescan_holdout` is the deterministic
+slice of would-drop jobs kept for grading so the false-negative rate stays
+measurable. The runner-side wiring (defer-on-raise, single-fetch ordering) is
+exercised in `test_phase2_runner.py`.
 """
 
 from __future__ import annotations
@@ -16,7 +20,8 @@ import pytest
 
 from app.models.targets import JobTarget, ScoringProfile
 from app.services.embeddings.prescan_gate import (
-    cosine_gate_admits_batch,
+    GateBatch,
+    cosine_gate_batch,
     in_prescan_holdout,
 )
 
@@ -84,23 +89,43 @@ async def test_batch_admits_above_drops_below_threshold() -> None:
             {"job_posting_id": "lo", "embedding": _FAR},
         ],
     )
-    out = await cosine_gate_admits_batch(sb, _target(), ["hi", "lo"])
-    assert out == {"hi": True, "lo": False}
+    gate = await cosine_gate_batch(sb, _target(), ["hi", "lo"])
+    assert gate.admit("hi") is True
+    assert gate.admit("lo") is False
+    # The SAME fetch carries the ordering signal — no second read needed.
+    assert gate.cosines["hi"] > 0.9
+    assert gate.cosines["lo"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
 async def test_batch_missing_job_vector_is_none_failopen() -> None:
     sb = _SB(target_rows=_CALIBRATED, job_rows=[{"job_posting_id": "hi", "embedding": _NEAR}])
-    out = await cosine_gate_admits_batch(sb, _target(), ["hi", "novec"])
-    assert out == {"hi": True, "novec": None}  # missing vector → no opinion (admit)
+    gate = await cosine_gate_batch(sb, _target(), ["hi", "novec"])
+    assert gate.admit("hi") is True
+    assert gate.admit("novec") is None  # missing vector → no opinion (admit)
+    assert "novec" not in gate.cosines
 
 
 @pytest.mark.asyncio
 async def test_batch_uncalibrated_target_all_none() -> None:
     # No embedding / threshold on the target → gate has no opinion for anything.
     sb = _SB(target_rows=[{"embedding": None, "prescan_cosine_threshold": None}], job_rows=[])
-    out = await cosine_gate_admits_batch(sb, _target(), ["a", "b"])
-    assert out == {"a": None, "b": None}
+    gate = await cosine_gate_batch(sb, _target(), ["a", "b"])
+    assert gate.admit("a") is None
+    assert gate.admit("b") is None
+
+
+@pytest.mark.asyncio
+async def test_batch_embedded_but_no_threshold_is_none_with_cosines() -> None:
+    # Mid-cutover shape (threshold NULLed, embedding present): no verdicts,
+    # but cosines still flow for ordering.
+    sb = _SB(
+        target_rows=[{"embedding": _VEC_A, "prescan_cosine_threshold": None}],
+        job_rows=[{"job_posting_id": "hi", "embedding": _NEAR}],
+    )
+    gate = await cosine_gate_batch(sb, _target(), ["hi"])
+    assert gate.admit("hi") is None
+    assert gate.cosines["hi"] > 0.9
 
 
 @pytest.mark.asyncio
@@ -109,21 +134,26 @@ async def test_batch_dim_mismatch_is_none() -> None:
         target_rows=_CALIBRATED,
         job_rows=[{"job_posting_id": "bad", "embedding": [1.0, 0.0]}],  # 2-dim vs 3
     )
-    out = await cosine_gate_admits_batch(sb, _target(), ["bad"])
-    assert out == {"bad": None}
+    gate = await cosine_gate_batch(sb, _target(), ["bad"])
+    assert gate.admit("bad") is None
+    assert "bad" not in gate.cosines
 
 
 @pytest.mark.asyncio
-async def test_batch_error_is_failopen() -> None:
+async def test_batch_infra_error_raises_fail_closed() -> None:
+    # THE contract flip: an infrastructure error must RAISE (caller defers),
+    # never manufacture all-None fail-open admits — that path bought ungated
+    # Sonnet grades under IO stress (2026-07-12 audit).
     sb = _SB(target_rows=_CALIBRATED, job_rows=[], raise_=True)
-    out = await cosine_gate_admits_batch(sb, _target(), ["a", "b"])
-    assert out == {"a": None, "b": None}
+    with pytest.raises(RuntimeError):
+        await cosine_gate_batch(sb, _target(), ["a", "b"])
 
 
 @pytest.mark.asyncio
 async def test_batch_empty_ids() -> None:
     sb = _SB(target_rows=_CALIBRATED, job_rows=[])
-    assert await cosine_gate_admits_batch(sb, _target(), []) == {}
+    gate = await cosine_gate_batch(sb, _target(), [])
+    assert gate == GateBatch(cosines={}, threshold=None)
 
 
 def test_holdout_bounds_and_determinism() -> None:
