@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.config import settings
 from app.models.targets import (
     CategoryProfile,
     JobTarget,
@@ -33,6 +34,7 @@ from app.services.relevance.title_triage import (
     _build_user_message,
     _prefix_matches_title,
     admitted,
+    phase1_batch_size,
     triage_titles,
 )
 
@@ -116,9 +118,47 @@ class TestTriageTitles:
     async def test_oversize_batch_raises(self) -> None:
         llm = MagicMock()
         titles = [f"Title {i}" for i in range(PHASE1_BATCH_SIZE + 1)]
-        with pytest.raises(ValueError, match="exceeds PHASE1_BATCH_SIZE"):
+        with pytest.raises(ValueError, match="exceeds the 250-title cap"):
             await triage_titles(llm, target=_target(), titles=titles)
         llm.complete_tool_use.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deepseek_oversize_batch_raises_at_its_tighter_cap(self) -> None:
+        # 151 titles fit Haiku's 250 cap but overflow deepseek's ~8K output
+        # ceiling (~34 tok/verdict) — the guard must trip BEFORE the LLM call,
+        # else the truncated batch defer-retries forever, paying input tokens
+        # every cycle for zero verdicts.
+        llm = MagicMock()
+        titles = [f"Title {i}" for i in range(151)]
+        with pytest.raises(ValueError, match="exceeds the 150-title cap"):
+            await triage_titles(
+                llm, target=_target(), titles=titles, model="deepseek-v3-2"
+            )
+        llm.complete_tool_use.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deepseek_cap_resolves_from_settings_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The poller passes no explicit model — the guard must clamp by the
+        # CONFIGURED model, or an env flip to deepseek would ship 250-title
+        # batches straight into the overflow.
+        monkeypatch.setattr(settings, "phase1_triage_model", "deepseek-v3-2")
+        llm = MagicMock()
+        titles = [f"Title {i}" for i in range(151)]
+        with pytest.raises(ValueError, match="exceeds the 150-title cap"):
+            await triage_titles(llm, target=_target(), titles=titles)
+        llm.complete_tool_use.assert_not_called()
+
+    def test_phase1_batch_size_resolution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert phase1_batch_size("claude-haiku-4-5") == PHASE1_BATCH_SIZE
+        assert phase1_batch_size("deepseek-v3-2") == 150
+        monkeypatch.setattr(settings, "phase1_triage_model", "deepseek-v3-2")
+        assert phase1_batch_size() == 150  # poller's no-arg call follows config
+        monkeypatch.setattr(settings, "phase1_triage_model", "claude-haiku-4-5")
+        assert phase1_batch_size() == PHASE1_BATCH_SIZE
 
     @pytest.mark.asyncio
     async def test_happy_path_returns_dict_keyed_by_index(
