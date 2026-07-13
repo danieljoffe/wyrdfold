@@ -44,7 +44,10 @@ logger = logging.getLogger(__name__)
 
 # Haiku 4.5 — the cheap-fast tier, same tier as Phase 1 title triage. This is a
 # bounded extraction/classification task, not deep judgement; Sonnet would just
-# inflate cost. Pinned into the prompt-regression golden contract
+# inflate cost. The RUNTIME model is ``settings.qualification_model`` (env
+# QUALIFICATION_MODEL), which can select deepseek-v3-2 via OpenRouter's
+# OpenAI-compatible path. Keep this constant in sync with that config
+# default — it's pinned into the prompt-regression golden contract
 # (tests/test_prompt_regression.py) so a model swap can't merge silently.
 QUALIFICATION_MODEL: ModelId = "claude-haiku-4-5"
 QUALIFICATION_PURPOSE = "qualification.tagger"
@@ -309,7 +312,7 @@ async def tag_job(
     company: str | None,
     location: str | None,
     description: str | None,
-    model: ModelId = QUALIFICATION_MODEL,
+    model: ModelId | None = None,
     purpose: str = QUALIFICATION_PURPOSE,
     description_chars: int | None = None,
 ) -> tuple[QualificationTags | None, LLMResult | None]:
@@ -320,6 +323,11 @@ async def tag_job(
     (not-yet-tagged) and a later poll re-attempts it. ``llm_result`` is returned
     for cost logging on success.
 
+    ``model`` defaults to the configured ``settings.qualification_model``
+    (Haiku, or deepseek-v3-2 when QUALIFICATION_MODEL selects it) — resolved
+    at call time so an env flip / test override takes effect without
+    re-import. An explicit ``model=`` still wins.
+
     ``description_chars`` caps how much of the cleaned JD is sent. Defaults to
     ``settings.qualification_jd_snippet_chars`` — a short snippet, since the
     tagger's signals are dense at the top of a JD and the full body needlessly
@@ -328,6 +336,8 @@ async def tag_job(
     The caller is responsible for the content-hash cache (``qualified_hash``);
     this function always calls the model when invoked.
     """
+    if model is None:
+        model = settings.qualification_model
     snippet_chars = (
         description_chars
         if description_chars is not None

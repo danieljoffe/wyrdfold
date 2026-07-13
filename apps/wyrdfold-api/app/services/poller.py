@@ -60,10 +60,10 @@ from app.services.qualification import (
 )
 from app.services.recency import refresh_recency_scores
 from app.services.relevance.title_triage import (
-    PHASE1_BATCH_SIZE,
     PHASE1_PURPOSE,
     TitleVerdict,
     admitted,
+    phase1_batch_size,
     triage_titles,
 )
 from app.services.sanitize import sanitize_html
@@ -1394,12 +1394,15 @@ async def _poll_one_source(
                         payer,
                     )
                     continue
-                # Chunk to PHASE1_BATCH_SIZE per call. Sources usually
-                # return well under one batch (10-200 jobs); larger
-                # sources spread cost across multiple calls.
+                # Chunk to the model-aware batch cap per call (250 on Haiku,
+                # tighter on deepseek whose ~8K output ceiling a full batch's
+                # verdict JSON would overflow). Sources usually return well
+                # under one batch (10-200 jobs); larger sources spread cost
+                # across multiple calls.
+                batch_cap = phase1_batch_size()
                 target_verdicts: dict[int, TitleVerdict] = {}
                 attempted_here: set[int] = set()
-                for start in range(0, len(titles), PHASE1_BATCH_SIZE):
+                for start in range(0, len(titles), batch_cap):
                     # Re-check the global daily cap before each batch (#60
                     # overspend fix). The per-cycle gate above trips the
                     # breaker once at cycle start, but a long backlog cycle
@@ -1416,7 +1419,7 @@ async def _poll_one_source(
                             active_target.id,
                         )
                         break
-                    batch = titles[start : start + PHASE1_BATCH_SIZE]
+                    batch = titles[start : start + batch_cap]
                     verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
                     if result is not None:
                         # A REAL LLM response → mark these titles attempted (a dropped
@@ -2556,7 +2559,8 @@ async def _poll_one_source_for_target(
         )
         if llm is not None:
             titles = [job.title for _, job in triage_candidates]
-            for start in range(0, len(titles), PHASE1_BATCH_SIZE):
+            batch_cap = phase1_batch_size()
+            for start in range(0, len(titles), batch_cap):
                 # Re-check the global daily cap before each batch (#60
                 # overspend fix) — bounds overshoot to one batch when a long
                 # cycle crosses the cap mid-run. Collected verdicts stand;
@@ -2571,7 +2575,7 @@ async def _poll_one_source_for_target(
                         target.id,
                     )
                     break
-                batch = titles[start : start + PHASE1_BATCH_SIZE]
+                batch = titles[start : start + batch_cap]
                 verdicts, result = await triage_titles(llm, target=target, titles=batch)
                 if result is not None:
                     # A REAL LLM response → attempted. A FAILED call (result None:

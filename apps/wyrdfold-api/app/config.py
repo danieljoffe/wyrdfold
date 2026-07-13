@@ -112,6 +112,22 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: float = Field(default=600.0, ge=1.0, le=3600.0)
     openrouter_max_retries: int = Field(default=3, ge=0, le=10)
 
+    # LLM credit-runway alarm. Three OpenRouter credit drains (2026-06-25,
+    # 2026-07-04, 2026-07-13) were each discovered only AFTER grading
+    # silently died: the daily budget caps bound the burn RATE, but nothing
+    # watched the BALANCE, and a 402-dead pipeline spends $0/day — which
+    # looks exactly like a quiet one. When the operator key pays
+    # (llm_provider="openrouter"), the poll-cycle health check probes the
+    # key's remaining credit and alarms when the runway (remaining ÷
+    # trailing 7-day daily spend) drops below this many days. 0 disables
+    # the runway rule.
+    llm_credit_min_runway_days: float = Field(default=3.0, ge=0.0)
+    # Absolute floor on remaining credit, in USD: alarm whenever the
+    # balance is below this regardless of run rate (protects the
+    # rate-can't-be-computed cases — a fresh stats window, or a pipeline
+    # already starved to ~$0/day). 0 disables the floor rule.
+    llm_credit_min_remaining_usd: float = Field(default=2.0, ge=0.0)
+
     # BYOK (#5). Master key for AES-256-GCM envelope encryption of
     # per-user provider API keys at rest in `user_api_keys`. Base64 of
     # exactly 32 random bytes (`openssl rand -base64 32`). Empty disables
@@ -318,6 +334,18 @@ class Settings(BaseSettings):
     # content-hash (``jobs.qualified_hash``) skips re-tagging unchanged
     # rows. Flip per-deploy once validated in DEV.
     qualification_enabled: bool = False
+
+    # Which model backs the qualification tagger. Default Haiku — the proven
+    # incumbent, pinned into the prompt-regression golden contract so a swap
+    # can't merge silently. Set QUALIFICATION_MODEL=deepseek-v3-2 to route
+    # through OpenRouter's OpenAI-compatible path: the tagger is the single
+    # largest LLM spender (41% / ~$52 of the 2026-07 30-day anatomy) and its
+    # one-job-per-call output (~170 tokens) sits far inside deepseek's
+    # ceilings, so unlike Phase-1 triage it needs no batch clamp. Tagging is
+    # best-effort per job (a failed call leaves tags NULL for a later
+    # re-attempt), so a model hiccup degrades gracefully, never breaks
+    # polling.
+    qualification_model: ModelId = "claude-haiku-4-5"
 
     # Max characters of the (cleaned) job description sent to the
     # qualification tagger. The tagger only needs the dense signals near the

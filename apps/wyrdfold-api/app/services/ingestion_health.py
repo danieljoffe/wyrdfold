@@ -28,11 +28,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
+import httpx
 from supabase import Client
 
 from app.config import settings
+from app.services.llm import cost_log
 
 logger = logging.getLogger(__name__)
+
+# OpenRouter credit endpoints. ``/v1/key`` describes the calling key
+# (including ``limit_remaining`` when a per-key limit is set); ``/v1/credits``
+# is the account-level balance for keys without their own limit.
+_OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+_OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
 
 def _capture_alert(message: str, *, level: Literal["error", "warning", "info"] = "error") -> None:
@@ -61,6 +69,9 @@ class IngestionHealthReport:
     mass_disable: bool = False
     newest_discovery_at: datetime | None = None
     stale_discovery: bool = False
+    credit_remaining_usd: float | None = None
+    credit_runway_days: float | None = None
+    low_credit: bool = False
     alerts: list[str] = field(default_factory=list)
 
 
@@ -132,6 +143,39 @@ async def _newest_discovery_at(supabase: Client) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+async def _openrouter_remaining_usd(
+    client: httpx.AsyncClient | None = None,
+) -> float | None:
+    """Remaining spendable USD on the operator's OpenRouter key.
+
+    Prefers the key's own budget (``/v1/key`` → ``limit_remaining``); a key
+    with no per-key limit falls back to the account balance (``/v1/credits``
+    → total_credits - total_usage). Returns None when neither is available.
+    ``client`` is an injection seam for tests (httpx.MockTransport); prod
+    callers let it default.
+    """
+    headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
+    owned = client is None
+    http = client or httpx.AsyncClient(timeout=10.0)
+    try:
+        resp = await http.get(_OPENROUTER_KEY_URL, headers=headers)
+        resp.raise_for_status()
+        key_data = (resp.json() or {}).get("data") or {}
+        remaining = key_data.get("limit_remaining")
+        if remaining is not None:
+            return float(remaining)
+        resp = await http.get(_OPENROUTER_CREDITS_URL, headers=headers)
+        resp.raise_for_status()
+        credit_data = (resp.json() or {}).get("data") or {}
+        credits, usage = credit_data.get("total_credits"), credit_data.get("total_usage")
+        if credits is None or usage is None:
+            return None
+        return float(credits) - float(usage)
+    finally:
+        if owned:
+            await http.aclose()
 
 
 async def check_ingestion_health(
@@ -236,12 +280,70 @@ async def check_ingestion_health(
         except Exception:
             logger.exception("ingestion health: discovery-staleness check failed")
 
+    # --- 4. LLM credit runway ------------------------------------------------
+    # Armed only when the operator's OpenRouter key pays for LLM calls. Three
+    # credit drains (2026-06-25, 2026-07-04, 2026-07-13) were each discovered
+    # only after grading silently died — the budget caps bound the burn rate,
+    # but only a balance probe sees exhaustion COMING. Two rules: an absolute
+    # USD floor (catches the already-starved case where the run rate reads
+    # ~$0/day), and a runway rule (remaining ÷ trailing 7-day daily spend).
+    if (
+        settings.llm_provider == "openrouter"
+        and settings.openrouter_api_key
+        and (
+            settings.llm_credit_min_runway_days > 0
+            or settings.llm_credit_min_remaining_usd > 0
+        )
+    ):
+        try:
+            remaining = await _openrouter_remaining_usd()
+            report.credit_remaining_usd = remaining
+            if remaining is not None:
+                week_spend = await asyncio.to_thread(
+                    cost_log.total_spend_all, supabase, moment - timedelta(days=7)
+                )
+                daily_rate = week_spend / 7.0
+                runway_days = remaining / daily_rate if daily_rate > 0 else None
+                report.credit_runway_days = runway_days
+                below_floor = (
+                    settings.llm_credit_min_remaining_usd > 0
+                    and remaining < settings.llm_credit_min_remaining_usd
+                )
+                below_runway = (
+                    settings.llm_credit_min_runway_days > 0
+                    and runway_days is not None
+                    and runway_days < settings.llm_credit_min_runway_days
+                )
+                if below_floor or below_runway:
+                    report.low_credit = True
+                    runway_txt = (
+                        f"~{runway_days:.1f} day(s)" if runway_days is not None else "n/a"
+                    )
+                    msg = (
+                        f"ingestion health: LLM credit runway low — "
+                        f"${remaining:.2f} remaining on the OpenRouter key "
+                        f"({runway_txt} at the trailing ${daily_rate:.2f}/day). "
+                        f"Top up before the pipeline 402s: "
+                        f"https://openrouter.ai/settings/credits"
+                    )
+                    report.alerts.append(msg)
+                    logger.error(msg)
+                    _capture_alert(msg, level="error")
+        except Exception:
+            logger.exception("ingestion health: LLM credit probe failed")
+
     if not report.alerts:
         logger.info(
-            "ingestion health OK: newest_job_at=%s sources=%d disabled=%d newest_discovery_at=%s",
+            "ingestion health OK: newest_job_at=%s sources=%d disabled=%d "
+            "newest_discovery_at=%s credit_remaining=%s",
             report.newest_job_at.isoformat() if report.newest_job_at else "none",
             report.total_sources,
             report.disabled_sources,
             report.newest_discovery_at.isoformat() if report.newest_discovery_at else "n/a",
+            (
+                f"${report.credit_remaining_usd:.2f}"
+                if report.credit_remaining_usd is not None
+                else "n/a"
+            ),
         )
     return report
