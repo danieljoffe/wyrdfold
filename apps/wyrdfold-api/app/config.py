@@ -112,6 +112,22 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: float = Field(default=600.0, ge=1.0, le=3600.0)
     openrouter_max_retries: int = Field(default=3, ge=0, le=10)
 
+    # LLM credit-runway alarm. Three OpenRouter credit drains (2026-06-25,
+    # 2026-07-04, 2026-07-13) were each discovered only AFTER grading
+    # silently died: the daily budget caps bound the burn RATE, but nothing
+    # watched the BALANCE, and a 402-dead pipeline spends $0/day — which
+    # looks exactly like a quiet one. When the operator key pays
+    # (llm_provider="openrouter"), the poll-cycle health check probes the
+    # key's remaining credit and alarms when the runway (remaining ÷
+    # trailing 7-day daily spend) drops below this many days. 0 disables
+    # the runway rule.
+    llm_credit_min_runway_days: float = Field(default=3.0, ge=0.0)
+    # Absolute floor on remaining credit, in USD: alarm whenever the
+    # balance is below this regardless of run rate (protects the
+    # rate-can't-be-computed cases — a fresh stats window, or a pipeline
+    # already starved to ~$0/day). 0 disables the floor rule.
+    llm_credit_min_remaining_usd: float = Field(default=2.0, ge=0.0)
+
     # BYOK (#5). Master key for AES-256-GCM envelope encryption of
     # per-user provider API keys at rest in `user_api_keys`. Base64 of
     # exactly 32 random bytes (`openssl rand -base64 32`). Empty disables
