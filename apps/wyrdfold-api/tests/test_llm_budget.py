@@ -103,3 +103,88 @@ def test_window_since_is_now_minus_offset(monkeypatch, fake_supabase):
     delta_seconds = (daily_since.replace(tzinfo=None) - hourly_since.replace(tzinfo=None)).total_seconds()
     # 24h - 1h = 23h = 82800s; allow a few seconds of clock drift between calls.
     assert -82800 - 5 < delta_seconds < -82800 + 5
+
+
+# ---- rail_excluded_purposes (2026-07-13 owner-lockout fix) -------------------
+#
+# The ledger attributes background catalog work (triage/grading/tagging) to
+# the target's payer, so all-purposes rails locked the OWNER out of
+# interactive features every day the pipeline ran (suggest-lateral 429'd at
+# $5.12/$5 daily with almost none of it interactive). With
+# ``rail_excluded_purposes`` set, the rails meter interactive spend only —
+# and an interactive loop must still trip them.
+
+
+def _patch_billable_spend(
+    monkeypatch: pytest.MonkeyPatch, *, hourly: float, daily: float
+) -> list[dict]:
+    """Stub cost_log.total_billable_spend (the exclusion-aware sum)."""
+    calls: list[dict] = []
+
+    def fake_billable(_supabase, *, user_id, since, excluded_purposes):
+        calls.append(
+            {
+                "user_id": user_id,
+                "since": since,
+                "excluded_purposes": excluded_purposes,
+            }
+        )
+        elapsed_s = (datetime.now(UTC) - since).total_seconds()
+        return hourly if elapsed_s < 7200 else daily
+
+    monkeypatch.setattr(cost_log, "total_billable_spend", fake_billable)
+    return calls
+
+
+def test_background_heavy_ledger_does_not_trip_rails(monkeypatch, fake_supabase):
+    # All-purposes spend is way over the daily limit...
+    _patch_spend(monkeypatch, hourly=1.0, daily=5.12)
+    # ...but interactive-only spend is tiny; with exclusions wired the
+    # rails read the billable sum and must PASS.
+    billable_calls = _patch_billable_spend(monkeypatch, hourly=0.02, daily=0.40)
+
+    budget.check_user_budget(
+        fake_supabase,
+        user_id="owner-1",
+        hourly_limit_usd=1.0,
+        daily_limit_usd=5.0,
+        rail_excluded_purposes=("poll_scoring", "qualification.tagger"),
+    )
+
+    # Both windows consulted the exclusion-aware sum with the given set.
+    assert len(billable_calls) == 2
+    assert all(
+        c["excluded_purposes"] == ("poll_scoring", "qualification.tagger")
+        for c in billable_calls
+    )
+
+
+def test_interactive_loop_still_trips_daily_rail(monkeypatch, fake_supabase):
+    _patch_billable_spend(monkeypatch, hourly=0.5, daily=6.0)
+
+    with pytest.raises(HTTPException) as exc:
+        budget.check_user_budget(
+            fake_supabase,
+            user_id="owner-1",
+            hourly_limit_usd=0.0,
+            daily_limit_usd=5.0,
+            rail_excluded_purposes=("poll_scoring",),
+        )
+    assert exc.value.status_code == 429
+    assert exc.value.detail["scope"] == "daily"
+
+
+def test_no_rail_exclusions_keeps_all_purposes_behavior(monkeypatch, fake_supabase):
+    # Without the new arg the rails still read total_spend — self-callers
+    # that never pass exclusions keep the original contract.
+    _patch_spend(monkeypatch, hourly=0.1, daily=6.0)
+
+    with pytest.raises(HTTPException) as exc:
+        budget.check_user_budget(
+            fake_supabase,
+            user_id="u-1",
+            hourly_limit_usd=1.0,
+            daily_limit_usd=5.0,
+        )
+    assert exc.value.status_code == 429
+    assert exc.value.detail["scope"] == "daily"

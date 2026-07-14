@@ -443,6 +443,7 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
         hourly_limit_usd,
         monthly_limit_usd,
         monthly_excluded_purposes=None,
+        rail_excluded_purposes=None,
     ):
         captured.update(
             user_id=user_id,
@@ -450,6 +451,7 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
             hourly_limit_usd=hourly_limit_usd,
             monthly_limit_usd=monthly_limit_usd,
             monthly_excluded_purposes=monthly_excluded_purposes,
+            rail_excluded_purposes=rail_excluded_purposes,
         )
 
     monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
@@ -466,12 +468,17 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
         supabase=MagicMock(),
         s=_budget_settings(daily=7.0, hourly=2.0, monthly=9.0),
     )
+    from app.services.entitlements import NON_BILLABLE_PURPOSES
+
     assert captured == {
         "user_id": USER_SUB,
         "daily_limit_usd": 7.0,
         "hourly_limit_usd": 2.0,
         "monthly_limit_usd": 9.0,
         "monthly_excluded_purposes": None,
+        # Rails always exclude payer-attributed background classes
+        # (2026-07-13 owner-lockout fix).
+        "rail_excluded_purposes": NON_BILLABLE_PURPOSES,
     }
 
 
@@ -500,6 +507,12 @@ def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
     )
     assert captured["monthly_limit_usd"] == 25.0
     assert captured["monthly_excluded_purposes"] == ("fit.job", "poll_scoring")
+    # The hourly/daily rails must meter interactive spend only — the
+    # payer-attributed background classes are excluded (2026-07-13
+    # owner-lockout fix).
+    from app.services.entitlements import NON_BILLABLE_PURPOSES
+
+    assert captured["rail_excluded_purposes"] == NON_BILLABLE_PURPOSES
 
 
 def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
