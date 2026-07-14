@@ -226,6 +226,7 @@ export default function ProfileIdentityCard() {
             value={phone}
             onChange={e => setPhone(e.target.value)}
             placeholder='+1 555 555 5555'
+            helperText='Also where SMS alerts are sent'
             autoComplete='tel'
             inputMode='tel'
             data-sentry-mask

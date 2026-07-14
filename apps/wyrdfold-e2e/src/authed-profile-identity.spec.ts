@@ -1,9 +1,10 @@
 import { test, expect } from '@playwright/test';
+import { createClient } from '@supabase/supabase-js';
 
 /**
  * Authenticated round-trip for the Profile identity card (added in
  * #703 / extended in F3-A; moved from /settings to /profile in the
- * settings refactor — see ``SettingsPage.tsx:444`` "Identity ...
+ * settings refactor — see ``SettingsPage.tsx`` "Identity ...
  * lives on /profile now"). Verifies the full FE → API → DB → API → FE
  * loop without burning LLM credits:
  *
@@ -30,6 +31,49 @@ import { test, expect } from '@playwright/test';
  *     handleSaveProfile path — this catches a regression where it
  *     drops that re-sync).
  */
+// Own the data setup like the other authed specs: a fresh stack's e2e
+// user has no profile row / NULL name, and the round-trip below needs a
+// non-empty starting value to restore to. Only writes when missing so a
+// long-lived environment's real name is left alone.
+test.beforeAll(async () => {
+  const url = process.env['NEXT_PUBLIC_SUPABASE_URL'];
+  const serviceKey = process.env['SUPABASE_SERVICE_ROLE_KEY'];
+  const email = process.env['E2E_TEST_USER_EMAIL'];
+  test.skip(!url || !serviceKey || !email, 'auth env not configured');
+
+  const admin = createClient(url!, serviceKey!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  const { data: userList, error: listErr } = await admin.auth.admin.listUsers();
+  if (listErr) throw new Error(`listUsers failed: ${listErr.message}`);
+  const user = userList.users.find(u => u.email === email);
+  if (!user) throw new Error(`e2e user ${email} not found — run seed-e2e-user`);
+
+  const { data: rows, error: selErr } = await admin
+    .from('user_profiles')
+    .select('id, name')
+    .eq('user_id', user.id)
+    .limit(1);
+  if (selErr) throw new Error(`user_profiles select failed: ${selErr.message}`);
+  if (rows?.length) {
+    if (!rows[0].name) {
+      const { error: updErr } = await admin
+        .from('user_profiles')
+        .update({ name: 'E2E Seed User' })
+        .eq('user_id', user.id);
+      if (updErr)
+        throw new Error(`user_profiles update failed: ${updErr.message}`);
+    }
+  } else {
+    const { error: insErr } = await admin
+      .from('user_profiles')
+      .insert({ user_id: user.id, name: 'E2E Seed User', email });
+    if (insErr)
+      throw new Error(`user_profiles insert failed: ${insErr.message}`);
+  }
+});
+
 test.describe('profile identity round-trip', () => {
   test('Name edits persist across reload', async ({ page }) => {
     const TEST_NAME = `E2E Test User ${Date.now()}`;
