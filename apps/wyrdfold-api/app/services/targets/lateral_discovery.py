@@ -28,7 +28,7 @@ suggestion list so the user reviews + picks first.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, Message, ModelId
@@ -42,6 +42,32 @@ DEFAULT_PURPOSE = "target.suggest_lateral"
 _MAX_SUGGESTIONS = 8
 
 
+# Display caps for the free-prose fields. The caps are a UI contract, not
+# a correctness bound — models routinely overflow them by a sentence, and
+# hard-failing the WHOLE response over a verbose field 500'd the endpoint
+# live (2026-07-14: two of eight suggestions ran long and the user got
+# nothing). Over-long values are truncated at a word boundary instead;
+# same doctrine as the tagger's tolerate-malformed-field fix.
+_PROSE_FIELD_CAPS: dict[str, int] = {
+    "label": 120,
+    "one_line_reasoning": 240,
+    "lateral_relationship": 180,
+    "primary_industry": 80,
+}
+
+
+def _truncate_prose(value: str, cap: int) -> str:
+    """Clamp to ``cap`` chars, preferring a word boundary, ending in '…'."""
+    if len(value) <= cap:
+        return value
+    cut = value[: cap - 1]
+    space = cut.rfind(" ")
+    # Only break at the space when it doesn't cost most of the budget.
+    if space >= cap // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.") + "…"
+
+
 class LateralSuggestion(BaseModel):
     """One adjacent target the user is competitive for.
 
@@ -50,6 +76,16 @@ class LateralSuggestion(BaseModel):
     1:1 onto the existing ``derive_profile_from_label`` output without
     a translation layer.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clamp_verbose_prose(cls, data: object) -> object:
+        if isinstance(data, dict):
+            for field, cap in _PROSE_FIELD_CAPS.items():
+                value = data.get(field)
+                if isinstance(value, str) and len(value) > cap:
+                    data[field] = _truncate_prose(value, cap)
+        return data
 
     label: str = Field(min_length=2, max_length=120)
     one_line_reasoning: str = Field(
