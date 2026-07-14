@@ -7,9 +7,30 @@ import ResumeUploader from '../ResumeUploader';
 const fetchMock = jest.fn();
 global.fetch = fetchMock as unknown as typeof fetch;
 
+// Scripted response for the NEXT upload POST; the mount-time source-file
+// probe (keep-or-replace fast path) always answers "no existing doc" so the
+// classic drop-zone flow renders unless a test overrides the whole mock.
+let uploadResponse: unknown;
+
 beforeEach(() => {
   fetchMock.mockReset();
+  uploadResponse = { ok: true, json: async () => ({}) };
+  fetchMock.mockImplementation((url: string) => {
+    if (String(url).includes('/upload-resume')) {
+      return Promise.resolve(uploadResponse);
+    }
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ optimized: null }),
+    });
+  });
 });
+
+function uploadCalls(): unknown[][] {
+  return (fetchMock.mock.calls as unknown[][]).filter(([url]) =>
+    String(url).includes('/upload-resume')
+  );
+}
 
 afterEach(() => {
   jest.useRealTimers();
@@ -45,7 +66,7 @@ describe('ResumeUploader', () => {
     // own MIME validation branch, so dispatch a change event directly.
     fireEvent.change(input, { target: { files: [txt] } });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(uploadCalls()).toHaveLength(0);
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(/pdf or docx/i);
     });
@@ -60,17 +81,17 @@ describe('ResumeUploader', () => {
     const oversized = makeFile('big.pdf', 'application/pdf', 11 * 1024 * 1024);
     await user.upload(input, oversized);
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(uploadCalls()).toHaveLength(0);
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(/under 10 mb/i);
     });
   });
 
   it('POSTs a valid PDF to the upload endpoint and shows the success state', async () => {
-    fetchMock.mockResolvedValueOnce({
+    uploadResponse = {
       ok: true,
       json: async () => ({ success: true }),
-    });
+    };
     const user = userEvent.setup();
     render(<ResumeUploader onComplete={jest.fn()} onSkip={jest.fn()} />);
     const input = document.querySelector(
@@ -95,10 +116,10 @@ describe('ResumeUploader', () => {
 
   it('calls onComplete after a brief delay following a successful upload', async () => {
     jest.useFakeTimers();
-    fetchMock.mockResolvedValueOnce({
+    uploadResponse = {
       ok: true,
       json: async () => ({ success: true }),
-    });
+    };
     const onComplete = jest.fn();
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
     render(<ResumeUploader onComplete={onComplete} onSkip={jest.fn()} />);
@@ -121,14 +142,14 @@ describe('ResumeUploader', () => {
   it('renders the API error message when the upload fails', async () => {
     // ``extractApiError`` reads via ``res.clone().json()`` so the
     // mock has to expose both.
-    fetchMock.mockResolvedValueOnce({
+    uploadResponse = {
       ok: false,
       status: 422,
       json: async () => ({ detail: 'Could not parse resume' }),
       clone() {
         return this;
       },
-    });
+    };
     const user = userEvent.setup();
     render(<ResumeUploader onComplete={jest.fn()} onSkip={jest.fn()} />);
     const input = document.querySelector(
@@ -150,5 +171,59 @@ describe('ResumeUploader', () => {
     render(<ResumeUploader onComplete={jest.fn()} onSkip={onSkip} />);
     await user.click(screen.getByRole('button', { name: /skip for now/i }));
     expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ResumeUploader — keep-or-replace fast path (existing source file)', () => {
+  beforeEach(() => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/optimized')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 'doc-1', version: 3 }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+  });
+
+  it('offers keep-or-replace instead of the drop zone', async () => {
+    render(<ResumeUploader onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: /you already have a source file/i,
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /upload source file/i })
+    ).toBeNull();
+  });
+
+  it('"Keep it and continue" advances without any upload', async () => {
+    const onComplete = jest.fn();
+    const user = userEvent.setup();
+    render(<ResumeUploader onComplete={onComplete} onSkip={jest.fn()} />);
+
+    await user.click(
+      await screen.findByRole('button', { name: /keep it and continue/i })
+    );
+
+    expect(onComplete).toHaveBeenCalled();
+    expect(uploadCalls()).toHaveLength(0);
+  });
+
+  it('"Upload a new file" reveals the classic drop zone', async () => {
+    const user = userEvent.setup();
+    render(<ResumeUploader onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    await user.click(
+      await screen.findByRole('button', { name: /upload a new file/i })
+    );
+
+    expect(
+      screen.getByRole('heading', { level: 2, name: /upload your resume/i })
+    ).toBeInTheDocument();
   });
 });

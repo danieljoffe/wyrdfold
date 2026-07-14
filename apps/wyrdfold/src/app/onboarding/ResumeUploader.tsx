@@ -30,8 +30,35 @@ export default function ResumeUploader({
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploaded, setUploaded] = useState(false);
+  // Re-collection dedup (UX/IA §F): a redo-onboarding user already has a
+  // parsed source file — offer keep-or-replace instead of silently asking
+  // them to upload again (keep = the common case; replace stays one click
+  // away for the "my resume changed" redo).
+  const [hasExistingDoc, setHasExistingDoc] = useState(false);
+  const [replacing, setReplacing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function checkExisting() {
+      try {
+        const res = await fetch('/api/career/experience/optimized');
+        if (cancelled || !res.ok) return;
+        const body = (await res.json()) as { id?: string };
+        // The endpoint returns the doc or `{ optimized: null }` when empty.
+        if (!cancelled && typeof body.id === 'string') {
+          setHasExistingDoc(true);
+        }
+      } catch {
+        // No fast-path — the drop zone renders as usual.
+      }
+    }
+    checkExisting();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Cleanup timeout on unmount
   useEffect(() => {
@@ -100,6 +127,53 @@ export default function ResumeUploader({
     },
     [upload]
   );
+
+  // Keep-or-replace fast path: an existing source file means this step is
+  // pure re-collection unless the user explicitly wants a fresh upload.
+  if (hasExistingDoc && !replacing) {
+    return (
+      <div className='flex flex-col gap-6'>
+        <div className='text-center'>
+          <Heading variant='cardTitle' as='h2'>
+            You already have a source file
+          </Heading>
+          <Text variant='caption' className='mt-1 text-text-secondary'>
+            Your master experience document is already built from a previous
+            upload. Keep it, or upload a new file to rebuild it.
+          </Text>
+        </div>
+        <div className='flex items-center justify-center gap-3'>
+          <Button
+            name='onboarding-replace-source-file'
+            variant='outline'
+            size='sm'
+            onClick={() => setReplacing(true)}
+          >
+            Upload a new file
+          </Button>
+          <Button
+            name='onboarding-keep-source-file'
+            variant='primary'
+            size='sm'
+            onClick={onComplete}
+          >
+            Keep it and continue
+          </Button>
+        </div>
+        <div className='text-center'>
+          <Button
+            name='onboarding-skip-upload'
+            variant='bare'
+            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
+            size='sm'
+            onClick={onSkip}
+          >
+            Skip for now
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className='flex flex-col gap-6'>
