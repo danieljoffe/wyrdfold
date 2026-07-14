@@ -372,7 +372,7 @@ export default function SettingsPage() {
       if (!res.ok) {
         const message = await extractApiError(
           res,
-          'Failed to save resume style'
+          'Failed to save export style'
         );
         toast({ variant: 'error', title: message });
         lastFailedStyleSigRef.current = sig;
@@ -383,9 +383,9 @@ export default function SettingsPage() {
       setStyleAccent(data.accent);
       lastStyleSigRef.current = styleSig(data.preset, data.accent);
       lastFailedStyleSigRef.current = null;
-      toast({ variant: 'success', title: 'Resume style saved' });
+      toast({ variant: 'success', title: 'Export style saved' });
     } catch {
-      toast({ variant: 'error', title: 'Failed to save resume style' });
+      toast({ variant: 'error', title: 'Failed to save export style' });
       lastFailedStyleSigRef.current = sig;
     } finally {
       setSavingStyle(false);
@@ -471,11 +471,11 @@ export default function SettingsPage() {
       label: 'Preferences',
       content: (
         <div className='flex flex-col gap-6 pt-4'>
-          {/* Resume style */}
+          {/* Export style */}
           <Card>
             <CardHeader>
               <div className='flex items-center gap-3'>
-                <CardTitle>Resume style</CardTitle>
+                <CardTitle>Export style</CardTitle>
                 <SavingIndicator active={savingStyle} />
               </div>
             </CardHeader>

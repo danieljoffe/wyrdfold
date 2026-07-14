@@ -74,7 +74,9 @@ describe('ResumeReviewPage', () => {
 
     render(<ResumeReviewPage jobPostingId='j-1' />);
 
-    expect(await screen.findByText(/Resume not found/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Tailored resume not found/i)
+    ).toBeInTheDocument();
     expect(
       screen.getByRole('link', { name: /Back to job/i })
     ).toBeInTheDocument();

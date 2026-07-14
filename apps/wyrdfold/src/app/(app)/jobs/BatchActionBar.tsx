@@ -39,7 +39,7 @@ export default function BatchActionBar({
       ? `Generating ${batchProgress.completed} of ${batchProgress.total}…`
       : generating
         ? 'Generating…'
-        : 'Generate resumes';
+        : 'Generate tailored resumes';
 
   return (
     <div

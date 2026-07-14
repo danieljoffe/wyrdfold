@@ -54,7 +54,7 @@ describe('ProfilePage', () => {
 
     expect(await screen.findByText(/Upload your resume/i)).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /Upload Resume/i })
+      screen.getByRole('button', { name: /Upload source file/i })
     ).toBeInTheDocument();
   });
 

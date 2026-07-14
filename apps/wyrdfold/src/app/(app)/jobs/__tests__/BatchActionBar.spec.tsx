@@ -32,7 +32,7 @@ describe('BatchActionBar', () => {
       screen.getByRole('button', { name: /deselect/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /generate resumes/i })
+      screen.getByRole('button', { name: /generate tailored resumes/i })
     ).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /^delete$/i })
@@ -59,7 +59,7 @@ describe('BatchActionBar', () => {
   it('disables Generate and shows a hard cap warning past the max', () => {
     render(<BatchActionBar {...baseProps} selectedCount={21} />);
     expect(
-      screen.getByRole('button', { name: /generate resumes/i })
+      screen.getByRole('button', { name: /generate tailored resumes/i })
     ).toBeDisabled();
     expect(screen.getByText(/max 20 per batch/i)).toBeInTheDocument();
   });
@@ -97,7 +97,9 @@ describe('BatchActionBar', () => {
     );
 
     await user.click(screen.getByRole('button', { name: /deselect/i }));
-    await user.click(screen.getByRole('button', { name: /generate resumes/i }));
+    await user.click(
+      screen.getByRole('button', { name: /generate tailored resumes/i })
+    );
     await user.click(screen.getByRole('button', { name: /export/i }));
     await user.click(screen.getByRole('button', { name: /^delete$/i }));
 

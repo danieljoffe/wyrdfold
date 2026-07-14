@@ -441,11 +441,11 @@ export default function ResumeReviewPage({
     return (
       <div className='mx-auto max-w-4xl p-6'>
         <Heading variant='hero' as='h1'>
-          Resume not found
+          Tailored resume not found
         </Heading>
         <Text variant='body'>
-          We couldn&rsquo;t find a resume for this job. Generate one from the
-          job page first.
+          We couldn&rsquo;t find a tailored resume for this job. Generate one
+          from the job page first.
         </Text>
         <Link
           href={`/jobs/${jobPostingId}`}
@@ -522,7 +522,7 @@ export default function ResumeReviewPage({
 
       <div>
         <Heading variant='hero' as='h1'>
-          Review Resume
+          Review tailored resume
         </Heading>
         <Text variant='body' className='text-text-secondary'>
           {posting.title} &mdash; {posting.company_name}
