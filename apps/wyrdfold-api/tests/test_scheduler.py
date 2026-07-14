@@ -2,7 +2,7 @@
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -11,6 +11,9 @@ import pytest
 from app.config import settings
 from app.scheduler import (
     _anchor_discovery_schedule,
+    _anchor_job_from_ledger,
+    _last_scheduler_run,
+    _record_scheduler_run,
     build_scheduler,
     start_scheduler_if_enabled,
 )
@@ -101,9 +104,9 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
     assert scheduler is not None
     try:
         assert scheduler.running is True
-        jobs = scheduler.get_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].id == "url_health_check"
+        ids = {j.id for j in scheduler.get_jobs()}
+        # The ledger catch-up rides with the interval job (#327 follow-up).
+        assert ids == {"url_health_check", "url_health_check_catchup"}
     finally:
         scheduler.shutdown(wait=False)
 
@@ -125,7 +128,11 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
     try:
         assert scheduler.running is True
         ids = {j.id for j in scheduler.get_jobs()}
-        assert ids == {"poll_due_sources", "url_health_check"}
+        assert ids == {
+            "poll_due_sources",
+            "url_health_check",
+            "url_health_check_catchup",
+        }
     finally:
         scheduler.shutdown(wait=False)
 
@@ -145,9 +152,8 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
     assert scheduler is not None
     try:
         assert scheduler.running is True
-        jobs = scheduler.get_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].id == "retention_purge"
+        ids = {j.id for j in scheduler.get_jobs()}
+        assert ids == {"retention_purge", "retention_purge_catchup"}
     finally:
         scheduler.shutdown(wait=False)
 
@@ -171,7 +177,13 @@ async def test_start_scheduler_registers_three_when_poll_health_retention_enable
     try:
         assert scheduler.running is True
         ids = {j.id for j in scheduler.get_jobs()}
-        assert ids == {"poll_due_sources", "url_health_check", "retention_purge"}
+        assert ids == {
+            "poll_due_sources",
+            "url_health_check",
+            "url_health_check_catchup",
+            "retention_purge",
+            "retention_purge_catchup",
+        }
     finally:
         scheduler.shutdown(wait=False)
 
@@ -240,10 +252,13 @@ async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
         assert ids == {
             "poll_due_sources",
             "url_health_check",
+            "url_health_check_catchup",
             "retention_purge",
+            "retention_purge_catchup",
             "discovery_run",
             "discovery_catchup",
             "recency_refresh",
+            "recency_refresh_catchup",
         }
     finally:
         scheduler.shutdown(wait=False)
@@ -264,9 +279,8 @@ async def test_start_scheduler_registers_only_recency_when_only_recency_enabled(
     assert scheduler is not None
     try:
         assert scheduler.running is True
-        jobs = scheduler.get_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].id == "recency_refresh"
+        ids = {j.id for j in scheduler.get_jobs()}
+        assert ids == {"recency_refresh", "recency_refresh_catchup"}
     finally:
         scheduler.shutdown(wait=False)
 
@@ -539,9 +553,7 @@ def _patch_discovery_deps(
     async def fake_run() -> None:
         runs.append(1)
 
-    monkeypatch.setattr(
-        "app.scheduler.run_discovery_all_targets_locked", fake_run
-    )
+    monkeypatch.setattr("app.scheduler.run_discovery_all_targets_locked", fake_run)
     return runs
 
 
@@ -562,9 +574,7 @@ class TestDiscoveryCatchup:
     @pytest.mark.asyncio
     async def test_overdue_runs_now(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "discovery_tick_hours", 24)
-        runs = _patch_discovery_deps(
-            monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=25)
-        )
+        runs = _patch_discovery_deps(monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=25))
         sched = _RecordingScheduler()
 
         await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # type: ignore[arg-type]
@@ -587,9 +597,7 @@ class TestDiscoveryCatchup:
         assert sched.modified == [("discovery_run", last + timedelta(hours=24))]
 
     @pytest.mark.asyncio
-    async def test_db_error_is_fail_soft(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_db_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
         runs = _patch_discovery_deps(monkeypatch, last_run=RuntimeError("db down"))
         sched = _RecordingScheduler()
 
@@ -599,9 +607,7 @@ class TestDiscoveryCatchup:
         assert sched.modified == []
 
     @pytest.mark.asyncio
-    async def test_missing_pool_client_skips_quietly(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_missing_pool_client_skips_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
         sched = _RecordingScheduler()
 
@@ -610,16 +616,230 @@ class TestDiscoveryCatchup:
         assert sched.modified == []
 
     @pytest.mark.asyncio
-    async def test_modify_job_error_is_fail_soft(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_modify_job_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "discovery_tick_hours", 24)
-        _patch_discovery_deps(
-            monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=2)
-        )
+        _patch_discovery_deps(monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=2))
 
         class _BoomScheduler:
             def modify_job(self, job_id: str, **changes: object) -> None:
                 raise RuntimeError("job store closed")
 
         await _anchor_discovery_schedule(_BoomScheduler(), now=_CATCHUP_NOW)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# scheduler_runs ledger: the generic catch-up + the stamp/read helpers
+# ---------------------------------------------------------------------------
+
+
+def _patch_ledger_read(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    last_run: "datetime | None | Exception",
+) -> None:
+    async def fake_last(_job_id: str) -> "datetime | None":
+        if isinstance(last_run, Exception):
+            raise last_run
+        return last_run
+
+    monkeypatch.setattr("app.scheduler._last_scheduler_run", fake_last)
+
+
+def _spy_runner() -> tuple[list[int], "Callable[[], Awaitable[None]]"]:
+    runs: list[int] = []
+
+    async def runner() -> None:
+        runs.append(1)
+
+    return runs, runner
+
+
+class TestLedgerCatchup:
+    @pytest.mark.asyncio
+    async def test_never_ran_runs_now(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ledger_read(monkeypatch, last_run=None)
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="url_health_check",
+            tick_hours=12,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == [1]
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_overdue_runs_now(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ledger_read(monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=13))
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="url_health_check",
+            tick_hours=12,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == [1]
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_fresh_anchors_next_fire_instead_of_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        last = _CATCHUP_NOW - timedelta(hours=2)
+        _patch_ledger_read(monkeypatch, last_run=last)
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="retention_purge",
+            tick_hours=24,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == []
+        assert sched.modified == [("retention_purge", last + timedelta(hours=24))]
+
+    @pytest.mark.asyncio
+    async def test_ledger_read_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ledger_read(monkeypatch, last_run=RuntimeError("db down"))
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]  # must not raise
+            job_id="recency_refresh",
+            tick_hours=12,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == []
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_runner_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ledger_read(monkeypatch, last_run=None)
+
+        async def boom() -> None:
+            raise RuntimeError("job body exploded")
+
+        await _anchor_job_from_ledger(
+            _RecordingScheduler(),  # type: ignore[arg-type]  # must not raise
+            job_id="url_health_check",
+            tick_hours=12,
+            runner=boom,
+            now=_CATCHUP_NOW,
+        )
+
+    @pytest.mark.asyncio
+    async def test_modify_job_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_ledger_read(monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=2))
+        runs, runner = _spy_runner()
+
+        class _BoomScheduler:
+            def modify_job(self, job_id: str, **changes: object) -> None:
+                raise RuntimeError("job store closed")
+
+        await _anchor_job_from_ledger(
+            _BoomScheduler(),  # type: ignore[arg-type]  # must not raise
+            job_id="retention_purge",
+            tick_hours=24,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == []
+
+
+class _LedgerTableStub:
+    """Just enough of the postgrest chain for the stamp/read helpers."""
+
+    def __init__(
+        self, *, rows: "list[dict[str, object]] | None" = None, boom: bool = False
+    ) -> None:
+        self.rows = rows or []
+        self.boom = boom
+        self.upserted: list[dict[str, object]] = []
+
+    # both chains funnel through table(); every step returns self
+    def table(self, name: str) -> "_LedgerTableStub":
+        assert name == "scheduler_runs"
+        return self
+
+    def upsert(self, payload: dict[str, object]) -> "_LedgerTableStub":
+        self.upserted.append(payload)
+        return self
+
+    def select(self, *_cols: str) -> "_LedgerTableStub":
+        return self
+
+    def eq(self, *_a: object) -> "_LedgerTableStub":
+        return self
+
+    def limit(self, _n: int) -> "_LedgerTableStub":
+        return self
+
+    def execute(self) -> object:
+        if self.boom:
+            raise RuntimeError("pooler down")
+
+        class _Resp:
+            def __init__(self, data: object) -> None:
+                self.data = data
+
+        return _Resp(self.rows)
+
+
+class TestLedgerHelpers:
+    def test_record_stamps_the_job_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _LedgerTableStub()
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+
+        _record_scheduler_run("url_health_check")
+
+        assert len(stub.upserted) == 1
+        assert stub.upserted[0]["job_id"] == "url_health_check"
+        assert stub.upserted[0]["last_run_at"]
+
+    def test_record_skips_without_pool_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+
+        _record_scheduler_run("url_health_check")  # must not raise
+
+    def test_record_write_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _LedgerTableStub(boom=True)
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+
+        _record_scheduler_run("url_health_check")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_last_run_parses_z_suffix_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _LedgerTableStub(rows=[{"last_run_at": "2026-07-14T10:30:00Z"}])
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+
+        got = await _last_scheduler_run("retention_purge")
+
+        assert got == datetime(2026, 7, 14, 10, 30, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_last_run_none_when_no_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub = _LedgerTableStub(rows=[])
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+
+        assert await _last_scheduler_run("retention_purge") is None
+
+    @pytest.mark.asyncio
+    async def test_last_run_none_without_pool_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+
+        assert await _last_scheduler_run("retention_purge") is None
