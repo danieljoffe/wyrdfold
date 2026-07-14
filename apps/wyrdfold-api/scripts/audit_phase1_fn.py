@@ -164,9 +164,9 @@ async def main_async(*, sample_per_target: int, dry_run: bool, seed: int) -> int
     if dry_run:
         logger.info("--dry-run: would issue Sonnet calls but not actually doing it.")
         return 0
-    if settings.llm_provider != "anthropic":
+    if settings.llm_provider not in ("anthropic", "openrouter"):
         raise RuntimeError(
-            f"LLM_PROVIDER must be 'anthropic' for a real audit (currently "
+            f"LLM_PROVIDER must be 'anthropic' or 'openrouter' for a real audit (currently "
             f"{settings.llm_provider!r}). Use --dry-run for a no-op test."
         )
 
