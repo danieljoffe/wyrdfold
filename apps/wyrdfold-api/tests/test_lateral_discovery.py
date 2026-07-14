@@ -248,3 +248,113 @@ async def test_passes_current_targets_to_prompt(
     assert len(seen_messages) == 1
     assert "Director of CX Operations" in seen_messages[0]
     assert "do NOT re-suggest" in seen_messages[0]
+
+
+# ---- verbose-prose tolerance (2026-07-14 live 500) ---------------------------
+#
+# Two of eight suggestions ran a sentence past lateral_relationship's
+# 180-char display cap and the WHOLE response 500'd. The caps are a UI
+# contract, not a correctness bound — over-long prose is truncated at a
+# word boundary now (same doctrine as the tagger's tolerate-malformed
+# fix). Structural garbage must still fail loud.
+
+
+def _valid_kwargs(**overrides: object) -> dict:
+    base: dict = {
+        "label": "Director of CX Ops",
+        "one_line_reasoning": "Ran a 40-agent org through a platform swap.",
+        "confidence": 80,
+        "lateral_relationship": "Same altitude, different industry vocabulary.",
+        "seniority_hint": "director",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_overlong_lateral_relationship_is_truncated_not_fatal() -> None:
+    # Mirror the incident: a verbose ~230-char relationship string.
+    verbose = (
+        "Same altitude, platform-operations flavored — your run of large "
+        "migrations maps directly, though the vocabulary here leans heavily "
+        "on marketplace tooling which differs from the recruiter's prior "
+        "industry mix and needs a reframe."
+    )
+    assert len(verbose) > 180
+    s = LateralSuggestion.model_validate(_valid_kwargs(lateral_relationship=verbose))
+    assert len(s.lateral_relationship) <= 180
+    assert s.lateral_relationship.endswith("…")
+    # Word-boundary cut: no mid-word tail before the ellipsis.
+    assert not s.lateral_relationship[:-1].endswith(" ")
+
+
+def test_all_prose_caps_are_tolerant() -> None:
+    s = LateralSuggestion.model_validate(
+        _valid_kwargs(
+            label="L" + "x" * 200,
+            one_line_reasoning="r" * 300,
+            lateral_relationship="q" * 300,
+            primary_industry="i" * 120,
+        )
+    )
+    assert len(s.label) <= 120
+    assert len(s.one_line_reasoning) <= 240
+    assert len(s.lateral_relationship) <= 180
+    assert s.primary_industry is not None and len(s.primary_industry) <= 80
+
+
+def test_exact_cap_passes_untouched() -> None:
+    exact = "x" * 180
+    s = LateralSuggestion.model_validate(_valid_kwargs(lateral_relationship=exact))
+    assert s.lateral_relationship == exact
+
+
+def test_structural_garbage_still_fails_loud() -> None:
+    from pydantic import ValidationError
+
+    # Wrong TYPE is a real malformed response, not verbosity — must raise.
+    with pytest.raises(ValidationError):
+        LateralSuggestion.model_validate(
+            _valid_kwargs(lateral_relationship=["not", "a", "string"])
+        )
+    # And a too-short label stays a hard error (min_length is a floor,
+    # not a prose cap).
+    with pytest.raises(ValidationError):
+        LateralSuggestion.model_validate(_valid_kwargs(label="X"))
+
+
+@pytest.mark.asyncio
+async def test_full_path_survives_verbose_model_via_mock() -> None:
+    """The 2026-07-14 incident as a mock behavior: the model's tool-call
+    payload overflows two prose caps; the real complete_json round trip
+    (schema validation included) must return truncated suggestions, not
+    raise. Grows the mock's edge battery per the LLM-surface rule."""
+    import json
+
+    from app.services.llm.mock import MockLLMClient
+
+    verbose_payload = {
+        "suggestions": [
+            {
+                "label": "Marketplace Operations Director",
+                "one_line_reasoning": "Your platform-migration record maps over.",
+                "confidence": 74,
+                "lateral_relationship": (
+                    "Same altitude, platform-operations flavored — your run of "
+                    "large migrations maps directly, though the vocabulary here "
+                    "leans heavily on marketplace tooling which differs from the "
+                    "recruiter's prior industry mix."
+                ),
+                "primary_industry": "marketplaces",
+                "seniority_hint": "director",
+            }
+        ]
+    }
+    mock = MockLLMClient()
+    mock.register("target.suggest_lateral", json.dumps(verbose_payload))
+
+    parsed, result = await suggest_lateral_targets(mock, payload=_payload())
+
+    assert result is not None
+    assert len(parsed.suggestions) == 1
+    assert len(parsed.suggestions[0].lateral_relationship) <= 180
+    assert parsed.suggestions[0].lateral_relationship.endswith("…")

@@ -88,8 +88,9 @@ describe('buildInsightsCsv', () => {
     expect(csv).toContain('## Score trend');
     expect(csv).toContain('## Skill mentions');
     expect(csv).toContain('## What to learn next');
-    expect(csv).toContain('## LLM cost over time');
-    expect(csv).toContain('## LLM cost by purpose');
+    // LLM cost sections dropped from the seeker view (UX/IA) — the CSV
+    // mirrors the view, so their absence is the contract now.
+    expect(csv).not.toContain('## LLM cost');
   });
 
   it('escapes commas and double quotes in cell values', () => {

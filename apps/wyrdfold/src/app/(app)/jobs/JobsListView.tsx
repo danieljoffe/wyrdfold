@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import { useAdminTableFetch } from '@/hooks/useAdminTableFetch';
 import { useToast } from '@/state/Toast/ToastProvider';
 import JobsFilter from './JobsFilter';
+import { filtersToApiParams } from './jobsFilterFields';
 import JobsListMobile from './JobsListMobile';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import type { JobPosting, JobsFilterState, JobsSortColumn } from './types';
@@ -96,19 +97,11 @@ export default function JobsListView({
   }, []);
 
   const extraParams = useMemo(() => {
-    const params: Record<string, string> = {};
+    // Every active filter dimension maps onto its /api/jobs query param via
+    // the shared field list (incl. the #86 logistics filters, which the
+    // backend applies over scores.logistics_filters).
+    const params: Record<string, string> = filtersToApiParams(filters);
     if (targetId) params.target_id = targetId;
-    if (filters.minScore) params.min_score = filters.minScore;
-    if (filters.status) params.status = filters.status;
-    if (filters.search) params.search = filters.search;
-    if (filters.excludeLocations)
-      params.exclude_locations = filters.excludeLocations;
-    if (filters.onlyLocations) params.only_locations = filters.onlyLocations;
-    // Logistics filters (#86) — forwarded to the backend /jobs endpoint, which
-    // filters on scores.logistics_filters (post-fetch, lenient/strict per param).
-    if (filters.remoteOnly) params.remote_only = filters.remoteOnly;
-    if (filters.minSalary) params.min_salary = filters.minSalary;
-    if (filters.country) params.country = filters.country;
     const combined = refreshKey + deleteKey;
     if (combined) params._r = String(combined);
     return params;

@@ -35,7 +35,7 @@ test.describe('authenticated dashboard smoke', () => {
 
     // 2. Page heading rendered.
     await expect(
-      page.getByRole('heading', { name: 'Dashboard', level: 1 })
+      page.getByRole('heading', { name: 'Home', level: 1 })
     ).toBeVisible();
 
     // 3. Sidebar logo a11y: the link's accessible name is
@@ -55,14 +55,9 @@ test.describe('authenticated dashboard smoke', () => {
     // Each top-level route should have a nav link. Order isn't
     // asserted — that's a styling choice that shouldn't gate the
     // build.
-    const routes = [
-      'Dashboard',
-      'Jobs',
-      'Targets',
-      'Profile',
-      'Insights',
-      'Settings',
-    ];
+    // Insights is deliberately absent: it merged into Home as the
+    // ?view=trends section (UX/IA Fork A) and left the nav.
+    const routes = ['Home', 'Jobs', 'Targets', 'Profile', 'Settings'];
     for (const label of routes) {
       await expect(
         page.getByRole('link', { name: label, exact: true }).first()

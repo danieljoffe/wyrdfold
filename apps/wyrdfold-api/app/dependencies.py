@@ -451,6 +451,7 @@ def enforce_llm_budget(
     """
     if user_id is None:
         return
+    from app.services.entitlements import NON_BILLABLE_PURPOSES
     from app.services.llm import budget
 
     quota = budget.resolve_llm_quota(supabase, user_id=user_id)
@@ -462,4 +463,9 @@ def enforce_llm_budget(
         hourly_limit_usd=s.user_llm_hourly_budget_usd,
         monthly_limit_usd=quota.monthly_cap_usd,
         monthly_excluded_purposes=quota.monthly_excluded_purposes,
+        # The rails meter the user's own interactive spend; the ledger
+        # attributes background catalog work to the target's payer, and
+        # counting it here locked the owner out of interactive features
+        # every day the pipeline ran (2026-07-13 incident).
+        rail_excluded_purposes=NON_BILLABLE_PURPOSES,
     )

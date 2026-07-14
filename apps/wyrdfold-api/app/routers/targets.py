@@ -12,6 +12,7 @@ from typing import Any, cast
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from postgrest.types import CountMethod
+from pydantic import ValidationError
 from supabase import Client
 
 from app.cache import job_list_cache, jobs_cache_prefix
@@ -466,9 +467,22 @@ async def suggest_lateral(
     # list — exactly what we want for personalised suggestions.
     current = crud.list_for_user(supabase, user_id=user_id)
 
-    suggestions, result = await suggest_lateral_targets(
-        llm, payload=doc.payload, current_targets=current
-    )
+    try:
+        suggestions, result = await suggest_lateral_targets(
+            llm, payload=doc.payload, current_targets=current
+        )
+    except ValidationError:
+        # The prose-cap overflows are truncated in-schema now; anything
+        # still failing here is a structurally malformed model response
+        # (wrong types, missing fields). That's an upstream hiccup, not a
+        # server bug — tell the client to retry instead of 500ing.
+        logger.warning(
+            "suggest-lateral: model returned malformed suggestions", exc_info=True
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The model returned malformed suggestions — please retry.",
+        ) from None
     cost_log.record(
         supabase,
         user_id=user_id,

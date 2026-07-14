@@ -3,15 +3,10 @@ import '@testing-library/jest-dom';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import JobsFilter from '../JobsFilter';
+import { emptyFilters } from '../jobsFilterFields';
 import type { JobsFilterState } from '../types';
 
-const baseFilters: JobsFilterState = {
-  minScore: '',
-  status: '',
-  search: '',
-  excludeLocations: '',
-  onlyLocations: '',
-};
+const baseFilters: JobsFilterState = emptyFilters();
 
 describe('JobsFilter', () => {
   it('renders the search input with an accessible label', () => {
