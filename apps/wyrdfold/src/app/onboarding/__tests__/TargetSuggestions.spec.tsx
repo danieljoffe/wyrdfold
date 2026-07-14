@@ -8,8 +8,14 @@ import type { JobTarget, MatchedSuggestion } from '@/app/(app)/targets/types';
 const fetchMock = jest.fn();
 global.fetch = fetchMock as unknown as typeof fetch;
 
+const mockPush = jest.fn();
+jest.mock('next/navigation', () => ({
+  useRouter: () => ({ push: mockPush, prefetch: jest.fn() }),
+}));
+
 beforeEach(() => {
   fetchMock.mockReset();
+  mockPush.mockReset();
 });
 
 afterEach(() => {
@@ -95,6 +101,101 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       '/api/targets/from-posting/p1',
       expect.objectContaining({ method: 'POST' })
     );
+  });
+
+  it('drafts the tailored resume and finishes on its review page (Path A payoff)', async () => {
+    fetchMock.mockImplementation((url: string, init?: { method?: string }) => {
+      const u = String(url);
+      if (u.includes('/from-posting/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 't1', label: 'Senior Engineer' }),
+        });
+      }
+      if (u.includes('/activate')) {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      if (u === '/api/jobs/p1') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ description_html: '<p>Great job</p>' }),
+        });
+      }
+      if (u.includes('/tailor/resume') && init?.method === 'POST') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ record: { id: 'r1' } }),
+        });
+      }
+      if (u.includes('/onboarding/complete')) {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      });
+    });
+    const onComplete = jest.fn();
+
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        jobData={{ postingId: 'p1', title: 'Eng' }}
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockPush).toHaveBeenCalledWith('/jobs/p1/resume');
+    });
+    // The wizard's own completion flow is bypassed — the review page IS
+    // the completion.
+    expect(onComplete).not.toHaveBeenCalled();
+    // The onboarding-complete flag was confirmed before navigating (the
+    // redirect-loop guard).
+    const urls = (fetchMock.mock.calls as unknown[][]).map(([u]) => String(u));
+    expect(urls.some(u => u.includes('/onboarding/complete'))).toBe(true);
+  });
+
+  it('falls back to the completion flow when the resume draft fails', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes('/from-posting/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 't1', label: 'Senior Engineer' }),
+        });
+      }
+      // Everything downstream (detail fetch, tailor) fails — e.g. LLM
+      // budget or gap gate.
+      return Promise.resolve({
+        ok: false,
+        status: 429,
+        json: async () => ({}),
+      });
+    });
+    const onComplete = jest.fn();
+
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        jobData={{ postingId: 'p1', title: 'Eng' }}
+      />
+    );
+
+    // The target still landed and the card shows; no navigation happened.
+    await waitFor(() => {
+      expect(screen.getByText(/target created/i)).toBeInTheDocument();
+    });
+    await waitFor(
+      () => {
+        expect(onComplete).toHaveBeenCalled();
+      },
+      { timeout: 4000 }
+    );
+    expect(mockPush).not.toHaveBeenCalled();
   });
 
   it('shows the error alert when from-posting fails', async () => {
