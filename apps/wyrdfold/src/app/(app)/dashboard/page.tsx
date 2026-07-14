@@ -1,11 +1,23 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import * as Sentry from '@sentry/nextjs';
+import { Heading } from '@danieljoffe/shared-ui/Heading';
+import { Text } from '@danieljoffe/shared-ui/Text';
 import { fetchJsonFromWyrdfoldAPI } from '@/lib/api/proxy';
+import type { InsightsInitial } from '@/hooks/useInsights';
 import DashboardPage, { type DashboardInitial } from '../DashboardPage';
+import InsightsDashboard from '../insights/InsightsDashboard';
+import type {
+  Period,
+  PipelineInsights,
+  SkillsCostInsights,
+  TargetInsights,
+} from '../insights/types';
 import type { JobPosting } from '../jobs/types';
 import { hasProse, type ProseResponse } from '../profile/types';
 import type { UserTargetWithSummary } from '../targets/types';
+import HomeViewToggle from './HomeViewToggle';
+import { parseHomeView } from './view';
 
 interface OnboardingStatus {
   completed_at: string | null;
@@ -14,7 +26,7 @@ interface OnboardingStatus {
 }
 
 export const metadata: Metadata = {
-  title: 'Dashboard',
+  title: 'Home',
 };
 
 interface JobsListResponse {
@@ -37,29 +49,16 @@ const PIPELINE_STATUSES = [
   'offer',
 ] as const;
 
-export default async function WyrdfoldDashboard() {
-  // Primary gate: explicit onboarding_completed_at flag on user_profiles.
-  // A NULL flag = user hasn't finished the wizard → redirect to it.
-  // See plan-wyrdfold-onboarding-completion-tracking.md.
-  //
-  // Redirect ONLY on a confirmed "not onboarded": a status object whose
-  // completed_at is null. ``fetchJsonFromWyrdfoldAPI`` returns ``null`` on
-  // any read failure (transient auth refresh race, network blip, upstream
-  // 5xx). The old ``onboardingStatus?.completed_at == null`` collapsed that
-  // failure case into "never onboarded" and redirected — so a single flaky
-  // read bounced an *already-onboarded* user back into the wizard (and,
-  // because the wizard restarts at path-chooser, into a redirect loop).
-  // Failing open here is safe: DashboardPage renders a graceful setup CTA
-  // for a genuinely-new user, so the worst case for an un-onboarded user
-  // whose read failed is they see the dashboard's empty state instead of
-  // the wizard for one load.
-  const onboardingStatus = await fetchJsonFromWyrdfoldAPI<OnboardingStatus>(
-    '/profile/onboarding'
-  );
-  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
-    redirect('/onboarding');
-  }
+const DEFAULT_PERIOD: Period = '30d';
 
+/** The Today section's server-seeded data (the daily launcher).
+ *  ``confirmedOnboarded`` gates the flag-set-but-no-prose telemetry: on the
+ *  fail-open path (degraded onboarding read) we don't actually know the flag
+ *  state, and the same degraded API likely returns no prose too — firing
+ *  there would be misleading. */
+async function fetchTodayInitial(
+  confirmedOnboarded: boolean
+): Promise<DashboardInitial> {
   // ``hasProfile`` checks whether the user has authored prose at all —
   // the underlying signal that "they've started onboarding." The
   // upstream ``/experience/prose`` endpoint returns ``{prose: null}``
@@ -95,13 +94,8 @@ export default async function WyrdfoldDashboard() {
   // DashboardPage's ``!hasProfile`` branch already renders a graceful
   // empty state with a "Set up profile" CTA, which is what the user
   // actually needs.
-  //
-  // Only warn when the flag is CONFIRMED set: on the fail-open path above
-  // (onboardingStatus === null, a degraded read) we don't actually know the
-  // flag state, and the same degraded API likely returns no prose too —
-  // firing "flag set but no prose" there would be misleading telemetry.
   const proseAuthored = proseRes != null && hasProse(proseRes);
-  if (onboardingStatus?.completed_at != null && !proseAuthored) {
+  if (confirmedOnboarded && !proseAuthored) {
     Sentry.captureMessage('dashboard:onboarding_flag_set_but_no_prose', {
       level: 'warning',
     });
@@ -112,13 +106,104 @@ export default async function WyrdfoldDashboard() {
     counts[status] = countsRes?.[status] ?? 0;
   }
 
-  const initial: DashboardInitial = {
+  return {
     topMatches: topRes?.postings ?? [],
     counts,
     hasProfile: proseAuthored,
     hasActiveTargets:
       targetsRes?.targets?.some(t => t.user_target.is_active) ?? false,
   };
+}
 
-  return <DashboardPage initial={initial} />;
+/** The Trends section's server-seeded data (the former /insights page).
+ *  Fetched in parallel so the section paints with data instead of three
+ *  client→Next→API round-trips after hydration (#851 P1). Each slice is
+ *  null on failure so a partial outage still renders what came back. */
+async function fetchTrendsInitial(): Promise<InsightsInitial> {
+  const qs = new URLSearchParams({ period: DEFAULT_PERIOD });
+  const [pipeline, targets, skillsCost] = await Promise.all([
+    fetchJsonFromWyrdfoldAPI<PipelineInsights>('/insights/pipeline', {
+      searchParams: qs,
+    }),
+    fetchJsonFromWyrdfoldAPI<TargetInsights>('/insights/targets', {
+      searchParams: qs,
+    }),
+    fetchJsonFromWyrdfoldAPI<SkillsCostInsights>('/insights/skills-cost', {
+      searchParams: qs,
+    }),
+  ]);
+
+  return {
+    period: DEFAULT_PERIOD,
+    pipeline: pipeline ?? undefined,
+    targets: targets ?? undefined,
+    skillsCost: skillsCost ?? undefined,
+    fetchedAt: Date.now(),
+  };
+}
+
+export default async function WyrdfoldHome({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  // Primary gate: explicit onboarding_completed_at flag on user_profiles.
+  // A NULL flag = user hasn't finished the wizard → redirect to it.
+  // See plan-wyrdfold-onboarding-completion-tracking.md.
+  //
+  // Redirect ONLY on a confirmed "not onboarded": a status object whose
+  // completed_at is null. ``fetchJsonFromWyrdfoldAPI`` returns ``null`` on
+  // any read failure (transient auth refresh race, network blip, upstream
+  // 5xx). The old ``onboardingStatus?.completed_at == null`` collapsed that
+  // failure case into "never onboarded" and redirected — so a single flaky
+  // read bounced an *already-onboarded* user back into the wizard (and,
+  // because the wizard restarts at path-chooser, into a redirect loop).
+  // Failing open here is safe: DashboardPage renders a graceful setup CTA
+  // for a genuinely-new user, so the worst case for an un-onboarded user
+  // whose read failed is they see the dashboard's empty state instead of
+  // the wizard for one load.
+  const [params, onboardingStatus] = await Promise.all([
+    searchParams,
+    fetchJsonFromWyrdfoldAPI<OnboardingStatus>('/profile/onboarding'),
+  ]);
+  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
+    redirect('/onboarding');
+  }
+
+  // Home = daily launcher ("Today") + historical view ("Trends", the
+  // former /insights page — UX/IA Fork A). One section per request:
+  // the server fetches only the data the selected view renders.
+  const view = parseHomeView(params['view']);
+
+  const todayInitial =
+    view === 'today'
+      ? await fetchTodayInitial(onboardingStatus?.completed_at != null)
+      : null;
+  const trendsInitial = view === 'trends' ? await fetchTrendsInitial() : null;
+
+  return (
+    <div className='flex flex-col gap-6'>
+      <div className='flex flex-wrap items-end justify-between gap-4'>
+        <div>
+          <Heading variant='hero' as='h1'>
+            Home
+          </Heading>
+          <Text variant='body' className='mt-1 text-text-secondary'>
+            {view === 'trends'
+              ? 'Track your job search progress'
+              : 'Your job search at a glance'}
+          </Text>
+        </div>
+        <HomeViewToggle value={view} />
+      </div>
+
+      {view === 'trends' ? (
+        <InsightsDashboard
+          {...(trendsInitial ? { initial: trendsInitial } : {})}
+        />
+      ) : (
+        todayInitial && <DashboardPage initial={todayInitial} />
+      )}
+    </div>
+  );
 }

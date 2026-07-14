@@ -27,10 +27,6 @@ import type { Period } from './types';
 // (https://nextjs.org/docs/messages/invalid-dynamic-options-type)
 // so we can't extract a shared options const — repeat the literal
 // per chart.
-const CostChart = dynamic(() => import('./charts/CostChart'), {
-  ssr: false,
-  loading: () => <ChartSkeleton />,
-});
 const FunnelChart = dynamic(() => import('./charts/FunnelChart'), {
   ssr: false,
   loading: () => <ChartSkeleton />,
@@ -199,7 +195,6 @@ export default function InsightsDashboard({
   const showScoreDistSkeleton = loading.targets && !targets;
   const showTargetCmpSkeleton = loading.targets && !targets;
   const showSkillFreqSkeleton = loading.skillsCost && !skillsCost;
-  const showCostSkeleton = loading.skillsCost && !skillsCost;
 
   // Stable per-chart array references so an unrelated slice resolution
   // (e.g. skillsCost) doesn't fabricate fresh `?? []` fallbacks for the
@@ -218,10 +213,6 @@ export default function InsightsDashboard({
   );
   const topMissingData = useMemo(
     () => skillsCost?.top_missing ?? [],
-    [skillsCost]
-  );
-  const costOverTimeData = useMemo(
-    () => skillsCost?.cost_over_time ?? [],
     [skillsCost]
   );
 
@@ -451,29 +442,6 @@ export default function InsightsDashboard({
             <Skeleton variant='rectangular' height={180} />
           ) : (
             <TopSkillGaps data={topMissingData} />
-          )}
-        </CardContent>
-      </Card>
-
-      {/* LLM Cost — full width */}
-      <Card aria-busy={showCostSkeleton}>
-        <CardHeader>
-          <div className='flex items-baseline gap-4'>
-            <CardTitle as='h2'>LLM Cost</CardTitle>
-            {skillsCost && (
-              <Text variant='meta'>
-                Total: ${skillsCost.total_cost.toFixed(2)}
-                {skillsCost.avg_cost_per_resume !== null &&
-                  ` | Avg/resume: $${skillsCost.avg_cost_per_resume.toFixed(2)}`}
-              </Text>
-            )}
-          </div>
-        </CardHeader>
-        <CardContent>
-          {showCostSkeleton ? (
-            <ChartSkeleton />
-          ) : (
-            <CostChart data={costOverTimeData} />
           )}
         </CardContent>
       </Card>

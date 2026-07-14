@@ -43,7 +43,9 @@ describe('WyrdfoldDashboard route', () => {
       current_step: null,
     });
 
-    await expect(WyrdfoldDashboard()).rejects.toThrow('REDIRECT:/onboarding');
+    await expect(
+      WyrdfoldDashboard({ searchParams: Promise.resolve({}) })
+    ).rejects.toThrow('REDIRECT:/onboarding');
 
     expect(mockRedirect).toHaveBeenCalledWith('/onboarding');
     expect(mockFetch).toHaveBeenCalledTimes(1);
@@ -66,7 +68,9 @@ describe('WyrdfoldDashboard route', () => {
       .mockResolvedValueOnce({ prose: null })
       .mockResolvedValue({ targets: [], postings: [], total: 0 });
 
-    const result = await WyrdfoldDashboard();
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({}),
+    });
 
     expect(mockRedirect).not.toHaveBeenCalled();
     expect(result).toBeDefined();
@@ -90,7 +94,9 @@ describe('WyrdfoldDashboard route', () => {
       .mockResolvedValueOnce({ prose: null }) // ← prose missing
       .mockResolvedValue({ targets: [], postings: [], total: 0 });
 
-    const result = await WyrdfoldDashboard();
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({}),
+    });
 
     expect(mockSentryCapture).toHaveBeenCalledWith(
       'dashboard:onboarding_flag_set_but_no_prose',
@@ -115,10 +121,54 @@ describe('WyrdfoldDashboard route', () => {
       })
       .mockResolvedValue({ targets: [], postings: [], total: 0 });
 
-    const result = await WyrdfoldDashboard();
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({}),
+    });
 
     expect(mockRedirect).not.toHaveBeenCalled();
     expect(mockSentryCapture).not.toHaveBeenCalled();
     expect(result).toBeDefined();
+  });
+
+  it('view=trends fetches the insights slices, not the launcher data', async () => {
+    // onboarding gate read
+    mockFetch.mockResolvedValueOnce({
+      completed_at: '2026-07-01T00:00:00Z',
+      path: 'A',
+      current_step: null,
+    });
+    // three insights slices (pipeline / targets / skills-cost)
+    mockFetch.mockResolvedValue(null);
+
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({ view: 'trends' }),
+    });
+
+    expect(result).toBeTruthy();
+    const endpoints = mockFetch.mock.calls.map(c => c[0]);
+    expect(endpoints).toContain('/insights/pipeline');
+    expect(endpoints).toContain('/insights/targets');
+    expect(endpoints).toContain('/insights/skills-cost');
+    // The Today launcher's fetches must NOT fire on the trends view —
+    // one section per request.
+    expect(endpoints).not.toContain('/jobs/pipeline-counts');
+    expect(endpoints).not.toContain('/experience/prose');
+  });
+
+  it('unknown view values fall back to the Today launcher', async () => {
+    mockFetch.mockResolvedValueOnce({
+      completed_at: '2026-07-01T00:00:00Z',
+      path: 'A',
+      current_step: null,
+    });
+    mockFetch.mockResolvedValue(null);
+
+    await WyrdfoldDashboard({
+      searchParams: Promise.resolve({ view: 'garbage' }),
+    });
+
+    const endpoints = mockFetch.mock.calls.map(c => c[0]);
+    expect(endpoints).toContain('/jobs/pipeline-counts');
+    expect(endpoints).not.toContain('/insights/pipeline');
   });
 });
