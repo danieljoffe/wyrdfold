@@ -566,9 +566,11 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         return
 
-    if settings.llm_provider != "anthropic":
+    if settings.llm_provider not in ("anthropic", "openrouter"):
+        # OpenRouter serves the same Anthropic models via /messages (prod's
+        # provider since the 2026-06 migration) — either real backend works.
         raise RuntimeError(
-            f"LLM_PROVIDER must be 'anthropic' for a real eval "
+            f"LLM_PROVIDER must be 'anthropic' or 'openrouter' for a real eval "
             f"(currently {settings.llm_provider!r}). Use --dry-run to test the flow."
         )
 

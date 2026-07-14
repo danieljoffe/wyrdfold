@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
@@ -191,6 +191,7 @@ async def _run_scheduled_url_health() -> None:
         if client is None:
             logger.warning("scheduled url_health skipped — supabase client not initialized")
             return
+        await asyncio.to_thread(_record_scheduler_run, "url_health_check")
         summary = await run_url_health_check(client)
         if summary["archived"] > 0:
             job_list_cache.invalidate()
@@ -211,6 +212,7 @@ async def _run_scheduled_retention_purge() -> None:
         if client is None:
             logger.warning("scheduled retention purge skipped — supabase client not initialized")
             return
+        await asyncio.to_thread(_record_scheduler_run, "retention_purge")
         report = await asyncio.to_thread(
             purge_expired_records,
             client,
@@ -240,6 +242,7 @@ async def _run_scheduled_recency_refresh() -> None:
         if client is None:
             logger.warning("scheduled recency refresh skipped — supabase client not initialized")
             return
+        await asyncio.to_thread(_record_scheduler_run, "recency_refresh")
         written = await asyncio.to_thread(refresh_all_recency_scores, client)
         if written > 0:
             # Cached list pages were sorted by the previous recency_score;
@@ -248,6 +251,96 @@ async def _run_scheduled_recency_refresh() -> None:
         logger.info("scheduled recency refresh: rewrote %d score rows", written)
     except Exception:
         logger.exception("scheduled recency refresh raised")
+
+
+# ---------------------------------------------------------------------------
+# scheduler_runs ledger (#327 follow-up): url_health / retention_purge /
+# recency_refresh have 12-24h ticks measured from process start, and this
+# app deploys near-daily — without a persisted marker they starve exactly
+# like discovery did. Discovery anchors to its natural marker
+# (source_discoveries); these jobs delete/rewrite rows and leave no trace,
+# so they stamp a one-row-per-job ledger at run START (an attempt marker:
+# a crashing job waits one tick instead of refiring every boot).
+# ---------------------------------------------------------------------------
+
+
+def _record_scheduler_run(job_id: str) -> None:
+    """Stamp the ledger. Fail-soft: a marker write must never break the job
+    (and pre-migration deploys simply log until the table exists)."""
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            return
+        client.table("scheduler_runs").upsert(
+            {
+                "job_id": job_id,
+                "last_run_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ).execute()
+    except Exception:
+        logger.warning("scheduler_runs stamp failed for %s (non-fatal)", job_id)
+
+
+async def _last_scheduler_run(job_id: str) -> datetime | None:
+    client = get_supabase_pool()
+    if client is None:
+        return None
+    resp = await asyncio.to_thread(
+        lambda: (
+            client.table("scheduler_runs")
+            .select("last_run_at")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
+    )
+    rows = cast("list[dict[str, object]]", resp.data or [])
+    if not rows:
+        return None
+    raw = rows[0].get("last_run_at")
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+async def _anchor_job_from_ledger(
+    scheduler: AsyncIOScheduler,
+    *,
+    job_id: str,
+    tick_hours: int,
+    runner: Callable[[], Awaitable[None]],
+    now: datetime | None = None,
+) -> None:
+    """One-shot catch-up for a ledger-stamped job — same contract as
+    ``_anchor_discovery_schedule``: overdue/never → run now (the runner
+    stamps the ledger itself); fresh → pull the interval job's next fire up
+    to ``last_run + tick``. Fail-soft: any error keeps the boot-relative
+    schedule."""
+    moment = now or datetime.now(UTC)
+    try:
+        last = await _last_scheduler_run(job_id)
+        tick = timedelta(hours=tick_hours)
+        if last is None or moment - last >= tick:
+            logger.info(
+                "%s catch-up: last persisted run %s is overdue (tick %dh) — running now",
+                job_id,
+                last.isoformat() if last else "never",
+                tick_hours,
+            )
+            await runner()
+        else:
+            next_fire = last + tick
+            scheduler.modify_job(job_id, next_run_time=next_fire)
+            logger.info(
+                "%s catch-up: last persisted run %s is fresh — next fire anchored to %s",
+                job_id,
+                last.isoformat(),
+                next_fire.isoformat(),
+            )
+    except Exception:
+        logger.exception("%s catch-up failed; keeping the boot-relative schedule", job_id)
 
 
 async def _anchor_discovery_schedule(
@@ -270,16 +363,13 @@ async def _anchor_discovery_schedule(
     try:
         client = get_supabase_pool()
         if client is None:
-            logger.warning(
-                "discovery catch-up skipped — supabase client not initialized"
-            )
+            logger.warning("discovery catch-up skipped — supabase client not initialized")
             return
         last = await _newest_discovery_at(client)
         tick = timedelta(hours=settings.discovery_tick_hours)
         if last is None or moment - last >= tick:
             logger.info(
-                "discovery catch-up: last persisted run %s is overdue "
-                "(tick %dh) — running now",
+                "discovery catch-up: last persisted run %s is overdue (tick %dh) — running now",
                 last.isoformat() if last else "never",
                 settings.discovery_tick_hours,
             )
@@ -288,15 +378,12 @@ async def _anchor_discovery_schedule(
             next_fire = last + tick
             scheduler.modify_job("discovery_run", next_run_time=next_fire)
             logger.info(
-                "discovery catch-up: last persisted run %s is fresh — next "
-                "fire anchored to %s",
+                "discovery catch-up: last persisted run %s is fresh — next fire anchored to %s",
                 last.isoformat(),
                 next_fire.isoformat(),
             )
     except Exception:
-        logger.exception(
-            "discovery catch-up failed; keeping the boot-relative schedule"
-        )
+        logger.exception("discovery catch-up failed; keeping the boot-relative schedule")
 
 
 def build_scheduler(
@@ -378,6 +465,21 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             coalesce=True,
             replace_existing=True,
         )
+        scheduler.add_job(
+            _anchor_job_from_ledger,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            kwargs={
+                "job_id": "url_health_check",
+                "tick_hours": settings.url_health_tick_hours,
+                "runner": _run_scheduled_url_health,
+            },
+            args=[scheduler],
+            id="url_health_check_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
         logger.info(
             "url_health scheduler registered (tick every %d h)",
             settings.url_health_tick_hours,
@@ -391,6 +493,21 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+        )
+        scheduler.add_job(
+            _anchor_job_from_ledger,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            kwargs={
+                "job_id": "retention_purge",
+                "tick_hours": settings.retention_purge_tick_hours,
+                "runner": _run_scheduled_retention_purge,
+            },
+            args=[scheduler],
+            id="retention_purge_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=3600,
         )
         logger.info(
             "retention purge scheduler registered (tick every %d h)",
@@ -440,6 +557,21 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+        )
+        scheduler.add_job(
+            _anchor_job_from_ledger,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            kwargs={
+                "job_id": "recency_refresh",
+                "tick_hours": settings.recency_refresh_tick_hours,
+                "runner": _run_scheduled_recency_refresh,
+            },
+            args=[scheduler],
+            id="recency_refresh_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=3600,
         )
         logger.info(
             "recency refresh scheduler registered (tick every %d h)",
