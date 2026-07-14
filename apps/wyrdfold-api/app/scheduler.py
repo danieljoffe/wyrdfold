@@ -24,14 +24,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
+from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
 
 from app.cache import job_list_cache
 from app.config import settings
-from app.services.ingestion_health import check_ingestion_health
+from app.services.ingestion_health import _newest_discovery_at, check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import poll_all_sources, poll_due_sources
 from app.services.recency import refresh_all_recency_scores
@@ -248,6 +250,55 @@ async def _run_scheduled_recency_refresh() -> None:
         logger.exception("scheduled recency refresh raised")
 
 
+async def _anchor_discovery_schedule(
+    scheduler: AsyncIOScheduler, *, now: datetime | None = None
+) -> None:
+    """One-shot catch-up: re-anchor the discovery interval to the last
+    PERSISTED run instead of process start.
+
+    ``IntervalTrigger`` measures from boot, and this app deploys near-daily,
+    so the 24h discovery tick effectively never elapsed — discovery ran ONCE
+    in its first six enabled days while the #244 staleness alarm correctly
+    fired about it (2026-07-13 finding). Overdue (or never ran) → run now;
+    the run is advisory-locked and Brave-budget-capped, so restarts cannot
+    stampede or blow the free tier. Fresh → pull the interval job's next
+    fire up to ``last_run + tick`` (APScheduler chains subsequent fires from
+    the overridden one, so the cadence stays anchored to real runs across
+    deploys). Fail-soft: any error keeps the boot-relative schedule.
+    """
+    moment = now or datetime.now(UTC)
+    try:
+        client = get_supabase_pool()
+        if client is None:
+            logger.warning(
+                "discovery catch-up skipped — supabase client not initialized"
+            )
+            return
+        last = await _newest_discovery_at(client)
+        tick = timedelta(hours=settings.discovery_tick_hours)
+        if last is None or moment - last >= tick:
+            logger.info(
+                "discovery catch-up: last persisted run %s is overdue "
+                "(tick %dh) — running now",
+                last.isoformat() if last else "never",
+                settings.discovery_tick_hours,
+            )
+            await run_discovery_all_targets_locked()
+        else:
+            next_fire = last + tick
+            scheduler.modify_job("discovery_run", next_run_time=next_fire)
+            logger.info(
+                "discovery catch-up: last persisted run %s is fresh — next "
+                "fire anchored to %s",
+                last.isoformat(),
+                next_fire.isoformat(),
+            )
+    except Exception:
+        logger.exception(
+            "discovery catch-up failed; keeping the boot-relative schedule"
+        )
+
+
 def build_scheduler(
     *, tick_minutes: int, job_func: Callable[[], Awaitable[None]] = _run_scheduled_poll
 ) -> AsyncIOScheduler:
@@ -355,8 +406,29 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             coalesce=True,
             replace_existing=True,
         )
+        # The interval above measures from PROCESS START, and this app deploys
+        # near-daily — so a 24h tick effectively never elapsed (discovery ran
+        # once in its first 6 enabled days while the #244 staleness alarm
+        # fired about it). One-shot catch-up shortly after boot re-anchors the
+        # schedule to the last PERSISTED run; the 3-minute delay lets the app
+        # settle and means a crash-looping process never reaches Brave at all.
+        scheduler.add_job(
+            _anchor_discovery_schedule,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            args=[scheduler],
+            id="discovery_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            # A catch-up must run whenever it CAN, not only exactly on time:
+            # APScheduler's ~1s default misfire grace silently SKIPS the job
+            # if the loop wakes late (observed 62s late on a busy boot — the
+            # local smoke caught it). An hour of grace keeps the one-shot
+            # alive through any realistic startup contention.
+            misfire_grace_time=3600,
+        )
         logger.info(
-            "discovery scheduler registered (tick every %d h)",
+            "discovery scheduler registered (tick every %d h, catch-up in 3m)",
             settings.discovery_tick_hours,
         )
 
