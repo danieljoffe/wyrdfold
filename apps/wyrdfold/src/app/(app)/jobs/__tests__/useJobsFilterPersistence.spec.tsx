@@ -1,22 +1,21 @@
 import { renderHook } from '@testing-library/react';
 
+import { emptyFilters } from '../jobsFilterFields';
 import type { JobsFilterState } from '../types';
 import { useJobsFilterPersistence } from '../useJobsFilterPersistence';
 
-const EMPTY: JobsFilterState = {
-  search: '',
-  status: '',
-  minScore: '',
-  excludeLocations: '',
-  onlyLocations: '',
-};
+const EMPTY: JobsFilterState = emptyFilters();
 
 const POPULATED: JobsFilterState = {
+  ...emptyFilters(),
   search: 'react',
   status: 'new',
   minScore: '60',
   excludeLocations: 'UK',
   onlyLocations: 'US',
+  remoteOnly: 'true',
+  minSalary: '150000',
+  country: 'US',
 };
 
 describe('useJobsFilterPersistence', () => {
@@ -95,11 +94,37 @@ describe('useJobsFilterPersistence', () => {
     const { result } = renderHook(() => useJobsFilterPersistence());
 
     expect(result.current.read('t')).toEqual({
+      ...emptyFilters(),
       search: 'react',
-      status: '',
-      minScore: '',
       excludeLocations: 'UK',
       onlyLocations: 'US',
+    });
+  });
+
+  it('restores a pre-logistics v1 snapshot with the newer dimensions empty', () => {
+    // Snapshots written before the logistics filters joined persistence
+    // hold only the original five fields. They must keep restoring those
+    // five — with remote/salary/country simply inactive, not poisoned.
+    window.localStorage.setItem(
+      'wyrdfold.filters.t-legacy',
+      JSON.stringify({
+        search: 'react',
+        status: 'new',
+        minScore: '60',
+        excludeLocations: 'UK',
+        onlyLocations: 'US',
+      })
+    );
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    expect(result.current.read('t-legacy')).toEqual({
+      search: 'react',
+      status: 'new',
+      minScore: '60',
+      excludeLocations: 'UK',
+      onlyLocations: 'US',
+      remoteOnly: '',
+      minSalary: '',
+      country: '',
     });
   });
 

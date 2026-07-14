@@ -3,6 +3,7 @@ import '@testing-library/jest-dom';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import JobsListView from '../JobsListView';
+import { emptyFilters } from '../jobsFilterFields';
 
 // Replace the heavy children with simple identifiable stubs so the spec
 // can exercise the layout-switch logic without pulling in the table /
@@ -64,13 +65,7 @@ function setMatchMedia(matches: boolean) {
 }
 
 const baseProps = {
-  filters: {
-    minScore: '',
-    status: '',
-    search: '',
-    excludeLocations: '',
-    onlyLocations: '',
-  },
+  filters: emptyFilters(),
   onFiltersChange: () => undefined,
   selectedIds: new Set<string>(),
   onSelectionChange: () => undefined,

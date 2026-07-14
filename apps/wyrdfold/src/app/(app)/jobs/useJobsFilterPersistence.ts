@@ -14,11 +14,11 @@
  * target — restore the snapshot into the URL via the caller's setter.
  *
  * Keyed per target so each target remembers its own filters. The All
- * Jobs view uses the ``__all__`` sentinel. Storage is keyed by
- * ``wyrdfold.filters.<targetId|__all__>`` and stores a JSON object
- * with the five persisted fields (search, status, minScore,
- * excludeLocations, onlyLocations). Sort/order/page/targetId are NOT
- * persisted — those are navigation state, not filter state.
+ * Jobs view uses the ``__all__`` sentinel. The persisted payload is the
+ * full ``JobsFilterState`` — every dimension in ``JOBS_FILTER_FIELDS``
+ * (a v1 payload holding only the original five fields still restores
+ * those five; see ``coerceStoredFilters``). Sort/order/page/targetId are
+ * NOT persisted — those are navigation state, not filter state.
  *
  * Failures (SSR, quota exceeded, disabled storage) are silent: read
  * returns ``null``, write becomes a no-op. The page works without
@@ -27,6 +27,7 @@
 
 import { useCallback } from 'react';
 
+import { coerceStoredFilters, isFilterStateEmpty } from './jobsFilterFields';
 import type { JobsFilterState } from './types';
 
 const STORAGE_PREFIX = 'wyrdfold.filters.';
@@ -34,39 +35,6 @@ const ALL_JOBS_KEY = '__all__';
 
 function storageKey(targetId: string | undefined): string {
   return `${STORAGE_PREFIX}${targetId ?? ALL_JOBS_KEY}`;
-}
-
-/**
- * Normalize a parsed storage payload into a valid ``JobsFilterState``.
- * Returns ``null`` if the payload is malformed enough that no field is
- * recoverable — caller should fall back to the empty filter set.
- *
- * Per-field validation is permissive: a single bad field doesn't poison
- * the whole snapshot; we just drop that field. This matters for forward
- * compat — if a future version adds a filter field, the old snapshot
- * still partially restores.
- */
-function coerce(raw: unknown): JobsFilterState | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const obj = raw as Record<string, unknown>;
-  const str = (k: string): string =>
-    typeof obj[k] === 'string' ? (obj[k] as string) : '';
-  const out: JobsFilterState = {
-    search: str('search'),
-    status: str('status'),
-    minScore: str('minScore'),
-    excludeLocations: str('excludeLocations'),
-    onlyLocations: str('onlyLocations'),
-  };
-  // If everything ended up empty there's nothing to restore — return
-  // ``null`` so the caller knows to leave the URL alone.
-  const allEmpty =
-    !out.search &&
-    !out.status &&
-    !out.minScore &&
-    !out.excludeLocations &&
-    !out.onlyLocations;
-  return allEmpty ? null : out;
 }
 
 interface JobsFilterPersistence {
@@ -82,7 +50,7 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
       try {
         const raw = window.localStorage.getItem(storageKey(targetId));
         if (!raw) return null;
-        return coerce(JSON.parse(raw));
+        return coerceStoredFilters(JSON.parse(raw));
       } catch {
         // Malformed JSON, parser error, etc. — treat as missing.
         return null;
@@ -98,13 +66,7 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
         // Drop the entry entirely when all fields are empty so a "clear
         // all filters" action doesn't leave a stale snapshot that would
         // re-apply on the next visit.
-        const allEmpty =
-          !filters.search &&
-          !filters.status &&
-          !filters.minScore &&
-          !filters.excludeLocations &&
-          !filters.onlyLocations;
-        if (allEmpty) {
+        if (isFilterStateEmpty(filters)) {
           window.localStorage.removeItem(storageKey(targetId));
           return;
         }
