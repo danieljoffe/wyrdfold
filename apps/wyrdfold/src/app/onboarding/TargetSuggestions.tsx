@@ -11,8 +11,12 @@ import { Alert } from '@danieljoffe/shared-ui/Alert';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { cn } from '@/lib/cn';
+import {
+  activateTargetInBackground,
+  createBareTarget,
+  linkTarget,
+} from '@/app/(app)/targets/targetFlows';
 import type {
-  JobTarget,
   MatchedSuggestion,
   MatchedSuggestions,
 } from '@/app/(app)/targets/types';
@@ -74,9 +78,7 @@ export default function TargetSuggestions({
           // lands on /dashboard. Path B (suggest) does this after
           // ``/link``; path A (from-posting) was missing it, so the
           // user landed on an empty Top Matches block.
-          fetch(`/api/targets/${data.id}/activate`, { method: 'POST' }).catch(
-            () => undefined
-          );
+          activateTargetInBackground(data.id);
           timerRef.current = setTimeout(onComplete, 2000);
         }
       } catch (err) {
@@ -174,40 +176,26 @@ export default function TargetSuggestions({
         let targetId: string;
 
         if (match.is_new) {
-          const createRes = await fetch('/api/targets', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              label: match.suggestion.label,
-              description: match.suggestion.description,
-            }),
+          // Bare create, NOT from-manual: these suggestions already went
+          // through LLM matching in ``/targets/suggest`` — re-running the
+          // create-or-link endpoint would repeat that call per target.
+          const createdTarget = await createBareTarget({
+            label: match.suggestion.label,
+            description: match.suggestion.description,
           });
-          if (!createRes.ok) continue;
-          const createdTarget = (await createRes.json()) as JobTarget;
           targetId = createdTarget.id;
         } else {
           targetId = match.matched_target!.id;
         }
 
-        const linkRes = await fetch(`/api/targets/${targetId}/link`, {
-          method: 'POST',
-        });
-        if (!linkRes.ok) continue;
+        await linkTarget(targetId);
         created++;
 
-        // Fire the activation pipeline (derive scoring profile → poll
-        // sources → mark ready) without awaiting. Onboarded targets
-        // were previously left at ``activation_status=idle`` because the
-        // wizard only ran create+link, so no jobs got polled until the
-        // user manually clicked Activate on /targets. Fire-and-forget
-        // keeps the wizard responsive; failures will surface on /jobs
-        // (still-idle target = no postings) rather than block the
-        // completion step. Catch and swallow to avoid an unhandled
-        // promise rejection — the user can re-activate from /targets if
-        // the kickoff was lost.
-        void fetch(`/api/targets/${targetId}/activate`, {
-          method: 'POST',
-        }).catch(() => undefined);
+        // Fire the activation pipeline without awaiting — onboarded
+        // targets were previously left at ``activation_status=idle``
+        // because the wizard only ran create+link, so no jobs got polled
+        // until the user manually clicked Activate on /targets.
+        activateTargetInBackground(targetId);
       } catch {
         // Continue creating remaining targets
       }

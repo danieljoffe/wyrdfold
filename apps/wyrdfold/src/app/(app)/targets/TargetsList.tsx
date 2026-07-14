@@ -18,13 +18,16 @@ import CreateTargetModal, {
   type UrlSubmission,
 } from './CreateTargetModal';
 import PendingTargetCard from './PendingTargetCard';
+import {
+  addSuggestionTarget,
+  createOrLinkTarget,
+  toListEntry,
+} from './targetFlows';
 import type {
-  CreateOrLinkResult,
   LateralSuggestion,
   LateralSuggestions,
   MatchedSuggestion,
   MatchedSuggestions,
-  UserTarget,
   UserTargetWithSummary,
   UserTargetWithTarget,
 } from './types';
@@ -199,6 +202,20 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   // resumes polling). The effect below polls each until it settles.
   const [derivingIds, setDerivingIds] = useState<Set<string>>(() => new Set());
 
+  // One insertion path for every create/link flow: newest first, replace
+  // any stale entry for the same target (covers the was_matched relink
+  // path), and seed the derive poller while the profile/fit is still
+  // being built.
+  const insertEntry = useCallback((entry: UserTargetWithSummary) => {
+    setTargets(prev => [
+      entry,
+      ...prev.filter(t => t.target.id !== entry.target.id),
+    ]);
+    if (isDeriving(entry)) {
+      setDerivingIds(prev => new Set(prev).add(entry.target.id));
+    }
+  }, []);
+
   const pollKey = useMemo(() => {
     const ids = new Set(derivingIds);
     for (const t of targets) {
@@ -288,15 +305,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       setLateralSuggestions([]);
 
       try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) {
-          throw new Error(await extractApiError(res, 'Failed to add target'));
-        }
-        const result = (await res.json()) as CreateOrLinkResult;
+        const result = await createOrLinkTarget(endpoint, body);
         const alreadyLinked = targets.some(
           t => t.target.id === result.target.id
         );
@@ -309,21 +318,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
             : `Target added: ${result.target.label}`,
         });
         // Use the response directly so the new card shows even if /mine
-        // is slow or fails. Replace any existing entry with the same
-        // target id (covers the was_matched=true relink path). The create
-        // endpoint returns a full target; project to the list summary (#863).
-        const entry: UserTargetWithSummary = {
-          user_target: result.user_target,
-          target: toSummary(result.target),
-        };
-        setTargets(prev => [
-          entry,
-          ...prev.filter(t => t.target.id !== result.target.id),
-        ]);
-        // Profile + fit score derive in the background — poll until ready.
-        if (isDeriving(entry)) {
-          setDerivingIds(prev => new Set(prev).add(entry.target.id));
-        }
+        // is slow or fails.
+        insertEntry(toListEntry(result));
       } catch (e) {
         toast({
           variant: 'error',
@@ -333,7 +329,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         setPendingTargets(p => p.filter(t => t.id !== pendingId));
       }
     },
-    [toast, targets]
+    [toast, targets, insertEntry]
   );
 
   const handleSubmitManual = useCallback(
@@ -387,47 +383,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const label = match.suggestion.label;
       setAddingSuggestion(label);
       try {
-        // Both branches resolve a full target; project to the list summary (#863).
-        let entry: UserTargetWithSummary;
-        if (match.is_new) {
-          const res = await fetch('/api/targets/from-manual', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              label,
-              description: match.suggestion.description,
-            }),
-          });
-          if (!res.ok) {
-            throw new Error(await extractApiError(res, 'Failed to add target'));
-          }
-          const result = (await res.json()) as CreateOrLinkResult;
-          entry = {
-            user_target: result.user_target,
-            target: toSummary(result.target),
-          };
-        } else {
-          const matchedTarget = match.matched_target!;
-          const linkRes = await fetch(`/api/targets/${matchedTarget.id}/link`, {
-            method: 'POST',
-          });
-          if (!linkRes.ok) throw new Error('Link failed');
-          const userTarget = (await linkRes.json()) as UserTarget;
-          entry = { user_target: userTarget, target: toSummary(matchedTarget) };
-        }
-
+        const entry = await addSuggestionTarget(match);
         toast({
           variant: 'success',
           title: `Added "${label}"`,
         });
         setSuggestions(prev => prev.filter(s => s.suggestion.label !== label));
-        setTargets(prev => [
-          entry,
-          ...prev.filter(t => t.target.id !== entry.target.id),
-        ]);
-        if (isDeriving(entry)) {
-          setDerivingIds(prev => new Set(prev).add(entry.target.id));
-        }
+        insertEntry(entry);
       } catch (e) {
         toast({
           variant: 'error',
@@ -437,7 +399,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         setAddingSuggestion(null);
       }
     },
-    [toast]
+    [toast, insertEntry]
   );
 
   // Lateral suggestions: adjacent sibling / career-stretch roles mined from
@@ -491,32 +453,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const label = suggestion.label;
       setAddingLateral(label);
       try {
-        const res = await fetch('/api/targets/from-manual', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            label,
-            description: suggestion.one_line_reasoning,
-          }),
+        const result = await createOrLinkTarget('/api/targets/from-manual', {
+          label,
+          description: suggestion.one_line_reasoning,
         });
-        if (!res.ok) {
-          throw new Error(await extractApiError(res, 'Failed to add target'));
-        }
-        const result = (await res.json()) as CreateOrLinkResult;
-        const entry: UserTargetWithSummary = {
-          user_target: result.user_target,
-          target: toSummary(result.target),
-        };
         toast({ variant: 'success', title: `Added "${label}"` });
         setLateralSuggestions(prev => prev.filter(s => s.label !== label));
-        setTargets(prev => [
-          entry,
-          ...prev.filter(t => t.target.id !== entry.target.id),
-        ]);
-        // Profile + fit score derive in the background — poll until ready.
-        if (isDeriving(entry)) {
-          setDerivingIds(prev => new Set(prev).add(entry.target.id));
-        }
+        insertEntry(toListEntry(result));
       } catch (e) {
         toast({
           variant: 'error',
@@ -526,7 +469,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         setAddingLateral(null);
       }
     },
-    [toast]
+    [toast, insertEntry]
   );
 
   const hasContent = targets.length > 0 || pendingTargets.length > 0;
