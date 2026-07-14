@@ -280,7 +280,7 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     if args.dry_run:
         return
-    if settings.llm_provider != "anthropic":
+    if settings.llm_provider not in ("anthropic", "openrouter"):
         raise RuntimeError(
             f"LLM_PROVIDER must be 'anthropic' (currently {settings.llm_provider!r})."
         )
