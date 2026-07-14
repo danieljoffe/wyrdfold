@@ -14,6 +14,11 @@ import { useToast } from '@/state/Toast/ToastProvider';
 import { useJobDelete } from './useJobDelete';
 import { cn } from '@/lib/cn';
 import BatchActionBar from './BatchActionBar';
+import {
+  filtersToUrlPatch,
+  isFilterStateEmpty,
+  pickFilters,
+} from './jobsFilterFields';
 import JobsListView from './JobsListView';
 import JobsThinResultsCallout from './JobsThinResultsCallout';
 import { promptForMissingContactName } from './promptForMissingContactName';
@@ -103,18 +108,10 @@ export default function JobsList({
 
   const setFilters = useCallback(
     (next: JobsFilterState) => {
-      setUrlState({
-        search: next.search || null,
-        status: next.status || null,
-        minScore: next.minScore || null,
-        excludeLocations: next.excludeLocations || null,
-        onlyLocations: next.onlyLocations || null,
-        remoteOnly: next.remoteOnly || null,
-        minSalary: next.minSalary || null,
-        country: next.country || null,
-        // No page reset needed: ``useAdminTableFetch`` re-fetches the first
-        // page (and drops the accumulated list) whenever filters change.
-      });
+      // Empty string → null so inactive dimensions leave the URL entirely.
+      // No page reset needed: ``useAdminTableFetch`` re-fetches the first
+      // page (and drops the accumulated list) whenever filters change.
+      setUrlState(filtersToUrlPatch(next));
     },
     [setUrlState]
   );
@@ -133,26 +130,25 @@ export default function JobsList({
   // saved snapshot on the next render.
   const restoredForTargetRef = useRef<string | null | undefined>(null);
 
+  // The URL state narrowed to just the filter dimensions (drops
+  // sort/order/target navigation fields). ``urlState`` is memoised on the
+  // search params, so this recomputes only when the URL actually changes.
+  const urlFilters = useMemo(() => pickFilters(urlState), [urlState]);
+
   // Snapshot to localStorage whenever the live filters change. Writes
   // are keyed by the current target (or the All Jobs sentinel) so each
   // target remembers its own filter state independently.
+  //
+  // Gated on the restore pass having run for this target: this effect is
+  // declared first, so on a BARE mount it would otherwise fire with the
+  // empty URL and delete the very snapshot the restore effect (below) is
+  // about to read — which silently broke restore-on-re-entry. After the
+  // restore pass, writes flow normally, including the deliberate
+  // "cleared all filters" removeItem.
   useEffect(() => {
-    persistence.write(activeTargetId, {
-      search: urlState.search,
-      status: urlState.status,
-      minScore: urlState.minScore,
-      excludeLocations: urlState.excludeLocations,
-      onlyLocations: urlState.onlyLocations,
-    });
-  }, [
-    persistence,
-    activeTargetId,
-    urlState.search,
-    urlState.status,
-    urlState.minScore,
-    urlState.excludeLocations,
-    urlState.onlyLocations,
-  ]);
+    if (restoredForTargetRef.current !== activeTargetId) return;
+    persistence.write(activeTargetId, urlFilters);
+  }, [persistence, activeTargetId, urlFilters]);
 
   // Restore from localStorage on first mount per target if the URL has
   // no filter params. Deep links (``/jobs?q=react``) win over the
@@ -161,24 +157,12 @@ export default function JobsList({
     if (restoredForTargetRef.current === activeTargetId) return;
     restoredForTargetRef.current = activeTargetId;
 
-    const urlBare =
-      !urlState.search &&
-      !urlState.status &&
-      !urlState.minScore &&
-      !urlState.excludeLocations &&
-      !urlState.onlyLocations;
-    if (!urlBare) return;
+    if (!isFilterStateEmpty(urlFilters)) return;
 
     const saved = persistence.read(activeTargetId);
     if (!saved) return;
 
-    setUrlState({
-      search: saved.search || null,
-      status: saved.status || null,
-      minScore: saved.minScore || null,
-      excludeLocations: saved.excludeLocations || null,
-      onlyLocations: saved.onlyLocations || null,
-    });
+    setUrlState(filtersToUrlPatch(saved));
     // Intentionally narrow deps: we only want this to fire on the first
     // render per target. Including ``urlState`` would re-trigger after
     // the restore writes its own values back into the URL, which is

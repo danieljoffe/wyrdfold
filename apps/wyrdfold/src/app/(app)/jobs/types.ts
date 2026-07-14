@@ -94,12 +94,16 @@ export interface JobsFilterState {
   /** Comma-separated location terms — show only postings whose location
    *  contains at least one of them. Empty string = no restriction. */
   onlyLocations: string;
-  /** Logistics filters (#86), over the grader's `logistics_filters`. URL-state
-   *  only (survive reload/share via the query string); intentionally NOT in the
-   *  per-target localStorage persistence for v1. Empty string = inactive. */
-  remoteOnly?: string; // '' | 'true'
-  minSalary?: string; // '' | numeric string (annual USD)
-  country?: string; // '' | ISO country code
+  /** Logistics filters (#86), over the grader's `logistics_filters`.
+   *  First-class dimensions like the rest: carried in the URL AND the
+   *  per-target localStorage persistence (the v1 URL-only carve-out made
+   *  them silently reset on any bare re-entry). Empty string = inactive.
+   *  The canonical field list lives in ``jobsFilterFields.ts`` — its
+   *  compile-time pins fail the build if this interface and that list
+   *  ever drift. */
+  remoteOnly: string; // '' | 'true'
+  minSalary: string; // '' | numeric string (annual USD)
+  country: string; // '' | ISO country code
 }
 
 export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';

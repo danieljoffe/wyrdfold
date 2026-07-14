@@ -3,6 +3,9 @@
 import { useCallback, useMemo, useRef } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
+import { JOBS_FILTER_FIELDS, type JobsFilterField } from './jobsFilterFields';
+import type { JobsFilterState } from './types';
+
 /**
  * Single source of truth for which filters / sort / page / target the
  * /jobs page is showing. Reads from ``useSearchParams`` so browser
@@ -15,19 +18,12 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation';
  * create history entries — that's the affordance a user expects when
  * they navigate to page 2 and then hit back.
  *
- * Keys are kept short for URL hygiene: ``q`` (search), ``s`` (status),
- * ``score`` (minScore), ``sort``, ``order``, ``page``, ``target``.
+ * The filter dimensions (and their short URL keys — ``q``, ``s``,
+ * ``score``, …) come from ``JOBS_FILTER_FIELDS``; only the navigation
+ * keys live here.
  */
 
-const KEYS = {
-  search: 'q',
-  status: 's',
-  minScore: 'score',
-  excludeLocations: 'exclude',
-  onlyLocations: 'only',
-  remoteOnly: 'remote_only',
-  minSalary: 'min_salary',
-  country: 'country',
+const NAV_KEYS = {
   sort: 'sort',
   order: 'order',
   target: 'target',
@@ -35,18 +31,7 @@ const KEYS = {
 
 type JobsUrlOrder = 'asc' | 'desc';
 
-interface JobsUrlState {
-  search: string;
-  status: string;
-  minScore: string;
-  excludeLocations: string;
-  onlyLocations: string;
-  /** '' | 'true' — logistics remote-only filter (#86). */
-  remoteOnly: string;
-  /** '' | numeric string — logistics minimum salary (#86). */
-  minSalary: string;
-  /** '' | ISO country code — logistics country filter (#86). */
-  country: string;
+export interface JobsUrlState extends JobsFilterState {
   sort: string;
   order: JobsUrlOrder;
   targetId: string | undefined;
@@ -54,7 +39,7 @@ interface JobsUrlState {
 
 /** Patch shape: pass only the keys you want to change. ``null`` clears
  *  the key. Omitted keys are left untouched. */
-type JobsUrlPatch = Partial<{
+export type JobsUrlPatch = Partial<{
   [K in keyof JobsUrlState]: JobsUrlState[K] | null;
 }>;
 
@@ -92,18 +77,14 @@ export function useJobsUrlState({
   paramsRef.current = searchParams;
 
   const state = useMemo<JobsUrlState>(() => {
-    const target = searchParams.get(KEYS.target);
+    const target = searchParams.get(NAV_KEYS.target);
+    const filters = Object.fromEntries(
+      JOBS_FILTER_FIELDS.map(f => [f.field, searchParams.get(f.urlKey) ?? ''])
+    ) as Record<JobsFilterField, string>;
     return {
-      search: searchParams.get(KEYS.search) ?? '',
-      status: searchParams.get(KEYS.status) ?? '',
-      minScore: searchParams.get(KEYS.minScore) ?? '',
-      excludeLocations: searchParams.get(KEYS.excludeLocations) ?? '',
-      onlyLocations: searchParams.get(KEYS.onlyLocations) ?? '',
-      remoteOnly: searchParams.get(KEYS.remoteOnly) ?? '',
-      minSalary: searchParams.get(KEYS.minSalary) ?? '',
-      country: searchParams.get(KEYS.country) ?? '',
-      sort: searchParams.get(KEYS.sort) ?? defaultSort,
-      order: parseOrder(searchParams.get(KEYS.order)) ?? defaultOrder,
+      ...filters,
+      sort: searchParams.get(NAV_KEYS.sort) ?? defaultSort,
+      order: parseOrder(searchParams.get(NAV_KEYS.order)) ?? defaultOrder,
       targetId: target ?? defaultTargetId ?? undefined,
     };
   }, [searchParams, defaultSort, defaultOrder, defaultTargetId]);
@@ -118,19 +99,12 @@ export function useJobsUrlState({
           next.set(key, value);
         }
       };
-      if ('search' in patch) apply(KEYS.search, patch.search);
-      if ('status' in patch) apply(KEYS.status, patch.status);
-      if ('minScore' in patch) apply(KEYS.minScore, patch.minScore);
-      if ('excludeLocations' in patch)
-        apply(KEYS.excludeLocations, patch.excludeLocations);
-      if ('onlyLocations' in patch)
-        apply(KEYS.onlyLocations, patch.onlyLocations);
-      if ('remoteOnly' in patch) apply(KEYS.remoteOnly, patch.remoteOnly);
-      if ('minSalary' in patch) apply(KEYS.minSalary, patch.minSalary);
-      if ('country' in patch) apply(KEYS.country, patch.country);
-      if ('sort' in patch) apply(KEYS.sort, patch.sort);
-      if ('order' in patch) apply(KEYS.order, patch.order);
-      if ('targetId' in patch) apply(KEYS.target, patch.targetId);
+      for (const f of JOBS_FILTER_FIELDS) {
+        if (f.field in patch) apply(f.urlKey, patch[f.field]);
+      }
+      if ('sort' in patch) apply(NAV_KEYS.sort, patch.sort);
+      if ('order' in patch) apply(NAV_KEYS.order, patch.order);
+      if ('targetId' in patch) apply(NAV_KEYS.target, patch.targetId);
 
       const qs = next.toString();
       const url = qs ? `${pathname}?${qs}` : pathname;
