@@ -147,7 +147,7 @@ describe('JobDetailPanel', () => {
     global.fetch = jest.fn().mockImplementation((url: string) => {
       if (typeof url === 'string' && url.includes('/tailor/by-job/')) {
         // ResumeSection fetches the existing tailored doc; 200 with a
-        // record means "Review Resume" link appears.
+        // record means "Review tailored resume" link appears.
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -182,7 +182,7 @@ describe('JobDetailPanel', () => {
       />
     );
     expect(
-      await screen.findByRole('link', { name: /review resume/i })
+      await screen.findByRole('link', { name: /review tailored resume/i })
     ).toHaveAttribute('href', '/jobs/j-1/resume');
   });
 
@@ -245,7 +245,7 @@ describe('JobDetailPanel', () => {
       />
     );
     expect(
-      screen.queryByRole('link', { name: /review resume/i })
+      screen.queryByRole('link', { name: /review tailored resume/i })
     ).not.toBeInTheDocument();
     expect(
       screen.queryByTestId('cover-letter-section-stub')

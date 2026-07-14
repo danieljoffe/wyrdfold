@@ -246,7 +246,10 @@ export default function ProfilePage() {
         if (!res.ok) {
           throw new Error(await extractApiError(res, 'Upload failed'));
         }
-        toast({ variant: 'success', title: 'Resume uploaded and processed' });
+        toast({
+          variant: 'success',
+          title: 'Source file uploaded and processed',
+        });
         await fetchData();
       } catch (err) {
         toast({
@@ -455,7 +458,7 @@ export default function ProfilePage() {
                 ) : (
                   <>
                     <Upload className='size-4' aria-hidden />
-                    <span>Upload Resume</span>
+                    <span>Upload source file</span>
                   </>
                 )}
               </Button>
@@ -608,7 +611,7 @@ export default function ProfilePage() {
               ) : (
                 <>
                   <Upload className='size-4' aria-hidden />
-                  <span>Upload Resume</span>
+                  <span>Upload source file</span>
                 </>
               )}
             </Button>
@@ -618,7 +621,7 @@ export default function ProfilePage() {
               size='sm'
               onClick={handleConsolidate}
               disabled={consolidating || !prose}
-              title='Merge duplicate sections from past resume uploads'
+              title='Merge duplicate sections from past source-file uploads'
             >
               {consolidating ? (
                 <>

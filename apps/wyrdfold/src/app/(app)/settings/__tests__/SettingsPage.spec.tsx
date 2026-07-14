@@ -137,7 +137,7 @@ afterEach(() => {
 describe('SettingsPage', () => {
   it('groups the cards under three tabs, Preferences first', async () => {
     render(<SettingsPage />);
-    expect(await screen.findByText(/resume style/i)).toBeInTheDocument();
+    expect(await screen.findByText(/export style/i)).toBeInTheDocument();
 
     for (const name of ['Preferences', 'Notifications', 'Account']) {
       expect(screen.getByRole('tab', { name })).toBeInTheDocument();
@@ -151,7 +151,7 @@ describe('SettingsPage', () => {
   it('Notifications tab shows both channels and writes ?tab= to the URL', async () => {
     const user = userEvent.setup();
     render(<SettingsPage />);
-    await screen.findByText(/resume style/i);
+    await screen.findByText(/export style/i);
 
     await user.click(screen.getByRole('tab', { name: 'Notifications' }));
 
@@ -174,7 +174,7 @@ describe('SettingsPage', () => {
 
     expect(await screen.findByTestId('billing-card')).toBeInTheDocument();
     expect(screen.getByTestId('delete-account-card')).toBeInTheDocument();
-    expect(screen.queryByText(/resume style/i)).toBeNull();
+    expect(screen.queryByText(/export style/i)).toBeNull();
   });
 
   it('SMS card has no phone input — the Profile record is displayed instead', async () => {
@@ -235,9 +235,9 @@ describe('SettingsPage', () => {
     ).toHaveAttribute('href', '/profile');
   });
 
-  it('renders the resume style card with the saved preset/accent and a preview', async () => {
+  it('renders the export style card with the saved preset/accent and a preview', async () => {
     render(<SettingsPage />);
-    expect(await screen.findByText(/resume style/i)).toBeInTheDocument();
+    expect(await screen.findByText(/export style/i)).toBeInTheDocument();
     const presetSelect = screen.getByLabelText(/^Style$/i) as HTMLSelectElement;
     const accentSelect = screen.getByLabelText(
       /accent color/i
@@ -245,7 +245,7 @@ describe('SettingsPage', () => {
     expect(presetSelect.value).toBe('modern');
     expect(accentSelect.value).toBe('slate');
     expect(
-      screen.getByRole('img', { name: /resume style preview/i })
+      screen.getByRole('img', { name: /export style preview/i })
     ).toBeInTheDocument();
   });
 
