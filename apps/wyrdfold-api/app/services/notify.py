@@ -61,17 +61,23 @@ async def send_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str
     if not profiles:
         return 0
 
-    job_ids = [j["id"] for j in new_job_rows if isinstance(j.get("id"), str)]
+    alertable_rows = [j for j in new_job_rows if _alertable(j)]
+    job_ids = [j["id"] for j in alertable_rows if isinstance(j.get("id"), str)]
     scores_by_job = await _load_scores_by_job(supabase, job_ids)
     targets_by_user = await _active_targets_by_user(
         supabase, [p["user_id"] for p in profiles if p.get("user_id")]
     )
+    families = await _families_by_target(
+        supabase,
+        list({t for pairs in scores_by_job.values() for t, _ in pairs}),
+    )
 
     sent = 0
-    for job in new_job_rows:
+    for job in alertable_rows:
         job_id = job.get("id")
         if not isinstance(job_id, str):
             continue
+        job_family = job.get("role_family")
         for profile in profiles:
             user_targets = targets_by_user.get(profile.get("user_id") or "", {})
             score = _qualifying_score(
@@ -80,12 +86,51 @@ async def send_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str
                 int(profile.get("job_score_threshold", 100)),
                 scores_by_job,
                 "job_score_threshold",
+                job_role_family=job_family if isinstance(job_family, str) else None,
+                families_by_target=families,
             )
             if score is None:
                 continue
             if await _try_send_one(supabase, profile, job, score):
                 sent += 1
     return sent
+
+
+async def _families_by_target(
+    supabase: Client, target_ids: list[str]
+) -> dict[str, str | None]:
+    """``target_id -> role_family`` for the family gate (#282). NULL family
+    (unlabeled target) is kept — the gate treats it as match-anything."""
+    if not target_ids:
+        return {}
+    resp = await asyncio.to_thread(
+        lambda: (
+            supabase.table("targets")
+            .select("id, role_family")
+            .in_("id", target_ids)
+            .execute()
+        )
+    )
+    out: dict[str, str | None] = {}
+    for row in cast(list[dict[str, Any]], resp.data or []):
+        tid = row.get("id")
+        if isinstance(tid, str):
+            fam = row.get("role_family")
+            out[tid] = fam if isinstance(fam, str) else None
+    return out
+
+
+def _alertable(job: dict[str, Any]) -> bool:
+    """Whether a job may be pushed to a user at all (#282).
+
+    Mirrors the display layer's gates: archived jobs and confirmed non-US
+    jobs are hidden from every list, so alerting on them would push what
+    the product deliberately hides. NULL ``is_us`` (not yet tagged at
+    alert time) keeps the benefit of the doubt, same as the list views.
+    """
+    if job.get("archived_at") is not None:
+        return False
+    return job.get("is_us") is not False
 
 
 async def _load_scores_by_job(
@@ -154,6 +199,8 @@ def _qualifying_score(
     profile_default: int,
     scores_by_job: dict[str, list[tuple[str, int]]],
     threshold_key: str,
+    job_role_family: str | None = None,
+    families_by_target: dict[str, str | None] | None = None,
 ) -> int | None:
     """The score to alert on for this (user, job), or ``None`` to not alert.
 
@@ -175,6 +222,13 @@ def _qualifying_score(
         overrides = user_targets.get(target_id)
         if overrides is None:
             continue  # not one of this user's active targets
+        # Off-family pairs never qualify (#282) — same STRICT+keep-null
+        # semantics as the list views' _gate_off_family: a NULL on either
+        # side keeps the pair (untagged jobs / unlabeled targets pass).
+        if job_role_family is not None and families_by_target is not None:
+            target_family = families_by_target.get(target_id)
+            if target_family is not None and target_family != job_role_family:
+                continue
         override = overrides.get(threshold_key)
         effective = profile_default if override is None else override
         if score >= effective and (best is None or score > best):
@@ -369,17 +423,23 @@ async def send_sms_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict
     if not sms_profiles:
         return 0
 
-    job_ids = [j["id"] for j in new_job_rows if isinstance(j.get("id"), str)]
+    alertable_rows = [j for j in new_job_rows if _alertable(j)]
+    job_ids = [j["id"] for j in alertable_rows if isinstance(j.get("id"), str)]
     scores_by_job = await _load_scores_by_job(supabase, job_ids)
     targets_by_user = await _active_targets_by_user(
         supabase, [p["user_id"] for p in sms_profiles if p.get("user_id")]
     )
+    families = await _families_by_target(
+        supabase,
+        list({t for pairs in scores_by_job.values() for t, _ in pairs}),
+    )
 
     sent = 0
-    for job in new_job_rows:
+    for job in alertable_rows:
         job_id = job.get("id")
         if not isinstance(job_id, str):
             continue
+        job_family = job.get("role_family")
         for profile in sms_profiles:
             user_targets = targets_by_user.get(profile.get("user_id") or "", {})
             score = _qualifying_score(
@@ -388,6 +448,8 @@ async def send_sms_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict
                 int(profile.get("sms_score_threshold", 100)),
                 scores_by_job,
                 "sms_score_threshold",
+                job_role_family=job_family if isinstance(job_family, str) else None,
+                families_by_target=families,
             )
             if score is None:
                 continue

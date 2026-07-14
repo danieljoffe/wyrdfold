@@ -73,6 +73,7 @@ def _build_supabase_mock(
     claim_response: list[dict] | None = None,
     scores_rows: list[dict] | None = None,
     user_targets_rows: list[dict] | None = None,
+    target_family_rows: list[dict] | None = None,
 ) -> MagicMock:
     """Mock answering the email fan-out's reads:
     - user_profiles  → profiles
@@ -102,6 +103,10 @@ def _build_supabase_mock(
             return _Chain(_ExecuteStub(scores))
         if name == "user_targets":
             return _Chain(_ExecuteStub(targets))
+        if name == "targets":
+            # Family gate lookup (#282): default = no labeled families,
+            # which the STRICT+keep-null gate treats as match-anything.
+            return _Chain(_ExecuteStub(target_family_rows or []))
         if name == "notifications_sent":
             return _notif_table()
         raise AssertionError(f"Unexpected table: {name}")
@@ -117,6 +122,7 @@ def _build_sms_supabase_mock(
     claim_response: list[dict] | None = None,
     scores_rows: list[dict] | None = None,
     user_targets_rows: list[dict] | None = None,
+    target_family_rows: list[dict] | None = None,
 ) -> MagicMock:
     """SMS variant — notifications_sent flow is count → claim → update."""
     profiles = _prep_profiles(profiles)
@@ -146,6 +152,10 @@ def _build_sms_supabase_mock(
             return _Chain(_ExecuteStub(scores))
         if name == "user_targets":
             return _Chain(_ExecuteStub(targets))
+        if name == "targets":
+            # Family gate lookup (#282): default = no labeled families,
+            # which the STRICT+keep-null gate treats as match-anything.
+            return _Chain(_ExecuteStub(target_family_rows or []))
         if name == "notifications_sent":
             return _notif_table()
         raise AssertionError(f"Unexpected table: {name}")
@@ -611,3 +621,126 @@ async def test_sms_per_target_threshold_below_profile_alerts(
 
     assert sent == 1
     mock_send.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# #282: alert candidates honour the display layer's gates
+# ---------------------------------------------------------------------------
+
+
+def _gated_job(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "id": "j1",
+        "score": 85,
+        "title": "Senior Frontend",
+        "company_name": "Acme",
+        "location": "Remote",
+        "absolute_url": "https://acme.com/jobs/1",
+    }
+    base.update(overrides)
+    return base
+
+
+def _happy_http(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"ok": True, "resendId": "resend-abc"}
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=response)
+    monkeypatch.setattr(notify, "get_http_client", lambda: http_client)
+    return http_client
+
+
+@pytest.mark.asyncio
+async def test_archived_job_never_alerts(monkeypatch: pytest.MonkeyPatch) -> None:
+    jobs = [_gated_job(archived_at="2026-07-14T00:00:00Z")]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+    )
+    http_client = _happy_http(monkeypatch)
+
+    assert await notify.send_alerts_for_new_jobs(supabase, jobs) == 0
+    http_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_non_us_job_never_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jobs = [_gated_job(is_us=False)]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+    )
+    http_client = _happy_http(monkeypatch)
+
+    assert await notify.send_alerts_for_new_jobs(supabase, jobs) == 0
+    http_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_untagged_is_us_keeps_benefit_of_doubt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NULL is_us (tagger hasn't reached the job by alert time) must still
+    # alert — same keep-null semantics as the list views.
+    jobs = [_gated_job(is_us=None)]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+    )
+    http_client = _happy_http(monkeypatch)
+
+    assert await notify.send_alerts_for_new_jobs(supabase, jobs) == 1
+    http_client.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_off_family_pair_never_qualifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Job tagged data_ml, the user's only matching target labeled
+    # engineering → the pair is off-family and must not alert, exactly as
+    # the list view hides it.
+    jobs = [_gated_job(role_family="data_ml")]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        target_family_rows=[{"id": "t-p1", "role_family": "engineering"}],
+    )
+    http_client = _happy_http(monkeypatch)
+
+    assert await notify.send_alerts_for_new_jobs(supabase, jobs) == 0
+    http_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_family_match_and_null_family_both_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Matching family alerts; an unlabeled target (NULL family) also keeps
+    # the pair (STRICT+keep-null).
+    jobs = [_gated_job(role_family="engineering")]
+    supabase = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs,
+        claim_response=[{"id": "sent-1"}],
+        target_family_rows=[{"id": "t-p1", "role_family": "engineering"}],
+    )
+    _happy_http(monkeypatch)
+    assert await notify.send_alerts_for_new_jobs(supabase, jobs) == 1
+
+    jobs2 = [_gated_job(role_family="engineering")]
+    supabase2 = _build_supabase_mock(
+        profiles=[{"id": "p1", "email": "me@test", "job_score_threshold": 70}],
+        jobs=jobs2,
+        claim_response=[{"id": "sent-1"}],
+        target_family_rows=[{"id": "t-p1", "role_family": None}],
+    )
+    _happy_http(monkeypatch)
+    assert await notify.send_alerts_for_new_jobs(supabase2, jobs2) == 1
