@@ -3,11 +3,17 @@
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
-from app.scheduler import build_scheduler, start_scheduler_if_enabled
+from app.config import settings
+from app.scheduler import (
+    _anchor_discovery_schedule,
+    build_scheduler,
+    start_scheduler_if_enabled,
+)
 from app.services.source_discovery import run_discovery_all_targets_locked
 
 
@@ -186,11 +192,12 @@ async def test_start_scheduler_registers_only_discovery_when_only_discovery_enab
     assert scheduler is not None
     try:
         assert scheduler.running is True
-        jobs = scheduler.get_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].id == "discovery_run"
+        jobs = {j.id: j for j in scheduler.get_jobs()}
+        # discovery_run (the 24h interval) + discovery_catchup (the one-shot
+        # boot anchor that stops near-daily deploys from starving the tick).
+        assert set(jobs) == {"discovery_run", "discovery_catchup"}
         # The registered callable is the bulk, all-targets, advisory-locked body.
-        assert jobs[0].func is run_discovery_all_targets_locked
+        assert jobs["discovery_run"].func is run_discovery_all_targets_locked
     finally:
         scheduler.shutdown(wait=False)
 
@@ -235,6 +242,7 @@ async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
             "url_health_check",
             "retention_purge",
             "discovery_run",
+            "discovery_catchup",
             "recency_refresh",
         }
     finally:
@@ -491,3 +499,127 @@ async def test_run_scheduled_poll_watchdog_disabled_when_zero(
         await _run_scheduled_poll()
 
     mock_poll.assert_awaited_once()
+
+
+# ---- discovery catch-up (anchor to last persisted run, task #33) ------------
+#
+# IntervalTrigger measures from process start; near-daily deploys meant the
+# 24h discovery tick never elapsed (one run in six enabled days, 2026-07-13).
+# The catch-up must: run discovery when the last persisted run is overdue or
+# absent, anchor the next interval fire to last+tick when fresh, and never
+# raise into the scheduler.
+
+
+class _RecordingScheduler:
+    def __init__(self) -> None:
+        self.modified: list[tuple[str, object]] = []
+
+    def modify_job(self, job_id: str, **changes: object) -> None:
+        self.modified.append((job_id, changes["next_run_time"]))
+
+
+def _patch_discovery_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    last_run: "datetime | None | Exception",
+) -> list[int]:
+    """Wire the catch-up's deps: a present pool client, a scripted
+    ``_newest_discovery_at``, and a spy on the discovery run body."""
+    runs: list[int] = []
+
+    monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: object())
+
+    async def fake_newest(_client: object) -> "datetime | None":
+        if isinstance(last_run, Exception):
+            raise last_run
+        return last_run
+
+    monkeypatch.setattr("app.scheduler._newest_discovery_at", fake_newest)
+
+    async def fake_run() -> None:
+        runs.append(1)
+
+    monkeypatch.setattr(
+        "app.scheduler.run_discovery_all_targets_locked", fake_run
+    )
+    return runs
+
+
+_CATCHUP_NOW = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
+
+
+class TestDiscoveryCatchup:
+    @pytest.mark.asyncio
+    async def test_never_ran_runs_now(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        runs = _patch_discovery_deps(monkeypatch, last_run=None)
+        sched = _RecordingScheduler()
+
+        await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # type: ignore[arg-type]
+
+        assert runs == [1]
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_overdue_runs_now(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "discovery_tick_hours", 24)
+        runs = _patch_discovery_deps(
+            monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=25)
+        )
+        sched = _RecordingScheduler()
+
+        await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # type: ignore[arg-type]
+
+        assert runs == [1]
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_fresh_anchors_next_fire_instead_of_running(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "discovery_tick_hours", 24)
+        last = _CATCHUP_NOW - timedelta(hours=2)
+        runs = _patch_discovery_deps(monkeypatch, last_run=last)
+        sched = _RecordingScheduler()
+
+        await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # type: ignore[arg-type]
+
+        assert runs == []
+        assert sched.modified == [("discovery_run", last + timedelta(hours=24))]
+
+    @pytest.mark.asyncio
+    async def test_db_error_is_fail_soft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runs = _patch_discovery_deps(monkeypatch, last_run=RuntimeError("db down"))
+        sched = _RecordingScheduler()
+
+        await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # must not raise
+
+        assert runs == []
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_missing_pool_client_skips_quietly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+        sched = _RecordingScheduler()
+
+        await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # must not raise
+
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_modify_job_error_is_fail_soft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "discovery_tick_hours", 24)
+        _patch_discovery_deps(
+            monkeypatch, last_run=_CATCHUP_NOW - timedelta(hours=2)
+        )
+
+        class _BoomScheduler:
+            def modify_job(self, job_id: str, **changes: object) -> None:
+                raise RuntimeError("job store closed")
+
+        await _anchor_discovery_schedule(_BoomScheduler(), now=_CATCHUP_NOW)  # type: ignore[arg-type]
