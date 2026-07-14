@@ -237,6 +237,7 @@ def check_user_budget(
     hourly_limit_usd: float,
     monthly_limit_usd: float = 0.0,
     monthly_excluded_purposes: tuple[str, ...] | None = None,
+    rail_excluded_purposes: tuple[str, ...] | None = None,
 ) -> None:
     """Raise 429 if the user has hit a rolling hourly/daily/monthly cap.
 
@@ -245,16 +246,32 @@ def check_user_budget(
     monthly allowance is the overall ceiling.
 
     ``monthly_excluded_purposes`` scopes the MONTHLY sum to billable
-    (interactive) spend for managed tiers (Phase 3); the hourly/daily
-    runaway rails always count everything — they exist to catch loops,
-    not to meter fairness.
+    (interactive) spend for managed tiers (Phase 3).
+
+    ``rail_excluded_purposes`` scopes the hourly/daily runaway rails the
+    same way. The rails exist to catch loops — but the ledger attributes
+    background catalog work (triage, grading, tagging) to the target's
+    payer, so an all-purposes rail reliably locked the OWNER out of
+    interactive features once the day's pipeline ran (2026-07-13:
+    suggest-lateral 429'd at $5.12/$5 daily with almost none of it
+    interactive). Interactive loops still trip the rails; background
+    runaways are the GLOBAL daily budget's jurisdiction, where they are
+    already caught.
     """
     now = datetime.now(UTC)
 
+    def _window_spend(since: datetime) -> float:
+        if rail_excluded_purposes:
+            return cost_log.total_billable_spend(
+                supabase,
+                user_id=user_id,
+                since=since,
+                excluded_purposes=rail_excluded_purposes,
+            )
+        return cost_log.total_spend(supabase, user_id=user_id, since=since)
+
     if hourly_limit_usd > 0:
-        spent_hour = cost_log.total_spend(
-            supabase, user_id=user_id, since=now - timedelta(hours=1)
-        )
+        spent_hour = _window_spend(now - timedelta(hours=1))
         if spent_hour >= hourly_limit_usd:
             _raise_budget_429(
                 "hourly", hourly_limit_usd, spent_hour, user_id=user_id
@@ -267,9 +284,7 @@ def check_user_budget(
         )
 
     if daily_limit_usd > 0:
-        spent_day = cost_log.total_spend(
-            supabase, user_id=user_id, since=now - timedelta(hours=24)
-        )
+        spent_day = _window_spend(now - timedelta(hours=24))
         if spent_day >= daily_limit_usd:
             _raise_budget_429(
                 "daily", daily_limit_usd, spent_day, user_id=user_id
