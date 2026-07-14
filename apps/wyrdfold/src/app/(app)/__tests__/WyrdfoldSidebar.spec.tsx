@@ -48,11 +48,10 @@ describe('WyrdfoldSidebar', () => {
     // Each link appears in both desktop nav and mobile bar/sheet — query all
     // and just assert presence + first href.
     const expected = [
-      ['Dashboard', '/dashboard'],
+      ['Home', '/dashboard'],
       ['Jobs', '/jobs'],
       ['Targets', '/targets'],
       ['Profile', '/profile'],
-      ['Insights', '/insights'],
       ['Settings', '/settings'],
     ] as const;
     for (const [label, href] of expected) {
@@ -67,7 +66,7 @@ describe('WyrdfoldSidebar', () => {
   it('marks the active nav item with aria-current="page"', () => {
     render(<WyrdfoldSidebar />);
     const dashboardLinks = screen.getAllByRole('link', {
-      name: /^dashboard$/i,
+      name: /^home$/i,
     });
     expect(dashboardLinks[0]).toHaveAttribute('aria-current', 'page');
   });

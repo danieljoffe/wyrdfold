@@ -9,7 +9,6 @@ import {
   Briefcase,
   Target,
   User,
-  BarChart3,
   Settings,
   MoreHorizontal,
   LogOut,
@@ -32,15 +31,16 @@ type NavItem = { id: string; label: string; href: string; lucide: Icon };
 
 const NAV_ITEMS: NavItem[] = [
   {
+    // Home = daily launcher + Trends (the former Insights page rides as
+    // its ?view=trends section — UX/IA Fork A).
     id: 'dashboard',
-    label: 'Dashboard',
+    label: 'Home',
     href: '/dashboard',
     lucide: LayoutDashboard,
   },
   { id: 'jobs', label: 'Jobs', href: '/jobs', lucide: Briefcase },
   { id: 'targets', label: 'Targets', href: '/targets', lucide: Target },
   { id: 'profile', label: 'Profile', href: '/profile', lucide: User },
-  { id: 'insights', label: 'Insights', href: '/insights', lucide: BarChart3 },
   { id: 'settings', label: 'Settings', href: '/settings', lucide: Settings },
 ];
 

@@ -107,15 +107,6 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
   if (!hasProfile) {
     return (
       <div className='flex flex-col gap-6'>
-        <div>
-          <Heading variant='hero' as='h1'>
-            Dashboard
-          </Heading>
-          <Text variant='body' className='mt-1 text-text-secondary'>
-            Your job search at a glance
-          </Text>
-        </div>
-
         <Card>
           <CardContent className='flex flex-col items-center gap-4 py-12'>
             <Sparkles className='size-12 text-text-tertiary' aria-hidden />
@@ -151,15 +142,6 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
   if (!hasActiveTargets) {
     return (
       <div className='flex flex-col gap-6'>
-        <div>
-          <Heading variant='hero' as='h1'>
-            Dashboard
-          </Heading>
-          <Text variant='body' className='mt-1 text-text-secondary'>
-            Your job search at a glance
-          </Text>
-        </div>
-
         <Card>
           <CardContent className='flex flex-col items-center gap-4 py-12'>
             <Target className='size-12 text-text-tertiary' aria-hidden />
@@ -186,15 +168,6 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
 
   return (
     <div className='flex flex-col gap-6'>
-      <div>
-        <Heading variant='hero' as='h1'>
-          Dashboard
-        </Heading>
-        <Text variant='body' className='mt-1 text-text-secondary'>
-          Your job search at a glance
-        </Text>
-      </div>
-
       {/* Pipeline stats — 7 statuses (new → saved → drafts → ready →
           applied → interviewing → offer). Reflow: 2 cols on mobile,
           3 on sm, 4 on md, 7 on xl so the row stays readable across

@@ -154,21 +154,9 @@ export function buildInsightsCsv(input: {
       ]),
     });
 
-    sections.push({
-      title: 'LLM cost over time',
-      headers: ['Week', 'Total cost (USD)', 'Resume count'],
-      rows: s.cost_over_time.map(b => [
-        b.week_start,
-        b.total_cost,
-        b.resume_count,
-      ]),
-    });
-
-    sections.push({
-      title: 'LLM cost by purpose',
-      headers: ['Purpose', 'Total cost (USD)', 'Call count'],
-      rows: s.cost_by_purpose.map(c => [c.purpose, c.total_cost, c.call_count]),
-    });
+    // LLM cost sections intentionally absent: operator telemetry, dropped
+    // from the seeker-facing Trends view (UX/IA report) — the CSV mirrors
+    // what the view shows.
   }
 
   return sections.map(renderSection).join('\n\n');
