@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import {
   Card,
   CardContent,
@@ -13,6 +15,7 @@ import { Select } from '@danieljoffe/shared-ui/Select';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Switch } from '@danieljoffe/shared-ui/Switch';
+import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -34,6 +37,27 @@ import {
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
+/**
+ * The former 10-card stack is grouped by scope (UX/IA §2.2-2.3):
+ * ``Preferences`` (how output + the list behave) · ``Notifications``
+ * (alert channels) · ``Account`` (keys, plan, data, danger zone).
+ * ``?tab=`` keeps the choice shareable and sticky across reloads
+ * (``router.replace`` — tab flips shouldn't pile up history entries).
+ *
+ * Contact is a single record: ``user_profiles.phone_number`` / ``email``
+ * are edited on /profile (resume header) and only *displayed* here as the
+ * alert destinations — Settings no longer carries a second phone writer
+ * that could silently overwrite the Profile one.
+ */
+const TAB_IDS = ['preferences', 'notifications', 'account'] as const;
+type SettingsTabId = (typeof TAB_IDS)[number];
+
+function parseTab(raw: string | null): SettingsTabId {
+  return (TAB_IDS as readonly string[]).includes(raw ?? '')
+    ? (raw as SettingsTabId)
+    : 'preferences';
+}
+
 interface NotificationPreferences {
   job_notifications_enabled: boolean;
   job_score_threshold: number;
@@ -47,8 +71,6 @@ interface NotificationPreferences {
   sms_available: boolean;
 }
 
-// Identity fields moved to apps/wyrdfold/src/app/(app)/profile/ProfileIdentityCard.tsx.
-
 type Section = 'list' | 'email' | 'sms';
 
 function emailSig(enabled: boolean, threshold: number): string {
@@ -61,14 +83,12 @@ function emailSig(enabled: boolean, threshold: number): string {
 function smsSig(
   enabled: boolean,
   threshold: number,
-  dailyLimit: number,
-  phone: string | null
+  dailyLimit: number
 ): string {
   return JSON.stringify({
     sms_notifications_enabled: enabled,
     sms_score_threshold: threshold,
     sms_daily_limit: dailyLimit,
-    phone_number: phone,
   });
 }
 
@@ -114,13 +134,36 @@ export default function SettingsPage() {
   const [prefs, setPrefs] = useState<NotificationPreferences | null>(null);
   const { toast } = useToast();
 
+  const pathname = usePathname();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  // The shared Tabs component is uncontrolled; remember what the URL said
+  // on first render so the two never disagree about the initial tab. No
+  // activeTab state — nothing here renders differently by tab (unlike
+  // TargetDetail's lazy JD fetch); the URL is the only consumer.
+  const initialTabRef = useRef(parseTab(searchParams.get('tab')));
+
+  const handleTabChange = useCallback(
+    (tabId: string) => {
+      const tab = parseTab(tabId);
+      const params = new URLSearchParams(searchParams.toString());
+      if (tab === 'preferences') {
+        params.delete('tab');
+      } else {
+        params.set('tab', tab);
+      }
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [pathname, router, searchParams]
+  );
+
   // Form state
   const [emailEnabled, setEmailEnabled] = useState(false);
   const [emailThreshold, setEmailThreshold] = useState('100');
   const [smsEnabled, setSmsEnabled] = useState(false);
   const [smsThreshold, setSmsThreshold] = useState('100');
   const [smsDailyLimit, setSmsDailyLimit] = useState('5');
-  const [phoneNumber, setPhoneNumber] = useState('');
   const [listMinScoreRaw, setListMinScoreRaw] = useState('');
   const [savingStyle, setSavingStyle] = useState(false);
   const [stylePreset, setStylePreset] = useState<ResumeStylePreset>(
@@ -155,7 +198,6 @@ export default function SettingsPage() {
         setSmsEnabled(data.sms_notifications_enabled);
         setSmsThreshold(String(data.sms_score_threshold));
         setSmsDailyLimit(String(data.sms_daily_limit));
-        setPhoneNumber(data.phone_number ?? '');
         setListMinScoreRaw(
           data.list_min_score !== null && data.list_min_score !== undefined
             ? String(data.list_min_score)
@@ -168,8 +210,7 @@ export default function SettingsPage() {
         lastSmsSigRef.current = smsSig(
           data.sms_notifications_enabled,
           data.sms_score_threshold,
-          data.sms_daily_limit,
-          data.phone_number ?? null
+          data.sms_daily_limit
         );
         lastListSigRef.current = listSig(data.list_min_score ?? null);
       }
@@ -276,24 +317,19 @@ export default function SettingsPage() {
   }, [emailEnabled, emailThreshold, toast]);
 
   const handleSaveSms = useCallback(async () => {
-    const trimmedPhone = phoneNumber.trim();
     const threshold = parseInt(smsThreshold, 10) || 100;
     const dailyLimit = parseInt(smsDailyLimit, 10) || 5;
-    const sig = smsSig(smsEnabled, threshold, dailyLimit, trimmedPhone || null);
+    const sig = smsSig(smsEnabled, threshold, dailyLimit);
     setSavingSection('sms');
     try {
-      const body: Record<string, unknown> = {
-        sms_notifications_enabled: smsEnabled,
-        sms_score_threshold: threshold,
-        sms_daily_limit: dailyLimit,
-      };
-      if (trimmedPhone) {
-        body.phone_number = trimmedPhone;
-      }
       const res = await fetch('/api/profile/notifications', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          sms_notifications_enabled: smsEnabled,
+          sms_score_threshold: threshold,
+          sms_daily_limit: dailyLimit,
+        }),
       });
       if (!res.ok) {
         const message = await extractApiError(
@@ -309,12 +345,10 @@ export default function SettingsPage() {
       setSmsEnabled(data.sms_notifications_enabled);
       setSmsThreshold(String(data.sms_score_threshold));
       setSmsDailyLimit(String(data.sms_daily_limit));
-      setPhoneNumber(data.phone_number ?? '');
       lastSmsSigRef.current = smsSig(
         data.sms_notifications_enabled,
         data.sms_score_threshold,
-        data.sms_daily_limit,
-        data.phone_number ?? null
+        data.sms_daily_limit
       );
       lastFailedSmsSigRef.current = null;
       toast({ variant: 'success', title: 'SMS settings saved' });
@@ -324,7 +358,7 @@ export default function SettingsPage() {
     } finally {
       setSavingSection(null);
     }
-  }, [smsEnabled, smsThreshold, smsDailyLimit, phoneNumber, toast]);
+  }, [smsEnabled, smsThreshold, smsDailyLimit, toast]);
 
   const handleSaveStyle = useCallback(async () => {
     const sig = styleSig(stylePreset, styleAccent);
@@ -338,7 +372,7 @@ export default function SettingsPage() {
       if (!res.ok) {
         const message = await extractApiError(
           res,
-          'Failed to save resume style'
+          'Failed to save export style'
         );
         toast({ variant: 'error', title: message });
         lastFailedStyleSigRef.current = sig;
@@ -349,9 +383,9 @@ export default function SettingsPage() {
       setStyleAccent(data.accent);
       lastStyleSigRef.current = styleSig(data.preset, data.accent);
       lastFailedStyleSigRef.current = null;
-      toast({ variant: 'success', title: 'Resume style saved' });
+      toast({ variant: 'success', title: 'Export style saved' });
     } catch {
-      toast({ variant: 'error', title: 'Failed to save resume style' });
+      toast({ variant: 'error', title: 'Failed to save export style' });
       lastFailedStyleSigRef.current = sig;
     } finally {
       setSavingStyle(false);
@@ -359,6 +393,8 @@ export default function SettingsPage() {
   }, [stylePreset, styleAccent, toast]);
 
   // -- Autosave effects -------------------------------------------------------
+  // These live at page level (not per tab panel), so an edit followed by a
+  // tab switch still saves — the debounce survives the panel unmounting.
 
   useEffect(() => {
     if (lastListSigRef.current === null) return;
@@ -390,8 +426,7 @@ export default function SettingsPage() {
     const sig = smsSig(
       smsEnabled,
       parseInt(smsThreshold, 10) || 100,
-      parseInt(smsDailyLimit, 10) || 5,
-      phoneNumber.trim() || null
+      parseInt(smsDailyLimit, 10) || 5
     );
     if (sig === lastSmsSigRef.current) return;
     if (sig === lastFailedSmsSigRef.current) return;
@@ -399,14 +434,7 @@ export default function SettingsPage() {
       handleSaveSms();
     }, AUTOSAVE_DEBOUNCE_MS);
     return () => clearTimeout(handle);
-  }, [
-    smsEnabled,
-    smsThreshold,
-    smsDailyLimit,
-    phoneNumber,
-    savingSection,
-    handleSaveSms,
-  ]);
+  }, [smsEnabled, smsThreshold, smsDailyLimit, savingSection, handleSaveSms]);
 
   useEffect(() => {
     if (lastStyleSigRef.current === null) return;
@@ -422,6 +450,7 @@ export default function SettingsPage() {
 
   const emailAvailable = prefs?.email_available ?? false;
   const smsAvailable = prefs?.sms_available ?? false;
+  const phoneOnFile = prefs?.phone_number ?? null;
 
   if (loading) {
     return (
@@ -436,6 +465,231 @@ export default function SettingsPage() {
     );
   }
 
+  const tabs: Tab[] = [
+    {
+      id: 'preferences',
+      label: 'Preferences',
+      content: (
+        <div className='flex flex-col gap-6 pt-4'>
+          {/* Export style */}
+          <Card>
+            <CardHeader>
+              <div className='flex items-center gap-3'>
+                <CardTitle>Export style</CardTitle>
+                <SavingIndicator active={savingStyle} />
+              </div>
+            </CardHeader>
+            <CardContent className='flex flex-col gap-4'>
+              <Text variant='caption' className='text-text-secondary'>
+                Pick how your tailored resume and cover-letter .docx exports
+                look. Applies to every new download — no regeneration needed.
+              </Text>
+              <div className='grid gap-4 sm:grid-cols-2'>
+                <Select
+                  label='Style'
+                  value={stylePreset}
+                  onChange={e =>
+                    setStylePreset(e.target.value as ResumeStylePreset)
+                  }
+                  options={PRESET_OPTIONS}
+                />
+                <Select
+                  label='Accent color'
+                  value={styleAccent}
+                  onChange={e =>
+                    setStyleAccent(e.target.value as ResumeStyleAccent)
+                  }
+                  options={ACCENT_OPTIONS}
+                />
+              </div>
+              <ResumeStylePreview preset={stylePreset} accent={styleAccent} />
+            </CardContent>
+          </Card>
+
+          {/* Score threshold (jobs-list default filter) */}
+          <Card>
+            <CardHeader>
+              <div className='flex items-center gap-3'>
+                <CardTitle>Score threshold</CardTitle>
+                <SavingIndicator active={savingSection === 'list'} />
+              </div>
+            </CardHeader>
+            <CardContent className='flex flex-col gap-4'>
+              <Text variant='caption' className='text-text-secondary'>
+                Hide jobs scoring below this value from the list. Leave empty to
+                show everything — your chip filters still work. Independent of
+                email and SMS notification thresholds.
+              </Text>
+              <div className='max-w-xs'>
+                <Input
+                  label='Minimum score'
+                  type='number'
+                  value={listMinScoreRaw}
+                  onChange={e => setListMinScoreRaw(e.target.value)}
+                  min={0}
+                  max={100}
+                  placeholder='No filter'
+                  helperText='0 or empty = show all jobs'
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      ),
+    },
+    {
+      id: 'notifications',
+      label: 'Notifications',
+      content: (
+        <div className='flex flex-col gap-6 pt-4'>
+          {/* Email Notifications */}
+          <Card>
+            <CardHeader>
+              <div className='flex flex-wrap items-center justify-between gap-3'>
+                <div className='flex items-center gap-3'>
+                  <CardTitle>Email Notifications</CardTitle>
+                  <SavingIndicator active={savingSection === 'email'} />
+                </div>
+                <Switch
+                  checked={emailEnabled && emailAvailable}
+                  onChange={setEmailEnabled}
+                  label='Enabled'
+                  disabled={!emailAvailable}
+                />
+              </div>
+            </CardHeader>
+            <CardContent className='flex flex-col gap-4'>
+              <Text variant='caption' className='text-text-secondary'>
+                Get email alerts when new jobs score above your threshold.
+                Powered by Resend.
+              </Text>
+              {!emailAvailable && (
+                <Text variant='meta' className='text-text-tertiary'>
+                  Email notifications are unavailable until the operator
+                  configures the email provider credentials.
+                </Text>
+              )}
+              {emailAvailable && prefs?.email && (
+                <Text variant='meta' className='text-text-tertiary'>
+                  Sending to: {prefs.email} —{' '}
+                  <Link
+                    href='/profile'
+                    className='text-brand-500 hover:underline'
+                  >
+                    managed on your Profile
+                  </Link>
+                </Text>
+              )}
+              <div className='max-w-xs'>
+                <Input
+                  label='Score threshold'
+                  type='number'
+                  value={emailThreshold}
+                  onChange={e => setEmailThreshold(e.target.value)}
+                  min={0}
+                  max={100}
+                  helperText='Minimum job score to trigger an email alert (0-100)'
+                  disabled={!emailEnabled || !emailAvailable}
+                />
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* SMS Notifications — the phone number is the Profile contact
+              record (one writer, /profile); here it is display-only. */}
+          <Card>
+            <CardHeader>
+              <div className='flex flex-wrap items-center justify-between gap-3'>
+                <div className='flex items-center gap-3'>
+                  <CardTitle>SMS Notifications</CardTitle>
+                  <SavingIndicator active={savingSection === 'sms'} />
+                </div>
+                <Switch
+                  checked={smsEnabled && smsAvailable}
+                  onChange={setSmsEnabled}
+                  label='Enabled'
+                  disabled={!smsAvailable}
+                />
+              </div>
+            </CardHeader>
+            <CardContent className='flex flex-col gap-4'>
+              <Text variant='caption' className='text-text-secondary'>
+                Get text messages for high-scoring jobs with a deep link to view
+                and act immediately. Powered by Twilio.
+              </Text>
+              {!smsAvailable && (
+                <Text variant='meta' className='text-text-tertiary'>
+                  SMS notifications are unavailable until the operator
+                  configures Twilio credentials.
+                </Text>
+              )}
+              <Text variant='meta' className='text-text-tertiary'>
+                {phoneOnFile ? (
+                  <>
+                    Texts go to: <span data-sentry-mask>{phoneOnFile}</span> —{' '}
+                    <Link
+                      href='/profile'
+                      className='text-brand-500 hover:underline'
+                    >
+                      managed on your Profile
+                    </Link>
+                  </>
+                ) : (
+                  <>
+                    No phone number on file —{' '}
+                    <Link
+                      href='/profile'
+                      className='text-brand-500 hover:underline'
+                    >
+                      add one on your Profile
+                    </Link>{' '}
+                    to receive texts.
+                  </>
+                )}
+              </Text>
+              <div className='grid gap-4 sm:grid-cols-2'>
+                <Input
+                  label='Score threshold'
+                  type='number'
+                  value={smsThreshold}
+                  onChange={e => setSmsThreshold(e.target.value)}
+                  min={0}
+                  max={100}
+                  helperText='Minimum score for SMS (0-100)'
+                  disabled={!smsEnabled || !smsAvailable}
+                />
+                <Input
+                  label='Daily limit'
+                  type='number'
+                  value={smsDailyLimit}
+                  onChange={e => setSmsDailyLimit(e.target.value)}
+                  min={1}
+                  max={50}
+                  helperText='Max texts per day (1-50)'
+                  disabled={!smsEnabled || !smsAvailable}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      ),
+    },
+    {
+      id: 'account',
+      label: 'Account',
+      content: (
+        <div className='flex flex-col gap-6 pt-4'>
+          <ApiKeysCard />
+          <LlmUsageCard />
+          <BillingCard />
+          <DataExportCard />
+          <OnboardingResetCard />
+          <DeleteAccountCard />
+        </div>
+      ),
+    },
+  ];
+
   return (
     <div className='flex flex-col gap-6'>
       <div>
@@ -443,205 +697,16 @@ export default function SettingsPage() {
           Settings
         </Heading>
         <Text variant='body' className='mt-1 text-text-secondary'>
-          Preferences for downloads, the jobs list, and alerts
+          Preferences, alerts, and account administration
         </Text>
       </div>
 
-      {/* Identity (contact header used on generated resumes + cover letters)
-          lives on /profile now — see ProfileIdentityCard.
-
-          Card order (most-used first):
-          1. Resume style — touched every download
-          2. Score threshold — touched whenever the list feels noisy
-          3. SMS notifications — disabled until Twilio is configured
-          4. Email notifications — disabled until SMTP is configured */}
-
-      {/* Resume style */}
-      <Card>
-        <CardHeader>
-          <div className='flex items-center gap-3'>
-            <CardTitle>Resume style</CardTitle>
-            <SavingIndicator active={savingStyle} />
-          </div>
-        </CardHeader>
-        <CardContent className='flex flex-col gap-4'>
-          <Text variant='caption' className='text-text-secondary'>
-            Pick how your tailored resume and cover-letter .docx exports look.
-            Applies to every new download — no regeneration needed.
-          </Text>
-          <div className='grid gap-4 sm:grid-cols-2'>
-            <Select
-              label='Style'
-              value={stylePreset}
-              onChange={e =>
-                setStylePreset(e.target.value as ResumeStylePreset)
-              }
-              options={PRESET_OPTIONS}
-            />
-            <Select
-              label='Accent color'
-              value={styleAccent}
-              onChange={e =>
-                setStyleAccent(e.target.value as ResumeStyleAccent)
-              }
-              options={ACCENT_OPTIONS}
-            />
-          </div>
-          <ResumeStylePreview preset={stylePreset} accent={styleAccent} />
-        </CardContent>
-      </Card>
-
-      {/* Score threshold (jobs-list default filter) */}
-      <Card>
-        <CardHeader>
-          <div className='flex items-center gap-3'>
-            <CardTitle>Score threshold</CardTitle>
-            <SavingIndicator active={savingSection === 'list'} />
-          </div>
-        </CardHeader>
-        <CardContent className='flex flex-col gap-4'>
-          <Text variant='caption' className='text-text-secondary'>
-            Hide jobs scoring below this value from the list. Leave empty to
-            show everything — your chip filters still work. Independent of email
-            and SMS notification thresholds.
-          </Text>
-          <div className='max-w-xs'>
-            <Input
-              label='Minimum score'
-              type='number'
-              value={listMinScoreRaw}
-              onChange={e => setListMinScoreRaw(e.target.value)}
-              min={0}
-              max={100}
-              placeholder='No filter'
-              helperText='0 or empty = show all jobs'
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* SMS Notifications */}
-      <Card>
-        <CardHeader>
-          <div className='flex flex-wrap items-center justify-between gap-3'>
-            <div className='flex items-center gap-3'>
-              <CardTitle>SMS Notifications</CardTitle>
-              <SavingIndicator active={savingSection === 'sms'} />
-            </div>
-            <Switch
-              checked={smsEnabled && smsAvailable}
-              onChange={setSmsEnabled}
-              label='Enabled'
-              disabled={!smsAvailable}
-            />
-          </div>
-        </CardHeader>
-        <CardContent className='flex flex-col gap-4'>
-          <Text variant='caption' className='text-text-secondary'>
-            Get text messages for high-scoring jobs with a deep link to view and
-            act immediately. Powered by Twilio.
-          </Text>
-          {!smsAvailable && (
-            <Text variant='meta' className='text-text-tertiary'>
-              SMS notifications are unavailable until the operator configures
-              Twilio credentials.
-            </Text>
-          )}
-          <div className='grid gap-4 sm:grid-cols-2 lg:grid-cols-3'>
-            <Input
-              label='Phone number'
-              type='tel'
-              value={phoneNumber}
-              onChange={e => setPhoneNumber(e.target.value)}
-              placeholder='+1 555 555 5555'
-              helperText='Include country code'
-              autoComplete='tel'
-              inputMode='tel'
-              data-sentry-mask
-              disabled={!smsEnabled || !smsAvailable}
-            />
-            <Input
-              label='Score threshold'
-              type='number'
-              value={smsThreshold}
-              onChange={e => setSmsThreshold(e.target.value)}
-              min={0}
-              max={100}
-              helperText='Minimum score for SMS (0-100)'
-              disabled={!smsEnabled || !smsAvailable}
-            />
-            <Input
-              label='Daily limit'
-              type='number'
-              value={smsDailyLimit}
-              onChange={e => setSmsDailyLimit(e.target.value)}
-              min={1}
-              max={50}
-              helperText='Max texts per day (1-50)'
-              disabled={!smsEnabled || !smsAvailable}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Email Notifications */}
-      <Card>
-        <CardHeader>
-          <div className='flex flex-wrap items-center justify-between gap-3'>
-            <div className='flex items-center gap-3'>
-              <CardTitle>Email Notifications</CardTitle>
-              <SavingIndicator active={savingSection === 'email'} />
-            </div>
-            <Switch
-              checked={emailEnabled && emailAvailable}
-              onChange={setEmailEnabled}
-              label='Enabled'
-              disabled={!emailAvailable}
-            />
-          </div>
-        </CardHeader>
-        <CardContent className='flex flex-col gap-4'>
-          <Text variant='caption' className='text-text-secondary'>
-            Get email alerts when new jobs score above your threshold. Powered
-            by Resend.
-          </Text>
-          {!emailAvailable && (
-            <Text variant='meta' className='text-text-tertiary'>
-              Email notifications are unavailable until the operator configures
-              the email provider credentials.
-            </Text>
-          )}
-          {emailAvailable && prefs?.email && (
-            <Text variant='meta' className='text-text-tertiary'>
-              Sending to: {prefs.email}
-            </Text>
-          )}
-          <div className='max-w-xs'>
-            <Input
-              label='Score threshold'
-              type='number'
-              value={emailThreshold}
-              onChange={e => setEmailThreshold(e.target.value)}
-              min={0}
-              max={100}
-              helperText='Minimum job score to trigger an email alert (0-100)'
-              disabled={!emailEnabled || !emailAvailable}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      <ApiKeysCard />
-
-      <LlmUsageCard />
-
-      <BillingCard />
-
-      <DataExportCard />
-
-      <OnboardingResetCard />
-
-      <DeleteAccountCard />
+      <Tabs
+        tabs={tabs}
+        defaultTab={initialTabRef.current}
+        variant='underline'
+        onChange={handleTabChange}
+      />
     </div>
   );
 }

@@ -31,7 +31,7 @@ export function ResumeStylePreview({
   return (
     <div
       role='img'
-      aria-label={`Resume style preview: ${preset} preset, ${accent} accent`}
+      aria-label={`Export style preview: ${preset} preset, ${accent} accent`}
       className='rounded-md p-4'
       style={{
         background: '#ffffff',

@@ -143,7 +143,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
 
       const data = (await res.json()) as TailorResponse;
       setRecord(data.record);
-      toast({ variant: 'success', title: 'Resume drafted with AI' });
+      toast({ variant: 'success', title: 'Tailored resume drafted with AI' });
     } catch {
       toast({ variant: 'error', title: 'Network error generating resume' });
     } finally {
@@ -180,7 +180,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
         size='sm'
         onClick={handleGenerate}
       >
-        Generate Resume
+        Generate tailored resume
       </Button>
     );
   }
@@ -191,7 +191,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
       size='sm'
       name={isApproved ? 'view-approved-resume' : 'review-resume'}
     >
-      {isApproved ? 'View Resume' : 'Review Resume'}
+      {isApproved ? 'View tailored resume' : 'Review tailored resume'}
     </LinkButton>
   );
 }

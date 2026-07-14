@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { CheckCircle, Target } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Card } from '@danieljoffe/shared-ui/Card';
@@ -11,12 +12,54 @@ import { Alert } from '@danieljoffe/shared-ui/Alert';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { cn } from '@/lib/cn';
+import {
+  activateTargetInBackground,
+  createBareTarget,
+  linkTarget,
+} from '@/app/(app)/targets/targetFlows';
 import type {
-  JobTarget,
   MatchedSuggestion,
   MatchedSuggestions,
 } from '@/app/(app)/targets/types';
+import { completeOnboarding } from './completeOnboarding';
 import type { JobData } from './JobUrlInput';
+
+/**
+ * Path A's promised payoff: after the from-posting target lands, draft
+ * the tailored resume for that very posting and finish onboarding ON the
+ * review page instead of a dashboard detour ("a tailored resume right
+ * away", PathChooser). Returns true only when the draft exists AND the
+ * onboarding-complete flag is confirmed persisted (navigating without
+ * the flag recreates the redirect-loop bug completeOnboarding documents).
+ * Any failure — no JD, gap gate, LLM budget, network — returns false and
+ * the caller falls back to the normal completion flow: the target is
+ * already created, so the user lost nothing but the shortcut.
+ */
+async function draftPathAResume(postingId: string): Promise<boolean> {
+  try {
+    const detailRes = await fetch(`/api/jobs/${postingId}`);
+    if (!detailRes.ok) return false;
+    const detail = (await detailRes.json()) as {
+      description_html: string | null;
+    };
+    const jd = (detail.description_html ?? '').trim();
+    if (!jd) return false;
+
+    const res = await fetch('/api/jobs/tailor/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_description: jd,
+        job_posting_id: postingId,
+      }),
+    });
+    if (!res.ok) return false;
+
+    return await completeOnboarding();
+  } catch {
+    return false;
+  }
+}
 
 interface TargetSuggestionsProps {
   onComplete: () => void;
@@ -29,9 +72,11 @@ export default function TargetSuggestions({
   onSkip,
   jobData,
 }: TargetSuggestionsProps) {
+  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
+  const [draftingResume, setDraftingResume] = useState(false);
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
@@ -74,9 +119,18 @@ export default function TargetSuggestions({
           // lands on /dashboard. Path B (suggest) does this after
           // ``/link``; path A (from-posting) was missing it, so the
           // user landed on an empty Top Matches block.
-          fetch(`/api/targets/${data.id}/activate`, { method: 'POST' }).catch(
-            () => undefined
-          );
+          activateTargetInBackground(data.id);
+          // Deliver the promised payoff: draft the tailored resume for
+          // this posting and finish on its review page. Fallback on any
+          // failure is the pre-existing flow (completion screen).
+          setDraftingResume(true);
+          const drafted = await draftPathAResume(postingId);
+          if (cancelled) return;
+          if (drafted) {
+            router.push(`/jobs/${postingId}/resume`);
+            return;
+          }
+          setDraftingResume(false);
           timerRef.current = setTimeout(onComplete, 2000);
         }
       } catch (err) {
@@ -102,7 +156,7 @@ export default function TargetSuggestions({
     return () => {
       cancelled = true;
     };
-  }, [jobData, onComplete]);
+  }, [jobData, onComplete, router]);
 
   // Paths B/C: fetch suggestions from LLM
   useEffect(() => {
@@ -174,40 +228,26 @@ export default function TargetSuggestions({
         let targetId: string;
 
         if (match.is_new) {
-          const createRes = await fetch('/api/targets', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              label: match.suggestion.label,
-              description: match.suggestion.description,
-            }),
+          // Bare create, NOT from-manual: these suggestions already went
+          // through LLM matching in ``/targets/suggest`` — re-running the
+          // create-or-link endpoint would repeat that call per target.
+          const createdTarget = await createBareTarget({
+            label: match.suggestion.label,
+            description: match.suggestion.description,
           });
-          if (!createRes.ok) continue;
-          const createdTarget = (await createRes.json()) as JobTarget;
           targetId = createdTarget.id;
         } else {
           targetId = match.matched_target!.id;
         }
 
-        const linkRes = await fetch(`/api/targets/${targetId}/link`, {
-          method: 'POST',
-        });
-        if (!linkRes.ok) continue;
+        await linkTarget(targetId);
         created++;
 
-        // Fire the activation pipeline (derive scoring profile → poll
-        // sources → mark ready) without awaiting. Onboarded targets
-        // were previously left at ``activation_status=idle`` because the
-        // wizard only ran create+link, so no jobs got polled until the
-        // user manually clicked Activate on /targets. Fire-and-forget
-        // keeps the wizard responsive; failures will surface on /jobs
-        // (still-idle target = no postings) rather than block the
-        // completion step. Catch and swallow to avoid an unhandled
-        // promise rejection — the user can re-activate from /targets if
-        // the kickoff was lost.
-        void fetch(`/api/targets/${targetId}/activate`, {
-          method: 'POST',
-        }).catch(() => undefined);
+        // Fire the activation pipeline without awaiting — onboarded
+        // targets were previously left at ``activation_status=idle``
+        // because the wizard only ran create+link, so no jobs got polled
+        // until the user manually clicked Activate on /targets.
+        activateTargetInBackground(targetId);
       } catch {
         // Continue creating remaining targets
       }
@@ -245,6 +285,14 @@ export default function TargetSuggestions({
                   {createdLabel}
                 </Text>
               </div>
+              {draftingResume && (
+                <div className='mt-2 flex items-center gap-2'>
+                  <Spinner size='sm' aria-label='Drafting tailored resume' />
+                  <Text variant='caption' className='text-text-secondary'>
+                    Drafting your tailored resume…
+                  </Text>
+                </div>
+              )}
             </div>
           </Card>
         </div>

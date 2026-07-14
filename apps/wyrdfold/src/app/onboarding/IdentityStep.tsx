@@ -30,8 +30,14 @@ interface IdentityFields {
  * Pre-fills both fields from ``/api/profile/identity`` (the auth
  * cookie pre-seeds email on the wyrdfold-api side for new accounts).
  * Name is the only required field — everything else (phone,
- * location, links) lives in Settings for users who want them on
- * their resume header.
+ * location, links) lives on the Profile page for users who want
+ * them on their resume header.
+ *
+ * Re-collection dedup (UX/IA §F): a user with a name already on file
+ * (redo-onboarding, or a profile built before this step existed) has
+ * nothing to add here — the step's one job is capturing the name — so
+ * it auto-advances instead of asking them to retype what the Profile
+ * page already owns.
  */
 export default function IdentityStep({
   onComplete,
@@ -51,7 +57,11 @@ export default function IdentityStep({
         if (!res.ok) return;
         const data = (await res.json()) as IdentityFields;
         if (cancelled) return;
-        if (data.name) setName(data.name);
+        if (data.name?.trim()) {
+          // Name already on file — nothing to collect.
+          onComplete();
+          return;
+        }
         if (data.email) setEmail(data.email);
       } catch {
         // Non-critical — the user will fill in fields manually
@@ -63,6 +73,7 @@ export default function IdentityStep({
     return () => {
       cancelled = true;
     };
+    // onComplete is stable for the lifetime of the step (wizard useCallback).
   }, []);
 
   async function handleSave(e: React.FormEvent) {
