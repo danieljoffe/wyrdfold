@@ -86,9 +86,12 @@ test.describe('profile identity round-trip', () => {
     const nameInput = page.getByRole('textbox', { name: /^Name\b/ });
     await expect(nameInput).toBeVisible();
 
-    // The shared test user should have a name set (created via the
-    // beta-invite script or dashboard). If this assertion fires
-    // empty, the GET is broken or the user has never been seeded.
+    // The beforeAll guarantees the user has a non-empty name, but the
+    // card renders its inputs immediately and only fills them once
+    // GET /identity resolves — reading the value at first visibility
+    // races that fetch (flaked on slower stacks). Wait for the seeded
+    // value to land instead.
+    await expect(nameInput).not.toHaveValue('', { timeout: 5_000 });
     const original = await nameInput.inputValue();
     expect(original.length).toBeGreaterThan(0);
 
@@ -118,7 +121,16 @@ test.describe('profile identity round-trip', () => {
       const restoreInput = page.getByRole('textbox', { name: /^Name\b/ });
       if ((await restoreInput.inputValue()) !== original) {
         await restoreInput.fill(original);
-        // Best-effort wait — don't fail the test on cleanup races.
+        // The autosave is debounced (~800ms), so the indicator must
+        // APPEAR before "hidden" means the PATCH completed — waiting
+        // only for hidden resolves instantly and closes the page before
+        // the restore ever fires (exactly how a stale test name got
+        // left in the DB). Best-effort both ways — don't fail the test
+        // on cleanup races.
+        await page
+          .getByText('Saving…')
+          .waitFor({ state: 'visible', timeout: 3_000 })
+          .catch(() => {});
         await page
           .getByText('Saving…')
           .waitFor({ state: 'hidden', timeout: 5_000 })
