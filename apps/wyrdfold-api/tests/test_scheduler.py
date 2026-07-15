@@ -462,8 +462,9 @@ async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
     """A HUNG poll cycle must be aborted by the watchdog so the next tick can
     run. Without it, ``max_instances=1`` wedges the scheduler until a restart
     (the 2026-07-06 402-storm incident: 68 min of no polls while the API stayed
-    up). The tick returns cleanly (no raise) after the timeout and skips the
-    post-poll steps."""
+    up). The tick returns cleanly (no raise) after the timeout; the health
+    checks still run (#350 — a broken cycle is exactly when the alarms must
+    fire), only the cache-invalidate/log post-poll steps are skipped."""
     import app.scheduler as sched
     from app.scheduler import _run_scheduled_poll
 
@@ -487,7 +488,9 @@ async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
         # (outer timeout) instead of hanging the suite forever.
         await asyncio.wait_for(_run_scheduled_poll(), timeout=5)
 
-    assert health_calls["n"] == 0  # a timed-out cycle skips the post-poll work
+    # The health pass runs even after a timed-out cycle (#350): the alarms
+    # must not be silenced by the very breakage they exist to report.
+    assert health_calls["n"] == 1
 
 
 @pytest.mark.asyncio
