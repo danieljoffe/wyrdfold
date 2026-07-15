@@ -161,16 +161,19 @@ async def test_scheduled_poll_runs_when_lock_acquired() -> None:
 @pytest.mark.asyncio
 async def test_scheduled_poll_skips_when_lock_held() -> None:
     """The regression guard: when the advisory lock is already held, the
-    scheduled poll must NOT call poll_due_sources (no double-poll)."""
+    scheduled poll must NOT call poll_due_sources (no double-poll) — but the
+    health checks MUST still run (#350): a leaked lock previously silenced
+    every alarm because they only ran inside the acquired branch, so the
+    exact failure the leaked-lock alarm exists for also disabled it."""
     sb, state = _fake_lock_supabase()
     state["held"] = True  # someone else already polling
 
     with (
         patch("app.scheduler.get_supabase_pool", return_value=sb),
         patch("app.scheduler.poll_due_sources") as mock_poll,
-        patch("app.scheduler.check_ingestion_health") as mock_health,
+        patch("app.scheduler.check_ingestion_health", new=AsyncMock()) as mock_health,
     ):
         await _run_scheduled_poll()
 
     mock_poll.assert_not_called()
-    mock_health.assert_not_called()
+    mock_health.assert_awaited_once_with(sb)

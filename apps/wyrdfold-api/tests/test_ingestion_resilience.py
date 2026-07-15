@@ -213,12 +213,19 @@ def _health_supabase(
     total: int,
     disabled: int,
     newest_discovery_at: str | None = None,
+    advisory_locks: list[dict[str, Any]] | None = None,
+    newest_polled_at: str | None = None,
 ) -> MagicMock:
     """A supabase mock answering the health-check queries:
     - jobs: select().order().limit().execute() → newest created_at row
-    - sources: select(count=exact) total, and .eq(enabled,False) disabled
+    - sources: select(count=exact) total, and .eq(enabled,False) disabled;
+      select().order().limit().execute() → newest last_polled_at row (only
+      read when a poll advisory lock is held)
     - source_discoveries: select().order().limit().execute() → newest
-      discovered_at row (only read when the discovery-staleness check is armed)
+      discovered_at row (only read when the discovery-staleness check is armed
+      or a discovery lock is held)
+    - rpc("advisory_lock_info") → the held advisory locks (#350); defaults to
+      none held so the leaked-lock check is a clean no-op in older tests
     """
     jobs_leaf = MagicMock()
     jobs_rows = [{"created_at": newest_created_at}] if newest_created_at else []
@@ -232,6 +239,11 @@ def _health_supabase(
     select_handle.execute.return_value = _Resp(data=[], count=total)
     # disabled count (.eq("enabled", False))
     select_handle.eq.return_value.execute.return_value = _Resp(data=[], count=disabled)
+    # newest last_polled_at keyset read (.order().limit())
+    polled_rows = [{"last_polled_at": newest_polled_at}] if newest_polled_at else []
+    select_handle.order.return_value.limit.return_value.execute.return_value = _Resp(
+        data=polled_rows
+    )
     sources_table.select.return_value = select_handle
 
     disc_leaf = MagicMock()
@@ -249,6 +261,7 @@ def _health_supabase(
 
     sb = MagicMock()
     sb.table.side_effect = _table
+    sb.rpc.return_value.execute.return_value = _Resp(data=advisory_locks or [])
     return sb
 
 
@@ -534,3 +547,184 @@ async def test_health_reads_ride_async_client_when_flag_on(monkeypatch) -> None:
     assert report.newest_job_at is None
     assert report.total_sources == 0
     assert report.mass_disable is False
+
+
+# ---------------------------------------------------------------------------
+# check_ingestion_health — leaked advisory lock (#350)
+# ---------------------------------------------------------------------------
+
+
+def _arm_lock_check_only(monkeypatch) -> None:
+    """Enable the health pass with every check but #5 disarmed, so the
+    leaked-lock assertions are isolated from the other alarms."""
+    monkeypatch.setattr(live_settings, "ingestion_health_check_enabled", True)
+    monkeypatch.setattr(live_settings, "ingestion_max_job_age_hours", 0)
+    monkeypatch.setattr(live_settings, "ingestion_mass_disable_ratio", 0.0)
+    monkeypatch.setattr(live_settings, "discovery_scheduler_enabled", False)
+    monkeypatch.setattr(live_settings, "llm_credit_min_runway_days", 0)
+    monkeypatch.setattr(live_settings, "llm_credit_min_remaining_usd", 0)
+    monkeypatch.setattr(live_settings, "advisory_lock_stale_after_minutes", 90)
+
+
+def _lock_row(key: int, pid: int = 4242) -> dict[str, Any]:
+    return {
+        "lock_key": key,
+        "pid": pid,
+        "granted": True,
+        "backend_start": "2026-07-06T08:00:00+00:00",
+        "application_name": "PostgREST 14.5",
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_alerts_on_leaked_poll_lock(monkeypatch) -> None:
+    """The #350 alarm: poll lock held while the newest sources.last_polled_at
+    is older than the threshold → error-level alert naming the holder + the
+    clearing runbook."""
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    stale = (now - timedelta(hours=4)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=None,
+        total=10,
+        disabled=0,
+        advisory_locks=[_lock_row(live_settings.poll_advisory_lock_key)],
+        newest_polled_at=stale,
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_poll_lock is True
+    assert report.held_advisory_locks == [live_settings.poll_advisory_lock_key]
+    assert any("POLL advisory lock" in a for a in report.alerts)
+    assert any("pg_terminate_backend" in a for a in report.alerts)
+    assert any("pid=4242" in a for a in report.alerts)
+    assert captured and captured[0][1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_health_alerts_when_lock_held_and_never_polled(monkeypatch) -> None:
+    """No last_polled_at stamp at all + a held lock is the leak's day-one
+    shape (fresh install / wiped stamps): still alarms, reporting 'never'."""
+    _arm_lock_check_only(monkeypatch)
+    _patch_sentry(monkeypatch)
+    sb = _health_supabase(
+        newest_created_at=None,
+        total=10,
+        disabled=0,
+        advisory_locks=[_lock_row(live_settings.poll_advisory_lock_key)],
+        newest_polled_at=None,
+    )
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    assert report.stale_poll_lock is True
+    assert any("never" in a for a in report.alerts)
+
+
+@pytest.mark.asyncio
+async def test_health_quiet_when_lock_held_but_stamps_fresh(monkeypatch) -> None:
+    """A held lock with FRESH stamps is a healthy in-flight cycle (e.g. a
+    long force-poll) — never alarm on it."""
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    fresh = (now - timedelta(minutes=3)).isoformat()
+    sb = _health_supabase(
+        newest_created_at=None,
+        total=10,
+        disabled=0,
+        advisory_locks=[_lock_row(live_settings.poll_advisory_lock_key)],
+        newest_polled_at=fresh,
+    )
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    assert report.stale_poll_lock is False
+    assert report.alerts == []
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_health_quiet_when_no_locks_held(monkeypatch) -> None:
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    sb = _health_supabase(newest_created_at=None, total=10, disabled=0)
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    assert report.held_advisory_locks == []
+    assert report.stale_poll_lock is False
+    assert report.stale_discovery_lock is False
+    assert report.alerts == []
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_health_ignores_foreign_advisory_locks(monkeypatch) -> None:
+    """Advisory locks on keys we don't own (other tooling) are reported in
+    the snapshot but never alarmed on."""
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    sb = _health_supabase(
+        newest_created_at=None,
+        total=10,
+        disabled=0,
+        advisory_locks=[_lock_row(999999)],
+    )
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    assert report.held_advisory_locks == [999999]
+    assert report.alerts == []
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_health_leaked_discovery_lock_warns(monkeypatch) -> None:
+    """Discovery-key variant: warning level (matches the discovery staleness
+    alarm's posture), fires even with the discovery scheduler off — a lock
+    leaked by a manual run still blocks the next manual run."""
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    sb = _health_supabase(
+        newest_created_at=None,
+        total=10,
+        disabled=0,
+        newest_discovery_at=None,
+        advisory_locks=[_lock_row(live_settings.discovery_advisory_lock_key, pid=777)],
+    )
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    assert report.stale_discovery_lock is True
+    assert any("DISCOVERY advisory lock" in a for a in report.alerts)
+    assert captured and captured[0][1] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_health_lock_check_disabled_at_zero(monkeypatch) -> None:
+    _arm_lock_check_only(monkeypatch)
+    monkeypatch.setattr(live_settings, "advisory_lock_stale_after_minutes", 0)
+    sb = _health_supabase(newest_created_at=None, total=10, disabled=0)
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    sb.rpc.assert_not_called()
+    assert report.held_advisory_locks == []
+
+
+@pytest.mark.asyncio
+async def test_health_lock_check_fails_soft_on_rpc_error(monkeypatch) -> None:
+    """An advisory_lock_info failure (e.g. migration not applied yet) must
+    not raise or block the other checks — fail-soft like every check here."""
+    _arm_lock_check_only(monkeypatch)
+    captured = _patch_sentry(monkeypatch)
+    sb = _health_supabase(newest_created_at=None, total=10, disabled=0)
+    sb.rpc.side_effect = RuntimeError("function advisory_lock_info() does not exist")
+
+    report = await health_mod.check_ingestion_health(sb)
+
+    assert report.alerts == []
+    assert captured == []
