@@ -28,6 +28,7 @@ import logging
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, Message, ModelId
 from app.models.logistics import LogisticsFilters
@@ -38,6 +39,11 @@ from app.services.targets.suggest import _build_user_message as _profile_summary
 
 logger = logging.getLogger(__name__)
 
+# Documented default, pinned by the prompt-regression golden contract. The
+# RUNTIME model is ``settings.phase2_fit_model`` (env PHASE2_FIT_MODEL) —
+# resolved at call time in ``derive_job_fit`` so the deepseek cost flip is an
+# env change with an instant unset-to-revert, exactly like the Phase-1 triage
+# and qualification-tagger flips.
 JOB_FIT_MODEL: ModelId = "claude-sonnet-4-6"
 JOB_FIT_PURPOSE = "fit.job"
 
@@ -326,7 +332,7 @@ async def derive_job_fit(
     target: JobTarget,
     job_title: str,
     jd_text: str,
-    model: ModelId = JOB_FIT_MODEL,
+    model: ModelId | None = None,
     purpose: str = JOB_FIT_PURPOSE,
     extract_logistics: bool = False,
 ) -> tuple[JobFitResult, LLMResult]:
@@ -336,6 +342,11 @@ async def derive_job_fit(
     Errors propagate (unlike Phase 1's fail-open semantics) — the
     poller catches them and falls back to ``promising=True, score=None``
     so the UI shows a "Pending" badge instead of grinding to a halt.
+
+    ``model`` defaults to the configured ``settings.phase2_fit_model``
+    (Sonnet, or deepseek-v3-2 when PHASE2_FIT_MODEL selects it) — resolved
+    at call time so an env flip / test override takes effect without
+    re-import. An explicit ``model=`` still wins.
 
     Caller is responsible for batching / rate-limiting; this is one
     call per (job, target). The progressive batching policy (first 20
@@ -347,6 +358,8 @@ async def derive_job_fit(
     Callers should pass ``settings.logistics_extraction_enabled`` so
     the global flag controls the behaviour.
     """
+    if model is None:
+        model = settings.phase2_fit_model
     static_prefix, dynamic_suffix = _split_user_message(
         payload=payload, target=target, job_title=job_title, jd_text=jd_text
     )

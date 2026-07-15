@@ -355,6 +355,22 @@ class Settings(BaseSettings):
     # polling.
     qualification_model: ModelId = "claude-haiku-4-5"
 
+    # Which model backs Phase-2 fit grading (``fit.job`` — the four-axis score
+    # users see). Default Sonnet (the incumbent the score distribution and
+    # gate calibrations were built on). Set PHASE2_FIT_MODEL=deepseek-v3-2 for
+    # the 2026-07-15 bake-off winner among the cheap candidates: Spearman
+    # rho 0.917 vs the production Sonnet gold over 58 real cases (Sonnet's own
+    # re-grade self-agreement is 0.974, Sonnet-4.5's 0.924), 0 schema
+    # failures, $0.00045/call vs $0.0114 (~25x cheaper). Known trade-offs,
+    # measured: slight score-band compression (stdev 25.5 vs 27.7), occasional
+    # 15-20pt under-scores on middle-band cases, ~27s latency (fine here —
+    # fit.job is background-only via the poller; it has no interactive
+    # callers). gemini-2.5-pro (11/58 failures) and gpt-5.1 (rho 0.875,
+    # over-scores) were eliminated. Env flip, instant unset-to-revert; new
+    # grades mix with the Sonnet-scored corpus until rows naturally re-grade
+    # (profile bumps), so expect a mildly mixed scale during transition.
+    phase2_fit_model: ModelId = "claude-sonnet-4-6"
+
     # Max characters of the (cleaned) job description sent to the
     # qualification tagger. The tagger only needs the dense signals near the
     # top of a JD (country cues, seniority wording, "general application"
