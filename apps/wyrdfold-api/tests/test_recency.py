@@ -802,7 +802,7 @@ async def test_refresh_poll_read_chunks_stay_url_safe(
     ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(400)]
     await refresh_recency_scores_poll(MagicMock(), ids)
 
-    # 400 ids at read-chunk 150 → 3 chunks per pass × 2 passes (jobs, scores).
+    # 400 ids at read-chunk 150 → 3 chunks per pass x 2 passes (jobs, scores).
     assert len(read_chunks) == 6
     assert all(n <= recency_mod._RECENCY_READ_CHUNK_SIZE for n in read_chunks)
     assert max(read_chunks) == recency_mod._RECENCY_READ_CHUNK_SIZE
