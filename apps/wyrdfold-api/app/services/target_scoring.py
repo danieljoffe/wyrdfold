@@ -17,6 +17,7 @@ Consumers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -262,8 +263,15 @@ async def score_title_and_upsert_poll(
     docstring for backend selection. Service-role only; the ``gated`` path is
     user-client-only and never runs in the poller. Slice 4 (#57) collapses
     the pair once the sync callers migrate.
+
+    The keyword compute runs in the executor, NOT on the event loop: the
+    sync path always had it inside ``to_thread`` (the whole helper was
+    offloaded), and the poll fans this out per (row x target) — at cycle
+    scale that is tens of seconds of pure-Python scoring, which on the loop
+    taxes every interactive request (measured ~+45ms p50 in the #57 load
+    test). Only the IO awaits on the loop.
     """
-    result = _title_score_result(title, target)
+    result = await asyncio.to_thread(_title_score_result, title, target)
     if result is None:
         return None
 
@@ -378,8 +386,13 @@ async def score_and_upsert_poll(
     docstring for backend selection. Service-role only; the ``gated`` path is
     user-client-only and never runs in the poller. Slice 4 (#57) collapses
     the pair once the sync callers migrate.
+
+    Compute in the executor, IO on the loop — see
+    :func:`score_title_and_upsert_poll` for why (full-JD scoring is the
+    heaviest per-row compute in the cycle).
     """
-    result = _stage2_score_result(
+    result = await asyncio.to_thread(
+        _stage2_score_result,
         title,
         description_html,
         target,
@@ -706,7 +719,9 @@ async def batch_update_global_scores_poll(supabase: Client, job_posting_ids: lis
         )
         all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
 
-    updates = _global_score_updates(unique_ids, all_score_rows)
+    # Aggregation is pure-Python over every fetched score row — off-loop for
+    # the same reason as the scoring compute in the ``*_poll`` twins.
+    updates = await asyncio.to_thread(_global_score_updates, unique_ids, all_score_rows)
     if updates:
         await poll_db_write(
             supabase,
