@@ -287,13 +287,13 @@ async def test_start_scheduler_registers_only_recency_when_only_recency_enabled(
 
 @pytest.mark.asyncio
 async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> None:
-    """The tick body must pull the singleton client and pass the configured
-    windows to ``purge_expired_records`` (run in a worker thread)."""
+    """The tick body must pull the async service-role client and pass the
+    configured windows to ``purge_expired_records`` (awaited natively)."""
     from app.scheduler import _run_scheduled_retention_purge
 
     fake_client = object()
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=fake_client),
+        patch("app.scheduler.get_async_supabase", return_value=fake_client),
         patch("app.scheduler.settings") as mock_settings,
         patch("app.scheduler.purge_expired_records", autospec=True) as mock_purge,
     ):
@@ -316,7 +316,7 @@ async def test_run_scheduled_retention_purge_skips_when_supabase_uninitialized()
     from app.scheduler import _run_scheduled_retention_purge
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch("app.scheduler.get_async_supabase", return_value=None),
         patch("app.scheduler.purge_expired_records", autospec=True) as mock_purge,
     ):
         await _run_scheduled_retention_purge()
@@ -329,7 +329,7 @@ async def test_run_scheduled_retention_purge_swallows_exceptions() -> None:
     from app.scheduler import _run_scheduled_retention_purge
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch(
             "app.scheduler.purge_expired_records",
             side_effect=RuntimeError("kaboom"),
@@ -341,13 +341,13 @@ async def test_run_scheduled_retention_purge_swallows_exceptions() -> None:
 
 @pytest.mark.asyncio
 async def test_run_scheduled_recency_refresh_invokes_sweep_and_invalidates_cache() -> None:
-    """The tick body must pull the singleton client, run the full sweep in a
-    worker thread, and invalidate the list cache when rows were rewritten."""
+    """The tick body must pull the async service-role client, await the full
+    sweep natively, and invalidate the list cache when rows were rewritten."""
     from app.scheduler import _run_scheduled_recency_refresh
 
     fake_client = object()
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=fake_client),
+        patch("app.scheduler.get_async_supabase", return_value=fake_client),
         patch("app.scheduler.refresh_all_recency_scores", autospec=True) as mock_sweep,
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
@@ -363,7 +363,7 @@ async def test_run_scheduled_recency_refresh_skips_cache_invalidate_when_nothing
     from app.scheduler import _run_scheduled_recency_refresh
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch("app.scheduler.refresh_all_recency_scores", return_value=0),
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
@@ -377,7 +377,7 @@ async def test_run_scheduled_recency_refresh_skips_when_supabase_uninitialized()
     from app.scheduler import _run_scheduled_recency_refresh
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch("app.scheduler.get_async_supabase", return_value=None),
         patch("app.scheduler.refresh_all_recency_scores", autospec=True) as mock_sweep,
     ):
         await _run_scheduled_recency_refresh()
@@ -390,7 +390,7 @@ async def test_run_scheduled_recency_refresh_swallows_exceptions() -> None:
     from app.scheduler import _run_scheduled_recency_refresh
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch(
             "app.scheduler.refresh_all_recency_scores",
             side_effect=RuntimeError("kaboom"),
@@ -789,7 +789,7 @@ class _LedgerTableStub:
     def limit(self, _n: int) -> "_LedgerTableStub":
         return self
 
-    def execute(self) -> object:
+    async def execute(self) -> object:
         if self.boom:
             raise RuntimeError("pooler down")
 
@@ -801,31 +801,34 @@ class _LedgerTableStub:
 
 
 class TestLedgerHelpers:
-    def test_record_stamps_the_job_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_record_stamps_the_job_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _LedgerTableStub()
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: stub)
 
-        _record_scheduler_run("url_health_check")
+        await _record_scheduler_run("url_health_check")
 
         assert len(stub.upserted) == 1
         assert stub.upserted[0]["job_id"] == "url_health_check"
         assert stub.upserted[0]["last_run_at"]
 
-    def test_record_skips_without_pool_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+    @pytest.mark.asyncio
+    async def test_record_skips_without_pool_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: None)
 
-        _record_scheduler_run("url_health_check")  # must not raise
+        await _record_scheduler_run("url_health_check")  # must not raise
 
-    def test_record_write_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_record_write_error_is_fail_soft(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _LedgerTableStub(boom=True)
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: stub)
 
-        _record_scheduler_run("url_health_check")  # must not raise
+        await _record_scheduler_run("url_health_check")  # must not raise
 
     @pytest.mark.asyncio
     async def test_last_run_parses_z_suffix_utc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _LedgerTableStub(rows=[{"last_run_at": "2026-07-14T10:30:00Z"}])
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: stub)
 
         got = await _last_scheduler_run("retention_purge")
 
@@ -834,12 +837,12 @@ class TestLedgerHelpers:
     @pytest.mark.asyncio
     async def test_last_run_none_when_no_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
         stub = _LedgerTableStub(rows=[])
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: stub)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: stub)
 
         assert await _last_scheduler_run("retention_purge") is None
 
     @pytest.mark.asyncio
     async def test_last_run_none_without_pool_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: None)
 
         assert await _last_scheduler_run("retention_purge") is None

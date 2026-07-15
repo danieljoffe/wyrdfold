@@ -97,11 +97,13 @@ class _UpdateChain:
         self._eq_args = (col, vals)
         return self
 
-    def execute(self) -> Any:
-        self._sink.append({
-            "payload": self._payload,
-            "eq": self._eq_args,
-        })
+    async def execute(self) -> Any:
+        self._sink.append(
+            {
+                "payload": self._payload,
+                "eq": self._eq_args,
+            }
+        )
         return MagicMock(data=[])
 
 
@@ -118,7 +120,7 @@ def _merge_supabase() -> tuple[MagicMock, MagicMock]:
     its call args to inspect the bulk-update payload (perf #93: one RPC, no
     per-row UPDATE loop)."""
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     return sb, sb.rpc
 
 
@@ -130,10 +132,11 @@ def _payload_by_id(rpc_mock: MagicMock) -> dict[str, dict[str, Any]]:
     return {u["id"]: u for u in args["p_updates"]}
 
 
-def test_merge_check_results_resets_counter_on_2xx() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_resets_counter_on_2xx() -> None:
     sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 2}]
-    _merge_check_results(sb, rows, {"j1": 200})
+    await _merge_check_results(sb, rows, {"j1": 200})
     sb.table.assert_not_called()  # no per-row UPDATE loop anymore
     u = _payload_by_id(rpc)["j1"]
     assert u["url_check_status"] == 200
@@ -141,31 +144,35 @@ def test_merge_check_results_resets_counter_on_2xx() -> None:
     assert u["last_url_check_at"] is not None
 
 
-def test_merge_check_results_increments_on_404() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_increments_on_404() -> None:
     sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 1}]
-    _merge_check_results(sb, rows, {"j1": 404})
+    await _merge_check_results(sb, rows, {"j1": 404})
     u = _payload_by_id(rpc)["j1"]
     assert u["url_check_status"] == 404
     assert u["url_check_failure_count"] == 2
 
 
-def test_merge_check_results_increments_on_network_error() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_increments_on_network_error() -> None:
     sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 0}]
-    _merge_check_results(sb, rows, {"j1": _STATUS_NETWORK_ERROR})
+    await _merge_check_results(sb, rows, {"j1": _STATUS_NETWORK_ERROR})
     assert _payload_by_id(rpc)["j1"]["url_check_failure_count"] == 1
 
 
-def test_merge_check_results_leaves_counter_on_5xx() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_leaves_counter_on_5xx() -> None:
     """Server hiccups should NOT count against the job — not the job's fault."""
     sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 1}]
-    _merge_check_results(sb, rows, {"j1": 503})
+    await _merge_check_results(sb, rows, {"j1": 503})
     assert _payload_by_id(rpc)["j1"]["url_check_failure_count"] == 1
 
 
-def test_merge_check_results_one_rpc_for_whole_batch() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_one_rpc_for_whole_batch() -> None:
     """The per-row UPDATE loop is gone: a multi-job batch issues exactly ONE
     bulk_update_url_health RPC carrying every job's computed values."""
     sb, rpc = _merge_supabase()
@@ -177,7 +184,7 @@ def test_merge_check_results_one_rpc_for_whole_batch() -> None:
         # Not in status_by_job → must be skipped entirely.
         {"id": "unchecked", "url_check_failure_count": 0},
     ]
-    _merge_check_results(
+    await _merge_check_results(
         sb,
         rows,
         {"ok": 200, "dead": 404, "blip": _STATUS_NETWORK_ERROR, "hiccup": 503},
@@ -192,23 +199,25 @@ def test_merge_check_results_one_rpc_for_whole_batch() -> None:
     assert len({u["last_url_check_at"] for u in by_id.values()}) == 1
 
 
-def test_merge_check_results_noop_when_no_matches() -> None:
+@pytest.mark.asyncio
+async def test_merge_check_results_noop_when_no_matches() -> None:
     """No checked rows → no RPC call at all (don't ship an empty payload)."""
     sb, rpc = _merge_supabase()
     rows = [{"id": "j1", "url_check_failure_count": 0}]
-    _merge_check_results(sb, rows, {})  # nothing was HEAD'd
+    await _merge_check_results(sb, rows, {})  # nothing was HEAD'd
     rpc.assert_not_called()
 
 
 # ---- _archive_with_data_drop ----------------------------------------------
 
 
-def test_archive_with_data_drop_nulls_heavy_fields() -> None:
+@pytest.mark.asyncio
+async def test_archive_with_data_drop_nulls_heavy_fields() -> None:
     """Archive nulls description_html on jobs and axis_scores/fit_reasoning/
     score_breakdown/matched_keywords on scores. Keeps identity intact."""
     sink: list[dict[str, Any]] = []
     sb = _mock_supabase(sink)
-    n = _archive_with_data_drop(sb, ["j1", "j2"])
+    n = await _archive_with_data_drop(sb, ["j1", "j2"])
     assert n == 2
     # First update: jobs table — global archived_at + description_html=null
     # (#75 C3: global liveness, not the per-user jobs.status).
@@ -227,9 +236,10 @@ def test_archive_with_data_drop_nulls_heavy_fields() -> None:
     }
 
 
-def test_archive_with_data_drop_noop_on_empty() -> None:
+@pytest.mark.asyncio
+async def test_archive_with_data_drop_noop_on_empty() -> None:
     sb = MagicMock()
-    n = _archive_with_data_drop(sb, [])
+    n = await _archive_with_data_drop(sb, [])
     assert n == 0
     sb.table.assert_not_called()
 
@@ -237,7 +247,8 @@ def test_archive_with_data_drop_noop_on_empty() -> None:
 # ---- _select_due_jobs candidate selection ---------------------------------
 
 
-def test_select_due_jobs_calls_anti_join_rpc() -> None:
+@pytest.mark.asyncio
+async def test_select_due_jobs_calls_anti_join_rpc() -> None:
     """#93: candidate selection is a server-side NOT EXISTS anti-join. The old
     null-first + older-than-cutoff two-query merge (which also pulled the full
     engaged-id set into Python for a `.not_.in_` exclusion) is replaced by a
@@ -247,9 +258,9 @@ def test_select_due_jobs_calls_anti_join_rpc() -> None:
     from app.services.url_health import _select_due_jobs
 
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
+    await _select_due_jobs(sb, batch_size=5, age_threshold_hours=24)
 
     # No engaged-id fetch / no client-side NOT IN: the table() helper isn't
     # touched at all for candidate selection now.
@@ -262,7 +273,8 @@ def test_select_due_jobs_calls_anti_join_rpc() -> None:
     assert "p_cutoff" in params
 
 
-def test_select_due_jobs_returns_rpc_rows_unchanged() -> None:
+@pytest.mark.asyncio
+async def test_select_due_jobs_returns_rpc_rows_unchanged() -> None:
     """Rows from the anti-join RPC flow through `_select_due_jobs` untouched,
     in the same (id, absolute_url, url_check_failure_count) shape the rest of
     url_health expects."""
@@ -273,9 +285,9 @@ def test_select_due_jobs_returns_rpc_rows_unchanged() -> None:
         {"id": "j2", "absolute_url": "https://x/2", "url_check_failure_count": 2},
     ]
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = MagicMock(data=rows)
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=rows))
 
-    out = _select_due_jobs(sb, batch_size=10, age_threshold_hours=24)
+    out = await _select_due_jobs(sb, batch_size=10, age_threshold_hours=24)
     assert out == rows
 
 
@@ -285,8 +297,10 @@ def test_select_due_jobs_returns_rpc_rows_unchanged() -> None:
 @pytest.mark.asyncio
 async def test_run_url_health_check_empty_input_returns_zero_summary() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = MagicMock(data=[])
-    summary = await run_url_health_check(sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3)
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+    summary = await run_url_health_check(
+        sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3
+    )
     assert summary == {
         "checked": 0,
         "healthy": 0,
@@ -301,18 +315,35 @@ async def test_run_url_health_check_archives_on_threshold() -> None:
     """End-to-end: a job at failure_count = threshold - 1 gets one more
     failure, ticks over threshold, and is archived (with data drop)."""
     rows_due = [
-        {"id": "alive", "absolute_url": "https://ok.example.com/job/1", "url_check_failure_count": 0},
-        {"id": "dying", "absolute_url": "https://dead.example.com/job/2", "url_check_failure_count": 2},
+        {
+            "id": "alive",
+            "absolute_url": "https://ok.example.com/job/1",
+            "url_check_failure_count": 0,
+        },
+        {
+            "id": "dying",
+            "absolute_url": "https://dead.example.com/job/2",
+            "url_check_failure_count": 2,
+        },
     ]
     with (
-        patch("app.services.url_health._select_due_jobs", return_value=rows_due),
-        patch("app.services.url_health._head_batch", new=AsyncMock(return_value={"alive": 200, "dying": 404})),
-        patch("app.services.url_health._merge_check_results") as merge,
-        patch("app.services.url_health._archive_with_data_drop", return_value=1) as archive,
+        patch("app.services.url_health._select_due_jobs", new=AsyncMock(return_value=rows_due)),
+        patch(
+            "app.services.url_health._head_batch",
+            new=AsyncMock(return_value={"alive": 200, "dying": 404}),
+        ),
+        patch("app.services.url_health._merge_check_results", new_callable=AsyncMock) as merge,
+        patch(
+            "app.services.url_health._archive_with_data_drop",
+            new_callable=AsyncMock,
+            return_value=1,
+        ) as archive,
     ):
         sb = MagicMock()
         # The post-merge refetch returns only the dying job (at threshold).
-        sb.table.return_value.select.return_value.in_.return_value.gte.return_value.execute.return_value = MagicMock(data=[{"id": "dying", "url_check_failure_count": 3}])
+        sb.table.return_value.select.return_value.in_.return_value.gte.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[{"id": "dying", "url_check_failure_count": 3}]))
+        )
         summary = await run_url_health_check(
             sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3
         )
@@ -332,14 +363,20 @@ async def test_run_url_health_check_does_not_archive_below_threshold() -> None:
         {"id": "blip", "absolute_url": "https://example.com/blip", "url_check_failure_count": 0},
     ]
     with (
-        patch("app.services.url_health._select_due_jobs", return_value=rows_due),
+        patch("app.services.url_health._select_due_jobs", new=AsyncMock(return_value=rows_due)),
         patch("app.services.url_health._head_batch", new=AsyncMock(return_value={"blip": 404})),
-        patch("app.services.url_health._merge_check_results"),
-        patch("app.services.url_health._archive_with_data_drop", return_value=0) as archive,
+        patch("app.services.url_health._merge_check_results", new_callable=AsyncMock),
+        patch(
+            "app.services.url_health._archive_with_data_drop",
+            new_callable=AsyncMock,
+            return_value=0,
+        ) as archive,
     ):
         sb = MagicMock()
         # Post-merge refetch finds NO jobs at threshold yet (counter = 1).
-        sb.table.return_value.select.return_value.in_.return_value.gte.return_value.execute.return_value = MagicMock(data=[])
+        sb.table.return_value.select.return_value.in_.return_value.gte.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[]))
+        )
         summary = await run_url_health_check(
             sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3
         )

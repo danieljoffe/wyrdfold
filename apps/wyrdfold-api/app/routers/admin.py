@@ -20,6 +20,7 @@ from app.config import settings
 from app.dependencies import get_supabase, verify_api_key
 from app.services.llm import cost_log
 from app.services.retention import purge_expired_records
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -159,19 +160,21 @@ class RetentionPurgeResult(BaseModel):
 
 
 @router.post("/retention/purge", response_model=RetentionPurgeResult)
-def purge_retention(
-    supabase: Client = Depends(get_supabase),
-) -> RetentionPurgeResult:
+async def purge_retention() -> RetentionPurgeResult:
     """Delete operational-log rows past their retention window (#29 P3).
 
     Idempotent; safe to call repeatedly. Mirrors the in-process scheduler
     job (gated on ``RETENTION_PURGE_ENABLED``), exposed so external cron
     (pg_cron, GitHub Actions) can drive the purge without running
     APScheduler. Windows come from settings; a 0-day window keeps that
-    log indefinitely.
+    log indefinitely. Runs on the async service-role client (#57 slice 1),
+    same as the scheduler job.
     """
-    report = purge_expired_records(
-        supabase,
+    aclient = get_async_supabase()
+    if aclient is None:
+        raise HTTPException(status_code=503, detail="async supabase client not initialized")
+    report = await purge_expired_records(
+        aclient,
         llm_costs_days=settings.llm_costs_retention_days,
         notifications_sent_days=settings.notifications_sent_retention_days,
         prescan_shadow_days=settings.prescan_shadow_retention_days,
@@ -214,16 +217,12 @@ def list_waitlist(
 ) -> WaitlistListResponse:
     """The operator's funnel view; ``?pending=true`` = not yet invited."""
     query = (
-        supabase.table("waitlist_signups")
-        .select("email,created_at,invited_at")
-        .order("created_at")
+        supabase.table("waitlist_signups").select("email,created_at,invited_at").order("created_at")
     )
     if pending:
         query = query.is_("invited_at", "null")
     rows = query.execute().data or []
-    return WaitlistListResponse(
-        entries=[WaitlistEntry.model_validate(r) for r in rows]
-    )
+    return WaitlistListResponse(entries=[WaitlistEntry.model_validate(r) for r in rows])
 
 
 # Sync `def`: blocking supabase + auth-admin work in the threadpool (#107).
@@ -255,12 +254,7 @@ def invite_from_waitlist(
         raise HTTPException(status_code=422, detail="Not a valid email address.")
 
     wl_rows = (
-        supabase.table("waitlist_signups")
-        .select("id")
-        .eq("email", email)
-        .execute()
-        .data
-        or []
+        supabase.table("waitlist_signups").select("id").eq("email", email).execute().data or []
     )
     from_waitlist = bool(wl_rows)
 
@@ -283,13 +277,11 @@ def invite_from_waitlist(
         raise
 
     if from_waitlist:
-        supabase.table("waitlist_signups").update(
-            {"invited_at": datetime.now(UTC).isoformat()}
-        ).eq("email", email).execute()
+        supabase.table("waitlist_signups").update({"invited_at": datetime.now(UTC).isoformat()}).eq(
+            "email", email
+        ).execute()
 
-    return WaitlistInviteResult(
-        email=email, invited=True, from_waitlist=from_waitlist
-    )
+    return WaitlistInviteResult(email=email, invited=True, from_waitlist=from_waitlist)
 
 
 # ---- Signup-mode switch (Phase 3 slice 5) -----------------------------------
