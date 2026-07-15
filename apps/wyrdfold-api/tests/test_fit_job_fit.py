@@ -272,3 +272,81 @@ class TestCacheMarker:
             job_title="Staff Web Engineer",
             jd_text="We need React and TypeScript experience.",
         )
+
+
+# ---- runtime model resolution (PHASE2_FIT_MODEL env flip) -------------------
+
+
+class TestModelResolution:
+    """The runtime model comes from ``settings.phase2_fit_model`` — resolved
+    at call time so the PHASE2_FIT_MODEL env flip (the deepseek cost swap,
+    2026-07-15 bake-off) takes effect without re-import — while the module
+    constant stays the documented default pinned by the prompt-regression
+    golden contract. Mirrors the qualification tagger's battery (#325)."""
+
+    def _capture_model(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+        import app.services.fit.job_fit as job_fit_mod
+
+        captured: dict[str, object] = {}
+
+        async def fake_complete_json(*_a: object, **kwargs: object) -> object:
+            captured["model"] = kwargs["model"]
+            fit = JobFitResult(
+                fit_score=70,
+                axes=AxisScores(title_fit=70, skills_fit=70, seniority_fit=70, domain_fit=70),
+                reasoning="stub",
+            )
+            return fit, object()
+
+        monkeypatch.setattr(job_fit_mod, "complete_json", fake_complete_json)
+        return captured
+
+    async def _derive(self, **kwargs: object) -> None:
+        from unittest.mock import MagicMock
+
+        from app.services.fit.job_fit import derive_job_fit
+
+        await derive_job_fit(
+            MagicMock(),
+            payload=_payload(),
+            target=_target(),
+            job_title="Staff Web Engineer",
+            jd_text="We need React and TypeScript experience.",
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_configured_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.services.fit.job_fit as job_fit_mod
+
+        captured = self._capture_model(monkeypatch)
+        await self._derive()
+        assert captured["model"] == job_fit_mod.JOB_FIT_MODEL
+
+    @pytest.mark.asyncio
+    async def test_env_flip_takes_effect_without_reimport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "phase2_fit_model", "deepseek-v3-2")
+        captured = self._capture_model(monkeypatch)
+        await self._derive()
+        assert captured["model"] == "deepseek-v3-2"
+
+    @pytest.mark.asyncio
+    async def test_explicit_model_wins_over_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "phase2_fit_model", "deepseek-v3-2")
+        captured = self._capture_model(monkeypatch)
+        await self._derive(model="claude-sonnet-4-6")
+        assert captured["model"] == "claude-sonnet-4-6"
+
+    def test_setting_default_matches_golden_constant(self) -> None:
+        # The prompt-regression contract pins the CONSTANT; this pins the
+        # SETTING default to it, so neither can drift silently.
+        import app.services.fit.job_fit as job_fit_mod
+        from app.config import Settings
+
+        assert Settings.model_fields["phase2_fit_model"].default == job_fit_mod.JOB_FIT_MODEL
