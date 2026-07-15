@@ -481,7 +481,8 @@ def test_apply_display_recency_skips_rows_without_score(
 
 class _SweepChain:
     """Minimal paged-query chain: returns a ``.range()`` slice of the table's
-    rows. The sweep fits the test corpus in one page (< 1000 rows)."""
+    rows (async client — the sweep runs on ``AsyncClient``, #57 slice 1).
+    The sweep fits the test corpus in one page (< 1000 rows)."""
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self._rows = rows
@@ -504,9 +505,19 @@ class _SweepChain:
         self._start, self._end = start, end
         return self
 
-    def execute(self) -> _Resp:
+    async def execute(self) -> _Resp:
         end = self._end if self._end is not None else len(self._rows)
         return _Resp(self._rows[self._start : end + 1])
+
+
+class _AsyncRpcChain:
+    """Async twin of ``_RpcChain`` for the sweep's ``AsyncClient`` RPC flush."""
+
+    def __init__(self, sink: list[dict[str, Any]]) -> None:
+        self._sink = sink
+
+    async def execute(self) -> _Resp:
+        return _Resp([])
 
 
 def _sweep_supabase(
@@ -518,15 +529,16 @@ def _sweep_supabase(
     sb = MagicMock()
     sb.table.side_effect = lambda name: _SweepChain(by_table[name])
 
-    def _rpc(name: str, params: dict[str, Any]) -> _RpcChain:
+    def _rpc(name: str, params: dict[str, Any]) -> _AsyncRpcChain:
         rpc_calls.append((name, params))
-        return _RpcChain([])
+        return _AsyncRpcChain([])
 
     sb.rpc.side_effect = _rpc
     return sb
 
 
-def test_refresh_all_sweeps_live_scores_and_skips_archived(
+@pytest.mark.asyncio
+async def test_refresh_all_sweeps_live_scores_and_skips_archived(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
@@ -546,7 +558,7 @@ def test_refresh_all_sweeps_live_scores_and_skips_archived(
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase(jobs, scores, rpc_calls)
 
-    written = refresh_all_recency_scores(sb)
+    written = await refresh_all_recency_scores(sb)
 
     assert written == 2  # archived score skipped
     assert len(rpc_calls) == 1
@@ -556,7 +568,8 @@ def test_refresh_all_sweeps_live_scores_and_skips_archived(
     assert "s3" not in by_id
 
 
-def test_refresh_all_mirrors_score_when_disabled(
+@pytest.mark.asyncio
+async def test_refresh_all_mirrors_score_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
@@ -566,15 +579,16 @@ def test_refresh_all_mirrors_score_when_disabled(
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase(jobs, scores, rpc_calls)
 
-    refresh_all_recency_scores(sb)
+    await refresh_all_recency_scores(sb)
 
     by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
     assert by_id["s1"] == 90  # flag off → recency mirrors raw score
 
 
-def test_refresh_all_noop_when_no_live_scores() -> None:
+@pytest.mark.asyncio
+async def test_refresh_all_noop_when_no_live_scores() -> None:
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase([], [], rpc_calls)
 
-    assert refresh_all_recency_scores(sb) == 0
+    assert await refresh_all_recency_scores(sb) == 0
     assert rpc_calls == []

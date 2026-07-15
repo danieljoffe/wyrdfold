@@ -31,7 +31,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 
@@ -65,9 +65,7 @@ def compute_recency_multiplier(age_days: float) -> float:
     return max(RECENCY_FLOOR, 1.0 - decay_days * RECENCY_DAILY_DECAY)
 
 
-def compute_recency_score(
-    score: int, age_days: float, *, enabled: bool
-) -> int:
+def compute_recency_score(score: int, age_days: float, *, enabled: bool) -> int:
     """Decay ``score`` by posting age. ``enabled=False`` is an identity
     (multiplier 1.0) so the column mirrors ``score`` when the flag is
     off."""
@@ -109,9 +107,7 @@ def _age_days(first_seen_at: Any, now: datetime) -> float:
     return max(0.0, (now - seen).total_seconds() / 86400.0)
 
 
-def refresh_recency_scores(
-    supabase: Client, job_posting_ids: list[str]
-) -> int:
+def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
     """Recompute ``recency_score`` for every scores row of the given jobs.
 
     Reads each job's ``first_seen_at`` to derive its age, then writes
@@ -138,12 +134,7 @@ def refresh_recency_scores(
     for i in range(0, len(unique_ids), _RECENCY_CHUNK_SIZE):
         chunk = unique_ids[i : i + _RECENCY_CHUNK_SIZE]
         try:
-            resp = (
-                supabase.table("jobs")
-                .select("id, first_seen_at")
-                .in_("id", chunk)
-                .execute()
-            )
+            resp = supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
         except Exception:
             logger.exception("refresh_recency_scores: jobs fetch failed")
             return 0
@@ -182,18 +173,14 @@ def refresh_recency_scores(
     for i in range(0, len(updates), _RECENCY_CHUNK_SIZE):
         chunk_updates = updates[i : i + _RECENCY_CHUNK_SIZE]
         try:
-            supabase.rpc(
-                "bulk_update_recency_scores", {"p_updates": chunk_updates}
-            ).execute()
+            supabase.rpc("bulk_update_recency_scores", {"p_updates": chunk_updates}).execute()
             written += len(chunk_updates)
         except Exception:
             logger.exception("refresh_recency_scores: bulk update failed")
     return written
 
 
-def _flush_recency_updates(
-    supabase: Client, updates: list[dict[str, Any]]
-) -> int:
+async def _flush_recency_updates(supabase: AsyncClient, updates: list[dict[str, Any]]) -> int:
     """Push one ``bulk_update_recency_scores`` RPC chunk; return rows written.
 
     A failed chunk is logged and counted as zero — one bad batch must not
@@ -202,16 +189,14 @@ def _flush_recency_updates(
     if not updates:
         return 0
     try:
-        supabase.rpc(
-            "bulk_update_recency_scores", {"p_updates": updates}
-        ).execute()
+        await supabase.rpc("bulk_update_recency_scores", {"p_updates": updates}).execute()
         return len(updates)
     except Exception:
         logger.exception("refresh recency bulk update failed")
         return 0
 
 
-def refresh_all_recency_scores(supabase: Client) -> int:
+async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
     """Rewrite ``recency_score`` for every live (non-excluded) scores row from
     the current date.
 
@@ -238,7 +223,7 @@ def refresh_all_recency_scores(supabase: Client) -> int:
     start = 0
     while True:
         try:
-            resp = (
+            resp = await (
                 supabase.table("jobs")
                 .select("id, first_seen_at")
                 .is_("archived_at", "null")
@@ -262,7 +247,7 @@ def refresh_all_recency_scores(supabase: Client) -> int:
     start = 0
     while True:
         try:
-            resp = (
+            resp = await (
                 supabase.table("scores")
                 .select("id, job_posting_id, score")
                 .eq("excluded", False)
@@ -289,13 +274,11 @@ def refresh_all_recency_scores(supabase: Client) -> int:
                 }
             )
         while len(updates) >= _RECENCY_CHUNK_SIZE:
-            written += _flush_recency_updates(
-                supabase, updates[:_RECENCY_CHUNK_SIZE]
-            )
+            written += await _flush_recency_updates(supabase, updates[:_RECENCY_CHUNK_SIZE])
             del updates[:_RECENCY_CHUNK_SIZE]
         if len(rows) < _RECENCY_SWEEP_PAGE_SIZE:
             break
         start += _RECENCY_SWEEP_PAGE_SIZE
 
-    written += _flush_recency_updates(supabase, updates)
+    written += await _flush_recency_updates(supabase, updates)
     return written

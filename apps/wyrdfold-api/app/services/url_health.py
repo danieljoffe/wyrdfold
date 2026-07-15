@@ -50,7 +50,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 
@@ -67,11 +67,7 @@ _HEAD_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
 # User-Agent for the HEAD requests. Identifies us so a job board operator
 # can contact us if needed without thinking it's a generic crawler.
-_USER_AGENT = (
-    "WyrdFoldUrlHealth/1.0 "
-    "(+https://wyrdfold.com; ops@wyrdfold.com) "
-    "httpx"
-)
+_USER_AGENT = "WyrdFoldUrlHealth/1.0 (+https://wyrdfold.com; ops@wyrdfold.com) httpx"
 
 
 async def _head_one(client: httpx.AsyncClient, url: str) -> int:
@@ -129,8 +125,8 @@ async def _head_batch(urls: list[tuple[str, str]], concurrency: int) -> dict[str
     return out
 
 
-def _select_due_jobs(
-    supabase: Client, *, batch_size: int, age_threshold_hours: int
+async def _select_due_jobs(
+    supabase: AsyncClient, *, batch_size: int, age_threshold_hours: int
 ) -> list[dict[str, Any]]:
     """Return up to ``batch_size`` live jobs whose URL hasn't been checked
     recently.
@@ -157,15 +153,15 @@ def _select_due_jobs(
     # NULLS FIRST puts every never-checked job ahead of every checked-but-stale
     # job, so the first batch_size rows are the same set in the same order the
     # two-query merge produced (all NULLs, then oldest non-NULLs).
-    due_resp = supabase.rpc(
+    due_resp = await supabase.rpc(
         "due_url_health_jobs",
         {"p_cutoff": cutoff, "p_batch_size": batch_size},
     ).execute()
     return cast(list[dict[str, Any]], due_resp.data or [])
 
 
-def _merge_check_results(
-    supabase: Client,
+async def _merge_check_results(
+    supabase: AsyncClient,
     rows: list[dict[str, Any]],
     status_by_job: dict[str, int],
 ) -> None:
@@ -195,18 +191,20 @@ def _merge_check_results(
             new_count = prev_count + 1
         else:
             new_count = prev_count  # don't penalise on 5xx
-        updates.append({
-            "id": jid,
-            "last_url_check_at": now_iso,
-            "url_check_status": code,
-            "url_check_failure_count": new_count,
-        })
+        updates.append(
+            {
+                "id": jid,
+                "last_url_check_at": now_iso,
+                "url_check_status": code,
+                "url_check_failure_count": new_count,
+            }
+        )
     if not updates:
         return
-    supabase.rpc("bulk_update_url_health", {"p_updates": updates}).execute()
+    await supabase.rpc("bulk_update_url_health", {"p_updates": updates}).execute()
 
 
-def _archive_with_data_drop(supabase: Client, job_ids: list[str]) -> int:
+async def _archive_with_data_drop(supabase: AsyncClient, job_ids: list[str]) -> int:
     """Mark jobs archived AND drop their heavy display fields.
 
     Kept (identity + display metadata + audit):
@@ -227,23 +225,37 @@ def _archive_with_data_drop(supabase: Client, job_ids: list[str]) -> int:
     now_iso = datetime.now(UTC).isoformat()
     # 1. Flag jobs globally-dead via archived_at (#75 C3 — global liveness,
     # distinct from per-user jobs.status) + drop the heavy HTML.
-    supabase.table("jobs").update({
-        "archived_at": now_iso,
-        "description_html": None,
-        "updated_at": now_iso,
-    }).in_("id", job_ids).execute()
+    await (
+        supabase.table("jobs")
+        .update(
+            {
+                "archived_at": now_iso,
+                "description_html": None,
+                "updated_at": now_iso,
+            }
+        )
+        .in_("id", job_ids)
+        .execute()
+    )
     # 2. Drop heavy fields on every (job, target) scores row.
-    supabase.table("scores").update({
-        "axis_scores": None,
-        "fit_reasoning": None,
-        "score_breakdown": None,
-        "matched_keywords": None,
-    }).in_("job_posting_id", job_ids).execute()
+    await (
+        supabase.table("scores")
+        .update(
+            {
+                "axis_scores": None,
+                "fit_reasoning": None,
+                "score_breakdown": None,
+                "matched_keywords": None,
+            }
+        )
+        .in_("job_posting_id", job_ids)
+        .execute()
+    )
     return len(job_ids)
 
 
 async def run_url_health_check(
-    supabase: Client,
+    supabase: AsyncClient,
     *,
     batch_size: int | None = None,
     concurrency: int | None = None,
@@ -281,9 +293,7 @@ async def run_url_health_check(
     }
 
     try:
-        rows = _select_due_jobs(
-            supabase, batch_size=bs, age_threshold_hours=age
-        )
+        rows = await _select_due_jobs(supabase, batch_size=bs, age_threshold_hours=age)
     except Exception:
         logger.exception("url_health: failed to fetch due jobs")
         return summary
@@ -291,9 +301,7 @@ async def run_url_health_check(
         logger.info("url_health: no jobs due for check")
         return summary
 
-    urls = [
-        (r["id"], r["absolute_url"]) for r in rows if r.get("absolute_url")
-    ]
+    urls = [(r["id"], r["absolute_url"]) for r in rows if r.get("absolute_url")]
     if not urls:
         logger.info("url_health: %d rows due but none have absolute_url", len(rows))
         return summary
@@ -304,12 +312,10 @@ async def run_url_health_check(
     summary["failures"] = sum(
         1 for c in status_by_job.values() if c == _STATUS_NETWORK_ERROR or 400 <= c < 500
     )
-    summary["server_errors"] = sum(
-        1 for c in status_by_job.values() if 500 <= c < 600
-    )
+    summary["server_errors"] = sum(1 for c in status_by_job.values() if 500 <= c < 600)
 
     try:
-        _merge_check_results(supabase, rows, status_by_job)
+        await _merge_check_results(supabase, rows, status_by_job)
     except Exception:
         logger.exception("url_health: failed to merge results")
         return summary
@@ -319,17 +325,15 @@ async def run_url_health_check(
     # re-querying keeps this idempotent across crashes mid-batch.)
     checked_ids = list(status_by_job.keys())
     try:
-        refreshed = await asyncio.to_thread(
-            lambda: supabase.table("jobs")
+        refreshed = await (
+            supabase.table("jobs")
             .select("id, url_check_failure_count")
             .in_("id", checked_ids)
             .gte("url_check_failure_count", threshold)
             .execute()
         )
-        dead_ids = [
-            r["id"] for r in cast(list[dict[str, Any]], refreshed.data or [])
-        ]
-        summary["archived"] = _archive_with_data_drop(supabase, dead_ids)
+        dead_ids = [r["id"] for r in cast(list[dict[str, Any]], refreshed.data or [])]
+        summary["archived"] = await _archive_with_data_drop(supabase, dead_ids)
     except Exception:
         logger.exception("url_health: failed to archive dead jobs")
         return summary

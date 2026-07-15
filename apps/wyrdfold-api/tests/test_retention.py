@@ -19,6 +19,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
+
+import pytest
 
 from app.services.retention import purge_expired_records
 
@@ -43,7 +46,7 @@ class _FakeDeleteQuery:
         self._lt = (col, val)
         return self
 
-    def execute(self) -> SimpleNamespace:
+    async def execute(self) -> SimpleNamespace:
         assert self._lt is not None, "purge must filter with .lt(ts_col, cutoff)"
         col, val = self._lt
         matched = [r for r in self._rows if str(r.get(col)) < val]
@@ -82,9 +85,10 @@ def _seeded() -> _FakeSupabase:
     )
 
 
-def test_purges_old_rows_and_keeps_recent() -> None:
+@pytest.mark.asyncio
+async def test_purges_old_rows_and_keeps_recent() -> None:
     sb = _seeded()
-    report = purge_expired_records(
+    report = await purge_expired_records(
         sb, llm_costs_days=365, notifications_sent_days=180, prescan_shadow_days=30
     )
     assert report == {"llm_costs": 2, "notifications_sent": 1, "prescan_shadow": 3}
@@ -94,7 +98,8 @@ def test_purges_old_rows_and_keeps_recent() -> None:
     assert sb.tables["prescan_shadow"] == [{"observed_at": _FUTURE}]
 
 
-def test_filters_on_the_right_timestamp_column() -> None:
+@pytest.mark.asyncio
+async def test_filters_on_the_right_timestamp_column() -> None:
     sb = _seeded()
     cols = {}
 
@@ -113,7 +118,7 @@ def test_filters_on_the_right_timestamp_column() -> None:
         return q
 
     sb.table = _tracking_table  # type: ignore[method-assign]
-    purge_expired_records(
+    await purge_expired_records(
         sb, llm_costs_days=30, notifications_sent_days=30, prescan_shadow_days=30
     )
     assert cols == {
@@ -123,9 +128,10 @@ def test_filters_on_the_right_timestamp_column() -> None:
     }
 
 
-def test_zero_window_retains_table_indefinitely() -> None:
+@pytest.mark.asyncio
+async def test_zero_window_retains_table_indefinitely() -> None:
     sb = _seeded()
-    report = purge_expired_records(
+    report = await purge_expired_records(
         sb, llm_costs_days=0, notifications_sent_days=180, prescan_shadow_days=0
     )
     # llm_costs untouched (no delete issued), notifications purged.
@@ -139,9 +145,10 @@ def test_zero_window_retains_table_indefinitely() -> None:
     assert "prescan_shadow" not in deleted_tables
 
 
-def test_uses_minimal_return_to_avoid_large_payloads() -> None:
+@pytest.mark.asyncio
+async def test_uses_minimal_return_to_avoid_large_payloads() -> None:
     sb = _seeded()
-    purge_expired_records(
+    await purge_expired_records(
         sb, llm_costs_days=365, notifications_sent_days=180, prescan_shadow_days=30
     )
     deletes = [(count, returning) for op, _, count, returning in sb.log if op == "delete"]
@@ -151,12 +158,13 @@ def test_uses_minimal_return_to_avoid_large_payloads() -> None:
         assert returning == "minimal"
 
 
-def test_idempotent_second_run_purges_nothing() -> None:
+@pytest.mark.asyncio
+async def test_idempotent_second_run_purges_nothing() -> None:
     sb = _seeded()
-    purge_expired_records(
+    await purge_expired_records(
         sb, llm_costs_days=365, notifications_sent_days=180, prescan_shadow_days=30
     )
-    second = purge_expired_records(
+    second = await purge_expired_records(
         sb, llm_costs_days=365, notifications_sent_days=180, prescan_shadow_days=30
     )
     assert second == {"llm_costs": 0, "notifications_sent": 0, "prescan_shadow": 0}
@@ -165,18 +173,38 @@ def test_idempotent_second_run_purges_nothing() -> None:
 def test_purge_endpoint_is_api_key_gated_and_returns_counts() -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import get_supabase, verify_api_key
+    from app.dependencies import verify_api_key
     from app.main import app
 
     sb = _seeded()
     app.dependency_overrides[verify_api_key] = lambda: None
-    app.dependency_overrides[get_supabase] = lambda: sb
     try:
-        client = TestClient(app)
-        resp = client.post("/admin/retention/purge")
+        # The route pulls the async service-role client directly (#57
+        # slice 1) rather than the request-scoped sync dependency.
+        with patch("app.routers.admin.get_async_supabase", return_value=sb):
+            client = TestClient(app)
+            resp = client.post("/admin/retention/purge")
     finally:
         app.dependency_overrides.clear()
 
     assert resp.status_code == 200
     # Defaults (365 / 180 / 30 days) purge the year-2000 sentinels.
     assert resp.json() == {"llm_costs": 2, "notifications_sent": 1, "prescan_shadow": 3}
+
+
+def test_purge_endpoint_503_when_async_client_uninitialized() -> None:
+    """No async client (e.g. Supabase unconfigured) → clean 503, not a crash."""
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import verify_api_key
+    from app.main import app
+
+    app.dependency_overrides[verify_api_key] = lambda: None
+    try:
+        with patch("app.routers.admin.get_async_supabase", return_value=None):
+            client = TestClient(app)
+            resp = client.post("/admin/retention/purge")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 503
