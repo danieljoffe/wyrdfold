@@ -15,6 +15,15 @@ when ingestion looks dead, so an operator finds out in hours, not weeks:
      running (``discovery_scheduler_enabled``). The same silent-freeze class
      one layer up: discovery quietly stopped producing sources and the
      catalog rotted for weeks (#60) before anyone noticed.
+  4. **LLM credit runway** — the OpenRouter key's remaining balance vs the
+     trailing spend rate; exhaustion 402s every grading stage silently
+     (three drains before this check existed).
+  5. **Leaked advisory lock** (#350) — a poll/discovery lock currently held
+     while the work it serializes is provably stale. The locks are
+     session-level and live on PostgREST's pooled backend, so an API death
+     mid-cycle leaks them and every later cycle "skips cleanly" (an INFO
+     log, invisible on prod). Postgres stores no lock-acquisition time, so
+     held-ness is paired with behavioral staleness instead.
 
 All are best-effort and never raise into the caller: a health-check
 query failure must not crash a poll cycle.
@@ -77,6 +86,9 @@ class IngestionHealthReport:
     credit_remaining_usd: float | None = None
     credit_runway_days: float | None = None
     low_credit: bool = False
+    held_advisory_locks: list[int] = field(default_factory=list)
+    stale_poll_lock: bool = False
+    stale_discovery_lock: bool = False
     alerts: list[str] = field(default_factory=list)
 
 
@@ -140,6 +152,54 @@ async def _newest_discovery_at(supabase: Client) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+async def _newest_source_polled_at(supabase: Client) -> datetime | None:
+    """``max(sources.last_polled_at)`` via a 1-row keyset read — the poll
+    cycle's behavioral freshness stamp (every polled source updates it, so it
+    advances continuously while any polling happens at all). ``nullsfirst=
+    False`` matters: PostgREST's DESC default puts NULLs first, and
+    never-polled sources would otherwise mask the real newest stamp."""
+    resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table("sources")
+            .select("last_polled_at")
+            .order("last_polled_at", desc=True, nullsfirst=False)
+            .limit(1)
+        ),
+        label="health newest-poll-stamp read",
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    raw = rows[0].get("last_polled_at")
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+async def _held_advisory_locks(supabase: Client) -> dict[int, dict[str, Any]]:
+    """Granted session advisory locks keyed by their bigint lock key (#350).
+
+    Reads the ``advisory_lock_info`` SECURITY DEFINER RPC (service-role
+    only); the RPC reassembles pg_locks' classid/objid split back into the
+    bigint the app locked with. Values carry holder diagnostics
+    (``pid`` / ``backend_start`` / ``application_name``) for the alarm text.
+    """
+    resp = await poll_db_read(
+        supabase,
+        lambda c: c.rpc("advisory_lock_info", {}),
+        label="health advisory-locks read",
+    )
+    held: dict[int, dict[str, Any]] = {}
+    for row in cast(list[dict[str, Any]], resp.data or []):
+        if row.get("granted") and row.get("lock_key") is not None:
+            held[int(row["lock_key"])] = row
+    return held
 
 
 async def _openrouter_remaining_usd(
@@ -323,6 +383,64 @@ async def check_ingestion_health(
                     _capture_alert(msg, level="error")
         except Exception:
             logger.exception("ingestion health: LLM credit probe failed")
+
+    # --- 5. Leaked advisory lock (#350) --------------------------------------
+    # A held lock is only a problem when the work it serializes is stale:
+    # a healthy in-flight cycle stamps sources/discoveries continuously, so
+    # fresh stamps + held lock = someone is legitimately mid-run. The
+    # scheduler calls this AFTER releasing its own lock, so a healthy tick
+    # never trips over its own hold. Runs even when polling is disabled —
+    # a lock leaked by a manual force-poll still blocks the next one.
+    stale_after_min = settings.advisory_lock_stale_after_minutes
+    if stale_after_min > 0:
+        try:
+            held = await _held_advisory_locks(supabase)
+            report.held_advisory_locks = sorted(held)
+            cutoff = moment - timedelta(minutes=stale_after_min)
+            runbook = (
+                "Clear with: select pg_terminate_backend(pid) from pg_locks "
+                "where locktype='advisory'; (#350)"
+            )
+
+            poll_lock_row = held.get(settings.poll_advisory_lock_key)
+            if poll_lock_row is not None:
+                newest_poll = await _newest_source_polled_at(supabase)
+                if newest_poll is None or newest_poll < cutoff:
+                    report.stale_poll_lock = True
+                    last_txt = newest_poll.isoformat() if newest_poll else "never"
+                    msg = (
+                        f"ingestion health: the POLL advisory lock "
+                        f"(key {settings.poll_advisory_lock_key}) is held by backend "
+                        f"pid={poll_lock_row.get('pid')} "
+                        f"(backend_start {poll_lock_row.get('backend_start')}) while the "
+                        f"newest sources.last_polled_at is {last_txt} "
+                        f"(threshold {stale_after_min}min) — likely LEAKED by a "
+                        f"mid-cycle death; every poll is silently skipping. {runbook}"
+                    )
+                    report.alerts.append(msg)
+                    logger.error(msg)
+                    _capture_alert(msg, level="error")
+
+            disc_lock_row = held.get(settings.discovery_advisory_lock_key)
+            if disc_lock_row is not None:
+                newest_disc = report.newest_discovery_at or await _newest_discovery_at(supabase)
+                if newest_disc is None or newest_disc < cutoff:
+                    report.stale_discovery_lock = True
+                    last_txt = newest_disc.isoformat() if newest_disc else "never"
+                    msg = (
+                        f"ingestion health: the DISCOVERY advisory lock "
+                        f"(key {settings.discovery_advisory_lock_key}) is held by backend "
+                        f"pid={disc_lock_row.get('pid')} "
+                        f"(backend_start {disc_lock_row.get('backend_start')}) while the "
+                        f"newest source_discoveries.discovered_at is {last_txt} "
+                        f"(threshold {stale_after_min}min) — likely LEAKED by a "
+                        f"mid-run death; discovery runs are silently skipping. {runbook}"
+                    )
+                    report.alerts.append(msg)
+                    logger.warning(msg)
+                    _capture_alert(msg, level="warning")
+        except Exception:
+            logger.exception("ingestion health: advisory-lock check failed")
 
     if not report.alerts:
         logger.info(

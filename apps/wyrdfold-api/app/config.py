@@ -629,6 +629,17 @@ class Settings(BaseSettings):
     # pg_try_advisory_lock and skips cleanly. The same generic
     # try_poll_advisory_lock / release_poll_advisory_lock RPCs back both keys.
     discovery_advisory_lock_key: int = 8675310
+    # Leaked-advisory-lock alarm (#350) — checked on the ingestion-health
+    # tick. The poll/discovery locks are session-level and live on PostgREST's
+    # pooled backend, so an API death mid-cycle leaks them and every later
+    # poll silently skips. Postgres records no lock-acquisition time, so the
+    # check pairs "lock currently held" (advisory_lock_info RPC) with
+    # behavioral staleness: alarm when a lock is held while the newest
+    # sources.last_polled_at / source_discoveries.discovered_at is older than
+    # this many minutes. Sized comfortably above a legitimate long hold (the
+    # poll watchdog caps cycles at poll_cycle_timeout_seconds = 20min; a full
+    # force-poll stamps sources continuously as it goes). 0 disables.
+    advisory_lock_stale_after_minutes: int = Field(default=90, ge=0, le=10080)
 
     @property
     def cors_allowed_origins_list(self) -> list[str]:

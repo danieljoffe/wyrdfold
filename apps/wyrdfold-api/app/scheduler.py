@@ -57,10 +57,14 @@ async def _run_scheduled_poll() -> None:
     that can't get the lock skips cleanly — another holder is already
     polling.
 
-    The ingestion health check runs every tick that acquires the lock
-    (cheap: two count queries + a 1-row read) so the "no new jobs in N
-    days" / mass-disable alerts fire even when the poll itself produces
-    nothing.
+    The ingestion health check runs on EVERY tick — including ticks that
+    could not take the lock. It used to live inside the acquired branch,
+    which meant a LEAKED advisory lock (#350: a mid-cycle death leaves the
+    lock with PostgREST's pooled backend, not the API process) silenced
+    not just polling but every alarm too — no-new-jobs / staleness /
+    credit-runway only ran when polling was already healthy. A lock-skipped
+    tick now still runs the checks, and the leaked-lock alarm inside them
+    pages on exactly that state.
 
     Errors are logged but never raised; APScheduler would otherwise
     suppress and we'd lose the trace.
@@ -76,39 +80,39 @@ async def _run_scheduled_poll() -> None:
                     "scheduled poll skipped — another poll holds the advisory lock (key=%s)",
                     settings.poll_advisory_lock_key,
                 )
-                return
-            # Watchdog: cap the cycle's wall-time so a HUNG cycle (a stuck
-            # httpx/LLM await during an upstream outage) can't wedge the
-            # scheduler — ``max_instances=1`` blocks the next tick while this
-            # one is still "running", so without this a hang stops ALL polling
-            # until a restart (the 402-storm incident, 2026-07-06). On timeout
-            # the cycle is cancelled, the advisory lock unwinds, and the next
-            # tick recovers. 0 disables.
-            timeout = settings.poll_cycle_timeout_seconds or None
-            try:
-                result = await asyncio.wait_for(poll_due_sources(client), timeout=timeout)
-            except TimeoutError:
-                logger.error(
-                    "scheduled poll: cycle exceeded the %ds watchdog and was "
-                    "aborted so the next tick can recover (a hung cycle "
-                    "otherwise wedges the scheduler until a restart)",
-                    settings.poll_cycle_timeout_seconds,
-                )
-                return
-            if result.sources_polled > 0:
-                job_list_cache.invalidate()
-            logger.info(
-                "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
-                result.sources_polled,
-                result.new_jobs,
-                result.updated_jobs,
-                result.archived_jobs,
-                len(result.errors),
-            )
-            # Health check piggybacks the locked poll tick so it can't
-            # race a concurrent poll and so it only runs on the replica
-            # actually driving ingestion.
-            await check_ingestion_health(client)
+            else:
+                # Watchdog: cap the cycle's wall-time so a HUNG cycle (a stuck
+                # httpx/LLM await during an upstream outage) can't wedge the
+                # scheduler — ``max_instances=1`` blocks the next tick while
+                # this one is still "running", so without this a hang stops
+                # ALL polling until a restart (the 402-storm incident,
+                # 2026-07-06). On timeout the cycle is cancelled, the advisory
+                # lock unwinds, and the next tick recovers. 0 disables.
+                timeout = settings.poll_cycle_timeout_seconds or None
+                try:
+                    result = await asyncio.wait_for(poll_due_sources(client), timeout=timeout)
+                except TimeoutError:
+                    logger.error(
+                        "scheduled poll: cycle exceeded the %ds watchdog and was "
+                        "aborted so the next tick can recover (a hung cycle "
+                        "otherwise wedges the scheduler until a restart)",
+                        settings.poll_cycle_timeout_seconds,
+                    )
+                else:
+                    if result.sources_polled > 0:
+                        job_list_cache.invalidate()
+                    logger.info(
+                        "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
+                        result.sources_polled,
+                        result.new_jobs,
+                        result.updated_jobs,
+                        result.archived_jobs,
+                        len(result.errors),
+                    )
+        # Outside the lock on purpose (see docstring); running after our own
+        # release also means the leaked-lock check never sees a healthy hold
+        # from this very tick.
+        await check_ingestion_health(client)
     except Exception:
         logger.exception("scheduled poll raised")
 
