@@ -756,3 +756,55 @@ async def test_refresh_all_noop_when_no_live_scores() -> None:
 
     assert await refresh_all_recency_scores(sb) == 0
     assert rpc_calls == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_poll_read_chunks_stay_url_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the 414 the #57 load test caught: the ``.in_()`` ID
+    reads ride the request URL, and 500 UUIDs build a ~19KB query string that
+    Kong rejects with "URI too long" — silently killing the refresh (fail-
+    soft) on any cycle bigger than a few hundred rows. Reads must chunk at
+    ``_RECENCY_READ_CHUNK_SIZE``; only the JSONB-body rpc write may batch at
+    the larger ``_RECENCY_CHUNK_SIZE``."""
+
+    read_chunks: list[int] = []
+    rpc_chunks: list[int] = []
+
+    class _Chain:
+        def select(self, *_a: Any, **_kw: Any) -> _Chain:
+            return self
+
+        def in_(self, _col: str, ids: list[str]) -> _Chain:
+            read_chunks.append(len(ids))
+            return self
+
+        async def execute(self) -> _Resp:
+            return _Resp([])
+
+    class _Client:
+        def table(self, _name: str) -> _Chain:
+            return _Chain()
+
+        def rpc(self, _name: str, params: dict[str, Any]) -> Any:
+            rpc_chunks.append(len(params["p_updates"]))
+
+            class _H:
+                async def execute(self) -> _Resp:
+                    return _Resp([])
+
+            return _H()
+
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: _Client())
+
+    ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(400)]
+    await refresh_recency_scores_poll(MagicMock(), ids)
+
+    # 400 ids at read-chunk 150 → 3 chunks per pass × 2 passes (jobs, scores).
+    assert len(read_chunks) == 6
+    assert all(n <= recency_mod._RECENCY_READ_CHUNK_SIZE for n in read_chunks)
+    assert max(read_chunks) == recency_mod._RECENCY_READ_CHUNK_SIZE
+    # Empty score reads → no updates → no rpc chunks in this run.
+    assert rpc_chunks == []

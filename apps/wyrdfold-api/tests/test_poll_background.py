@@ -1,20 +1,22 @@
-"""``POST /poll`` returns 202 and runs the force-poll in the background.
+"""``POST /poll`` returns 202 and runs the force-poll detached.
 
 The force-poll-all-sources route used to ``await`` the multi-minute poll
 inline, so a manual/external trigger held the request open past the
 edge's 300s timeout (curl got a 499/502 even when the poll was fine). It
-now schedules the poll via FastAPI ``BackgroundTasks`` and returns ``202``
-immediately.
+now spawns the poll as a DETACHED task (``app.background.spawn_detached``)
+and returns ``202`` immediately. Deliberately NOT starlette
+``BackgroundTasks``: with ``POLLER_ASYNC_DB`` on, the poll's async DB
+fan-out deadlocks the pooled httpx client inside the request's background
+machinery under uvloop (see ``app/background.py``).
 
 Two things are proven here:
   - the HTTP contract: ``POST /poll`` returns ``202 {"status": "scheduled"}``
-    and the poll is *scheduled* (queued as a background task), not awaited
-    inside the request handler; the response is produced before the poll
-    body runs.
-  - the background body (``run_force_poll_locked``): it routes through the
-    SAME advisory lock as the scheduler, so a manual trigger can't
-    double-poll alongside the scheduled tick; it skips cleanly when the
-    lock is held; and it never lets a backgrounded exception escape.
+    and the poll is *spawned detached*, never awaited inside the request
+    handler.
+  - the body (``run_force_poll_locked``): it routes through the SAME
+    advisory lock as the scheduler, so a manual trigger can't double-poll
+    alongside the scheduled tick; it skips cleanly when the lock is held;
+    and it never lets a backgrounded exception escape.
 """
 
 from __future__ import annotations
@@ -57,33 +59,34 @@ def test_poll_returns_202_with_scheduled_body() -> None:
             app.dependency_overrides.clear()
 
 
-def test_poll_schedules_background_task_not_awaited_inline() -> None:
-    """The poll runs as a background task: the response is produced BEFORE
-    the poll body runs, and the handler never awaits the poll itself.
+def test_poll_spawns_detached_and_never_awaits_inline() -> None:
+    """The handler hands the poll coroutine to ``spawn_detached`` and
+    returns — it must not await the poll itself, and it must not route it
+    through starlette BackgroundTasks (the uvloop + POLLER_ASYNC_DB
+    deadlock — see ``app/background.py``)."""
+    spawned: list[tuple[Any, str]] = []
 
-    We record ordering — the request handler returns, then the background
-    task fires. If the route had awaited the poll inline, the poll body
-    would run *during* the request (inside ``client.post``), not after it.
-    """
-    events: list[str] = []
+    def _capture(coro: Any, *, name: str) -> MagicMock:
+        spawned.append((coro, name))
+        return MagicMock()
 
-    async def _fake_force_poll() -> None:
-        events.append("poll_ran")
-
-    with patch("app.routers.poll.run_force_poll_locked", new=_fake_force_poll):
+    with (
+        patch("app.routers.poll.spawn_detached", side_effect=_capture),
+        patch("app.routers.poll.run_force_poll_locked", new=AsyncMock()) as body,
+    ):
         client = _client()
         try:
-            # Starlette's TestClient runs background tasks after sending
-            # the response. Record the moment the handler returns relative
-            # to the background body.
-            assert events == []  # nothing polled before the request
             res = client.post("/poll", headers={"x-api-key": "cronkey"})
             assert res.status_code == 202
-            # The background body ran (TestClient drains background tasks
-            # before returning from .post), proving it was *scheduled*...
-            assert events == ["poll_ran"]
+            # The coroutine was constructed and handed off — never awaited
+            # inside the request handler.
+            body.assert_called_once()
+            body.assert_not_awaited()
+            assert [name for _, name in spawned] == ["force-poll"]
         finally:
             app.dependency_overrides.clear()
+            for coro, _ in spawned:
+                coro.close()
 
 
 def test_poll_handler_does_not_call_poll_all_sources_inline() -> None:

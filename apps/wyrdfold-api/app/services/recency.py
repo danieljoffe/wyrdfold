@@ -44,10 +44,18 @@ RECENCY_GRACE_DAYS = 7
 RECENCY_DAILY_DECAY = 0.015
 RECENCY_FLOOR = 0.3
 
-# Chunk size for the bulk recency RPC payload. Matches the IN-chunk
-# sizing used elsewhere (target_scoring, jobs router) — keeps the JSONB
-# argument well under PostgREST's request limits.
+# Chunk size for the bulk recency RPC payload — it rides in a JSONB body,
+# so it only needs to stay under PostgREST's request-size limits.
 _RECENCY_CHUNK_SIZE = 500
+
+# Chunk size for the ``.in_(...)`` ID reads. These IDs travel in the request
+# URL (not a body), and 500 UUIDs build a ~19KB query string that Kong
+# rejects with 414 "URI too long" — the #57 load test caught the refresh
+# silently failing (fail-soft) on any cycle bigger than a few hundred rows.
+# 150 IDs ≈ 5.7KB stays comfortably under the ~8KB default limit; matches
+# the 100-200 sizing of the other in_-chunked reads (target_scoring, purge
+# guard).
+_RECENCY_READ_CHUNK_SIZE = 150
 
 # Page size for the full sweep's table walks. PostgREST caps a single
 # response at 1000 rows by default, so the sweep pages with ``.range()``.
@@ -137,8 +145,8 @@ async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[st
 
     # 1. Job ages (one property per posting, shared across its targets).
     age_by_job: dict[str, float] = {}
-    for i in range(0, len(unique_ids), _RECENCY_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _RECENCY_CHUNK_SIZE]
+    for i in range(0, len(unique_ids), _RECENCY_READ_CHUNK_SIZE):
+        chunk = unique_ids[i : i + _RECENCY_READ_CHUNK_SIZE]
         try:
             resp = await poll_db_read(
                 supabase,
@@ -153,8 +161,8 @@ async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[st
 
     # 2. Per-(job, target) score rows → recency_score updates.
     updates: list[dict[str, Any]] = []
-    for i in range(0, len(unique_ids), _RECENCY_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _RECENCY_CHUNK_SIZE]
+    for i in range(0, len(unique_ids), _RECENCY_READ_CHUNK_SIZE):
+        chunk = unique_ids[i : i + _RECENCY_READ_CHUNK_SIZE]
         try:
             resp = await poll_db_read(
                 supabase,

@@ -9,8 +9,9 @@ anyone pressing a button.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, Depends, status
 
+from app.background import spawn_detached
 from app.dependencies import verify_api_key
 from app.services.source_discovery import run_discovery_all_targets_locked
 
@@ -18,22 +19,29 @@ router = APIRouter(prefix="/discovery", tags=["discovery"], dependencies=[Depend
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
-async def trigger_discovery_run(background_tasks: BackgroundTasks) -> dict[str, str]:
+async def trigger_discovery_run() -> dict[str, str]:
     """Run source discovery across EVERY target (active + inactive).
 
     Returns ``202 Accepted`` immediately and runs the (~10-minute) discovery
-    pass in the background, so manual/external triggers stop hitting the edge's
-    300s timeout — the full pass used to run synchronously inside the request,
-    so a curl caller got a 499/502 timeout even when discovery itself was fine.
+    pass detached from the request, so manual/external triggers stop hitting
+    the edge's 300s timeout — the full pass used to run synchronously inside
+    the request, so a curl caller got a 499/502 timeout even when discovery
+    itself was fine.
 
-    The background pass is routed through ``run_discovery_all_targets_locked``,
-    which takes a Postgres advisory lock (DISTINCT from the poll lock): a manual
+    The pass is routed through ``run_discovery_all_targets_locked``, which
+    takes a Postgres advisory lock (DISTINCT from the poll lock): a manual
     trigger and the scheduled discovery tick can't run concurrently, and a
     trigger fired while a pass is already running logs "discovery already
-    running, skipping" and exits cleanly. The background task wraps the work in
+    running, skipping" and exits cleanly. The body wraps the work in
     try/except so a failure is logged rather than silently swallowed. The
     Brave-key gate still applies inside the run — an empty
     ``BRAVE_SEARCH_API_KEY`` makes every per-target pass a clean no-op.
+
+    Spawned via :func:`app.background.spawn_detached`, NOT starlette
+    ``BackgroundTasks`` — its advisory-lock RPCs (and, as slices of #57
+    land, its DB work) ride the pooled async client, which deadlocks inside
+    the request's background machinery under uvloop (see
+    ``app/background.py``).
     """
-    background_tasks.add_task(run_discovery_all_targets_locked)
+    spawn_detached(run_discovery_all_targets_locked(), name="discovery-run")
     return {"status": "scheduled"}
