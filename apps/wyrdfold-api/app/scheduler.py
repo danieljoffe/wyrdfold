@@ -40,7 +40,7 @@ from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
 from app.services.url_health import run_url_health_check
-from app.supabase_pool import get_supabase_pool
+from app.supabase_pool import get_async_supabase, get_supabase_pool
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -187,11 +187,11 @@ async def _run_scheduled_url_health() -> None:
     next page load.
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("scheduled url_health skipped — supabase client not initialized")
+            logger.warning("scheduled url_health skipped — async supabase client not initialized")
             return
-        await asyncio.to_thread(_record_scheduler_run, "url_health_check")
+        await _record_scheduler_run("url_health_check")
         summary = await run_url_health_check(client)
         if summary["archived"] > 0:
             job_list_cache.invalidate()
@@ -204,17 +204,18 @@ async def _run_scheduled_retention_purge() -> None:
 
     Same defensive shape as ``_run_scheduled_poll``: pull the singleton
     client, skip if uninitialized, never raise (APScheduler would swallow
-    it). The purge is synchronous (service-role supabase client), so it
-    runs in a worker thread to keep the event loop free.
+    it). The purge runs on the async service-role client (#57 slice 1),
+    awaited natively on the event loop — no worker-thread hop.
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("scheduled retention purge skipped — supabase client not initialized")
+            logger.warning(
+                "scheduled retention purge skipped — async supabase client not initialized"
+            )
             return
-        await asyncio.to_thread(_record_scheduler_run, "retention_purge")
-        report = await asyncio.to_thread(
-            purge_expired_records,
+        await _record_scheduler_run("retention_purge")
+        report = await purge_expired_records(
             client,
             llm_costs_days=settings.llm_costs_retention_days,
             notifications_sent_days=settings.notifications_sent_retention_days,
@@ -232,18 +233,21 @@ async def _run_scheduled_recency_refresh() -> None:
     The poller only refreshes recency for jobs it re-touched that cycle, so
     postings that age off the boards freeze their decay; this sweep keeps the
     stored sort key current for ALL live rows (see
-    ``app/services/recency.refresh_all_recency_scores``). Synchronous
-    (service-role client), so it runs in a worker thread to keep the event
-    loop free. Same defensive shape as the other ticks: skip if the client
-    isn't ready, never raise (APScheduler would swallow the trace).
+    ``app/services/recency.refresh_all_recency_scores``). Runs on the async
+    service-role client (#57 slice 1), awaited natively on the event loop —
+    no worker-thread hop. Same defensive shape as the other ticks: skip if
+    the client isn't ready, never raise (APScheduler would swallow the
+    trace).
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("scheduled recency refresh skipped — supabase client not initialized")
+            logger.warning(
+                "scheduled recency refresh skipped — async supabase client not initialized"
+            )
             return
-        await asyncio.to_thread(_record_scheduler_run, "recency_refresh")
-        written = await asyncio.to_thread(refresh_all_recency_scores, client)
+        await _record_scheduler_run("recency_refresh")
+        written = await refresh_all_recency_scores(client)
         if written > 0:
             # Cached list pages were sorted by the previous recency_score;
             # drop them so the refreshed ordering surfaces on next load.
@@ -264,36 +268,34 @@ async def _run_scheduled_recency_refresh() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _record_scheduler_run(job_id: str) -> None:
+async def _record_scheduler_run(job_id: str) -> None:
     """Stamp the ledger. Fail-soft: a marker write must never break the job
     (and pre-migration deploys simply log until the table exists)."""
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
             return
-        client.table("scheduler_runs").upsert(
-            {
-                "job_id": job_id,
-                "last_run_at": datetime.now(UTC).isoformat(),
-                "updated_at": datetime.now(UTC).isoformat(),
-            }
-        ).execute()
+        await (
+            client.table("scheduler_runs")
+            .upsert(
+                {
+                    "job_id": job_id,
+                    "last_run_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            .execute()
+        )
     except Exception:
         logger.warning("scheduler_runs stamp failed for %s (non-fatal)", job_id)
 
 
 async def _last_scheduler_run(job_id: str) -> datetime | None:
-    client = get_supabase_pool()
+    client = get_async_supabase()
     if client is None:
         return None
-    resp = await asyncio.to_thread(
-        lambda: (
-            client.table("scheduler_runs")
-            .select("last_run_at")
-            .eq("job_id", job_id)
-            .limit(1)
-            .execute()
-        )
+    resp = await (
+        client.table("scheduler_runs").select("last_run_at").eq("job_id", job_id).limit(1).execute()
     )
     rows = cast("list[dict[str, object]]", resp.data or [])
     if not rows:

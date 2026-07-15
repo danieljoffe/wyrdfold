@@ -5,11 +5,12 @@ otherwise pruned. This service deletes rows older than a configured
 window so the data-retention posture is an explicit, bounded choice
 rather than "keep operational PII forever by default".
 
-Runs with the **service-role** client — background maintenance with no
-JWT. Each delete is a single filtered statement (``WHERE ts < cutoff``),
-so there is no id-list to marshal and ``returning="minimal"`` keeps the
-response small even on a large first sweep; the count comes from the
-``Content-Range`` header (``resp.count``).
+Runs with the **async service-role** client (#57 slice 1) — background
+maintenance with no JWT, awaited directly on the event loop instead of
+hopping through ``asyncio.to_thread``. Each delete is a single filtered
+statement (``WHERE ts < cutoff``), so there is no id-list to marshal and
+``returning="minimal"`` keeps the response small even on a large first
+sweep; the count comes from the ``Content-Range`` header (``resp.count``).
 
 Window semantics: ``days <= 0`` means **retain indefinitely** — that
 table is skipped. The defaults (set in ``config.py``) are deliberately
@@ -34,7 +35,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from postgrest.types import CountMethod, ReturnMethod
-from supabase import Client
+from supabase import AsyncClient
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ _NOTIFICATIONS = ("notifications_sent", "sent_at")
 _PRESCAN_SHADOW = ("prescan_shadow", "observed_at")
 
 
-def _purge_table(supabase: Client, table: str, ts_col: str, days: int) -> int:
+async def _purge_table(supabase: AsyncClient, table: str, ts_col: str, days: int) -> int:
     """Delete rows in ``table`` whose ``ts_col`` is older than ``days``.
 
     ``days <= 0`` retains indefinitely (skipped). Returns the number of
@@ -54,7 +55,7 @@ def _purge_table(supabase: Client, table: str, ts_col: str, days: int) -> int:
         logger.info("retention: %s retained indefinitely (days=%d)", table, days)
         return 0
     cutoff = datetime.now(UTC) - timedelta(days=days)
-    resp = (
+    resp = await (
         supabase.table(table)
         .delete(count=CountMethod.exact, returning=ReturnMethod.minimal)
         .lt(ts_col, cutoff.isoformat())
@@ -71,8 +72,8 @@ def _purge_table(supabase: Client, table: str, ts_col: str, days: int) -> int:
     return deleted
 
 
-def purge_expired_records(
-    supabase: Client,
+async def purge_expired_records(
+    supabase: AsyncClient,
     *,
     llm_costs_days: int,
     notifications_sent_days: int,
@@ -83,7 +84,7 @@ def purge_expired_records(
     Idempotent — a second run within the same window deletes nothing.
     """
     return {
-        _LLM_COSTS[0]: _purge_table(supabase, *_LLM_COSTS, llm_costs_days),
-        _NOTIFICATIONS[0]: _purge_table(supabase, *_NOTIFICATIONS, notifications_sent_days),
-        _PRESCAN_SHADOW[0]: _purge_table(supabase, *_PRESCAN_SHADOW, prescan_shadow_days),
+        _LLM_COSTS[0]: await _purge_table(supabase, *_LLM_COSTS, llm_costs_days),
+        _NOTIFICATIONS[0]: await _purge_table(supabase, *_NOTIFICATIONS, notifications_sent_days),
+        _PRESCAN_SHADOW[0]: await _purge_table(supabase, *_PRESCAN_SHADOW, prescan_shadow_days),
     }

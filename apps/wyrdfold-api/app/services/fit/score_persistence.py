@@ -165,7 +165,7 @@ async def score_with_phase2_and_persist(
             "scored_profile_version": target.profile_version,
             # Keep the recency invariant (recency_score == score when
             # decay is off). When decay is on the poller's
-            # refresh_recency_scores pass overwrites this with the
+            # refresh_recency_scores_poll pass overwrites this with the
             # age-decayed value later in the same cycle.
             "recency_score": fit.fit_score,
             "updated_at": datetime.now(UTC).isoformat(),

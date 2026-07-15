@@ -1132,9 +1132,11 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "get_latest_optimized", lambda _sb, _uid: doc)
-    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", MagicMock())
-    monkeypatch.setattr(poller_mod, "target_score_and_upsert", MagicMock())
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", MagicMock())
+    # The scoring helpers are the async ``*_poll`` seam variants now (#57) —
+    # the poller awaits them directly, so their stand-ins must be awaitable.
+    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
     monkeypatch.setattr(poller_mod, "run_phase2_for_jobs", fake_phase2)
     monkeypatch.setattr(poller_mod, "_run_llm_scoring_for_row", fake_legacy)
 
@@ -1316,3 +1318,189 @@ async def test_no_candidates_leaves_last_candidate_at_unstamped(monkeypatch):
     payload = sources_table.update.call_args.args[0]
     assert "last_candidate_at" not in payload
     assert "last_polled_at" in payload
+
+
+# ---- POLLER_ASYNC_DB flag-on: the whole cycle rides the async client (#57) --
+
+
+class _SyncClientForbidden:
+    """Stand-in for the sync service-role client that MUST stay untouched
+    when the flag is on and the async client is up: any attribute access is
+    a test failure. The poller still passes this object around (it is the
+    fail-safe fallback), but no seam call may build a query on it."""
+
+    def __getattr__(self, name: str):  # pragma: no cover - failure path
+        raise AssertionError(f"sync supabase client touched via .{name} with flag on")
+
+
+class _AsyncChain:
+    """One query chain on the fake async client: records ops, returns self
+    for any builder method, async-executes via the parent's router."""
+
+    def __init__(self, parent: "_AsyncSeamClient", ops: list) -> None:
+        self._parent = parent
+        self.ops = ops
+
+    def __getattr__(self, name: str):
+        if name == "not_":
+            self.ops.append(("not_",))
+            return self
+
+        def _record(*args, **kwargs):
+            self.ops.append((name, args, kwargs))
+            return self
+
+        return _record
+
+    async def execute(self):
+        self._parent.executed.append(self.ops)
+        return self._parent.respond(self.ops)
+
+
+class _AsyncSeamClient:
+    """Generic async supabase stand-in: every table()/rpc() starts a fresh
+    recorded chain; ``respond`` synthesizes realistic response shapes for
+    the queries one ``_poll_one_source`` cycle issues."""
+
+    def __init__(self) -> None:
+        self.executed: list[list] = []
+
+    def table(self, name: str) -> _AsyncChain:
+        return _AsyncChain(self, [("table", name)])
+
+    def rpc(self, name: str, params: dict) -> _AsyncChain:
+        return _AsyncChain(self, [("rpc", name, params)])
+
+    @staticmethod
+    def _resp(data):
+        resp = MagicMock()
+        resp.data = data
+        return resp
+
+    def respond(self, ops: list):
+        head = ops[0]
+        if head[0] == "rpc":
+            # source_live_unengaged_jobs / get_jobs_by_ids /
+            # get_job_scores_by_ids / bulk_update_scores → empty sets are
+            # valid for a first-poll cycle.
+            return self._resp([])
+        table = head[1]
+        op_names = {o[0] for o in ops[1:]}
+        if table == "jobs" and "upsert" in op_names:
+            rows = next(o[1][0] for o in ops[1:] if o[0] == "upsert")
+            return self._resp(
+                [
+                    {
+                        **row,
+                        "id": f"job-{row['external_id']}",
+                        "created_at": "2026-07-15T00:00:00Z",
+                        "updated_at": "2026-07-15T00:00:00Z",
+                    }
+                    for row in rows
+                ]
+            )
+        if table == "scores" and "upsert" in op_names:
+            row = next(o[1][0] for o in ops[1:] if o[0] == "upsert")
+            return self._resp(
+                [
+                    {
+                        **row,
+                        "id": f"score-{row['job_posting_id']}",
+                        "created_at": "2026-07-15T00:00:00Z",
+                        "updated_at": "2026-07-15T00:00:00Z",
+                    }
+                ]
+            )
+        # selects (purge guard, etc.) and updates (mark-polled) — empty data.
+        return self._resp([])
+
+    def chains(self, *prefix) -> list[list]:
+        """Executed chains whose head matches ``prefix`` (e.g. ("table",
+        "jobs"))."""
+        return [ops for ops in self.executed if tuple(ops[0][: len(prefix)]) == prefix]
+
+
+@pytest.mark.asyncio
+async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatch):
+    """End-to-end ``_poll_one_source`` with POLLER_ASYNC_DB on: every DB
+    touch (existing-rows read, purge guard, jobs upsert, Stage 1/2 score
+    upserts through the ``*_poll`` seam variants, global-score RPC,
+    mark-polled update) must execute on the async client; the sync client
+    must never even be attribute-accessed."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import db_write
+    from app.services import poller as poller_mod
+    from app.services.targets.payers import PayerBudgetGate
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    monkeypatch.setattr(live_settings, "phase2_enabled", False)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+    monkeypatch.setattr(live_settings, "qualification_enabled", False)
+    monkeypatch.setattr(live_settings, "prescan_embed_enabled", False)
+    monkeypatch.setattr(live_settings, "prescan_shadow_enabled", False)
+    monkeypatch.setattr(live_settings, "recency_decay_enabled", False)
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+
+    async_client = _AsyncSeamClient()
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+    # poll_lock and any other module-level import of the getter must agree,
+    # but _poll_one_source itself never takes the lock — db_write is enough.
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            _job("a-1", "Staff Frontend Engineer", "Remote, USA"),
+            _job("a-2", "Senior React Engineer", "New York, NY"),
+        ]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(
+        poller_mod,
+        "notify",
+        MagicMock(send_alerts_for_new_jobs=AsyncMock(), send_sms_alerts_for_new_jobs=AsyncMock()),
+    )
+
+    target = _full_target(is_active=True, search_keywords=["frontend engineer", "react"])
+    sync_client = _SyncClientForbidden()
+
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE),
+        sync_client,
+        PayerBudgetGate(),
+        active_targets=[target],
+        stage3_users=({}, {}),
+    )
+
+    assert summary["error"] is None
+    assert summary["polled"] is True
+    assert summary["new"] == 2
+
+    # The jobs upsert ran on the async client with both rows.
+    jobs_upserts = [
+        ops
+        for ops in async_client.chains("table", "jobs")
+        if any(o[0] == "upsert" for o in ops[1:])
+    ]
+    assert len(jobs_upserts) == 1
+    upserted = next(o[1][0] for o in jobs_upserts[0][1:] if o[0] == "upsert")
+    assert [r["external_id"] for r in upserted] == ["a-1", "a-2"]
+
+    # Stage 1 + Stage 2 score upserts (2 jobs x 1 target x 2 stages).
+    score_upserts = [
+        ops
+        for ops in async_client.chains("table", "scores")
+        if any(o[0] == "upsert" for o in ops[1:])
+    ]
+    assert len(score_upserts) == 4
+
+    # Global-score aggregation RPC ran on the async client too.
+    assert async_client.chains("rpc", "bulk_update_scores")
+
+    # Mark-polled update landed on sources via the async client.
+    source_updates = [
+        ops
+        for ops in async_client.chains("table", "sources")
+        if any(o[0] == "update" for o in ops[1:])
+    ]
+    assert source_updates, "mark-polled update must ride the async client"

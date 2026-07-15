@@ -229,6 +229,14 @@ class Settings(BaseSettings):
     # off; flipped per the migration rollout after the before/after load test.
     poller_async_db: bool = False
 
+    # Synthetic "mock" board provider for local load testing (#57). When True,
+    # a source row with ``provider='mock'`` synthesizes a deterministic job
+    # feed in-process (no network) so a poll burst is reproducible without
+    # hammering real ATS boards. OFF by default and must stay off in prod: a
+    # mistyped provider on a real source must fail its poll, not fabricate
+    # jobs. See app/services/mock_board.py.
+    mock_fetcher_enabled: bool = False
+
     # Retention purge for append-only operational logs (#29 P3). OFF by
     # default — opt-in via RETENTION_PURGE_ENABLED, so self-host keeps
     # every row until an operator chooses a window. When on, the scheduler

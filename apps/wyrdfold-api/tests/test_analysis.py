@@ -441,8 +441,13 @@ async def test_poller_stage3_persists_under_doc_owner_then_reuses_cache(
 
     monkeypatch.setattr(poller_mod, "get_cached_analysis", fake_get_cached)
     monkeypatch.setattr(poller_mod, "persist_analysis", fake_persist)
+
     # Don't touch the real DB for the score-blend writes / mark-complete.
-    monkeypatch.setattr(poller_mod, "mark_target_scores_complete", lambda *_a, **_k: None)
+    # mark-complete is the awaited ``mark_complete_poll`` seam variant (#57).
+    async def _noop_mark_complete(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(poller_mod, "mark_target_scores_complete", _noop_mark_complete)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", lambda *_a, **_k: None)
 
     llm = MockLLMClient(scripted={"poll_scoring": _valid_analysis_json()})

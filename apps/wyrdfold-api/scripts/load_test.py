@@ -50,10 +50,10 @@ import httpx
 ENDPOINTS: list[tuple[str, str]] = [
     ("GET", "/jobs?limit=50"),
     ("GET", "/jobs?limit=50&search=engineer"),
+    ("GET", "/jobs/pipeline-counts"),
     ("GET", "/insights/pipeline"),
     ("GET", "/insights/targets"),
     ("GET", "/insights/skills-cost"),
-    ("GET", "/targets"),
     ("GET", "/targets/mine"),
     ("GET", "/targets/active"),
     ("GET", "/experience/optimized"),

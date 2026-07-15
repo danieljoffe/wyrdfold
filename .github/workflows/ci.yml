@@ -93,11 +93,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Fails on any known advisory in the production dependency tree.
-      # Dev-chain advisories are handled via pnpm overrides (see #21);
-      # production must stay at zero.
-      - name: Audit production dependencies
-        run: pnpm audit --prod
+      # Fails on any known advisory in the dependency tree. `pnpm audit`
+      # died 2026-07-15 when npm retired its classic audit endpoint (410;
+      # pnpm 10/11 still call it), so the gate queries the OSV database
+      # directly — same source the python job's pip-audit uses. Stricter
+      # than the old `--prod` scope: dev-chain advisories block too, and
+      # are fixed via overrides in pnpm-workspace.yaml.
+      - name: Audit dependencies (OSV)
+        run: |
+          curl -sSL -o /tmp/osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64
+          chmod +x /tmp/osv-scanner
+          /tmp/osv-scanner --lockfile=pnpm-lock.yaml
 
       # run-many (not affected) — only 3 projects; local Nx cache plus the
       # pnpm store cache keep this fast. wyrdfold-api is Python; it runs
