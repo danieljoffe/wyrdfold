@@ -1,22 +1,27 @@
-"""Poll-cycle DB-write routing — the async/sync seam + the write-herd cap.
+"""Poll-cycle DB routing — the async/sync seam + the write-herd cap.
 
-Every write the poll cycle issues routes through :func:`poll_db_write`, which
-picks the backend by the ``POLLER_ASYNC_DB`` flag:
+Every write the poll cycle issues routes through :func:`poll_db_write`, and
+every direct read through :func:`poll_db_read`. Both pick the backend by the
+``POLLER_ASYNC_DB`` flag:
 
-- **flag on + async client up** — run the write natively on the event loop via
+- **flag on + async client up** — run the query natively on the event loop via
   the pooled HTTP/2 ``AsyncClient`` (#225). Async I/O doesn't occupy an
-  executor thread, so the poll's write fan-out stops starving the threads that
+  executor thread, so the poll's DB fan-out stops starving the threads that
   interactive requests need — the #57 regression this targets.
-- **otherwise** — the #107 path: the sync client in a thread, under the
-  cycle-wide write semaphore. This is also the fail-safe: a missing async
-  client silently falls back to sync, so the flag never drops a write.
+- **otherwise** — the #107 path: the sync client in a thread. This is also the
+  fail-safe: a missing async client silently falls back to sync, so the flag
+  never drops a query.
 
-Both paths retry transient transport blips (idempotent writes only — see
-:mod:`app.services.supabase_retry`) and are bounded by ``DB_WRITE_CONCURRENCY``
-so the burst can't thundering-herd the Supabase pooler.
+Writes additionally retry transient transport blips (idempotent writes only —
+see :mod:`app.services.supabase_retry`) and are bounded by
+``DB_WRITE_CONCURRENCY`` on both paths so the burst can't thundering-herd the
+Supabase pooler. Reads skip the write semaphore (they never did hold it on the
+sync path, and coupling read latency to the write herd would slow the cycle);
+their concurrency is bounded by the source fan-out itself plus, on the async
+path, the client's connection limits.
 
 The semaphore + thread-runner live here (not in the poller) so every service
-module that issues poll writes can share them without importing the poller.
+module that issues poll queries can share them without importing the poller.
 """
 
 from __future__ import annotations
@@ -89,3 +94,37 @@ async def poll_db_write(
             async with _db_write_semaphore():
                 return await execute_with_retry(build(async_sb).execute, label=label)
     return await db_to_thread(lambda: execute_with_retry_sync(build(supabase).execute, label=label))
+
+
+async def poll_db_read(
+    supabase: Any,
+    build: Callable[..., Any],
+    *,
+    label: str,
+    retry_sync: bool = False,
+) -> Any:
+    """Execute one poll-cycle read, async-on-loop or sync-in-thread by flag.
+
+    Same ``build(client)`` contract as :func:`poll_db_write`, minus the write
+    semaphore: poll reads never held it on the sync path (only the write herd
+    is capped), and serializing reads behind the write burst would slow the
+    cycle for no pooler benefit — read concurrency is already bounded by the
+    source fan-out (``POLL_CONCURRENCY``) and, on the async path, the pooled
+    client's connection limits.
+
+    ``retry_sync`` mirrors the pre-seam behavior of each call site: the few
+    reads that already wrapped ``execute_with_retry_sync`` keep their retry on
+    the sync path; the rest stay bare so the flag-off path is byte-for-byte
+    today's behavior. The async path always retries — a re-issued read is
+    harmless and the pooled h2 connection is where transient stream drops
+    live.
+    """
+    if settings.poller_async_db:
+        async_sb = get_async_supabase()
+        if async_sb is not None:
+            return await execute_with_retry(build(async_sb).execute, label=label)
+    if retry_sync:
+        return await asyncio.to_thread(
+            lambda: execute_with_retry_sync(build(supabase).execute, label=label)
+        )
+    return await asyncio.to_thread(build(supabase).execute)

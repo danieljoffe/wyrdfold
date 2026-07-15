@@ -2,8 +2,9 @@
 
 Covers the pure decay math (``compute_recency_multiplier`` /
 ``compute_recency_score``), the poller-side refresh pass
-(``refresh_recency_scores``), and the /jobs two-query ordering when the
-``RECENCY_DECAY_ENABLED`` flag is on.
+(``refresh_recency_scores_poll`` — flag-off sync-in-thread AND flag-on
+async-client routing through the #57 seam), and the /jobs two-query
+ordering when the ``RECENCY_DECAY_ENABLED`` flag is on.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import app.services.recency as recency_mod
 from app.config import settings
 from app.models.targets import AxisWeights
 from app.routers.jobs import (
@@ -21,13 +23,14 @@ from app.routers.jobs import (
     _list_jobs_across_user_targets,
     _list_jobs_for_target_two_query,
 )
+from app.services import db_write
 from app.services.recency import (
     RECENCY_FLOOR,
     compute_recency_multiplier,
     compute_recency_score,
     display_recency_score,
     refresh_all_recency_scores,
-    refresh_recency_scores,
+    refresh_recency_scores_poll,
 )
 
 # ---- Pure decay math -------------------------------------------------------
@@ -69,7 +72,7 @@ def test_compute_recency_score_enabled_applies_decay() -> None:
     assert compute_recency_score(90, age_days=400, enabled=True) == 27
 
 
-# ---- refresh_recency_scores ------------------------------------------------
+# ---- refresh_recency_scores_poll -------------------------------------------
 
 
 class _Resp:
@@ -115,7 +118,8 @@ def _refresh_supabase(
     return sb
 
 
-def test_refresh_applies_decay_per_row_when_enabled(
+@pytest.mark.asyncio
+async def test_refresh_applies_decay_per_row_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
@@ -134,7 +138,7 @@ def test_refresh_applies_decay_per_row_when_enabled(
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _refresh_supabase(jobs, scores, rpc_calls)
 
-    written = refresh_recency_scores(sb, ["j-fresh", "j-old"])
+    written = await refresh_recency_scores_poll(sb, ["j-fresh", "j-old"])
 
     assert written == 3
     assert len(rpc_calls) == 1
@@ -146,7 +150,8 @@ def test_refresh_applies_decay_per_row_when_enabled(
     assert by_id["s3"] == 28  # round(40 * 0.70)
 
 
-def test_refresh_mirrors_score_when_disabled(
+@pytest.mark.asyncio
+async def test_refresh_mirrors_score_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
@@ -156,16 +161,175 @@ def test_refresh_mirrors_score_when_disabled(
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _refresh_supabase(jobs, scores, rpc_calls)
 
-    refresh_recency_scores(sb, ["j-old"])
+    await refresh_recency_scores_poll(sb, ["j-old"])
 
     by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
     assert by_id["s1"] == 90  # flag off → recency mirrors raw score
 
 
-def test_refresh_noop_on_empty_input() -> None:
+@pytest.mark.asyncio
+async def test_refresh_noop_on_empty_input() -> None:
     sb = MagicMock()
-    assert refresh_recency_scores(sb, []) == 0
+    assert await refresh_recency_scores_poll(sb, []) == 0
     sb.rpc.assert_not_called()
+
+
+# ---- refresh_recency_scores_poll on the #57 async seam ----------------------
+
+
+class _AsyncReadChain:
+    """Async twin of ``_TableChain``: what the seam's ``build`` closure chains
+    on the pooled ``AsyncClient`` when ``POLLER_ASYNC_DB`` is on."""
+
+    def __init__(self, client: _AsyncSeamClient, resp: _Resp, fail: bool) -> None:
+        self._client = client
+        self._resp = resp
+        self._fail = fail
+
+    def select(self, *_a: Any, **_kw: Any) -> _AsyncReadChain:
+        return self
+
+    def in_(self, *_a: Any, **_kw: Any) -> _AsyncReadChain:
+        return self
+
+    async def execute(self) -> _Resp:
+        self._client.executed += 1
+        if self._fail:
+            raise Exception("db down")
+        return self._resp
+
+
+class _AsyncRpcHandle:
+    """Async rpc handle; raises on execute when the chunk is marked to fail."""
+
+    def __init__(self, client: _AsyncSeamClient, fail: bool) -> None:
+        self._client = client
+        self._fail = fail
+
+    async def execute(self) -> _Resp:
+        self._client.executed += 1
+        if self._fail:
+            raise Exception("bulk chunk failed")
+        return _Resp([])
+
+
+class _AsyncSeamClient:
+    """Async-client stand-in handed to ``build`` by the #57 seam: answers the
+    jobs/scores reads, records rpc calls, and counts every ``execute``.
+    ``fail_rpc`` marks which rpc calls (1-based) blow up; ``fail_jobs_read``
+    makes the jobs fetch raise."""
+
+    def __init__(
+        self,
+        jobs: list[dict[str, Any]],
+        scores: list[dict[str, Any]],
+        *,
+        fail_rpc: set[int] | None = None,
+        fail_jobs_read: bool = False,
+    ) -> None:
+        self._jobs = jobs
+        self._scores = scores
+        self._fail_rpc = fail_rpc or set()
+        self._fail_jobs_read = fail_jobs_read
+        self.executed = 0
+        self.rpc_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def table(self, name: str) -> _AsyncReadChain:
+        if name == "jobs":
+            return _AsyncReadChain(self, _Resp(self._jobs), fail=self._fail_jobs_read)
+        return _AsyncReadChain(self, _Resp(self._scores), fail=False)
+
+    def rpc(self, name: str, params: dict[str, Any]) -> _AsyncRpcHandle:
+        self.rpc_calls.append((name, params))
+        return _AsyncRpcHandle(self, fail=len(self.rpc_calls) in self._fail_rpc)
+
+
+def _flag_on(monkeypatch: pytest.MonkeyPatch, async_client: _AsyncSeamClient) -> None:
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+
+
+@pytest.mark.asyncio
+async def test_refresh_poll_flag_on_reads_and_writes_on_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POLLER_ASYNC_DB on: both reads AND the bulk-update rpc execute on the
+    pooled async client, the sync client is never touched, and the decay math
+    is byte-identical to the flag-off path."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    fresh = datetime.now(UTC).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
+    jobs = [
+        {"id": "j-fresh", "first_seen_at": fresh},
+        {"id": "j-old", "first_seen_at": old},
+    ]
+    scores = [
+        {"id": "s1", "job_posting_id": "j-fresh", "score": 80},
+        {"id": "s2", "job_posting_id": "j-old", "score": 90},
+        {"id": "s3", "job_posting_id": "j-old", "score": 40},
+    ]
+    async_client = _AsyncSeamClient(jobs, scores)
+    _flag_on(monkeypatch, async_client)
+    sync_sb = MagicMock()
+
+    written = await refresh_recency_scores_poll(sync_sb, ["j-fresh", "j-old"])
+
+    assert written == 3
+    # jobs read + scores read + rpc write, all on the async client.
+    assert async_client.executed == 3
+    sync_sb.table.assert_not_called()
+    sync_sb.rpc.assert_not_called()
+    assert len(async_client.rpc_calls) == 1
+    name, params = async_client.rpc_calls[0]
+    assert name == "bulk_update_recency_scores"
+    by_id = {u["id"]: u["recency_score"] for u in params["p_updates"]}
+    assert by_id["s1"] == 80  # fresh → no decay
+    assert by_id["s2"] == 63  # round(90 * 0.70)
+    assert by_id["s3"] == 28  # round(40 * 0.70)
+
+
+@pytest.mark.asyncio
+async def test_refresh_poll_flag_on_failed_chunk_counts_zero_others_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed bulk-update chunk is logged and counts 0 while the remaining
+    chunks still land — one bad batch must never abort the pass."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    monkeypatch.setattr(recency_mod, "_RECENCY_CHUNK_SIZE", 2)
+    now_iso = datetime.now(UTC).isoformat()
+    jobs = [
+        {"id": "j1", "first_seen_at": now_iso},
+        {"id": "j2", "first_seen_at": now_iso},
+    ]
+    # 3 updates with chunk size 2 → chunks [s1, s2] and [s3].
+    scores = [
+        {"id": "s1", "job_posting_id": "j1", "score": 80},
+        {"id": "s2", "job_posting_id": "j1", "score": 90},
+        {"id": "s3", "job_posting_id": "j2", "score": 40},
+    ]
+    async_client = _AsyncSeamClient(jobs, scores, fail_rpc={1})
+    _flag_on(monkeypatch, async_client)
+
+    written = await refresh_recency_scores_poll(MagicMock(), ["j1", "j2"])
+
+    # First chunk (2 rows) failed → 0; second chunk (1 row) landed.
+    assert written == 1
+    assert len(async_client.rpc_calls) == 2  # both chunks attempted
+    assert [u["id"] for u in async_client.rpc_calls[0][1]["p_updates"]] == ["s1", "s2"]
+    assert [u["id"] for u in async_client.rpc_calls[1][1]["p_updates"]] == ["s3"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_poll_flag_on_jobs_read_failure_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A jobs-fetch error is swallowed: return 0, never raise into the poll
+    cycle, and never reach the rpc."""
+    async_client = _AsyncSeamClient([], [], fail_jobs_read=True)
+    _flag_on(monkeypatch, async_client)
+
+    assert await refresh_recency_scores_poll(MagicMock(), ["j1"]) == 0
+    assert async_client.rpc_calls == []
 
 
 # ---- /jobs ordering by recency_score ---------------------------------------
@@ -592,3 +756,55 @@ async def test_refresh_all_noop_when_no_live_scores() -> None:
 
     assert await refresh_all_recency_scores(sb) == 0
     assert rpc_calls == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_poll_read_chunks_stay_url_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the 414 the #57 load test caught: the ``.in_()`` ID
+    reads ride the request URL, and 500 UUIDs build a ~19KB query string that
+    Kong rejects with "URI too long" — silently killing the refresh (fail-
+    soft) on any cycle bigger than a few hundred rows. Reads must chunk at
+    ``_RECENCY_READ_CHUNK_SIZE``; only the JSONB-body rpc write may batch at
+    the larger ``_RECENCY_CHUNK_SIZE``."""
+
+    read_chunks: list[int] = []
+    rpc_chunks: list[int] = []
+
+    class _Chain:
+        def select(self, *_a: Any, **_kw: Any) -> _Chain:
+            return self
+
+        def in_(self, _col: str, ids: list[str]) -> _Chain:
+            read_chunks.append(len(ids))
+            return self
+
+        async def execute(self) -> _Resp:
+            return _Resp([])
+
+    class _Client:
+        def table(self, _name: str) -> _Chain:
+            return _Chain()
+
+        def rpc(self, _name: str, params: dict[str, Any]) -> Any:
+            rpc_chunks.append(len(params["p_updates"]))
+
+            class _H:
+                async def execute(self) -> _Resp:
+                    return _Resp([])
+
+            return _H()
+
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: _Client())
+
+    ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(400)]
+    await refresh_recency_scores_poll(MagicMock(), ids)
+
+    # 400 ids at read-chunk 150 → 3 chunks per pass x 2 passes (jobs, scores).
+    assert len(read_chunks) == 6
+    assert all(n <= recency_mod._RECENCY_READ_CHUNK_SIZE for n in read_chunks)
+    assert max(read_chunks) == recency_mod._RECENCY_READ_CHUNK_SIZE
+    # Empty score reads → no updates → no rpc chunks in this run.
+    assert rpc_chunks == []

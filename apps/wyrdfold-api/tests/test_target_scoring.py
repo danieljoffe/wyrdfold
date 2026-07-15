@@ -870,3 +870,543 @@ def test_batch_update_global_scores_aggregates_each_job_graded_first() -> None:
     assert name == "bulk_update_scores"
     by_id = {u["id"]: u["score"] for u in payload["p_updates"]}
     assert by_id == {"job-1": 90, "job-2": 30}
+
+
+# ---------------------------------------------------------------------------
+# Async-seam poll variants (#57 slice 2)
+#
+# The ``*_poll`` functions are the poller's seam twins of the sync originals:
+# identical compute + payload, with the DB hop routed through
+# ``app.services.db_write.poll_db_write`` / ``poll_db_read``. These tests
+# mirror tests/test_db_write.py's recorder pattern — a chainable query-builder
+# stand-in that records ops and answers ``execute()`` from a queue, in a sync
+# and an async flavour. The drift guards pin the sync/poll pairs together
+# until #57 slice 4 collapses them.
+# ---------------------------------------------------------------------------
+
+
+class _SeamRecorder:
+    """Chainable supabase-client stand-in: records the query chain in ``ops``
+    and answers ``execute()`` either from ``rows_by_job`` (filtered on the
+    ids of the preceding ``.in_()`` — deterministic regardless of chunk
+    order) or by popping the next queued response (empty when exhausted).
+    """
+
+    def __init__(
+        self,
+        responses: list[list[dict[str, Any]]] | None = None,
+        rows_by_job: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        self.ops: list[tuple[Any, ...]] = []
+        self.executed = 0
+        self.responses = list(responses or [])
+        self.rows_by_job = rows_by_job
+        self._pending_in_ids: list[str] | None = None
+
+    # -- chainable query-builder methods (each records and returns self) --
+    def table(self, name: str) -> _SeamRecorder:
+        self.ops.append(("table", name))
+        return self
+
+    def select(self, *cols: str) -> _SeamRecorder:
+        self.ops.append(("select", *cols))
+        return self
+
+    def eq(self, col: str, val: Any) -> _SeamRecorder:
+        self.ops.append(("eq", col, val))
+        return self
+
+    def lt(self, col: str, val: Any) -> _SeamRecorder:
+        self.ops.append(("lt", col, val))
+        return self
+
+    def in_(self, col: str, vals: list[str]) -> _SeamRecorder:
+        self.ops.append(("in_", col, list(vals)))
+        self._pending_in_ids = list(vals)
+        return self
+
+    def upsert(self, row: Any, **kwargs: Any) -> _SeamRecorder:
+        self.ops.append(("upsert", row, kwargs))
+        return self
+
+    def update(self, payload: dict[str, Any]) -> _SeamRecorder:
+        self.ops.append(("update", payload))
+        return self
+
+    def rpc(self, name: str, params: dict[str, Any]) -> _SeamRecorder:
+        self.ops.append(("rpc", name, params))
+        return self
+
+    def order(self, *args: Any, **kwargs: Any) -> _SeamRecorder:
+        self.ops.append(("order", args, kwargs))
+        return self
+
+    def limit(self, n: int) -> _SeamRecorder:
+        self.ops.append(("limit", n))
+        return self
+
+    def range(self, start: int, end: int) -> _SeamRecorder:
+        self.ops.append(("range", start, end))
+        return self
+
+    # -- execution --
+    def _result(self) -> Any:
+        self.executed += 1
+        pending, self._pending_in_ids = self._pending_in_ids, None
+        if pending is not None and self.rows_by_job is not None:
+            data = [row for jid in pending for row in self.rows_by_job.get(jid, [])]
+            return MagicMock(data=data)
+        return MagicMock(data=self.responses.pop(0) if self.responses else [])
+
+    # -- introspection helpers --
+    def op(self, kind: str) -> tuple[Any, ...]:
+        matches = [o for o in self.ops if o[0] == kind]
+        assert len(matches) == 1, f"expected exactly one {kind!r} op, got {matches!r}"
+        return matches[0]
+
+    def upsert_payload(self) -> dict[str, Any]:
+        payload = self.op("upsert")[1]
+        assert isinstance(payload, dict)
+        return dict(payload)
+
+
+class _SyncSeamClient(_SeamRecorder):
+    def execute(self) -> Any:
+        return self._result()
+
+
+class _AsyncSeamClient(_SeamRecorder):
+    async def execute(self) -> Any:
+        return self._result()
+
+
+def _seam_flag_off(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Force the sync seam path. Returns the async-client lookup log — flag
+    off means ``get_async_supabase`` must never even be consulted, so the
+    list must stay empty."""
+    from app.services import db_write
+
+    lookups: list[int] = []
+    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: lookups.append(1))
+    return lookups
+
+
+def _seam_flag_on(monkeypatch: pytest.MonkeyPatch, async_client: _AsyncSeamClient) -> None:
+    """Route the seam's async path onto ``async_client``."""
+    from app.services import db_write
+
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+
+
+# ---- score_title_and_upsert_poll -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_score_title_and_upsert_poll_flag_off_uses_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import score_title_and_upsert_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+
+    result = await score_title_and_upsert_poll(
+        sync_client,  # type: ignore[arg-type]
+        job_posting_id="job-1",
+        title="Senior React Engineer",
+        target=_target(core={"React": 3}),
+    )
+
+    assert result is not None
+    assert result.job_posting_id == "job-1"
+    assert sync_client.executed == 1  # sync client took the write
+    assert lookups == []  # flag off: async client never consulted
+    assert ("table", "scores") in sync_client.ops
+    assert sync_client.op("upsert")[2] == {"on_conflict": "job_posting_id,target_id"}
+
+
+@pytest.mark.asyncio
+async def test_score_title_and_upsert_poll_flag_on_uses_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import score_title_and_upsert_poll
+
+    async_client = _AsyncSeamClient(responses=[[_upserted_score_row(score=41)]])
+    _seam_flag_on(monkeypatch, async_client)
+    sync_client = _SyncSeamClient()
+
+    result = await score_title_and_upsert_poll(
+        sync_client,  # type: ignore[arg-type]
+        job_posting_id="job-1",
+        title="Senior React Engineer",
+        target=_target(core={"React": 3}),
+    )
+
+    # Response parsed from the async client's row...
+    assert result is not None
+    assert result.job_posting_id == "job-1"
+    assert result.target_id == "target-1"
+    assert result.score == 41
+    # ...which took the write; the sync client was untouched.
+    assert async_client.executed == 1
+    assert sync_client.executed == 0
+    payload = async_client.upsert_payload()
+    assert payload["scoring_status"] == "stage1"
+
+
+@pytest.mark.asyncio
+async def test_score_title_and_upsert_poll_no_match_skips_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same skip contract as the sync original: no keyword match and no
+    exclusion -> ``None`` and zero DB traffic on either backend."""
+    from app.services.target_scoring import score_title_and_upsert_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient()
+
+    result = await score_title_and_upsert_poll(
+        sync_client,  # type: ignore[arg-type]
+        job_posting_id="job-1",
+        title="Pharmacy Technician",
+        target=_target(core={"React": 3}),
+    )
+
+    assert result is None
+    assert sync_client.executed == 0
+    assert sync_client.ops == []
+    assert lookups == []
+
+
+# ---- score_and_upsert_poll --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_score_and_upsert_poll_flag_off_uses_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import score_and_upsert_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+
+    result = await score_and_upsert_poll(
+        sync_client,  # type: ignore[arg-type]
+        job_posting_id="job-1",
+        title="Senior Frontend Engineer",
+        description_html="<p>React and TypeScript required.</p>",
+        target=_target(core={"React": 3, "TypeScript": 3}),
+    )
+
+    assert result.job_posting_id == "job-1"
+    assert sync_client.executed == 1
+    assert lookups == []
+    assert ("table", "scores") in sync_client.ops
+    assert sync_client.upsert_payload()["scoring_status"] == "stage2"
+
+
+@pytest.mark.asyncio
+async def test_score_and_upsert_poll_flag_on_uses_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import score_and_upsert_poll
+
+    async_client = _AsyncSeamClient(responses=[[_upserted_score_row()]])
+    _seam_flag_on(monkeypatch, async_client)
+    sync_client = _SyncSeamClient()
+
+    result = await score_and_upsert_poll(
+        sync_client,  # type: ignore[arg-type]
+        job_posting_id="job-1",
+        title="Senior Frontend Engineer",
+        description_html="<p>React and TypeScript required.</p>",
+        target=_target(core={"React": 3, "TypeScript": 3}),
+        excluded_by_prefilter=True,
+        promising=False,
+        phase1_confidence=91,
+    )
+
+    # Response parsed from the async client's row; sync client untouched.
+    assert result.job_posting_id == "job-1"
+    assert result.target_id == "target-1"
+    assert result.score == 70
+    assert async_client.executed == 1
+    assert sync_client.executed == 0
+    payload = async_client.upsert_payload()
+    # The prefilter OR and the Phase 1 columns ride through the poll path.
+    assert payload["excluded"] is True
+    assert payload["promising"] is False
+    assert payload["phase1_confidence"] == 91
+    assert async_client.op("upsert")[2] == {"on_conflict": "job_posting_id,target_id"}
+
+
+@pytest.mark.asyncio
+async def test_score_and_upsert_poll_raises_on_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty upsert rows raise exactly like the sync ``_upsert_score``."""
+    from app.services.target_scoring import score_and_upsert_poll
+
+    _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient()  # queue empty -> execute() yields data=[]
+
+    with pytest.raises(RuntimeError, match="Failed to upsert"):
+        await score_and_upsert_poll(
+            sync_client,  # type: ignore[arg-type]
+            job_posting_id="job-1",
+            title="Engineer",
+            description_html="<p>React.</p>",
+            target=_target(core={"React": 3}),
+        )
+
+
+# ---- Drift guards: poll payloads must equal the sync originals' -------------
+
+
+@pytest.mark.asyncio
+async def test_score_and_upsert_poll_payload_matches_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DRIFT GUARD (#57): for identical inputs — including the Phase 1
+    columns — the poll variant must upsert the *identical* payload dict the
+    sync original does (modulo the per-call ``updated_at`` stamp), with the
+    same conflict target. Pins the pair together until slice 4 deletes one.
+    """
+    from app.services.target_scoring import score_and_upsert_poll
+
+    _seam_flag_off(monkeypatch)
+    kwargs: dict[str, Any] = {
+        "job_posting_id": "job-1",
+        "title": "Senior Frontend Engineer",
+        "description_html": "<p>React and TypeScript required.</p>",
+        "target": _target(core={"React": 3, "TypeScript": 3}),
+        "excluded_by_prefilter": False,
+        "promising": True,
+        "phase1_confidence": 88,
+    }
+
+    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+    score_and_upsert(sync_client, **kwargs)  # type: ignore[arg-type]
+
+    poll_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+    await score_and_upsert_poll(poll_client, **kwargs)  # type: ignore[arg-type]
+
+    sync_payload = sync_client.upsert_payload()
+    poll_payload = poll_client.upsert_payload()
+    assert sync_payload.pop("updated_at")
+    assert poll_payload.pop("updated_at")
+    assert sync_payload == poll_payload
+    # The interesting keys really are present (not vacuously equal-by-absence).
+    assert sync_payload["promising"] is True
+    assert sync_payload["phase1_confidence"] == 88
+    assert sync_payload["scoring_status"] == "stage2"
+    assert sync_payload["recency_score"] == sync_payload["score"]
+    assert sync_client.op("upsert")[2] == poll_client.op("upsert")[2]
+
+
+@pytest.mark.asyncio
+async def test_score_title_and_upsert_poll_payload_matches_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DRIFT GUARD (#57), Stage 1 flavour: identical title inputs produce
+    identical upsert payloads (modulo ``updated_at``) — including the
+    *absence* of the conditional Phase 1 keys."""
+    from app.services.target_scoring import score_title_and_upsert, score_title_and_upsert_poll
+
+    _seam_flag_off(monkeypatch)
+    target = _target(core={"React": 3})
+
+    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+    assert (
+        score_title_and_upsert(
+            sync_client,  # type: ignore[arg-type]
+            job_posting_id="job-1",
+            title="Senior React Engineer",
+            target=target,
+        )
+        is not None
+    )
+
+    poll_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
+    assert (
+        await score_title_and_upsert_poll(
+            poll_client,  # type: ignore[arg-type]
+            job_posting_id="job-1",
+            title="Senior React Engineer",
+            target=target,
+        )
+        is not None
+    )
+
+    sync_payload = sync_client.upsert_payload()
+    poll_payload = poll_client.upsert_payload()
+    assert sync_payload.pop("updated_at")
+    assert poll_payload.pop("updated_at")
+    assert sync_payload == poll_payload
+    assert sync_payload["scoring_status"] == "stage1"
+    assert "promising" not in sync_payload  # None -> key omitted, both paths
+    assert "phase1_confidence" not in sync_payload
+    assert sync_client.op("upsert")[2] == poll_client.op("upsert")[2]
+
+
+# ---- mark_complete_poll ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_complete_poll_flag_off_uses_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import mark_complete_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient()
+
+    await mark_complete_poll(sync_client, "job-9")  # type: ignore[arg-type]
+
+    assert sync_client.executed == 1
+    assert lookups == []
+    assert ("table", "scores") in sync_client.ops
+    assert ("update", {"scoring_status": "complete"}) in sync_client.ops
+    assert ("eq", "job_posting_id", "job-9") in sync_client.ops
+
+
+@pytest.mark.asyncio
+async def test_mark_complete_poll_flag_on_uses_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.target_scoring import mark_complete_poll
+
+    async_client = _AsyncSeamClient()
+    _seam_flag_on(monkeypatch, async_client)
+    sync_client = _SyncSeamClient()
+
+    await mark_complete_poll(sync_client, "job-9")  # type: ignore[arg-type]
+
+    assert async_client.executed == 1
+    assert sync_client.executed == 0
+    assert ("table", "scores") in async_client.ops
+    assert ("update", {"scoring_status": "complete"}) in async_client.ops
+    assert ("eq", "job_posting_id", "job-9") in async_client.ops
+
+
+# ---- batch_update_global_scores_poll ----------------------------------------
+
+_BATCH_ROWS_BY_JOB: dict[str, list[dict[str, Any]]] = {
+    # job-1: graded 90 + keyword 10 -> 90 (graded-first, #194)
+    "job-1": [
+        _score_row(90, scoring_status="complete", job_posting_id="job-1"),
+        _score_row(10, scoring_status="stage2", job_posting_id="job-1"),
+    ],
+    # job-2: keyword only -> avg(20, 40) = 30
+    "job-2": [
+        _score_row(20, scoring_status="stage1", job_posting_id="job-2"),
+        _score_row(40, scoring_status="stage2", job_posting_id="job-2"),
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_batch_update_global_scores_poll_flag_off_uses_sync_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.target_scoring as ts
+    from app.services.target_scoring import batch_update_global_scores_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)  # 2 unique ids -> 2 chunk reads
+    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
+
+    # Duplicate id proves the dedupe: 3 ids in, only 2 chunk reads out.
+    await batch_update_global_scores_poll(
+        sync_client,  # type: ignore[arg-type]
+        ["job-1", "job-2", "job-1"],
+    )
+
+    assert sync_client.executed == 3  # 2 chunked reads + 1 bulk-update rpc
+    assert lookups == []
+    name, params = sync_client.op("rpc")[1:]
+    assert name == "bulk_update_scores"
+    by_id = {u["id"]: u["score"] for u in params["p_updates"]}
+    assert by_id == {"job-1": 90, "job-2": 30}
+
+
+@pytest.mark.asyncio
+async def test_batch_update_global_scores_poll_flag_on_uses_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.target_scoring as ts
+    from app.services.target_scoring import batch_update_global_scores_poll
+
+    async_client = _AsyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
+    _seam_flag_on(monkeypatch, async_client)
+    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)
+    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
+
+    await batch_update_global_scores_poll(
+        sync_client,  # type: ignore[arg-type]
+        ["job-1", "job-2"],
+    )
+
+    # Reads AND the rpc write all land on the async client; sync untouched.
+    assert async_client.executed == 3
+    assert sync_client.executed == 0
+    name, params = async_client.op("rpc")[1:]
+    assert name == "bulk_update_scores"
+    assert all(set(u) == {"id", "score"} for u in params["p_updates"])
+    by_id = {u["id"]: u["score"] for u in params["p_updates"]}
+    assert by_id == {"job-1": 90, "job-2": 30}
+
+
+@pytest.mark.asyncio
+async def test_batch_update_global_scores_poll_matches_sync_rpc_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DRIFT GUARD (#57): the poll variant's ``bulk_update_scores`` payload
+    equals what the sync original computes for the same score rows. The
+    shared :func:`_global_score_updates` makes this structural; the assert
+    pins the whole read->aggregate->rpc shape anyway."""
+    import app.services.target_scoring as ts
+    from app.services.target_scoring import (
+        batch_update_global_scores,
+        batch_update_global_scores_poll,
+    )
+
+    _seam_flag_off(monkeypatch)
+    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)  # exercise multi-chunk reads
+    ids = ["job-1", "job-2"]
+
+    poll_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
+    await batch_update_global_scores_poll(poll_client, ids)  # type: ignore[arg-type]
+
+    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
+    batch_update_global_scores(sync_client, ids)  # type: ignore[arg-type]
+
+    poll_name, poll_params = poll_client.op("rpc")[1:]
+    sync_name, sync_params = sync_client.op("rpc")[1:]
+    assert poll_name == sync_name == "bulk_update_scores"
+    assert sorted(poll_params["p_updates"], key=lambda u: str(u["id"])) == sorted(
+        sync_params["p_updates"], key=lambda u: str(u["id"])
+    )
+    # Same read shape too: identical select/in_ chunk sequences.
+    poll_reads = [o for o in poll_client.ops if o[0] in ("select", "in_")]
+    sync_reads = [o for o in sync_client.ops if o[0] in ("select", "in_")]
+    assert poll_reads == sync_reads
+
+
+@pytest.mark.asyncio
+async def test_batch_update_global_scores_poll_empty_ids_no_db_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guard clause as the sync original: no ids -> zero queries."""
+    from app.services.target_scoring import batch_update_global_scores_poll
+
+    lookups = _seam_flag_off(monkeypatch)
+    sync_client = _SyncSeamClient()
+
+    await batch_update_global_scores_poll(sync_client, [])  # type: ignore[arg-type]
+
+    assert sync_client.executed == 0
+    assert sync_client.ops == []
+    assert lookups == []

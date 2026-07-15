@@ -15,6 +15,7 @@ from postgrest.types import CountMethod
 from pydantic import ValidationError
 from supabase import Client
 
+from app.background import spawn_detached
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.config import settings
 from app.dependencies import (
@@ -196,9 +197,7 @@ async def _activate_pipeline(
                 target_id,
                 TargetUpdate(activation_status="deriving"),
             )
-            doc = await asyncio.to_thread(
-                optimized.get_latest, supabase, user_id=user_id
-            )
+            doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
                 await asyncio.to_thread(
@@ -209,9 +208,7 @@ async def _activate_pipeline(
                 )
                 return
 
-            derived, result = await derive_profile_from_label(
-                llm, label=target.label
-            )
+            derived, result = await derive_profile_from_label(llm, label=target.label)
             await asyncio.to_thread(
                 cost_log.record,
                 supabase,
@@ -476,9 +473,7 @@ async def suggest_lateral(
         # still failing here is a structurally malformed model response
         # (wrong types, missing fields). That's an upstream hiccup, not a
         # server bug — tell the client to retry instead of 500ing.
-        logger.warning(
-            "suggest-lateral: model returned malformed suggestions", exc_info=True
-        )
+        logger.warning("suggest-lateral: model returned malformed suggestions", exc_info=True)
         raise HTTPException(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
@@ -593,28 +588,34 @@ def update_target(
     return target
 
 
-# Sync `def` (not `async def`): the foreground body is blocking supabase work
-# (link + reads), so FastAPI runs it in its threadpool and keeps it off the
-# event loop. The async LLM/poll work runs after the response as the
-# ``_activate_pipeline`` BackgroundTask. See #107.
+# Async: the blocking supabase reads/link are offloaded via ``to_thread``
+# (#107), and the LLM/poll pipeline is spawned as a DETACHED task on the
+# loop — not a starlette BackgroundTask, whose machinery deadlocks the
+# pooled async DB client under uvloop once POLLER_ASYNC_DB routes the
+# pipeline's poll fan-out through it (see ``app/background.py``).
 @router.post(
     "/{target_id}/activate",
     response_model=JobTarget,
     dependencies=[Depends(enforce_llm_budget)],
 )
-def activate_target(
+async def activate_target(
     target_id: str,
-    background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
-    target = crud.get(supabase, target_id)
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
     try:
-        crud.link_user_to_target(supabase, user_id=user_id, target_id=target_id, is_active=True)
+        await asyncio.to_thread(
+            crud.link_user_to_target,
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            is_active=True,
+        )
     except crud.ActiveTargetLimitError as e:
         # 409 Conflict — the request was well-formed but conflicts with
         # current state (the user is already at the active-target cap).
@@ -632,9 +633,12 @@ def activate_target(
                 ),
             },
         ) from e
-    refreshed = crud.get(supabase, target_id) or target
+    refreshed = await asyncio.to_thread(crud.get, supabase, target_id) or target
 
-    background_tasks.add_task(_activate_pipeline, supabase, llm, refreshed, user_id)
+    spawn_detached(
+        _activate_pipeline(supabase, llm, refreshed, user_id),
+        name=f"activate-target-{target_id}",
+    )
     return refreshed
 
 
@@ -850,9 +854,7 @@ def get_target_preferences(
     meaningless without a (user, target) pairing, and a 404 keeps a
     non-owner from confirming the target exists.
     """
-    prefs = crud.get_user_target_preferences(
-        supabase, user_id=user_id, target_id=target_id
-    )
+    prefs = crud.get_user_target_preferences(supabase, user_id=user_id, target_id=target_id)
     if prefs is None:
         raise HTTPException(
             status_code=404,
@@ -1251,9 +1253,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
         # Generic client message — echoing the resolved host/IP back is an
         # internal-recon oracle (audit #29 R3 / H8). Keep specifics in logs.
         logger.warning("ssrf_reject JD host=%s: %s", hostname, exc)
-        raise HTTPException(
-            status_code=422, detail="This URL cannot be fetched"
-        ) from exc
+        raise HTTPException(status_code=422, detail="This URL cannot be fetched") from exc
 
     # Size-capped streaming fetch — without this, a user-pasted URL
     # pointing to a huge payload could OOM the API (the shared
@@ -1272,9 +1272,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
         # A redirect hop resolved to an internal address — don't reflect it
         # (audit #29 R3 / H8).
         logger.warning("ssrf_reject JD redirect for %s: %s", url, exc)
-        raise HTTPException(
-            status_code=422, detail="This URL cannot be fetched"
-        ) from exc
+        raise HTTPException(status_code=422, detail="This URL cannot be fetched") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail="Failed to fetch JD URL") from exc
 
@@ -1284,9 +1282,7 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
             assert_safe_host(final_hostname)
         except ValueError as exc:
             # Don't reflect the resolved internal host/IP (audit #29 R3 / H8).
-            logger.warning(
-                "ssrf_reject JD redirect host=%s: %s", final_hostname, exc
-            )
+            logger.warning("ssrf_reject JD redirect host=%s: %s", final_hostname, exc)
             raise HTTPException(
                 status_code=422,
                 detail="This URL cannot be fetched",
@@ -1434,9 +1430,7 @@ async def add_reference_jd(
     # examples not weighted aggregates, and merging across JDs would dilute
     # the few-shot signal. The latest JD overwrites; pools stay coherent.
     if user_id is None:
-        all_ref_jds = await asyncio.to_thread(
-            crud.list_reference_jds, supabase, target_id
-        )
+        all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
         composite = merge_reference_jds(all_ref_jds)
         updated = await asyncio.to_thread(
             crud.update,
@@ -1451,9 +1445,7 @@ async def add_reference_jd(
             ),
         )
         if updated is None:
-            raise HTTPException(
-                status_code=500, detail="Failed to update target profile"
-            )
+            raise HTTPException(status_code=500, detail="Failed to update target profile")
         return updated
 
     # #191 slice 1b — user contributions to the SHARED profile are bounded
@@ -1466,9 +1458,7 @@ async def add_reference_jd(
     # concurrent-write conflict.
     current = target
     for _attempt in range(2):
-        all_ref_jds = await asyncio.to_thread(
-            crud.list_reference_jds, supabase, target_id
-        )
+        all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
         composite = merge_reference_jds(all_ref_jds)
         prev_profile = current.scoring_profile.model_dump()
         # Project the full "after" state: the merge installs the new JD's
@@ -1514,11 +1504,14 @@ async def add_reference_jd(
                 },
             }
             await asyncio.to_thread(
-                lambda: supabase.table("reference_jds")
-                .update({"suppressed": True})
-                .eq("id", added_jd.id)
-                .execute()
+                lambda: (
+                    supabase.table("reference_jds")
+                    .update({"suppressed": True})
+                    .eq("id", added_jd.id)
+                    .execute()
+                )
             )
+
             def _insert_staged_row(row: dict[str, Any] = staged_row) -> None:
                 supabase.table("target_learning_log").insert(row).execute()
 
@@ -1551,9 +1544,7 @@ async def add_reference_jd(
         if outcome == "applied":
             updated = await asyncio.to_thread(crud.get, supabase, target_id)
             if updated is None:
-                raise HTTPException(
-                    status_code=500, detail="Failed to update target profile"
-                )
+                raise HTTPException(status_code=500, detail="Failed to update target profile")
             return updated
         if outcome == "version_conflict":
             refreshed = await asyncio.to_thread(crud.get, supabase, target_id)
@@ -1612,9 +1603,7 @@ def delete_reference_jd(
     # A regular caller may only remove their OWN contribution; operators
     # (user_id None) may remove any. A non-owner's delete matches no rows and
     # returns 404 — without enumerating who contributed it.
-    deleted = crud.delete_reference_jd(
-        supabase, ref_jd_id, target_id=target_id, user_id=user_id
-    )
+    deleted = crud.delete_reference_jd(supabase, ref_jd_id, target_id=target_id, user_id=user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
@@ -1703,9 +1692,7 @@ def vote_on_reference_jd(
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
     # The caller's vote goes through their RLS client (DB enforces own-row).
-    votes.set_user_vote(
-        user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
-    )
+    votes.set_user_vote(user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value)
 
     # Tally every vote (service-role) and reconcile the suppression flag.
     suppressed, changed = votes.recompute_suppression(
@@ -1729,9 +1716,7 @@ def vote_on_reference_jd(
             target = crud.get(supabase, target_id)
             if target is None:
                 break
-            composite = merge_reference_jds(
-                crud.list_reference_jds(supabase, target_id)
-            )
+            composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
             outcome, new_version = apply_profile_patch_rpc(
                 supabase,
                 user_id=user_id,
@@ -1744,8 +1729,7 @@ def vote_on_reference_jd(
                 break
             if outcome != "version_conflict":
                 logger.warning(
-                    "Vote re-merge refused by RPC (%s) for (user=%s, "
-                    "target=%s)",
+                    "Vote re-merge refused by RPC (%s) for (user=%s, target=%s)",
                     outcome,
                     user_id,
                     target_id,

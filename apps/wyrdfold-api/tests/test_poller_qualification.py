@@ -78,16 +78,13 @@ def _patch_common(
         rec["cost_user_id"] = user_id
         rec["cost_purpose"] = purpose
 
-    def fake_execute_with_retry_sync(fn: Any, *, label: str = "") -> Any:
-        # The poller passes ``supabase.table(...).update(payload).eq(...).execute``
-        # — a bound MagicMock method. We don't need to run it; record that a
-        # write was attempted. The payload is captured separately below.
-        return MagicMock(data=[])
-
+    # The tag write goes through the ``poll_db_write`` seam now (#57); with
+    # the flag off it builds + executes the update on the MagicMock supabase
+    # directly (the ``update`` side_effect below records the payload), so no
+    # retry-helper patch is needed anymore.
     monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
-    monkeypatch.setattr(poller_mod, "execute_with_retry_sync", fake_execute_with_retry_sync)
     return rec
 
 

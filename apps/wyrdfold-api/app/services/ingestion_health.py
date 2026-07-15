@@ -18,6 +18,10 @@ when ingestion looks dead, so an operator finds out in hours, not weeks:
 
 All are best-effort and never raise into the caller: a health-check
 query failure must not crash a poll cycle.
+
+The DB reads route through the #57 seam (:func:`app.services.db_write.
+poll_db_read`), so the health pass rides the pooled async client when
+``POLLER_ASYNC_DB`` is on and falls back to sync-in-thread otherwise.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import httpx
 from supabase import Client
 
 from app.config import settings
+from app.services.db_write import poll_db_read
 from app.services.llm import cost_log
 
 logger = logging.getLogger(__name__)
@@ -78,14 +83,10 @@ class IngestionHealthReport:
 async def _newest_job_created_at(supabase: Client) -> datetime | None:
     """``max(jobs.created_at)`` via a 1-row keyset read on the existing
     ``created_at DESC`` index — cheaper than an aggregate scan."""
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("jobs")
-            .select("created_at")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
+    resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("jobs").select("created_at").order("created_at", desc=True).limit(1),
+        label="health newest-job read",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -102,20 +103,15 @@ async def _newest_job_created_at(supabase: Client) -> datetime | None:
 
 async def _source_counts(supabase: Client) -> tuple[int, int]:
     """Returns ``(total_sources, disabled_sources)``."""
-    total_resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("sources")
-            .select("id", count="exact")  # type: ignore[arg-type]
-            .execute()
-        )
+    total_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("sources").select("id", count="exact"),
+        label="health sources count",
     )
-    disabled_resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("sources")
-            .select("id", count="exact")  # type: ignore[arg-type]
-            .eq("enabled", False)
-            .execute()
-        )
+    disabled_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("sources").select("id", count="exact").eq("enabled", False),
+        label="health disabled-sources count",
     )
     return int(total_resp.count or 0), int(disabled_resp.count or 0)
 
@@ -124,14 +120,15 @@ async def _newest_discovery_at(supabase: Client) -> datetime | None:
     """``max(source_discoveries.discovered_at)`` via a 1-row keyset read on
     the ``discovered_at DESC`` index — the timestamp of the most recent
     discovery attempt of any outcome (inserted / duplicate / filtered)."""
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("source_discoveries")
+    resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table("source_discoveries")
             .select("discovered_at")
             .order("discovered_at", desc=True)
             .limit(1)
-            .execute()
-        )
+        ),
+        label="health newest-discovery read",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -290,10 +287,7 @@ async def check_ingestion_health(
     if (
         settings.llm_provider == "openrouter"
         and settings.openrouter_api_key
-        and (
-            settings.llm_credit_min_runway_days > 0
-            or settings.llm_credit_min_remaining_usd > 0
-        )
+        and (settings.llm_credit_min_runway_days > 0 or settings.llm_credit_min_remaining_usd > 0)
     ):
         try:
             remaining = await _openrouter_remaining_usd()
@@ -316,9 +310,7 @@ async def check_ingestion_health(
                 )
                 if below_floor or below_runway:
                     report.low_credit = True
-                    runway_txt = (
-                        f"~{runway_days:.1f} day(s)" if runway_days is not None else "n/a"
-                    )
+                    runway_txt = f"~{runway_days:.1f} day(s)" if runway_days is not None else "n/a"
                     msg = (
                         f"ingestion health: LLM credit runway low — "
                         f"${remaining:.2f} remaining on the OpenRouter key "

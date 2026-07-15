@@ -24,8 +24,7 @@ from app.services.analysis.persistence import (
 from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
-from app.services.db_write import DB_WRITE_CONCURRENCY
-from app.services.db_write import db_to_thread as _db_to_thread
+from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
 from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import (
     DEFAULT_MODEL as EMBED_DEFAULT_MODEL,
@@ -51,6 +50,7 @@ from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.cost_log import record as record_llm_cost
 from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
+from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
     is_us_location,
@@ -58,7 +58,7 @@ from app.services.qualification import (
     qualification_hash,
     tag_job,
 )
-from app.services.recency import refresh_recency_scores
+from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.title_triage import (
     PHASE1_PURPOSE,
     TitleVerdict,
@@ -70,18 +70,17 @@ from app.services.sanitize import sanitize_html
 from app.services.scoring import score_title_against_profile, strip_html
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
-from app.services.supabase_retry import execute_with_retry_sync
 from app.services.target_scoring import (
-    batch_update_global_scores,
+    batch_update_global_scores_poll as batch_update_global_scores,
 )
 from app.services.target_scoring import (
-    mark_complete as mark_target_scores_complete,
+    mark_complete_poll as mark_target_scores_complete,
 )
 from app.services.target_scoring import (
-    score_and_upsert as target_score_and_upsert,
+    score_and_upsert_poll as target_score_and_upsert,
 )
 from app.services.target_scoring import (
-    score_title_and_upsert as target_title_score_and_upsert,
+    score_title_and_upsert_poll as target_title_score_and_upsert,
 )
 from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
@@ -105,20 +104,29 @@ FETCHERS: dict[str, Fetcher] = {
     "smartrecruiters": fetch_smartrecruiters_jobs,
     "jsonld": fetch_jsonld_jobs,
     "crawl": fetch_firecrawl_jobs,
+    # Local load-testing only — raises unless MOCK_FETCHER_ENABLED (see
+    # app/services/mock_board.py), so a mistyped provider on a real source
+    # fails its poll instead of fabricating jobs.
+    "mock": fetch_mock_jobs,
 }
 
 # How many sources poll in parallel. Lowered from 10 (audit #29 / live
 # prod broken-pipe storm): combined with the per-source scoring fan-out
-# (each row → an ``asyncio.to_thread`` supabase write), 10 concurrent
-# sources thundering-herd the Supabase pooler. The hard ceiling on
-# concurrent DB writes is now ``DB_WRITE_CONCURRENCY`` below, but a lower
+# (each row → one supabase write), 10 concurrent sources thundering-herd
+# the Supabase pooler. The hard ceiling on concurrent DB writes is
+# ``DB_WRITE_CONCURRENCY`` (see ``app.services.db_write``), but a lower
 # source fan-out also keeps the per-source detail/JD fetches civil.
 POLL_CONCURRENCY = 6
 LLM_CONCURRENCY = 3
 
-# DB_WRITE_CONCURRENCY, the per-loop write semaphore, and _db_to_thread now
-# live in ``app.services.db_write`` (imported above) so the service modules
-# that issue poll writes can share the seam without importing the poller.
+# Every DB touch in the poll cycle routes through the ``db_write`` seam
+# (``poll_db_write`` / ``poll_db_read`` or the ``*_poll`` service variants
+# built on them): sync-client-in-a-thread today, the pooled async HTTP/2
+# client when ``POLLER_ASYNC_DB`` is on (#57). The handful of remaining
+# ``asyncio.to_thread(helper, ...)`` calls below wrap sync helpers from
+# modules outside the poll herd (targets CRUD, budget meters, analysis
+# persistence) — a few calls per cycle, migrating with the request-handler
+# slice, not per-row fan-outs.
 
 # Minimum keyword score to trigger LLM analysis during polling.
 # Below this threshold, only keyword scoring is used.
@@ -472,8 +480,10 @@ async def _batch_fetch_job_scores(supabase: Client, job_ids: list[str]) -> dict[
     """
     if not job_ids:
         return {}
-    resp = await asyncio.to_thread(
-        supabase.rpc("get_job_scores_by_ids", {"p_ids": job_ids}).execute
+    resp = await poll_db_read(
+        supabase,
+        lambda c: c.rpc("get_job_scores_by_ids", {"p_ids": job_ids}),
+        label="poll job-scores read",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     out: dict[str, int] = {}
@@ -509,7 +519,11 @@ async def _load_alert_rows(
     # The RPC returns SETOF jobs — the same column shape the old
     # ``select("*")`` returned, so alert dispatch reads identical rows.
     try:
-        resp = await asyncio.to_thread(supabase.rpc("get_jobs_by_ids", {"p_ids": new_ids}).execute)
+        resp = await poll_db_read(
+            supabase,
+            lambda c: c.rpc("get_jobs_by_ids", {"p_ids": new_ids}),
+            label="poll alert-rows refresh",
+        )
         refreshed = cast(list[dict[str, Any]], resp.data or [])
         if refreshed:
             return refreshed
@@ -553,8 +567,10 @@ async def _run_llm_scoring_for_row(
     if current_score is None:
         # Single-row fallback for callers without a pre-fetched batch.
         try:
-            score_resp = await asyncio.to_thread(
-                supabase.table("jobs").select("score").eq("id", job_id).single().execute
+            score_resp = await poll_db_read(
+                supabase,
+                lambda c: c.table("jobs").select("score").eq("id", job_id).single(),
+                label="poll job-score fallback read",
             )
             current_score = int(cast(dict[str, Any], score_resp.data).get("score", 0))
         except Exception:
@@ -571,7 +587,7 @@ async def _run_llm_scoring_for_row(
     if current_score < LLM_SCORE_THRESHOLD:
         # Below threshold — skip LLM but still mark as complete
         try:
-            await asyncio.to_thread(mark_target_scores_complete, supabase, job_id)
+            await mark_target_scores_complete(supabase, job_id)
         except Exception:
             logger.exception("Failed to mark scores complete for job %s", job_id)
         return
@@ -595,19 +611,22 @@ async def _run_llm_scoring_for_row(
         if cached is not None:
             llm_score = scorecard_to_numeric(cached.scorecard)
             blended = blend_scores(current_score, llm_score)
-            await asyncio.to_thread(
-                supabase.table("jobs")
-                .update(
-                    {
-                        "score": blended,
-                        "llm_score": llm_score,
-                        "llm_analysis_id": cached.id,
-                    }
-                )
-                .eq("id", job_id)
-                .execute
+            await poll_db_write(
+                supabase,
+                lambda c: (
+                    c.table("jobs")
+                    .update(
+                        {
+                            "score": blended,
+                            "llm_score": llm_score,
+                            "llm_analysis_id": cached.id,
+                        }
+                    )
+                    .eq("id", job_id)
+                ),
+                label="poll llm-score cached update",
             )
-            await asyncio.to_thread(mark_target_scores_complete, supabase, job_id)
+            await mark_target_scores_complete(supabase, job_id)
             return
     except Exception:
         logger.debug("LLM cache check failed for job %s, proceeding with analysis", job_id)
@@ -647,21 +666,24 @@ async def _run_llm_scoring_for_row(
         blended = blend_scores(current_score, llm_score)
 
         # Update the jobs row with LLM score data
-        await asyncio.to_thread(
-            supabase.table("jobs")
-            .update(
-                {
-                    "score": blended,
-                    "llm_score": llm_score,
-                    "llm_analysis_id": record.id,
-                }
-            )
-            .eq("id", job_id)
-            .execute
+        await poll_db_write(
+            supabase,
+            lambda c: (
+                c.table("jobs")
+                .update(
+                    {
+                        "score": blended,
+                        "llm_score": llm_score,
+                        "llm_analysis_id": record.id,
+                    }
+                )
+                .eq("id", job_id)
+            ),
+            label="poll llm-score update",
         )
 
         # Mark all target scores as complete
-        await asyncio.to_thread(mark_target_scores_complete, supabase, job_id)
+        await mark_target_scores_complete(supabase, job_id)
 
     except Exception:
         logger.exception(
@@ -671,7 +693,7 @@ async def _run_llm_scoring_for_row(
         )
         # Still mark as complete on error — don't leave jobs stuck in stage2
         with contextlib.suppress(Exception):
-            await asyncio.to_thread(mark_target_scores_complete, supabase, job_id)
+            await mark_target_scores_complete(supabase, job_id)
 
 
 async def _resolve_user_targets_for_stage3(
@@ -694,12 +716,15 @@ async def _resolve_user_targets_for_stage3(
         return {}, {}
 
     target_ids = [t.id for t in active_targets]
-    junction_resp = await asyncio.to_thread(
-        supabase.table("user_targets")
-        .select("target_id, user_id")
-        .eq("is_active", True)
-        .in_("target_id", target_ids)
-        .execute
+    junction_resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table("user_targets")
+            .select("target_id, user_id")
+            .eq("is_active", True)
+            .in_("target_id", target_ids)
+        ),
+        label="poll stage3 user-targets read",
     )
     junction_rows = cast(list[dict[str, Any]], junction_resp.data or [])
     users_by_target: dict[str, list[str]] = {}
@@ -799,11 +824,10 @@ async def _qualify_one_job(
     ):
         payload["archived_at"] = datetime.now(UTC).isoformat()
     try:
-        await _db_to_thread(
-            lambda: execute_with_retry_sync(
-                supabase.table("jobs").update(payload).eq("id", row["id"]).execute,
-                label="qualification tags update",
-            )
+        await poll_db_write(
+            supabase,
+            lambda c: c.table("jobs").update(payload).eq("id", row["id"]),
+            label="qualification tags update",
         )
     except Exception:
         logger.exception("Qualification tag write failed for job %s", row.get("id"))
@@ -903,17 +927,20 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
     if limit <= 0:
         return
     try:
-        resp = await asyncio.to_thread(
-            supabase.table("jobs")
-            .select(
-                "id, absolute_url, title, company_name, location, "
-                "description_html, qualified_hash, qualified_at"
-            )
-            .is_("role_family", "null")
-            .is_("archived_at", "null")
-            .order("created_at", desc=False)
-            .limit(limit)
-            .execute
+        resp = await poll_db_read(
+            supabase,
+            lambda c: (
+                c.table("jobs")
+                .select(
+                    "id, absolute_url, title, company_name, location, "
+                    "description_html, qualified_hash, qualified_at"
+                )
+                .is_("role_family", "null")
+                .is_("archived_at", "null")
+                .order("created_at", desc=False)
+                .limit(limit)
+            ),
+            label="poll qualify-backfill select",
         )
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
@@ -949,11 +976,14 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
     if dead:
         logger.info("Qualification backfill: archiving %d dead listing(s)", len(dead))
         with contextlib.suppress(Exception):
-            await asyncio.to_thread(
-                supabase.table("jobs")
-                .update({"archived_at": datetime.now(UTC).isoformat()})
-                .in_("id", dead)
-                .execute
+            await poll_db_write(
+                supabase,
+                lambda c: (
+                    c.table("jobs")
+                    .update({"archived_at": datetime.now(UTC).isoformat()})
+                    .in_("id", dead)
+                ),
+                label="poll qualify-backfill archive",
             )
     if live:
         logger.info("Qualification backfill: tagging %d live job(s)", len(live))
@@ -1018,17 +1048,19 @@ async def _drop_purged_rows(
         purged: set[str] = set()
         for i in range(0, len(ext_ids), 200):
             chunk = ext_ids[i : i + 200]
-            resp = await asyncio.to_thread(
-                supabase.table("jobs")
-                .select("external_id")
-                .eq("source_id", source_id)
-                .not_.is_("purged_at", "null")
-                .in_("external_id", chunk)
-                .execute
+            resp = await poll_db_read(
+                supabase,
+                lambda c, ids=chunk: (
+                    c.table("jobs")
+                    .select("external_id")
+                    .eq("source_id", source_id)
+                    .not_.is_("purged_at", "null")
+                    .in_("external_id", ids)
+                ),
+                label="poll purge-guard read",
             )
             purged.update(
-                cast(str, r["external_id"])
-                for r in cast(list[dict[str, Any]], resp.data or [])
+                cast(str, r["external_id"]) for r in cast(list[dict[str, Any]], resp.data or [])
             )
         if not purged:
             return rows
@@ -1075,17 +1107,20 @@ async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
         # ``job_embeddings`` row for the CURRENT model — a stale row from a
         # retired model (voyage-3) must not mask the missing current-space
         # vector, or a model migration would strand the whole old corpus.
-        resp = await asyncio.to_thread(
-            supabase.table("jobs")
-            .select("id, title, description_html, job_embeddings(job_posting_id)")
-            .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
-            .is_("job_embeddings", "null")
-            # Tombstoned rows have their payload stripped — embedding them
-            # would return skipped_empty forever, wasting sweep slots.
-            .is_("purged_at", "null")
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute
+        resp = await poll_db_read(
+            supabase,
+            lambda c: (
+                c.table("jobs")
+                .select("id, title, description_html, job_embeddings(job_posting_id)")
+                .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
+                .is_("job_embeddings", "null")
+                # Tombstoned rows have their payload stripped — embedding them
+                # would return skipped_empty forever, wasting sweep slots.
+                .is_("purged_at", "null")
+                .order("created_at", desc=True)
+                .limit(limit)
+            ),
+            label="poll embed-backfill select",
         )
     except Exception:
         logger.exception("Embed backfill: select failed; skipping this cycle")
@@ -1167,14 +1202,12 @@ async def _shadow_threshold(supabase: Client, *, target_id: str) -> float | None
     threshold logged even when cosine is NULL.
     """
     try:
-        resp = await asyncio.to_thread(
-            lambda: (
-                supabase.table("targets")
-                .select("prescan_cosine_threshold")
-                .eq("id", target_id)
-                .limit(1)
-                .execute()
-            )
+        resp = await poll_db_read(
+            supabase,
+            lambda c: (
+                c.table("targets").select("prescan_cosine_threshold").eq("id", target_id).limit(1)
+            ),
+            label="poll shadow-threshold read",
         )
         rows = cast(list[dict[str, Any]], resp.data or [])
         if not rows:
@@ -1295,10 +1328,11 @@ async def _poll_one_source(
         # never leaves Postgres. `source_live_unengaged_jobs` returns exactly
         # the live (archived_at IS NULL), unengaged jobs for this source with
         # the same columns existing_rows is read for below.
-        existing_resp = await asyncio.to_thread(
-            execute_with_retry_sync,
-            supabase.rpc("source_live_unengaged_jobs", {"p_source_id": source_id}).execute,
+        existing_resp = await poll_db_read(
+            supabase,
+            lambda c: c.rpc("source_live_unengaged_jobs", {"p_source_id": source_id}),
             label=f"poll existing {company_name}",
+            retry_sync=True,
         )
         existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
         known_external_ids = {r.get("external_id") for r in existing_rows}
@@ -1557,9 +1591,7 @@ async def _poll_one_source(
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2).
         if rows_to_upsert:
-            rows_to_upsert = await _drop_purged_rows(
-                supabase, source_id, rows_to_upsert
-            )
+            rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
 
         # Re-check after dedupe: it can remove EVERY row (a source whose
         # postings are all cross-posting dupes of existing rows). Calling
@@ -1568,12 +1600,11 @@ async def _poll_one_source(
         # ``source_failure_disable_threshold`` consecutive empties — would
         # auto-disable a perfectly healthy source. Skip the write instead.
         if rows_to_upsert:
-            upsert_query = supabase.table("jobs").upsert(
-                rows_to_upsert, on_conflict="source_id,external_id"
-            )
-            upsert_resp = await asyncio.to_thread(
-                execute_with_retry_sync,
-                upsert_query.execute,
+            upsert_resp = await poll_db_write(
+                supabase,
+                lambda c: c.table("jobs").upsert(
+                    rows_to_upsert, on_conflict="source_id,external_id"
+                ),
                 label=f"poll upsert {company_name}",
             )
             for raw_row in upsert_resp.data or []:
@@ -1619,8 +1650,7 @@ async def _poll_one_source(
                     row_data: dict[str, Any], target: JobTarget = active_target
                 ) -> None:
                     try:
-                        await _db_to_thread(
-                            target_title_score_and_upsert,
+                        await target_title_score_and_upsert(
                             supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
@@ -1637,7 +1667,7 @@ async def _poll_one_source(
             stage1_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if stage1_ids:
                 try:
-                    await asyncio.to_thread(batch_update_global_scores, supabase, stage1_ids)
+                    await batch_update_global_scores(supabase, stage1_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 1")
 
@@ -1682,8 +1712,7 @@ async def _poll_one_source(
                             min_confidence=settings.phase1_min_confidence,
                         )
                         phase1_confidence = verdict.confidence if verdict is not None else None
-                        stage2 = await _db_to_thread(
-                            target_score_and_upsert,
+                        stage2 = await target_score_and_upsert(
                             supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
@@ -1720,7 +1749,7 @@ async def _poll_one_source(
             stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if stage2_ids:
                 try:
-                    await asyncio.to_thread(batch_update_global_scores, supabase, stage2_ids)
+                    await batch_update_global_scores(supabase, stage2_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 2")
 
@@ -1792,7 +1821,7 @@ async def _poll_one_source(
                         )
                 if stage2_ids:
                     try:
-                        await asyncio.to_thread(batch_update_global_scores, supabase, stage2_ids)
+                        await batch_update_global_scores(supabase, stage2_ids)
                     except Exception:
                         logger.exception("Global score update failed after Phase 2")
             elif primary_by_user:
@@ -1855,7 +1884,7 @@ async def _poll_one_source(
             # upsert in that case, so the list sort is unaffected.
             if settings.recency_decay_enabled and stage2_ids:
                 try:
-                    await asyncio.to_thread(refresh_recency_scores, supabase, stage2_ids)
+                    await refresh_recency_scores_poll(supabase, stage2_ids)
                 except Exception:
                     logger.exception("Recency refresh failed for %s", company_name)
 
@@ -1898,9 +1927,9 @@ async def _poll_one_source(
         # daily interval and restores them once they produce again.
         if rows_to_upsert:
             mark_polled_payload["last_candidate_at"] = datetime.now(UTC).isoformat()
-        last_polled_query = (
-            supabase.table("sources").update(mark_polled_payload).eq("id", source_id)
-        )
+
+        def _mark_polled_query(c: Any) -> Any:
+            return c.table("sources").update(mark_polled_payload).eq("id", source_id)
 
         if stale_ids:
             # Flag stale/delisted jobs globally-dead via archived_at (#75 C3
@@ -1916,22 +1945,22 @@ async def _poll_one_source(
             # Both writes are idempotent (UPDATE with stable WHERE), so a
             # retry after a stream drop is safe.
             await asyncio.gather(
-                asyncio.to_thread(
-                    execute_with_retry_sync,
-                    supabase.rpc("archive_jobs_by_ids", {"p_ids": stale_ids}).execute,
+                poll_db_write(
+                    supabase,
+                    lambda c: c.rpc("archive_jobs_by_ids", {"p_ids": stale_ids}),
                     label=f"poll archive {company_name}",
                 ),
-                asyncio.to_thread(
-                    execute_with_retry_sync,
-                    last_polled_query.execute,
+                poll_db_write(
+                    supabase,
+                    _mark_polled_query,
                     label=f"poll mark-polled {company_name}",
                 ),
             )
             summary["archived"] = len(stale_ids)
         else:
-            await asyncio.to_thread(
-                execute_with_retry_sync,
-                last_polled_query.execute,
+            await poll_db_write(
+                supabase,
+                _mark_polled_query,
                 label=f"poll mark-polled {company_name}",
             )
 
@@ -2028,8 +2057,10 @@ async def _record_source_failure(
                 company,
                 failures,
             )
-        await asyncio.to_thread(
-            lambda: supabase.table("sources").update(updates).eq("id", source_id).execute()
+        await poll_db_write(
+            supabase,
+            lambda c: c.table("sources").update(updates).eq("id", source_id),
+            label="poll source-failure update",
         )
         if disabling and settings.sentry_dsn:
             try:
@@ -2067,9 +2098,10 @@ async def recover_stale_sources(supabase: Client, *, now: datetime | None = None
     moment = now or datetime.now(UTC)
     cutoff = (moment - timedelta(hours=cooldown_hours)).isoformat()
     try:
-        resp = await asyncio.to_thread(
-            lambda: (
-                supabase.table("sources")
+        resp = await poll_db_write(
+            supabase,
+            lambda c: (
+                c.table("sources")
                 .update(
                     {
                         "enabled": True,
@@ -2080,8 +2112,8 @@ async def recover_stale_sources(supabase: Client, *, now: datetime | None = None
                 .eq("enabled", False)
                 .not_.is_("disabled_at", "null")
                 .lt("disabled_at", cutoff)
-                .execute()
-            )
+            ),
+            label="poll source auto-recovery",
         )
     except Exception:
         logger.exception("source auto-recovery sweep failed")
@@ -2322,8 +2354,11 @@ def _drop_paid_sources_if_unconsumed(
 
 
 async def poll_all_sources(supabase: Client) -> PollResult:
-    sources_query = supabase.table("sources").select("*").eq("enabled", True)
-    sources_resp = await asyncio.to_thread(sources_query.execute)
+    sources_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("sources").select("*").eq("enabled", True),
+        label="poll sources read",
+    )
     all_sources = cast(list[dict[str, Any]], sources_resp.data or [])
 
     # Cycle-wide constants resolved once instead of once per source:
@@ -2415,8 +2450,11 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     # ingestion down forever (the Sept-2026 failure mode).
     await recover_stale_sources(supabase)
 
-    sources_query = supabase.table("sources").select("*").eq("enabled", True)
-    sources_resp = await asyncio.to_thread(sources_query.execute)
+    sources_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("sources").select("*").eq("enabled", True),
+        label="poll sources read",
+    )
     all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
@@ -2655,15 +2693,18 @@ async def _poll_one_source_for_target(
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
         if rows_to_upsert:
-            rows_to_upsert = await _drop_purged_rows(
-                supabase, source_id, rows_to_upsert
-            )
+            rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
 
         if rows_to_upsert:
-            upsert_resp = await asyncio.to_thread(
-                supabase.table("jobs")
-                .upsert(rows_to_upsert, on_conflict="source_id,external_id")
-                .execute
+            # Routing through the seam also gives this upsert the transient-
+            # blip retry the all-sources path already had (idempotent upsert,
+            # so a re-issue after a dropped stream is safe).
+            upsert_resp = await poll_db_write(
+                supabase,
+                lambda c: c.table("jobs").upsert(
+                    rows_to_upsert, on_conflict="source_id,external_id"
+                ),
+                label=f"poll upsert {company_name}",
             )
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
@@ -2695,8 +2736,7 @@ async def _poll_one_source_for_target(
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
                 try:
-                    await _db_to_thread(
-                        target_title_score_and_upsert,
+                    await target_title_score_and_upsert(
                         supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
@@ -2735,8 +2775,7 @@ async def _poll_one_source_for_target(
                         min_confidence=settings.phase1_min_confidence,
                     )
                     phase1_confidence = verdict.confidence if verdict is not None else None
-                    stage2 = await _db_to_thread(
-                        target_score_and_upsert,
+                    stage2 = await target_score_and_upsert(
                         supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
@@ -2771,7 +2810,7 @@ async def _poll_one_source_for_target(
             s2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
             if s2_ids:
                 try:
-                    await asyncio.to_thread(batch_update_global_scores, supabase, s2_ids)
+                    await batch_update_global_scores(supabase, s2_ids)
                 except Exception:
                     logger.exception("Batch global score update failed after stage 2")
 
@@ -2828,7 +2867,7 @@ async def _poll_one_source_for_target(
                             )
                     if s2_ids:
                         try:
-                            await asyncio.to_thread(batch_update_global_scores, supabase, s2_ids)
+                            await batch_update_global_scores(supabase, s2_ids)
                         except Exception:
                             logger.exception("Global score update failed after Phase 2")
             elif primary_by_user:
@@ -2893,11 +2932,14 @@ async def _poll_one_source_for_target(
         try:
             source_id_for_stamp = source.get("id")
             if source_id_for_stamp:
-                await asyncio.to_thread(
-                    supabase.table("sources")
-                    .update({"last_polled_at": datetime.now(UTC).isoformat()})
-                    .eq("id", source_id_for_stamp)
-                    .execute
+                await poll_db_write(
+                    supabase,
+                    lambda c: (
+                        c.table("sources")
+                        .update({"last_polled_at": datetime.now(UTC).isoformat()})
+                        .eq("id", source_id_for_stamp)
+                    ),
+                    label=f"poll target mark-polled {company_name}",
                 )
         except Exception:
             # Non-fatal — the actual poll already happened, this is just
@@ -2934,8 +2976,11 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
             errors=["Target has no search keywords"],
         )
 
-    sources_query = supabase.table("sources").select("*").eq("enabled", True)
-    sources_resp = await asyncio.to_thread(sources_query.execute)
+    sources_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("sources").select("*").eq("enabled", True),
+        label="poll sources read",
+    )
     sources = sources_resp.data or []
 
     # Optimized doc is fetched per-user inside

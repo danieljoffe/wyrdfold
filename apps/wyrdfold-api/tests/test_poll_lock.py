@@ -79,6 +79,64 @@ async def test_acquire_failure_returns_false_not_raise() -> None:
         assert acquired is False
 
 
+# ---- POLLER_ASYNC_DB backend selection (#57) --------------------------------
+
+
+class _AsyncLockClient:
+    """Async-client stand-in: records rpc calls, async execute, no locking
+    semantics needed — these tests only assert WHICH backend ran the RPC."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def rpc(self, name: str, params: dict[str, Any]) -> Any:
+        self.calls.append((name, params))
+
+        class _Handle:
+            async def execute(self) -> _Resp:
+                return _Resp(True)
+
+        return _Handle()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_lock_rpcs_use_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import poll_lock
+
+    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
+    async_client = _AsyncLockClient()
+    monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: async_client)
+    sync_sb, _ = _fake_lock_supabase()
+
+    async with poll_advisory_lock(sync_sb, 42) as acquired:
+        assert acquired is True
+
+    assert [name for name, _ in async_client.calls] == [
+        "try_poll_advisory_lock",
+        "release_poll_advisory_lock",
+    ]
+    assert all(params == {"p_key": 42} for _, params in async_client.calls)
+    sync_sb.rpc.assert_not_called()  # sync client never touched
+
+
+@pytest.mark.asyncio
+async def test_flag_on_without_async_client_falls_back_to_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import poll_lock
+
+    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
+    monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: None)
+    sb, state = _fake_lock_supabase()
+
+    async with poll_advisory_lock(sb, 7) as acquired:
+        assert acquired is True
+        assert state["held"] is True
+    assert state["held"] is False
+
+
 @pytest.mark.asyncio
 async def test_scheduled_poll_runs_when_lock_acquired() -> None:
     """Happy path: lock acquired → poll_due_sources is called."""
