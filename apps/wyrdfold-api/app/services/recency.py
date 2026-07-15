@@ -34,6 +34,7 @@ from typing import Any, cast
 from supabase import AsyncClient, Client
 
 from app.config import settings
+from app.services.db_write import poll_db_read, poll_db_write
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def _age_days(first_seen_at: Any, now: datetime) -> float:
     return max(0.0, (now - seen).total_seconds() / 86400.0)
 
 
-def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
+async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[str]) -> int:
     """Recompute ``recency_score`` for every scores row of the given jobs.
 
     Reads each job's ``first_seen_at`` to derive its age, then writes
@@ -115,6 +116,11 @@ def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
     ``bulk_update_recency_scores`` RPC. Called by the poller after the
     cycle's fit scores are settled (keyword and/or Phase 2), so the
     stored value tracks both the latest fit score and the current date.
+
+    All queries route through the #57 seam (:func:`poll_db_read` /
+    :func:`poll_db_write`), so they ride the pooled ``AsyncClient`` on the
+    event loop when ``POLLER_ASYNC_DB`` is on and fall back to the sync
+    client in a thread otherwise.
 
     Idempotent and side-effect-light: a no-op when the recency flag is
     off would still be correct (recency_score == score), but the poller
@@ -134,9 +140,13 @@ def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
     for i in range(0, len(unique_ids), _RECENCY_CHUNK_SIZE):
         chunk = unique_ids[i : i + _RECENCY_CHUNK_SIZE]
         try:
-            resp = supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
+            resp = await poll_db_read(
+                supabase,
+                lambda c, chunk=chunk: c.table("jobs").select("id, first_seen_at").in_("id", chunk),
+                label="recency jobs read",
+            )
         except Exception:
-            logger.exception("refresh_recency_scores: jobs fetch failed")
+            logger.exception("refresh_recency_scores_poll: jobs fetch failed")
             return 0
         for row in cast(list[dict[str, Any]], resp.data or []):
             age_by_job[row["id"]] = _age_days(row.get("first_seen_at"), now)
@@ -146,14 +156,17 @@ def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
     for i in range(0, len(unique_ids), _RECENCY_CHUNK_SIZE):
         chunk = unique_ids[i : i + _RECENCY_CHUNK_SIZE]
         try:
-            resp = (
-                supabase.table("scores")
-                .select("id, job_posting_id, score")
-                .in_("job_posting_id", chunk)
-                .execute()
+            resp = await poll_db_read(
+                supabase,
+                lambda c, chunk=chunk: (
+                    c.table("scores")
+                    .select("id, job_posting_id, score")
+                    .in_("job_posting_id", chunk)
+                ),
+                label="recency scores read",
             )
         except Exception:
-            logger.exception("refresh_recency_scores: scores fetch failed")
+            logger.exception("refresh_recency_scores_poll: scores fetch failed")
             return 0
         for row in cast(list[dict[str, Any]], resp.data or []):
             age = age_by_job.get(row["job_posting_id"], 0.0)
@@ -173,10 +186,16 @@ def refresh_recency_scores(supabase: Client, job_posting_ids: list[str]) -> int:
     for i in range(0, len(updates), _RECENCY_CHUNK_SIZE):
         chunk_updates = updates[i : i + _RECENCY_CHUNK_SIZE]
         try:
-            supabase.rpc("bulk_update_recency_scores", {"p_updates": chunk_updates}).execute()
+            await poll_db_write(
+                supabase,
+                lambda c, chunk_updates=chunk_updates: c.rpc(
+                    "bulk_update_recency_scores", {"p_updates": chunk_updates}
+                ),
+                label="recency bulk update",
+            )
             written += len(chunk_updates)
         except Exception:
-            logger.exception("refresh_recency_scores: bulk update failed")
+            logger.exception("refresh_recency_scores_poll: bulk update failed")
     return written
 
 
@@ -200,11 +219,11 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
     """Rewrite ``recency_score`` for every live (non-excluded) scores row from
     the current date.
 
-    ``refresh_recency_scores`` only touches the jobs a poll cycle re-fetched,
-    so a posting that ages off the boards freezes at its last-refresh decay
-    while its true age keeps climbing — and the /jobs list sorts by that
-    stored column, so stale rows drift out of order relative to the read-time
-    displayed decay. This sweep walks ALL live jobs to build a current age
+    ``refresh_recency_scores_poll`` only touches the jobs a poll cycle
+    re-fetched, so a posting that ages off the boards freezes at its
+    last-refresh decay while its true age keeps climbing — and the /jobs
+    list sorts by that stored column, so stale rows drift out of order
+    relative to the read-time displayed decay. This sweep walks ALL live jobs to build a current age
     map, then walks ALL live score rows and recomputes ``recency_score``,
     keeping the sort key consistent with what users see.
 

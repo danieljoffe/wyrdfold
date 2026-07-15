@@ -225,3 +225,103 @@ async def test_async_path_retries_transient_blip(
 
     assert resp.data == [{"ok": True}]
     assert async_client.executed == 2  # retried on the loop
+
+
+# ---- poll_db_read -----------------------------------------------------------
+
+
+def _sources_select(c: Any) -> Any:
+    return c.table("sources").update({"x": 1}).eq("enabled", True)
+
+
+@pytest.mark.asyncio
+async def test_read_flag_on_uses_async_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    async_client = _AsyncClient()
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+    sync_client = _SyncClient()
+
+    resp = await db_write.poll_db_read(sync_client, _sources_select, label="r")
+
+    assert resp.data == [{"ok": True}]
+    assert async_client.executed == 1
+    assert sync_client.executed == 0
+
+
+@pytest.mark.asyncio
+async def test_read_flag_on_no_async_client_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    sync_client = _SyncClient()
+
+    resp = await db_write.poll_db_read(sync_client, _sources_select, label="r")
+
+    assert resp.data == [{"ok": True}]
+    assert sync_client.executed == 1
+
+
+@pytest.mark.asyncio
+async def test_read_flag_off_sync_no_retry_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag-off reads must be byte-for-byte today's behavior: bare execute in
+    a thread, NO retry — a transient blip propagates to the caller exactly as
+    the pre-seam ``asyncio.to_thread(query.execute)`` did."""
+    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    sync_client = _SyncClient(fail_times=1)
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        await db_write.poll_db_read(sync_client, _sources_select, label="r")
+    assert sync_client.executed == 1  # one attempt, no retry
+
+
+@pytest.mark.asyncio
+async def test_read_flag_off_retry_sync_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Call sites that already wrapped their read in the sync retry helper
+    keep that behavior via ``retry_sync=True``."""
+    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    sync_client = _SyncClient(fail_times=1)
+
+    resp = await db_write.poll_db_read(sync_client, _sources_select, label="r", retry_sync=True)
+
+    assert resp.data == [{"ok": True}]
+    assert sync_client.executed == 2
+
+
+@pytest.mark.asyncio
+async def test_read_flag_on_always_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    async_client = _AsyncClient(fail_times=1)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+
+    resp = await db_write.poll_db_read(_SyncClient(), _sources_select, label="r")
+
+    assert resp.data == [{"ok": True}]
+    assert async_client.executed == 2
+
+
+@pytest.mark.asyncio
+async def test_read_does_not_hold_the_write_semaphore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read must proceed even when the write herd has the semaphore fully
+    saturated — reads never queued behind writes pre-seam, and coupling them
+    would stretch the cycle."""
+    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    sem = db_write._db_write_semaphore()
+    holds = [await sem.acquire() for _ in range(db_write.DB_WRITE_CONCURRENCY)]
+    try:
+        sync_client = _SyncClient()
+        resp = await asyncio.wait_for(
+            db_write.poll_db_read(sync_client, _sources_select, label="r"),
+            timeout=2.0,
+        )
+        assert resp.data == [{"ok": True}]
+        assert sync_client.executed == 1
+    finally:
+        for _ in holds:
+            sem.release()

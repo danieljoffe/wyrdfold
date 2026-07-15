@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import settings as live_settings
+from app.services import db_write
 from app.services import ingestion_health as health_mod
 from app.services import poller as poller_mod
 
@@ -470,3 +471,66 @@ async def test_health_discovery_threshold_floors_at_two_ticks(monkeypatch) -> No
 
     assert report.stale_discovery is False
     assert not any("discovery" in m for m, _ in captured)
+
+
+# ---------------------------------------------------------------------------
+# check_ingestion_health — #57 seam routing (POLLER_ASYNC_DB on)
+# ---------------------------------------------------------------------------
+
+
+class _AsyncHealthRecorder:
+    """Async-client stand-in for the #57 seam: a self-returning query chain
+    whose async ``execute`` answers every read with empty data / zero count.
+    Proves the ROUTING (health reads ride the pooled async client); the
+    parse/alert logic is covered by the sync-stub tests above."""
+
+    def __init__(self) -> None:
+        self.executed = 0
+        self.tables: list[str] = []
+
+    def table(self, name: str) -> _AsyncHealthRecorder:
+        self.tables.append(name)
+        return self
+
+    def select(self, *_a: Any, **_kw: Any) -> _AsyncHealthRecorder:
+        return self
+
+    def order(self, *_a: Any, **_kw: Any) -> _AsyncHealthRecorder:
+        return self
+
+    def limit(self, *_a: Any, **_kw: Any) -> _AsyncHealthRecorder:
+        return self
+
+    def eq(self, *_a: Any, **_kw: Any) -> _AsyncHealthRecorder:
+        return self
+
+    async def execute(self) -> _Resp:
+        self.executed += 1
+        return _Resp(data=[], count=0)
+
+
+@pytest.mark.asyncio
+async def test_health_reads_ride_async_client_when_flag_on(monkeypatch) -> None:
+    """#57 seam: with POLLER_ASYNC_DB on, every health-check read executes on
+    the pooled async client and the sync client is never touched — and the
+    empty/None-ish answers still parse into a coherent report."""
+    _arm_health(monkeypatch, discovery_enabled=True)
+    _patch_sentry(monkeypatch)
+
+    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
+    async_client = _AsyncHealthRecorder()
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
+    sync_sb = MagicMock()
+
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    report = await health_mod.check_ingestion_health(sync_sb, now=now)
+
+    # newest-job + total sources + disabled sources (+ newest discovery).
+    assert async_client.executed >= 3
+    assert {"jobs", "sources", "source_discoveries"} <= set(async_client.tables)
+    sync_sb.table.assert_not_called()
+    # Empty tables through the seam still parse: no jobs at all → stale.
+    assert report.stale_job_data is True
+    assert report.newest_job_at is None
+    assert report.total_sources == 0
+    assert report.mass_disable is False
