@@ -331,6 +331,28 @@ class MyTargetsListResponse(BaseModel):
     targets: list[UserTargetWithTarget]
 
 
+class TargetSearchResult(BaseModel):
+    """A shared target surfaced by ``GET /targets/search`` — a lightweight card
+    the caller can follow. Targets are a shared catalog: a role one user created
+    can be discovered and followed by others instead of minting a duplicate.
+
+    The heavy ``scoring_profile`` is intentionally omitted (the full row is
+    served by ``GET /targets/{id}`` once followed). ``is_linked`` tells the UI
+    whether the caller already follows this target so it can show "Following"
+    instead of "Follow"."""
+
+    id: str
+    label: str
+    description: str | None = None
+    is_linked: bool = False
+
+
+class TargetSearchResponse(BaseModel):
+    """Response shape for ``GET /targets/search``."""
+
+    results: list[TargetSearchResult]
+
+
 # ---- List-DTO (summary) shapes (#863) --------------------------------------
 # Light projections for the targets list views. They omit the heavy JSONB
 # fields (scoring_profile, search_keywords, example_*_titles, domain_hints)

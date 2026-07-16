@@ -10,7 +10,7 @@ import logging
 from typing import Any, cast
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from postgrest.types import CountMethod
 from pydantic import ValidationError
 from supabase import Client
@@ -50,6 +50,8 @@ from app.models.targets import (
     TargetFromUrl,
     TargetPreferences,
     TargetPreferencesUpdate,
+    TargetSearchResponse,
+    TargetSearchResult,
     TargetsListResponse,
     TargetStatusResponse,
     TargetUpdate,
@@ -550,6 +552,37 @@ def get_my_targets(
     """
     items = crud.list_user_targets_with_summary(supabase, user_id)
     return MyTargetsSummaryListResponse(targets=items)
+
+
+# Declared before ``/{target_id}`` so "search" isn't captured as a target id.
+@router.get("/search", response_model=TargetSearchResponse)
+def search_targets(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=50),
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> TargetSearchResponse:
+    """Search the shared catalog by label so the caller can follow an existing
+    target instead of minting a duplicate.
+
+    JWT-only. Targets are shared, so any user's target is discoverable — but
+    each result is marked ``is_linked`` for the ones the caller already follows.
+    The heavy ``scoring_profile`` is omitted (see ``TargetSearchResult``); the
+    full row is served by ``GET /targets/{id}`` once followed. A blank / 1-char
+    query returns no results rather than dumping the catalog.
+    """
+    matches = crud.search_by_label(supabase, q, limit=limit)
+    linked_ids = crud.get_user_target_ids(supabase, user_id) if matches else set()
+    results = [
+        TargetSearchResult(
+            id=t.id,
+            label=t.label,
+            description=t.description,
+            is_linked=t.id in linked_ids,
+        )
+        for t in matches
+    ]
+    return TargetSearchResponse(results=results)
 
 
 @router.get("/{target_id}", response_model=JobTarget)

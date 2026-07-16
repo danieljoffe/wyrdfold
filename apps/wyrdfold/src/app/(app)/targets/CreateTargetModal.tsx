@@ -6,6 +6,8 @@ import { Input } from '@danieljoffe/shared-ui/Input';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
 import Button from '@/components/kit/Button';
+import TargetSearchTab from './TargetSearchTab';
+import type { TargetSearchResult } from './types';
 
 export interface ManualSubmission {
   label: string;
@@ -17,13 +19,14 @@ export interface UrlSubmission {
   label: string | undefined;
 }
 
-type Mode = 'manual' | 'url';
+type Mode = 'search' | 'manual' | 'url';
 
 interface CreateTargetModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSubmitManual: (payload: ManualSubmission) => void;
   onSubmitUrl: (payload: UrlSubmission) => void;
+  onFollow: (target: TargetSearchResult) => Promise<boolean>;
 }
 
 export default function CreateTargetModal({
@@ -31,8 +34,12 @@ export default function CreateTargetModal({
   onClose,
   onSubmitManual,
   onSubmitUrl,
+  onFollow,
 }: CreateTargetModalProps) {
-  const [mode, setMode] = useState<Mode>('manual');
+  // Discovery-first: default to searching the shared catalog so a user follows
+  // an existing target instead of minting a duplicate; Manual / From URL are
+  // the create fallbacks.
+  const [mode, setMode] = useState<Mode>('search');
   const [label, setLabel] = useState('');
   const [description, setDescription] = useState('');
   const [urlLabel, setUrlLabel] = useState('');
@@ -43,7 +50,7 @@ export default function CreateTargetModal({
     setDescription('');
     setUrlLabel('');
     setJdUrl('');
-    setMode('manual');
+    setMode('search');
   }, []);
 
   const handleClose = useCallback(() => {
@@ -82,9 +89,18 @@ export default function CreateTargetModal({
   ]);
 
   const canSubmit =
-    mode === 'manual' ? label.trim().length > 0 : jdUrl.trim().length > 0;
+    mode === 'manual'
+      ? label.trim().length > 0
+      : mode === 'url'
+        ? jdUrl.trim().length > 0
+        : false;
 
   const tabs: Tab[] = [
+    {
+      id: 'search',
+      label: 'Search',
+      content: <TargetSearchTab onFollow={onFollow} />,
+    },
     {
       id: 'manual',
       label: 'Manual',
@@ -150,21 +166,23 @@ export default function CreateTargetModal({
           >
             Cancel
           </Button>
-          <Button
-            name='target-create-submit'
-            variant='primary'
-            size='sm'
-            onClick={handleSubmit}
-            disabled={!canSubmit}
-          >
-            Create Target
-          </Button>
+          {mode !== 'search' && (
+            <Button
+              name='target-create-submit'
+              variant='primary'
+              size='sm'
+              onClick={handleSubmit}
+              disabled={!canSubmit}
+            >
+              Create Target
+            </Button>
+          )}
         </div>
       }
     >
       <Tabs
         tabs={tabs}
-        defaultTab='manual'
+        defaultTab='search'
         variant='underline'
         onChange={id => setMode(id as Mode)}
       />
