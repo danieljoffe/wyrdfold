@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, Query
 from supabase import Client
 
+from app.cache import insights_cache, make_cache_key
 from app.dependencies import (
     get_current_user_id,
     get_user_supabase,
@@ -110,13 +111,19 @@ def pipeline_insights(
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_pipeline()
-    return compute_pipeline(
+    cache_key = make_cache_key(f"insights:pipeline:u={user_id}", period=period)
+    cached: PipelineInsights | None = insights_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = compute_pipeline(
         supabase,
         _since(period),
         _prior_window(period),
         target_ids=target_ids,
         user_id=user_id,
     )
+    insights_cache.set(cache_key, result)
+    return result
 
 
 @router.get("/targets")
@@ -128,9 +135,15 @@ def target_insights(
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_targets()
-    return compute_targets(
+    cache_key = make_cache_key(f"insights:targets:u={user_id}", period=period)
+    cached: TargetInsights | None = insights_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = compute_targets(
         supabase, _since(period), target_ids=target_ids, user_id=user_id
     )
+    insights_cache.set(cache_key, result)
+    return result
 
 
 @router.get("/skills-cost")
@@ -142,6 +155,12 @@ def skills_cost_insights(
     target_ids = get_user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_skills_cost()
-    return compute_skills_cost(
+    cache_key = make_cache_key(f"insights:skills-cost:u={user_id}", period=period)
+    cached: SkillsCostInsights | None = insights_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = compute_skills_cost(
         supabase, _since(period), user_id=user_id, target_ids=target_ids
     )
+    insights_cache.set(cache_key, result)
+    return result
