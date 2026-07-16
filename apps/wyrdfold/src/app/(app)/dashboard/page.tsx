@@ -52,12 +52,15 @@ const PIPELINE_STATUSES = [
 const DEFAULT_PERIOD: Period = '30d';
 
 /** The Today section's server-seeded data (the daily launcher).
- *  ``confirmedOnboarded`` gates the flag-set-but-no-prose telemetry: on the
- *  fail-open path (degraded onboarding read) we don't actually know the flag
- *  state, and the same degraded API likely returns no prose too — firing
- *  there would be misleading. */
+ *  Takes the in-flight onboarding read (rather than its resolved boolean) so
+ *  the widget fetches overlap it instead of queuing behind it — the gate
+ *  costs a full API round-trip, and this render blocks the dashboard's
+ *  content paint. ``confirmedOnboarded`` gates the flag-set-but-no-prose
+ *  telemetry: on the fail-open path (degraded onboarding read) we don't
+ *  actually know the flag state, and the same degraded API likely returns no
+ *  prose too — firing there would be misleading. */
 async function fetchTodayInitial(
-  confirmedOnboarded: boolean
+  onboarding: Promise<OnboardingStatus | null>
 ): Promise<DashboardInitial> {
   // ``hasProfile`` checks whether the user has authored prose at all —
   // the underlying signal that "they've started onboarding." The
@@ -68,21 +71,24 @@ async function fetchTodayInitial(
   // A naive ``proseRes?.prose != null`` check matched only the empty
   // case and silently treated every populated response as ``no profile``,
   // sending users back to the onboarding CTA after they'd onboarded.
-  const [topRes, proseRes, targetsRes, countsRes] = await Promise.all([
-    fetchJsonFromWyrdfoldAPI<JobsListResponse>('/jobs', {
-      searchParams: new URLSearchParams({
-        status: 'new',
-        sort: 'score',
-        order: 'desc',
-        page_size: '5',
+  const [topRes, proseRes, targetsRes, countsRes, onboardingStatus] =
+    await Promise.all([
+      fetchJsonFromWyrdfoldAPI<JobsListResponse>('/jobs', {
+        searchParams: new URLSearchParams({
+          status: 'new',
+          sort: 'score',
+          order: 'desc',
+          page_size: '5',
+        }),
       }),
-    }),
-    fetchJsonFromWyrdfoldAPI<ProseResponse>('/experience/prose'),
-    fetchJsonFromWyrdfoldAPI<{ targets: UserTargetWithSummary[] }>(
-      '/targets/mine'
-    ),
-    fetchJsonFromWyrdfoldAPI<Record<string, number>>('/jobs/pipeline-counts'),
-  ]);
+      fetchJsonFromWyrdfoldAPI<ProseResponse>('/experience/prose'),
+      fetchJsonFromWyrdfoldAPI<{ targets: UserTargetWithSummary[] }>(
+        '/targets/mine'
+      ),
+      fetchJsonFromWyrdfoldAPI<Record<string, number>>('/jobs/pipeline-counts'),
+      onboarding,
+    ]);
+  const confirmedOnboarded = onboardingStatus?.completed_at != null;
 
   // Flag is set but prose isn't there. Causes: a Path A/B user who
   // skipped the resume step (or whose upload failed mid-flow — see
@@ -162,24 +168,34 @@ export default async function WyrdfoldHome({
   // for a genuinely-new user, so the worst case for an un-onboarded user
   // whose read failed is they see the dashboard's empty state instead of
   // the wizard for one load.
-  const [params, onboardingStatus] = await Promise.all([
-    searchParams,
-    fetchJsonFromWyrdfoldAPI<OnboardingStatus>('/profile/onboarding'),
-  ]);
-  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
-    redirect('/onboarding');
-  }
+  const onboardingPromise = fetchJsonFromWyrdfoldAPI<OnboardingStatus>(
+    '/profile/onboarding'
+  );
+  const params = await searchParams;
 
   // Home = daily launcher ("Today") + historical view ("Trends", the
   // former /insights page — UX/IA Fork A). One section per request:
   // the server fetches only the data the selected view renders.
+  //
+  // The section's fetches start BEFORE the onboarding gate resolves — the
+  // gate is one API round-trip, and serializing it ahead of the widgets
+  // added that latency to every dashboard paint. The trade: a
+  // not-yet-onboarded user's single pre-wizard visit now fires the widget
+  // reads too, wasted when the redirect below aborts the render. That's a
+  // handful of one-time reads on the rarest path vs. a round-trip saved on
+  // every load of the app's default page.
   const view = parseHomeView(params['view']);
+  const todayPromise =
+    view === 'today' ? fetchTodayInitial(onboardingPromise) : null;
+  const trendsPromise = view === 'trends' ? fetchTrendsInitial() : null;
 
-  const todayInitial =
-    view === 'today'
-      ? await fetchTodayInitial(onboardingStatus?.completed_at != null)
-      : null;
-  const trendsInitial = view === 'trends' ? await fetchTrendsInitial() : null;
+  const onboardingStatus = await onboardingPromise;
+  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
+    redirect('/onboarding');
+  }
+
+  const todayInitial = todayPromise ? await todayPromise : null;
+  const trendsInitial = trendsPromise ? await trendsPromise : null;
 
   return (
     <div className='flex flex-col gap-6'>

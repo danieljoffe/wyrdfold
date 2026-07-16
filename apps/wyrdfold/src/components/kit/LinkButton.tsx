@@ -1,9 +1,7 @@
 'use client';
 
-import { useCallback, type ComponentProps, type ReactNode } from 'react';
+import type { ComponentProps, ReactNode } from 'react';
 import Link from 'next/link';
-import type { Url } from 'next/dist/shared/lib/router/router';
-import { useRouter } from 'next/navigation';
 import {
   baseButtonStyles,
   sizeButtonStyles,
@@ -35,11 +33,13 @@ interface LinkButtonProps extends Omit<
  * classes, so a library restyle flows through automatically.
  *
  * Ported behaviors from the bespoke Button's link mode:
- * - Prefetch-on-hover for internal routes (snappier nav than viewport-only
- *   prefetch on long lists).
  * - `disabled` renders an aria-disabled span — links have no disabled state.
  * - `target='_blank'` auto-applies `rel='noopener noreferrer'`.
  * - Falls back to an id derived from `aria-label` (test/analytics hooks).
+ *
+ * No imperative hover prefetch: next/link already prefetches on hover
+ * natively (onNavigationIntent), so the `router.prefetch` this once carried
+ * only enqueued a duplicate of what the underlying Link was about to do.
  */
 export default function LinkButton({
   variant = 'primary',
@@ -49,23 +49,12 @@ export default function LinkButton({
   className,
   ...rest
 }: LinkButtonProps) {
-  const router = useRouter();
-
   const classes = cn(
     baseButtonStyles,
     variantButtonStyles[variant],
     sizeButtonStyles[size],
     disabled && 'pointer-events-none',
     className
-  );
-
-  const handleMouseEnter = useCallback(
-    (href: Url) => {
-      if (href && href.toString().startsWith('/')) {
-        router.prefetch(href.toString());
-      }
-    },
-    [router]
   );
 
   if (rest.href == null || rest.href.toString().length === 0) return null;
@@ -85,7 +74,6 @@ export default function LinkButton({
     <Link
       {...rest}
       className={classes}
-      onMouseEnter={() => handleMouseEnter(href)}
       id={id ?? ariaLabel?.replace(' ', '-')}
       href={href}
       aria-label={ariaLabel}

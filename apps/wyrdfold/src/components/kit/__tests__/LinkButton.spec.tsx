@@ -86,11 +86,15 @@ describe('LinkButton (kit)', () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
-  test('prefetches internal routes on hover', async () => {
+  test('hover does NOT imperatively prefetch — native next/link owns it', async () => {
+    // The kit button once mirrored hover into router.prefetch(). Next's
+    // app-router Link already prefetches on hover natively
+    // (onNavigationIntent), so the imperative call only enqueued a duplicate
+    // request per hover across every strip/row of LinkButtons.
     const user = userEvent.setup();
     render(<LinkButton href='/jobs/1'>Job</LinkButton>);
     await user.hover(screen.getByRole('link', { name: /job/i }));
-    expect(prefetch).toHaveBeenCalledWith('/jobs/1');
+    expect(prefetch).not.toHaveBeenCalled();
   });
 
   test('generates id from aria-label when id not provided', () => {
