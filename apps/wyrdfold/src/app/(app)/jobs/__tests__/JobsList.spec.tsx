@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import JobsList, { type TargetTab } from '../JobsList';
 import type { JobPosting, JobsFilterState } from '../types';
@@ -366,5 +366,111 @@ describe('JobsList — with targets', () => {
         screen.queryByRole('toolbar', { name: /batch actions/i })
       ).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('JobsList — activation status poll cadence', () => {
+  // The poll is a chained setTimeout: 3s ticks for the first 10 attempts,
+  // then 15s, parked entirely while the tab is hidden. It replaced a flat
+  // 3s setInterval that burned its whole 60-attempt budget in 3 minutes at
+  // 20 req/min against a pipeline that legitimately runs for many minutes.
+  const TARGETS: TargetTab[] = [{ id: 't1', label: 'Frontend', paused: false }];
+
+  const pollingResponse = {
+    ok: true,
+    json: async () => ({ activation_status: 'polling', jobs_count: 0 }),
+  };
+
+  function statusCalls(spy: jest.Mock): number {
+    return spy.mock.calls.filter(([url]) => String(url).includes('/status'))
+      .length;
+  }
+
+  async function tick(ms: number) {
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('polls at 3s for the fast window, then backs off to 15s', async () => {
+    jest.useFakeTimers();
+    const fetchSpy = jest.fn().mockResolvedValue(pollingResponse);
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    render(<JobsList targetId='t1' initialTargets={TARGETS} />);
+    await tick(0); // initial check fires immediately
+    expect(statusCalls(fetchSpy)).toBe(1);
+
+    await tick(3000);
+    expect(statusCalls(fetchSpy)).toBe(2);
+
+    // Consume the rest of the fast window (attempts 3..10 at 3s each).
+    await tick(8 * 3000);
+    expect(statusCalls(fetchSpy)).toBe(10);
+
+    // Backed off: 3s later nothing fires…
+    await tick(3000);
+    expect(statusCalls(fetchSpy)).toBe(10);
+    // …the next tick lands at 15s.
+    await tick(12000);
+    expect(statusCalls(fetchSpy)).toBe(11);
+  });
+
+  it('parks the poll while the tab is hidden and resumes on visibilitychange', async () => {
+    jest.useFakeTimers();
+    const fetchSpy = jest.fn().mockResolvedValue(pollingResponse);
+    global.fetch = fetchSpy as unknown as typeof fetch;
+    const visibility = jest.spyOn(document, 'visibilityState', 'get');
+    visibility.mockReturnValue('visible');
+
+    try {
+      render(<JobsList targetId='t1' initialTargets={TARGETS} />);
+      await tick(0);
+      expect(statusCalls(fetchSpy)).toBe(1);
+
+      // Hide the tab: the pending tick fires but issues no request and
+      // schedules nothing further — a backgrounded /jobs tab goes silent.
+      visibility.mockReturnValue('hidden');
+      await tick(60_000);
+      expect(statusCalls(fetchSpy)).toBe(1);
+
+      // Foreground again: the visibilitychange handler re-enters the loop
+      // immediately (no stale multi-second wait for fresh status).
+      visibility.mockReturnValue('visible');
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+        await jest.advanceTimersByTimeAsync(0);
+      });
+      expect(statusCalls(fetchSpy)).toBe(2);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it('survives a transient non-ok response and stops once ready', async () => {
+    jest.useFakeTimers();
+    const fetchSpy = jest
+      .fn()
+      .mockResolvedValueOnce(pollingResponse)
+      .mockResolvedValueOnce({ ok: false }) // transient 5xx mid-pipeline
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({ activation_status: 'ready', jobs_count: 3 }),
+      });
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    render(<JobsList targetId='t1' initialTargets={TARGETS} />);
+    await tick(0); // polling
+    await tick(3000); // 5xx — the chain must reschedule, not freeze
+    await tick(3000); // ready → clears the poll
+    expect(statusCalls(fetchSpy)).toBe(3);
+
+    // Settled: no further ticks, ever.
+    await tick(120_000);
+    expect(statusCalls(fetchSpy)).toBe(3);
   });
 });
