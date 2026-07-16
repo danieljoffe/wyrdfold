@@ -574,7 +574,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
     jobs_selects: list[str] = []
 
     class _JobsRec:
-        def select(self, cols: str) -> "_JobsRec":
+        def select(self, cols: str) -> _JobsRec:
             jobs_selects.append(cols)
             return self
 
@@ -582,7 +582,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
             if name == "not_":
                 return self
 
-            def _f(*_a: object, **_k: object) -> "_JobsRec":
+            def _f(*_a: object, **_k: object) -> _JobsRec:
                 return self
 
             return _f
@@ -595,7 +595,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
             if name == "not_":
                 return self
 
-            def _f(*_a: object, **_k: object) -> "_ScoresRec":
+            def _f(*_a: object, **_k: object) -> _ScoresRec:
                 return self
 
             return _f
@@ -634,7 +634,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
 
     class _TargetsRec:
         def __getattr__(self, name: str):
-            def _f(*_a: object, **_k: object) -> "_TargetsRec":
+            def _f(*_a: object, **_k: object) -> _TargetsRec:
                 return self
 
             return _f
