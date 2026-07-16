@@ -534,6 +534,16 @@ def _is_pending(row: dict[str, Any]) -> bool:
     collapsed the graded/Pending tiers into one recency-ordered lump.
     ``tests/test_jobs_pending_floor.py`` pins signal-columns ⊆ both list
     selects; keep it true when touching either side."""
+    flagged = row.get("pending")
+    if isinstance(flagged, bool):
+        # Posting rows: the overlay precomputes this flag FROM the scores row
+        # (which carries the real signal columns) before any ranking runs.
+        # The post-fetch-filter branch ranks POSTING rows — they carry neither
+        # axis_scores nor fit_reasoning, so without this rung every filtered
+        # list collapsed back into the Pending tier (recency-ordered "out of
+        # order" scores the moment a location/preference filter was active —
+        # the 2026-07-16 follow-up regression).
+        return flagged
     axes = row.get("axis_scores")
     if isinstance(axes, dict) and axes:
         return False
