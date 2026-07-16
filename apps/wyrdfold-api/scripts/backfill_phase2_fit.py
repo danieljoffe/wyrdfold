@@ -49,13 +49,21 @@ _PAGE = 500
 
 
 def _promising_job_ids(supabase: Any, target_id: str) -> list[str]:
-    """All ``promising=true`` job ids for a target (paginated)."""
+    """LIVE ``promising=true`` job ids for a target (paginated).
+
+    Live-only via an inner join on the jobs row (archived/purged/confirmed
+    non-US excluded): 78% of one target's 18.5k stale promising rows were
+    attached to dead jobs (2026-07-15) — grading those is pure spend the
+    display can never show."""
     job_ids: list[str] = []
     offset = 0
     while True:
         resp = (
             supabase.table("scores")
-            .select("job_posting_id")
+            .select("job_posting_id, jobs!inner(id)")
+            .is_("jobs.archived_at", "null")
+            .is_("jobs.purged_at", "null")
+            .not_.is_("jobs.is_us", "false")
             .eq("target_id", target_id)
             .eq("promising", True)
             .range(offset, offset + _PAGE - 1)
@@ -86,9 +94,7 @@ def _fetch_jobs(supabase: Any, job_ids: list[str]) -> list[dict[str, Any]]:
     return jobs
 
 
-def _resolve_target_user(
-    supabase: Any, target: JobTarget
-) -> tuple[str, Any] | None:
+def _resolve_target_user(supabase: Any, target: JobTarget) -> tuple[str, Any] | None:
     """Return ``(user_id, optimized_payload)`` for an active target.
 
     Picks the first active owner with a generated optimized profile —
@@ -109,9 +115,7 @@ def _resolve_target_user(
     return None
 
 
-async def backfill(
-    *, dry_run: bool, cap: int, target_id: str | None
-) -> int:
+async def backfill(*, dry_run: bool, cap: int, target_id: str | None) -> int:
     init_supabase()
     supabase = get_supabase_pool()
     if supabase is None:
@@ -196,9 +200,7 @@ def main() -> None:
         help="Restrict to a single target id.",
     )
     args = parser.parse_args()
-    asyncio.run(
-        backfill(dry_run=args.dry_run, cap=args.cap, target_id=args.target)
-    )
+    asyncio.run(backfill(dry_run=args.dry_run, cap=args.cap, target_id=args.target))
 
 
 if __name__ == "__main__":

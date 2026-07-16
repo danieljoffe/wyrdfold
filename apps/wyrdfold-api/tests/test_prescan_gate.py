@@ -210,3 +210,42 @@ async def test_uses_default_model_in_query() -> None:
     assert "eq:job_posting_id=job-xyz" in sb.calls
     assert f"eq:model={prescan_gate.DEFAULT_MODEL}" in sb.calls
     assert "eq:id=tgt-9" in sb.calls
+
+
+@pytest.mark.asyncio
+async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
+    """Regression for the 2026-07-15 backfill find: the vectors read rode ONE
+    ``.in_()`` with the whole candidate set — thousands of UUIDs build a URL
+    httpx itself refuses (``InvalidURL: query too long``), and the gate's
+    fail-closed contract then silently deferred every batch. Reads must chunk
+    at ``_VECTOR_READ_CHUNK_SIZE``."""
+    from unittest.mock import MagicMock
+
+    from app.services.embeddings import prescan_gate as pg
+
+    seen_chunks: list[int] = []
+
+    class _Chain:
+        def select(self, *_a, **_k):
+            return self
+
+        def in_(self, _col, ids):
+            seen_chunks.append(len(ids))
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def execute(self):
+            return MagicMock(data=[])
+
+    sb = MagicMock()
+    sb.table.return_value = _Chain()
+
+    ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(400)]
+    out = await pg._fetch_job_vectors_batch(sb, job_ids=ids, model="m")
+
+    assert out == {}
+    assert len(seen_chunks) == 3  # 400 at chunk 150 → 150+150+100
+    assert all(n <= pg._VECTOR_READ_CHUNK_SIZE for n in seen_chunks)
+    assert sum(seen_chunks) == 400
