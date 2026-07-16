@@ -185,6 +185,107 @@ def test_pipeline_counts_rpc_identical_on_user_jwt_client(
     assert {r["status"]: r["count"] for r in via_jwt or []} == {"applied": 1}
 
 
+def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
+    service_client: Client, two_seeded_users: tuple[str, str]
+) -> None:
+    """Live proof of the 20260716050000 RPC semantics (the floor the list
+    applies via ``_apply_score_floor``): with a floor set, a graded row below
+    the floor is dropped, a Pending row (``scoring_status`` ≠ 'complete')
+    passes regardless of its placeholder score, and a purged job never counts
+    even above the floor."""
+    uid_a, _ = two_seeded_users
+    source_id = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    jobs = {
+        "graded_pass": str(uuid.uuid4()),  # complete, 80 → counted
+        "graded_fail": str(uuid.uuid4()),  # complete, 30 → floored out
+        "pending_low": str(uuid.uuid4()),  # stage2, 30 → exempt, counted
+        "purged_pass": str(uuid.uuid4()),  # complete, 80, purged → gated out
+    }
+    board_token = f"test-{uuid.uuid4().hex[:12]}"
+    try:
+        service_client.table("sources").insert(
+            {
+                "id": source_id,
+                "board_token": board_token,
+                "company_name": "Acme",
+                "provider": "greenhouse",
+            }
+        ).execute()
+        service_client.table("jobs").insert(
+            [
+                {
+                    "id": jid,
+                    "external_id": f"ext-{name}",
+                    "source_id": source_id,
+                    "title": f"Job {name}",
+                    "company_name": "Acme",
+                    "purged_at": ("2026-01-01T00:00:00Z" if name == "purged_pass" else None),
+                }
+                for name, jid in jobs.items()
+            ]
+        ).execute()
+        service_client.table("targets").insert({"id": target_id, "label": "Floor Target"}).execute()
+        service_client.table("scores").insert(
+            [
+                {
+                    "job_posting_id": jobs["graded_pass"],
+                    "target_id": target_id,
+                    "score": 80,
+                    "scoring_status": "complete",
+                    "excluded": False,
+                },
+                {
+                    "job_posting_id": jobs["graded_fail"],
+                    "target_id": target_id,
+                    "score": 30,
+                    "scoring_status": "complete",
+                    "excluded": False,
+                },
+                {
+                    "job_posting_id": jobs["pending_low"],
+                    "target_id": target_id,
+                    "score": 30,
+                    "scoring_status": "stage2",
+                    "excluded": False,
+                },
+                {
+                    "job_posting_id": jobs["purged_pass"],
+                    "target_id": target_id,
+                    "score": 80,
+                    "scoring_status": "complete",
+                    "excluded": False,
+                },
+            ]
+        ).execute()
+        # Distinct per-user statuses on the two decisive rows, so the grouped
+        # result distinguishes them: the pre-fix RPC also totalled 2 here
+        # (purged_pass leaked in exactly as pending_low was floored out), and a
+        # bare total would have passed against the old SQL by coincidence.
+        service_client.table("user_jobs").insert(
+            [
+                {"user_id": uid_a, "job_posting_id": jobs["pending_low"], "status": "saved"},
+                {"user_id": uid_a, "job_posting_id": jobs["purged_pass"], "status": "applied"},
+            ]
+        ).execute()
+        counts = (
+            service_client.rpc(
+                "pipeline_counts",
+                {"p_target_ids": [target_id], "p_min_score": 70, "p_user_id": uid_a},
+            )
+            .execute()
+            .data
+        )
+        # graded_pass (above floor, no user_jobs row) = 'new'; pending_low
+        # (floor-exempt) = 'saved'. graded_fail floored out; purged_pass
+        # liveness-gated out — its 'applied' status must NOT appear.
+        assert {r["status"]: r["count"] for r in counts or []} == {"new": 1, "saved": 1}
+    finally:
+        # source cascade -> jobs -> scores
+        service_client.table("sources").delete().eq("id", source_id).execute()
+        service_client.table("targets").delete().eq("id", target_id).execute()
+
+
 def test_invoker_rpc_blocks_spoofed_user_id_on_jwt_client(
     user_client_factory: Callable[[str], Client],
     seeded_shared_job: tuple[str, str, str, str],

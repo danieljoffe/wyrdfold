@@ -300,13 +300,24 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
 # --------------------------------------------------------------------------
 
 
-def test_counts_skip_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Floored counts ride the RPC since 20260716050000 taught it the Pending
+    # exemption — the Python path is the mid-deploy fallback only. Forcing
+    # Python here cost floored users ~2s of chunked round-trips per dashboard
+    # load (2026-07-16 audit).
     sb = MagicMock()
-    sb.rpc.side_effect = AssertionError("flat-floor RPC must not run when a floor is set")
-    monkeypatch.setattr(jobs_mod, "_pipeline_counts_python", lambda *a, **k: {"new": 7})
+    sb.rpc.return_value.execute.return_value = FakeResponse([{"status": "new", "count": 7}])
+    monkeypatch.setattr(
+        jobs_mod,
+        "_pipeline_counts_python",
+        lambda *a, **k: pytest.fail("floored counts must use the RPC, not the Python fallback"),
+    )
     out = _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=70, user_id="u1")
-    assert out == {"new": 7}  # Pending-aware Python path
-    sb.rpc.assert_not_called()
+    assert out == {"new": 7}
+    sb.rpc.assert_called_once_with(
+        "pipeline_counts",
+        {"p_target_ids": ["t-1"], "p_min_score": 70, "p_user_id": "u1"},
+    )
 
 
 def test_counts_use_rpc_when_unfloored() -> None:
