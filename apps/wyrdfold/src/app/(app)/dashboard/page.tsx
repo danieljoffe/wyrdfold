@@ -80,6 +80,13 @@ async function fetchTodayInitial(
           order: 'desc',
           page_size: '5',
         }),
+        // This is the cross-target status=new list — the known-fragile query
+        // that 8-10s's / 500s under load (#365). The default 1-retry pass would
+        // re-issue that exact query a second time on a 5xx, piling more load
+        // onto the endpoint that's already collapsing (and doubling this
+        // render's tail). Disable retry for the Top Matches read specifically;
+        // the cheap idempotent reads below keep it.
+        retries: 0,
       }),
       fetchJsonFromWyrdfoldAPI<ProseResponse>('/experience/prose'),
       fetchJsonFromWyrdfoldAPI<{ targets: UserTargetWithSummary[] }>(

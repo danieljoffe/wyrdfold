@@ -14,7 +14,7 @@ export default function DashboardLoading() {
           across breakpoints. */}
       <div>
         <Heading variant='hero' as='h1'>
-          Dashboard
+          Home
         </Heading>
         <Text variant='body' className='mt-1 text-text-secondary'>
           Your job search at a glance
