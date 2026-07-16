@@ -1822,15 +1822,13 @@ def _pipeline_counts_grouped(
     user_id: str | None,
 ) -> dict[str, int]:
     """Single grouped count via the ``pipeline_counts`` RPC; falls back
-    to the client-side two-query variant if the RPC isn't deployed yet."""
-    # The RPC floors on raw ``score``, which can't exempt Pending rows. When a
-    # floor is active, use the Python path (which exempts Pending) so the tab
-    # counts match the Pending-aware list. Unfloored counts keep the RPC —
-    # Pending rows are counted anyway. (#47)
-    if min_score and min_score > 0:
-        return _pipeline_counts_python(
-            supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
-        )
+    to the client-side chunked variant if the RPC isn't deployed yet.
+
+    Floored counts ride the RPC too: since 20260716050000 it mirrors
+    ``_apply_score_floor`` exactly (the floor applies only to rows with
+    ``scoring_status = 'complete'``; Pending rows always pass, #47).
+    Floored users previously forced the Python path — ~1.6–2.6s of chunked
+    round-trips inside the dashboard's hottest projection."""
     try:
         resp = supabase.rpc(
             "pipeline_counts",
