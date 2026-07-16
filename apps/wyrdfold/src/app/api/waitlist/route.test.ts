@@ -46,6 +46,8 @@ function makeRequest(
 beforeEach(() => {
   jest.clearAllMocks();
   process.env['WYRDFOLD_API_URL'] = API_URL;
+  // Each test controls the BFF secret explicitly; start clean so it can't bleed.
+  delete process.env['WYRDFOLD_BFF_SECRET'];
   global.fetch = mockFetch as unknown as typeof fetch;
   mockFetch.mockResolvedValue(upstreamResponse(200, { ok: true }));
 });
@@ -225,5 +227,20 @@ describe('POST /api/waitlist (BFF forwarder)', () => {
     const res = await POST(makeRequest({ email: 'jane@example.com' }));
     expect(res.status).toBe(503);
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  // SEC-5: the backend requires the BFF shared secret on this public endpoint
+  // (when configured) so a direct hit can't spoof the per-IP limit.
+  it('forwards the BFF shared secret when WYRDFOLD_BFF_SECRET is set', async () => {
+    process.env['WYRDFOLD_BFF_SECRET'] = 'sekret';
+    await POST(makeRequest({ email: 'jane@example.com' }));
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get('x-wyrdfold-bff')).toBe('sekret');
+  });
+
+  it('omits the BFF secret header when WYRDFOLD_BFF_SECRET is unset', async () => {
+    await POST(makeRequest({ email: 'jane@example.com' }));
+    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(new Headers(init.headers).get('x-wyrdfold-bff')).toBeNull();
   });
 });

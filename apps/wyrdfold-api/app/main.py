@@ -113,6 +113,20 @@ def _validate_settings(s: Settings) -> None:
             "Either set VOYAGE_API_KEY or switch EMBEDDINGS_PROVIDER=mock."
         )
 
+    # SEC-5: in saas mode the public waitlist / signup-mode endpoints are
+    # internet-facing and rate-limited per client IP. Without the BFF shared
+    # secret, a direct hit to the API can spoof X-Forwarded-For to rotate past
+    # that limit. Warn rather than fail — ``require_bff_secret`` fails open by
+    # design so setting it is a two-platform rollout, not a boot precondition —
+    # so the deploy log flags the gap until it's set on Railway + Vercel.
+    if s.deployment_mode == "saas" and not s.wyrdfold_bff_secret:
+        _log.warning(
+            "WYRDFOLD_BFF_SECRET is unset in saas mode: the public "
+            "waitlist/signup-mode endpoints are reachable directly and their "
+            "per-IP rate limit can be bypassed via X-Forwarded-For (SEC-5). "
+            "Set it on both the API (Railway) and the BFF (Vercel) to enforce."
+        )
+
 
 _LEGACY_KEY_DISABLED_SIGNATURE = "Legacy API keys are disabled"
 

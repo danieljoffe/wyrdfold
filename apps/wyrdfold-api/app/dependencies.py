@@ -172,6 +172,34 @@ def verify_api_key(
     return key or ""
 
 
+def require_bff_secret(
+    request: Request,
+    s: Settings = Depends(get_settings),
+) -> None:
+    """Reject requests that didn't come through the trusted Next.js BFF (SEC-5).
+
+    The public, IP-rate-limited endpoints (waitlist join, signup-mode) are only
+    meant to be reached via the BFF, which injects the shared ``X-Wyrdfold-BFF``
+    secret. Requiring it makes them BFF-only, so a direct hit to Railway can't
+    spoof ``X-Forwarded-For`` to rotate past slowapi's per-IP limit — the
+    residual gap left by ``FORWARDED_ALLOW_IPS="*"`` (the BFF already forwards
+    the trusted Vercel ``x-real-ip`` as the peer, so legit per-client keying is
+    unaffected).
+
+    Fail-open when unconfigured: an empty ``wyrdfold_bff_secret`` skips the
+    check, so a deploy that hasn't set the secret on BOTH the API (Railway) and
+    the BFF (Vercel) yet won't hard-break public signup. Roll out by setting the
+    BFF (Vercel) var first — it starts sending the header — then the API
+    (Railway) var to begin enforcing, closing the window with no gap.
+    """
+    secret = s.wyrdfold_bff_secret
+    if not secret:
+        return
+    provided = request.headers.get("x-wyrdfold-bff", "")
+    if not hmac.compare_digest(provided, secret):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 def _extract_bearer_token(request: Request) -> str | None:
     auth = request.headers.get("authorization")
     if not auth or not auth.lower().startswith("bearer "):
