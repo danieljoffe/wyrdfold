@@ -13,8 +13,9 @@ whether the daily grading cap happened to reach it. These tests pin the fix:
 - each row carries a ``pending`` flag so the UI can badge it instead of showing
   the placeholder as a grade,
 - the untargeted view's per-job dedup prefers a graded row over a Pending one,
-- the status-tab counts stay consistent (floored counts use the Pending-aware
-  Python path, not the flat-floor RPC).
+- the status-tab counts stay consistent (the ``pipeline_counts`` RPC applies
+  the same Pending-exempt floor as of migration 20260716050000, so floored
+  counts ride it too).
 """
 
 from __future__ import annotations
