@@ -11,8 +11,15 @@ router routes mishandled that:
 - **SEC-4 (MED)** ``POST /targets/{id}/deactivate`` was missing the
   ``_require_user_owns_target`` guard every sibling route has, so any JWT user could
   read back any target's full metadata.
+- **SEC-2 (HIGH)** ``PATCH /targets/{id}`` let any co-follower overwrite the shared
+  scoring profile / label — uncapped, bypassing the #191 merge machinery. Direct
+  field edits are now operator-only; end users tune their own ``user_targets`` view
+  or contribute through the bounded #191 path (reference JDs, learner review).
+- **SEC-3 (MED)** ``POST /targets/{id}/derive-profile`` re-derived and overwrote the
+  shared profile from the caller's experience. It had no legitimate caller and is
+  removed entirely.
 
-These pin both fixes.
+These pin all four fixes.
 """
 
 from __future__ import annotations
@@ -181,3 +188,55 @@ def test_deactivate_owner_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resp.status_code == 200
     assert resp.json()["id"] == "target-1"
     inactivate.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# SEC-2 — the shared row is view-only for end users; edits are operator-only
+# --------------------------------------------------------------------------
+
+
+def test_update_target_by_jwt_user_is_403_and_never_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.routers import targets as mod
+
+    update = MagicMock(return_value=_job_target())
+    monkeypatch.setattr(mod.crud, "update", update)
+
+    resp = _client("user-1").patch("/targets/target-1", json={"label": "hacked"})
+
+    assert resp.status_code == 403
+    # THE regression: a signed-in user must never write the shared catalog row,
+    # even one they follow. The operator gate fires before any write.
+    update.assert_not_called()
+
+
+def test_update_target_by_operator_still_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.routers import targets as mod
+
+    # Operator path (user_id is None): curation via the api-key is preserved.
+    update = MagicMock(return_value=_job_target())
+    monkeypatch.setattr(mod.crud, "update", update)
+
+    resp = _client(None).patch("/targets/target-1", json={"label": "Renamed"})
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "target-1"
+    update.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# SEC-3 — the user-triggered shared-profile re-derive route is gone
+# --------------------------------------------------------------------------
+
+
+def test_derive_profile_route_is_removed() -> None:
+    # The route overwrote the shared profile from the caller's experience and
+    # had no FE/internal caller — removed rather than gated.
+    paths = {getattr(r, "path", None) for r in app.routes}
+    assert "/targets/{target_id}/derive-profile" not in paths
+    # And it is unreachable over HTTP.
+    resp = _client("user-1").post("/targets/target-1/derive-profile")
+    assert resp.status_code == 404

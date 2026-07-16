@@ -24,9 +24,9 @@ jest.mock('next/navigation', () => ({
 
 // Children are exercised in their own specs; stub them so this spec only
 // proves the section composition + loading / not-found switch.
-jest.mock('../ScoringProfileEditor', () => ({
+jest.mock('../ScoringProfileView', () => ({
   __esModule: true,
-  default: () => <div data-testid='scoring-profile-editor-stub' />,
+  default: () => <div data-testid='scoring-profile-view-stub' />,
 }));
 jest.mock('../ReferenceJDList', () => ({
   __esModule: true,
@@ -117,11 +117,11 @@ describe('TargetDetail', () => {
     ).toBeInTheDocument();
     // The Scoring tab is the default: shared scoring model renders,
     // the other tabs' editors do NOT mount until selected (lazy per tab).
-    expect(
-      screen.getByTestId('scoring-profile-editor-stub')
-    ).toBeInTheDocument();
+    expect(screen.getByTestId('scoring-profile-view-stub')).toBeInTheDocument();
     expect(screen.queryByTestId('reference-jd-list-stub')).toBeNull();
     expect(screen.queryByTestId('learning-log-stub')).toBeNull();
+    // SEC-2 (#366): the shared label is view-only — no inline edit control.
+    expect(screen.queryByRole('button', { name: /edit label/i })).toBeNull();
     // Tabs are present with the Fork B labels.
     for (const label of [
       'Scoring',
@@ -195,7 +195,7 @@ describe('TargetDetail', () => {
     );
     expect(fetchCalls.some(u => u.endsWith('/reference-jds'))).toBe(true);
     // Default-tab content unmounted; Learning still never mounted.
-    expect(screen.queryByTestId('scoring-profile-editor-stub')).toBeNull();
+    expect(screen.queryByTestId('scoring-profile-view-stub')).toBeNull();
     expect(screen.queryByTestId('learning-log-stub')).toBeNull();
 
     await user.click(screen.getByRole('tab', { name: 'Learning' }));
