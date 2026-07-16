@@ -86,3 +86,17 @@ def jobs_cache_prefix(*, target_id: str | None) -> str:
 
 # Singleton caches
 job_list_cache = TTLCache(ttl=60.0, max_size=128)
+
+# Insights/analytics result cache. The three /insights endpoints recompute
+# heavy period-windowed GROUP BY aggregations on every request, and the Trends
+# UI toggles period (7d/30d/90d/all) across three tabs — so one visit used to
+# re-run the app's most expensive reads several times (historically 9-41s).
+#
+# These are slow-moving historical aggregates seeded server-side per visit, so
+# a short TTL (not event-invalidation) is the right fit: it collapses the
+# toggle/tab thrash and quick revisits while bounding staleness to the TTL.
+# A user-initiated status change is reflected immediately on the jobs page's
+# own counts (job_list_cache-backed); the Trends view tolerates up to one TTL
+# of lag. If that lag ever matters, wire per-user invalidation at the
+# status-write sites — deliberately deferred (see PERF-2 in #368).
+insights_cache = TTLCache(ttl=90.0, max_size=256)
