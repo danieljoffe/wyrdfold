@@ -48,10 +48,13 @@ describe('WyrdfoldDashboard route', () => {
     ).rejects.toThrow('REDIRECT:/onboarding');
 
     expect(mockRedirect).toHaveBeenCalledWith('/onboarding');
-    expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(mockFetch).toHaveBeenCalledWith('/profile/onboarding');
-    // We bail before the bulk data fetch — keeps the new-user request
-    // cheap on the API.
+    // The widget fetches now START alongside the gate read (they no longer
+    // queue behind its round-trip on every onboarded load), so this
+    // pre-wizard visit fires them too — 5 calls, results discarded by the
+    // redirect. Deliberate trade: a handful of one-time reads on the rarest
+    // path buys a round-trip off every load of the app's default page.
+    expect(mockFetch).toHaveBeenCalledTimes(5);
     expect(mockSentryCapture).not.toHaveBeenCalled();
   });
 

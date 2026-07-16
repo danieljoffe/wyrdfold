@@ -37,14 +37,21 @@ export interface TargetTab {
 const BATCH_POLL_INTERVAL = 3000;
 
 /**
- * Cap for the target-activation status poll. 3s × 60 = ~180s — generous
- * enough for slow LLM-bound derivations to finish, tight enough that a
- * target genuinely stuck in `deriving` doesn't tick 20×/min forever
- * (#851 P4). On cap reached we clear the timer and rely on the next
- * tab switch or router.refresh() to pick up the eventually-settled
- * state.
+ * Budget for the target-activation status poll: 10 ticks at 3s (fresh
+ * feedback while a normal derive/poll finishes) then 15s per tick — the
+ * same 60-attempt cap now covers ~13 minutes instead of burning out in 3
+ * at 20 req/min (#851 P4; re-activation pipelines that re-poll sources
+ * can legitimately run for minutes, and prod logs showed the fast cadence
+ * sustained across those windows). On cap reached we clear the timer and
+ * rely on the next tab switch or router.refresh() to pick up the
+ * eventually-settled state. Hidden tabs don't tick at all — the
+ * visibilitychange listener resumes the loop, so a backgrounded /jobs tab
+ * stops contributing request noise entirely.
  */
 const STATUS_POLL_MAX_ATTEMPTS = 60;
+const STATUS_POLL_FAST_ATTEMPTS = 10;
+const STATUS_POLL_FAST_MS = 3_000;
+const STATUS_POLL_SLOW_MS = 15_000;
 
 interface JobsListProps {
   targetId: string | undefined;
@@ -247,13 +254,19 @@ export default function JobsList({
 
     let cancelled = false;
     let attempts = 0;
+    // True between ensureStatusPoll() and clearStatusPoll() — i.e. "the
+    // pipeline is mid-flight and we owe the user updates". Lets the
+    // visibilitychange handler distinguish "paused while hidden" from
+    // "settled, nothing to resume".
+    let polling = false;
     const statusPollRef: {
-      current: ReturnType<typeof setInterval> | undefined;
+      current: ReturnType<typeof setTimeout> | undefined;
     } = { current: undefined };
 
     function clearStatusPoll() {
+      polling = false;
       if (statusPollRef.current) {
-        clearInterval(statusPollRef.current);
+        clearTimeout(statusPollRef.current);
         // Null out the ref so a later branch that gates on
         // ``!statusPollRef.current`` can re-establish polling.
         // Previously the cleared timer ID lingered, so going
@@ -263,11 +276,40 @@ export default function JobsList({
       }
     }
 
+    // Chained setTimeout rather than setInterval: each tick schedules the
+    // next, so the cadence can back off after the fast window, and a hidden
+    // tab schedules nothing until it's visible again.
+    function scheduleTick() {
+      if (statusPollRef.current) return;
+      const delay =
+        attempts < STATUS_POLL_FAST_ATTEMPTS
+          ? STATUS_POLL_FAST_MS
+          : STATUS_POLL_SLOW_MS;
+      statusPollRef.current = setTimeout(() => {
+        statusPollRef.current = undefined;
+        // Hidden tab: park the chain — onVisibility re-enters it. The
+        // attempt budget only counts requests actually issued.
+        if (document.visibilityState === 'hidden') return;
+        void checkStatus();
+      }, delay);
+    }
+
     function ensureStatusPoll() {
-      if (!statusPollRef.current) {
-        statusPollRef.current = setInterval(checkStatus, 3000);
+      polling = true;
+      scheduleTick();
+    }
+
+    function onVisibility() {
+      if (
+        document.visibilityState === 'visible' &&
+        polling &&
+        !statusPollRef.current &&
+        !cancelled
+      ) {
+        void checkStatus();
       }
     }
+    document.addEventListener('visibilitychange', onVisibility);
 
     async function checkStatus() {
       // Bail before issuing the network request when we've exhausted
@@ -280,7 +322,14 @@ export default function JobsList({
       }
       try {
         const res = await fetch(`/api/targets/${activeTargetId}/status`);
-        if (!res.ok || cancelled) return;
+        if (cancelled) return;
+        if (!res.ok) {
+          // Transient failure mid-pipeline: keep the chain alive (the old
+          // setInterval retried implicitly; a chained timeout must
+          // reschedule or a single 5xx freezes the status UI).
+          if (polling) scheduleTick();
+          return;
+        }
         const data = (await res.json()) as {
           activation_status: string;
           jobs_count: number;
@@ -321,7 +370,9 @@ export default function JobsList({
           clearStatusPoll();
         }
       } catch {
-        // Non-critical — will retry on next interval or tab switch
+        // Non-critical — reschedule if mid-pipeline, else the next tab
+        // switch retries.
+        if (!cancelled && polling) scheduleTick();
       }
     }
 
@@ -329,6 +380,7 @@ export default function JobsList({
 
     return () => {
       cancelled = true;
+      document.removeEventListener('visibilitychange', onVisibility);
       clearStatusPoll();
     };
   }, [activeTargetId]);
