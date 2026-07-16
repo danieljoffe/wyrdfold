@@ -125,6 +125,18 @@ export interface UserTargetWithSummary {
   target: JobTargetSummary;
 }
 
+/**
+ * A shared target surfaced by `GET /targets/search` — a lightweight card the
+ * user can follow to discover a role someone else already created (instead of
+ * minting a duplicate). `is_linked` marks the ones the caller already follows.
+ */
+export interface TargetSearchResult {
+  id: string;
+  label: string;
+  description: string | null;
+  is_linked: boolean;
+}
+
 /** Project a full {@link JobTarget} down to its list summary, deriving the
  * counts locally — used at the create/suggestion/poll boundaries where the
  * API still returns a full target but list state holds summaries. */
