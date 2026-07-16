@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server';
 
-import { proxyToWyrdfoldAPI, readJsonBody } from '@/lib/api/proxy';
+import { proxyToWyrdfoldAPI } from '@/lib/api/proxy';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -9,15 +9,10 @@ export async function GET(_request: NextRequest, { params }: Params) {
   return proxyToWyrdfoldAPI(`/targets/${id}`);
 }
 
-export async function PATCH(request: NextRequest, { params }: Params) {
-  const { id } = await params;
-  const parsed = await readJsonBody(request);
-  if (!parsed.ok) return parsed.response;
-  return proxyToWyrdfoldAPI(`/targets/${id}`, {
-    method: 'PATCH',
-    body: parsed.body,
-  });
-}
+// PATCH removed (SEC-2, #366): the target row is a shared catalog — direct
+// field edits are operator-only on the API. Per-user tuning goes through the
+// axis-weights / preferences sub-routes; shared-model contribution through the
+// bounded #191 path (reference JDs, learning log).
 
 export async function DELETE(_request: NextRequest, { params }: Params) {
   const { id } = await params;

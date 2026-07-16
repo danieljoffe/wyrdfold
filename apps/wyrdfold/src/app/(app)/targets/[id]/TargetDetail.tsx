@@ -3,15 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { Check, Pencil } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/kit/Button';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
-import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type {
   JobTarget,
@@ -23,7 +20,7 @@ import AxisWeightsEditor from './AxisWeightsEditor';
 import LearningLogPanel from './LearningLogPanel';
 import NotificationThresholdsEditor from './NotificationThresholdsEditor';
 import ReferenceJDList from './ReferenceJDList';
-import ScoringProfileEditor from './ScoringProfileEditor';
+import ScoringProfileView from './ScoringProfileView';
 import TargetDetailSkeleton from './TargetDetailSkeleton';
 import TargetPreferencesEditor from './TargetPreferencesEditor';
 
@@ -53,9 +50,6 @@ export default function TargetDetail({ id }: TargetDetailProps) {
   const [referenceJDs, setReferenceJDs] = useState<TargetReferenceJD[]>([]);
   const [jdsLoaded, setJdsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [editingLabel, setEditingLabel] = useState(false);
-  const [labelDraft, setLabelDraft] = useState('');
-  const [savingLabel, setSavingLabel] = useState(false);
   const { toast } = useToast();
 
   const pathname = usePathname();
@@ -90,7 +84,6 @@ export default function TargetDetail({ id }: TargetDetailProps) {
       if (!res.ok) throw new Error('Failed to fetch target');
       const data = (await res.json()) as JobTarget;
       setTarget(data);
-      setLabelDraft(data.label);
     } catch {
       toast({ variant: 'error', title: 'Failed to load target' });
     }
@@ -151,35 +144,6 @@ export default function TargetDetail({ id }: TargetDetailProps) {
     }
   }, [activeTab, jdsLoaded, fetchReferenceJDs]);
 
-  const handleSaveLabel = useCallback(async () => {
-    const trimmed = labelDraft.trim();
-    if (!trimmed || trimmed === target?.label) {
-      setEditingLabel(false);
-      return;
-    }
-
-    setSavingLabel(true);
-    try {
-      const res = await fetch(`/api/targets/${id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: trimmed }),
-      });
-      if (!res.ok)
-        throw new Error(await extractApiError(res, 'Failed to update label'));
-      setTarget(prev => (prev ? { ...prev, label: trimmed } : prev));
-      setEditingLabel(false);
-      toast({ variant: 'success', title: 'Label updated' });
-    } catch (err) {
-      toast({
-        variant: 'error',
-        title: err instanceof Error ? err.message : 'Failed to update label',
-      });
-    } finally {
-      setSavingLabel(false);
-    }
-  }, [id, labelDraft, target?.label, toast]);
-
   const handleRefresh = useCallback(() => {
     fetchTarget();
     fetchReferenceJDs();
@@ -194,8 +158,10 @@ export default function TargetDetail({ id }: TargetDetailProps) {
         content: (
           <div className='flex flex-col gap-8 pt-4'>
             {/* Fork C: the scoring model is SHARED — co-searchers on this
-                target score with the same rubric, so editing it is a
-                knowing act. The per-user knobs live in "Your view". */}
+                target score with the same rubric, so it is view-only per user
+                (SEC-2, #366). It's shaped through the bounded #191 path
+                (reference JDs + the learning log), not edited directly. The
+                per-user knobs live in "Your view". */}
             <section
               aria-labelledby='shared-scoring-heading'
               className='flex flex-col gap-2'
@@ -204,15 +170,16 @@ export default function TargetDetail({ id }: TargetDetailProps) {
                 <Heading variant='section' as='h2' id='shared-scoring-heading'>
                   Scoring model
                 </Heading>
-                <Badge variant='warning' size='sm'>
+                <Badge variant='default' size='sm'>
                   Shared with co-searchers
                 </Badge>
               </div>
               <Text variant='meta'>
-                Edits here change how jobs are scored for everyone pursuing this
-                target — not just you.
+                This model is shared by everyone pursuing this target.
+                It&rsquo;s refined through reference JDs and the learning log —
+                not edited directly.
               </Text>
-              <ScoringProfileEditor target={target} onSaved={fetchTarget} />
+              <ScoringProfileView target={target} />
             </section>
 
             {userTarget && (
@@ -327,59 +294,12 @@ export default function TargetDetail({ id }: TargetDetailProps) {
         ]}
       />
 
-      {/* Persistent header — visible on every tab. */}
+      {/* Persistent header — visible on every tab. The label is a shared
+          catalog field, so it's read-only per user (SEC-2, #366). */}
       <div className='flex items-center gap-3 flex-wrap'>
-        {editingLabel ? (
-          <div className='flex items-center gap-2'>
-            <input
-              aria-label='Target label'
-              aria-describedby='label-edit-hint'
-              value={labelDraft}
-              onChange={e => setLabelDraft(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter') handleSaveLabel();
-                if (e.key === 'Escape') {
-                  setEditingLabel(false);
-                  setLabelDraft(target.label);
-                }
-              }}
-              className='text-xl font-semibold bg-transparent border-b-2 border-brand-500 outline-none text-text-primary'
-              maxLength={200}
-              autoFocus
-              disabled={savingLabel}
-            />
-            <span id='label-edit-hint' className='sr-only'>
-              Press Enter to save, Escape to cancel
-            </span>
-            <Button
-              name='target-label-save'
-              variant='bare'
-              size='sm'
-              iconOnly
-              onClick={handleSaveLabel}
-              disabled={savingLabel}
-              aria-label='Save label'
-            >
-              <Check className='size-4' />
-            </Button>
-          </div>
-        ) : (
-          <div className='flex items-center gap-2'>
-            <Heading variant='hero' as='h1'>
-              {target.label}
-            </Heading>
-            <Button
-              name='target-label-edit'
-              variant='bare'
-              size='sm'
-              iconOnly
-              onClick={() => setEditingLabel(true)}
-              aria-label='Edit label'
-            >
-              <Pencil className='size-3.5' />
-            </Button>
-          </div>
-        )}
+        <Heading variant='hero' as='h1'>
+          {target.label}
+        </Heading>
 
         {target.is_active && (
           <Badge variant='brand-solid' size='sm'>

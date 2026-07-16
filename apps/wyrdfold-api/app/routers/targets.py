@@ -175,6 +175,29 @@ def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_i
         raise HTTPException(status_code=404, detail="Target not found")
 
 
+def _require_operator(user_id: str | None) -> None:
+    """Reject a signed-in end user from a shared-catalog mutation.
+
+    Targets are a shared row (many users co-follow one target via the global
+    ``find_matching_target`` label dedup), so a direct field edit here would
+    rewrite the scoring rubric / label every co-follower depends on. Those
+    edits are operator-only: ``user_id is None`` is the operator/api-key path
+    (cron, admin curation) and passes; a real subject is a JWT end user and is
+    refused. End users shape only their own view (axis weights, preferences on
+    ``user_targets``) and contribute to the shared profile solely through the
+    bounded #191 path (reference JDs, learner review). See SEC-2 (#366).
+    """
+    if user_id is not None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Targets are a shared catalog and can't be edited directly. "
+                "Tune your own view via axis weights and preferences, or "
+                "contribute a reference JD."
+            ),
+        )
+
+
 async def _activate_pipeline(
     supabase: Client, llm: LLMClient, target: JobTarget, user_id: str
 ) -> None:
@@ -581,7 +604,10 @@ def update_target(
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    # Shared-catalog write → operator-only (SEC-2, #366). End users can't edit
+    # the shared scoring profile / label; they tune their own view via
+    # axis-weights / preferences and contribute via the bounded #191 path.
+    _require_operator(user_id)
     target = crud.update(supabase, target_id, body)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -960,58 +986,6 @@ async def link_target(
                 ),
             },
         ) from e
-
-
-@router.post(
-    "/{target_id}/derive-profile",
-    response_model=JobTarget,
-    dependencies=[Depends(enforce_llm_budget)],
-)
-@limiter.limit("10/minute")
-async def derive_target_profile(
-    request: Request,
-    target_id: str,
-    supabase: Client = Depends(get_supabase),
-    llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
-) -> JobTarget:
-    """Derive a scoring profile + search keywords from the target label + user experience."""
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="Target not found")
-
-    doc = optimized.get_latest(supabase, user_id=user_id)
-    if doc is None:
-        # Precondition (profile exists) not met — see /from-manual for rationale.
-        raise HTTPException(status_code=422, detail="No experience profile found")
-
-    derived, result = await derive_profile_from_label(llm, label=target.label)
-    cost_log.record(
-        supabase,
-        user_id=user_id,
-        purpose=DERIVE_LABEL_PURPOSE,
-        result=result,
-        metadata={"target_id": target_id},
-    )
-
-    updated = crud.update(
-        supabase,
-        target_id,
-        TargetUpdate(
-            scoring_profile=derived.scoring_profile,
-            search_keywords=derived.search_keywords,
-            example_promising_titles=derived.example_promising_titles,
-            example_unpromising_titles=derived.example_unpromising_titles,
-            description=derived.description,
-            seniority_hint=derived.seniority_hint,
-            domain_hints=derived.domain_hints or None,
-            profile_version=target.profile_version + 1,
-        ),
-    )
-    if updated is None:
-        raise HTTPException(status_code=500, detail="Failed to update target")
-    return updated
 
 
 @router.post(
