@@ -54,6 +54,17 @@ class ScoresQuery:
     def order(self, *_a: Any, **_kw: Any) -> ScoresQuery:
         return self
 
+    def is_(self, *_a: Any, **_kw: Any) -> ScoresQuery:
+        # The scores-layer liveness join (`jobs.archived_at is null`, ...)
+        # — a fluent no-op here; liveness outcomes are modelled by which
+        # rows the test seeds. See _scores_live_join.
+        return self
+
+    @property
+    def not_(self) -> ScoresQuery:
+        # `.not_.is_("jobs.is_us", "false")` — same no-op treatment.
+        return self
+
     def gte(self, _col: str, value: int) -> ScoresQuery:
         # A plain (non-Pending-aware) floor.
         self._floor = value

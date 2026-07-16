@@ -250,9 +250,7 @@ def _fetch_jobs_chunked(
     # liveness gate for a purge gate (tombstones stay hidden: their payload
     # is stripped) and carries ``archived_at`` through for the overlay below.
     archived_view = status == "archived"
-    for_view_cols = (
-        _JP_SELECT_COLS + ", archived_at" if archived_view else _JP_SELECT_COLS
-    )
+    for_view_cols = _JP_SELECT_COLS + ", archived_at" if archived_view else _JP_SELECT_COLS
     out: list[dict[str, Any]] = []
     for i in range(0, len(page_ids), _IN_CHUNK_SIZE):
         chunk = page_ids[i : i + _IN_CHUNK_SIZE]
@@ -517,19 +515,62 @@ def _display_sort_value(
 
 
 def _is_pending(row: dict[str, Any]) -> bool:
-    """True when a row is not yet Sonnet-graded — its ``score`` is still a
+    """True when a row is not yet LLM-graded — its ``score`` is still a
     keyword placeholder, not a real fit score.
 
-    The genuine-grade signal is a persisted ``fit_reasoning`` — the evidence-first
-    reasoning a real Phase-2 grade always produces, and Phase 2 is the only writer
-    of the per-(job, target) fit score. ``scoring_status`` is NOT reliable here:
-    'complete' is set on rows that were never actually graded (deferred / reset),
-    so keying Pending off ``scoring_status != 'complete'`` surfaced ~2,300 keyword
-    placeholders in prod as if they were fit scores. A missing/blank reasoning ⇒
-    Pending regardless of status; the chip then shows a neutral symbol, not the
-    placeholder number."""
+    The genuine-grade signals are the fields ONLY Phase 2's persist writes,
+    atomically in one UPDATE: ``axis_scores`` and ``fit_reasoning``
+    (prod-verified equivalent — zero rows carry one without the other). A row
+    is graded when EITHER is present, so callers fetching either column
+    classify correctly. ``scoring_status`` is NOT reliable here: 'complete'
+    is set on rows that were never actually graded (deferred / reset), which
+    once surfaced ~2,300 keyword placeholders as if they were fit scores.
+
+    THE SELECT-SHAPE RULE (the 2026-07-16 regression): this classifier may
+    only rely on columns the list paths actually fetch. The original
+    fit_reasoning-only version silently classified EVERY list row as Pending
+    — the list selects don't fetch ``fit_reasoning`` (it's per-row prose;
+    fetching it for ~2k candidate rows per request is pure payload) — which
+    collapsed the graded/Pending tiers into one recency-ordered lump.
+    ``tests/test_jobs_pending_floor.py`` pins signal-columns ⊆ both list
+    selects; keep it true when touching either side."""
+    axes = row.get("axis_scores")
+    if isinstance(axes, dict) and axes:
+        return False
     reasoning = row.get("fit_reasoning")
     return not (isinstance(reasoning, str) and reasoning.strip())
+
+
+# Candidate score-row columns for the two list paths. ``axis_scores`` must
+# stay in this list: it is ``_is_pending``'s graded-signal column (the
+# 2026-07-16 regression was a classifier keyed on a column these selects
+# don't fetch — every row classified Pending and the tiers collapsed).
+# ``tests/test_jobs_pending_floor.py`` pins this invariant.
+_SCORE_ROW_COLS = (
+    "job_posting_id, score, recency_score, score_breakdown, "
+    "scoring_status, axis_scores, logistics_filters"
+)
+
+
+def _scores_live_join(query: Any, *, archived_view: bool) -> Any:
+    """Restrict candidate score rows to LIVE jobs at the scores layer.
+
+    Dead rows (archived/purged/confirmed-non-US jobs) used to survive into
+    ranking + pagination and only drop at the jobs re-fetch — silently eating
+    page slots (chronically short pages; an ascending score sort whose whole
+    first window was dead rows rendered a fully EMPTY page, 2026-07-16). The
+    ``jobs!inner`` embed mirrors ``_gate_live_us`` + the purge filter at the
+    query layer so pagination only slices rows that can actually render.
+    Callers must include ``jobs!inner(id)`` in the select when not the
+    archived view (which keeps archived jobs and skips this).
+    """
+    if archived_view:
+        return query
+    return (
+        query.is_("jobs.archived_at", "null")
+        .is_("jobs.purged_at", "null")
+        .not_.is_("jobs.is_us", "false")
+    )
 
 
 def _apply_score_floor(query: Any, min_score: int | None) -> Any:
@@ -842,15 +883,14 @@ def _list_jobs_for_target_two_query(
     # DB). No server-side ORDER BY or exact count: _assemble_jobs_page re-ranks
     # by the DISPLAY value and derives the total from the row set, so both would
     # be pure waste (an exact count on every list request that nothing reads).
+    archived_view = status == "archived"
     ts_query = (
         supabase.table("scores")
-        .select(
-            "job_posting_id, score, recency_score, score_breakdown, "
-            "scoring_status, axis_scores, logistics_filters",
-        )
+        .select(_SCORE_ROW_COLS + ("" if archived_view else ", jobs!inner(id)"))
         .eq("target_id", target_id)
         .eq("excluded", False)
     )
+    ts_query = _scores_live_join(ts_query, archived_view=archived_view)
     ts_query = _apply_score_floor(ts_query, min_score)
     ts_rows = cast(list[dict[str, Any]], ts_query.execute().data or [])
 
@@ -997,15 +1037,14 @@ def _list_jobs_across_user_targets(
     # axis-weighted blend + read-time decay), computed below — not a stored
     # column. ``min_score`` still filters on the raw fit score.
 
+    archived_view = status == "archived"
     score_query = (
         supabase.table("scores")
-        .select(
-            "job_posting_id, target_id, score, recency_score, "
-            "axis_scores, score_breakdown, scoring_status, logistics_filters"
-        )
+        .select(_SCORE_ROW_COLS + ", target_id" + ("" if archived_view else ", jobs!inner(id)"))
         .in_("target_id", list(user_target_ids))
         .eq("excluded", False)
     )
+    score_query = _scores_live_join(score_query, archived_view=archived_view)
     score_query = _apply_score_floor(score_query, min_score)
     score_resp = score_query.execute()
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
