@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     # the automation key can no longer authenticate against user data. Empty
     # changes nothing (the legacy key keeps working everywhere it does today).
     wyrdfold_cron_key: str = Field(default="", repr=False)
+    # Shared secret proving a request came through the trusted Next.js BFF
+    # (SEC-5). The BFF injects it as ``X-Wyrdfold-BFF`` on the public,
+    # IP-rate-limited endpoints (waitlist join, signup-mode); the API requires
+    # it there so a direct hit to Railway can't spoof ``X-Forwarded-For`` to
+    # rotate past the per-IP limit. OPTIONAL: empty disables the check
+    # (fail-open) so a deploy that hasn't set it on BOTH platforms yet doesn't
+    # hard-break public signup. Rollout: set the BFF (Vercel) var first so it
+    # starts sending the header, then the API (Railway) var to begin enforcing.
+    wyrdfold_bff_secret: str = Field(default="", repr=False)
     # JWT verification uses Supabase's JWKS endpoint at
     # `<supabase_url>/auth/v1/.well-known/jwks.json` — public-key verification
     # with key rotation handled automatically. No shared secret required.

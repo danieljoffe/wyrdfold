@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
 
+import { bffSecretHeader } from '@/lib/api/bffSecret';
+
 // Public perimeter probe (Phase 3 slice 5): the login form reads this to
 // decide sign-in vs sign-up presentation (`shouldCreateUser`). Pre-auth by
 // design — it only reveals whether signup is open, which the signup form
@@ -13,6 +15,8 @@ export async function GET() {
   }
   try {
     const res = await fetch(`${baseUrl}/signup-mode`, {
+      // Prove this came through the BFF (SEC-5); the API requires it here.
+      headers: { ...bffSecretHeader() },
       // Perimeter flips are rare; a short cache keeps this off the hot path.
       next: { revalidate: 60 },
     });
