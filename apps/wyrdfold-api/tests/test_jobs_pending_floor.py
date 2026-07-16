@@ -64,6 +64,17 @@ def test_is_pending_uses_grade_written_fields_not_status() -> None:
     assert _is_pending({"scoring_status": "complete", "axis_scores": {"title_fit": 9}}) is False
 
 
+def test_is_pending_honors_precomputed_posting_flag() -> None:
+    """Posting rows carry the overlay's precomputed ``pending`` bool (derived
+    from the scores row's signal columns) — the filtered list branch ranks
+    POSTING rows, which have neither axis_scores nor fit_reasoning, so the
+    flag must win when present."""
+    assert _is_pending({"pending": False, "title": "x"}) is False
+    assert _is_pending({"pending": True, "title": "x"}) is True
+    # A truthy-but-not-bool value must NOT be trusted as the flag.
+    assert _is_pending({"pending": "yes"}) is True  # falls through, no signal
+
+
 def test_pending_signal_columns_are_fetched_by_the_list_selects() -> None:
     """THE 2026-07-16 regression pin: ``_is_pending``'s PRIMARY signal column
     must be in the list paths' score select — the classifier once keyed only
@@ -488,3 +499,60 @@ def test_archived_view_keeps_archived_jobs() -> None:
     )
     assert not any("jobs!inner" in s for s in rec.selects)
     assert rec.is_calls == []
+
+
+def test_filtered_path_keeps_graded_first_and_score_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE 2026-07-16 follow-up regression: with a location/preference filter
+    active, ranking runs over POSTING rows (post-fetch branch) — the graded
+    tier collapsed into Pending and the list went recency-ordered. Rows shaped
+    like production (scores carry axis_scores; postings carry the overlay
+    flag) must stay graded-first, score-descending, Pending below."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = [
+        {
+            "job_posting_id": "g65",
+            "score": 65,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 65},
+        },
+        {"job_posting_id": "p1", "score": 30, "score_breakdown": {}, "scoring_status": "stage2"},
+        {
+            "job_posting_id": "g78",
+            "score": 78,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 78},
+        },
+        {
+            "job_posting_id": "g72",
+            "score": 72,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 72},
+        },
+    ]
+    postings = {
+        jid: {"id": jid, "title": jid, "location": "Remote, US"}
+        for jid in ("g65", "p1", "g78", "g72")
+    }
+    result = _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=["remote"],
+        cursor={},
+    )
+    ids = [p["id"] for p in result["postings"]]
+    # Graded by score desc, Pending strictly last — never interleaved.
+    assert ids == ["g78", "g72", "g65", "p1"]
+    assert [p["pending"] for p in result["postings"]] == [False, False, False, True]
