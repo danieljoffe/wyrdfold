@@ -562,6 +562,24 @@ _SCORE_ROW_COLS = (
 )
 
 
+# The liveness inner-join doubles as a column ride-along: role_family feeds
+# the off-family gate and first_seen_at the Pending-tier recency sort —
+# columns these paths used to re-fetch in up to ~20 sequential chunked reads
+# per request (the 4-8s /jobs + dashboard latencies, 2026-07-16). One join,
+# zero extra round-trips.
+_JOBS_EMBED = ", jobs!inner(id, role_family, first_seen_at)"
+
+
+def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
+    """The embedded ``jobs`` relation's ``field`` for a scores row, or None
+    when the row was fetched without the embed (archived view / older
+    stubs)."""
+    embedded = row.get("jobs")
+    if isinstance(embedded, dict):
+        return embedded.get(field)
+    return None
+
+
 def _scores_live_join(query: Any, *, archived_view: bool) -> Any:
     """Restrict candidate score rows to LIVE jobs at the scores layer.
 
@@ -680,10 +698,21 @@ def _gate_off_family(
     if not any(target_family.values()):
         return by_id
 
+    # The scores fetch embeds jobs(role_family) on the live paths, so this is
+    # usually a pure in-memory harvest; only rows fetched WITHOUT the embed
+    # (archived view) fall back to the chunked reads — which used to run for
+    # every request (~20 sequential round-trips on a 2k-row candidate set,
+    # the dominant term in the 4-8s /jobs latencies).
     job_family: dict[str, str | None] = {}
-    ids = list(by_id.keys())
-    for i in range(0, len(ids), _IN_CHUNK_SIZE):
-        chunk = ids[i : i + _IN_CHUNK_SIZE]
+    missing: list[str] = []
+    for pid, s in by_id.items():
+        embedded = s.get("jobs")
+        if isinstance(embedded, dict) and "role_family" in embedded:
+            job_family[pid] = embedded.get("role_family")
+        else:
+            missing.append(pid)
+    for i in range(0, len(missing), _IN_CHUNK_SIZE):
+        chunk = missing[i : i + _IN_CHUNK_SIZE]
         jf = supabase.table("jobs").select("id, role_family").in_("id", chunk).execute()
         for r in cast(list[dict[str, Any]], jf.data or []):
             job_family[r["id"]] = r.get("role_family")
@@ -745,10 +774,21 @@ def _assemble_jobs_page(
 
     now = datetime.now(UTC)
     # Force the first-seen fetch on the score sort even with decay off — the
-    # Pending-tier recency sort keys on it (#47 f/u).
-    fs_lookup = _first_seen_lookup(
-        supabase, list(by_id.keys()), force=(sort == "score" or sort_col == "score")
-    )
+    # Pending-tier recency sort keys on it (#47 f/u). The live-path scores
+    # fetch embeds jobs(first_seen_at), so this is normally a pure harvest;
+    # only embed-less rows (archived view) still pay the chunked reads.
+    fs_lookup: dict[str, Any] = {}
+    fs_missing: list[str] = []
+    for pid, s in by_id.items():
+        embedded = s.get("jobs")
+        if isinstance(embedded, dict) and "first_seen_at" in embedded:
+            fs_lookup[pid] = embedded.get("first_seen_at")
+        else:
+            fs_missing.append(pid)
+    if fs_missing:
+        fs_lookup.update(
+            _first_seen_lookup(supabase, fs_missing, force=(sort == "score" or sort_col == "score"))
+        )
 
     def _display(row: dict[str, Any]) -> int:
         return _display_sort_value(
@@ -896,7 +936,7 @@ def _list_jobs_for_target_two_query(
     archived_view = status == "archived"
     ts_query = (
         supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ("" if archived_view else ", jobs!inner(id)"))
+        .select(_SCORE_ROW_COLS + ("" if archived_view else _JOBS_EMBED))
         .eq("target_id", target_id)
         .eq("excluded", False)
     )
@@ -1050,7 +1090,7 @@ def _list_jobs_across_user_targets(
     archived_view = status == "archived"
     score_query = (
         supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ", target_id" + ("" if archived_view else ", jobs!inner(id)"))
+        .select(_SCORE_ROW_COLS + ", target_id" + ("" if archived_view else _JOBS_EMBED))
         .in_("target_id", list(user_target_ids))
         .eq("excluded", False)
     )

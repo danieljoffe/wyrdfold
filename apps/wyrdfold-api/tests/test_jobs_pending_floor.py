@@ -471,7 +471,9 @@ def test_live_view_applies_jobs_inner_join() -> None:
         only_terms=[],
         cursor={},
     )
-    assert any("jobs!inner(id)" in s for s in rec.selects)
+    # The embed also rides the gate + recency columns (perf: kills the
+    # per-request chunked role_family/first_seen reads).
+    assert any("jobs!inner(id, role_family, first_seen_at)" in s for s in rec.selects)
     assert ("jobs.archived_at", "null") in rec.is_calls
     assert ("jobs.purged_at", "null") in rec.is_calls
     assert ("not.jobs.is_us", "false") in rec.is_calls
@@ -556,3 +558,115 @@ def test_filtered_path_keeps_graded_first_and_score_order(
     # Graded by score desc, Pending strictly last — never interleaved.
     assert ids == ["g78", "g72", "g65", "p1"]
     assert [p["pending"] for p in result["postings"]] == [False, False, False, True]
+
+
+def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Perf regression pin (2026-07-16, the 4-8s /jobs + dashboard renders):
+    when the scores fetch embeds jobs(role_family, first_seen_at), the
+    off-family gate and the Pending-recency sort must harvest those fields
+    in-memory — ZERO follow-up jobs-table reads beyond the single page
+    fetch. On a ~2k-row candidate set the old chunked re-reads were ~20+
+    sequential round-trips per request."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+
+    jobs_selects: list[str] = []
+
+    class _JobsRec:
+        def select(self, cols: str) -> "_JobsRec":
+            jobs_selects.append(cols)
+            return self
+
+        def __getattr__(self, name: str):
+            if name == "not_":
+                return self
+
+            def _f(*_a: object, **_k: object) -> "_JobsRec":
+                return self
+
+            return _f
+
+        def execute(self) -> FakeResponse:
+            return FakeResponse([{"id": "j1", "title": "j1"}, {"id": "j2", "title": "j2"}])
+
+    class _ScoresRec:
+        def __getattr__(self, name: str):
+            if name == "not_":
+                return self
+
+            def _f(*_a: object, **_k: object) -> "_ScoresRec":
+                return self
+
+            return _f
+
+        def execute(self) -> FakeResponse:
+            return FakeResponse(
+                [
+                    {
+                        "job_posting_id": "j1",
+                        "target_id": "t-1",
+                        "score": 70,
+                        "score_breakdown": {},
+                        "scoring_status": "complete",
+                        "axis_scores": {"title_fit": 70},
+                        "jobs": {
+                            "id": "j1",
+                            "role_family": "engineering",
+                            "first_seen_at": "2026-07-10T00:00:00Z",
+                        },
+                    },
+                    {
+                        "job_posting_id": "j2",
+                        "target_id": "t-1",
+                        "score": 50,
+                        "score_breakdown": {},
+                        "scoring_status": "complete",
+                        "axis_scores": {"title_fit": 50},
+                        "jobs": {
+                            "id": "j2",
+                            "role_family": "engineering",
+                            "first_seen_at": "2026-07-11T00:00:00Z",
+                        },
+                    },
+                ]
+            )
+
+    class _TargetsRec:
+        def __getattr__(self, name: str):
+            def _f(*_a: object, **_k: object) -> "_TargetsRec":
+                return self
+
+            return _f
+
+        def execute(self) -> FakeResponse:
+            return FakeResponse([{"id": "t-1", "role_family": "engineering"}])
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: {
+        "scores": _ScoresRec(),
+        "jobs": _JobsRec(),
+        "targets": _TargetsRec(),
+    }[name]
+
+    result = _list_jobs_across_user_targets(
+        sb,
+        user_target_ids={"t-1"},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+
+    assert [p["id"] for p in result["postings"]] == ["j1", "j2"]
+    # Exactly ONE jobs read: the page fetch. No role_family / first_seen
+    # chunk reads.
+    assert len(jobs_selects) == 1
+    assert "role_family" not in jobs_selects[0].replace("jobs!inner", "")
+    assert all("first_seen_at" not in s or "title" in s for s in jobs_selects)
