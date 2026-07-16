@@ -41,12 +41,15 @@ from tests.support.fake_supabase import FakeResponse, two_query_supabase
 # --------------------------------------------------------------------------
 
 
-def test_is_pending_uses_fit_reasoning_not_status() -> None:
-    # A genuine grade is signalled by persisted fit_reasoning — the only reliable
-    # marker. scoring_status is NOT trusted: 'complete' is set on rows that were
-    # never actually graded (deferred / reset), which leaked the keyword
-    # placeholder as a fit score (~2,300 such rows in prod).
+def test_is_pending_uses_grade_written_fields_not_status() -> None:
+    # A genuine grade is signalled by the fields ONLY Phase 2's persist writes
+    # (axis_scores / fit_reasoning, written atomically — prod-verified zero
+    # rows carry one without the other). scoring_status is NOT trusted:
+    # 'complete' is set on rows that were never actually graded (deferred /
+    # reset), which leaked the keyword placeholder as a fit score (~2,300
+    # such rows in prod).
     assert _is_pending({"fit_reasoning": "Title: matches. Gap: seniority."}) is False
+    assert _is_pending({"axis_scores": {"title_fit": 80}}) is False
     assert _is_pending({"scoring_status": "stage1"}) is True
     assert _is_pending({"scoring_status": "stage2"}) is True
     assert _is_pending({}) is True  # nothing → Pending
@@ -54,8 +57,26 @@ def test_is_pending_uses_fit_reasoning_not_status() -> None:
     assert _is_pending({"scoring_status": "complete"}) is True
     assert _is_pending({"scoring_status": "complete", "fit_reasoning": ""}) is True
     assert _is_pending({"scoring_status": "complete", "fit_reasoning": "  "}) is True
+    assert _is_pending({"scoring_status": "complete", "axis_scores": {}}) is True
+    assert _is_pending({"scoring_status": "complete", "axis_scores": None}) is True
     # A real grade → graded, regardless of the status text.
     assert _is_pending({"scoring_status": "complete", "fit_reasoning": "graded"}) is False
+    assert _is_pending({"scoring_status": "complete", "axis_scores": {"title_fit": 9}}) is False
+
+
+def test_pending_signal_columns_are_fetched_by_the_list_selects() -> None:
+    """THE 2026-07-16 regression pin: ``_is_pending``'s PRIMARY signal column
+    must be in the list paths' score select — the classifier once keyed only
+    on ``fit_reasoning``, which the selects deliberately don't fetch (per-row
+    prose × ~2k candidate rows), so EVERY list row classified Pending and the
+    graded/Pending tiers collapsed into one recency-ordered lump (unsorted
+    lists; empty ascending pages)."""
+    from app.routers.jobs import _SCORE_ROW_COLS
+
+    assert "axis_scores" in _SCORE_ROW_COLS
+    # And the classifier prefers exactly that column: a row shaped like the
+    # list select (axis_scores, NO fit_reasoning) must classify graded.
+    assert _is_pending({"axis_scores": {"title_fit": 70}, "score": 70}) is False
 
 
 class _RecordingQuery:
@@ -78,9 +99,7 @@ def test_apply_score_floor_exempts_pending_when_floored() -> None:
     q = _RecordingQuery()
     assert _apply_score_floor(q, 70) is q
     # Pending rows pass via the status legs; graded rows must clear the floor.
-    assert q.or_calls == [
-        "scoring_status.is.null,scoring_status.neq.complete,score.gte.70"
-    ]
+    assert q.or_calls == ["scoring_status.is.null,scoring_status.neq.complete,score.gte.70"]
     assert q.gte_calls == []  # never a flat floor that would hide Pending
 
 
@@ -141,16 +160,36 @@ def test_prefer_score_row_graded_beats_pending() -> None:
 def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
-        {"job_posting_id": "g90", "score": 90, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
-        {"job_posting_id": "g30", "score": 30, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
+        {
+            "job_posting_id": "g90",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
+        {
+            "job_posting_id": "g30",
+            "score": 30,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
         {"job_posting_id": "p20", "score": 20, "score_breakdown": {}, "scoring_status": "stage2"},
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g90", "g30", "p20")}
     result = _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
-        target_id="t-1", page_size=10, sort="score", ascending=False,
-        min_score=50, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=50,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     ids = [p["id"] for p in result["postings"]]
     # g30 (graded, below floor) dropped; p20 (Pending) kept despite being below.
@@ -161,16 +200,36 @@ def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.Monkey
 def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
-        {"job_posting_id": "g50", "score": 50, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
+        {
+            "job_posting_id": "g50",
+            "score": 50,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
         {"job_posting_id": "p80", "score": 80, "score_breakdown": {}, "scoring_status": "stage2"},
-        {"job_posting_id": "g70", "score": 70, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
+        {
+            "job_posting_id": "g70",
+            "score": 70,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g50", "p80", "g70")}
     result = _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
-        target_id="t-1", page_size=10, sort="score", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     # The keyword 80 does NOT outrank the graded rows.
     assert [p["id"] for p in result["postings"]] == ["g70", "g50", "p80"]
@@ -188,15 +247,36 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same job scored on two targets: a graded 60 and a Pending 90.
     scores = [
-        {"job_posting_id": "j", "target_id": "t-1", "score": 60, "score_breakdown": {}, "scoring_status": "complete", "fit_reasoning": "graded"},
-        {"job_posting_id": "j", "target_id": "t-2", "score": 90, "score_breakdown": {}, "scoring_status": "stage2"},
+        {
+            "job_posting_id": "j",
+            "target_id": "t-1",
+            "score": 60,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
+        {
+            "job_posting_id": "j",
+            "target_id": "t-2",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "stage2",
+        },
     ]
     postings = {"j": {"id": "j", "title": "j"}}
     result = _list_jobs_across_user_targets(
         two_query_supabase(scores, postings),
-        user_target_ids={"t-1", "t-2"}, page_size=10, sort="score", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        user_target_ids={"t-1", "t-2"},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     row = result["postings"][0]
     # The graded representative wins, so the shown score is the real grade.
@@ -224,3 +304,187 @@ def test_counts_use_rpc_when_unfloored() -> None:
     out = _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=None, user_id="u1")
     assert out == {"new": 3}
     sb.rpc.assert_called_once()  # no floor → keyset RPC fast path
+
+
+# --------------------------------------------------------------------------
+# 2026-07-16 regression: select-shaped rows must tier + sort correctly
+# --------------------------------------------------------------------------
+
+
+def test_select_shaped_graded_rows_sort_by_score_not_recency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows shaped EXACTLY like the list select fetches them (axis_scores
+    present, no fit_reasoning) must rank as graded, by score — the regression
+    had them all classified Pending and recency-ordered (newest ingest first,
+    a 45 above a 78)."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = [
+        {
+            "job_posting_id": "new45",
+            "score": 45,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 45},
+        },
+        {
+            "job_posting_id": "old78",
+            "score": 78,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 78},
+        },
+        {
+            "job_posting_id": "new68",
+            "score": 68,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 68},
+        },
+    ]
+    postings = {jid: {"id": jid, "title": jid} for jid in ("new45", "old78", "new68")}
+    result = _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    assert [p["id"] for p in result["postings"]] == ["old78", "new68", "new45"]
+    assert all(p["pending"] is False for p in result["postings"])
+
+
+def test_ascending_score_sort_returns_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The observed symptom's second half: sort=score&order=asc returned an
+    EMPTY page (all-Pending mis-tiering surfaced the oldest, dead-job rows
+    into the first window). With correct tiering, ascending returns the
+    graded rows lowest-first."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = [
+        {
+            "job_posting_id": "a78",
+            "score": 78,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 78},
+        },
+        {
+            "job_posting_id": "b45",
+            "score": 45,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 45},
+        },
+    ]
+    postings = {jid: {"id": jid, "title": jid} for jid in ("a78", "b45")}
+    result = _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=True,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    assert [p["id"] for p in result["postings"]] == ["b45", "a78"]
+
+
+# --------------------------------------------------------------------------
+# Scores-layer liveness join (dead rows must not eat page slots)
+# --------------------------------------------------------------------------
+
+
+class _LiveJoinRecorder:
+    def __init__(self) -> None:
+        self.selects: list[str] = []
+        self.is_calls: list[tuple[str, str]] = []
+        self._neg = False
+
+    def table(self, _name: str) -> _LiveJoinRecorder:
+        return self
+
+    def select(self, cols: str) -> _LiveJoinRecorder:
+        self.selects.append(cols)
+        return self
+
+    def eq(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        return self
+
+    def in_(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        return self
+
+    def or_(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        return self
+
+    @property
+    def not_(self) -> _LiveJoinRecorder:
+        self._neg = True
+        return self
+
+    def is_(self, col: str, val: str) -> _LiveJoinRecorder:
+        self.is_calls.append((("not." if self._neg else "") + col, val))
+        self._neg = False
+        return self
+
+    def execute(self) -> FakeResponse:
+        return FakeResponse([])
+
+
+def test_live_view_applies_jobs_inner_join() -> None:
+    sb = MagicMock()
+    rec = _LiveJoinRecorder()
+    sb.table.return_value = rec
+    _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    assert any("jobs!inner(id)" in s for s in rec.selects)
+    assert ("jobs.archived_at", "null") in rec.is_calls
+    assert ("jobs.purged_at", "null") in rec.is_calls
+    assert ("not.jobs.is_us", "false") in rec.is_calls
+
+
+def test_archived_view_keeps_archived_jobs() -> None:
+    """status=archived must NOT liveness-join at the scores layer — the
+    archived view exists to show archived jobs."""
+    sb = MagicMock()
+    rec = _LiveJoinRecorder()
+    sb.table.return_value = rec
+    _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status="archived",
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    assert not any("jobs!inner" in s for s in rec.selects)
+    assert rec.is_calls == []
