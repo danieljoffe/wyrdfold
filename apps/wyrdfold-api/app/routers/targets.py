@@ -685,6 +685,13 @@ def deactivate_target(
     supabase: Client = Depends(get_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
+    # Ownership gate (#29 R3 / SEC-4): every sibling route carries this, but
+    # deactivate was missing it — without the check any JWT user could POST a
+    # target id they don't follow and read back the shared row's full metadata
+    # (scoring_profile / search_keywords / example titles) on the service-role
+    # client. set_user_target_inactive is already caller-scoped (a harmless
+    # no-op for a non-follower), but the response still leaked the row.
+    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
     target = crud.get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -1105,6 +1112,21 @@ def delete_target(
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> DeleteResponse:
     _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    # Targets are a SHARED catalog — find_matching_target dedups by normalized
+    # label across users, so distinct users routinely co-follow one row. A JWT
+    # caller "deleting" their target must therefore only drop THEIR link: hard-
+    # deleting the shared row cascades away every co-follower's user_targets /
+    # scores / feedback / analyses / learning (all those FKs are ON DELETE
+    # CASCADE), which is exactly what account-erasure is documented never to do.
+    # The user_targets AFTER-DELETE trigger deactivates the target once its last
+    # active follower leaves. Operators (api-key path, user_id is None) keep the
+    # hard delete. Mirrors the audit-#29 H1 fix that turned the jobs "delete"
+    # into a per-user unlink for the same shared-row reason.
+    if user_id is not None:
+        unlinked = crud.unlink_user_from_target(supabase, user_id, target_id)
+        if not unlinked:
+            raise HTTPException(status_code=404, detail="Target not found")
+        return DeleteResponse(deleted=True)
     deleted = crud.delete(supabase, target_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Target not found")
