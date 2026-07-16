@@ -410,6 +410,19 @@ class Settings(BaseSettings):
     # runs when ``qualification_enabled``.
     qualification_backfill_batch: int = Field(default=50, ge=0, le=1000)
 
+    # Phase-2 grade backfill (the qualify-sweep's grading twin). Every poll
+    # cycle, grade up to this many LIVE, view-ordered ``promising`` rows per
+    # (user, target) that are stuck at ``stage2`` — deferred grades and the
+    # rows a profile-version bump reset (which otherwise re-grade only if
+    # their source happens to re-list them; a profile edit wiped one target's
+    # graded shelf and left its /jobs list 76% off-target pending noise,
+    # 2026-07-15). Spend is bounded by every existing gate (global breaker,
+    # payer allowances, BYOK require-mode, and the per-target DAILY quota the
+    # sweep shares with cycle grading — it fills unused quota, never exceeds
+    # it). 0 disables (default: grading spends payer money, so self-host
+    # opts in; prod sets PHASE2_BACKFILL_BATCH).
+    phase2_backfill_batch: int = Field(default=0, ge=0, le=500)
+
     # ---- Archival lifecycle (UX/IA §5; Stage 1 + Stage 2 A/B) ----------
     # Ships OFF like every sweep — the operator flips ARCHIVAL_SWEEP_ENABLED
     # per-deploy. When on, a throttled (~6h) sweep piggybacks the poll cycle:

@@ -1140,6 +1140,115 @@ async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
     await embed_jobs_batch(supabase, embeddings_client, rows)
 
 
+async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
+    """Grade a bounded, view-ordered batch of the stale ``promising`` backlog.
+
+    ``run_phase2_for_jobs`` only ever sees jobs a poll cycle re-touched, so a
+    ``promising=true`` row whose grading was deferred (budget/BYOK/cap) — or
+    that a profile-version bump reset back to ``stage2`` via
+    ``bulk_score_for_target`` — re-grades only if its source happens to
+    re-list the job. A profile edit therefore wipes a target's graded shelf
+    and the /jobs list falls back to the *Pending* tier, which carries
+    keyword placeholders and fossilized fail-open triage admits — the
+    unrelated-roles pollution found on 2026-07-15 (18.5k stale promising rows
+    on one target, 76%% of its visible pending tier off-target). Same
+    stranding class ``_backfill_qualify_stale`` fixes for tags; this is its
+    grading twin.
+
+    Selection is LIVE-only (archived/purged/non-US rows excluded — 78%% of
+    that target's stale backlog was attached to dead jobs; grading those is
+    pure spend) and ordered by ``recency_score`` DESC so the rows the user
+    is actually looking at grade first.
+
+    Spend safety: every existing gate still applies — the once-per-cycle
+    global breaker + payer allowances (via ``_cycle_budget_gate``), BYOK
+    require-mode (no key → defer), and ``run_phase2_for_jobs``'s own
+    per-target DAILY quota, which this sweep shares with cycle grading (it
+    fills unused quota, it cannot exceed it). ``limit`` bounds the batch per
+    (user, target) per cycle on top. Best-effort throughout — a sweep
+    failure never breaks a poll.
+    """
+    if limit <= 0:
+        return
+    try:
+        gate, _has_active = await _cycle_budget_gate(supabase)
+        active_targets = await asyncio.to_thread(get_active_target, supabase)
+        primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
+            supabase, active_targets, "(grade backfill)"
+        )
+    except Exception:
+        logger.exception("Grade backfill: cycle context resolution failed; skipping")
+        return
+    if not primary_by_user:
+        return
+
+    payer_clients: dict[str | None, LLMClient | None] = {}
+    for uid, target in primary_by_user.items():
+        if gate.user_blocked(uid):
+            logger.info(
+                "Grade backfill deferred for user %s / target %s (over allowance)",
+                uid,
+                target.id,
+            )
+            continue
+        llm = _resolve_payer_client(payer_clients, supabase, uid)
+        if llm is None:
+            continue  # BYOK require-mode without a key — defer (logged inside)
+        try:
+            resp = await poll_db_read(
+                supabase,
+                lambda c, tid=target.id: (
+                    c.table("scores")
+                    .select(
+                        "recency_score, jobs!inner(id, title, description_html, "
+                        "first_seen_at, archived_at, purged_at, is_us)"
+                    )
+                    .eq("target_id", tid)
+                    .eq("promising", True)
+                    .eq("excluded", False)
+                    .eq("scoring_status", "stage2")
+                    .is_("jobs.archived_at", "null")
+                    .is_("jobs.purged_at", "null")
+                    .not_.is_("jobs.is_us", "false")
+                    .order("recency_score", desc=True, nullsfirst=False)
+                    .limit(limit)
+                ),
+                label="poll grade-backfill select",
+            )
+        except Exception:
+            logger.exception("Grade backfill: select failed for target %s; skipping", target.id)
+            continue
+        stale_jobs = [
+            cast(dict[str, Any], r["jobs"]) for r in cast(list[dict[str, Any]], resp.data or [])
+        ]
+        if not stale_jobs:
+            continue
+        logger.info(
+            "Grade backfill: grading up to %d stale promising job(s) for target %s",
+            len(stale_jobs),
+            target.id,
+        )
+        try:
+            graded = await run_phase2_for_jobs(
+                supabase,
+                llm,
+                target=target,
+                payload=user_optimized[uid].payload,
+                jobs=stale_jobs,
+                user_id=uid,
+            )
+        except Exception:
+            logger.exception("Grade backfill failed for target %s", target.id)
+            continue
+        if graded:
+            # Phase 2 rewrote ``scores.score``; re-aggregate the global
+            # ``jobs.score`` for the touched rows (mirrors the cycle path).
+            try:
+                await batch_update_global_scores(supabase, [cast(str, j["id"]) for j in stale_jobs])
+            except Exception:
+                logger.exception("Grade backfill: global score update failed")
+
+
 async def _shadow_observe(
     supabase: Client,
     *,
@@ -2483,6 +2592,12 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     # Cheap (~$0.00005/job), so no budget gate; 0 disables.
     if settings.prescan_embed_enabled and settings.prescan_embed_backfill_batch > 0:
         await _backfill_embed_missing(supabase, settings.prescan_embed_backfill_batch)
+
+    # Grade a slice of the stale promising backlog (the qualify sweep's
+    # grading twin) — also before the ``not due`` early-exit, so quiet
+    # cycles still drain it. Flag-gated + quota-bounded inside.
+    if settings.phase2_enabled and settings.phase2_backfill_batch > 0:
+        await _backfill_grade_stale(supabase, settings.phase2_backfill_batch)
 
     if not due:
         return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])

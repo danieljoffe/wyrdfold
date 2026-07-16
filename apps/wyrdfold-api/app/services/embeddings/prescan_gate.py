@@ -69,9 +69,7 @@ def parse_vector(raw: Any) -> list[float] | None:
     return None
 
 
-async def _fetch_job_vector(
-    supabase: Client, *, job_id: str, model: str
-) -> list[float] | None:
+async def _fetch_job_vector(supabase: Client, *, job_id: str, model: str) -> list[float] | None:
     """The cached vector for (job, model) from ``job_embeddings``, or None."""
     resp = await asyncio.to_thread(
         lambda: (
@@ -142,9 +140,7 @@ async def cosine_gate_decision(
         if job_vec is None:
             return None, None
 
-        target_vec, threshold = await _fetch_target_gate(
-            supabase, target_id=target.id
-        )
+        target_vec, threshold = await _fetch_target_gate(supabase, target_id=target.id)
         if target_vec is None or threshold is None:
             return None, None
 
@@ -162,32 +158,46 @@ async def cosine_gate_decision(
         sim = cosine(job_vec, target_vec)
         return sim, sim >= threshold
     except Exception:
-        logger.exception(
-            "Pre-scan cosine gate failed for job %s / target %s", job_id, target.id
-        )
+        logger.exception("Pre-scan cosine gate failed for job %s / target %s", job_id, target.id)
         return None, None
+
+
+# ``.in_()`` id lists ride the request URL, so the vectors read must chunk:
+# ~150 UUIDs ~= 5.7KB stays under proxy URL limits AND httpx's own 64KB
+# refusal (``InvalidURL: query too long`` — hit at backfill scale on
+# 2026-07-15, where the gate's fail-closed contract silently deferred the
+# whole batch). Matches the 100-200 sizing of the other in_-chunked reads.
+_VECTOR_READ_CHUNK_SIZE = 150
 
 
 async def _fetch_job_vectors_batch(
     supabase: Client, *, job_ids: list[str], model: str
 ) -> dict[str, list[float]]:
-    """Cached vectors for many jobs in ONE query, keyed by id (missing omitted)."""
+    """Cached vectors for many jobs, keyed by id (missing omitted).
+
+    Chunked ``.in_()`` reads (URL-safe); one query per
+    ``_VECTOR_READ_CHUNK_SIZE`` ids. Any read error propagates — the gate's
+    callers are fail-CLOSED on infra errors by contract."""
     if not job_ids:
         return {}
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(JOB_EMBEDDINGS_TABLE)
-            .select("job_posting_id, embedding")
-            .in_("job_posting_id", job_ids)
-            .eq("model", model)
-            .execute()
-        )
-    )
     out: dict[str, list[float]] = {}
-    for r in cast(list[dict[str, Any]], resp.data or []):
-        vec = parse_vector(r.get("embedding"))
-        if vec is not None:
-            out[str(r["job_posting_id"])] = vec
+    for i in range(0, len(job_ids), _VECTOR_READ_CHUNK_SIZE):
+        chunk = job_ids[i : i + _VECTOR_READ_CHUNK_SIZE]
+
+        def _read(ids: list[str] = chunk) -> Any:
+            return (
+                supabase.table(JOB_EMBEDDINGS_TABLE)
+                .select("job_posting_id, embedding")
+                .in_("job_posting_id", ids)
+                .eq("model", model)
+                .execute()
+            )
+
+        resp = await asyncio.to_thread(_read)
+        for r in cast(list[dict[str, Any]], resp.data or []):
+            vec = parse_vector(r.get("embedding"))
+            if vec is not None:
+                out[str(r["job_posting_id"])] = vec
     return out
 
 
@@ -253,9 +263,7 @@ async def cosine_gate_batch(
         return GateBatch(cosines={}, threshold=None)
     job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
     cosines = {
-        jid: cosine(jv, target_vec)
-        for jid, jv in job_vecs.items()
-        if len(jv) == len(target_vec)
+        jid: cosine(jv, target_vec) for jid, jv in job_vecs.items() if len(jv) == len(target_vec)
     }
     return GateBatch(cosines=cosines, threshold=threshold)
 
