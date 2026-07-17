@@ -1049,7 +1049,161 @@ def _list_jobs_for_target(
         )
 
 
+def _list_jobs_across_user_targets_rpc(
+    supabase: Client,
+    *,
+    user_target_ids: set[str],
+    page_size: int,
+    sort: str,
+    ascending: bool,
+    min_score: int | None,
+    status: str | None,
+    company: str | None,
+    search: str | None,
+    cursor: dict[str, Any],
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Untargeted list via the server-side dedup+sort+paginate RPC (#365).
+
+    The cross-target twin of ``_list_jobs_for_target_rpc``: pushes the status
+    filter, best-representative dedup, off-family gate, Pending-exempt floor,
+    graded-first sort, and pagination into ``get_cross_target_jobs`` — one
+    round-trip returning just the page, instead of pulling every live scores
+    row (JSONB and all) into Python to resolve status + rank (the 57014
+    statement-timeout path, #365). Offset-paginated to match the two-query
+    cursor contract. Raises to fall back to the two-query path for the shapes
+    the RPC can't express DB-side (the dispatcher gates most; multi-word search
+    is caught here since it uses OR semantics the RPC's single ILIKE can't)."""
+    if search and len(_tokenize_search(search)) > 1:
+        raise RuntimeError("RPC path skipped: multi-word search uses OR semantics")
+    offset = _offset_from_cursor(cursor)
+    resp = supabase.rpc(
+        "get_cross_target_jobs",
+        {
+            "p_target_ids": list(user_target_ids),
+            "p_min_score": min_score or 0,
+            "p_status": status,
+            "p_company": company,
+            "p_search": search,
+            "p_sort": sort,
+            "p_ascending": ascending,
+            # One extra row to detect "has more" without a COUNT (the two-query
+            # path's ``total`` is unavailable here; None is best-effort, same as
+            # the per-target keyset RPC).
+            "p_limit": page_size + 1,
+            "p_offset": offset,
+            "p_user_id": user_id,
+            # Decay-aware graded sort key when read-time recency decay is on
+            # (prod). The shared _apply_display_recency post-step still sets the
+            # shown number; the RPC only needs the ORDER to match.
+            "p_recency_decay": settings.recency_decay_enabled,
+        },
+    ).execute()
+    if not isinstance(resp.data, list):
+        raise TypeError("RPC get_cross_target_jobs returned non-list response")
+    rows = cast(list[dict[str, Any]], resp.data)
+    has_more = len(rows) > page_size
+    postings = rows[:page_size]
+    # The RPC computes ``pending`` per row (its graded signal is ``axis_scores``,
+    # which the list selects otherwise avoid) — the UI badges from it directly.
+    next_cursor = _encode_cursor({"o": offset + page_size}) if has_more else None
+    return {"postings": postings, "next_cursor": next_cursor, "total": None}
+
+
 def _list_jobs_across_user_targets(
+    supabase: Client,
+    *,
+    user_target_ids: set[str],
+    page_size: int,
+    sort: str,
+    ascending: bool,
+    min_score: int | None,
+    status: str | None,
+    company: str | None,
+    search: str | None,
+    exclude_terms: list[str],
+    only_terms: list[str],
+    cursor: dict[str, Any],
+    weights_by_target: dict[str, AxisWeights] | None = None,
+    user_id: str | None = None,
+    logistics: _LogisticsFilter | None = None,
+) -> dict[str, Any]:
+    """Untargeted list — the union of jobs scored against any of the user's
+    active targets, deduplicated by job id.
+
+    Tries the server-side ``get_cross_target_jobs`` RPC first (single
+    round-trip, DB-side status filter + dedup + rank + paginate — #365), then
+    falls back to the two-query Python path. The RPC is skipped for shapes it
+    can't express: custom axis weights (the displayed score — hence the sort —
+    is a per-target blend the RPC can't reproduce), post-fetch location /
+    logistics filters (the RPC paginates with no knowledge of them, so its page
+    would carry pre-filter rows), and the archived view (the RPC gates to live
+    rows). Read-time recency decay is NOT a skip — the RPC ranks by the decayed
+    score DB-side (``p_recency_decay``). Those exceptions keep the two-query
+    path."""
+    has_location_filter = bool(exclude_terms or only_terms)
+    has_logistics = logistics is not None and logistics.active
+    if (
+        weights_by_target
+        or has_location_filter
+        or has_logistics
+        or status == "archived"
+    ):
+        return _list_jobs_across_user_targets_two_query(
+            supabase,
+            user_target_ids=user_target_ids,
+            page_size=page_size,
+            sort=sort,
+            ascending=ascending,
+            min_score=min_score,
+            status=status,
+            company=company,
+            search=search,
+            exclude_terms=exclude_terms,
+            only_terms=only_terms,
+            cursor=cursor,
+            weights_by_target=weights_by_target,
+            user_id=user_id,
+            logistics=logistics,
+        )
+    try:
+        return _list_jobs_across_user_targets_rpc(
+            supabase,
+            user_target_ids=user_target_ids,
+            page_size=page_size,
+            sort=sort,
+            ascending=ascending,
+            min_score=min_score,
+            status=status,
+            company=company,
+            search=search,
+            cursor=cursor,
+            user_id=user_id,
+        )
+    except Exception:
+        logger.debug(
+            "RPC get_cross_target_jobs unavailable/ineligible, falling back to two-query"
+        )
+        return _list_jobs_across_user_targets_two_query(
+            supabase,
+            user_target_ids=user_target_ids,
+            page_size=page_size,
+            sort=sort,
+            ascending=ascending,
+            min_score=min_score,
+            status=status,
+            company=company,
+            search=search,
+            exclude_terms=exclude_terms,
+            only_terms=only_terms,
+            cursor=cursor,
+            weights_by_target=weights_by_target,
+            user_id=user_id,
+            logistics=logistics,
+        )
+
+
+def _list_jobs_across_user_targets_two_query(
     supabase: Client,
     *,
     user_target_ids: set[str],
