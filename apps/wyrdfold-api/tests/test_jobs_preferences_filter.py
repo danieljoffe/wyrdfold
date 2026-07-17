@@ -322,15 +322,23 @@ def test_post_fetch_pref_filter_forces_two_query(monkeypatch: Any) -> None:
 
 
 def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
-    """A cutoff-only preference set (no post-fetch filter) must still allow the
-    fast RPC path — the cutoff rides in ``min_score`` and needs no post-fetch
-    work."""
-    calls = {"rpc": 0, "two_query": 0}
+    """A cutoff-only preference set (no post-fetch filter) must still allow a fast
+    RPC path — the cutoff rides in ``min_score`` and needs no post-fetch work.
+    Score sort routes to the cross-target RPC restricted to this one target (#2,
+    the index-only denormalized path); it must NOT fall to the scan-everything
+    two-query path."""
+    calls = {"cross_rpc": 0, "target_rpc": 0, "two_query": 0}
 
     monkeypatch.setattr(
         jobs_mod,
+        "_list_jobs_across_user_targets_rpc",
+        lambda supabase, **kw: calls.__setitem__("cross_rpc", calls["cross_rpc"] + 1)
+        or {"postings": [], "next_cursor": None, "total": None},
+    )
+    monkeypatch.setattr(
+        jobs_mod,
         "_list_jobs_for_target_rpc",
-        lambda supabase, **kw: calls.__setitem__("rpc", calls["rpc"] + 1)
+        lambda supabase, **kw: calls.__setitem__("target_rpc", calls["target_rpc"] + 1)
         or {"postings": [], "next_cursor": None, "total": 0},
     )
     monkeypatch.setattr(
@@ -357,7 +365,8 @@ def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
         user_id="user-1",
     )
 
-    assert calls == {"rpc": 1, "two_query": 0}
+    # Score sort → cross-target RPC restricted to the target; no two-query.
+    assert calls == {"cross_rpc": 1, "target_rpc": 0, "two_query": 0}
 
 
 # ---- integration: cutoff filters low scores + leniency end-to-end ----------

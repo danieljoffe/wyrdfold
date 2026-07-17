@@ -32,6 +32,8 @@ from supabase import Client
 from app.routers.jobs import (
     _list_jobs_across_user_targets_rpc,
     _list_jobs_across_user_targets_two_query,
+    _list_jobs_for_target,
+    _list_jobs_for_target_two_query,
 )
 from tests.integration.conftest import create_auth_user, delete_auth_user
 
@@ -315,6 +317,41 @@ def test_jobs_refamily_trigger_syncs_and_gates(
     py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False)
     assert "Bravo Graded Low" not in {p["title"] for p in rpc["postings"]}
     assert _ids(rpc) == _ids(py)
+
+
+def test_per_target_score_sort_routes_through_cross_target_and_gates(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+) -> None:
+    """#2: per-target `/jobs?target_id=…&sort=score` used to run the Python
+    scan-everything path (~8.6s cold). It now routes through the cross-target RPC
+    restricted to the one target — the same gated + graded-first + decay +
+    Pending-floor ranking, index-only. The one intended behavior change: score
+    sort now applies the off-family gate (like the per-target non-score sorts and
+    the dashboard), where the old scan-everything path did not. Assert exactly
+    that: off-family drops, and nothing else in the ranking moves."""
+    user_id, target_ids = seeded_cross_target
+    tmap = {
+        t["id"]: t["role_family"]
+        for t in service_client.table("targets").select("id,role_family").in_("id", list(target_ids)).execute().data
+    }
+    t_eng = next(t for t, fam in tmap.items() if fam == "engineering")
+    common: dict = {
+        "target_id": t_eng, "page_size": 50, "sort": "score", "ascending": False,
+        "min_score": None, "status": None, "company": None, "search": None,
+        "exclude_terms": [], "only_terms": [], "cursor": {}, "user_id": user_id,
+    }
+    new = _list_jobs_for_target(service_client, **common)           # new routing
+    old = _list_jobs_for_target_two_query(service_client, **common)  # prior behavior
+    new_titles = [p["title"] for p in new["postings"]]
+    old_titles = [p["title"] for p in old["postings"]]
+
+    # The off-family job (finance job scored by the eng target) is now gated out,
+    # where the scan-everything path kept it.
+    assert "Delta OffFamily Drop" in old_titles
+    assert "Delta OffFamily Drop" not in new_titles
+    # Everything else — same jobs, same order — once off-family is removed.
+    assert new_titles == [t for t in old_titles if t != "Delta OffFamily Drop"]
 
 
 def test_rpc_offset_pagination_and_has_more(
