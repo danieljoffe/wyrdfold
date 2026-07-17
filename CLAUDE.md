@@ -36,6 +36,34 @@ The user can down-scope a fork they can see; they can't down-scope one you never
 them. Quietly shipping the easy fix when a better one was on the table is the failure this
 prevents.
 
+## Prove the diagnosis before prescribing the fix
+
+Every fix rests on a claim about the cause. **Confirm that claim before proposing the fix —
+and again before applying it**: trace the real code path, and where behavior is in question,
+measure or reproduce it. State the cause as something you _checked_, not a plausible story
+that happens to fit the symptom.
+
+The failure this prevents: fixing the wrong thing. It burns the work, it _feels_ like
+progress so the real bug hides longer, and the change can add a fresh problem while "solving"
+a non-issue. A confident-but-unverified root cause is worse than "not sure yet" — it makes
+everyone act on a guess.
+
+- **Name the hypothesis and how you'll confirm it** (which code path, which measurement)
+  before recommending action. "Likely X" is a lead, not a conclusion.
+- **Before applying, ask what you actually checked that rules out the alternatives.** "It
+  sounds right" is a guess, not a diagnosis — go look.
+- **Validating can flip the fix.** Checking often shows it's already handled, aimed at the
+  wrong layer, or fighting a deliberate design — so "I checked, and we should _not_ do this"
+  is a first-class outcome, not a failure to deliver. Don't run a proposal on autopilot once
+  the ground under it has moved.
+- **Correct an earlier guess out loud** the moment you know better — never let an unverified
+  cause harden into fact in a PR body, a memory, or the next turn.
+
+Seen in one session: a keepalive "fix" for a connection-pool cold-start that a trace showed
+was the _query_ all along (the reconnect was ~73ms), and an "add a healthcheck" fix that was
+already configured and deliberately designed the other way. A code read and a measurement
+caught both before they shipped.
+
 ## Validate and stress-test before opening a PR
 
 A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
