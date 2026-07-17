@@ -826,7 +826,8 @@ def count_user_reference_jds(supabase: Client, *, target_id: str, user_id: str) 
     Drives the per-user contribution cap (#47)."""
     resp = (
         supabase.table(REF_JDS_TABLE)
-        .select("id", count="exact")  # type: ignore[arg-type]
+        # head=True → count only, no rows shipped (HEAD request).
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
         .eq("target_id", target_id)
         .eq("user_id", user_id)
         .execute()
