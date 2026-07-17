@@ -1040,6 +1040,41 @@ def _list_jobs_for_target(
             logistics=logistics,
             **kwargs,
         )
+    # Score sort is Pending-below-graded + decay-aware, which the per-target
+    # keyset RPC (get_target_jobs) can't express — so it used to fall to the
+    # scan-everything two-query path (~8.6s cold on a heavy target, #2). Route it
+    # instead through the cross-target RPC restricted to this one target: the
+    # SAME gated + graded-first + decay + Pending-floor ranking, now index-only
+    # via the denormalized scores columns (20260717040000). This also applies the
+    # off-family gate to per-target score sort — aligning it with the per-target
+    # non-score sorts and the cross-target dashboard (previously the score sort
+    # alone showed off-family jobs). Location / multi-word search still need the
+    # two-query path (the RPC's single ILIKE + server-side page can't express
+    # them); those fall through to the keyset RPC's own score-sort bail below.
+    has_location_filter = bool(exclude_terms or only_terms)
+    is_multiword_search = bool(search and len(_tokenize_search(search)) > 1)
+    if sort == "score" and not has_location_filter and not is_multiword_search:
+        try:
+            return _list_jobs_across_user_targets_rpc(
+                supabase,
+                user_target_ids={target_id},
+                page_size=page_size,
+                sort=sort,
+                ascending=ascending,
+                min_score=min_score,
+                status=status,
+                company=company,
+                search=search,
+                cursor=cursor,
+                user_id=user_id,
+            )
+        except Exception:
+            logger.debug(
+                "cross-target RPC unavailable for per-target score sort; falling back"
+            )
+            return _list_jobs_for_target_two_query(
+                supabase, preferences=preferences, logistics=logistics, **kwargs
+            )
     try:
         return _list_jobs_for_target_rpc(supabase, **kwargs)
     except Exception:
