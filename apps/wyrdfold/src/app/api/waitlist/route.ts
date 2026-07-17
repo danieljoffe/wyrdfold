@@ -1,6 +1,8 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 
+import { bffSecretHeader } from '@/lib/api/bffSecret';
+
 /**
  * Public waitlist signup (non-invited visitors on the marketing homepage).
  *
@@ -119,6 +121,9 @@ export async function POST(request: NextRequest) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        // Prove this came through the BFF so the backend accepts it (SEC-5) —
+        // it rejects direct hits that could forge the IP below.
+        ...bffSecretHeader(),
         // Forward the TRUSTED client IP (Vercel `x-real-ip`, validated above)
         // as `x-forwarded-for` so the backend's uvicorn `--proxy-headers`
         // reads it as the peer and slowapi keys the per-IP limit on the real

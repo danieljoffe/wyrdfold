@@ -19,8 +19,10 @@ import CreateTargetModal, {
 } from './CreateTargetModal';
 import PendingTargetCard from './PendingTargetCard';
 import {
+  addSearchSuggestionTarget,
   addSuggestionTarget,
   createOrLinkTarget,
+  linkTarget,
   toListEntry,
 } from './targetFlows';
 import type {
@@ -28,6 +30,7 @@ import type {
   LateralSuggestions,
   MatchedSuggestion,
   MatchedSuggestions,
+  TargetSearchResult,
   UserTargetWithSummary,
   UserTargetWithTarget,
 } from './types';
@@ -344,6 +347,55 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       void runCreate('/api/targets/from-url', payload, payload.label ?? '');
     },
     [runCreate]
+  );
+
+  // Follow a target discovered via the modal's Search tab: link the caller to
+  // the existing shared row and pull the authoritative list. Returns whether
+  // the follow succeeded so the search row can flip to "Following". The modal
+  // stays open so the user can follow several in a row.
+  const handleFollowSearchResult = useCallback(
+    async (target: TargetSearchResult): Promise<boolean> => {
+      try {
+        await linkTarget(target.id);
+        toast({ variant: 'success', title: `Following: ${target.label}` });
+        router.refresh();
+        return true;
+      } catch (e) {
+        toast({
+          variant: 'error',
+          title: e instanceof Error ? e.message : 'Failed to follow target',
+        });
+        return false;
+      }
+    },
+    [toast, router]
+  );
+
+  // Create-or-follow one AI suggestion from the modal's Search tab (the LLM
+  // fallback when catalog search dead-ends). Reuses the same create→link atom
+  // as experience suggestions, then inserts the new entry + refreshes. Returns
+  // whether it succeeded so the card can be removed; the modal stays open for
+  // adding several. Mirrors handleFollowSearchResult's contract.
+  const handleCreateSearchSuggestion = useCallback(
+    async (match: MatchedSuggestion): Promise<boolean> => {
+      try {
+        const entry = await addSearchSuggestionTarget(match);
+        toast({
+          variant: 'success',
+          title: `Added "${match.suggestion.label}"`,
+        });
+        insertEntry(entry);
+        router.refresh();
+        return true;
+      } catch (e) {
+        toast({
+          variant: 'error',
+          title: e instanceof Error ? e.message : 'Failed to add target',
+        });
+        return false;
+      }
+    },
+    [toast, insertEntry, router]
   );
 
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
@@ -677,6 +729,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onClose={() => setModalOpen(false)}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
+        onFollow={handleFollowSearchResult}
+        onCreateSuggestion={handleCreateSearchSuggestion}
       />
 
       <ConfirmModal

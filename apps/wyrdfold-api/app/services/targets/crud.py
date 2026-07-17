@@ -152,6 +152,32 @@ def get(supabase: Client, target_id: str) -> JobTarget | None:
     return _parse_target(rows[0]) if rows else None
 
 
+def search_by_label(
+    supabase: Client, query: str, *, limit: int = 20
+) -> list[JobTarget]:
+    """Substring search over the shared catalog by display label.
+
+    Discovery for the "search for a target" flow: a role one user created is
+    visible to all, so a new user can follow an existing target instead of
+    minting a duplicate. Case-insensitive ``ILIKE`` on ``label`` (a small
+    column that scans fine at the current catalog size), ordered by label for
+    stable results. Returns ``[]`` for a blank / too-short query so the UI
+    never dumps the whole catalog on an empty box.
+    """
+    trimmed = query.strip()
+    if len(trimmed) < 2:
+        return []
+    resp = (
+        supabase.table(TARGETS_TABLE)
+        .select("*")
+        .ilike("label", f"%{trimmed}%")
+        .order("label")
+        .limit(limit)
+        .execute()
+    )
+    return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
 def list_all(supabase: Client) -> list[JobTarget]:
     """Return all targets, ordered by creation date."""
     resp = supabase.table(TARGETS_TABLE).select("*").order("created_at", desc=True).execute()

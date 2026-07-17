@@ -10,7 +10,7 @@ import logging
 from typing import Any, cast
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from postgrest.types import CountMethod
 from pydantic import ValidationError
 from supabase import Client
@@ -45,11 +45,15 @@ from app.models.targets import (
     ReferenceJDsListResponse,
     ReferenceJDVote,
     ScoringProfile,
+    SuggestFromQueryRequest,
     TargetCreate,
     TargetFromManual,
+    TargetFromSuggestion,
     TargetFromUrl,
     TargetPreferences,
     TargetPreferencesUpdate,
+    TargetSearchResponse,
+    TargetSearchResult,
     TargetsListResponse,
     TargetStatusResponse,
     TargetUpdate,
@@ -95,13 +99,19 @@ from app.services.targets.lateral_discovery import (
     suggest_lateral_targets,
 )
 from app.services.targets.learning_projection import project_profile_impact
-from app.services.targets.match import suggest_and_match
+from app.services.targets.match import (
+    suggest_and_match,
+    suggest_and_match_from_query,
+)
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
     apply_profile_merge_rpc,
     apply_profile_patch_rpc,
 )
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
+from app.services.targets.suggest import (
+    QUERY_DEFAULT_PURPOSE as QUERY_SUGGEST_PURPOSE,
+)
 from app.services.validate import assert_safe_host, validate_job_url
 
 logger = logging.getLogger(__name__)
@@ -173,6 +183,29 @@ def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_i
         return
     if target_id not in crud.get_user_target_ids(supabase, user_id):
         raise HTTPException(status_code=404, detail="Target not found")
+
+
+def _require_operator(user_id: str | None) -> None:
+    """Reject a signed-in end user from a shared-catalog mutation.
+
+    Targets are a shared row (many users co-follow one target via the global
+    ``find_matching_target`` label dedup), so a direct field edit here would
+    rewrite the scoring rubric / label every co-follower depends on. Those
+    edits are operator-only: ``user_id is None`` is the operator/api-key path
+    (cron, admin curation) and passes; a real subject is a JWT end user and is
+    refused. End users shape only their own view (axis weights, preferences on
+    ``user_targets``) and contribute to the shared profile solely through the
+    bounded #191 path (reference JDs, learner review). See SEC-2 (#366).
+    """
+    if user_id is not None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Targets are a shared catalog and can't be edited directly. "
+                "Tune your own view via axis weights and preferences, or "
+                "contribute a reference JD."
+            ),
+        )
 
 
 async def _activate_pipeline(
@@ -344,6 +377,48 @@ async def create_target_from_manual(
 
 
 @router.post(
+    "/from-suggestion",
+    response_model=CreateOrLinkResult,
+    status_code=201,
+    dependencies=[Depends(enforce_llm_budget)],
+)
+@limiter.limit("6/minute")
+async def create_target_from_suggestion(
+    request: Request,
+    body: TargetFromSuggestion,
+    background_tasks: BackgroundTasks,
+    supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
+    user_id: str = Depends(get_current_user_id),
+) -> CreateOrLinkResult:
+    """Create-or-link a target from an AI search-suggestion the user picked.
+
+    The completion of the catalog-search LLM fallback: the user searched a
+    role, got AI suggestions from ``/targets/suggest-from-query``, and picked
+    one. Its label is already canonical, so — unlike ``/from-manual`` — no
+    inline normalization runs, and matching the shared catalog server-side
+    dedups a stale client ``is_new`` (or a race) into a link instead of a
+    duplicate row. Links ``is_active=False`` (never trips the active-target
+    cap), defers the scoring-profile derivation, and returns immediately.
+
+    PROFILE-INDEPENDENT (unlike ``/from-manual``): a user with no experience
+    profile can still create a target from a role search — the query is the
+    signal. Only the per-user fit score is deferred-and-skipped when absent.
+    """
+    doc = optimized.get_latest(supabase, user_id=user_id)
+    payload = doc.payload if doc is not None else None
+    return await from_input.from_suggestion(
+        supabase,
+        llm,
+        background_tasks,
+        user_id=user_id,
+        label=body.label,
+        description=body.description,
+        payload=payload,
+    )
+
+
+@router.post(
     "/from-url",
     response_model=CreateOrLinkResult,
     status_code=201,
@@ -492,6 +567,57 @@ async def suggest_lateral(
     return suggestions
 
 
+@router.post(
+    "/suggest-from-query",
+    response_model=MatchedSuggestions,
+    dependencies=[Depends(enforce_llm_budget)],
+)
+@limiter.limit("6/minute")
+async def suggest_from_query(
+    request: Request,
+    body: SuggestFromQueryRequest,
+    supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
+    user_id: str = Depends(get_current_user_id),
+) -> MatchedSuggestions:
+    """Turn a free-text role search into selectable target suggestions.
+
+    Catalog search (``GET /targets/search``) only finds targets that already
+    exist; when it comes up empty the UI falls back here. The LLM canonicalises
+    the query into a target plus a few adjacent roles, each matched against the
+    shared catalog so the user can follow an existing one or create a new one.
+
+    Tailored to the user's experience when they have a profile, but works
+    without one (the query is the primary signal) — unlike ``/suggest``, which
+    requires a profile. Rate-limited a touch higher than ``/suggest`` (6/min)
+    since it's an interactive search affordance, and LLM-budget-gated.
+    """
+    doc = optimized.get_latest(supabase, user_id=user_id)
+    payload = doc.payload if doc is not None else None
+    try:
+        matched, result = await suggest_and_match_from_query(
+            supabase, llm, query=body.query, user_id=user_id, payload=payload
+        )
+    except ValidationError:
+        # Structurally malformed model response (wrong types/missing fields).
+        # An upstream hiccup, not a server bug — tell the client to retry.
+        logger.warning(
+            "suggest-from-query: model returned malformed suggestions", exc_info=True
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The model returned malformed suggestions — please retry.",
+        ) from None
+    cost_log.record(
+        supabase,
+        user_id=user_id,
+        purpose=QUERY_SUGGEST_PURPOSE,
+        result=result,
+        metadata={"user_id": user_id, "query_len": len(body.query)},
+    )
+    return matched
+
+
 @router.get("/active", response_model=TargetsListResponse)
 def get_active_targets(
     supabase: Client = Depends(get_supabase),
@@ -527,6 +653,37 @@ def get_my_targets(
     """
     items = crud.list_user_targets_with_summary(supabase, user_id)
     return MyTargetsSummaryListResponse(targets=items)
+
+
+# Declared before ``/{target_id}`` so "search" isn't captured as a target id.
+@router.get("/search", response_model=TargetSearchResponse)
+def search_targets(
+    q: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20, ge=1, le=50),
+    supabase: Client = Depends(get_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> TargetSearchResponse:
+    """Search the shared catalog by label so the caller can follow an existing
+    target instead of minting a duplicate.
+
+    JWT-only. Targets are shared, so any user's target is discoverable — but
+    each result is marked ``is_linked`` for the ones the caller already follows.
+    The heavy ``scoring_profile`` is omitted (see ``TargetSearchResult``); the
+    full row is served by ``GET /targets/{id}`` once followed. A blank / 1-char
+    query returns no results rather than dumping the catalog.
+    """
+    matches = crud.search_by_label(supabase, q, limit=limit)
+    linked_ids = crud.get_user_target_ids(supabase, user_id) if matches else set()
+    results = [
+        TargetSearchResult(
+            id=t.id,
+            label=t.label,
+            description=t.description,
+            is_linked=t.id in linked_ids,
+        )
+        for t in matches
+    ]
+    return TargetSearchResponse(results=results)
 
 
 @router.get("/{target_id}", response_model=JobTarget)
@@ -581,7 +738,10 @@ def update_target(
     supabase: Client = Depends(get_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    # Shared-catalog write → operator-only (SEC-2, #366). End users can't edit
+    # the shared scoring profile / label; they tune their own view via
+    # axis-weights / preferences and contribute via the bounded #191 path.
+    _require_operator(user_id)
     target = crud.update(supabase, target_id, body)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -960,58 +1120,6 @@ async def link_target(
                 ),
             },
         ) from e
-
-
-@router.post(
-    "/{target_id}/derive-profile",
-    response_model=JobTarget,
-    dependencies=[Depends(enforce_llm_budget)],
-)
-@limiter.limit("10/minute")
-async def derive_target_profile(
-    request: Request,
-    target_id: str,
-    supabase: Client = Depends(get_supabase),
-    llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
-) -> JobTarget:
-    """Derive a scoring profile + search keywords from the target label + user experience."""
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="Target not found")
-
-    doc = optimized.get_latest(supabase, user_id=user_id)
-    if doc is None:
-        # Precondition (profile exists) not met — see /from-manual for rationale.
-        raise HTTPException(status_code=422, detail="No experience profile found")
-
-    derived, result = await derive_profile_from_label(llm, label=target.label)
-    cost_log.record(
-        supabase,
-        user_id=user_id,
-        purpose=DERIVE_LABEL_PURPOSE,
-        result=result,
-        metadata={"target_id": target_id},
-    )
-
-    updated = crud.update(
-        supabase,
-        target_id,
-        TargetUpdate(
-            scoring_profile=derived.scoring_profile,
-            search_keywords=derived.search_keywords,
-            example_promising_titles=derived.example_promising_titles,
-            example_unpromising_titles=derived.example_unpromising_titles,
-            description=derived.description,
-            seniority_hint=derived.seniority_hint,
-            domain_hints=derived.domain_hints or None,
-            profile_version=target.profile_version + 1,
-        ),
-    )
-    if updated is None:
-        raise HTTPException(status_code=500, detail="Failed to update target")
-    return updated
 
 
 @router.post(

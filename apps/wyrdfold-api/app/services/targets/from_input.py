@@ -125,13 +125,18 @@ async def derive_manual_target_bg(
     user_id: str,
     target_id: str,
     label: str,
-    payload: OptimizedPayload,
+    payload: OptimizedPayload | None,
 ) -> None:
     """Derive profile-from-label then fit score for a new manual target.
 
     Runs as a ``BackgroundTask``. The target already exists in
     ``activation_status="deriving"``; on success it flips to ``idle`` with
     the derived scoring profile, on failure (or timeout) to ``error``.
+
+    ``payload`` is ``None`` when the caller has no experience profile (the
+    ``from_suggestion`` search-fallback path): the label-derived scoring
+    profile is still produced, but the per-user fit score — which needs the
+    experience payload — is skipped.
     """
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
@@ -164,7 +169,10 @@ async def derive_manual_target_bg(
             if updated is None:
                 logger.error("Failed to update target %s after deferred derive", target_id)
                 return
-            await _apply_fit_score(supabase, llm, user_id=user_id, target=updated, payload=payload)
+            if payload is not None:
+                await _apply_fit_score(
+                    supabase, llm, user_id=user_id, target=updated, payload=payload
+                )
     except TimeoutError:
         logger.error(
             "Deferred manual-target derivation timed out after %ss for target %s",
@@ -299,6 +307,69 @@ async def _normalize_suggestion(
         raise HTTPException(status_code=502, detail=_MALFORMED_SUGGESTION_DETAIL) from exc
 
 
+async def _create_or_link_from_suggestion(
+    supabase: Client,
+    llm: LLMClient,
+    background_tasks: BackgroundTasks,
+    *,
+    user_id: str,
+    suggestion: TargetSuggestion,
+    payload: OptimizedPayload | None,
+) -> CreateOrLinkResult:
+    """Match a canonical ``TargetSuggestion`` against the shared catalog, then
+    link the caller to the existing target or create a new one.
+
+    The shared core of ``from_manual`` (after LLM normalization) and
+    ``from_suggestion`` (labels already canonical). Deduplicating on
+    ``suggestion.label`` here — server-side, at write time — is what keeps two
+    users (or a client retry) from minting duplicate catalog rows for the same
+    role. Links with ``is_active=False`` so it never trips the active-target
+    cap; the user follows the target and activates it separately.
+
+    ``payload`` is the caller's experience profile, or ``None`` when they have
+    none. When ``None`` the label-derived scoring profile is still produced,
+    but the per-user fit score (which needs the payload) is skipped.
+    """
+    matched = find_matching_target(supabase, suggestion.label)
+    if matched is not None:
+        link = crud.link_user_to_target(
+            supabase, user_id=user_id, target_id=matched.id, is_active=False
+        )
+        if payload is not None:
+            background_tasks.add_task(
+                _apply_fit_score,
+                supabase,
+                llm,
+                user_id=user_id,
+                target=matched,
+                payload=payload,
+            )
+        return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
+
+    # New target: create immediately in "deriving" so it appears in the
+    # list with a pending indicator while the background task derives the
+    # scoring profile (+ fit score when we have a profile).
+    target = crud.create(
+        supabase,
+        payload=TargetCreate(
+            label=suggestion.label,
+            description=suggestion.description,
+        ),
+    )
+    target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
+    link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
+    background_tasks.add_task(
+        derive_manual_target_bg,
+        supabase,
+        llm,
+        user_id=user_id,
+        target_id=target.id,
+        label=suggestion.label,
+        payload=payload,
+    )
+    return CreateOrLinkResult(user_target=link, target=target, was_matched=False)
+
+
 async def from_manual(
     supabase: Client,
     llm: LLMClient,
@@ -330,44 +401,49 @@ async def from_manual(
         result=norm_result,
         metadata={"user_id": user_id, "raw_label": label},
     )
-
-    matched = find_matching_target(supabase, suggestion.label)
-    if matched is not None:
-        link = crud.link_user_to_target(
-            supabase, user_id=user_id, target_id=matched.id, is_active=False
-        )
-        background_tasks.add_task(
-            _apply_fit_score,
-            supabase,
-            llm,
-            user_id=user_id,
-            target=matched,
-            payload=payload,
-        )
-        return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
-
-    # New target: create immediately in "deriving" so it appears in the
-    # list with a pending indicator while the background task derives the
-    # scoring profile + fit score.
-    target = crud.create(
-        supabase,
-        payload=TargetCreate(
-            label=suggestion.label,
-            description=suggestion.description,
-        ),
-    )
-    target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
-    link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
-    background_tasks.add_task(
-        derive_manual_target_bg,
+    return await _create_or_link_from_suggestion(
         supabase,
         llm,
+        background_tasks,
         user_id=user_id,
-        target_id=target.id,
-        label=suggestion.label,
+        suggestion=suggestion,
         payload=payload,
     )
-    return CreateOrLinkResult(user_target=link, target=target, was_matched=False)
+
+
+async def from_suggestion(
+    supabase: Client,
+    llm: LLMClient,
+    background_tasks: BackgroundTasks,
+    *,
+    user_id: str,
+    label: str,
+    description: str | None,
+    payload: OptimizedPayload | None = None,
+) -> CreateOrLinkResult:
+    """Create-or-link from an AI search-suggestion the user picked.
+
+    Backs ``POST /targets/from-suggestion`` (the catalog-search LLM fallback).
+    The label already came from ``suggest_targets_from_query``, which
+    canonicalised it, so — unlike ``from_manual`` — we skip the inline
+    normalization LLM call and match the shared catalog directly. Server-side
+    dedup means a stale client ``is_new`` (or a race) links the existing row
+    instead of minting a duplicate. Profile-independent: ``payload`` is
+    optional, and only the per-user fit score is skipped when it's absent.
+    """
+    suggestion = TargetSuggestion(
+        label=label.strip()[:200],
+        description=(description or "").strip(),
+        core_skills=[],
+    )
+    return await _create_or_link_from_suggestion(
+        supabase,
+        llm,
+        background_tasks,
+        user_id=user_id,
+        suggestion=suggestion,
+        payload=payload,
+    )
 
 
 async def from_url(

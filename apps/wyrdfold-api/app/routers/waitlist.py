@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from supabase import Client
 
-from app.dependencies import get_supabase
+from app.dependencies import get_supabase, require_bff_secret
 from app.models.waitlist import WaitlistSignup, WaitlistSignupResponse
 from app.rate_limit import limiter
 
@@ -61,7 +61,13 @@ def _insert_signup(supabase: Client, email: str) -> None:
     )
 
 
-@router.post("/waitlist", response_model=WaitlistSignupResponse)
+@router.post(
+    "/waitlist",
+    response_model=WaitlistSignupResponse,
+    # SEC-5: BFF-only. The per-IP limit below is only spoof-proof if the
+    # endpoint can't be hit directly with a forged X-Forwarded-For.
+    dependencies=[Depends(require_bff_secret)],
+)
 @limiter.limit("5/minute;20/hour")
 async def join_waitlist(
     request: Request,
@@ -104,7 +110,11 @@ class SignupModeResponse(BaseModel):
 
 
 # Sync `def`: blocking supabase read in the threadpool (#107).
-@router.get("/signup-mode", response_model=SignupModeResponse)
+@router.get(
+    "/signup-mode",
+    response_model=SignupModeResponse,
+    dependencies=[Depends(require_bff_secret)],  # SEC-5: BFF-only (see join_waitlist)
+)
 @limiter.limit("30/minute")
 def get_signup_mode(
     request: Request,

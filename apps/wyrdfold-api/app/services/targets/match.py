@@ -30,6 +30,7 @@ from app.models.targets import (
     JobTarget,
     MatchedSuggestion,
     MatchedSuggestions,
+    TargetSuggestion,
 )
 from app.services.llm.client import LLMClient
 from app.services.targets.crud import (
@@ -37,7 +38,10 @@ from app.services.targets.crud import (
     _parse_target,
     get_user_target_ids,
 )
-from app.services.targets.suggest import suggest_targets
+from app.services.targets.suggest import (
+    suggest_targets,
+    suggest_targets_from_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,26 +91,20 @@ def find_matching_target(
     return None
 
 
-async def suggest_and_match(
+def _match_suggestions(
     supabase: Client,
-    llm: LLMClient,
-    *,
-    payload: OptimizedPayload,
-    user_id: str,
-) -> tuple[MatchedSuggestions, LLMResult]:
-    """Suggest targets, match against existing, exclude user's current targets.
+    suggestions: list[TargetSuggestion],
+    existing_ids: set[str],
+) -> list[MatchedSuggestion]:
+    """Match each suggestion against the shared catalog, dropping any the user
+    already follows.
 
-    Returns (matched_suggestions, llm_result) so callers can log cost.
+    A suggestion matched to a target the caller already has is skipped (no
+    point re-offering it); everything else is returned paired with its matched
+    target (``is_new=False``) or flagged as new (``is_new=True``).
     """
-    # Get user's existing target IDs to exclude
-    existing_ids = get_user_target_ids(supabase, user_id)
-
-    # Get LLM suggestions
-    suggestions, result = await suggest_targets(llm, payload=payload)
-
     matches: list[MatchedSuggestion] = []
-    for suggestion in suggestions.suggestions:
-        # Try to match against existing targets
+    for suggestion in suggestions:
         matched = find_matching_target(supabase, suggestion.label)
 
         if matched and matched.id in existing_ids:
@@ -120,5 +118,48 @@ async def suggest_and_match(
                 is_new=matched is None,
             )
         )
+    return matches
 
+
+async def suggest_and_match(
+    supabase: Client,
+    llm: LLMClient,
+    *,
+    payload: OptimizedPayload,
+    user_id: str,
+) -> tuple[MatchedSuggestions, LLMResult]:
+    """Suggest targets from experience, match against existing, exclude the
+    user's current targets.
+
+    Returns (matched_suggestions, llm_result) so callers can log cost.
+    """
+    existing_ids = get_user_target_ids(supabase, user_id)
+    suggestions, result = await suggest_targets(llm, payload=payload)
+    matches = _match_suggestions(supabase, suggestions.suggestions, existing_ids)
+    return MatchedSuggestions(matches=matches), result
+
+
+async def suggest_and_match_from_query(
+    supabase: Client,
+    llm: LLMClient,
+    *,
+    query: str,
+    user_id: str,
+    payload: OptimizedPayload | None = None,
+) -> tuple[MatchedSuggestions, LLMResult]:
+    """Suggest targets from a free-text query, match against the shared catalog,
+    exclude the user's current targets.
+
+    Backs the catalog-search LLM fallback: when ``GET /targets/search`` finds
+    nothing, the LLM canonicalizes the query into a target plus adjacent roles,
+    each matched so the user can follow an existing one or create a new one.
+    Experience-tailored when ``payload`` is provided, but works without it.
+
+    Returns (matched_suggestions, llm_result) so callers can log cost.
+    """
+    existing_ids = get_user_target_ids(supabase, user_id)
+    suggestions, result = await suggest_targets_from_query(
+        llm, query=query, payload=payload
+    )
+    matches = _match_suggestions(supabase, suggestions.suggestions, existing_ids)
     return MatchedSuggestions(matches=matches), result

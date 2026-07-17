@@ -5,8 +5,13 @@ import json
 import pytest
 
 from app.models.llm import Message
+from app.models.targets import TargetSuggestions
 from app.services.llm.client import complete_json
-from app.services.llm.mock import MockLLMClient
+from app.services.llm.mock import (
+    QUERY_SUGGEST_PURPOSE,
+    MockLLMClient,
+    dev_default_responses,
+)
 
 
 async def test_echo_mode_returns_json_with_latest_user_content() -> None:
@@ -173,3 +178,55 @@ async def test_complete_tool_use_records_tool_name_in_call_log() -> None:
         purpose="tool",
     )
     assert client.calls[0]["tool_name"] == "return_Foo"
+
+
+# ---- dev-default responses (local `LLM_PROVIDER=mock` realism) ----------------
+
+
+def test_dev_default_responses_covers_query_suggest() -> None:
+    """The seed exposes the query-suggest purpose so local search fallback
+    returns usable data instead of the bare echo."""
+    assert QUERY_SUGGEST_PURPOSE in dev_default_responses()
+
+
+def test_dev_default_responses_returns_a_fresh_dict_each_call() -> None:
+    """Callers mutate their own copy — the seed must not be shared state."""
+    a = dev_default_responses()
+    a["extra"] = "x"
+    assert "extra" not in dev_default_responses()
+
+
+async def test_dev_default_query_suggest_echoes_query_as_first_suggestion() -> None:
+    """Seeded mock synthesizes the query as the canonical first suggestion plus
+    adjacent-seniority neighbours — a valid TargetSuggestions, not the echo."""
+    client = MockLLMClient(scripted=dev_default_responses())
+    parsed, _ = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="",
+        messages=[Message(role="user", content="frontend engineer\n\nbackground")],
+        schema=TargetSuggestions,
+        purpose=QUERY_SUGGEST_PURPOSE,
+    )
+    assert parsed.suggestions
+    assert parsed.suggestions[0].label == "Frontend Engineer"
+    labels = {s.label for s in parsed.suggestions}
+    assert "Senior Frontend Engineer" in labels  # a neighbour was added
+    # No duplicate labels leak from the seniority-ladder dedup.
+    assert len(labels) == len(parsed.suggestions)
+
+
+async def test_dev_default_query_suggest_survives_blank_query() -> None:
+    """An empty/whitespace query must still yield a valid suggestion, never a
+    crash or an empty label (min_length=1 on TargetSuggestion.label)."""
+    client = MockLLMClient(scripted=dev_default_responses())
+    parsed, _ = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="",
+        messages=[Message(role="user", content="   ")],
+        schema=TargetSuggestions,
+        purpose=QUERY_SUGGEST_PURPOSE,
+    )
+    assert parsed.suggestions
+    assert all(s.label for s in parsed.suggestions)

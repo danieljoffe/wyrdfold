@@ -39,7 +39,9 @@ import type {
 import { toSummary } from './types';
 
 export type CreateOrLinkEndpoint =
-  '/api/targets/from-manual' | '/api/targets/from-url';
+  | '/api/targets/from-manual'
+  | '/api/targets/from-url'
+  | '/api/targets/from-suggestion';
 
 /** POST one of the LLM-backed create-or-link endpoints. */
 export async function createOrLinkTarget(
@@ -117,6 +119,34 @@ export async function addSuggestionTarget(
     return toListEntry(result);
   }
   return linkExistingTarget(match.matched_target!);
+}
+
+/**
+ * Add one AI search-suggestion the user picked (the catalog-search LLM
+ * fallback). A single call to `/api/targets/from-suggestion`, which
+ * create-or-links server-side.
+ *
+ * Deliberately NOT the client-side create→link dance {@link addSuggestionTarget}
+ * uses: the server dedups on the (already-canonical) label at write time, so a
+ * stale client `is_new` — or a race — links the existing catalog row instead of
+ * minting a duplicate. And unlike `/from-manual` it needs no experience profile
+ * (the fallback is meant for brand-new users; the role query is the signal), so
+ * `match.is_new` / `match.matched_target` are ignored here — the server decides.
+ * Links `is_active=False`; the user activates from /targets when ready (matching
+ * the manual/URL create flows on that page).
+ */
+export async function addSearchSuggestionTarget(
+  match: MatchedSuggestion
+): Promise<UserTargetWithSummary> {
+  const result = await createOrLinkTarget(
+    '/api/targets/from-suggestion',
+    {
+      label: match.suggestion.label,
+      description: match.suggestion.description,
+    },
+    'Failed to add target'
+  );
+  return toListEntry(result);
 }
 
 /**
