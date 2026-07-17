@@ -38,6 +38,78 @@ def _approx_tokens(text: str) -> int:
 ResponseSource = str | Callable[[str, list[Message]], str]
 
 
+# Kept in sync with ``targets.suggest.QUERY_DEFAULT_PURPOSE``. Duplicated (not
+# imported) to keep the mock free of service-layer imports.
+QUERY_SUGGEST_PURPOSE = "target.suggest_from_query"
+
+
+# Seniority words we strip off the front of a query so we can rebuild a small
+# ladder of adjacent-seniority neighbours around the role's "core".
+_SENIORITY_PREFIXES = frozenset(
+    {"junior", "jr", "mid", "mid-level", "senior", "sr", "staff", "principal", "lead", "head"}
+)
+
+
+def _dev_suggest_from_query(latest_user: str, _messages: list[Message]) -> str:
+    """Deterministic happy-path suggestions for the ``target.suggest_from_query``
+    purpose, used for local dev / integration-through-DI (never in tests, which
+    register their own scripted responses).
+
+    The query-suggest service puts the raw query on the first line of the user
+    message (see ``suggest._build_query_message``). We echo it back as the
+    canonical first suggestion, then add a couple of adjacent-seniority
+    neighbours so the local search UI shows a realistic selectable list. This
+    is a fake — the real LLM tailors these to the query and the user's
+    experience; the descriptions say so plainly.
+    """
+    first_line = next(
+        (line.strip() for line in latest_user.splitlines() if line.strip()), ""
+    )
+    query = first_line[:120] or "Target Role"
+    canonical = query.title()
+    words = canonical.split()
+    core = (
+        " ".join(words[1:])
+        if words and words[0].lower() in _SENIORITY_PREFIXES and len(words) > 1
+        else canonical
+    )
+
+    seen: set[str] = set()
+    labels: list[str] = []
+    for label in (canonical, f"Senior {core}", f"Staff {core}", f"Principal {core}"):
+        key = label.lower()
+        if key not in seen:
+            seen.add(key)
+            labels.append(label)
+        if len(labels) >= 4:
+            break
+
+    suggestions = [
+        {
+            "label": label,
+            "description": (
+                f"Roles similar to “{query}”. "
+                "(Local mock suggestion — the real LLM tailors these.)"
+            ),
+            "core_skills": [],
+        }
+        for label in labels
+    ]
+    return json.dumps({"suggestions": suggestions})
+
+
+def dev_default_responses() -> dict[str, ResponseSource]:
+    """Scripted responses seeded into the mock for LOCAL DEV / integration only
+    (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data
+    instead of the bare ``{"mock": True}`` echo.
+
+    Unit tests construct ``MockLLMClient()`` directly (no seed) and register
+    their own responses, so this never changes test behavior. A fresh dict is
+    returned each call so callers can mutate their own copy.
+    """
+    return {QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query}
+
+
 class MockLLMClient:
     """Implements the LLMClient Protocol. Not used in production."""
 

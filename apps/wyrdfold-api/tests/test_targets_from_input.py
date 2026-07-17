@@ -471,6 +471,145 @@ async def test_derive_manual_target_bg_marks_error_on_timeout(
     assert stub_crud.by_name("link") == []
 
 
+# ---- from_suggestion: inline path (profile-independent, no normalize) --------
+
+
+@pytest.mark.asyncio
+async def test_from_suggestion_new_creates_without_normalize_call(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """New suggestion → create in 'deriving' + link + defer derivation, and —
+    unlike from_manual — NO inline normalize LLM call (label already canonical)."""
+    supabase = MagicMock()
+    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: None)
+
+    created = _target(id="new", label="Senior Frontend Engineer")
+    create_calls: list[TargetCreate] = []
+    monkeypatch.setattr(
+        crud,
+        "create",
+        lambda _s, *, payload: create_calls.append(payload) or created,  # type: ignore[func-returns-value]
+    )
+
+    bg = BackgroundTasks()
+    result = await from_input.from_suggestion(
+        supabase,
+        MagicMock(),
+        bg,
+        user_id="user-1",
+        label="Senior Frontend Engineer",
+        description="Frontend roles.",
+        payload=OptimizedPayload(),
+    )
+
+    assert result.was_matched is False
+    assert result.target.activation_status == "deriving"
+    # The distinguishing property: NO normalization LLM call.
+    assert "normalize" not in stub_llm_helpers.names()
+    # Created straight from the (already-canonical) label + description.
+    assert create_calls[0].label == "Senior Frontend Engineer"
+    assert create_calls[0].description == "Frontend roles."
+    link_kwargs = stub_crud.by_name("link")[0]
+    assert link_kwargs["is_active"] is False  # never trips the active cap
+    scheduled = _scheduled(bg)
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is from_input.derive_manual_target_bg
+
+
+@pytest.mark.asyncio
+async def test_from_suggestion_matched_dedups_to_existing_row(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """A suggestion whose label matches an existing catalog row LINKS it instead
+    of creating a duplicate — the server-side dedup that a stale client
+    ``is_new`` can't defeat."""
+    supabase = MagicMock()
+    matched = _target(id="existing")
+    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
+    create_spy = MagicMock()
+    monkeypatch.setattr(crud, "create", create_spy)
+
+    bg = BackgroundTasks()
+    result = await from_input.from_suggestion(
+        supabase,
+        MagicMock(),
+        bg,
+        user_id="user-1",
+        label="Senior Frontend Engineer",
+        description="Frontend roles.",
+        payload=OptimizedPayload(),
+    )
+
+    assert result.was_matched is True
+    assert result.target.id == "existing"
+    create_spy.assert_not_called()  # NO duplicate row minted
+    # Fit-score deferred (we have a profile).
+    scheduled = _scheduled(bg)
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is from_input._apply_fit_score
+
+
+@pytest.mark.asyncio
+async def test_from_suggestion_no_profile_skips_fit_score(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """payload=None (user has no experience profile): a matched suggestion links
+    but schedules NO fit-score task (fit needs the profile). Profile-independent
+    is the whole point of the search fallback."""
+    supabase = MagicMock()
+    matched = _target(id="existing")
+    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
+
+    bg = BackgroundTasks()
+    result = await from_input.from_suggestion(
+        supabase,
+        MagicMock(),
+        bg,
+        user_id="user-1",
+        label="Senior Frontend Engineer",
+        description=None,
+        payload=None,
+    )
+
+    assert result.was_matched is True
+    # Linked, but NO fit-score task — nothing to score against.
+    assert stub_crud.by_name("link")[0]["is_active"] is False
+    assert _scheduled(bg) == []
+
+
+@pytest.mark.asyncio
+async def test_derive_manual_target_bg_skips_fit_when_no_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """Background derive with payload=None still derives the label profile
+    (status→idle) but skips the fit score."""
+    supabase = MagicMock()
+
+    await from_input.derive_manual_target_bg(
+        supabase,
+        MagicMock(),
+        user_id="user-1",
+        target_id="new",
+        label="Senior Frontend Engineer",
+        payload=None,
+    )
+
+    names = stub_llm_helpers.names()
+    assert "derive_from_label" in names  # profile still derived from the label
+    assert "fit_score" not in names  # but no per-user fit score
+    update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
+    assert update_body.activation_status == "idle"
+    assert stub_crud.by_name("link") == []  # fit-score link upsert skipped
+
+
 # ---- from_url: inline path --------------------------------------------------
 
 

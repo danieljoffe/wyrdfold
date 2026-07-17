@@ -45,8 +45,10 @@ from app.models.targets import (
     ReferenceJDsListResponse,
     ReferenceJDVote,
     ScoringProfile,
+    SuggestFromQueryRequest,
     TargetCreate,
     TargetFromManual,
+    TargetFromSuggestion,
     TargetFromUrl,
     TargetPreferences,
     TargetPreferencesUpdate,
@@ -97,13 +99,19 @@ from app.services.targets.lateral_discovery import (
     suggest_lateral_targets,
 )
 from app.services.targets.learning_projection import project_profile_impact
-from app.services.targets.match import suggest_and_match
+from app.services.targets.match import (
+    suggest_and_match,
+    suggest_and_match_from_query,
+)
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
     apply_profile_merge_rpc,
     apply_profile_patch_rpc,
 )
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
+from app.services.targets.suggest import (
+    QUERY_DEFAULT_PURPOSE as QUERY_SUGGEST_PURPOSE,
+)
 from app.services.validate import assert_safe_host, validate_job_url
 
 logger = logging.getLogger(__name__)
@@ -369,6 +377,48 @@ async def create_target_from_manual(
 
 
 @router.post(
+    "/from-suggestion",
+    response_model=CreateOrLinkResult,
+    status_code=201,
+    dependencies=[Depends(enforce_llm_budget)],
+)
+@limiter.limit("6/minute")
+async def create_target_from_suggestion(
+    request: Request,
+    body: TargetFromSuggestion,
+    background_tasks: BackgroundTasks,
+    supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
+    user_id: str = Depends(get_current_user_id),
+) -> CreateOrLinkResult:
+    """Create-or-link a target from an AI search-suggestion the user picked.
+
+    The completion of the catalog-search LLM fallback: the user searched a
+    role, got AI suggestions from ``/targets/suggest-from-query``, and picked
+    one. Its label is already canonical, so — unlike ``/from-manual`` — no
+    inline normalization runs, and matching the shared catalog server-side
+    dedups a stale client ``is_new`` (or a race) into a link instead of a
+    duplicate row. Links ``is_active=False`` (never trips the active-target
+    cap), defers the scoring-profile derivation, and returns immediately.
+
+    PROFILE-INDEPENDENT (unlike ``/from-manual``): a user with no experience
+    profile can still create a target from a role search — the query is the
+    signal. Only the per-user fit score is deferred-and-skipped when absent.
+    """
+    doc = optimized.get_latest(supabase, user_id=user_id)
+    payload = doc.payload if doc is not None else None
+    return await from_input.from_suggestion(
+        supabase,
+        llm,
+        background_tasks,
+        user_id=user_id,
+        label=body.label,
+        description=body.description,
+        payload=payload,
+    )
+
+
+@router.post(
     "/from-url",
     response_model=CreateOrLinkResult,
     status_code=201,
@@ -515,6 +565,57 @@ async def suggest_lateral(
         },
     )
     return suggestions
+
+
+@router.post(
+    "/suggest-from-query",
+    response_model=MatchedSuggestions,
+    dependencies=[Depends(enforce_llm_budget)],
+)
+@limiter.limit("6/minute")
+async def suggest_from_query(
+    request: Request,
+    body: SuggestFromQueryRequest,
+    supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
+    user_id: str = Depends(get_current_user_id),
+) -> MatchedSuggestions:
+    """Turn a free-text role search into selectable target suggestions.
+
+    Catalog search (``GET /targets/search``) only finds targets that already
+    exist; when it comes up empty the UI falls back here. The LLM canonicalises
+    the query into a target plus a few adjacent roles, each matched against the
+    shared catalog so the user can follow an existing one or create a new one.
+
+    Tailored to the user's experience when they have a profile, but works
+    without one (the query is the primary signal) — unlike ``/suggest``, which
+    requires a profile. Rate-limited a touch higher than ``/suggest`` (6/min)
+    since it's an interactive search affordance, and LLM-budget-gated.
+    """
+    doc = optimized.get_latest(supabase, user_id=user_id)
+    payload = doc.payload if doc is not None else None
+    try:
+        matched, result = await suggest_and_match_from_query(
+            supabase, llm, query=body.query, user_id=user_id, payload=payload
+        )
+    except ValidationError:
+        # Structurally malformed model response (wrong types/missing fields).
+        # An upstream hiccup, not a server bug — tell the client to retry.
+        logger.warning(
+            "suggest-from-query: model returned malformed suggestions", exc_info=True
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The model returned malformed suggestions — please retry.",
+        ) from None
+    cost_log.record(
+        supabase,
+        user_id=user_id,
+        purpose=QUERY_SUGGEST_PURPOSE,
+        result=result,
+        metadata={"user_id": user_id, "query_len": len(body.query)},
+    )
+    return matched
 
 
 @router.get("/active", response_model=TargetsListResponse)

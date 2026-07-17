@@ -27,6 +27,7 @@ function renderModal(
     onSubmitManual: jest.fn(),
     onSubmitUrl: jest.fn(),
     onFollow: jest.fn().mockResolvedValue(true),
+    onCreateSuggestion: jest.fn().mockResolvedValue(true),
     ...overrides,
   };
   render(<CreateTargetModal {...props} />);
