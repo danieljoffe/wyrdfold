@@ -19,6 +19,7 @@ import CreateTargetModal, {
 } from './CreateTargetModal';
 import PendingTargetCard from './PendingTargetCard';
 import {
+  addSearchSuggestionTarget,
   addSuggestionTarget,
   createOrLinkTarget,
   linkTarget,
@@ -370,6 +371,33 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     [toast, router]
   );
 
+  // Create-or-follow one AI suggestion from the modal's Search tab (the LLM
+  // fallback when catalog search dead-ends). Reuses the same create→link atom
+  // as experience suggestions, then inserts the new entry + refreshes. Returns
+  // whether it succeeded so the card can be removed; the modal stays open for
+  // adding several. Mirrors handleFollowSearchResult's contract.
+  const handleCreateSearchSuggestion = useCallback(
+    async (match: MatchedSuggestion): Promise<boolean> => {
+      try {
+        const entry = await addSearchSuggestionTarget(match);
+        toast({
+          variant: 'success',
+          title: `Added "${match.suggestion.label}"`,
+        });
+        insertEntry(entry);
+        router.refresh();
+        return true;
+      } catch (e) {
+        toast({
+          variant: 'error',
+          title: e instanceof Error ? e.message : 'Failed to add target',
+        });
+        return false;
+      }
+    },
+    [toast, insertEntry, router]
+  );
+
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
@@ -702,6 +730,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
         onFollow={handleFollowSearchResult}
+        onCreateSuggestion={handleCreateSearchSuggestion}
       />
 
       <ConfirmModal

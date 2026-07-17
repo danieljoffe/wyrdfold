@@ -353,6 +353,40 @@ class TargetSearchResponse(BaseModel):
     results: list[TargetSearchResult]
 
 
+class SuggestFromQueryRequest(BaseModel):
+    """Request body for ``POST /targets/suggest-from-query`` — the LLM fallback
+    when catalog search finds nothing. ``query`` is the raw role text the user
+    typed into the search box; the cap mirrors ``GET /targets/search``'s ``q``."""
+
+    query: str = Field(min_length=1, max_length=200)
+
+    @field_validator("query")
+    @classmethod
+    def _strip_and_require_nonblank(cls, value: str) -> str:
+        """Trim surrounding whitespace and reject a blank query. ``min_length``
+        alone lets ``"   "`` (3 spaces) through; strip it so the service always
+        gets a clean, meaningful query and a whitespace-only body 422s."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("query must not be blank")
+        return stripped
+
+
+class TargetFromSuggestion(BaseModel):
+    """Create-or-link a target from an AI search-suggestion the user picked
+    (``POST /targets/from-suggestion``).
+
+    Distinct from ``TargetFromManual``: the ``label`` came from
+    ``suggest_targets_from_query``, which already LLM-canonicalised it, so the
+    server skips the inline normalization call and matches the shared catalog
+    directly. Profile-independent — unlike ``/from-manual`` it needs no
+    experience profile (see the router). ``description`` caps at 500 to match
+    the suggestion source (``TargetSuggestion.description``)."""
+
+    label: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=500)
+
+
 # ---- List-DTO (summary) shapes (#863) --------------------------------------
 # Light projections for the targets list views. They omit the heavy JSONB
 # fields (scoring_profile, search_keywords, example_*_titles, domain_hints)

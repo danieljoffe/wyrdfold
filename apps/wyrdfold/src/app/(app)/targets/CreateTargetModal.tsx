@@ -7,7 +7,7 @@ import { Textarea } from '@danieljoffe/shared-ui/Textarea';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
 import Button from '@/components/kit/Button';
 import TargetSearchTab from './TargetSearchTab';
-import type { TargetSearchResult } from './types';
+import type { MatchedSuggestion, TargetSearchResult } from './types';
 
 export interface ManualSubmission {
   label: string;
@@ -27,6 +27,7 @@ interface CreateTargetModalProps {
   onSubmitManual: (payload: ManualSubmission) => void;
   onSubmitUrl: (payload: UrlSubmission) => void;
   onFollow: (target: TargetSearchResult) => Promise<boolean>;
+  onCreateSuggestion: (match: MatchedSuggestion) => Promise<boolean>;
 }
 
 export default function CreateTargetModal({
@@ -35,6 +36,7 @@ export default function CreateTargetModal({
   onSubmitManual,
   onSubmitUrl,
   onFollow,
+  onCreateSuggestion,
 }: CreateTargetModalProps) {
   // Discovery-first: default to searching the shared catalog so a user follows
   // an existing target instead of minting a duplicate; Manual / From URL are
@@ -99,7 +101,12 @@ export default function CreateTargetModal({
     {
       id: 'search',
       label: 'Search',
-      content: <TargetSearchTab onFollow={onFollow} />,
+      content: (
+        <TargetSearchTab
+          onFollow={onFollow}
+          onCreateSuggestion={onCreateSuggestion}
+        />
+      ),
     },
     {
       id: 'manual',

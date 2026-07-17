@@ -30,11 +30,13 @@ from app.models.tailor import (
     TailoredResume,
     TailoredRole,
 )
+from app.models.targets import TargetSuggestion, TargetSuggestions
 from app.services.analysis.analyze import analyze_job
 from app.services.experience.derive import derive_from_prose
 from app.services.llm.client import strip_markdown_fence
 from app.services.llm.mock import MockLLMClient
 from app.services.tailor.tailor import tailor_resume
+from app.services.targets.suggest import suggest_targets_from_query
 from tests.support.llm_edges import (
     INJECTION_TEXT,
     TEXT_EDGES,
@@ -97,6 +99,18 @@ def _valid_analysis_dict() -> dict[str, Any]:
             domain_rationale="Adjacent domain.",
         ),
         recommendation="Apply: strong technical match.",
+    ).model_dump(mode="json")
+
+
+def _valid_suggest_from_query_dict() -> dict[str, Any]:
+    return TargetSuggestions(
+        suggestions=[
+            TargetSuggestion(
+                label="Senior Frontend Engineer",
+                description="Frontend roles leveraging React/TypeScript.",
+                core_skills=["React", "TypeScript"],
+            )
+        ]
     ).model_dump(mode="json")
 
 
@@ -172,6 +186,18 @@ SURFACES = [
             contact=ContactInfo(name="Test User", email="test@example.com"),
         ),
         text_field=lambda res: res[0].summary,
+    ),
+    Surface(
+        name="suggest_from_query",
+        purpose="target.suggest_from_query",
+        schema=TargetSuggestions,
+        valid=_valid_suggest_from_query_dict,
+        call=lambda llm: suggest_targets_from_query(
+            llm, query="senior frontend engineer"
+        ),
+        text_field=lambda res: (
+            res[0].suggestions[0].description if res[0].suggestions else None
+        ),
     ),
 ]
 

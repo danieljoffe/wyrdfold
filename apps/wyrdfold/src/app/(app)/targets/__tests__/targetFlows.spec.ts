@@ -1,5 +1,6 @@
 import {
   activateTargetInBackground,
+  addSearchSuggestionTarget,
   addSuggestionTarget,
   createBareTarget,
   createOrLinkTarget,
@@ -192,6 +193,60 @@ describe('addSuggestionTarget', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/targets/t-1/link');
     expect(entry.user_target.id).toBe('ut-1');
+  });
+});
+
+describe('addSearchSuggestionTarget (profile-independent LLM fallback)', () => {
+  it('POSTs the pick to the profile-free from-suggestion endpoint (server dedups)', async () => {
+    fetchMock.mockResolvedValue(okResponse(CREATE_RESULT));
+    const match = {
+      is_new: true,
+      suggestion: { label: 'Staff Engineer', description: 'desc' },
+      matched_target: null,
+    } as unknown as MatchedSuggestion;
+
+    const entry = await addSearchSuggestionTarget(match);
+
+    // ONE server call — the API create-or-links + dedups; no client-side dance.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/targets/from-suggestion');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({
+      label: 'Staff Engineer',
+      description: 'desc',
+    });
+    // Never the profile-gated /from-manual, and no bare-create/link/activate.
+    expect(url).not.toBe('/api/targets/from-manual');
+    expect(entry.target.id).toBe('t-1');
+    expect(entry.user_target.id).toBe('ut-1');
+  });
+
+  it('ignores the stale client is_new — the server re-matches either way', async () => {
+    // is_new=false, but the flow still just POSTs the label+description and
+    // lets the server decide link-vs-create (dedup is authoritative there).
+    fetchMock.mockResolvedValue(okResponse(CREATE_RESULT));
+    const match = {
+      is_new: false,
+      suggestion: { label: 'Staff Engineer', description: 'desc' },
+      matched_target: TARGET,
+    } as unknown as MatchedSuggestion;
+
+    await addSearchSuggestionTarget(match);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/targets/from-suggestion');
+  });
+
+  it('surfaces the server error on failure', async () => {
+    fetchMock.mockResolvedValue(errorResponse(500, 'boom'));
+    const match = {
+      is_new: true,
+      suggestion: { label: 'Staff Engineer', description: 'desc' },
+      matched_target: null,
+    } as unknown as MatchedSuggestion;
+
+    await expect(addSearchSuggestionTarget(match)).rejects.toThrow('boom');
   });
 });
 

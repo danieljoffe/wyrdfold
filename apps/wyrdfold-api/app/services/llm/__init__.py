@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.client import LLMClient
 from app.services.llm.errors import MissingUserKeyError
-from app.services.llm.mock import MockLLMClient
+from app.services.llm.mock import MockLLMClient, dev_default_responses
 from app.services.llm.openrouter_client import OpenRouterLLMClient
 
 if TYPE_CHECKING:
@@ -101,7 +101,9 @@ def get_default_client() -> LLMClient:
             settings.openrouter_timeout_seconds,
             settings.openrouter_max_retries,
         )
-    return MockLLMClient()
+    # Seed dev-default scripted responses so local `LLM_PROVIDER=mock` flows
+    # return usable data (e.g. query suggestions) instead of the bare echo.
+    return MockLLMClient(scripted=dev_default_responses())
 
 
 def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
@@ -130,7 +132,7 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
     from app.config import settings
 
     if settings.llm_provider == "mock":
-        return MockLLMClient()
+        return MockLLMClient(scripted=dev_default_responses())
 
     if user_id and supabase is not None:
         user_key = _user_byok_key(supabase, user_id)
