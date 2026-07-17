@@ -253,6 +253,70 @@ def test_rpc_drops_offfamily_liveness_and_dedups(
     assert dedup_rows[0]["score"] == 75
 
 
+def test_rpc_company_and_search_filters_match_python(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+) -> None:
+    """The rare page path joins jobs for a company/search filter (the denormalized
+    columns don't carry title/company). Assert it still matches Python."""
+    user_id, target_ids = seeded_cross_target
+    for kw in (
+        {"company": "Acme"},          # only "Alpha Graded High"
+        {"search": "Graded"},         # "Alpha Graded High" + "Bravo Graded Low"
+        {"company": "Bristol", "search": "Bravo"},  # both filters together
+    ):
+        rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False, **kw)
+        py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False, **kw)
+        assert _ids(rpc) == _ids(py), f"filter {kw}: rpc={_ids(rpc)} py={_ids(py)}"
+
+
+def test_jobs_archival_trigger_syncs_and_drops(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+) -> None:
+    """The denormalization's liveness can go stale if a job is archived AFTER
+    scoring. The jobs AFTER-UPDATE trigger must fan job_is_live out to scores so
+    the RPC drops the now-dead job — matching the Python path, which reads jobs
+    live. This is the failure mode denormalization introduces; pin it."""
+    user_id, target_ids = seeded_cross_target
+    before = {p["title"] for p in _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)["postings"]}
+    assert "Alpha Graded High" in before
+
+    job = service_client.table("jobs").select("id").eq("title", "Alpha Graded High").single().execute().data
+    service_client.table("jobs").update({"archived_at": _iso(datetime.now(UTC))}).eq("id", job["id"]).execute()
+
+    # Trigger flipped every score row's denormalized liveness.
+    rows = service_client.table("scores").select("job_is_live").eq("job_posting_id", job["id"]).execute().data
+    assert rows and all(r["job_is_live"] is False for r in rows), "jobs trigger did not sync job_is_live"
+
+    # And the RPC now drops it, still matching the live-reading Python path.
+    rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    assert "Alpha Graded High" not in {p["title"] for p in rpc["postings"]}
+    assert _ids(rpc) == _ids(py)
+
+
+def test_jobs_refamily_trigger_syncs_and_gates(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+) -> None:
+    """Re-tagging a job's role_family must sync to scores so the off-family gate
+    re-evaluates against the denormalized value — matching Python."""
+    user_id, target_ids = seeded_cross_target
+    # "Bravo Graded Low" is engineering, scored only by the eng target → kept.
+    job = service_client.table("jobs").select("id").eq("title", "Bravo Graded Low").single().execute().data
+    service_client.table("jobs").update({"role_family": "finance"}).eq("id", job["id"]).execute()
+
+    rows = service_client.table("scores").select("job_role_family").eq("job_posting_id", job["id"]).execute().data
+    assert rows and all(r["job_role_family"] == "finance" for r in rows), "jobs trigger did not sync role_family"
+
+    # Now off-family for the eng target → gated out, matching Python.
+    rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    assert "Bravo Graded Low" not in {p["title"] for p in rpc["postings"]}
+    assert _ids(rpc) == _ids(py)
+
+
 def test_rpc_offset_pagination_and_has_more(
     service_client: Client,
     seeded_cross_target: tuple[str, set[str]],
