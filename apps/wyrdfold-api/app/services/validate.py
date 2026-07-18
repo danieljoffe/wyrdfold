@@ -63,11 +63,34 @@ def validate_format(url: str) -> str | None:
 def _is_disallowed_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Return True if *ip* falls in any range we refuse to fetch from.
 
-    Covers loopback, link-local (incl. 169.254.169.254 cloud metadata),
-    RFC1918 private, IPv4-mapped IPv6, ULA (fc00::/7), and the all-zeros
-    block. Also blocks reserved / multicast / unspecified for safety —
-    none of those are valid HTTP origins for a public job posting.
+    A legitimate public job posting is served from a *globally-routable*
+    address, so the primary predicate is ``not ip.is_global``. That refuses
+    loopback, link-local (incl. 169.254.169.254 cloud metadata), RFC1918
+    private, ULA, multicast, reserved, the all-zeros block — AND the ranges
+    the older explicit checks missed, chiefly **CGNAT / shared address space
+    (100.64.0.0/10, RFC 6598)**: a carrier-NAT range that is neither private
+    nor reserved, so every ``is_private``/``is_reserved`` check waves it
+    through, leaving a blind-SSRF oracle on deployments where 100.64/10 is
+    routable (SEC-L1). ``is_global`` is False for it, so this closes the gap
+    (plus TEST-NET / benchmarking / 6to4-relay, all equally non-origins).
+
+    Verified on the pinned runtime (Python 3.11, post the gh-113171
+    ``is_global`` fix) that every legitimate public host — IPv4, IPv6, and
+    IPv4-mapped IPv6 (``::ffff:8.8.8.8`` etc.) — reports ``is_global`` True,
+    so this over-blocks nothing real.
+
+    The explicit range checks are kept below as a defense-in-depth floor and
+    living documentation: they reject the same addresses even if a future
+    ``is_global`` semantics change ever weakened the primary predicate, and
+    they spell out the IPv4-mapped-IPv6 handling ``is_global`` does
+    implicitly.
     """
+    # Primary predicate: allow only globally-routable addresses. This is what
+    # closes the CGNAT 100.64.0.0/10 gap (SEC-L1) — none of the explicit
+    # checks below catch it (it is neither private nor reserved).
+    if not ip.is_global:
+        return True
+    # Defense-in-depth floor (subsumed by is_global today; kept deliberately).
     if ip.is_loopback or ip.is_link_local or ip.is_private:
         return True
     if ip.is_multicast or ip.is_unspecified or ip.is_reserved:
