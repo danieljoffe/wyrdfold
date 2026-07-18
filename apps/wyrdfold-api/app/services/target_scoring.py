@@ -484,13 +484,20 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         }
         batch_ids = list(existing_promising_by_job.keys())
 
-        resp = (
-            supabase.table("jobs")
-            .select("id, title, description_html")
-            .in_("id", batch_ids)
-            .execute()
-        )
-        jobs = cast(list[dict[str, Any]], resp.data or [])
+        # Chunk the id filter. A single ``.in_`` of up to _RESCORE_BATCH_SIZE
+        # (500) ids builds a ~19 KB URL that 414s past PostgREST's URL-safe
+        # bound — and here the 414 is swallowed, so a feedback thumbs-down or a
+        # manual /rescore on a heavy target would silently fail to re-score.
+        # Reuse the same _BATCH_CHUNK_SIZE the aggregate loops below use.
+        jobs: list[dict[str, Any]] = []
+        for i in range(0, len(batch_ids), _BATCH_CHUNK_SIZE):
+            resp = (
+                supabase.table("jobs")
+                .select("id, title, description_html")
+                .in_("id", batch_ids[i : i + _BATCH_CHUNK_SIZE])
+                .execute()
+            )
+            jobs.extend(cast(list[dict[str, Any]], resp.data or []))
         if not jobs:
             # No backing ``jobs`` rows for this page (e.g. deleted). Without
             # an upsert these stale ``scores`` rows would keep matching the
