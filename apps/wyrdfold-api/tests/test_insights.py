@@ -8,8 +8,10 @@ from unittest.mock import MagicMock
 
 from app.models.insights import FunnelStage
 from app.services.insights import (
+    _SCORES_PAGE_SIZE,
     _cost_by_purpose,
     _fetch_in_chunks,
+    _posting_target_map,
     compute_pipeline,
     compute_skills_cost,
     compute_targets,
@@ -1662,3 +1664,145 @@ class TestCostByPurpose:
         sb.rpc.assert_not_called()
         assert abs(totals["analysis"] - 0.50) < 1e-9
         assert counts == {"analysis": 2}
+
+
+# ===========================================================================
+# _posting_target_map keyset pagination (audit P4)
+# ===========================================================================
+
+
+class _PaginatingScores:
+    """Faithfully simulates PostgREST on the ``scores`` table: applies the
+    ``in_``/``eq``/``order``/``gt`` filters to a fixed dataset and caps each
+    page at ``cap`` rows (the server's ``max_rows``). A fresh instance per
+    ``table("scores")`` call = a fresh query with fresh cursor state, exactly
+    like the real client."""
+
+    def __init__(self, rows: list[dict], cap: int) -> None:
+        self._all = rows
+        self._cap = cap
+        self._targets: set[str] = set()
+        self._excluded: bool | None = None
+        self._after: str | None = None
+        self._limit: int | None = None
+
+    def select(self, *_a: object, **_k: object) -> _PaginatingScores:
+        return self
+
+    def in_(self, col: str, vals: list[str]) -> _PaginatingScores:
+        assert col == "target_id"
+        self._targets = set(vals)
+        return self
+
+    def eq(self, col: str, val: object) -> _PaginatingScores:
+        if col == "excluded":
+            self._excluded = bool(val)
+        return self
+
+    def order(self, col: str, **_k: object) -> _PaginatingScores:
+        assert col == "id"
+        return self
+
+    def gt(self, col: str, val: str) -> _PaginatingScores:
+        assert col == "id"
+        self._after = val
+        return self
+
+    def limit(self, n: int) -> _PaginatingScores:
+        self._limit = n
+        return self
+
+    def execute(self) -> MagicMock:
+        rows = sorted(
+            (r for r in self._all if r["target_id"] in self._targets),
+            key=lambda r: r["id"],
+        )
+        if self._excluded is not None:
+            rows = [r for r in rows if r["excluded"] is self._excluded]
+        if self._after is not None:
+            rows = [r for r in rows if r["id"] > self._after]
+        page = rows[: min(self._limit or len(rows), self._cap)]
+        resp = MagicMock()
+        resp.data = page
+        return resp
+
+
+def _paginating_client(rows: list[dict], cap: int = _SCORES_PAGE_SIZE) -> MagicMock:
+    client = MagicMock()
+    client.table.side_effect = lambda name: (
+        _PaginatingScores(rows, cap) if name == "scores" else MagicMock()
+    )
+    return client
+
+
+class TestPostingTargetMapPagination:
+    """The membership read must keyset-paginate so it is never silently
+    truncated at PostgREST's ``max_rows`` (1000). Before the fix, a single
+    un-paginated read dropped every (job, target) row past the first 1000,
+    undercounting insights for any user with a busy target."""
+
+    def test_fetches_all_rows_past_the_cap(self) -> None:
+        # 2,500 non-excluded postings under T (> 2x the 1000 cap), plus rows
+        # that must be excluded: 30 excluded=true, and 40 under another target.
+        rows: list[dict] = [
+            {"id": f"{i:08d}", "job_posting_id": f"job-{i}", "target_id": "T", "excluded": False}
+            for i in range(2500)
+        ]
+        rows += [
+            {"id": f"{i:08d}", "job_posting_id": f"jobx-{i}", "target_id": "T", "excluded": True}
+            for i in range(2500, 2530)
+        ]
+        rows += [
+            {"id": f"{i:08d}", "job_posting_id": f"jobo-{i}", "target_id": "OTHER", "excluded": False}
+            for i in range(2530, 2570)
+        ]
+        client = _paginating_client(rows)
+
+        m = _posting_target_map(client, {"T"})
+
+        assert m is not None
+        # All 2,500 non-excluded postings under T — NOT truncated to 1000.
+        assert len(m) == 2500
+        assert all(v == {"T"} for v in m.values())
+        assert not any(k.startswith("jobx-") for k in m)  # excluded dropped
+        assert not any(k.startswith("jobo-") for k in m)  # other target dropped
+
+    def test_multi_target_membership_survives_pagination(self) -> None:
+        # Same posting scored under two requested targets → maps to BOTH,
+        # even across the cap (3,000 total rows, 1,500 distinct postings).
+        rows: list[dict] = []
+        for i in range(1500):
+            rows.append(
+                {"id": f"a{i:07d}", "job_posting_id": f"job-{i}", "target_id": "T1", "excluded": False}
+            )
+            rows.append(
+                {"id": f"b{i:07d}", "job_posting_id": f"job-{i}", "target_id": "T2", "excluded": False}
+            )
+        client = _paginating_client(rows)
+
+        m = _posting_target_map(client, {"T1", "T2"})
+
+        assert m is not None
+        assert len(m) == 1500
+        assert all(v == {"T1", "T2"} for v in m.values())
+
+    def test_exact_multiple_of_page_size_terminates(self) -> None:
+        # Exactly 2000 rows (2x page size) must not loop forever and must
+        # return all 2000 — the full-page cursor advance + empty terminal page.
+        rows = [
+            {"id": f"{i:08d}", "job_posting_id": f"job-{i}", "target_id": "T", "excluded": False}
+            for i in range(2 * _SCORES_PAGE_SIZE)
+        ]
+        m = _posting_target_map(_paginating_client(rows), {"T"})
+        assert m is not None
+        assert len(m) == 2 * _SCORES_PAGE_SIZE
+
+    def test_empty_targets_returns_empty_without_reading(self) -> None:
+        client = MagicMock()
+        assert _posting_target_map(client, set()) == {}
+        client.table.assert_not_called()
+
+    def test_none_targets_is_unscoped(self) -> None:
+        client = MagicMock()
+        assert _posting_target_map(client, None) is None
+        client.table.assert_not_called()
