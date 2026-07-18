@@ -5,6 +5,7 @@ thin wrappers over Supabase table operations that validate rows through
 Pydantic models on the way out.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -27,6 +28,22 @@ from app.models.targets import (
 TARGETS_TABLE = "targets"
 USER_TARGETS_TABLE = "user_targets"
 REF_JDS_TABLE = "reference_jds"
+
+_LABEL_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def normalize_label(label: str) -> str:
+    """Canonical dedup-key normalization for a target label.
+
+    Lowercase, trim, and collapse internal whitespace runs to a single space
+    — so "Senior Engineer" and "Senior  Engineer" normalize identically. This
+    is the **single source of truth** for the value stored in
+    ``targets.normalized_label`` and matched against it (``find_matching_target``
+    imports this), so the write path and the lookup path can never disagree.
+    It is exactly the key the ``targets_normalized_label_key`` UNIQUE
+    constraint enforces.
+    """
+    return _LABEL_WHITESPACE_RE.sub(" ", label.lower().strip())
 
 
 def _parse_target(row: dict[str, Any]) -> JobTarget:
@@ -164,7 +181,7 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
     richer exact+fuzzy dedup still lives in the higher-level paths; here we
     align exactly with the DB constraint (exact ``normalized_label``).
     """
-    normalized = payload.label.lower().strip()
+    normalized = normalize_label(payload.label)
     row: dict[str, Any] = {
         "label": payload.label,
         "description": payload.description,
@@ -257,7 +274,7 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
         updates["label"] = payload.label
-        updates["normalized_label"] = payload.label.lower().strip()
+        updates["normalized_label"] = normalize_label(payload.label)
     if payload.description is not None:
         updates["description"] = payload.description
     if payload.scoring_profile is not None:
