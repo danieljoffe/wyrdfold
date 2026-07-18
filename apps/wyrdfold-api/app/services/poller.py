@@ -119,6 +119,37 @@ FETCHERS: dict[str, Fetcher] = {
 POLL_CONCURRENCY = 6
 LLM_CONCURRENCY = 3
 
+# Cycle-wide caps for the two fan-outs that otherwise had none. Both
+# ``_qualify_jobs`` (LLM ``tag_job`` per row) and ``_validate_rows`` (URL
+# validation per row) gather over a whole source's rows, and POLL_CONCURRENCY
+# sources run at once — so without a *shared* bound the poll can open hundreds
+# of simultaneous OpenRouter calls (429s + cost bursts) or thousands of
+# simultaneous URL validations. One semaphore per event loop, keyed by the
+# running loop like ``db_write`` so a fresh test/worker loop gets its own.
+QUALIFY_LLM_CONCURRENCY = 12
+VALIDATE_CONCURRENCY = 20
+_qualify_llm_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+_validate_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+def _qualify_llm_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _qualify_llm_sems.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(QUALIFY_LLM_CONCURRENCY)
+        _qualify_llm_sems[loop] = sem
+    return sem
+
+
+def _validate_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _validate_sems.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(VALIDATE_CONCURRENCY)
+        _validate_sems[loop] = sem
+    return sem
+
+
 # Every DB touch in the poll cycle routes through the ``db_write`` seam
 # (``poll_db_write`` / ``poll_db_read`` or the ``*_poll`` service variants
 # built on them): sync-client-in-a-thread today, the pooled async HTTP/2
@@ -444,7 +475,9 @@ async def _validate_one_row(row: dict[str, Any]) -> dict[str, Any]:
     if not url:
         return row
     try:
-        result = await validate_job_url(url)
+        # PERF-H3: bound the URL-validation fan-out cycle-wide.
+        async with _validate_semaphore():
+            result = await validate_job_url(url)
         if not result.is_valid:
             row["url_validation_status"] = "rejected"
             row["url_validation_warnings"] = [result.rejection_reason]
@@ -775,13 +808,15 @@ async def _qualify_one_job(
         # Unchanged content already tagged — skip the spend.
         return
 
-    tags, result = await tag_job(
-        llm,
-        title=row.get("title", ""),
-        company=row.get("company_name"),
-        location=row.get("location"),
-        description=row.get("description_html"),
-    )
+    # PERF-H2: bound the qualify LLM fan-out cycle-wide (see _qualify_llm_semaphore).
+    async with _qualify_llm_semaphore():
+        tags, result = await tag_job(
+            llm,
+            title=row.get("title", ""),
+            company=row.get("company_name"),
+            location=row.get("location"),
+            description=row.get("description_html"),
+        )
     if tags is None:
         # Tagger failed (logged inside tag_job). Leave the row NULL.
         return
