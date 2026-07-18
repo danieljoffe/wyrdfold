@@ -19,7 +19,6 @@ because they share "senior" + "engineer" + suffix).
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, cast
 
 from supabase import Client
@@ -37,6 +36,7 @@ from app.services.targets.crud import (
     TARGETS_TABLE,
     _parse_target,
     get_user_target_ids,
+    normalize_label,
 )
 from app.services.targets.suggest import (
     suggest_targets,
@@ -45,13 +45,12 @@ from app.services.targets.suggest import (
 
 logger = logging.getLogger(__name__)
 
-_WHITESPACE_RE = re.compile(r"\s+")
 _SIMILARITY_THRESHOLD = 0.7
 
-
-def _normalize_label(label: str) -> str:
-    """Normalize a target label for matching."""
-    return _WHITESPACE_RE.sub(" ", label.lower().strip())
+# The label dedup key is normalized once, in crud, so the write path
+# (normalized_label) and this lookup path can never diverge. Kept under the
+# original private name for the callers and tests that import it here.
+_normalize_label = normalize_label
 
 
 def find_matching_target(

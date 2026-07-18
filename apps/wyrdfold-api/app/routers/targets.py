@@ -1166,27 +1166,29 @@ def get_target_status(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    # Filter ``excluded=False`` so this count matches what the user
-    # actually sees in /jobs?target_id=... — the list endpoint hides
-    # rows the scorer flagged as excluded (negative-keyword matches),
-    # but this endpoint was previously counting all of them. Result:
-    # a "ready, 3 jobs scored" status that landed the user on a list
-    # showing 1, with the other 2 silently filtered out for being
-    # off-target.
+    # Gate ``excluded=False`` AND ``job_is_live`` so this count reflects
+    # what /jobs?target_id=... actually shows — the list hides both
+    # scorer-excluded rows (negative-keyword matches) and jobs that are no
+    # longer live (archived/purged). Counting only ``excluded=False``
+    # over-reported badly: on the heaviest prod target the not-excluded
+    # count was 12,853 but only 2,808 were live — a "12,853 jobs scored"
+    # status landing the user on a list of ~2,808. (The list additionally
+    # applies the off-family gate + per-user score floor; those are
+    # smaller, per-user refinements left as a follow-up — this closes the
+    # dominant liveness gap.)
+    #
     # ``head=True`` → PostgREST issues a HEAD, returning only the
-    # Content-Range count and *zero* rows. Without it this GET shipped a
-    # full page of matching ``id`` rows (PostgREST's db-max-rows cap =
-    # 1,000 on prod, measured) back to the API just to read one integer
-    # from the count header, then discarded them — a wire/serialization
-    # read-amplification. The count itself is an index-only scan on
-    # ``idx_jts_target_score (target_id, excluded, …)`` (~24ms on the
-    # heaviest target's 12,853 rows), so no new index is needed; the fix
-    # is purely to stop shipping the rows.
+    # Content-Range count and *zero* rows (not the up-to-1,000-row page a
+    # GET would ship just to read one integer, then discard). The
+    # ``job_is_live AND NOT excluded`` predicate matches the
+    # ``idx_scores_live_dedup`` partial index, so this stays an index-only
+    # count (no rows, no new index).
     count_resp = (
         supabase.table("scores")
         .select("id", count=CountMethod.exact, head=True)
         .eq("target_id", target_id)
         .eq("excluded", False)
+        .eq("job_is_live", True)
         .execute()
     )
     jobs_count = count_resp.count or 0

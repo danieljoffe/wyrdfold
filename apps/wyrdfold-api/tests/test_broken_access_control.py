@@ -205,8 +205,9 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(crud, "get", lambda *_a, **_kw: target)
 
     supabase = MagicMock()
+    # Count chain: .select(count).eq(target_id).eq(excluded).eq(job_is_live)
     (
-        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value.count
+        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value.count
     ) = 3
 
     from app.main import app
@@ -233,6 +234,13 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
         ]
         assert count_selects, "expected a count=exact select on the status path"
         assert all(c.kwargs.get("head") is True for c in count_selects)
+        # And it must gate ``job_is_live`` so the count reflects the live
+        # list, not the raw not-excluded scored count (which over-reports
+        # ~4.5x with archived jobs — 12,853 vs 2,808 on the heaviest target).
+        live_eq = (
+            supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq
+        )
+        live_eq.assert_called_with("job_is_live", True)
     finally:
         app.dependency_overrides.clear()
 

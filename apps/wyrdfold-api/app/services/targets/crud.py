@@ -5,6 +5,7 @@ thin wrappers over Supabase table operations that validate rows through
 Pydantic models on the way out.
 """
 
+import re
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -27,6 +28,22 @@ from app.models.targets import (
 TARGETS_TABLE = "targets"
 USER_TARGETS_TABLE = "user_targets"
 REF_JDS_TABLE = "reference_jds"
+
+_LABEL_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def normalize_label(label: str) -> str:
+    """Canonical dedup-key normalization for a target label.
+
+    Lowercase, trim, and collapse internal whitespace runs to a single space
+    — so "Senior Engineer" and "Senior  Engineer" normalize identically. This
+    is the **single source of truth** for the value stored in
+    ``targets.normalized_label`` and matched against it (``find_matching_target``
+    imports this), so the write path and the lookup path can never disagree.
+    It is exactly the key the ``targets_normalized_label_key`` UNIQUE
+    constraint enforces.
+    """
+    return _LABEL_WHITESPACE_RE.sub(" ", label.lower().strip())
 
 
 def _parse_target(row: dict[str, Any]) -> JobTarget:
@@ -130,8 +147,41 @@ def _parse_ref_jd(row: dict[str, Any]) -> TargetReferenceJD:
 # ---- Target CRUD -----------------------------------------------------------
 
 
+def get_by_normalized_label(
+    supabase: Client, normalized_label: str
+) -> JobTarget | None:
+    """Return the shared-catalog target for a normalized label, or None.
+
+    Exact match on ``normalized_label`` — the dedup key the
+    ``targets_normalized_label_key`` UNIQUE constraint enforces.
+    """
+    resp = (
+        supabase.table(TARGETS_TABLE)
+        .select("*")
+        .eq("normalized_label", normalized_label)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_target(rows[0]) if rows else None
+
+
 def create(supabase: Client, payload: TargetCreate) -> JobTarget:
-    normalized = payload.label.lower().strip()
+    """Find-or-create a shared-catalog target, keyed on ``normalized_label``.
+
+    The catalog is shared — one canonical row per role, ownership via
+    ``user_targets`` — so create is **idempotent** on the normalized label: an
+    existing row is returned unchanged rather than duplicated. This is the
+    low-level backstop that ``UNIQUE(normalized_label)`` (migration
+    20260717060000) made necessary — without it a raw ``POST /targets``, or a
+    race between the ``find_matching_target`` check and the insert in the
+    ``from_manual`` / ``from_suggestion`` create-or-link paths, would surface a
+    23505 as a 500. Routing the insert through an on-conflict upsert makes it
+    race-safe: concurrent creators converge on the one committed row. The
+    richer exact+fuzzy dedup still lives in the higher-level paths; here we
+    align exactly with the DB constraint (exact ``normalized_label``).
+    """
+    normalized = normalize_label(payload.label)
     row: dict[str, Any] = {
         "label": payload.label,
         "description": payload.description,
@@ -139,11 +189,23 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
         "scoring_profile": payload.scoring_profile.model_dump(),
         "search_keywords": payload.search_keywords,
     }
-    resp = supabase.table(TARGETS_TABLE).insert(row).execute()
+    # Insert unless the normalized label already exists; ignore_duplicates
+    # skips (never overwrites) the existing canonical row.
+    resp = (
+        supabase.table(TARGETS_TABLE)
+        .upsert(row, on_conflict="normalized_label", ignore_duplicates=True)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        raise RuntimeError("Failed to insert targets row")
-    return _parse_target(rows[0])
+    if rows:
+        return _parse_target(rows[0])  # freshly inserted
+    # Conflict → the row already existed (a prior create, or a concurrent
+    # writer that has committed by the time our ignore-duplicates upsert
+    # returned). Return the canonical row rather than a 500.
+    existing = get_by_normalized_label(supabase, normalized)
+    if existing is not None:
+        return existing
+    raise RuntimeError("Failed to insert or locate targets row")
 
 
 def get(supabase: Client, target_id: str) -> JobTarget | None:
@@ -212,7 +274,7 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
         updates["label"] = payload.label
-        updates["normalized_label"] = payload.label.lower().strip()
+        updates["normalized_label"] = normalize_label(payload.label)
     if payload.description is not None:
         updates["description"] = payload.description
     if payload.scoring_profile is not None:
