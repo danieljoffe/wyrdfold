@@ -13,6 +13,8 @@ from collections.abc import Callable
 import pytest
 from supabase import Client
 
+pytestmark = pytest.mark.integration
+
 
 def test_entitlement_columns_immutable_to_user(
     service_client: Client,

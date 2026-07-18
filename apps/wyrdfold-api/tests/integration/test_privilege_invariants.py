@@ -53,18 +53,12 @@ _PSQL_BIN = shutil.which("psql")
 # --- Allowlists (the INTENTIONAL exceptions) --------------------------------
 
 # SECURITY DEFINER functions in `public` that MAY be executed by
-# `authenticated`. These are the #6 R2 hardened score-write path: each body
-# gates on `auth.uid()` (see 20260621140000 / 20260621150000 /
-# 20260629120000), so an authenticated caller can only touch its own rows.
-# Matched by proname only (args are asserted-stable in practice; keeping this
-# name-based keeps the allowlist readable). NOTHING may be anon-executable.
-AUTHENTICATED_EXECUTABLE_DEFINER_FNS: frozenset[str] = frozenset(
-    {
-        "user_upsert_score",
-        "user_apply_score_blend",
-        "user_set_scores_included",
-    }
-)
+# `authenticated`. SEC-H2 (audit 2026-07-18): the #6 R2 score-write RPCs were
+# the only entries; they are now service_role-only (a follower of a shared,
+# ownerless target could otherwise vandalise its scores via direct PostgREST),
+# so this allowlist is EMPTY — no public DEFINER function is
+# authenticated-executable. NOTHING may be anon-executable either.
+AUTHENTICATED_EXECUTABLE_DEFINER_FNS: frozenset[str] = frozenset()
 
 # Tables documented + coded as service-role-only (no per-user owner column;
 # reached only through the service-role client, which bypasses RLS). They must
@@ -209,25 +203,26 @@ def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None
     )
 
 
-def test_guard_actually_sees_the_allowlisted_rpcs(_require_db: None) -> None:
-    """Sanity: the R2 RPCs really ARE authenticated-executable in the reset DB.
-
-    Without this, the allowlist test would vacuously pass if the RPCs were
-    dropped/renamed — the guard would be pinning nothing. This proves the query
-    finds them.
+def test_score_rpcs_are_service_role_executable(_require_db: None) -> None:
+    """SEC-H2: the score-write DEFINER RPCs are now service_role-only. Prove the
+    query machinery finds them (so the empty-allowlist invariant test isn't
+    pinning nothing) AND that they still exist as service_role-executable
+    definer functions — i.e. the lockdown revoked `authenticated` without
+    dropping/renaming them out from under the backend.
     """
     rows = _psql(
         """
         SELECT p.proname
         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'public' AND p.prosecdef
-          AND has_function_privilege('authenticated', p.oid, 'EXECUTE')
+          AND has_function_privilege('service_role', p.oid, 'EXECUTE')
         ORDER BY p.proname;
         """
     )
     assert rows is not None
     executable = {r for r in rows.splitlines() if r}
-    assert AUTHENTICATED_EXECUTABLE_DEFINER_FNS.issubset(executable), (
-        "Expected the R2 score-write RPCs to be authenticated-executable but "
-        f"some are missing: {sorted(AUTHENTICATED_EXECUTABLE_DEFINER_FNS - executable)}"
+    expected = {"user_upsert_score", "user_apply_score_blend", "user_set_scores_included"}
+    assert expected.issubset(executable), (
+        "Score-write RPCs must remain service_role-executable definer fns: "
+        f"missing {sorted(expected - executable)}"
     )
