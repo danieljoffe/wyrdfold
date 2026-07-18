@@ -14,6 +14,8 @@ from collections.abc import Callable
 import pytest
 from supabase import Client
 
+pytestmark = pytest.mark.integration
+
 
 def _is_permission_denied(err: pytest.ExceptionInfo[Exception]) -> bool:
     s = str(err.value).lower()

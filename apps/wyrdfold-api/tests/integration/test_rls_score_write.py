@@ -1,11 +1,16 @@
-"""RLS / authz gate for the user-facing scores write (#6 R2).
+"""RLS / authz gate for the shared-catalog scores writes.
 
 `scores` is the shared catalog and has no write policy, so a user JWT can't
-touch it directly. The analysis-blend write goes through the
-`user_apply_score_blend` SECURITY DEFINER RPC, which re-checks target
-ownership against `auth.uid()` in the DB. These prove that gate end-to-end:
-a follower can blend their target's score, a non-follower is rejected by the
-RPC, and the service-role (poller/operator, auth.uid() NULL) is exempt.
+touch it directly. The writes go through the `user_upsert_score` /
+`user_set_scores_included` / `user_apply_score_blend` SECURITY DEFINER RPCs.
+
+SEC-H2 (audit 2026-07-18): those RPCs are now **service_role-only** — even a
+follower can no longer call them directly (a follower of a shared, ownerless
+target could otherwise vandalise its scores for every co-follower). Ownership
+is scoped by the backend in Python; these prove the backend (service_role)
+path writes correctly while an authenticated user is blocked. The
+authenticated-is-blocked invariant across all three is also covered in
+`test_score_rpc_lockdown`.
 """
 
 from __future__ import annotations
@@ -102,72 +107,6 @@ def _score(service_client: Client, job_id: str, target_id: str) -> int:
     return int(rows[0]["score"])
 
 
-def test_follower_can_blend_their_targets_score(
-    seeded_for_blend: tuple[str, str, str, str, str, str],
-    service_client: Client,
-    user_client_factory: Callable[[str], Client],
-) -> None:
-    uid_a, _uid_b, job_id, target_a, _target_b, analysis_id = seeded_for_blend
-
-    user_client_factory(uid_a).rpc(
-        "user_apply_score_blend",
-        {
-            "p_job_posting_id": job_id,
-            "p_target_id": target_a,
-            "p_score": 88,
-            "p_analysis_id": analysis_id,
-        },
-    ).execute()
-
-    assert _score(service_client, job_id, target_a) == 88
-
-
-def test_non_follower_is_rejected_by_the_rpc(
-    seeded_for_blend: tuple[str, str, str, str, str, str],
-    service_client: Client,
-    user_client_factory: Callable[[str], Client],
-) -> None:
-    _uid_a, uid_b, job_id, target_a, _target_b, analysis_id = seeded_for_blend
-
-    # User B does NOT follow target_a — the DEFINER RPC's in-body auth.uid()
-    # check must reject this even though the function runs as owner.
-    with pytest.raises(APIError):
-        user_client_factory(uid_b).rpc(
-            "user_apply_score_blend",
-            {
-                "p_job_posting_id": job_id,
-                "p_target_id": target_a,
-                "p_score": 1,
-                "p_analysis_id": analysis_id,
-            },
-        ).execute()
-
-    assert _score(service_client, job_id, target_a) == 50, "non-follower mutated a shared score"
-
-
-def test_service_role_is_exempt(
-    seeded_for_blend: tuple[str, str, str, str, str, str],
-    service_client: Client,
-) -> None:
-    # service-role (auth.uid() NULL) is the poller/operator path — exempt.
-    _uid_a, _uid_b, job_id, target_a, _target_b, analysis_id = seeded_for_blend
-
-    service_client.rpc(
-        "user_apply_score_blend",
-        {
-            "p_job_posting_id": job_id,
-            "p_target_id": target_a,
-            "p_score": 77,
-            "p_analysis_id": analysis_id,
-        },
-    ).execute()
-
-    assert _score(service_client, job_id, target_a) == 77
-
-
-# --- R2 step 2: manual-add scores write RPCs -------------------------------
-
-
 def _row(job_id: str, target_id: str, score: int) -> dict:
     return {
         "job_posting_id": job_id,
@@ -183,46 +122,63 @@ def _row(job_id: str, target_id: str, score: int) -> dict:
     }
 
 
-def test_user_upsert_score_enforces_ownership(
+def test_blend_is_service_role_only(
     seeded_for_blend: tuple[str, str, str, str, str, str],
     service_client: Client,
     user_client_factory: Callable[[str], Client],
 ) -> None:
-    uid_a, uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
-
-    # Follower upserts their own target's score.
-    user_client_factory(uid_a).rpc(
-        "user_upsert_score", {"p_row": _row(job_id, target_a, 70)}
-    ).execute()
-    assert _score(service_client, job_id, target_a) == 70
-
-    # Non-follower (B doesn't follow target_a) is rejected by the RPC.
+    """SEC-H2: even a follower can't call user_apply_score_blend directly; the
+    backend (service_role) still writes."""
+    uid_a, _uid_b, job_id, target_a, _target_b, analysis_id = seeded_for_blend
+    args = {
+        "p_job_posting_id": job_id,
+        "p_target_id": target_a,
+        "p_score": 88,
+        "p_analysis_id": analysis_id,
+    }
     with pytest.raises(APIError):
-        user_client_factory(uid_b).rpc(
-            "user_upsert_score", {"p_row": _row(job_id, target_a, 5)}
-        ).execute()
-    assert _score(service_client, job_id, target_a) == 70
+        user_client_factory(uid_a).rpc("user_apply_score_blend", args).execute()
+    assert _score(service_client, job_id, target_a) == 50, "follower must be blocked"
+
+    service_client.rpc("user_apply_score_blend", args).execute()
+    assert _score(service_client, job_id, target_a) == 88
 
 
-def test_user_set_scores_included_enforces_ownership(
+def test_upsert_score_is_service_role_only(
     seeded_for_blend: tuple[str, str, str, str, str, str],
     service_client: Client,
     user_client_factory: Callable[[str], Client],
 ) -> None:
-    uid_a, uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
+    """SEC-H2: user_upsert_score is service_role-only; the backend writes."""
+    uid_a, _uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
+    with pytest.raises(APIError):
+        user_client_factory(uid_a).rpc(
+            "user_upsert_score", {"p_row": _row(job_id, target_a, 70)}
+        ).execute()
+    assert _score(service_client, job_id, target_a) == 50, "follower must be blocked"
+
+    service_client.rpc("user_upsert_score", {"p_row": _row(job_id, target_a, 70)}).execute()
+    assert _score(service_client, job_id, target_a) == 70
+
+
+def test_set_scores_included_is_service_role_only(
+    seeded_for_blend: tuple[str, str, str, str, str, str],
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+) -> None:
+    """SEC-H2: user_set_scores_included is service_role-only; the backend writes."""
+    uid_a, _uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
     service_client.table("scores").update({"excluded": True}).eq(
         "job_posting_id", job_id
     ).eq("target_id", target_a).execute()
 
-    # Non-follower can't force-include.
     with pytest.raises(APIError):
-        user_client_factory(uid_b).rpc(
+        user_client_factory(uid_a).rpc(
             "user_set_scores_included",
             {"p_job_posting_id": job_id, "p_target_ids": [target_a]},
         ).execute()
 
-    # Follower can.
-    user_client_factory(uid_a).rpc(
+    service_client.rpc(
         "user_set_scores_included",
         {"p_job_posting_id": job_id, "p_target_ids": [target_a]},
     ).execute()
