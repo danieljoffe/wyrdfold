@@ -2285,11 +2285,15 @@ async def add_manual_job(
         else:
             active_targets = await asyncio.to_thread(get_active_target, supabase)
         parsed = parse_jd(description_html)
+        # Score against the caller's OWN active_targets (scoped above), writing
+        # through the gated user_upsert_score RPC on the SERVICE-ROLE client
+        # (SEC-H2): that RPC is now service_role-only, and the ownership scope
+        # is the active_targets set, not a per-call follower check.
         results = await asyncio.gather(
             *[
                 asyncio.to_thread(
                     target_score_and_upsert,
-                    caller_supabase,
+                    supabase,
                     job_posting_id=posting_id,
                     title=title,
                     description_html=description_html,
@@ -2333,7 +2337,10 @@ async def add_manual_job(
         if scored_target_ids:
             try:
                 await asyncio.to_thread(
-                    lambda: caller_supabase.rpc(
+                    # SEC-H2: service-role client — user_set_scores_included is
+                    # now service_role-only; the target ids are the caller's own
+                    # active_targets (scoped above).
+                    lambda: supabase.rpc(
                         "user_set_scores_included",
                         {
                             "p_job_posting_id": posting_id,

@@ -9,6 +9,7 @@ metadata range. IPv6 literals and bare IPv4 literals are blocked at the
 format layer. (Phase 5 P0-Sec-3.)
 """
 
+import asyncio
 import ipaddress
 import logging
 import re
@@ -289,8 +290,11 @@ async def validate_job_url(url: str) -> ValidationResult:
         )
 
     # SSRF defense: refuse to fetch URLs that resolve to internal IPs.
+    # ``assert_safe_host`` calls the blocking ``socket.getaddrinfo`` — run it in
+    # a thread so a slow DNS lookup can't stall the single poll event loop
+    # (PERF-H3: this validation fans out over every discovered row).
     try:
-        assert_safe_host(hostname)
+        await asyncio.to_thread(assert_safe_host, hostname)
     except ValueError as exc:
         return ValidationResult(
             is_valid=False,
@@ -331,7 +335,7 @@ async def validate_job_url(url: str) -> ValidationResult:
                         ),
                     )
                 try:
-                    assert_safe_host(hop_host)
+                    await asyncio.to_thread(assert_safe_host, hop_host)
                 except ValueError as exc:
                     return ValidationResult(
                         is_valid=False,
@@ -378,7 +382,7 @@ async def validate_job_url(url: str) -> ValidationResult:
 
                 # Defense-in-depth SSRF re-check on the final host.
                 try:
-                    assert_safe_host(final_hostname)
+                    await asyncio.to_thread(assert_safe_host, final_hostname)
                 except ValueError as exc:
                     return ValidationResult(
                         is_valid=False,

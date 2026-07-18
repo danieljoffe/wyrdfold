@@ -114,9 +114,11 @@ class TestManualJobEndpoint:
         assert row["score"] >= 0
 
     @pytest.mark.asyncio
-    async def test_manual_add_scores_through_gated_caller_client(self, monkeypatch):
-        """#6 R2 step 2: a JWT user's manual-add scores their target via the
-        gated RPCs on the caller's client, not a direct service-role write."""
+    async def test_manual_add_scores_through_gated_service_client(self, monkeypatch):
+        """SEC-H2: a JWT user's manual-add scores their (Python-scoped) active
+        targets via the gated RPCs on the SERVICE-ROLE client — those RPCs are
+        now service_role-only, and the user/caller client is never used for the
+        gated writes (nor a direct service-role scores UPDATE)."""
         _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML)
 
         from datetime import UTC, datetime
@@ -163,12 +165,15 @@ class TestManualJobEndpoint:
         )
 
         assert result.posting_id == "posting-uuid-r2"
-        # Per-target scoring ran on the caller's client, gated.
-        assert captured["score_client"] is mock_caller
+        # Per-target scoring ran on the SERVICE-ROLE client, gated (SEC-H2).
+        assert captured["score_client"] is mock_service
         assert captured["gated"] is True
-        # Force-include went through the gated RPC on the caller's client.
-        rpc_names = [c.args[0] for c in mock_caller.rpc.call_args_list]
+        # Force-include went through the gated RPC on the service-role client,
+        # NOT the user/caller client.
+        rpc_names = [c.args[0] for c in mock_service.rpc.call_args_list]
         assert "user_set_scores_included" in rpc_names
+        caller_rpc_names = [c.args[0] for c in mock_caller.rpc.call_args_list]
+        assert "user_set_scores_included" not in caller_rpc_names
 
     @pytest.mark.asyncio
     async def test_user_overrides(self, monkeypatch):

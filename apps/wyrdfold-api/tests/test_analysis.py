@@ -748,12 +748,13 @@ async def test_router_missing_target_returns_404(
         app.dependency_overrides.clear()
 
 
-async def test_router_blend_writes_score_via_caller_rpc(
+async def test_router_blend_writes_score_via_service_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#6 R2: the scores blend is written via the user_apply_score_blend
-    SECURITY DEFINER RPC on the caller's client — not a direct service-role
-    scores update."""
+    """SEC-H2: the scores blend is written via the user_apply_score_blend
+    SECURITY DEFINER RPC on the SERVICE-ROLE client — the RPC is now
+    service_role-only (ownership gated upstream in create_analysis), never on
+    the user/caller client, and not a direct scores UPDATE."""
     cached_record = JobAnalysisRecord.model_validate(_analysis_record_row())
     monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: cached_record)
 
@@ -781,13 +782,14 @@ async def test_router_blend_writes_score_via_caller_rpc(
     try:
         resp = TestClient(app).post("/analysis/job-1?target_id=tgt-1")
         assert resp.status_code == 200
-        # Gated write goes through the RPC on the caller client...
-        caller.rpc.assert_called_once()
-        assert caller.rpc.call_args[0][0] == "user_apply_score_blend"
-        rpc_args = caller.rpc.call_args[0][1]
+        # Gated blend goes through the RPC on the SERVICE-ROLE client (SEC-H2)...
+        supabase.rpc.assert_called_once()
+        assert supabase.rpc.call_args[0][0] == "user_apply_score_blend"
+        rpc_args = supabase.rpc.call_args[0][1]
         assert rpc_args["p_job_posting_id"] == "job-1"
         assert rpc_args["p_target_id"] == "tgt-1"
-        # ...not via a direct service-role scores UPDATE.
+        # ...never on the user/caller client, and not a direct scores UPDATE.
+        caller.rpc.assert_not_called()
         supabase.table.return_value.update.assert_not_called()
     finally:
         app.dependency_overrides.clear()

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from supabase import Client
 
 from app.models.targets import TargetCreate
 from app.services.targets import crud
+
+pytestmark = pytest.mark.integration
 
 
 def test_crud_create_is_idempotent_find_or_create(service_client: Client) -> None:
