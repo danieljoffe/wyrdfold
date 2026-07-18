@@ -464,7 +464,8 @@ async def _sms_count_today(supabase: Client, profile_id: str) -> int:
     resp = await asyncio.to_thread(
         lambda: (
             supabase.table("notifications_sent")
-            .select("id", count="exact")  # type: ignore[arg-type]
+            # head=True → count only, no rows shipped (HEAD request).
+            .select("id", count="exact", head=True)  # type: ignore[arg-type]
             .eq("user_profile_id", profile_id)
             .eq("channel", "sms")
             .gte("sent_at", today)

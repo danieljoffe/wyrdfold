@@ -1173,9 +1173,18 @@ def get_target_status(
     # a "ready, 3 jobs scored" status that landed the user on a list
     # showing 1, with the other 2 silently filtered out for being
     # off-target.
+    # ``head=True`` → PostgREST issues a HEAD, returning only the
+    # Content-Range count and *zero* rows. Without it this GET shipped a
+    # full page of matching ``id`` rows (PostgREST's db-max-rows cap =
+    # 1,000 on prod, measured) back to the API just to read one integer
+    # from the count header, then discarded them — a wire/serialization
+    # read-amplification. The count itself is an index-only scan on
+    # ``idx_jts_target_score (target_id, excluded, …)`` (~24ms on the
+    # heaviest target's 12,853 rows), so no new index is needed; the fix
+    # is purely to stop shipping the rows.
     count_resp = (
         supabase.table("scores")
-        .select("id", count=CountMethod.exact)
+        .select("id", count=CountMethod.exact, head=True)
         .eq("target_id", target_id)
         .eq("excluded", False)
         .execute()
