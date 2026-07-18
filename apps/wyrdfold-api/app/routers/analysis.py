@@ -126,7 +126,7 @@ async def create_analysis(
         # the row already has the blended score.
         await asyncio.to_thread(
             _apply_llm_blend,
-            caller_supabase,
+            supabase,
             job_posting_id=job_id,
             target_id=target_id,
             scorecard=cached.scorecard,
@@ -215,7 +215,7 @@ async def create_analysis(
     # ``/jobs?target_id=...`` ordering.
     await asyncio.to_thread(
         _apply_llm_blend,
-        caller_supabase,
+        supabase,
         job_posting_id=job_id,
         target_id=target_id,
         scorecard=analysis.scorecard,
@@ -226,7 +226,7 @@ async def create_analysis(
 
 
 def _apply_llm_blend(
-    caller_supabase: Client,
+    supabase: Client,
     *,
     job_posting_id: str,
     target_id: str,
@@ -235,19 +235,17 @@ def _apply_llm_blend(
 ) -> None:
     """Blend the LLM scorecard into the per-target ``scores`` row.
 
-    Reads the current keyword score (shared-readable: ``scores`` is
-    SELECT-true for ``authenticated``), blends with the LLM numeric, then
-    writes back score + scoring_status='complete' via the
-    ``user_apply_score_blend`` SECURITY DEFINER RPC (#6 R2) — both on the
-    caller's client, so Postgres re-checks that the caller follows
-    ``target_id`` before touching the shared row (a service-role/operator
-    caller is exempt). The Python ownership gate in ``create_analysis`` stays
-    for the 404 UX; this is the DB-level backstop. Best-effort: failures are
-    swallowed so an LLM blend hiccup doesn't fail the user's request.
+    Reads the current keyword score (shared-readable), blends with the LLM
+    numeric, then writes back score + scoring_status='complete' via the
+    ``user_apply_score_blend`` SECURITY DEFINER RPC. SEC-H2: that RPC is now
+    service_role-only, so this runs on the **service-role** client; ownership
+    is enforced upstream by ``create_analysis``'s gate (the caller must follow
+    ``target_id`` to reach here). Best-effort: failures are swallowed so an LLM
+    blend hiccup doesn't fail the user's request.
     """
     try:
         cur_resp = (
-            caller_supabase.table("scores")
+            supabase.table("scores")
             .select("score")
             .eq("job_posting_id", job_posting_id)
             .eq("target_id", target_id)
@@ -260,7 +258,7 @@ def _apply_llm_blend(
         blended = blend_scores(keyword_score, llm_score)
         # Gated write: updates the shared (job, target) scores row + stamps
         # jobs.llm_analysis_id behind an ownership check enforced in Postgres.
-        caller_supabase.rpc(
+        supabase.rpc(
             "user_apply_score_blend",
             {
                 "p_job_posting_id": job_posting_id,
