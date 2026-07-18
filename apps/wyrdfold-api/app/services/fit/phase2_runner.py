@@ -61,9 +61,11 @@ PHASE2_BATCH_SIZE = 50
 # 50 sockets at once — mirrors the poller's LLM_CONCURRENCY for Stage 3.
 PHASE2_CONCURRENCY = 3
 
-# Chunk size for the scores-state lookup IN-query (mirrors the sizing in
-# target_scoring / recency so the request stays under PostgREST limits).
-_STATE_CHUNK_SIZE = 500
+# Chunk size for the scores-state lookup IN-query. Mirrors target_scoring's
+# _BATCH_CHUNK_SIZE (100): a larger ``.in_`` overruns PostgREST's ~150-id
+# URL-safe bound and 414s (the previous value, 500, did — despite this
+# comment's claim that it stayed under the limit).
+_STATE_CHUNK_SIZE = 100
 
 
 def _needs_phase2(
