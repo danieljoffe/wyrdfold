@@ -197,6 +197,89 @@ class TestSsrfHostCheck:
         )
         assert_safe_host("public.example")  # no exception
 
+    def test_cgnat_shared_address_space_blocked(self, monkeypatch):
+        """SEC-L1: CGNAT / RFC 6598 shared address space (100.64.0.0/10) is
+        neither private nor reserved, so the pre-fix predicate waved it through
+        — a blind-SSRF oracle on deployments where 100.64/10 is routable. The
+        `not is_global` predicate now rejects the whole /10 (both boundaries +
+        interior)."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        for ip in ("100.64.0.0", "100.100.50.1", "100.127.255.255"):
+            monkeypatch.setattr(
+                v, "_resolve_addresses", lambda _h, _c=ip: [ipaddress.ip_address(_c)]
+            )
+            with pytest.raises(ValueError, match="disallowed"):
+                assert_safe_host(f"cgnat-{ip}")
+
+    def test_ipv4_mapped_cgnat_blocked(self, monkeypatch):
+        """The IPv4-mapped form ::ffff:100.64.x.x must be blocked too."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        monkeypatch.setattr(
+            v,
+            "_resolve_addresses",
+            lambda _h: [ipaddress.ip_address("::ffff:100.64.0.1")],
+        )
+        with pytest.raises(ValueError, match="disallowed"):
+            assert_safe_host("mapped-cgnat")
+
+    def test_real_public_hosts_still_pass(self, monkeypatch):
+        """Over-block guard: `not is_global` must let every genuinely public
+        host through — v4, v6, IPv4-mapped v6, and the addresses immediately
+        OUTSIDE 100.64/10 — or it would break legitimate URL validation."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        public = [
+            "8.8.8.8",  # Google DNS
+            "1.1.1.1",  # Cloudflare
+            "142.250.72.14",  # google.com
+            "13.107.42.14",  # public Azure
+            "151.101.0.1",  # Fastly
+            "100.63.255.255",  # just BELOW 100.64/10 — public, must pass
+            "100.128.0.0",  # just ABOVE 100.64/10 — public, must pass
+            "2001:4860:4860::8888",  # Google DNS v6
+            "::ffff:8.8.8.8",  # IPv4-mapped public
+        ]
+        for ip in public:
+            monkeypatch.setattr(
+                v, "_resolve_addresses", lambda _h, _c=ip: [ipaddress.ip_address(_c)]
+            )
+            assert_safe_host(f"public-{ip}")  # must NOT raise
+
+    def test_is_disallowed_address_classification(self):
+        """Direct predicate unit check pinning the 100.64/10 boundaries:
+        100.63.255.255 (out) allowed, 100.64.0.0 + 100.127.255.255 (in)
+        blocked, 100.128.0.0 (out) allowed — plus the classic SSRF ranges."""
+        import ipaddress
+
+        blocked = [
+            "100.64.0.0",
+            "100.127.255.255",
+            "169.254.169.254",
+            "10.0.0.1",
+            "::1",
+            "fc00::1",
+            "::ffff:100.64.0.1",
+        ]
+        allowed = [
+            "100.63.255.255",
+            "100.128.0.0",
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+        ]
+        for ip in blocked:
+            assert _is_disallowed_address(ipaddress.ip_address(ip)) is True, ip
+        for ip in allowed:
+            assert _is_disallowed_address(ipaddress.ip_address(ip)) is False, ip
+
     def test_any_disallowed_in_set_blocks(self, monkeypatch):
         """If hostname returns multiple A records and any is disallowed,
         reject — defense against split DNS / load-balanced rebinding."""
