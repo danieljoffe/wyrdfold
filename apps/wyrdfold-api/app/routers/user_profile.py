@@ -526,7 +526,8 @@ async def get_llm_usage(
         def _analysis_used() -> int:
             return (
                 supabase.table("llm_costs")
-                .select("id", count="exact")  # type: ignore[arg-type]
+                # head=True → count only, no rows shipped (HEAD request).
+                .select("id", count="exact", head=True)  # type: ignore[arg-type]
                 .eq("user_id", user_id)
                 .eq("purpose", DEFAULT_PURPOSE)
                 .gte("created_at", day_since.isoformat())

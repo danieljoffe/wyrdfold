@@ -340,7 +340,8 @@ def check_daily_count(
     since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
     used = (
         supabase.table("llm_costs")
-        .select("id", count="exact")  # type: ignore[arg-type]
+        # head=True → count only, no rows shipped (HEAD request).
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
         .eq("user_id", user_id)
         .eq("purpose", purpose)
         .gte("created_at", since)

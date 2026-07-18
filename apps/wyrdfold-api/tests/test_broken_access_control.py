@@ -222,6 +222,17 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
         resp = tc.get("/targets/any-target/status")
         assert resp.status_code == 200
         assert resp.json()["jobs_count"] == 3
+        # Regression guard: the count read must pass head=True so PostgREST
+        # returns only the count (HEAD), never the up-to-~13k id rows it
+        # would otherwise ship and the endpoint discards. Assert every
+        # count=exact select on this path carried head=True.
+        count_selects = [
+            c
+            for c in supabase.table.return_value.select.call_args_list
+            if "count" in c.kwargs
+        ]
+        assert count_selects, "expected a count=exact select on the status path"
+        assert all(c.kwargs.get("head") is True for c in count_selects)
     finally:
         app.dependency_overrides.clear()
 
