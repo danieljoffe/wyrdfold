@@ -1,0 +1,22 @@
+-- Enforce shared-catalog dedup at the database layer.
+--
+-- `targets` is a SHARED catalog: there is no owner column on the row (a
+-- user links to a target via the `user_targets` junction), so one target
+-- row is a single canonical role definition shared by everyone who links
+-- it. Two rows with the same `normalized_label` therefore fragment the
+-- catalog — duplicate "senior backend engineer" targets, each carrying its
+-- own scores + discovery — which is never desired.
+--
+-- Dedup was enforced only in application code (the create-or-link paths in
+-- `from_manual` / `from_suggestion`); a raw `POST /targets` (crud.create)
+-- bypassed it and could still insert a duplicate. This adds the missing DB
+-- backstop.
+--
+-- `normalized_label` is already the app's dedup key (lowercased/trimmed at
+-- write time), so a plain UNIQUE on the stored value matches the code's
+-- lookup exactly. The column is nullable and Postgres treats NULLs as
+-- distinct under UNIQUE, so unlabeled targets are unaffected (they may
+-- coexist). Verified dup-free before shipping: prod = 8 rows / 8 distinct
+-- labels / 0 NULLs, so the constraint applies without a backfill.
+ALTER TABLE public.targets
+  ADD CONSTRAINT targets_normalized_label_key UNIQUE (normalized_label);
