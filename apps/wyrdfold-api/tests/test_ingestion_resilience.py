@@ -319,6 +319,40 @@ async def test_health_alerts_on_mass_disable(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_source_counts_use_head_true(monkeypatch) -> None:
+    """Regression (M9): the two source-count reads must pass ``head=True``.
+
+    Without it, ``count="exact"`` ships every matching ``sources.id`` row in
+    the body just to read one integer from the Content-Range header — and the
+    ``sources`` catalog grows with every discovered company, so each health
+    tick would transfer thousands of rows twice for two integers.
+    """
+    monkeypatch.setattr(live_settings, "ingestion_health_check_enabled", True)
+    monkeypatch.setattr(live_settings, "ingestion_max_job_age_hours", 48)
+    monkeypatch.setattr(live_settings, "ingestion_mass_disable_ratio", 0.5)
+
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    fresh = (now - timedelta(hours=1)).isoformat()
+    sb = _health_supabase(newest_created_at=fresh, total=10, disabled=2)
+
+    report = await health_mod.check_ingestion_health(sb, now=now)
+
+    # Counts still read correctly (from the Content-Range header, .count).
+    assert report.total_sources == 10
+    assert report.disabled_sources == 2
+
+    sources_table = sb.table("sources")
+    count_selects = [
+        call
+        for call in sources_table.select.call_args_list
+        if call.kwargs.get("count") == "exact"
+    ]
+    # Exactly the total + disabled source counts, both HEAD-only.
+    assert len(count_selects) == 2
+    assert all(call.kwargs.get("head") is True for call in count_selects)
+
+
+@pytest.mark.asyncio
 async def test_health_quiet_when_healthy(monkeypatch) -> None:
     """Negative control: fresh jobs + few disabled sources → no alert."""
     monkeypatch.setattr(live_settings, "ingestion_health_check_enabled", True)
