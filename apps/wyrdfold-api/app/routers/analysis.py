@@ -181,8 +181,10 @@ async def create_analysis(
         target_context=target_context,
     )
 
-    # 6. Log cost
-    cost_log.record(
+    # 6. Log cost — sync supabase helper, so offload the round-trip off the loop
+    # in this async handler (audit 2026-07-18 PERF-M).
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=DEFAULT_PURPOSE,

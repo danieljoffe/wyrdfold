@@ -318,7 +318,7 @@ async def create_target_from_manual(
     BackgroundTask (new targets start in ``deriving`` status). The user
     always ends up with a ``user_targets`` row.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if doc is None:
         # 422 (Unprocessable Entity): the route exists and the request is
         # well-formed, but a business precondition (an experience profile
@@ -369,7 +369,7 @@ async def create_target_from_suggestion(
     profile can still create a target from a role search — the query is the
     signal. Only the per-user fit score is deferred-and-skipped when absent.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     payload = doc.payload if doc is not None else None
     return await from_input.from_suggestion(
         supabase,
@@ -406,7 +406,7 @@ async def create_target_from_url(
     score all run in a BackgroundTask (new targets start in ``deriving``
     status). The user is always linked.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(
@@ -454,13 +454,14 @@ async def suggest(
     Returns each suggestion paired with its matched target (if one exists)
     or flagged as new. Excludes targets the user already has.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
     matched, result = await suggest_and_match(supabase, llm, payload=doc.payload, user_id=user_id)
-    cost_log.record(
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=SUGGEST_PURPOSE,
@@ -493,7 +494,7 @@ async def suggest_lateral(
     confidence; the activation flow plugs them into
     ``derive_profile_from_label`` to materialise the full target.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if doc is None:
         raise HTTPException(status_code=422, detail="No experience profile found")
 
@@ -501,7 +502,7 @@ async def suggest_lateral(
     # don't re-suggest what they already have. list_for_user is
     # user-scoped (via user_targets junction), not the global active
     # list — exactly what we want for personalised suggestions.
-    current = crud.list_for_user(supabase, user_id=user_id)
+    current = await asyncio.to_thread(crud.list_for_user, supabase, user_id=user_id)
 
     try:
         suggestions, result = await suggest_lateral_targets(
@@ -517,7 +518,8 @@ async def suggest_lateral(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
         ) from None
-    cost_log.record(
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=LATERAL_PURPOSE,
@@ -556,7 +558,7 @@ async def suggest_from_query(
     requires a profile. Rate-limited a touch higher than ``/suggest`` (6/min)
     since it's an interactive search affordance, and LLM-budget-gated.
     """
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     payload = doc.payload if doc is not None else None
     try:
         matched, result = await suggest_and_match_from_query(
@@ -572,7 +574,8 @@ async def suggest_from_query(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
         ) from None
-    cost_log.record(
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=QUERY_SUGGEST_PURPOSE,
@@ -794,8 +797,10 @@ async def discover_sources_for_target_endpoint(
     # so it's only meaningful for the user's own targets — and we don't want
     # to let a JWT caller burn the global Brave quota on someone else's
     # search keywords.
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
+    await asyncio.to_thread(
+        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
+    )
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
@@ -1043,17 +1048,18 @@ async def link_target(
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Link the current user to a target and derive a fit score."""
-    target = crud.get(supabase, target_id)
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if doc is not None:
         fit_result, result = await derive_fit_score(llm, payload=doc.payload, target=target)
-        cost_log.record(
+        await asyncio.to_thread(
+            cost_log.record,
             supabase,
             user_id=user_id,
             purpose=FIT_SCORE_PURPOSE,
@@ -1064,7 +1070,8 @@ async def link_target(
         fit_reasoning = fit_result.reasoning
 
     try:
-        return crud.link_user_to_target(
+        return await asyncio.to_thread(
+            crud.link_user_to_target,
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -1101,7 +1108,7 @@ async def poll_jobs_for_target(
     unauthenticated caller can't trigger a fan-out poll across all
     configured ATS sources. Not reachable from the wyrdfold FE.
     """
-    target = crud.get(supabase, target_id)
+    target = await asyncio.to_thread(crud.get, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
     if not target.search_keywords:
@@ -1255,14 +1262,17 @@ async def create_target_from_posting(
     absolute_url: str | None = posting.get("absolute_url")
 
     # Create the target
-    target = crud.create(supabase, payload=TargetCreate(label=title))
+    target = await asyncio.to_thread(
+        crud.create, supabase, payload=TargetCreate(label=title)
+    )
 
     # Derive scoring profile from description if substantial
     jd_text = strip_html(description_html)
     if len(jd_text) >= 50:
         try:
             derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
-            cost_log.record(
+            await asyncio.to_thread(
+                cost_log.record,
                 supabase,
                 user_id=user_id,
                 purpose=DEFAULT_PURPOSE,
@@ -1274,7 +1284,8 @@ async def create_target_from_posting(
                 },
             )
 
-            crud.add_reference_jd(
+            await asyncio.to_thread(
+                crud.add_reference_jd,
                 supabase,
                 target_id=target.id,
                 jd_text=jd_text,
@@ -1283,7 +1294,8 @@ async def create_target_from_posting(
             )
 
             # Update target with the derived profile + search keywords
-            crud.update(
+            await asyncio.to_thread(
+                crud.update,
                 supabase,
                 target.id,
                 TargetUpdate(
@@ -1309,7 +1321,13 @@ async def create_target_from_posting(
     # user identity to link.
     if user_id is not None:
         try:
-            crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=True)
+            await asyncio.to_thread(
+                crud.link_user_to_target,
+                supabase,
+                user_id=user_id,
+                target_id=target.id,
+                is_active=True,
+            )
         except crud.ActiveTargetLimitError as e:
             raise HTTPException(
                 status_code=409,
@@ -1325,9 +1343,9 @@ async def create_target_from_posting(
             ) from e
         # Re-read the target row so the response carries the
         # trigger-synced ``is_active``.
-        refreshed = crud.get(supabase, target.id)
+        refreshed = await asyncio.to_thread(crud.get, supabase, target.id)
         return refreshed or target
-    activated = crud.set_active(supabase, target_id=target.id)
+    activated = await asyncio.to_thread(crud.set_active, supabase, target_id=target.id)
     return activated or target
 
 

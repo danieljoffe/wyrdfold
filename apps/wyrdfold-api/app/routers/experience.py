@@ -141,7 +141,7 @@ async def consolidate_prose(
     contain multiple near-identical resume copies. This pass merges them.
     The result is always a new version — the original stays in history.
     """
-    latest = prose.get_latest(supabase, user_id=user_id)
+    latest = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
     if latest is None:
         raise HTTPException(status_code=404, detail="no prose doc to consolidate")
 
@@ -157,7 +157,8 @@ async def consolidate_prose(
         }
         if fallback_reason is not None:
             metadata["fallback_reason"] = fallback_reason
-        cost_log.record(
+        await asyncio.to_thread(
+            cost_log.record,
             cost_supabase,
             user_id=user_id,
             purpose=consolidate.DEFAULT_PURPOSE,
@@ -179,7 +180,9 @@ async def consolidate_prose(
             fallback_reason=fallback_reason,
         )
 
-    new_doc = prose.create_version(supabase, user_id=user_id, content=consolidated)
+    new_doc = await asyncio.to_thread(
+        prose.create_version, supabase, user_id=user_id, content=consolidated
+    )
     return ProseConsolidateResponse(
         prose=new_doc,
         chars_before=len(latest.content),
@@ -258,7 +261,8 @@ async def upload_resume(
     upload_id = str(uuid.uuid4())
     file_ext = parsed.file_type
     try:
-        storage_path = upload_file(
+        storage_path = await asyncio.to_thread(
+            upload_file,
             supabase,
             user_id=user_id,
             upload_id=upload_id,
@@ -271,15 +275,18 @@ async def upload_resume(
         storage_path = ""
 
     # Merge into prose doc — semantic merge via LLM (#497).
-    existing = prose.get_latest(supabase, user_id=user_id)
+    existing = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
     merged, merge_result = await merge_into_prose(
         llm,
         existing_content=existing.content if existing else None,
         parsed=parsed,
     )
-    prose_doc = prose.create_version(supabase, user_id=user_id, content=merged)
+    prose_doc = await asyncio.to_thread(
+        prose.create_version, supabase, user_id=user_id, content=merged
+    )
     if merge_result is not None:
-        cost_log.record(
+        await asyncio.to_thread(
+            cost_log.record,
             supabase,
             user_id=user_id,
             purpose="experience.ingest_merge",
@@ -310,7 +317,8 @@ async def upload_resume(
         payload, result = await derive.derive_from_prose(
             llm, prose_text=prose_doc.content
         )
-        cost_log.record(
+        await asyncio.to_thread(
+            cost_log.record,
             supabase,
             user_id=user_id,
             purpose=derive.DEFAULT_PURPOSE,
@@ -320,7 +328,7 @@ async def upload_resume(
 
         # Carry forward annotations from previous doc and merge with any
         # the LLM extracted from inline prose comments this round (#499).
-        previous_opt = optimized.get_latest(supabase, user_id=user_id)
+        previous_opt = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
         carried = (
             annotations.validate_annotation_refs(
                 previous_opt.payload.annotations, payload
@@ -331,7 +339,8 @@ async def upload_resume(
         merged_annotations = annotations.merge_annotations(carried, payload.annotations)
         payload = payload.model_copy(update={"annotations": merged_annotations})
 
-        doc = optimized.create_version(
+        doc = await asyncio.to_thread(
+            optimized.create_version,
             supabase,
             user_id=user_id,
             payload=payload,
@@ -375,7 +384,8 @@ async def create_optimized(
     user_id: str = Depends(get_current_user_id),
     cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
 ) -> OptimizedDoc:
-    doc = optimized.create_version(
+    doc = await asyncio.to_thread(
+        optimized.create_version,
         supabase,
         user_id=user_id,
         payload=body.payload,
@@ -415,11 +425,11 @@ async def derive_optimized(
     otherwise. User-edited optimized docs (source="user_edit") never
     short-circuit; the user has explicitly asked to regenerate.
     """
-    prose_doc = prose.get_latest(supabase, user_id=user_id)
+    prose_doc = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
     if prose_doc is None:
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
-    previous = optimized.get_latest(supabase, user_id=user_id)
+    previous = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
     if (
         previous is not None
         and previous.prose_doc_id == prose_doc.id
@@ -431,7 +441,8 @@ async def derive_optimized(
         llm,
         prose_text=prose_doc.content,
     )
-    cost_log.record(
+    await asyncio.to_thread(
+        cost_log.record,
         cost_supabase,
         user_id=user_id,
         purpose=derive.DEFAULT_PURPOSE,
@@ -451,7 +462,8 @@ async def derive_optimized(
     merged = annotations.merge_annotations(carried, payload.annotations)
     payload = payload.model_copy(update={"annotations": merged})
 
-    doc = optimized.create_version(
+    doc = await asyncio.to_thread(
+        optimized.create_version,
         supabase,
         user_id=user_id,
         payload=payload,
