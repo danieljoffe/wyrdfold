@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.errors import LLMServiceError
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from app.services.qualification.heuristics import (
     clean_description,
@@ -318,10 +319,18 @@ async def tag_job(
 ) -> tuple[QualificationTags | None, LLMResult | None]:
     """Classify ONE job. Returns ``(tags, llm_result)``.
 
-    ``tags`` is ``None`` (and ``llm_result`` ``None``) on any LLM/parse/network
-    error — fail-soft so the caller leaves the row's qualification columns NULL
-    (not-yet-tagged) and a later poll re-attempts it. ``llm_result`` is returned
-    for cost logging on success.
+    ``tags`` is ``None`` (and ``llm_result`` ``None``) on a **row-specific**
+    failure (parse/validation/malformed content) — fail-soft so the caller
+    leaves the row's qualification columns NULL (not-yet-tagged) and a later
+    poll re-attempts it. ``llm_result`` is returned for cost logging on success.
+
+    A **provider-level** ``LLMServiceError`` (402 quota-exhausted, 429
+    rate-limited after the client's own retries, auth/upstream) is NOT a
+    property of this row — every other row this cycle will hit it too — so it
+    **propagates** instead of being swallowed, letting the poller latch its
+    fast-fail breaker and stop hammering a provider that's rejecting calls
+    (audit PERF-M "402/429 fast-fail"). This function's sole caller
+    (``poller._qualify_one_job``) handles it.
 
     ``model`` defaults to the configured ``settings.qualification_model``
     (Haiku, or deepseek-v3-2 when QUALIFICATION_MODEL selects it) — resolved
@@ -364,6 +373,11 @@ async def tag_job(
             max_tokens=1024,
             cache_system=True,
         )
+    except LLMServiceError:
+        # Provider-level failure (402/429/auth/upstream) — not this row's fault
+        # and not fail-soft-able: propagate so the poller can latch the
+        # fast-fail breaker instead of re-hitting a provider that's saying "no".
+        raise
     except Exception:
         logger.exception(
             "Qualification tagging failed for %r @ %r; leaving tags NULL",
