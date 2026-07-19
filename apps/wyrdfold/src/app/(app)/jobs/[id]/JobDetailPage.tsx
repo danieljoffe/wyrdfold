@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { ArrowLeft, ExternalLink } from 'lucide-react';
+import { ArrowLeft, ExternalLink, Trash2 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
@@ -278,15 +278,24 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         />
       </Card>
 
+      {/* Removing one posting is low-stakes and reversible-in-effect (it can
+          be re-added), so it gets the app's restrained destructive treatment —
+          an outline button with error-red text + a trash icon, matching the
+          Profile master-document Delete. Filled-red (`variant='error'`) is
+          reserved for the genuinely irreversible "Delete account". The confirm
+          modal below is the real guard. */}
       <div className='flex justify-center pt-2'>
         <Button
           name='delete-posting'
-          variant='error'
+          variant='outline'
           size='sm'
           onClick={() => setConfirmDeleteOpen(true)}
           disabled={deleting}
+          className='text-error hover:text-error'
+          title='Remove this posting from your list.'
         >
-          {deleting ? 'Deleting...' : 'Delete posting'}
+          <Trash2 className='size-4' aria-hidden />
+          <span>{deleting ? 'Deleting…' : 'Delete posting'}</span>
         </Button>
       </div>
 
