@@ -115,14 +115,21 @@ async def _newest_job_created_at(supabase: Client) -> datetime | None:
 
 async def _source_counts(supabase: Client) -> tuple[int, int]:
     """Returns ``(total_sources, disabled_sources)``."""
+    # ``head=True`` → PostgREST issues a HEAD, returning only the
+    # Content-Range count and *zero* rows. Without it, ``count="exact"``
+    # ships every matching ``id`` row in the body just to read one integer
+    # from the header — and the ``sources`` catalog grows with every
+    # discovered company (722 discoveries across 6 targets in project
+    # history), so each health tick would transfer thousands of rows twice.
+    # We read only ``.count`` below, never ``.data``, so this is a pure win.
     total_resp = await poll_db_read(
         supabase,
-        lambda c: c.table("sources").select("id", count="exact"),
+        lambda c: c.table("sources").select("id", count="exact", head=True),
         label="health sources count",
     )
     disabled_resp = await poll_db_read(
         supabase,
-        lambda c: c.table("sources").select("id", count="exact").eq("enabled", False),
+        lambda c: c.table("sources").select("id", count="exact", head=True).eq("enabled", False),
         label="health disabled-sources count",
     )
     return int(total_resp.count or 0), int(disabled_resp.count or 0)

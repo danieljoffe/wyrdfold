@@ -555,6 +555,74 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
     return total_scored
 
 
+# Page size for the retro-score title sweep over the whole ``jobs`` table —
+# same 500 as the re-score pager; a narrow ``id, title`` select, keyset-paged.
+_RETRO_TITLE_BATCH_SIZE = 500
+
+
+def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
+    """Stage-1 title-score every posting in ``jobs`` against ``target``,
+    writing matches in bulk. Returns the number of score rows written.
+
+    Used at target activation so postings that pre-date the target still
+    appear under it. Replaces the per-row-upsert N+1 the activation path used
+    to run: matched rows are accumulated per page and written with a SINGLE
+    ``.upsert(...)``, then one :func:`batch_update_global_scores` recomputes
+    ``jobs.score`` for the page — the old retro path never recomputed the
+    global score, so jobs it newly matched kept a stale ``jobs.score`` until
+    the next poll happened to touch them (a secondary correctness gap).
+
+    Keyset-paginated by ``id ASC``, not OFFSET: the old ``.range(offset, …)``
+    had no ``ORDER BY``, so a concurrent poller insert could shift the window
+    and make it skip / re-visit rows, and OFFSET deepens to O(N²/page) scan
+    cost. Mirrors the batch shape :func:`bulk_score_for_target` already uses
+    (upsert the page, then one global-score recompute per page).
+    """
+    written = 0
+    after_id: str | None = None
+    while True:
+        query = (
+            supabase.table("jobs").select("id, title").order("id").limit(_RETRO_TITLE_BATCH_SIZE)
+        )
+        if after_id is not None:
+            query = query.gt("id", after_id)
+        resp = query.execute()
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if not rows:
+            break
+
+        rows_to_upsert: list[dict[str, Any]] = []
+        for row in rows:
+            result = _title_score_result(row["title"], target)
+            if result is None:
+                continue
+            rows_to_upsert.append(
+                _score_row_payload(
+                    job_posting_id=row["id"],
+                    target_id=target.id,
+                    score=result.score,
+                    breakdown=result.breakdown,
+                    matched_keywords=result.matched_keywords,
+                    excluded=result.excluded,
+                    scoring_status="stage1",
+                    scored_profile_version=target.profile_version,
+                )
+            )
+
+        if rows_to_upsert:
+            supabase.table(TABLE).upsert(
+                rows_to_upsert, on_conflict="job_posting_id,target_id"
+            ).execute()
+            written += len(rows_to_upsert)
+            batch_update_global_scores(supabase, [r["job_posting_id"] for r in rows_to_upsert])
+
+        if len(rows) < _RETRO_TITLE_BATCH_SIZE:
+            break
+        after_id = rows[-1]["id"]
+
+    return written
+
+
 def get_target_scores(
     supabase: Client,
     target_id: str,

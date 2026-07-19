@@ -23,6 +23,7 @@ from app.models.targets import (
 )
 from app.services.target_scoring import (
     bulk_score_for_target,
+    bulk_title_score_for_target,
     get_target_scores,
     score_and_upsert,
 )
@@ -1410,3 +1411,147 @@ async def test_batch_update_global_scores_poll_empty_ids_no_db_traffic(
     assert sync_client.executed == 0
     assert sync_client.ops == []
     assert lookups == []
+
+
+# ---------------------------------------------------------------------------
+# bulk_title_score_for_target (retro-score at activation — audit P3/M7)
+# ---------------------------------------------------------------------------
+
+
+class _RetroSupabase:
+    """Fake supabase for ``bulk_title_score_for_target``: keyset-paginates a
+    fixed ``jobs`` dataset (``.order('id').limit(n).gt('id', cursor)``) and
+    records every ``scores`` bulk upsert, so a test can assert one upsert PER
+    PAGE (not per row) and the exact rows written. It deliberately has NO
+    ``.range`` — if the code paginated by OFFSET the test would AttributeError,
+    which pins the keyset behaviour."""
+
+    def __init__(self, jobs: list[dict[str, Any]]) -> None:
+        self._jobs = sorted(jobs, key=lambda j: j["id"])
+        self.upsert_calls: list[list[dict[str, Any]]] = []
+        self._after: str | None = None
+        self._limit: int | None = None
+
+    def table(self, _name: str) -> _RetroSupabase:
+        self._after = None
+        self._limit = None
+        return self
+
+    def select(self, *_a: object, **_k: object) -> _RetroSupabase:
+        return self
+
+    def order(self, col: str, **_k: object) -> _RetroSupabase:
+        assert col == "id"
+        return self
+
+    def limit(self, n: int) -> _RetroSupabase:
+        self._limit = n
+        return self
+
+    def gt(self, col: str, val: str) -> _RetroSupabase:
+        assert col == "id"
+        self._after = val
+        return self
+
+    def upsert(self, rows: list[dict[str, Any]], **_k: object) -> MagicMock:
+        self.upsert_calls.append(rows)
+        resp = MagicMock()
+        resp.data = rows
+        return resp
+
+    def execute(self) -> MagicMock:
+        rows = self._jobs
+        if self._after is not None:
+            rows = [j for j in rows if j["id"] > self._after]
+        rows = rows[: (self._limit or len(rows))]
+        resp = MagicMock()
+        resp.data = rows
+        return resp
+
+
+def _retro_jobs() -> list[dict[str, str]]:
+    # 6 jobs; matches (contain "React") = j01, j05, j06. j05 also has the
+    # "junior" negative -> written but excluded. j02/j03/j04 don't match and
+    # (with page size 2) j03+j04 form a whole page with NO matches.
+    return [
+        {"id": "j01", "title": "React Engineer"},
+        {"id": "j02", "title": "Backend Go Developer"},
+        {"id": "j03", "title": "Data Scientist"},
+        {"id": "j04", "title": "DevOps Engineer"},
+        {"id": "j05", "title": "Junior React Developer"},
+        {"id": "j06", "title": "React Native Lead"},
+    ]
+
+
+def test_bulk_title_score_batches_upserts_and_recomputes_globals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One bulk upsert + one global-score recompute PER PAGE (not per row),
+    only for pages that produced matches; the correctness fix for the retro
+    N+1 that never recomputed jobs.score."""
+    import app.services.target_scoring as ts
+
+    batch_update = MagicMock()
+    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
+    monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)  # force multi-page
+
+    supabase = _RetroSupabase(_retro_jobs())
+    target = _target(core={"React": 3})
+
+    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
+
+    # 3 matches: j01, j05 (excluded), j06.
+    assert written == 3
+    # Bulk, not N+1: one upsert per page-with-matches. Page1 -> [j01],
+    # page2 (j03,j04) -> no matches -> NO upsert, page3 -> [j05, j06].
+    assert len(supabase.upsert_calls) == 2
+    assert [len(c) for c in supabase.upsert_calls] == [1, 2]  # 2nd call is a real batch
+    upserted = [r for call in supabase.upsert_calls for r in call]
+    assert {r["job_posting_id"] for r in upserted} == {"j01", "j05", "j06"}
+    assert all(r["scoring_status"] == "stage1" for r in upserted)
+    assert all(r["target_id"] == "target-1" for r in upserted)
+    # The negative-keyword job is written but excluded; the plain matches aren't.
+    by_id = {r["job_posting_id"]: r for r in upserted}
+    assert by_id["j05"]["excluded"] is True
+    assert by_id["j01"]["excluded"] is False
+    assert by_id["j06"]["excluded"] is False
+    # Global score recomputed once per page-with-matches, with that page's ids.
+    assert batch_update.call_count == 2
+    assert [sorted(call.args[1]) for call in batch_update.call_args_list] == [
+        ["j01"],
+        ["j05", "j06"],
+    ]
+
+
+def test_bulk_title_score_empty_catalog_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_update = MagicMock()
+    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
+    supabase = _RetroSupabase([])
+    target = _target(core={"React": 3})
+
+    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
+
+    assert written == 0
+    assert supabase.upsert_calls == []
+    batch_update.assert_not_called()
+
+
+def test_bulk_title_score_no_matches_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Jobs exist but none match the target -> no upsert, no global recompute
+    (and the keyset loop still terminates)."""
+    batch_update = MagicMock()
+    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
+    supabase = _RetroSupabase(
+        [{"id": "j01", "title": "Plumber"}, {"id": "j02", "title": "Chef"}]
+    )
+    target = _target(core={"React": 3})
+
+    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
+
+    assert written == 0
+    assert supabase.upsert_calls == []
+    batch_update.assert_not_called()

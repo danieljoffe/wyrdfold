@@ -170,6 +170,18 @@ def _parse_dt(value: str) -> datetime:
 # ── Target membership ────────────────────────────────────────────────────────
 
 
+# PostgREST caps every read at ``max_rows`` (1000 on this project — see
+# ``supabase/config.toml``). ``_posting_target_map`` reads the whole (job,
+# target) score set for a user's targets, which is unbounded and routinely
+# exceeds that (a real beta user has ~12.5k non-excluded rows on a single busy
+# target), so a single un-paginated read SILENTLY TRUNCATES the membership map
+# to the first 1000 rows — the exact latent-correctness class this module
+# already guards for ``.in_()`` chunking (see ``_IN_CHUNK``). Keyset-paginate
+# by the ``scores`` PK so the full set is read, in pages the server returns
+# whole (page size == max_rows).
+_SCORES_PAGE_SIZE = 1000
+
+
 def _posting_target_map(
     supabase: Client, target_ids: set[str] | None
 ) -> dict[str, set[str]] | None:
@@ -189,21 +201,37 @@ def _posting_target_map(
     why the pipeline + skills-cost endpoints currently 500. Pivot all
     target scoping through the ``scores`` table, which is the actual
     source of truth.
+
+    The read is keyset-paginated by the ``scores`` PK because the result set
+    is unbounded and would otherwise truncate at PostgREST's ``max_rows``
+    (see ``_SCORES_PAGE_SIZE``) — losing membership rows silently.
     """
     if target_ids is None:
         return None
     if not target_ids:
         return {}
-    rows = _rows(
-        supabase.table("scores")
-        .select("job_posting_id, target_id")
-        .in_("target_id", list(target_ids))
-        .eq("excluded", False),
-        label="insights/posting_target_map",
-    )
+    target_list = list(target_ids)
     out: dict[str, set[str]] = defaultdict(set)
-    for r in rows:
-        out[r["job_posting_id"]].add(r["target_id"])
+    after: str | None = None
+    while True:
+        query = (
+            supabase.table("scores")
+            .select("id, job_posting_id, target_id")
+            .in_("target_id", target_list)
+            .eq("excluded", False)
+            .order("id")
+            .limit(_SCORES_PAGE_SIZE)
+        )
+        if after is not None:
+            query = query.gt("id", after)
+        page = _rows(query, label="insights/posting_target_map")
+        if not page:
+            break
+        for r in page:
+            out[r["job_posting_id"]].add(r["target_id"])
+        if len(page) < _SCORES_PAGE_SIZE:
+            break
+        after = page[-1]["id"]
     return dict(out)
 
 
