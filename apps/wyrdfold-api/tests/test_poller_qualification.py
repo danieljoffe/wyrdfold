@@ -17,6 +17,7 @@ Covers ``poller._qualify_one_job`` / ``_qualify_jobs``:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -24,6 +25,7 @@ import pytest
 
 from app.config import settings as live_settings
 from app.services import poller as poller_mod
+from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
 from app.services.qualification import QualificationTags, qualification_hash
 
 _TAGS = QualificationTags(
@@ -506,3 +508,94 @@ class TestGradingReserve:
 
         assert rec["tag_calls"] == 0  # tagger yields the reserved slice
         assert rec["writes"] == []
+
+
+class TestProviderFastFail:
+    """audit PERF-M "402/429 fast-fail": a provider rejecting calls (402
+    out-of-credits / sustained 429) latches a cooldown breaker so the qualify
+    fan-out stops firing doomed round-trips. Orthogonal to the spend-based
+    budget gate, which won't fire while we're UNDER the daily cap (the exact
+    low-balance-high-cap case a 402 hits)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch(self) -> Any:
+        poller_mod._provider_fatal_until = 0.0
+        yield
+        poller_mod._provider_fatal_until = 0.0
+
+    @pytest.mark.asyncio
+    async def test_402_latches_breaker_and_leaves_row_null(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+
+        async def raising_tag_job(_llm: object, **_kw: Any) -> Any:
+            rec["tag_calls"] += 1
+            raise LLMQuotaExhaustedError(upstream_status=402)
+
+        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
+        sb = _supabase_capturing_updates(rec)
+
+        assert not poller_mod._provider_fatal_active()
+        await poller_mod._qualify_one_job(MagicMock(), sb, _row())
+
+        assert poller_mod._provider_fatal_active()  # breaker latched
+        assert rec["writes"] == []  # row left NULL (best-effort, re-tags later)
+
+    @pytest.mark.asyncio
+    async def test_429_also_latches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+
+        async def raising_tag_job(_llm: object, **_kw: Any) -> Any:
+            raise LLMRateLimitedError(upstream_status=429)
+
+        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
+        await poller_mod._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row()
+        )
+        assert poller_mod._provider_fatal_active()
+
+    @pytest.mark.asyncio
+    async def test_active_breaker_skips_the_llm_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        poller_mod._provider_fatal_until = time.monotonic() + 300.0  # latched
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_one_job(MagicMock(), sb, _row())
+
+        assert rec["tag_calls"] == 0  # never hit the provider
+        assert rec["writes"] == []
+
+    @pytest.mark.asyncio
+    async def test_qualify_jobs_defers_backlog_once_latched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Every tag_job 402s. Across a >1-chunk backlog the breaker latches on
+        # the first failure and the loop defers the rest — so NOT every row is
+        # attempted (fast-fail, not "grind the whole backlog into 402s").
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+
+        async def raising_tag_job(_llm: object, **_kw: Any) -> Any:
+            rec["tag_calls"] += 1
+            raise LLMQuotaExhaustedError(upstream_status=402)
+
+        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
+        n = poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY + 5  # spans 2 chunks
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, _unique_rows(n))
+
+        assert poller_mod._provider_fatal_active()
+        assert rec["tag_calls"] < n  # deferred the rest instead of firing all N
+        assert rec["writes"] == []
+
+    @pytest.mark.asyncio
+    async def test_triage_gate_honors_the_breaker(self) -> None:
+        poller_mod._provider_fatal_until = time.monotonic() + 300.0
+        assert await poller_mod._triage_budget_blocks(MagicMock()) is True
+
+    def test_breaker_auto_clears_after_cooldown(self) -> None:
+        poller_mod._provider_fatal_until = time.monotonic() - 1.0  # in the past
+        assert not poller_mod._provider_fatal_active()
