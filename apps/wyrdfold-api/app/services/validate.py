@@ -319,10 +319,18 @@ async def validate_job_url(url: str) -> ValidationResult:
     try:
         await asyncio.to_thread(assert_safe_host, hostname)
     except ValueError as exc:
+        # Log the detail (which host, resolved-to-private vs did-not-resolve)
+        # server-side for ops, but return a GENERIC reason to the caller.
+        # Echoing "resolves to a private/internal address" vs "did not resolve"
+        # (and the hostname) turns this endpoint into a blind DNS/SSRF-recon
+        # oracle — a logged-in caller could map which internal hostnames resolve
+        # to private ranges. The sibling /jobs/manual was already hardened this
+        # way; this closes the missed twin. (red-team 2026-07-19)
+        logger.info("url validation rejected — unsafe host: %s", exc)
         return ValidationResult(
             is_valid=False,
             final_url=cleaned,
-            rejection_reason=f"unsafe_host:{exc}",
+            rejection_reason="unsafe_host",
         )
 
     # Layer 3: Redirect detection + Layer 4: Content verification
@@ -360,10 +368,14 @@ async def validate_job_url(url: str) -> ValidationResult:
                 try:
                     await asyncio.to_thread(assert_safe_host, hop_host)
                 except ValueError as exc:
+                    # Generic reason to the caller (see the initial-host check
+                    # above): the redirect-target detail is an SSRF-recon oracle
+                    # too. (red-team 2026-07-19)
+                    logger.info("url validation rejected — unsafe redirect host: %s", exc)
                     return ValidationResult(
                         is_valid=False,
                         final_url=str(current),
-                        rejection_reason=f"unsafe_host_after_redirect:{exc}",
+                        rejection_reason="unsafe_host_after_redirect",
                     )
                 resp = await client.get(current, follow_redirects=False)
                 if resp.status_code in _REDIRECT_CODES and "location" in resp.headers:
@@ -407,10 +419,13 @@ async def validate_job_url(url: str) -> ValidationResult:
                 try:
                     await asyncio.to_thread(assert_safe_host, final_hostname)
                 except ValueError as exc:
+                    # Generic reason to the caller (SSRF-recon oracle); detail
+                    # stays server-side. (red-team 2026-07-19)
+                    logger.info("url validation rejected — unsafe final host: %s", exc)
                     return ValidationResult(
                         is_valid=False,
                         final_url=final_url,
-                        rejection_reason=f"unsafe_host_after_redirect:{exc}",
+                        rejection_reason="unsafe_host_after_redirect",
                     )
 
                 if resp.status_code != 200:

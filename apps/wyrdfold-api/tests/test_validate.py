@@ -144,6 +144,36 @@ class TestSsrfHostCheck:
         assert secret_ip not in result.rejection_reason
         assert result.rejection_reason.startswith("unsafe_host")
 
+    async def test_validate_job_url_reason_is_generic_no_ssrf_oracle(self, monkeypatch):
+        """Red-team 2026-07-19: the client-facing ``rejection_reason`` must not
+        let a caller distinguish "host resolves to an INTERNAL ip" from "host
+        does not resolve" — that distinction (plus the echoed hostname) is a
+        blind DNS/SSRF-recon oracle for mapping internal hosts (a logged-in user
+        could enumerate internal DNS through POST /jobs/validate-url). Both cases
+        return the same generic ``unsafe_host`` and never echo the hostname; the
+        detail still goes to the server log for ops."""
+        import ipaddress
+
+        import app.services.validate as v
+
+        host = "internal-secret.corp"
+        # Case A: the host resolves to an internal IP.
+        monkeypatch.setattr(
+            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("10.0.0.5")]
+        )
+        resolves_internal = await v.validate_job_url(f"https://{host}/job/1")
+        # Case B: the host does not resolve at all.
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [])
+        does_not_resolve = await v.validate_job_url(f"https://{host}/job/1")
+
+        assert resolves_internal.is_valid is False
+        assert does_not_resolve.is_valid is False
+        # Indistinguishable outcomes → no oracle.
+        assert resolves_internal.rejection_reason == "unsafe_host"
+        assert does_not_resolve.rejection_reason == "unsafe_host"
+        # The caller-supplied hostname is not reflected back either.
+        assert host not in (resolves_internal.rejection_reason or "")
+
     def test_ipv6_loopback_blocked(self, monkeypatch):
         import ipaddress
 
