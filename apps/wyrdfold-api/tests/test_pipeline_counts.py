@@ -7,8 +7,11 @@ deduplicated by job, grouped by the caller's per-user status
 (``user_jobs`` row; absent → ``'new'``).
 """
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock
+
+import pytest
 
 from app.routers.jobs import (
     _pipeline_counts_grouped,
@@ -99,7 +102,7 @@ def test_grouped_uses_rpc_result() -> None:
     )
 
 
-def test_grouped_falls_back_when_rpc_missing() -> None:
+def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -> None:
     sb = MagicMock()
     sb.rpc.return_value.execute.side_effect = Exception("function not found")
 
@@ -112,8 +115,16 @@ def test_grouped_falls_back_when_rpc_missing() -> None:
         return _Chain(_Resp([{"job_posting_id": "j1", "status": "interviewing"}]))
 
     sb.table.side_effect = _table
-    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
+    with caplog.at_level(logging.WARNING, logger="app.routers.jobs"):
+        counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
     assert counts == {"interviewing": 1}
+    # audit 2026-07-18 PERF-M / silent-degrade: a genuine RPC failure must
+    # degrade LOUDLY — a WARNING carrying the traceback — so silent reversion of
+    # the dashboard's hottest projection to the slower client-side count is
+    # visible on prod (it logged at DEBUG before, invisible under the INFO root).
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("pipeline_counts RPC FAILED" in r.getMessage() for r in warned), caplog.text
+    assert any(r.exc_info for r in warned), "the WARNING must carry exc_info (the traceback)"
 
 
 def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:

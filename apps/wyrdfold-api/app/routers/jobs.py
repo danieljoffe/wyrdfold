@@ -81,6 +81,24 @@ from app.services.validate import (
 
 logger = logging.getLogger(__name__)
 
+
+class _RpcIneligibleError(RuntimeError):
+    """Raised by a list-helper when the RPC provably *can't express* the
+    requested query shape (multi-word OR-search, post-fetch location filter,
+    Pending-aware score bucketing, floor-exemption) — an **expected** signal to
+    use the two-query path, not a failure.
+
+    The dispatchers below catch this separately from a genuine RPC failure so
+    silent degradation of the hottest endpoints is observable on prod (audit
+    2026-07-18 PERF-M): an ineligible *shape* falls back quietly at DEBUG, while
+    a real RPC failure (function drift, timeout, non-list response, permission
+    change) falls back **loudly at WARNING with the traceback**. Before this the
+    whole fallback logged at DEBUG — invisible under prod's INFO root
+    (`logging_config.py`) — so an RPC that broke would keep "working" on the
+    slower path with no signal until it became a latency/cost incident (cf.
+    #365). Subclasses ``RuntimeError`` so any pre-existing broad
+    ``except RuntimeError`` still catches it."""
+
 # Operator location-filter path fetches pre-filter rows into Python (location
 # can't be filtered server-side), so cap the scan to keep it bounded as `jobs`
 # grows (#113). A hit is logged, never silently truncated.
@@ -403,23 +421,29 @@ def _list_jobs_for_target_rpc(
     # walk pre-filter rows and pages would render half-empty. Force the
     # two-query fallback, which filters the full set then paginates.
     if exclude_terms or only_terms:
-        raise RuntimeError("RPC path skipped: location filter requires post-fetch pagination")
+        raise _RpcIneligibleError(
+            "RPC path skipped: location filter requires post-fetch pagination"
+        )
     # Multi-word search ("customer director") should OR each token across
     # the title — the RPC's ``p_search`` is a single ilike, so bypass it
     # whenever the user typed more than one word.
     if search and len(_tokenize_search(search)) > 1:
-        raise RuntimeError("RPC path skipped: multi-word search uses OR semantics")
+        raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     # Score sort needs Pending-below-graded bucketing (and, with decay on, the
     # ``recency_score`` column the RPC doesn't order by) — both handled in the
     # two-query path. The RPC's single-column keyset can't bucket. (#47/#118)
     if sort == "score":
-        raise RuntimeError("RPC path skipped: Pending-aware score sort handled in two-query path")
+        raise _RpcIneligibleError(
+            "RPC path skipped: Pending-aware score sort handled in two-query path"
+        )
     # A min_score floor must exempt not-yet-graded rows; the RPC's flat
     # ``score >= p_min_score`` can't. Route floored queries to the two-query
     # path, which exempts Pending. Unfloored queries keep the keyset fast path
     # (Pending rows pass anyway). (#47)
     if min_score and min_score > 0:
-        raise RuntimeError("RPC path skipped: Pending floor-exemption handled in two-query path")
+        raise _RpcIneligibleError(
+            "RPC path skipped: Pending floor-exemption handled in two-query path"
+        )
     """List jobs via server-side keyset RPC (single round-trip)."""
     after_value = cursor.get("v")
     resp = supabase.rpc(
@@ -1068,20 +1092,33 @@ def _list_jobs_for_target(
                 cursor=cursor,
                 user_id=user_id,
             )
-        except Exception:
+        except _RpcIneligibleError as exc:
             logger.debug(
-                "cross-target RPC unavailable for per-target score sort; falling back"
+                "cross-target RPC ineligible for per-target score sort (%s); "
+                "using two-query path",
+                exc,
             )
-            return _list_jobs_for_target_two_query(
-                supabase, preferences=preferences, logistics=logistics, **kwargs
+        except Exception:
+            logger.warning(
+                "cross-target RPC FAILED for per-target score sort; degrading to "
+                "the slower two-query path",
+                exc_info=True,
             )
-    try:
-        return _list_jobs_for_target_rpc(supabase, **kwargs)
-    except Exception:
-        logger.debug("RPC get_target_jobs unavailable, falling back to two-query pattern")
         return _list_jobs_for_target_two_query(
             supabase, preferences=preferences, logistics=logistics, **kwargs
         )
+    try:
+        return _list_jobs_for_target_rpc(supabase, **kwargs)
+    except _RpcIneligibleError as exc:
+        logger.debug("get_target_jobs ineligible (%s); using two-query path", exc)
+    except Exception:
+        logger.warning(
+            "get_target_jobs RPC FAILED; degrading to the slower two-query path",
+            exc_info=True,
+        )
+    return _list_jobs_for_target_two_query(
+        supabase, preferences=preferences, logistics=logistics, **kwargs
+    )
 
 
 def _list_jobs_across_user_targets_rpc(
@@ -1110,7 +1147,7 @@ def _list_jobs_across_user_targets_rpc(
     the RPC can't express DB-side (the dispatcher gates most; multi-word search
     is caught here since it uses OR semantics the RPC's single ILIKE can't)."""
     if search and len(_tokenize_search(search)) > 1:
-        raise RuntimeError("RPC path skipped: multi-word search uses OR semantics")
+        raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     offset = _offset_from_cursor(cursor)
     resp = supabase.rpc(
         "get_cross_target_jobs",
@@ -1215,27 +1252,32 @@ def _list_jobs_across_user_targets(
             cursor=cursor,
             user_id=user_id,
         )
-    except Exception:
+    except _RpcIneligibleError as exc:
         logger.debug(
-            "RPC get_cross_target_jobs unavailable/ineligible, falling back to two-query"
+            "get_cross_target_jobs ineligible (%s); using two-query path", exc
         )
-        return _list_jobs_across_user_targets_two_query(
-            supabase,
-            user_target_ids=user_target_ids,
-            page_size=page_size,
-            sort=sort,
-            ascending=ascending,
-            min_score=min_score,
-            status=status,
-            company=company,
-            search=search,
-            exclude_terms=exclude_terms,
-            only_terms=only_terms,
-            cursor=cursor,
-            weights_by_target=weights_by_target,
-            user_id=user_id,
-            logistics=logistics,
+    except Exception:
+        logger.warning(
+            "get_cross_target_jobs RPC FAILED; degrading to the slower two-query path",
+            exc_info=True,
         )
+    return _list_jobs_across_user_targets_two_query(
+        supabase,
+        user_target_ids=user_target_ids,
+        page_size=page_size,
+        sort=sort,
+        ascending=ascending,
+        min_score=min_score,
+        status=status,
+        company=company,
+        search=search,
+        exclude_terms=exclude_terms,
+        only_terms=only_terms,
+        cursor=cursor,
+        weights_by_target=weights_by_target,
+        user_id=user_id,
+        logistics=logistics,
+    )
 
 
 def _list_jobs_across_user_targets_two_query(
@@ -2028,7 +2070,10 @@ def _pipeline_counts_grouped(
             },
         ).execute()
     except Exception:
-        logger.debug("pipeline_counts RPC unavailable, falling back to client-side count")
+        logger.warning(
+            "pipeline_counts RPC FAILED; degrading to the slower client-side count",
+            exc_info=True,
+        )
         return _pipeline_counts_python(
             supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
