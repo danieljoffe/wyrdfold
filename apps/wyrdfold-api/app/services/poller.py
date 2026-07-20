@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -50,6 +51,11 @@ from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.cost_log import record as record_llm_cost
 from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
+from app.services.llm.errors import (
+    LLMQuotaExhaustedError,
+    LLMRateLimitedError,
+    LLMServiceError,
+)
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -172,6 +178,39 @@ LLM_SCORE_THRESHOLD = 40
 # spend (~this many Haiku calls) rather than the entire backlog. Smaller =
 # tighter cap, more meter reads; this balances the two.
 QUALIFICATION_BUDGET_RECHECK_EVERY = 50
+
+# --- Provider-fatal fast-fail breaker (audit PERF-M "402/429 fast-fail") -------
+# ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. This
+# breaker catches the *provider* rejecting every call — OpenRouter out of
+# credits (402) or sustained rate-limiting (429, after the client's own
+# retries) — which can happen while we're still UNDER budget (a low account
+# balance with a high cap). The first such error from the tagger latches this
+# for a cooldown so the qualify fan-out stops firing hundreds of doomed calls
+# per cycle; it auto-clears (monotonic), so the first cycle after the cooldown
+# retries once (credits may be topped up / the 429 window may have passed).
+# Module-level + in-process is fine on the single poller worker (same rationale
+# as the lifecycle sweep below).
+_PROVIDER_FATAL_COOLDOWN_S = 300.0
+_provider_fatal_until = 0.0
+
+
+def _trip_provider_fatal(exc: BaseException) -> None:
+    """Latch the fast-fail breaker for the cooldown after a provider 402/429."""
+    global _provider_fatal_until
+    _provider_fatal_until = time.monotonic() + _PROVIDER_FATAL_COOLDOWN_S
+    logger.warning(
+        "LLM provider fast-fail latched for %.0fs — provider rejecting calls "
+        "(%s: %s). Deferring the rest of this cycle's tagging; it retries after "
+        "the cooldown. If this is a 402, top up OpenRouter credits.",
+        _PROVIDER_FATAL_COOLDOWN_S,
+        type(exc).__name__,
+        exc,
+    )
+
+
+def _provider_fatal_active() -> bool:
+    """True while the provider-fatal breaker is latched (within the cooldown)."""
+    return time.monotonic() < _provider_fatal_until
 
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
 # ``app/services/qualification/heuristics.py`` so the poller's ingestion gate
@@ -808,17 +847,38 @@ async def _qualify_one_job(
         # Unchanged content already tagged — skip the spend.
         return
 
+    # Fast-fail: once the provider has rejected a call this cooldown (402/429),
+    # skip the round-trip entirely — it would just fail too. (audit PERF-M)
+    if _provider_fatal_active():
+        return
+
     # PERF-H2: bound the qualify LLM fan-out cycle-wide (see _qualify_llm_semaphore).
-    async with _qualify_llm_semaphore():
-        tags, result = await tag_job(
-            llm,
-            title=row.get("title", ""),
-            company=row.get("company_name"),
-            location=row.get("location"),
-            description=row.get("description_html"),
-        )
+    try:
+        async with _qualify_llm_semaphore():
+            # Re-check under the semaphore: the breaker may have latched while
+            # we waited for a slot behind an earlier row's 402 — don't fire the
+            # doomed call just because we passed the check before queuing.
+            if _provider_fatal_active():
+                return
+            tags, result = await tag_job(
+                llm,
+                title=row.get("title", ""),
+                company=row.get("company_name"),
+                location=row.get("location"),
+                description=row.get("description_html"),
+            )
+    except (LLMQuotaExhaustedError, LLMRateLimitedError) as exc:
+        # Provider-fatal (402 out-of-credits / sustained 429): latch the breaker
+        # so the rest of the cycle stops hammering it. Leave THIS row NULL
+        # (best-effort — it re-tags once the cooldown clears). (audit PERF-M)
+        _trip_provider_fatal(exc)
+        return
+    except LLMServiceError:
+        # Other provider error (auth/upstream) — transient / config, handled
+        # elsewhere; leave the row NULL like a row-level tagger failure.
+        return
     if tags is None:
-        # Tagger failed (logged inside tag_job). Leave the row NULL.
+        # Tagger failed on a row-specific error (logged inside tag_job). NULL.
         return
 
     if result is not None:
@@ -898,6 +958,16 @@ async def _qualify_jobs(
         return
 
     for start in range(0, len(rows), QUALIFICATION_BUDGET_RECHECK_EVERY):
+        # Provider fast-fail (audit PERF-M): if a prior chunk already hit a
+        # 402/429, the provider is rejecting every call — defer the rest of the
+        # backlog this cycle instead of firing hundreds of doomed round-trips.
+        if _provider_fatal_active():
+            logger.warning(
+                "Qualification tagger: LLM provider fast-fail active — deferring "
+                "%d remaining job(s) this cycle (they re-tag after the cooldown).",
+                len(rows) - start,
+            )
+            return
         # Re-read the meter between chunks so a long backlog can't blow past
         # the cap. A meter-read failure fails CLOSED (skip the rest) —
         # refuse to spend when we can't see the budget, matching the cycle
@@ -2325,7 +2395,13 @@ async def _triage_budget_blocks(supabase: Client) -> bool:
     check is a best-effort tightening — a transient read blip must not break
     a poll or silently drop the precision filter. (Qualification, which has
     NO other gate, instead fails CLOSED in :func:`_qualify_jobs`.)
+
+    Also honors the provider fast-fail breaker (audit PERF-M): if the tagger
+    already tripped it on a 402/429 this cooldown, triage stops too — the same
+    provider will reject its Phase-1 calls.
     """
+    if _provider_fatal_active():
+        return True
     try:
         return await asyncio.to_thread(_global_budget_exhausted, supabase)
     except Exception:

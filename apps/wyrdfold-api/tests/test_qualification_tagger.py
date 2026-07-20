@@ -28,6 +28,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+from app.services.llm.errors import LLMQuotaExhaustedError
 from app.services.llm.mock import MockLLMClient
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -553,6 +554,23 @@ class TestSchemaAndFailSoft:
         )
         assert tags is None
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_provider_error_propagates_not_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A provider-level failure (402 out-of-credits) is NOT this row's fault
+        # and not fail-soft-able — every other row hits it too — so it must
+        # PROPAGATE (unlike the row-specific error above) so the poller can latch
+        # its fast-fail breaker. (audit PERF-M "402/429 fast-fail")
+        async def quota_boom(*_a: object, **_k: object) -> object:
+            raise LLMQuotaExhaustedError(upstream_status=402)
+
+        monkeypatch.setattr(tagger_mod, "complete_json", quota_boom)
+        with pytest.raises(LLMQuotaExhaustedError):
+            await tag_job(
+                MockLLMClient(), title="x", company="y", location="z", description="d"
+            )
 
     @pytest.mark.asyncio
     async def test_calls_haiku_with_qualification_purpose(
