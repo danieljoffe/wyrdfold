@@ -91,9 +91,7 @@ def test_turns_write_own_ok_and_read_scoped(
         }
     ).execute()
 
-    rows = (
-        client_a.table("experience_conversation_turns").select("user_id").execute().data
-    )
+    rows = client_a.table("experience_conversation_turns").select("user_id").execute().data
     seen = {r["user_id"] for r in rows}
     assert uid_a in seen
     assert uid_b not in seen, "RLS leak: A sees B's conversation turn"

@@ -88,16 +88,16 @@ class TestManualJobEndpoint:
 
         mock_supabase = MagicMock()
         mock_upsert = MagicMock()
-        mock_upsert.execute = MagicMock(
-            return_value=MagicMock(data=[{"id": "posting-uuid-1"}])
-        )
+        mock_upsert.execute = MagicMock(return_value=MagicMock(data=[{"id": "posting-uuid-1"}]))
         mock_supabase.table.return_value.upsert.return_value = mock_upsert
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
-        result = await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
+        result = await add_manual_job(
+            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+        )
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-1"
@@ -181,8 +181,8 @@ class TestManualJobEndpoint:
         _patch_size_cap_fetch(monkeypatch, text=OG_HTML)
 
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.upsert.return_value.execute.return_value = (
-            MagicMock(data=[{"id": "posting-uuid-2"}])
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "posting-uuid-2"}]
         )
 
         from app.models.schemas import ManualJobRequest
@@ -193,7 +193,9 @@ class TestManualJobEndpoint:
             title="My Custom Title",
             company_name="Override Corp",
         )
-        result = await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
+        result = await add_manual_job(
+            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+        )
 
         assert result.success is True
         # User overrides should win
@@ -237,7 +239,9 @@ class TestManualJobEndpoint:
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/opaque-page")
-        result = await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+        result = await add_manual_job(
+            request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
+        )
 
         assert result.success is False
         assert result.needs_manual_fields is True
@@ -249,8 +253,8 @@ class TestManualJobEndpoint:
         _patch_size_cap_fetch(monkeypatch, text="<html><body>Nothing</body></html>")
 
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.upsert.return_value.execute.return_value = (
-            MagicMock(data=[{"id": "posting-uuid-3"}])
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "posting-uuid-3"}]
         )
 
         from app.models.schemas import ManualJobRequest
@@ -261,7 +265,9 @@ class TestManualJobEndpoint:
             title="Manually Entered Job",
             company_name="Some Company",
         )
-        result = await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
+        result = await add_manual_job(
+            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+        )
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-3"
@@ -277,8 +283,8 @@ class TestManualJobEndpoint:
         _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML, url=url)
 
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.upsert.return_value.execute.return_value = (
-            MagicMock(data=[{"id": "uuid"}])
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "uuid"}]
         )
 
         from app.models.schemas import ManualJobRequest
@@ -293,9 +299,7 @@ class TestManualJobEndpoint:
 
     @pytest.mark.asyncio
     async def test_fetch_error(self, monkeypatch):
-        _patch_size_cap_fetch(
-            monkeypatch, side_effect=httpx.ConnectError("Connection refused")
-        )
+        _patch_size_cap_fetch(monkeypatch, side_effect=httpx.ConnectError("Connection refused"))
 
         from fastapi import HTTPException
 
@@ -310,9 +314,7 @@ class TestManualJobEndpoint:
 
     @pytest.mark.asyncio
     async def test_redirect_to_banned(self, monkeypatch):
-        _patch_size_cap_fetch(
-            monkeypatch, text="", url="https://www.ziprecruiter.com/redirect"
-        )
+        _patch_size_cap_fetch(monkeypatch, text="", url="https://www.ziprecruiter.com/redirect")
 
         from fastapi import HTTPException
 
@@ -332,8 +334,8 @@ class TestManualJobEndpoint:
         _patch_size_cap_fetch(monkeypatch, text=JSONLD_HTML)
 
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.upsert.return_value.execute.return_value = (
-            MagicMock(data=[{"id": "posting-uuid-1"}])
+        mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
+            data=[{"id": "posting-uuid-1"}]
         )
 
         from app.models.schemas import ManualJobRequest
@@ -376,8 +378,8 @@ class TestManualJobEndpoint:
             '"sources".'
         )
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.upsert.return_value.execute.side_effect = (
-            APIError({"message": raw_pg_message})
+        mock_supabase.table.return_value.upsert.return_value.execute.side_effect = APIError(
+            {"message": raw_pg_message}
         )
 
         from fastapi import HTTPException

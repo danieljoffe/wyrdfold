@@ -84,13 +84,8 @@ def _sample_unpromising(
     chosen = pool[:k]
     # Hydrate titles in one query.
     ids = [r["job_posting_id"] for r in chosen]
-    jobs_resp = (
-        sb.table("jobs").select("id, title").in_("id", ids).execute()
-    )
-    titles_by_id = {
-        r["id"]: r["title"]
-        for r in cast(list[dict[str, Any]], jobs_resp.data or [])
-    }
+    jobs_resp = sb.table("jobs").select("id, title").in_("id", ids).execute()
+    titles_by_id = {r["id"]: r["title"] for r in cast(list[dict[str, Any]], jobs_resp.data or [])}
     return [(jid, titles_by_id.get(jid, "")) for jid in ids if jid in titles_by_id]
 
 

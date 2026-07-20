@@ -284,9 +284,7 @@ def test_verify_api_key_or_jwt_rejects_both_missing():
 # ---------------------------------------------------------------------------
 
 
-def _settings_with_cron(
-    api_key: str = "legacykey", cron_key: str = "cronkey"
-) -> Settings:
+def _settings_with_cron(api_key: str = "legacykey", cron_key: str = "cronkey") -> Settings:
     return Settings(
         wyrdfold_api_key=api_key,
         wyrdfold_cron_key=cron_key,
@@ -296,16 +294,12 @@ def _settings_with_cron(
 
 def test_verify_api_key_accepts_cron_key_on_operator_routes():
     """The cron key authenticates the strictly-operator gate."""
-    assert (
-        verify_api_key(key="cronkey", s=_settings_with_cron()) == "cronkey"
-    )
+    assert verify_api_key(key="cronkey", s=_settings_with_cron()) == "cronkey"
 
 
 def test_verify_api_key_still_accepts_legacy_key():
     """No regression: the legacy key keeps working on operator routes."""
-    assert (
-        verify_api_key(key="legacykey", s=_settings_with_cron()) == "legacykey"
-    )
+    assert verify_api_key(key="legacykey", s=_settings_with_cron()) == "legacykey"
 
 
 def test_verify_api_key_rejects_unknown_key():
@@ -401,9 +395,7 @@ def test_get_current_user_id_optional_prefers_jwt_over_api_key():
     assert get_current_user_id_optional(req, key="testkey", s=_settings()) == USER_SUB
 
 
-def _budget_settings(
-    daily: float = 5.0, hourly: float = 1.0, monthly: float = 5.0
-) -> Settings:
+def _budget_settings(daily: float = 5.0, hourly: float = 1.0, monthly: float = 5.0) -> Settings:
     return Settings(
         wyrdfold_api_key="testkey",
         supabase_url=TEST_SUPABASE_URL,
@@ -502,9 +494,7 @@ def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
             25.0, True, ("fit.job", "poll_scoring")
         ),
     )
-    enforce_llm_budget(
-        user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0)
-    )
+    enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0))
     assert captured["monthly_limit_usd"] == 25.0
     assert captured["monthly_excluded_purposes"] == ("fit.job", "poll_scoring")
     # The hourly/daily rails must meter interactive spend only — the
@@ -528,9 +518,7 @@ def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
     monkeypatch.setattr(budget_mod, "check_user_budget", check_spy)
 
     with pytest.raises(HTTPException) as exc:
-        enforce_llm_budget(
-            user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings()
-        )
+        enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings())
     assert exc.value.status_code == 403
     assert exc.value.detail["code"] == "llm_disabled"
     check_spy.assert_not_called()

@@ -41,21 +41,38 @@ def seeded_logistics(service_client: Client) -> Iterator[tuple[str, dict[str, st
     }
     try:
         service_client.table("sources").insert(
-            {"id": source_id, "board_token": board_token, "company_name": "Acme", "provider": "greenhouse"}
+            {
+                "id": source_id,
+                "board_token": board_token,
+                "company_name": "Acme",
+                "provider": "greenhouse",
+            }
         ).execute()
         service_client.table("jobs").insert(
             [
-                {"id": jid, "external_id": f"ext-{label}", "source_id": source_id,
-                 "title": label, "company_name": "Acme"}
+                {
+                    "id": jid,
+                    "external_id": f"ext-{label}",
+                    "source_id": source_id,
+                    "title": label,
+                    "company_name": "Acme",
+                }
                 for label, jid in ids.items()
             ]
         ).execute()
-        service_client.table("targets").insert({"id": target_id, "label": "Logistics Target"}).execute()
+        service_client.table("targets").insert(
+            {"id": target_id, "label": "Logistics Target"}
+        ).execute()
         service_client.table("scores").insert(
             [
-                {"job_posting_id": jid, "target_id": target_id, "score": 80,
-                 "excluded": False, "scoring_status": "complete",
-                 "logistics_filters": logistics[label]}
+                {
+                    "job_posting_id": jid,
+                    "target_id": target_id,
+                    "score": 80,
+                    "excluded": False,
+                    "scoring_status": "complete",
+                    "logistics_filters": logistics[label],
+                }
                 for label, jid in ids.items()
             ]
         ).execute()
@@ -67,9 +84,19 @@ def seeded_logistics(service_client: Client) -> Iterator[tuple[str, dict[str, st
 
 def _ids(service_client: Client, target_id: str, f: _LogisticsFilter) -> set[str]:
     result = _list_jobs_for_target_two_query(
-        service_client, target_id=target_id, page_size=50, sort="score", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={}, logistics=f,
+        service_client,
+        target_id=target_id,
+        page_size=50,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+        logistics=f,
     )
     return {p["title"] for p in result["postings"]}
 
@@ -103,7 +130,8 @@ def test_filters_compose(
 ) -> None:
     target_id, _ = seeded_logistics
     got = _ids(
-        service_client, target_id,
+        service_client,
+        target_id,
         _LogisticsFilter(remote_only=True, min_salary=150000, country="US"),
     )
     assert got == {"remote_hi"}  # only the remote, US, >=150k job survives all three
@@ -116,9 +144,19 @@ def test_no_filter_returns_all_with_logistics_overlaid(
     (proving the SELECT + overlay wiring, not just the drop logic)."""
     target_id, _ = seeded_logistics
     result = _list_jobs_for_target_two_query(
-        service_client, target_id=target_id, page_size=50, sort="score", ascending=False,
-        min_score=None, status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={}, logistics=_LogisticsFilter(),
+        service_client,
+        target_id=target_id,
+        page_size=50,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+        logistics=_LogisticsFilter(),
     )
     by_title = {p["title"]: p for p in result["postings"]}
     assert set(by_title) == {"remote_hi", "onsite_hi", "remote_lo", "remote_ca"}
@@ -136,10 +174,18 @@ def test_rpc_fast_path_also_returns_logistics(
 
     target_id, _ = seeded_logistics
     result = _list_jobs_for_target_rpc(
-        service_client, target_id=target_id, page_size=50,
-        sort="created_at", ascending=False, min_score=None,
-        status=None, company=None, search=None,
-        exclude_terms=[], only_terms=[], cursor={},
+        service_client,
+        target_id=target_id,
+        page_size=50,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
     )
     by_title = {p["title"]: p for p in result["postings"]}
     assert set(by_title) == {"remote_hi", "onsite_hi", "remote_lo", "remote_ca"}

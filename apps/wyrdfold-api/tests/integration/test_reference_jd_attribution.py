@@ -55,9 +55,7 @@ def test_add_records_contributor(
     ref = _add(service_client, target_id, uid_a)
     assert ref.user_id == uid_a
     # ...and it round-trips through the list read the merge consumes.
-    assert [j.user_id for j in crud.list_reference_jds(service_client, target_id)] == [
-        uid_a
-    ]
+    assert [j.user_id for j in crud.list_reference_jds(service_client, target_id)] == [uid_a]
 
 
 def test_remove_own_is_scoped_to_contributor(
@@ -68,18 +66,14 @@ def test_remove_own_is_scoped_to_contributor(
 
     # B cannot delete A's contribution: no row matches -> False, JD persists.
     assert (
-        crud.delete_reference_jd(
-            service_client, ref_a.id, target_id=target_id, user_id=uid_b
-        )
+        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=uid_b)
         is False
     )
     assert len(crud.list_reference_jds(service_client, target_id)) == 1
 
     # A can delete their own.
     assert (
-        crud.delete_reference_jd(
-            service_client, ref_a.id, target_id=target_id, user_id=uid_a
-        )
+        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=uid_a)
         is True
     )
     assert crud.list_reference_jds(service_client, target_id) == []
@@ -93,9 +87,7 @@ def test_operator_can_remove_any_contribution(
     # Operator path (user_id None) is unscoped -> removes any contributor's JD,
     # matching the route's ownership guard, which also lets operators bypass.
     assert (
-        crud.delete_reference_jd(
-            service_client, ref_a.id, target_id=target_id, user_id=None
-        )
+        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=None)
         is True
     )
     assert crud.list_reference_jds(service_client, target_id) == []

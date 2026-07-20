@@ -45,9 +45,7 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 # ``{base_url}|{tenant}|{site}`` token, and the site only appears in the URL
 # path. We therefore parse Workday URLs separately instead of routing them
 # through the slug-based probers.
-_WORKDAY_HOST_RE = re.compile(
-    r"^(?P<tenant>[a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$", re.I
-)
+_WORKDAY_HOST_RE = re.compile(r"^(?P<tenant>[a-z0-9-]+)\.wd\d+\.myworkdayjobs\.com$", re.I)
 
 # Leading path segment that's a locale ("en-US", "fr-FR", "de"), not the
 # career-site name.
@@ -217,9 +215,7 @@ async def _probe_ashby(slug: str, client: httpx.AsyncClient) -> DetectResult | N
     )
 
 
-async def _probe_smartrecruiters(
-    slug: str, client: httpx.AsyncClient
-) -> DetectResult | None:
+async def _probe_smartrecruiters(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
     url = f"{SMARTRECRUITERS_BASE}/{slug}/postings?limit=1"
     try:
         resp = await client.get(url)

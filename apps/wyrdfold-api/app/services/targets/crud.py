@@ -147,9 +147,7 @@ def _parse_ref_jd(row: dict[str, Any]) -> TargetReferenceJD:
 # ---- Target CRUD -----------------------------------------------------------
 
 
-def get_by_normalized_label(
-    supabase: Client, normalized_label: str
-) -> JobTarget | None:
+def get_by_normalized_label(supabase: Client, normalized_label: str) -> JobTarget | None:
     """Return the shared-catalog target for a normalized label, or None.
 
     Exact match on ``normalized_label`` — the dedup key the
@@ -214,9 +212,7 @@ def get(supabase: Client, target_id: str) -> JobTarget | None:
     return _parse_target(rows[0]) if rows else None
 
 
-def search_by_label(
-    supabase: Client, query: str, *, limit: int = 20
-) -> list[JobTarget]:
+def search_by_label(supabase: Client, query: str, *, limit: int = 20) -> list[JobTarget]:
     """Substring search over the shared catalog by display label.
 
     Discovery for the "search for a target" flow: a role one user created is

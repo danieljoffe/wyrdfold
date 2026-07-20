@@ -234,9 +234,7 @@ async def test_fetch_drops_posting_when_detail_fetch_404s(
 async def test_404_on_list_returns_empty(mock_http_client: Any) -> None:
     """A 404 on the list endpoint short-circuits — no detail calls fire."""
     mock_http_client.post = AsyncMock(return_value=_make_resp(404))
-    mock_http_client.get = AsyncMock(
-        side_effect=AssertionError("detail must not be called")
-    )
+    mock_http_client.get = AsyncMock(side_effect=AssertionError("detail must not be called"))
     token = "https://example.wd5.myworkdayjobs.com|example|Site"
     jobs = await fetch_workday_jobs(token)
     assert jobs == []
@@ -245,9 +243,7 @@ async def test_404_on_list_returns_empty(mock_http_client: Any) -> None:
 @pytest.mark.asyncio
 async def test_network_error_on_list_returns_empty(mock_http_client: Any) -> None:
     mock_http_client.post = AsyncMock(side_effect=httpx.HTTPError("timeout"))
-    mock_http_client.get = AsyncMock(
-        side_effect=AssertionError("detail must not be called")
-    )
+    mock_http_client.get = AsyncMock(side_effect=AssertionError("detail must not be called"))
     token = "https://example.wd5.myworkdayjobs.com|example|Site"
     jobs = await fetch_workday_jobs(token)
     assert jobs == []

@@ -61,9 +61,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_cover_letter")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 # Three writer models — matches plan section "Eval 2".
@@ -123,16 +121,12 @@ def _pick_pairs(fixture: dict[str, Any], n: int = 5) -> list[dict[str, Any]]:
 
 def _first_payload(fixture: dict[str, Any]) -> OptimizedPayload:
     first_tid = next(iter(fixture["targets"]))
-    return OptimizedPayload.model_validate(
-        fixture["targets"][first_tid]["payload"]
-    )
+    return OptimizedPayload.model_validate(fixture["targets"][first_tid]["payload"])
 
 
 def _anon_id(model_short: str, pair_idx: int, salt: str) -> str:
     """Stable but blind: a letter that doesn't reveal the model."""
-    h = hashlib.sha256(
-        f"{salt}|{model_short}|{pair_idx}".encode()
-    ).hexdigest()[:6]
+    h = hashlib.sha256(f"{salt}|{model_short}|{pair_idx}".encode()).hexdigest()[:6]
     return f"draft-{pair_idx}-{h}"
 
 
@@ -178,12 +172,7 @@ async def _write_one(
         if isinstance(raw_paras, list):
             for p in raw_paras:
                 if isinstance(p, dict):
-                    text = (
-                        p.get("text")
-                        or p.get("content")
-                        or p.get("body")
-                        or p.get("paragraph")
-                    )
+                    text = p.get("text") or p.get("content") or p.get("body") or p.get("paragraph")
                     if isinstance(text, str) and text:
                         paragraphs.append(text)
                 elif isinstance(p, str):
@@ -192,9 +181,7 @@ async def _write_one(
                 schema_ok = True
         elif isinstance(raw_paras, str) and raw_paras.strip():
             # A single-string body — split on double-newlines.
-            paragraphs = [
-                p.strip() for p in raw_paras.split("\n\n") if p.strip()
-            ]
+            paragraphs = [p.strip() for p in raw_paras.split("\n\n") if p.strip()]
             schema_ok = bool(paragraphs)
 
     return {
@@ -379,9 +366,7 @@ def _write_report(
             f"${cost_by_model.get(m, 0):.4f} | "
             f"{int(sum(latency_by_model.get(m, [0])) / max(1, len(latency_by_model.get(m, [1]))))}ms |"
         )
-    md.append(
-        f"\nJudge (Opus 4.7) total cost: **${judge_cost:.4f}**."
-    )
+    md.append(f"\nJudge (Opus 4.7) total cost: **${judge_cost:.4f}**.")
     md.append("")
 
     # Judge findings, anonymized.
@@ -399,6 +384,7 @@ def _write_report(
         parsed = j["parsed"]
         ranks = parsed.get("ranks", {})
         scores = parsed.get("scores", {})
+
         def _sum(label: str) -> str:
             s = scores.get(label) or {}
             try:
@@ -409,6 +395,7 @@ def _write_report(
                 )
             except (TypeError, ValueError):
                 return "?"
+
         md.append(
             f"| {cid[:8]} | {(case.get('title') or '')[:40]} | "
             f"{ranks.get('A', '?')} | {ranks.get('B', '?')} | "
@@ -476,11 +463,7 @@ def main() -> None:
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
-    base = (
-        Path(args.output)
-        if args.output
-        else (_RESULTS_DIR / f"eval_cover_letter_{ts}")
-    )
+    base = Path(args.output) if args.output else (_RESULTS_DIR / f"eval_cover_letter_{ts}")
     base.parent.mkdir(parents=True, exist_ok=True)
     inflight = base.with_suffix(".inflight.json")
 
@@ -493,11 +476,7 @@ def main() -> None:
 
     # ----- Writer pass --------------------------------------------------
     sem = asyncio.Semaphore(args.concurrency)
-    writer_jobs = [
-        (case, short, slug)
-        for case in pairs
-        for short, slug in _WRITER_MODELS.items()
-    ]
+    writer_jobs = [(case, short, slug) for case in pairs for short, slug in _WRITER_MODELS.items()]
 
     async def _writer_bounded(job: tuple[dict[str, Any], str, str]) -> dict[str, Any]:
         case, short, slug = job
@@ -515,9 +494,7 @@ def main() -> None:
         pending = {asyncio.create_task(_writer_bounded(j)) for j in writer_jobs}
         completed = 0
         while pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 writer_results.append(t.result())
                 completed += 1
@@ -532,9 +509,7 @@ def main() -> None:
                         indent=2,
                     )
                 )
-                logger.info(
-                    "Writer progress: %d/%d", completed, len(writer_jobs)
-                )
+                logger.info("Writer progress: %d/%d", completed, len(writer_jobs))
         return writer_results
 
     writer_results = asyncio.run(_run_all())
@@ -546,6 +521,7 @@ def main() -> None:
     # ----- Judge pass ---------------------------------------------------
     judge_results: list[dict[str, Any]] = []
     if not args.skip_judge:
+
         async def _judge_all() -> list[dict[str, Any]]:
             out: list[dict[str, Any]] = []
             sem2 = asyncio.Semaphore(min(3, args.concurrency))
@@ -561,9 +537,7 @@ def main() -> None:
             pending = {asyncio.create_task(_bounded(c)) for c in pairs}
             completed = 0
             while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     out.append(t.result())
                     completed += 1

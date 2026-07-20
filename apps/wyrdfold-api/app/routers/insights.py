@@ -139,9 +139,7 @@ def target_insights(
     cached: TargetInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
-    result = compute_targets(
-        supabase, _since(period), target_ids=target_ids, user_id=user_id
-    )
+    result = compute_targets(supabase, _since(period), target_ids=target_ids, user_id=user_id)
     insights_cache.set(cache_key, result)
     return result
 
@@ -159,8 +157,6 @@ def skills_cost_insights(
     cached: SkillsCostInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
-    result = compute_skills_cost(
-        supabase, _since(period), user_id=user_id, target_ids=target_ids
-    )
+    result = compute_skills_cost(supabase, _since(period), user_id=user_id, target_ids=target_ids)
     insights_cache.set(cache_key, result)
     return result

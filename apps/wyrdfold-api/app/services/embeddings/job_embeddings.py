@@ -244,11 +244,7 @@ async def embed_jobs_batch(
             ]
 
             def _write(c: list[dict[str, Any]]) -> Any:
-                return (
-                    supabase.table(TABLE)
-                    .upsert(c, on_conflict="job_posting_id,model")
-                    .execute()
-                )
+                return supabase.table(TABLE).upsert(c, on_conflict="job_posting_id,model").execute()
 
             for w in range(0, len(to_write), _BATCH_WRITE_CHUNK):
                 chunk = to_write[w : w + _BATCH_WRITE_CHUNK]
@@ -259,8 +255,7 @@ async def embed_jobs_batch(
                 except Exception:
                     consecutive_write_failures += 1
                     logger.exception(
-                        "Batched embed write failed for %d row(s) "
-                        "(consecutive failure %d/%d)",
+                        "Batched embed write failed for %d row(s) (consecutive failure %d/%d)",
                         len(chunk),
                         consecutive_write_failures,
                         _WRITE_BREAKER_LIMIT,
@@ -268,9 +263,7 @@ async def embed_jobs_batch(
                     counts["error"] += len(chunk)
                     if consecutive_write_failures >= _WRITE_BREAKER_LIMIT:
                         remaining = len(to_write) - (w + len(chunk))
-                        counts["aborted"] = remaining + max(
-                            0, len(rows) - (i + len(batch))
-                        )
+                        counts["aborted"] = remaining + max(0, len(rows) - (i + len(batch)))
                         logger.warning(
                             "Batched embed: write circuit breaker tripped "
                             "(%d consecutive chunk failures) — aborting the "

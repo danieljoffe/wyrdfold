@@ -31,12 +31,8 @@ _CLIENT_CACHE_SIZE = 8
 
 
 @lru_cache(maxsize=_CLIENT_CACHE_SIZE)
-def _cached_voyage(
-    api_key: str | None, timeout: float, max_retries: int
-) -> VoyageEmbeddingsClient:
-    return VoyageEmbeddingsClient(
-        api_key=api_key, timeout=timeout, max_retries=max_retries
-    )
+def _cached_voyage(api_key: str | None, timeout: float, max_retries: int) -> VoyageEmbeddingsClient:
+    return VoyageEmbeddingsClient(api_key=api_key, timeout=timeout, max_retries=max_retries)
 
 
 def reset_embeddings_client_cache() -> None:

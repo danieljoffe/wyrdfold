@@ -274,9 +274,7 @@ _TITLE_TIERS: dict[int, tuple[str, ...]] = {
 }
 
 _LEVEL_TO_TIER: dict[str, int] = {
-    level.lower(): tier
-    for tier, levels in _TITLE_TIERS.items()
-    for level in levels
+    level.lower(): tier for tier, levels in _TITLE_TIERS.items() for level in levels
 }
 # Multi-word level aliases the LLM emits for ``profile.seniority.level``.
 _LEVEL_TO_TIER["vice president"] = 7
@@ -318,9 +316,7 @@ def _highest_title_tier(title_lower: str) -> int | None:
     return None
 
 
-def _seniority_tier_penalty(
-    title_lower: str, profile_level: str | None
-) -> float:
+def _seniority_tier_penalty(title_lower: str, profile_level: str | None) -> float:
     """Penalty when the title sits more than one tier below the profile.
 
     Same tier or one below = no penalty (e.g. a Manager title for a
@@ -377,18 +373,14 @@ def _score_role_titles(
     """
     if not search_keywords:
         return 0.0, []
-    matched = [
-        kw for kw in search_keywords if _keyword_or_alias_in_text(kw, title_lower)
-    ]
+    matched = [kw for kw in search_keywords if _keyword_or_alias_in_text(kw, title_lower)]
     if not matched:
         return 0.0, []
     credit = _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT * _title_match_specificity(matched)
     return credit, matched
 
 
-def _calc_max_possible(
-    profile: ScoringProfile, search_keywords: list[str] | None = None
-) -> float:
+def _calc_max_possible(profile: ScoringProfile, search_keywords: list[str] | None = None) -> float:
     """Calculate the maximum possible raw score for a profile.
 
     Used as the normalizer so scores represent a true percentage of how
@@ -503,9 +495,7 @@ def score_job_with_profile(
             all_matched.append(signal)
 
     # ---- Role-title intent (search_keywords) ----
-    role_title_points, role_title_matches = _score_role_titles(
-        search_keywords, title_lower
-    )
+    role_title_points, role_title_matches = _score_role_titles(search_keywords, title_lower)
     if role_title_matches:
         breakdown.role_titles += role_title_points
         all_matched.extend(role_title_matches)
@@ -543,9 +533,7 @@ def score_job_with_profile(
     # Pushes "Engineer" / "Rep" titles below the floor for a Director
     # target even when no explicit negative-keyword matches. Stacks
     # additively with the negative bucket since both are deductions.
-    breakdown.negative += _seniority_tier_penalty(
-        title_lower, profile.seniority.level
-    )
+    breakdown.negative += _seniority_tier_penalty(title_lower, profile.seniority.level)
 
     # Role-match guard: a target with role-intent keywords whose title
     # matched none (role_titles == 0) must not be carried to a passing
@@ -634,9 +622,7 @@ def score_title_against_profile(
             all_matched.append(signal)
 
     # Role-title intent (search_keywords)
-    role_title_points, role_title_matches = _score_role_titles(
-        search_keywords, title_lower
-    )
+    role_title_points, role_title_matches = _score_role_titles(search_keywords, title_lower)
     if role_title_matches:
         breakdown.role_titles += role_title_points
         all_matched.extend(role_title_matches)
@@ -648,9 +634,7 @@ def score_title_against_profile(
             excluded = True
 
     # Seniority-tier penalty — see _seniority_tier_penalty docstring
-    breakdown.negative += _seniority_tier_penalty(
-        title_lower, profile.seniority.level
-    )
+    breakdown.negative += _seniority_tier_penalty(title_lower, profile.seniority.level)
 
     # Role-match guard — see score_job_with_profile: role keywords set but
     # title matched none ⇒ keyword matches alone must not carry the score

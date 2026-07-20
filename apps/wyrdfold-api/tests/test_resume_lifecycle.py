@@ -254,9 +254,7 @@ class TestPersistenceHelpers:
         from app.services.tailor.persistence import upsert_user_job
 
         supabase = MagicMock()
-        upsert_user_job(
-            supabase, user_id="user-1", job_posting_id="job-9", status="applied"
-        )
+        upsert_user_job(supabase, user_id="user-1", job_posting_id="job-9", status="applied")
 
         supabase.table.assert_called_with("user_jobs")
         upsert_call = supabase.table.return_value.upsert.call_args
@@ -309,9 +307,7 @@ class TestSingleResumeStatusBump:
                 "app.routers.tailor.run_tailor_pipeline",
                 return_value=success,
             ),
-            patch(
-                "app.services.tailor.persistence.mark_job_resume_draft"
-            ) as mock_mark,
+            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
         ):
             mock_opt.get_latest.return_value = MagicMock(
                 payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
@@ -374,9 +370,7 @@ class TestSingleResumeStatusBump:
                 "app.routers.tailor.run_tailor_pipeline",
                 return_value=success,
             ),
-            patch(
-                "app.services.tailor.persistence.mark_job_resume_draft"
-            ) as mock_mark,
+            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
         ):
             mock_opt.get_latest.return_value = MagicMock(
                 payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
@@ -606,9 +600,7 @@ class TestApproveResume:
 
         supabase = MagicMock()
         record = _make_record(document_type="cover_letter")
-        approved_record = _make_record(
-            document_type="cover_letter", approved_at=_NOW
-        )
+        approved_record = _make_record(document_type="cover_letter", approved_at=_NOW)
 
         with (
             patch("app.services.tailor.persistence.get", return_value=record),
@@ -904,9 +896,7 @@ class TestCheckpointEndpoint:
                 "app.services.tailor.versions.checkpoint",
                 return_value=True,
             ) as mock_checkpoint,
-            patch(
-                "app.services.tailor.persistence.update_payload_md"
-            ) as mock_update,
+            patch("app.services.tailor.persistence.update_payload_md") as mock_update,
         ):
             result = tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
@@ -929,9 +919,7 @@ class TestCheckpointEndpoint:
 
         with (
             patch("app.services.tailor.persistence.get", return_value=record),
-            patch(
-                "app.services.tailor.persistence.update_payload_md"
-            ) as mock_update,
+            patch("app.services.tailor.persistence.update_payload_md") as mock_update,
             patch(
                 "app.services.tailor.versions.checkpoint",
                 return_value=True,
@@ -967,9 +955,7 @@ class TestCheckpointEndpoint:
 
         with (
             patch("app.services.tailor.persistence.get", return_value=record),
-            patch(
-                "app.services.tailor.versions.checkpoint"
-            ) as mock_checkpoint,
+            patch("app.services.tailor.versions.checkpoint") as mock_checkpoint,
             pytest.raises(HTTPException) as exc_info,
         ):
             tailor_router.checkpoint_tailored_resume(
@@ -991,9 +977,7 @@ class TestCheckpointEndpoint:
 
         with (
             patch("app.services.tailor.persistence.get", return_value=record),
-            patch(
-                "app.services.tailor.versions.checkpoint"
-            ) as mock_checkpoint,
+            patch("app.services.tailor.versions.checkpoint") as mock_checkpoint,
         ):
             result = tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
@@ -1046,9 +1030,7 @@ class TestMarkDocxRendered:
         update_call = supabase.table.return_value.update.call_args[0][0]
         assert update_call["storage_path"] == "anon/rec-1.docx"
         assert update_call["docx_payload_md_hash"] == "hash-xyz"
-        supabase.table.return_value.update.return_value.eq.assert_called_with(
-            "id", "rec-1"
-        )
+        supabase.table.return_value.update.return_value.eq.assert_called_with("id", "rec-1")
 
 
 class TestDownloadCache:
@@ -1080,9 +1062,7 @@ class TestDownloadCache:
                 return_value=b"PKcached-bytes",
             ) as mock_download,
             patch("app.routers.tailor.md_to_docx") as mock_render,
-            patch(
-                "app.services.tailor.persistence.mark_docx_rendered"
-            ) as mock_mark,
+            patch("app.services.tailor.persistence.mark_docx_rendered") as mock_mark,
         ):
             user_supabase = MagicMock()
             response = await tailor_router.download_tailored_resume(
@@ -1120,9 +1100,7 @@ class TestDownloadCache:
                 "app.services.tailor.persistence.upload_docx",
                 return_value="anon/rec-1.docx",
             ),
-            patch(
-                "app.services.tailor.persistence.mark_docx_rendered"
-            ) as mock_mark,
+            patch("app.services.tailor.persistence.mark_docx_rendered") as mock_mark,
         ):
             response = await tailor_router.download_tailored_resume(
                 resume_id="rec-1",

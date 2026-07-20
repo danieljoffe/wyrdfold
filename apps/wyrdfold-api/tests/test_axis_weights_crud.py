@@ -37,16 +37,12 @@ def _row(
 
 def _wire_select(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
     """Mock the 3-eq chain used by ``get_user_target`` (table-select-eq-eq)."""
-    chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute
-    )
+    chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute
     chain.return_value.data = rows
 
 
 def _wire_update(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
-    chain = (
-        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute
-    )
+    chain = supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute
     chain.return_value.data = rows
 
 
@@ -63,9 +59,7 @@ def test_set_axis_weights_snapshots_prior_into_previous() -> None:
         "seniority_fit": 0.2,
         "domain_fit": 0.2,
     }
-    new = AxisWeights(
-        title_fit=0.1, skills_fit=0.4, seniority_fit=0.4, domain_fit=0.1
-    )
+    new = AxisWeights(title_fit=0.1, skills_fit=0.4, seniority_fit=0.4, domain_fit=0.1)
 
     supabase = MagicMock()
     _wire_select(supabase, [_row(axis_weights=prior)])
@@ -158,9 +152,7 @@ def test_undo_swaps_current_and_previous() -> None:
         [_row(axis_weights=previous, axis_weights_previous=current)],
     )
 
-    result = crud.undo_user_target_axis_weights(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    result = crud.undo_user_target_axis_weights(supabase, user_id="user-1", target_id="target-1")
 
     payload = supabase.table.return_value.update.call_args.args[0]
     assert payload["axis_weights"] == previous
@@ -181,17 +173,13 @@ def test_undo_with_no_previous_clears_current() -> None:
     }
 
     supabase = MagicMock()
-    _wire_select(
-        supabase, [_row(axis_weights=current, axis_weights_previous=None)]
-    )
+    _wire_select(supabase, [_row(axis_weights=current, axis_weights_previous=None)])
     _wire_update(
         supabase,
         [_row(axis_weights=None, axis_weights_previous=current)],
     )
 
-    result = crud.undo_user_target_axis_weights(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    result = crud.undo_user_target_axis_weights(supabase, user_id="user-1", target_id="target-1")
 
     payload = supabase.table.return_value.update.call_args.args[0]
     assert payload["axis_weights"] is None
@@ -204,9 +192,7 @@ def test_undo_returns_none_when_row_missing() -> None:
     supabase = MagicMock()
     _wire_select(supabase, [])
 
-    result = crud.undo_user_target_axis_weights(
-        supabase, user_id="user-1", target_id="missing"
-    )
+    result = crud.undo_user_target_axis_weights(supabase, user_id="user-1", target_id="missing")
 
     assert result is None
     supabase.table.return_value.update.assert_not_called()

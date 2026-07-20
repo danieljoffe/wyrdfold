@@ -101,8 +101,5 @@ def _legacy_concat(existing_content: str, parsed: ParsedResume) -> str:
     will need to resolve.
     """
     return (
-        f"{existing_content}\n\n"
-        f"---\n"
-        f"[Uploaded Resume: {parsed.source_filename}]\n\n"
-        f"{parsed.text}"
+        f"{existing_content}\n\n---\n[Uploaded Resume: {parsed.source_filename}]\n\n{parsed.text}"
     )

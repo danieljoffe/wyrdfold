@@ -107,9 +107,7 @@ async def test_default_call_uses_base_prompt(monkeypatch: pytest.MonkeyPatch) ->
     the cached system slot invalidates the cache."""
     seen: dict[str, object] = {}
 
-    async def fake_complete_json(
-        *_args: object, system: str, **kwargs: object
-    ) -> object:
+    async def fake_complete_json(*_args: object, system: str, **kwargs: object) -> object:
         seen["system"] = system
         seen["max_tokens"] = kwargs["max_tokens"]
         return (JobFitResult(fit_score=80, axes=_axes(), reasoning="ok"), MagicMock())
@@ -137,9 +135,7 @@ async def test_extract_logistics_appends_addendum(
     so the additional JSON section doesn't truncate mid-write."""
     seen: dict[str, object] = {}
 
-    async def fake_complete_json(
-        *_args: object, system: str, **kwargs: object
-    ) -> object:
+    async def fake_complete_json(*_args: object, system: str, **kwargs: object) -> object:
         seen["system"] = system
         seen["max_tokens"] = kwargs["max_tokens"]
         return (
@@ -173,6 +169,4 @@ def test_addendum_is_strictly_additive() -> None:
     Otherwise the shadow-comparison contract breaks: 'old vs new' would
     actually be 'old vs (new + base-edit)' — confounding the eval."""
     assert _SYSTEM_PROMPT in (_SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM)
-    assert (
-        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM
-    ).startswith(_SYSTEM_PROMPT)
+    assert (_SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM).startswith(_SYSTEM_PROMPT)

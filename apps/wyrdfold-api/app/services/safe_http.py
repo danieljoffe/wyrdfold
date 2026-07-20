@@ -93,12 +93,8 @@ class _PinningBackend(AsyncNetworkBackend):
         # split-horizon / round-robin DNS that mixes a public and an internal
         # record. Generic message: never echo the resolved IP to callers.
         if any(_is_disallowed_address(ip) for ip in ips):
-            logger.warning(
-                "ssrf_block(connect): %s resolved to a disallowed address", host
-            )
-            raise httpcore.ConnectError(
-                "host resolves to a disallowed (private/internal) address"
-            )
+            logger.warning("ssrf_block(connect): %s resolved to a disallowed address", host)
+            raise httpcore.ConnectError("host resolves to a disallowed (private/internal) address")
         # Pin: connect to the validated IP literal so no second resolution can
         # rebind onto an internal address. httpcore still SNIs/cert-verifies
         # against the original hostname when it runs start_tls on this stream.
@@ -119,7 +115,9 @@ class _PinningBackend(AsyncNetworkBackend):
     ) -> AsyncNetworkStream:
         # No hostname to resolve; delegate unchanged. (Not used by our clients.)
         return await self._base.connect_unix_socket(
-            path, timeout=timeout, socket_options=socket_options  # type: ignore[arg-type]
+            path,
+            timeout=timeout,
+            socket_options=socket_options,  # type: ignore[arg-type]
         )
 
     async def sleep(self, seconds: float) -> None:

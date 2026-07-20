@@ -61,9 +61,9 @@ def _owned_posting_supabase() -> tuple[MagicMock, dict[str, MagicMock]]:
                 tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value.data
             ) = [{"id": "job-1"}]
         elif name == "user_targets":
-            (
-                tbl.select.return_value.eq.return_value.execute.return_value.data
-            ) = [{"target_id": "tgt-a"}]
+            (tbl.select.return_value.eq.return_value.execute.return_value.data) = [
+                {"target_id": "tgt-a"}
+            ]
         elif name == "scores":
             (
                 tbl.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute.return_value.data
@@ -109,9 +109,7 @@ def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row(
         app.dependency_overrides.clear()
 
     # Per-user archive happened, scoped to the caller.
-    assert upsert_calls == [
-        {"user_id": "user-a", "job_posting_id": "job-1", "status": "archived"}
-    ]
+    assert upsert_calls == [{"user_id": "user-a", "job_posting_id": "job-1", "status": "archived"}]
     # The shared `jobs` row was NEVER hard-deleted — that was the regression
     # that cascade-wiped every other user's data. `jobs` is still *read* for
     # the ownership check, but `.delete()` must never be issued on it.
@@ -228,18 +226,14 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
         # would otherwise ship and the endpoint discards. Assert every
         # count=exact select on this path carried head=True.
         count_selects = [
-            c
-            for c in supabase.table.return_value.select.call_args_list
-            if "count" in c.kwargs
+            c for c in supabase.table.return_value.select.call_args_list if "count" in c.kwargs
         ]
         assert count_selects, "expected a count=exact select on the status path"
         assert all(c.kwargs.get("head") is True for c in count_selects)
         # And it must gate ``job_is_live`` so the count reflects the live
         # list, not the raw not-excluded scored count (which over-reports
         # ~4.5x with archived jobs — 12,853 vs 2,808 on the heaviest target).
-        live_eq = (
-            supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq
-        )
+        live_eq = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq
         live_eq.assert_called_with("job_is_live", True)
     finally:
         app.dependency_overrides.clear()

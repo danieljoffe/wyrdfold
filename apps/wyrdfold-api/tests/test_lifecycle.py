@@ -31,8 +31,7 @@ def _supabase_for_sweep(
             # rows for whichever user this call is for. MagicMock can't
             # branch on eq args easily; queue per-call side effects.
             t.update.return_value.eq.return_value.eq.return_value.execute.side_effect = [
-                MagicMock(data=flipped_rows_by_user.get(uid, []))
-                for uid in idle_user_ids
+                MagicMock(data=flipped_rows_by_user.get(uid, [])) for uid in idle_user_ids
             ]
         elif name == "targets":
             t.select.return_value.in_.return_value.execute.return_value.data = [
@@ -57,9 +56,7 @@ def _supabase_for_sweep(
 async def test_sweep_deactivates_idle_users_and_emails_once(monkeypatch):
     sb = _supabase_for_sweep(
         idle_user_ids=["u-idle"],
-        flipped_rows_by_user={
-            "u-idle": [{"target_id": "t-1", "user_id": "u-idle"}]
-        },
+        flipped_rows_by_user={"u-idle": [{"target_id": "t-1", "user_id": "u-idle"}]},
     )
     email_spy = AsyncMock(return_value=True)
     monkeypatch.setattr(lifecycle.notify, "send_target_paused_email", email_spy)
@@ -77,9 +74,7 @@ async def test_sweep_deactivates_idle_users_and_emails_once(monkeypatch):
 async def test_sweep_skips_users_with_no_active_links(monkeypatch):
     """Idempotency: an idle user whose links are already inactive gets no
     update rows back → no email, count 0."""
-    sb = _supabase_for_sweep(
-        idle_user_ids=["u-idle"], flipped_rows_by_user={"u-idle": []}
-    )
+    sb = _supabase_for_sweep(idle_user_ids=["u-idle"], flipped_rows_by_user={"u-idle": []})
     email_spy = AsyncMock()
     monkeypatch.setattr(lifecycle.notify, "send_target_paused_email", email_spy)
 
@@ -106,9 +101,7 @@ async def test_sweep_disabled_when_threshold_zero(monkeypatch):
 async def test_email_failure_does_not_block_deactivation(monkeypatch):
     sb = _supabase_for_sweep(
         idle_user_ids=["u-idle"],
-        flipped_rows_by_user={
-            "u-idle": [{"target_id": "t-1", "user_id": "u-idle"}]
-        },
+        flipped_rows_by_user={"u-idle": [{"target_id": "t-1", "user_id": "u-idle"}]},
     )
     monkeypatch.setattr(
         lifecycle.notify,
@@ -214,9 +207,7 @@ def test_gate_blocks_idle_payer(monkeypatch):
     ]
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(
-        payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0
-    )
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
 
     gate = build_budget_gate(sb, ["t-idle", "t-fresh"])
     assert gate.target_blocked("t-idle") is True
@@ -230,18 +221,14 @@ def test_gate_null_last_seen_not_blocked(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"}
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
         {"user_id": "u-1", "llm_monthly_budget_usd": None, "last_seen_at": None},
     ]
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(
-        payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0
-    )
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
 
     gate = build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False
@@ -251,9 +238,7 @@ def test_gate_idle_defer_zero_disables(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"}
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
     ancient = (datetime.now(UTC) - timedelta(days=365)).isoformat()
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
@@ -261,9 +246,7 @@ def test_gate_idle_defer_zero_disables(monkeypatch):
     ]
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(
-        payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0
-    )
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
 
     gate = build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False

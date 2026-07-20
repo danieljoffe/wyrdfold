@@ -78,9 +78,7 @@ def test_correctness_report_empty_without_labels() -> None:
 def test_correctness_report_counts_unlabeled_separately() -> None:
     titles_by_target = {"t1": ["A", "B"]}
     labels = {"t1": {"A": True}}  # B unlabeled
-    results = [
-        {"model": "m", "target_id": "t1", "chunk_idx": 0, "verdicts": {1: True, 2: True}}
-    ]
+    results = [{"model": "m", "target_id": "t1", "chunk_idx": 0, "verdicts": {1: True, 2: True}}]
     rep = _correctness_report(results, titles_by_target, labels, batch_size=25)
     assert rep["m"]["scored"] == 1
     assert rep["m"]["unlabeled_verdicts"] == 1

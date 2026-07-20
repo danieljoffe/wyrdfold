@@ -73,9 +73,7 @@ def wipe(user_id: str, dry_run: bool) -> None:
     prefix = "[dry-run] would delete" if dry_run else "deleted"
 
     # 1. Resolve the user's user_targets so we can scope scores + status_log
-    ut_resp = sb.table("user_targets").select("id, target_id").eq(
-        "user_id", user_id
-    ).execute()
+    ut_resp = sb.table("user_targets").select("id, target_id").eq("user_id", user_id).execute()
     ut_rows = cast(list[dict[str, Any]], ut_resp.data or [])
     user_target_ids = [r["id"] for r in ut_rows]
     target_ids = list({r["target_id"] for r in ut_rows})
@@ -91,15 +89,11 @@ def wipe(user_id: str, dry_run: bool) -> None:
     posting_ids: list[str] = []
     if target_ids:
         scores_resp = (
-            sb.table("scores")
-            .select("job_posting_id")
-            .in_("target_id", target_ids)
-            .execute()
+            sb.table("scores").select("job_posting_id").in_("target_id", target_ids).execute()
         )
-        posting_ids = list({
-            r["job_posting_id"]
-            for r in cast(list[dict[str, Any]], scores_resp.data or [])
-        })
+        posting_ids = list(
+            {r["job_posting_id"] for r in cast(list[dict[str, Any]], scores_resp.data or [])}
+        )
     logger.info("user touched %d distinct postings (via scores)", len(posting_ids))
 
     # 3. Tailored docs — ON DELETE CASCADE on ``document_versions.resume_id``
@@ -133,17 +127,13 @@ def wipe(user_id: str, dry_run: bool) -> None:
             or 0
         )
         if not dry_run:
-            sb.table("status_log").delete().in_(
-                "posting_id", posting_ids
-            ).execute()
+            sb.table("status_log").delete().in_("posting_id", posting_ids).execute()
         logger.info("%s %d status_log rows", prefix, sl_count)
 
     # 6. Reset jobs.status for the touched postings (shared catalog).
     if posting_ids:
         if not dry_run:
-            sb.table("jobs").update({"status": "new"}).in_(
-                "id", posting_ids
-            ).execute()
+            sb.table("jobs").update({"status": "new"}).in_("id", posting_ids).execute()
         logger.info(
             "%s reset %d jobs.status -> 'new' (shared catalog rows)",
             "would" if dry_run else "did",

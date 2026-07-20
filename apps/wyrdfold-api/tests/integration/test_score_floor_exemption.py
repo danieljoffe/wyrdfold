@@ -60,9 +60,7 @@ def seeded_floor_scores(service_client: Client) -> Iterator[tuple[str, str, str]
                 },
             ]
         ).execute()
-        service_client.table("targets").insert(
-            {"id": target_id, "label": "Floor Target"}
-        ).execute()
+        service_client.table("targets").insert({"id": target_id, "label": "Floor Target"}).execute()
         service_client.table("scores").insert(
             [
                 # Graded (real fit score) at 40 — below a 50 floor, must drop.

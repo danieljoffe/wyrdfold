@@ -35,9 +35,7 @@ from app.services.targets import crud
 def test_delete_reference_jd_constrains_on_target_id() -> None:
     supabase = MagicMock()
     delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.eq.return_value.eq.return_value.execute.return_value.data = [
-        {"id": "ref-1"}
-    ]
+    delete_chain.eq.return_value.eq.return_value.execute.return_value.data = [{"id": "ref-1"}]
 
     assert crud.delete_reference_jd(supabase, "ref-1", target_id="tgt-1") is True
 
@@ -52,10 +50,7 @@ def test_delete_reference_jd_returns_false_when_not_in_target() -> None:
     delete_chain = supabase.table.return_value.delete.return_value
     delete_chain.eq.return_value.eq.return_value.execute.return_value.data = []
 
-    assert (
-        crud.delete_reference_jd(supabase, "ref-other-target", target_id="tgt-1")
-        is False
-    )
+    assert crud.delete_reference_jd(supabase, "ref-other-target", target_id="tgt-1") is False
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +71,7 @@ async def test_analysis_unowned_target_is_404_before_any_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """JWT caller not linked to target_id → 404; no cache read, no LLM call."""
-    monkeypatch.setattr(
-        crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"}
-    )
+    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"})
     from app.services.analysis import persistence as persistence_mod
 
     get_cached = MagicMock()
@@ -111,9 +104,7 @@ async def test_analysis_owned_target_passes_gate(
 ) -> None:
     """Linked caller proceeds past the ownership gate (404s later on the
     missing optimized doc, NOT on ownership)."""
-    monkeypatch.setattr(
-        crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"}
-    )
+    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"})
     from app.services.experience import optimized as opt_mod
 
     monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: None)

@@ -46,9 +46,7 @@ def target_with_contribution(service_client: Client) -> Iterator[tuple[str, str]
     try:
         yield target_id, ref.id
     finally:
-        service_client.table("contribution_votes").delete().eq(
-            "reference_jd_id", ref.id
-        ).execute()
+        service_client.table("contribution_votes").delete().eq("reference_jd_id", ref.id).execute()
         service_client.table("reference_jds").delete().eq("target_id", target_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
 
@@ -71,11 +69,7 @@ def test_votes_are_anonymous_and_own_row_only(
     # ...but a raw RLS read returns ONLY A's row — B's vote is invisible, so no
     # one can tell who voted how (anonymity).
     visible = (
-        a.table("contribution_votes")
-        .select("user_id")
-        .eq("reference_jd_id", ref_id)
-        .execute()
-        .data
+        a.table("contribution_votes").select("user_id").eq("reference_jd_id", ref_id).execute().data
     )
     assert [r["user_id"] for r in visible] == [uid_a]
 
@@ -122,15 +116,17 @@ def test_quorum_suppresses_and_upvote_rescues(
 
     # One down-vote: net 1 < quorum 2 -> not suppressed.
     votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=-1)
-    assert votes.recompute_suppression(
-        service_client, reference_jd_id=ref_id, quorum=2
-    ) == (False, False)
+    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+        False,
+        False,
+    )
 
     # Second down-vote: net 2 >= quorum 2 -> suppressed (and it CHANGED).
     votes.set_user_vote(b, reference_jd_id=ref_id, user_id=uid_b, value=-1)
-    assert votes.recompute_suppression(
-        service_client, reference_jd_id=ref_id, quorum=2
-    ) == (True, True)
+    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+        True,
+        True,
+    )
     # The merge drops the suppressed contribution — the only one here, so the
     # shared profile empties out.
     ref_jds = crud.list_reference_jds(service_client, target_id)
@@ -139,9 +135,10 @@ def test_quorum_suppresses_and_upvote_rescues(
 
     # A switches to an up-vote: net 0 < quorum -> rescued (un-suppressed).
     votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=1)
-    assert votes.recompute_suppression(
-        service_client, reference_jd_id=ref_id, quorum=2
-    ) == (False, True)
+    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+        False,
+        True,
+    )
     ref_jds = crud.list_reference_jds(service_client, target_id)
     assert not any(j.suppressed for j in ref_jds)
     assert merge_reference_jds(ref_jds).categories["core_skills"].keywords == {"React": 3}

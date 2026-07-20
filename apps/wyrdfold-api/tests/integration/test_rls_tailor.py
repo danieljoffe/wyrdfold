@@ -38,9 +38,7 @@ def test_documents_read_is_rls_scoped(
     uid_a, uid_b = two_seeded_users
     service_client.table("documents").insert([_doc(uid_a), _doc(uid_b)]).execute()
 
-    rows = (
-        user_client_factory(uid_a).table("documents").select("user_id").execute().data
-    )
+    rows = user_client_factory(uid_a).table("documents").select("user_id").execute().data
     seen = {r["user_id"] for r in rows}
     assert uid_a in seen
     assert uid_b not in seen, "RLS leak: A sees B's tailored document"

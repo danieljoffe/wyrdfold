@@ -64,6 +64,7 @@ class StagedPatchConflictError(Exception):
     target profile (`version_conflict` from the RPC). The caller should
     re-review the staged patch against the now-current profile."""
 
+
 SYSTEM_PROMPT = (
     UNTRUSTED_CONTENT_DIRECTIVE
     + "\n\n"
@@ -163,19 +164,12 @@ def _fetch_unapplied_feedback(
     return [_parse_row(r) for r in rows]
 
 
-def _fetch_job_titles(
-    supabase: Client, job_ids: list[str]
-) -> dict[str, str]:
+def _fetch_job_titles(supabase: Client, job_ids: list[str]) -> dict[str, str]:
     if not job_ids:
         return {}
     # Deduplicate to keep the in_() filter sensible at scale.
     unique = list({jid for jid in job_ids if jid})
-    resp = (
-        supabase.table("jobs")
-        .select("id, title")
-        .in_("id", unique)
-        .execute()
-    )
+    resp = supabase.table("jobs").select("id, title").in_("id", unique).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["id"]: r.get("title", "?") for r in rows}
 
@@ -225,9 +219,7 @@ def _strip_self_colliding_negatives(
     return patch.model_copy(update={"add_negative": kept}), dropped
 
 
-def _apply_patch_to_profile(
-    profile: dict[str, Any], patch: ProfilePatch
-) -> dict[str, Any]:
+def _apply_patch_to_profile(profile: dict[str, Any], patch: ProfilePatch) -> dict[str, Any]:
     """Pure function: returns a NEW profile dict with the patch applied.
 
     Leaves the input untouched so the caller can use it as ``prev_profile``
@@ -264,9 +256,7 @@ def _apply_patch_to_profile(
         for _cat_name, cat in (next_profile.get("categories") or {}).items():
             kws = cat.get("keywords") or {}
             if isinstance(kws, dict):
-                cat["keywords"] = {
-                    k: v for k, v in kws.items() if k.lower() not in drop_set
-                }
+                cat["keywords"] = {k: v for k, v in kws.items() if k.lower() not in drop_set}
 
     return cast(dict[str, Any], next_profile)
 
@@ -304,9 +294,7 @@ def _insert_log(
     return TargetLearningLogRow.model_validate(rows[0])
 
 
-def _stamp_consumed_feedback(
-    supabase: Client, feedback_ids: list[str], run_id: str
-) -> None:
+def _stamp_consumed_feedback(supabase: Client, feedback_ids: list[str], run_id: str) -> None:
     if not feedback_ids:
         return
     supabase.table("job_feedback").update(
@@ -346,20 +334,14 @@ async def run_llm_learner(
         return None
 
     target_resp = await asyncio.to_thread(
-        lambda: supabase.table("targets")
-        .select("*")
-        .eq("id", target_id)
-        .single()
-        .execute()
+        lambda: supabase.table("targets").select("*").eq("id", target_id).single().execute()
     )
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
     prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
 
-    job_titles = _fetch_job_titles(
-        supabase, [r.job_posting_id for r in feedback]
-    )
+    job_titles = _fetch_job_titles(supabase, [r.job_posting_id for r in feedback])
 
     patch, llm_result = await complete_json(
         llm,
@@ -394,8 +376,7 @@ async def run_llm_learner(
         patch = patch.model_copy(
             update={
                 "rationale": (
-                    f"[dropped self-colliding negatives {dropped_negatives}] "
-                    + patch.rationale
+                    f"[dropped self-colliding negatives {dropped_negatives}] " + patch.rationale
                 )
             }
         )
@@ -463,9 +444,7 @@ async def run_llm_learner(
             f"by ≥{projection.move_threshold} pts, over the "
             f"{projection.max_moved_fraction:.0%} cap] "
         )
-        staged_patch = patch.model_copy(
-            update={"rationale": note + patch.rationale}
-        )
+        staged_patch = patch.model_copy(update={"rationale": note + patch.rationale})
         log = _insert_log(
             supabase,
             user_id=user_id,
@@ -513,9 +492,7 @@ async def run_llm_learner(
             "[auto-staged: the shared profile changed during the learn run "
             f"(expected v{expected_version}, found v{rpc_version})] "
         )
-        staged_patch = patch.model_copy(
-            update={"rationale": note + patch.rationale}
-        )
+        staged_patch = patch.model_copy(update={"rationale": note + patch.rationale})
         log = _insert_log(
             supabase,
             user_id=user_id,
@@ -575,9 +552,7 @@ async def run_llm_learner(
         patch.confidence,
         new_version,
     )
-    return LearningRunResult(
-        log=log, applied=True, profile_version_after=new_version
-    )
+    return LearningRunResult(log=log, applied=True, profile_version_after=new_version)
 
 
 def _apply_staged_merge(
@@ -609,8 +584,7 @@ def _apply_staged_merge(
     # Include the quarantined row in the merge WITHOUT flipping the DB flag
     # yet — the flag lifts only after the RPC accepts the write.
     unquarantined = [
-        j.model_copy(update={"suppressed": False}) if j.id == ref_jd_id else j
-        for j in ref_jds
+        j.model_copy(update={"suppressed": False}) if j.id == ref_jd_id else j for j in ref_jds
     ]
     prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
     next_profile = merge_reference_jds(unquarantined).model_dump()
@@ -642,9 +616,9 @@ def _apply_staged_merge(
     new_version = cast(int, rpc_version)
 
     if ref_jd_id is not None:
-        supabase.table("reference_jds").update({"suppressed": False}).eq(
-            "id", ref_jd_id
-        ).eq("target_id", target_id).execute()
+        supabase.table("reference_jds").update({"suppressed": False}).eq("id", ref_jd_id).eq(
+            "target_id", target_id
+        ).execute()
 
     new_run_id = str(uuid.uuid4())
     update_resp = (
@@ -671,9 +645,7 @@ def _apply_staged_merge(
     )
 
 
-def apply_staged_patch(
-    supabase: Client, *, user_id: str, run_id: str
-) -> LearningRunResult | None:
+def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> LearningRunResult | None:
     """Take a staged patch + apply it. Returns None if no staged row matches."""
     log_resp = (
         supabase.table(LEARNING_LOG_TABLE)
@@ -689,13 +661,7 @@ def apply_staged_patch(
         return None
 
     target_id = log_row["target_id"]
-    target_resp = (
-        supabase.table("targets")
-        .select("*")
-        .eq("id", target_id)
-        .single()
-        .execute()
-    )
+    target_resp = supabase.table("targets").select("*").eq("id", target_id).single().execute()
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
@@ -725,15 +691,12 @@ def apply_staged_patch(
     # forever" hazard the stage-time strip protects against (#47).
     stage_patch, dropped_negatives = _strip_self_colliding_negatives(
         stage_patch,
-        search_keywords=cast(
-            list[str], target_row.get("search_keywords") or []
-        ),
+        search_keywords=cast(list[str], target_row.get("search_keywords") or []),
         core_skills=_core_skill_keywords(prev_profile),
     )
     if dropped_negatives:
         logger.warning(
-            "Staged-patch apply dropped now-self-colliding negative(s) %s "
-            "for (user=%s, target=%s)",
+            "Staged-patch apply dropped now-self-colliding negative(s) %s for (user=%s, target=%s)",
             dropped_negatives,
             user_id,
             target_id,
@@ -828,9 +791,7 @@ def apply_staged_patch(
     )
 
 
-def reject_staged_patch(
-    supabase: Client, *, user_id: str, run_id: str
-) -> LearningRunResult | None:
+def reject_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> LearningRunResult | None:
     """Mark a staged patch as rejected. Does NOT stamp feedback as
     consumed — those rows stay unapplied so a future learn run can
     revisit them (the user said "no" to this *interpretation*, not to

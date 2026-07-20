@@ -54,9 +54,7 @@ def test_apply_search_multi_token_uses_or_chain() -> None:
     q = MagicMock()
     _apply_title_search(q, "customer director")
     q.ilike.assert_not_called()
-    q.or_.assert_called_once_with(
-        "title.ilike.*customer*,title.ilike.*director*"
-    )
+    q.or_.assert_called_once_with("title.ilike.*customer*,title.ilike.*director*")
 
 
 def test_apply_search_strips_commas_and_parens() -> None:

@@ -182,9 +182,7 @@ def test_patch_step_rejects_unknown_step_value(client_factory):
         },
     )
     client = client_factory(sb)
-    r = client.patch(
-        "/profile/onboarding/step", json={"current_step": "imaginary-step"}
-    )
+    r = client.patch("/profile/onboarding/step", json={"current_step": "imaginary-step"})
     assert r.status_code == 422
 
 

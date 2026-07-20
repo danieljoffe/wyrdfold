@@ -19,14 +19,10 @@ from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
 
 _LIST_URL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
-_DETAIL_URL = (
-    "https://api.smartrecruiters.com/v1/companies/{slug}/postings/{posting_id}"
-)
+_DETAIL_URL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings/{posting_id}"
 
 
-def _mock_response(
-    status_code: int, json_data: dict[str, Any] | None = None
-) -> MagicMock:
+def _mock_response(status_code: int, json_data: dict[str, Any] | None = None) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
     resp.json.return_value = json_data or {}
@@ -66,9 +62,7 @@ def _two_phase_handler(
 async def test_fetch_404_returns_empty(mock_http_client):
     """List endpoint 404 → no detail calls, empty result."""
     list_resp = _mock_response(404)
-    mock_http_client.get = AsyncMock(
-        side_effect=_two_phase_handler(list_response=list_resp)
-    )
+    mock_http_client.get = AsyncMock(side_effect=_two_phase_handler(list_response=list_resp))
     result = await fetch_smartrecruiters_jobs("missing-co")
     assert result == []
 
@@ -105,12 +99,8 @@ async def test_fetch_pulls_jd_body_and_posting_url_from_detail(mock_http_client)
         "location": {"city": "Berlin", "country": "DE"},
         "department": {"label": "Engineering"},
         "releasedDate": "2026-04-01T00:00:00Z",
-        "postingUrl": (
-            "https://jobs.smartrecruiters.com/example/sr-001-backend-engineer"
-        ),
-        "applyUrl": (
-            "https://jobs.smartrecruiters.com/example/sr-001-backend-engineer?oga=true"
-        ),
+        "postingUrl": ("https://jobs.smartrecruiters.com/example/sr-001-backend-engineer"),
+        "applyUrl": ("https://jobs.smartrecruiters.com/example/sr-001-backend-engineer?oga=true"),
         "ref": "https://api.smartrecruiters.com/v1/companies/example/postings/sr-001",
         "jobAd": {
             "sections": {
@@ -145,10 +135,7 @@ async def test_fetch_pulls_jd_body_and_posting_url_from_detail(mock_http_client)
     # and over the API ``ref``. Previously the fetcher used ``company.website``
     # which fell through to ``ref`` (the API URL) and that's why the LLM
     # analyzer was being handed JSON instead of HTML.
-    assert (
-        job.absolute_url
-        == "https://jobs.smartrecruiters.com/example/sr-001-backend-engineer"
-    )
+    assert job.absolute_url == "https://jobs.smartrecruiters.com/example/sr-001-backend-engineer"
 
 
 @pytest.mark.asyncio
@@ -218,9 +205,7 @@ async def test_fetch_drops_posting_when_detail_fetch_404s(mock_http_client):
 async def test_fetch_empty_content_returns_empty(mock_http_client):
     """An empty ``content`` array on the list response → no detail calls."""
     mock_http_client.get = AsyncMock(
-        side_effect=_two_phase_handler(
-            list_response=_mock_response(200, {"content": []})
-        )
+        side_effect=_two_phase_handler(list_response=_mock_response(200, {"content": []}))
     )
     result = await fetch_smartrecruiters_jobs("empty")
     assert result == []

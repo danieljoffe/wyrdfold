@@ -41,12 +41,8 @@ def test_list_feedback_reads_via_user_client(
 
     # Pass the ownership gate without touching the DB, and capture which
     # client the read path receives.
-    monkeypatch.setattr(
-        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
-    )
-    monkeypatch.setattr(
-        "app.routers.feedback.list_for_target", fake_list_for_target
-    )
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback.list_for_target", fake_list_for_target)
     app.dependency_overrides[get_supabase] = lambda: service_sb
     app.dependency_overrides[get_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
@@ -85,9 +81,7 @@ def test_create_feedback_upsert_via_user_client_learner_via_service(
     captured: dict[str, object] = {}
 
     monkeypatch.setattr("app.routers.feedback._job_exists", lambda *a, **k: True)
-    monkeypatch.setattr(
-        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
-    )
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
 
     def fake_upsert(supabase, **kwargs):
         captured["upsert_client"] = supabase
@@ -146,9 +140,7 @@ def test_learning_log_reads_via_user_client(
     (
         user_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data
     ) = []
-    monkeypatch.setattr(
-        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
-    )
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
     app.dependency_overrides[get_supabase] = lambda: service_sb
     app.dependency_overrides[get_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
@@ -171,9 +163,7 @@ def test_staged_apply_conflict_maps_to_409(
     and not a silent 404."""
     from app.services.llm_learner import StagedPatchConflictError
 
-    monkeypatch.setattr(
-        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
-    )
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
 
     def _raise(*_a: object, **_k: object) -> None:
         raise StagedPatchConflictError("profile moved")
@@ -196,22 +186,15 @@ def test_learner_trigger_rate_limited_at_10_per_minute(
     (conftest RATE_LIMIT_ENABLED=false); flip it on for this case."""
     from app.rate_limit import limiter
 
-    monkeypatch.setattr(
-        "app.routers.feedback._target_exists_for_user", lambda *a, **k: True
-    )
-    monkeypatch.setattr(
-        "app.routers.feedback.maybe_run_learner", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback.maybe_run_learner", lambda *a, **k: None)
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     client = TestClient(app)
     limiter.enabled = True
     try:
-        statuses = [
-            client.post(f"/targets/{_TARGET_ID}/learn").status_code
-            for _ in range(11)
-        ]
+        statuses = [client.post(f"/targets/{_TARGET_ID}/learn").status_code for _ in range(11)]
     finally:
         limiter.enabled = False
         limiter.reset()

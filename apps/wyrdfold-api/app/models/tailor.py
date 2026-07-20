@@ -219,16 +219,12 @@ class TailoredResumeRecord(BaseModel):
 
     def as_resume(self) -> TailoredResume:
         if self.document_type != "resume":
-            raise ValueError(
-                f"record is document_type={self.document_type!r}, not a resume"
-            )
+            raise ValueError(f"record is document_type={self.document_type!r}, not a resume")
         return TailoredResume.model_validate(self.payload)
 
     def as_cover_letter(self) -> TailoredCoverLetter:
         if self.document_type != "cover_letter":
-            raise ValueError(
-                f"record is document_type={self.document_type!r}, not a cover letter"
-            )
+            raise ValueError(f"record is document_type={self.document_type!r}, not a cover letter")
         return TailoredCoverLetter.model_validate(self.payload)
 
 

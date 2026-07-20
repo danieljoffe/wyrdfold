@@ -28,16 +28,13 @@ def _no_master_doc_by_default():
     """Default the master-doc lookup to None so the staleness check (#47) is
     a no-op for the existing reuse tests. The staleness tests below override
     this with their own ``patch`` to supply a master with a known created_at."""
-    with patch(
-        "app.services.tailor.reuse.get_latest_optimized", return_value=None
-    ):
+    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=None):
         yield
 
 
 def _profile(keywords_by_cat: dict[str, dict[str, int]]) -> ScoringProfile:
     cats = {
-        name: CategoryProfile(keywords=kws, weight=1.0)
-        for name, kws in keywords_by_cat.items()
+        name: CategoryProfile(keywords=kws, weight=1.0) for name, kws in keywords_by_cat.items()
     }
     return ScoringProfile(
         categories=cats,
@@ -158,9 +155,7 @@ def _reuse_supabase(
     score_rows: list[dict],
 ) -> MagicMock:
     docs_mock = MagicMock()
-    docs_chain = (
-        docs_mock.select.return_value.eq.return_value.order.return_value.limit.return_value
-    )
+    docs_chain = docs_mock.select.return_value.eq.return_value.order.return_value.limit.return_value
     # ``user_id=None`` path uses .is_("user_id", "null"); a real user uses .eq.
     docs_chain.is_.return_value.execute.return_value.data = doc_rows
     docs_chain.eq.return_value.execute.return_value.data = doc_rows
@@ -193,9 +188,9 @@ def test_find_reusable_resume_no_resumes() -> None:
 def test_find_reusable_resume_posting_not_in_target() -> None:
     """A recent resume whose posting has no scores row for this target
     must not be reused."""
-    resume_row = _record(
-        jd_snapshot="React TypeScript GraphQL Node.js developer"
-    ).model_dump(mode="json")
+    resume_row = _record(jd_snapshot="React TypeScript GraphQL Node.js developer").model_dump(
+        mode="json"
+    )
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[])
 
     result = find_reusable_resume(
@@ -211,9 +206,7 @@ def test_find_reusable_resume_below_threshold() -> None:
     resume_row = _record(jd_snapshot="Looking for a Python Django developer").model_dump(
         mode="json"
     )
-    supabase = _reuse_supabase(
-        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
-    )
+    supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
 
     result = find_reusable_resume(
         supabase,
@@ -228,9 +221,7 @@ def test_find_reusable_resume_above_threshold() -> None:
     resume_row = _record(
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
-    supabase = _reuse_supabase(
-        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
-    )
+    supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
 
     kws = {"react", "typescript", "graphql", "node.js"}
     result = find_reusable_resume(
@@ -253,9 +244,7 @@ def test_reuse_refused_when_resume_predates_master_edit() -> None:
     resume_row = _record(
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
-    supabase = _reuse_supabase(
-        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
-    )
+    supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
     master = SimpleNamespace(created_at=datetime(2026, 5, 1, tzinfo=UTC))
     with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
         result = find_reusable_resume(
@@ -271,9 +260,7 @@ def test_reuse_allowed_when_resume_newer_than_master_version() -> None:
     resume_row = _record(
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
-    supabase = _reuse_supabase(
-        doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}]
-    )
+    supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
     # Current master last versioned BEFORE the resume was generated → not stale.
     master = SimpleNamespace(created_at=datetime(2026, 4, 1, tzinfo=UTC))
     with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
@@ -356,9 +343,7 @@ def test_clone_resume_carries_markdown_and_cache_hash() -> None:
     # `insert_row` writes to `documents` first and then to the
     # versions table — find the documents call and assert against it.
     inserts = supabase.table.return_value.insert.call_args_list
-    main_insert = next(
-        call[0][0] for call in inserts if "jd_snapshot" in call[0][0]
-    )
+    main_insert = next(call[0][0] for call in inserts if "jd_snapshot" in call[0][0])
     assert main_insert["payload_md"] == md
     assert main_insert["docx_payload_md_hash"] == "hash-source"
     # And the returned record reflects them.

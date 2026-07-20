@@ -60,13 +60,7 @@ def test_user_profiles_cross_read_returns_empty(
     client_a = user_client_factory(uid_a)
 
     # Even explicitly targeting B's row, RLS yields nothing.
-    rows = (
-        client_a.table("user_profiles")
-        .select("user_id")
-        .eq("user_id", uid_b)
-        .execute()
-        .data
-    )
+    rows = client_a.table("user_profiles").select("user_id").eq("user_id", uid_b).execute().data
     assert rows == []
 
 

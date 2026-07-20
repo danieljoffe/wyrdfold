@@ -41,12 +41,7 @@ def test_admin_waitlist_requires_api_key() -> None:
     app.dependency_overrides.clear()
     client = TestClient(app)
     assert client.get("/admin/waitlist").status_code == 401
-    assert (
-        client.post(
-            "/admin/waitlist/invite", json={"email": "a@b.co"}
-        ).status_code
-        == 401
-    )
+    assert client.post("/admin/waitlist/invite", json={"email": "a@b.co"}).status_code == 401
 
 
 def test_invite_from_waitlist_upserts_invites_and_stamps(
@@ -57,9 +52,7 @@ def test_invite_from_waitlist_upserts_invites_and_stamps(
         {"id": "wl-1"}
     ]
 
-    r = TestClient(app).post(
-        "/admin/waitlist/invite", json={"email": "  Jane@Example.com "}
-    )
+    r = TestClient(app).post("/admin/waitlist/invite", json={"email": "  Jane@Example.com "})
 
     assert r.status_code == 200
     assert r.json() == {
@@ -81,9 +74,7 @@ def test_invite_from_waitlist_upserts_invites_and_stamps(
 
 
 def test_direct_invite_skips_waitlist_stamp(sb: MagicMock) -> None:
-    r = TestClient(app).post(
-        "/admin/waitlist/invite", json={"email": "new@example.com"}
-    )
+    r = TestClient(app).post("/admin/waitlist/invite", json={"email": "new@example.com"})
 
     assert r.status_code == 200
     assert r.json()["from_waitlist"] is False
@@ -100,9 +91,7 @@ def test_already_registered_is_409_after_allowlist_upsert(
         "A user with this email address has already been registered"
     )
 
-    r = TestClient(app).post(
-        "/admin/waitlist/invite", json={"email": "old@example.com"}
-    )
+    r = TestClient(app).post("/admin/waitlist/invite", json={"email": "old@example.com"})
 
     assert r.status_code == 409
     sb.table.return_value.upsert.assert_called_once()
@@ -110,9 +99,7 @@ def test_already_registered_is_409_after_allowlist_upsert(
 
 
 def test_invalid_email_is_422_with_no_side_effects(sb: MagicMock) -> None:
-    r = TestClient(app).post(
-        "/admin/waitlist/invite", json={"email": "not-an-email"}
-    )
+    r = TestClient(app).post("/admin/waitlist/invite", json={"email": "not-an-email"})
 
     assert r.status_code == 422
     sb.table.return_value.upsert.assert_not_called()
@@ -122,8 +109,7 @@ def test_invalid_email_is_422_with_no_side_effects(sb: MagicMock) -> None:
 def test_pending_filter_queries_null_invited_at(sb: MagicMock) -> None:
     chain = sb.table.return_value.select.return_value.order.return_value
     chain.is_.return_value.execute.return_value.data = [
-        {"email": "p@example.com", "created_at": "2026-07-01T00:00:00+00:00",
-         "invited_at": None}
+        {"email": "p@example.com", "created_at": "2026-07-01T00:00:00+00:00", "invited_at": None}
     ]
     chain.execute.return_value.data = []
 

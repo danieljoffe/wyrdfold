@@ -131,9 +131,7 @@ class TestTriageTitles:
         llm = MagicMock()
         titles = [f"Title {i}" for i in range(151)]
         with pytest.raises(ValueError, match="exceeds the 150-title cap"):
-            await triage_titles(
-                llm, target=_target(), titles=titles, model="deepseek-v3-2"
-            )
+            await triage_titles(llm, target=_target(), titles=titles, model="deepseek-v3-2")
         llm.complete_tool_use.assert_not_called()
 
     @pytest.mark.asyncio
@@ -150,9 +148,7 @@ class TestTriageTitles:
             await triage_titles(llm, target=_target(), titles=titles)
         llm.complete_tool_use.assert_not_called()
 
-    def test_phase1_batch_size_resolution(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_phase1_batch_size_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert phase1_batch_size("claude-haiku-4-5") == PHASE1_BATCH_SIZE
         assert phase1_batch_size("deepseek-v3-2") == 150
         monkeypatch.setattr(settings, "phase1_triage_model", "deepseek-v3-2")
@@ -200,9 +196,7 @@ class TestTriageTitles:
         assert result is not None  # MagicMock, but not None
 
     @pytest.mark.asyncio
-    async def test_llm_failure_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_llm_failure_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Network/parse/timeout errors return ({}, None) so the caller
         admits everything. A Phase 1 outage must not block ingestion."""
         llm = MagicMock()
@@ -210,24 +204,19 @@ class TestTriageTitles:
         async def boom(*args: object, **kwargs: object) -> object:
             raise RuntimeError("anthropic-api 503")
 
-        monkeypatch.setattr(
-            "app.services.relevance.title_triage.complete_json", boom
-        )
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", boom)
 
-        verdicts, result = await triage_titles(
-            llm, target=_target(), titles=["A"]
-        )
+        verdicts, result = await triage_titles(llm, target=_target(), titles=["A"])
 
         assert verdicts == {}
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_duplicate_verdict_last_wins(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_duplicate_verdict_last_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """If the LLM hallucinates duplicates, the later one overwrites.
         Documents the contract — we don't error out on a model that
         slips up; we just take the last verdict per id."""
+
         async def fake_complete_json(*args: object, **kwargs: object) -> object:
             return (
                 TitleTriageResponse(
@@ -250,11 +239,10 @@ class TestTriageTitles:
         assert verdicts[1].promising is False
 
     @pytest.mark.asyncio
-    async def test_missing_verdict_omitted_from_dict(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_missing_verdict_omitted_from_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When the LLM omits an id, we don't fabricate a value.
         Caller-side .get(i, True) handles the fail-open."""
+
         async def fake_complete_json(*args: object, **kwargs: object) -> object:
             return (
                 TitleTriageResponse(
@@ -270,9 +258,7 @@ class TestTriageTitles:
         )
 
         llm = MagicMock()
-        verdicts, _ = await triage_titles(
-            llm, target=_target(), titles=["A", "B"]
-        )
+        verdicts, _ = await triage_titles(llm, target=_target(), titles=["A", "B"])
 
         # Only the present id is in the dict; caller treats missing as
         # admit (fail-open).
@@ -281,11 +267,10 @@ class TestTriageTitles:
         assert 2 not in verdicts
 
     @pytest.mark.asyncio
-    async def test_matching_title_prefix_is_kept(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_matching_title_prefix_is_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A verdict whose echoed title_prefix leads the id's input title is
         trusted (#47)."""
+
         async def fake(*args: object, **kwargs: object) -> object:
             return (
                 TitleTriageResponse(
@@ -297,9 +282,7 @@ class TestTriageTitles:
                 MagicMock(),
             )
 
-        monkeypatch.setattr(
-            "app.services.relevance.title_triage.complete_json", fake
-        )
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake)
         verdicts, _ = await triage_titles(
             MagicMock(), target=_target(), titles=["Frontend Engineer", "Sales Rep"]
         )
@@ -312,6 +295,7 @@ class TestTriageTitles:
         """A verdict whose title_prefix matches a DIFFERENT input title (a
         transposed id) is dropped, so the caller fail-opens rather than
         assigning the wrong verdict (#47)."""
+
         async def fake(*args: object, **kwargs: object) -> object:
             return (
                 TitleTriageResponse(
@@ -325,18 +309,14 @@ class TestTriageTitles:
                 MagicMock(),
             )
 
-        monkeypatch.setattr(
-            "app.services.relevance.title_triage.complete_json", fake
-        )
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake)
         verdicts, _ = await triage_titles(
             MagicMock(), target=_target(), titles=["Frontend Engineer", "Sales Rep"]
         )
         assert set(verdicts.keys()) == {1}  # id 2 dropped → fail-open admit
 
     @pytest.mark.asyncio
-    async def test_out_of_range_id_is_dropped(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_out_of_range_id_is_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def fake(*args: object, **kwargs: object) -> object:
             return (
                 TitleTriageResponse(
@@ -348,9 +328,7 @@ class TestTriageTitles:
                 MagicMock(),
             )
 
-        monkeypatch.setattr(
-            "app.services.relevance.title_triage.complete_json", fake
-        )
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake)
         verdicts, _ = await triage_titles(
             MagicMock(), target=_target(), titles=["Frontend Engineer"]
         )
@@ -398,12 +376,8 @@ class TestCacheMarker:
 
         monkeypatch.setattr(triage_mod, "complete_json", fake_complete_json)
 
-        target = _target(
-            promising=["Senior FE Engineer"], unpromising=["Sales Lead"]
-        )
-        await triage_titles(
-            MagicMock(), target=target, titles=["Title One", "Title Two"]
-        )
+        target = _target(promising=["Senior FE Engineer"], unpromising=["Sales Lead"])
+        await triage_titles(MagicMock(), target=target, titles=["Title One", "Title Two"])
 
         messages = captured["messages"]
         assert isinstance(messages, list) and len(messages) == 1
@@ -421,9 +395,7 @@ class TestCacheMarker:
         assert "Title Two" in suffix
         # Marker is a split, not a rewrite: halves reassemble the exact
         # message the prompt has always sent.
-        assert prefix + suffix == _build_user_message(
-            target, ["Title One", "Title Two"]
-        )
+        assert prefix + suffix == _build_user_message(target, ["Title One", "Title Two"])
 
     @pytest.mark.asyncio
     async def test_cached_prefix_is_stable_across_batches(
@@ -444,9 +416,7 @@ class TestCacheMarker:
 
         target = _target(promising=["Senior FE Engineer"])
         await triage_titles(MagicMock(), target=target, titles=["Batch One Title"])
-        await triage_titles(
-            MagicMock(), target=target, titles=["Other", "Different", "Batch"]
-        )
+        await triage_titles(MagicMock(), target=target, titles=["Other", "Different", "Batch"])
 
         assert len(prefixes) == 2
         assert prefixes[0] == prefixes[1]

@@ -52,9 +52,7 @@ def _check_phase2(sb: Any) -> None:
     models = {r.get("model") for r in rows}
     costs = [float(r.get("cost_usd", 0)) for r in rows]
     latencies = [int(r.get("latency_ms", 0)) for r in rows]
-    cache_hits = sum(
-        1 for r in rows if int(r.get("cache_read_input_tokens", 0)) > 0
-    )
+    cache_hits = sum(1 for r in rows if int(r.get("cache_read_input_tokens", 0)) > 0)
 
     print(f"  Models seen: {sorted(m for m in models if m)}")
     print(f"  Mean cost/call: ${statistics.mean(costs):.5f}")

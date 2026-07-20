@@ -56,10 +56,7 @@ async def main() -> int:
             continue
         parsed = result.parsed
         if not parsed or parsed.get("ok") is not True:
-            print(
-                f"PARSE-FAIL [latency={result.latency_ms}ms, "
-                f"raw={result.raw_content[:60]!r}]"
-            )
+            print(f"PARSE-FAIL [latency={result.latency_ms}ms, raw={result.raw_content[:60]!r}]")
             failures.append(short)
             continue
         total_cost += result.cost_usd

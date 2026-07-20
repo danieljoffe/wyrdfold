@@ -149,9 +149,7 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
 
 def _make_supabase_mock(*, insert_data: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    supabase.table.return_value.insert.return_value.execute.return_value.data = (
-        insert_data
-    )
+    supabase.table.return_value.insert.return_value.execute.return_value.data = insert_data
     supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = []
     supabase.storage.from_.return_value.upload.return_value = None
     return supabase
@@ -278,9 +276,7 @@ def _letter_with_paragraph(text: str) -> TailoredCoverLetter:
 def test_validate_warns_on_fabricated_number_in_prose() -> None:
     # The ref set is clean, but the prose narrates a number the source never
     # had — the exact gap the validator's old docstring conceded it missed.
-    letter = _letter_with_paragraph(
-        "At FightCamp I grew revenue 40% and shipped 12 features."
-    )
+    letter = _letter_with_paragraph("At FightCamp I grew revenue 40% and shipped 12 features.")
     cleaned, warnings = validate_cover_letter_refs(letter, _optimized_payload())
     # WARN, not strip: prose is preserved so legitimate copy isn't mangled.
     assert cleaned.paragraphs[0].text == letter.paragraphs[0].text
@@ -472,9 +468,7 @@ async def test_pipeline_cost_logs_under_tailor_cover_letter(
         contact=_contact(),
     )
     assert cost_record.call_args.kwargs["purpose"] == DEFAULT_COVER_LETTER_PURPOSE
-    assert (
-        cost_record.call_args.kwargs["metadata"]["recipient_company"] == "Acme"
-    )
+    assert cost_record.call_args.kwargs["metadata"]["recipient_company"] == "Acme"
 
 
 async def test_pipeline_preferences_are_passed_through(

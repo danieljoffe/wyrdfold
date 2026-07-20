@@ -85,14 +85,19 @@ def _psql(query: str) -> str | None:
         proc = subprocess.run(  # noqa: S603 — constant SQL, resolved psql path
             [
                 _PSQL_BIN,
-                "-h", PGHOST,
-                "-p", PGPORT,
-                "-U", PGUSER,
-                "-d", PGDATABASE,
+                "-h",
+                PGHOST,
+                "-p",
+                PGPORT,
+                "-U",
+                PGUSER,
+                "-d",
+                PGDATABASE,
                 "-t",  # tuples only (no header/row-count footer)
                 "-A",  # unaligned output
                 "-q",  # quiet
-                "-c", query,
+                "-c",
+                query,
             ],
             env={**os.environ, "PGPASSWORD": PGPASSWORD},
             capture_output=True,
@@ -192,9 +197,7 @@ def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None
     )
     assert rows is not None
     offenders = [
-        r
-        for r in rows.splitlines()
-        if r and r.split(":", 1)[0] in SERVICE_ROLE_ONLY_TABLES
+        r for r in rows.splitlines() if r and r.split(":", 1)[0] in SERVICE_ROLE_ONLY_TABLES
     ]
     assert not offenders, (
         "Service-role-only table(s) still grant privileges to "

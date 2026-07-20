@@ -66,9 +66,7 @@ def test_valid_email_inserts_and_returns_generic_success() -> None:
 
 def test_email_is_normalised_lowercase_and_trimmed() -> None:
     supabase, rec = _supabase_with_recorder()
-    resp = _client(supabase).post(
-        "/waitlist", json={"email": "  Jane.Doe@Example.COM  "}
-    )
+    resp = _client(supabase).post("/waitlist", json={"email": "  Jane.Doe@Example.COM  "})
 
     assert resp.status_code == 200
     assert rec["row"] == {"email": "jane.doe@example.com"}

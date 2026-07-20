@@ -38,18 +38,12 @@ def _profile(
     if core is not None:
         cats["core_skills"] = CategoryProfile(keywords=core, weight=core_weight)
     if secondary is not None:
-        cats["secondary_skills"] = CategoryProfile(
-            keywords=secondary, weight=secondary_weight
-        )
+        cats["secondary_skills"] = CategoryProfile(keywords=secondary, weight=secondary_weight)
     return ScoringProfile(
         categories=cats,
-        seniority=SeniorityProfile(
-            level=seniority_level, signals=seniority_signals or []
-        ),
+        seniority=SeniorityProfile(level=seniority_level, signals=seniority_signals or []),
         domain=DomainProfile(signals=domain_signals or [], weight=domain_weight),
-        negative=NegativeProfile(
-            keywords=negative_keywords or [], weight=negative_weight
-        ),
+        negative=NegativeProfile(keywords=negative_keywords or [], weight=negative_weight),
     )
 
 

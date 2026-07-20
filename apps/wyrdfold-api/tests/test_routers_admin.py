@@ -48,9 +48,7 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
             return 4.0
         return 12.0
 
-    def _fake_spend_by_purpose_all(
-        _sb: Any, *, since: datetime | None = None
-    ) -> dict[str, float]:
+    def _fake_spend_by_purpose_all(_sb: Any, *, since: datetime | None = None) -> dict[str, float]:
         if since is None:
             return {}
         # Approximate window
@@ -58,9 +56,7 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
             return {"phase1_triage": 1.0, "phase2_fit": 0.5}
         return {"phase1_triage": 8.0, "phase2_fit": 4.0}
 
-    def _fake_cache_metrics_all(
-        _sb: Any, *, since: datetime | None = None
-    ) -> dict[str, int]:
+    def _fake_cache_metrics_all(_sb: Any, *, since: datetime | None = None) -> dict[str, int]:
         assert since is not None  # endpoint always sets a window
         if since >= datetime.now(UTC) - timedelta(hours=25):
             # today: 800 read of 1000 total input tokens → 80% hit rate
@@ -104,9 +100,7 @@ def test_cost_summary_usage_pct_none_when_cap_disabled(
     _override(sb)
 
     monkeypatch.setattr(cost_log, "total_spend_all", lambda _s, **_kw: 5.0)
-    monkeypatch.setattr(
-        cost_log, "spend_by_purpose_all", lambda _s, **_kw: {}
-    )
+    monkeypatch.setattr(cost_log, "spend_by_purpose_all", lambda _s, **_kw: {})
     monkeypatch.setattr(
         cost_log,
         "cache_metrics_all",

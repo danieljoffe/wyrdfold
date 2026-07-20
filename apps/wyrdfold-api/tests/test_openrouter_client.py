@@ -80,8 +80,7 @@ def test_slug_map_covers_every_model_id() -> None:
 
     for model in get_args(ModelId):
         assert model in _MODEL_SLUG_MAP, (
-            f"{model!r} is a ModelId but has no OpenRouter slug. "
-            f"Add it to _MODEL_SLUG_MAP."
+            f"{model!r} is a ModelId but has no OpenRouter slug. Add it to _MODEL_SLUG_MAP."
         )
 
 

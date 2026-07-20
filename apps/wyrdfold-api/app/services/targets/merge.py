@@ -56,9 +56,7 @@ def merge_by_contributor(
     levels so the averaging/union semantics stay identical to the single-level
     merge it replaces.
     """
-    per_contributor = [
-        merge_profiles(profiles) for profiles in profiles_by_contributor if profiles
-    ]
+    per_contributor = [merge_profiles(profiles) for profiles in profiles_by_contributor if profiles]
     return merge_profiles(per_contributor)
 
 
@@ -102,8 +100,7 @@ def _merge_categories(
     merged: dict[str, CategoryProfile] = {}
     for cat_name in cat_keywords:
         keywords = {
-            kw: max(1, round(sum(ws) / len(ws)))
-            for kw, ws in cat_keywords[cat_name].items()
+            kw: max(1, round(sum(ws) / len(ws))) for kw, ws in cat_keywords[cat_name].items()
         }
         cat_w = sum(cat_weights[cat_name]) / len(cat_weights[cat_name])
         merged[cat_name] = CategoryProfile(keywords=keywords, weight=round(cat_w, 2))

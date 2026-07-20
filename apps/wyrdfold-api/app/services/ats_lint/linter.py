@@ -145,8 +145,7 @@ def lint_docx(
             LintViolation(
                 code="page_count",
                 message=(
-                    f"Document has {paragraph_count} non-empty paragraphs; "
-                    f"likely exceeds 2 pages."
+                    f"Document has {paragraph_count} non-empty paragraphs; likely exceeds 2 pages."
                 ),
                 severity="warning",
             )

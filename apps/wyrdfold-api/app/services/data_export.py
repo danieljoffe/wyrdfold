@@ -253,9 +253,7 @@ def write_export_zip(
     )
 
 
-def build_export_zip(
-    supabase: Client, *, user_id: str, service_supabase: Client
-) -> bytes:
+def build_export_zip(supabase: Client, *, user_id: str, service_supabase: Client) -> bytes:
     """In-memory convenience wrapper over ``write_export_zip`` (tests)."""
     buf = io.BytesIO()
     write_export_zip(supabase, buf, user_id=user_id, service_supabase=service_supabase)

@@ -85,9 +85,7 @@ def test_chunk_write_for_another_users_doc_is_denied(
 
 
 def _one_chunk_payload() -> OptimizedPayload:
-    return OptimizedPayload(
-        summary="hi", roles=[], skills=[Skill(name="React")], outcomes=[]
-    )
+    return OptimizedPayload(summary="hi", roles=[], skills=[Skill(name="React")], outcomes=[])
 
 
 async def test_upsert_writes_chunks_via_rls_and_cost_via_service_role(

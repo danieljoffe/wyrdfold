@@ -100,9 +100,7 @@ def test_dependency_503_when_anon_key_unset() -> None:
 
 def test_dependency_returns_bound_client(monkeypatch: pytest.MonkeyPatch) -> None:
     sentinel = MagicMock()
-    monkeypatch.setattr(
-        "app.supabase_pool.get_user_client", lambda token: sentinel
-    )
+    monkeypatch.setattr("app.supabase_pool.get_user_client", lambda token: sentinel)
     s = Settings(supabase_url="https://x.supabase.co", supabase_anon_key="anon")
     result = get_user_supabase(_req_with_auth("Bearer abc"), s)  # type: ignore[arg-type]
     assert result is sentinel

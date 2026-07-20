@@ -22,9 +22,7 @@ from app.services.targets.match import (
 from app.services.targets.suggest import DEFAULT_PURPOSE
 
 
-def _target_row(
-    *, id: str = "t1", label: str = "Senior Frontend Engineer"
-) -> dict[str, Any]:
+def _target_row(*, id: str = "t1", label: str = "Senior Frontend Engineer") -> dict[str, Any]:
     now = datetime.now(UTC).isoformat()
     return {
         "id": id,
@@ -145,9 +143,7 @@ async def test_suggest_and_match_excludes_users_existing_targets(
     supabase.rpc.return_value.execute.return_value.data = []
 
     # Bypass the supabase chain for get_user_target_ids — it's not the SUT here.
-    monkeypatch.setattr(
-        match_module, "get_user_target_ids", lambda _s, _u: {"t1"}
-    )
+    monkeypatch.setattr(match_module, "get_user_target_ids", lambda _s, _u: {"t1"})
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
 
@@ -172,9 +168,7 @@ async def test_suggest_and_match_marks_unmatched_suggestions_as_new(
     exact_chain.return_value.data = []
     supabase.rpc.return_value.execute.return_value.data = []
 
-    monkeypatch.setattr(
-        match_module, "get_user_target_ids", lambda _s, _u: set()
-    )
+    monkeypatch.setattr(match_module, "get_user_target_ids", lambda _s, _u: set())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
 

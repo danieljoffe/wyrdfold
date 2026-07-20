@@ -105,10 +105,5 @@ def test_user_client_cannot_read_other_users_user_job(
     client_a = user_client_factory(uid_a)
 
     # Explicitly targeting B's posting still returns nothing for A.
-    resp = (
-        client_a.table("user_jobs")
-        .select("*")
-        .eq("job_posting_id", posting_b)
-        .execute()
-    )
+    resp = client_a.table("user_jobs").select("*").eq("job_posting_id", posting_b).execute()
     assert (resp.data or []) == []

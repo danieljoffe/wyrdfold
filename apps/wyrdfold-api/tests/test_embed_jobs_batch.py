@@ -67,8 +67,7 @@ def _cost_log(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 def _rows(n: int) -> list[dict[str, Any]]:
     return [
-        {"id": f"j{i}", "title": f"Job {i}", "description_html": "<p>desc</p>"}
-        for i in range(n)
+        {"id": f"j{i}", "title": f"Job {i}", "description_html": "<p>desc</p>"} for i in range(n)
     ]
 
 

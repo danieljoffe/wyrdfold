@@ -106,9 +106,7 @@ def _apply_accent(style: Any, color: RGBColor, *, size_pt: float) -> None:
 
 
 @lru_cache(maxsize=64)
-def _build_reference_docx_cached(
-    preset: ResumeStylePreset, accent: ResumeStyleAccent
-) -> bytes:
+def _build_reference_docx_cached(preset: ResumeStylePreset, accent: ResumeStyleAccent) -> bytes:
     spec = PRESET_SPECS[preset]
     color = _rgb(ACCENT_HEX[accent])
 

@@ -14,7 +14,7 @@ def _make_docx_bytes(paragraphs: list[str] | None = None) -> bytes:
     from docx import Document
 
     doc = Document()
-    for text in (paragraphs or ["Senior Frontend Engineer", "React, TypeScript"]):
+    for text in paragraphs or ["Senior Frontend Engineer", "React, TypeScript"]:
         doc.add_paragraph(text)
     buf = io.BytesIO()
     doc.save(buf)
@@ -39,9 +39,7 @@ def _mock_supabase() -> MagicMock:
     supabase = MagicMock()
 
     # prose get_latest → None (first upload)
-    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.eq.return_value.execute.return_value.data = (
-        []
-    )
+    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.eq.return_value.execute.return_value.data = []
 
     # prose create_version → new doc
     supabase.table.return_value.insert.return_value.execute.return_value.data = [
@@ -68,16 +66,16 @@ class TestUploadResumeEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
 
         from datetime import UTC, datetime
 
         from app.models.experience import ProseDoc
 
         created_doc = ProseDoc(
-            id="prose-1", user_id=None, version=1,
+            id="prose-1",
+            user_id=None,
+            version=1,
             content="Software Engineer\nBuilt amazing things",
             created_at=datetime.now(UTC),
         )
@@ -132,9 +130,7 @@ class TestUploadResumeEndpoint:
         assert "Empty" in exc_info.value.detail
 
     @pytest.mark.asyncio
-    async def test_parse_timeout_returns_422(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_parse_timeout_returns_422(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A parse that exceeds the wall-clock bound returns 422 promptly
         instead of hanging the request (#29 M6)."""
         import time
@@ -145,9 +141,7 @@ class TestUploadResumeEndpoint:
 
         # Tiny bound + a parse that blocks past it -> wait_for raises TimeoutError.
         monkeypatch.setattr(exp_router, "_PARSE_TIMEOUT_SECONDS", 0.05)
-        monkeypatch.setattr(
-            exp_router, "parse_resume", lambda *a, **kw: time.sleep(0.5)
-        )
+        monkeypatch.setattr(exp_router, "parse_resume", lambda *a, **kw: time.sleep(0.5))
 
         file = _make_upload_file(b"some resume bytes")
         with pytest.raises(HTTPException) as exc_info:
@@ -265,7 +259,9 @@ class TestUploadResumeEndpoint:
         docx_bytes = _make_docx_bytes(["New upload content"])
 
         existing_doc = ProseDoc(
-            id="prose-old", user_id=None, version=3,
+            id="prose-old",
+            user_id=None,
+            version=3,
             content="Existing career narrative here.",
             created_at=datetime.now(UTC),
         )
@@ -279,25 +275,27 @@ class TestUploadResumeEndpoint:
         def fake_create(supabase: Any, user_id: Any, content: str) -> ProseDoc:
             created_content.append(content)
             return ProseDoc(
-                id="prose-new", user_id=None, version=4,
-                content=content, created_at=datetime.now(UTC),
+                id="prose-new",
+                user_id=None,
+                version=4,
+                content=content,
+                created_at=datetime.now(UTC),
             )
 
         monkeypatch.setattr(
-            "app.services.experience.prose.create_version", fake_create,
+            "app.services.experience.prose.create_version",
+            fake_create,
         )
         monkeypatch.setattr(
             "app.services.ingest.storage.upload_file",
             lambda *a, **kw: "anon/upload-2.docx",
         )
         monkeypatch.setattr(
-            "app.services.llm.cost_log.record", MagicMock(),
+            "app.services.llm.cost_log.record",
+            MagicMock(),
         )
 
-        merged_doc = (
-            "Existing career narrative here.\n"
-            "New upload content"
-        )
+        merged_doc = "Existing career narrative here.\nNew upload content"
         llm = MockLLMClient(scripted={MERGE_PURPOSE: merged_doc})
         supabase = _mock_supabase()
         file = _make_upload_file(docx_bytes)
@@ -329,13 +327,17 @@ class TestUploadResumeEndpoint:
         docx_bytes = _make_docx_bytes(["Career content"])
 
         monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: None,
+            "app.services.experience.prose.get_latest",
+            lambda *a, **kw: None,
         )
         monkeypatch.setattr(
             "app.services.experience.prose.create_version",
             lambda *a, **kw: ProseDoc(
-                id="prose-1", user_id=None, version=1,
-                content="Career content", created_at=datetime.now(UTC),
+                id="prose-1",
+                user_id=None,
+                version=1,
+                content="Career content",
+                created_at=datetime.now(UTC),
             ),
         )
         monkeypatch.setattr(
@@ -349,24 +351,33 @@ class TestUploadResumeEndpoint:
             derive_called["count"] += 1
             payload = OptimizedPayload(summary="Derived summary")
             result = LLMResult(
-                content="{}", model="claude-sonnet-4-6",
+                content="{}",
+                model="claude-sonnet-4-6",
                 usage=LLMUsage(input_tokens=100, output_tokens=50),
-                cost_usd=0.001, latency_ms=50,
+                cost_usd=0.001,
+                latency_ms=50,
             )
             return payload, result
 
         monkeypatch.setattr(
-            "app.services.experience.derive.derive_from_prose", fake_derive,
+            "app.services.experience.derive.derive_from_prose",
+            fake_derive,
         )
         monkeypatch.setattr(
-            "app.services.llm.cost_log.record", MagicMock(),
+            "app.services.llm.cost_log.record",
+            MagicMock(),
         )
         monkeypatch.setattr(
             "app.services.experience.optimized.create_version",
             lambda *a, **kw: OptimizedDoc(
-                id="opt-1", user_id=None, prose_doc_id="prose-1",
-                version=1, payload=OptimizedPayload(summary="Derived summary"),
-                markdown_view=None, source="llm", created_at=datetime.now(UTC),
+                id="opt-1",
+                user_id=None,
+                prose_doc_id="prose-1",
+                version=1,
+                payload=OptimizedPayload(summary="Derived summary"),
+                markdown_view=None,
+                source="llm",
+                created_at=datetime.now(UTC),
             ),
         )
         monkeypatch.setattr(

@@ -17,8 +17,13 @@ def main() -> None:
     url = os.environ.get("SUPABASE_URL") or os.environ["NEXT_PUBLIC_SUPABASE_URL"]
     sb = create_client(url, os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
-    ut_active = sb.table("user_targets").select("id", count="exact").eq("is_active", True).execute().count or 0
-    t_active = sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    ut_active = (
+        sb.table("user_targets").select("id", count="exact").eq("is_active", True).execute().count
+        or 0
+    )
+    t_active = (
+        sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    )
     print(f"before: user_targets active={ut_active}, targets active={t_active}")
 
     if ut_active:
@@ -26,12 +31,19 @@ def main() -> None:
 
     # Trigger should sync targets.is_active; backstop in case any row
     # was set directly on targets without a user link.
-    t_after_trigger = sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    t_after_trigger = (
+        sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    )
     if t_after_trigger:
         sb.table("targets").update({"is_active": False}).eq("is_active", True).execute()
 
-    ut_final = sb.table("user_targets").select("id", count="exact").eq("is_active", True).execute().count or 0
-    t_final = sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    ut_final = (
+        sb.table("user_targets").select("id", count="exact").eq("is_active", True).execute().count
+        or 0
+    )
+    t_final = (
+        sb.table("targets").select("id", count="exact").eq("is_active", True).execute().count or 0
+    )
     print(f"after:  user_targets active={ut_final}, targets active={t_final}")
     print("OK" if ut_final == 0 and t_final == 0 else "!! STILL ACTIVE ROWS — investigate")
 

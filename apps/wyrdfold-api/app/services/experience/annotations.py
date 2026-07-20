@@ -157,9 +157,7 @@ def apply_exclusions(
             excluded_outcome_substrings.append(ex.ref_value.lower())
 
     roles = [r for r in payload.roles if r.id not in excluded_role_ids]
-    skills = [
-        s for s in payload.skills if s.name.lower() not in excluded_skill_names
-    ]
+    skills = [s for s in payload.skills if s.name.lower() not in excluded_skill_names]
 
     def _outcome_excluded(o: Outcome) -> bool:
         if o.role_ref and o.role_ref in excluded_role_ids:
@@ -192,13 +190,13 @@ def build_annotations_text(
         lines.append("EMPHASIZE (prioritize these items):")
         for a in emphasize:
             reason = f" (reason: {a.reason})" if a.reason else ""
-            lines.append(f"- {a.ref_type} \"{a.ref_value}\"{reason}")
+            lines.append(f'- {a.ref_type} "{a.ref_value}"{reason}')
 
     if de_emphasize:
         lines.append("DE-EMPHASIZE (include only if space allows):")
         for a in de_emphasize:
             reason = f" (reason: {a.reason})" if a.reason else ""
-            lines.append(f"- {a.ref_type} \"{a.ref_value}\"{reason}")
+            lines.append(f'- {a.ref_type} "{a.ref_value}"{reason}')
 
     return "\n".join(lines)
 

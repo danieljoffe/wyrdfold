@@ -18,7 +18,13 @@ from typing import Literal
 from app.models.ats_lint import LintResult, LintViolation
 
 _TABLE_PIPE_RE = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
-_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+# `![...]` is the start of EVERY markdown image form — inline `![alt](url)`,
+# reference `![alt][ref]`, collapsed `![alt][]`, and shortcut `![alt]`. Matching
+# only the inline form (the old `!\[[^\]]*\]\([^)]+\)`) let reference-style
+# images slip past this linter while pandoc still fetched them server-side on
+# render — an SSRF bypass. The render boundary (pandoc_render._STRIP_IMAGES_LUA)
+# is the authoritative defense; this rejects images early with a clean 422.
+_IMAGE_RE = re.compile(r"!\[[^\]]*\]")
 _HTML_TAG_RE = re.compile(r"<[a-zA-Z][^>]*>")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _BULLET_RE = re.compile(r"^\s*[-*+]\s+(.+?)\s*$", re.MULTILINE)
@@ -90,10 +96,7 @@ def lint_markdown(
         violations.append(
             LintViolation(
                 code="no_inline_images",
-                message=(
-                    "Markdown contains an inline image. ATS parsers "
-                    "routinely drop image content."
-                ),
+                message=("Markdown contains an image. ATS parsers routinely drop image content."),
                 severity="error",
             )
         )
@@ -176,10 +179,7 @@ def lint_markdown(
         violations.append(
             LintViolation(
                 code="page_count",
-                message=(
-                    f"Markdown has {line_count} non-empty lines; "
-                    f"likely exceeds 2 pages."
-                ),
+                message=(f"Markdown has {line_count} non-empty lines; likely exceeds 2 pages."),
                 severity="warning",
             )
         )

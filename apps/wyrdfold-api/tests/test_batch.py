@@ -397,9 +397,7 @@ class TestBatchProcessing:
                 new_callable=AsyncMock,
                 return_value=success,
             ),
-            patch(
-                "app.services.tailor.persistence.mark_job_resume_draft"
-            ) as mock_mark,
+            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
         ):
             await process_batch(
                 supabase,
@@ -481,16 +479,12 @@ class TestBatchEndpoint:
             assert "nonexistent" in exc_info.value.detail
 
     @pytest.mark.asyncio
-    async def test_create_batch_happy_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_create_batch_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
         # Mock jobs lookup
-        _set_mock_data(supabase, [
-            {"id": "job-1", "title": "SWE", "description_html": "<p>JD</p>"}
-        ])
+        _set_mock_data(supabase, [{"id": "job-1", "title": "SWE", "description_html": "<p>JD</p>"}])
         llm = MagicMock()
         background = MagicMock()
 

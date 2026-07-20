@@ -75,8 +75,7 @@ async def _engaged_ids(supabase: Client, job_ids: list[str]) -> set[str]:
             .execute
         )
         out.update(
-            cast(str, r["job_posting_id"])
-            for r in cast(list[dict[str, Any]], resp.data or [])
+            cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], resp.data or [])
         )
     return out
 
@@ -95,8 +94,7 @@ async def _graded_ids(supabase: Client, job_ids: list[str]) -> set[str]:
             .execute
         )
         out.update(
-            cast(str, r["job_posting_id"])
-            for r in cast(list[dict[str, Any]], resp.data or [])
+            cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], resp.data or [])
         )
     return out
 
@@ -123,10 +121,7 @@ async def _archive_stale(supabase: Client, *, batch: int) -> int:
     for i in range(0, len(to_archive), _WRITE_CHUNK):
         chunk = to_archive[i : i + _WRITE_CHUNK]
         await asyncio.to_thread(
-            supabase.table("jobs")
-            .update({"archived_at": now})
-            .in_("id", chunk)
-            .execute
+            supabase.table("jobs").update({"archived_at": now}).in_("id", chunk).execute
         )
     if engaged:
         logger.info(
@@ -181,9 +176,7 @@ async def _purge_old(supabase: Client, *, batch: int) -> tuple[int, int]:
 
     for i in range(0, len(delete_ids), _WRITE_CHUNK):
         chunk = delete_ids[i : i + _WRITE_CHUNK]
-        await asyncio.to_thread(
-            supabase.table("jobs").delete().in_("id", chunk).execute
-        )
+        await asyncio.to_thread(supabase.table("jobs").delete().in_("id", chunk).execute)
 
     now = datetime.now(UTC).isoformat()
     for i in range(0, len(tombstone_ids), _WRITE_CHUNK):

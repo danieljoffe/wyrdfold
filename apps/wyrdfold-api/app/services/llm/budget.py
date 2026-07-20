@@ -62,9 +62,7 @@ def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
     enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
     plan = cast("str | None", rows[0].get("plan")) if rows else None
     return LlmAccount(
-        monthly_override_usd=(
-            float(cast(float, override)) if override is not None else None
-        ),
+        monthly_override_usd=(float(cast(float, override)) if override is not None else None),
         llm_enabled=enabled,
         plan=plan,
     )
@@ -115,9 +113,7 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
     # "Who pays" must match what get_client will actually do: only a key
     # that exists AND decrypts routes spend to the user; a broken row
     # falls back to the host key and must stay metered.
-    if keys_store.has_usable_key(
-        supabase, user_id=user_id, provider="openrouter"
-    ):
+    if keys_store.has_usable_key(supabase, user_id=user_id, provider="openrouter"):
         return ResolvedQuota(0.0, account.llm_enabled, None)
 
     entitlement = ent.entitlements_for(account.plan)
@@ -146,9 +142,7 @@ def raise_if_llm_disabled(enabled: bool) -> None:
         )
 
 
-def _raise_budget_429(
-    scope: str, limit_usd: float, spent_usd: float, *, user_id: str
-) -> None:
+def _raise_budget_429(scope: str, limit_usd: float, spent_usd: float, *, user_id: str) -> None:
     """Raise the 429 *and* capture a Sentry warning so per-user budget
     hits are observable (#26 F2). The 429 response is the user signal;
     the Sentry breadcrumb is the operator signal — a spike of cap hits
@@ -273,9 +267,7 @@ def check_user_budget(
     if hourly_limit_usd > 0:
         spent_hour = _window_spend(now - timedelta(hours=1))
         if spent_hour >= hourly_limit_usd:
-            _raise_budget_429(
-                "hourly", hourly_limit_usd, spent_hour, user_id=user_id
-            )
+            _raise_budget_429("hourly", hourly_limit_usd, spent_hour, user_id=user_id)
         _maybe_warn_approaching(
             user_id=user_id,
             scope="hourly",
@@ -286,9 +278,7 @@ def check_user_budget(
     if daily_limit_usd > 0:
         spent_day = _window_spend(now - timedelta(hours=24))
         if spent_day >= daily_limit_usd:
-            _raise_budget_429(
-                "daily", daily_limit_usd, spent_day, user_id=user_id
-            )
+            _raise_budget_429("daily", daily_limit_usd, spent_day, user_id=user_id)
         _maybe_warn_approaching(
             user_id=user_id,
             scope="daily",
@@ -306,13 +296,9 @@ def check_user_budget(
                 excluded_purposes=monthly_excluded_purposes,
             )
         else:
-            spent_month = cost_log.total_spend(
-                supabase, user_id=user_id, since=month_since
-            )
+            spent_month = cost_log.total_spend(supabase, user_id=user_id, since=month_since)
         if spent_month >= monthly_limit_usd:
-            _raise_budget_429(
-                "monthly", monthly_limit_usd, spent_month, user_id=user_id
-            )
+            _raise_budget_429("monthly", monthly_limit_usd, spent_month, user_id=user_id)
         _maybe_warn_approaching(
             user_id=user_id,
             scope="monthly",

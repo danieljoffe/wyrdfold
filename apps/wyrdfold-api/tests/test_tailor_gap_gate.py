@@ -44,9 +44,36 @@ def _insufficient_outcomes_payload() -> OptimizedPayload:
     """3 roles, 2 without outcomes — majority lack outcomes."""
     return OptimizedPayload(
         roles=[
-            Role(id="a", company="A", title="Eng", start="2020-01", end="2022-01", summary="s", skills=[], outcome_refs=["x"]),
-            Role(id="b", company="B", title="Eng", start="2018-01", end="2019-12", summary="s", skills=[], outcome_refs=[]),
-            Role(id="c", company="C", title="Eng", start="2016-01", end="2017-12", summary="s", skills=[], outcome_refs=[]),
+            Role(
+                id="a",
+                company="A",
+                title="Eng",
+                start="2020-01",
+                end="2022-01",
+                summary="s",
+                skills=[],
+                outcome_refs=["x"],
+            ),
+            Role(
+                id="b",
+                company="B",
+                title="Eng",
+                start="2018-01",
+                end="2019-12",
+                summary="s",
+                skills=[],
+                outcome_refs=[],
+            ),
+            Role(
+                id="c",
+                company="C",
+                title="Eng",
+                start="2016-01",
+                end="2017-12",
+                summary="s",
+                skills=[],
+                outcome_refs=[],
+            ),
         ],
     )
 
@@ -56,7 +83,16 @@ def _high_gap_pct_but_structural_ok() -> OptimizedPayload:
     Should NOT be blocked by the structural gate."""
     return OptimizedPayload(
         roles=[
-            Role(id="a", company="A", title="Eng", start="2020-01", end=None, summary=None, skills=[], outcome_refs=["x"]),
+            Role(
+                id="a",
+                company="A",
+                title="Eng",
+                start="2020-01",
+                end=None,
+                summary=None,
+                skills=[],
+                outcome_refs=["x"],
+            ),
         ],
         outcomes=[Outcome(description="Did things", metric=None, value=None, role_ref="a")],
         skills=[Skill(name="React"), Skill(name="TS")],

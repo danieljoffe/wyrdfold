@@ -28,9 +28,7 @@ def _patch_spend(monkeypatch: pytest.MonkeyPatch, *, hourly: float, daily: float
 
 def test_under_both_limits_passes(monkeypatch, fake_supabase):
     _patch_spend(monkeypatch, hourly=0.5, daily=2.0)
-    budget.check_user_budget(
-        fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=1.0
-    )
+    budget.check_user_budget(fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=1.0)
 
 
 def test_hourly_exceeded_raises_429(monkeypatch, fake_supabase):
@@ -58,26 +56,20 @@ def test_daily_exceeded_raises_429(monkeypatch, fake_supabase):
 
 def test_hourly_disabled_skips_query(monkeypatch, fake_supabase):
     calls = _patch_spend(monkeypatch, hourly=999.0, daily=2.0)
-    budget.check_user_budget(
-        fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=0.0
-    )
+    budget.check_user_budget(fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=0.0)
     # Only the daily query should fire.
     assert len(calls) == 1
 
 
 def test_daily_disabled_skips_query(monkeypatch, fake_supabase):
     calls = _patch_spend(monkeypatch, hourly=0.5, daily=999.0)
-    budget.check_user_budget(
-        fake_supabase, user_id="u1", daily_limit_usd=0.0, hourly_limit_usd=1.0
-    )
+    budget.check_user_budget(fake_supabase, user_id="u1", daily_limit_usd=0.0, hourly_limit_usd=1.0)
     assert len(calls) == 1
 
 
 def test_both_disabled_no_queries(monkeypatch, fake_supabase):
     calls = _patch_spend(monkeypatch, hourly=999.0, daily=999.0)
-    budget.check_user_budget(
-        fake_supabase, user_id="u1", daily_limit_usd=0.0, hourly_limit_usd=0.0
-    )
+    budget.check_user_budget(fake_supabase, user_id="u1", daily_limit_usd=0.0, hourly_limit_usd=0.0)
     assert calls == []
 
 
@@ -94,13 +86,13 @@ def test_hourly_trips_first_when_both_exceeded(monkeypatch, fake_supabase):
 def test_window_since_is_now_minus_offset(monkeypatch, fake_supabase):
     """Hourly window is 1h, daily is 24h, both anchored on now."""
     calls = _patch_spend(monkeypatch, hourly=0.0, daily=0.0)
-    budget.check_user_budget(
-        fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=1.0
-    )
+    budget.check_user_budget(fake_supabase, user_id="u1", daily_limit_usd=5.0, hourly_limit_usd=1.0)
     assert len(calls) == 2
     hourly_since: datetime = calls[0]["since"]
     daily_since: datetime = calls[1]["since"]
-    delta_seconds = (daily_since.replace(tzinfo=None) - hourly_since.replace(tzinfo=None)).total_seconds()
+    delta_seconds = (
+        daily_since.replace(tzinfo=None) - hourly_since.replace(tzinfo=None)
+    ).total_seconds()
     # 24h - 1h = 23h = 82800s; allow a few seconds of clock drift between calls.
     assert -82800 - 5 < delta_seconds < -82800 + 5
 
@@ -154,8 +146,7 @@ def test_background_heavy_ledger_does_not_trip_rails(monkeypatch, fake_supabase)
     # Both windows consulted the exclusion-aware sum with the given set.
     assert len(billable_calls) == 2
     assert all(
-        c["excluded_purposes"] == ("poll_scoring", "qualification.tagger")
-        for c in billable_calls
+        c["excluded_purposes"] == ("poll_scoring", "qualification.tagger") for c in billable_calls
     )
 
 

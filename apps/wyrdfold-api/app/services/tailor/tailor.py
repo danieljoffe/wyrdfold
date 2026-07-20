@@ -233,9 +233,7 @@ def validate_trace_refs(
     # "a literal clause from role.summary". We accept a *meaningful* clause
     # echoed out of the summary (see ``_traces_to_summary``); a trivial
     # one-word substring is not real traceability.
-    role_summaries: dict[str, str] = {
-        r.id: r.summary or "" for r in optimized.roles
-    }
+    role_summaries: dict[str, str] = {r.id: r.summary or "" for r in optimized.roles}
 
     warnings: list[str] = []
     cleaned_experience: list[TailoredRole] = []
@@ -243,9 +241,7 @@ def validate_trace_refs(
     for role in resume.experience:
         source = roles_by_id.get(role.source_role_ref)
         if source is None:
-            raise ValueError(
-                f"TailoredRole references unknown role id: {role.source_role_ref!r}"
-            )
+            raise ValueError(f"TailoredRole references unknown role id: {role.source_role_ref!r}")
         summary_for_role = role_summaries.get(role.source_role_ref, "")
         kept_bullets: list[TailoredBullet] = []
         for bullet in role.bullets:
@@ -257,8 +253,7 @@ def validate_trace_refs(
             traces_to_summary = _traces_to_summary(ref, summary_for_role)
             if not (traces_to_outcome or traces_to_summary):
                 warnings.append(
-                    f"Dropped bullet with untraceable ref {ref[:60]!r}: "
-                    f"{bullet.text[:80]!r}"
+                    f"Dropped bullet with untraceable ref {ref[:60]!r}: {bullet.text[:80]!r}"
                 )
                 continue
             outcome = outcomes_by_desc.get(ref) if traces_to_outcome else None
@@ -295,8 +290,7 @@ def validate_trace_refs(
 
         if role.company != source.company:
             warnings.append(
-                f"Corrected employer {role.company!r} -> {source.company!r} "
-                f"for role {source.id!r}"
+                f"Corrected employer {role.company!r} -> {source.company!r} for role {source.id!r}"
             )
         # Company + dates are authoritative from the source Role, never the
         # LLM's free text. Title is left to the tailoring step.
@@ -328,9 +322,7 @@ def validate_trace_refs(
         seen_skills.add(canonical)
         kept_skills.append(canonical)
     if len(kept_skills) > MAX_RESUME_SKILLS:
-        warnings.append(
-            f"Trimmed skills from {len(kept_skills)} to the {MAX_RESUME_SKILLS} cap"
-        )
+        warnings.append(f"Trimmed skills from {len(kept_skills)} to the {MAX_RESUME_SKILLS} cap")
         kept_skills = kept_skills[:MAX_RESUME_SKILLS]
 
     # Summary (#47): the summary ships verbatim and is min_length=1, so we
@@ -354,9 +346,7 @@ def validate_trace_refs(
         )
 
     return (
-        resume.model_copy(
-            update={"experience": cleaned_experience, "skills": kept_skills}
-        ),
+        resume.model_copy(update={"experience": cleaned_experience, "skills": kept_skills}),
         warnings,
     )
 
@@ -525,7 +515,7 @@ def validate_cover_letter_refs(
     for ref in letter.source_skill_refs:
         if ref in valid_skill_names:
             kept_skill_refs.append(ref)
-        elif (canonical := skill_normalized_to_canonical.get(_normalize_skill(ref))):
+        elif canonical := skill_normalized_to_canonical.get(_normalize_skill(ref)):
             kept_skill_refs.append(canonical)
         else:
             warnings.append(f"Dropped unknown skill_ref: {ref!r}")

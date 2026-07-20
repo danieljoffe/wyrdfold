@@ -52,9 +52,7 @@ def _build_supabase(
     # gone). The prior per-user status comes from user_jobs (below). Delete
     # route still uses the legacy shape with ``jobs.target_id`` inline.
     prior_status = posting_data.get("status", "new") if posting_data else "new"
-    posting_id_only = (
-        {"id": "abc"} if posting_data is not None else None
-    )
+    posting_id_only = {"id": "abc"} if posting_data is not None else None
     posting_with_target = (
         {**posting_data, "target_id": _TEST_TARGET_ID, "id": "abc"}
         if posting_data is not None
@@ -66,9 +64,7 @@ def _build_supabase(
         if name == "jobs":
             sel = t.select.return_value
             # status.py uses .single().execute() — selects just ``id``
-            sel.eq.return_value.single.return_value.execute.return_value = _Resp(
-                posting_id_only
-            )
+            sel.eq.return_value.single.return_value.execute.return_value = _Resp(posting_id_only)
             # jobs.py delete/get use .limit(1).execute() — still selects target_id
             sel.eq.return_value.limit.return_value.execute.return_value = _Resp(
                 [posting_with_target] if posting_with_target else None
@@ -86,16 +82,12 @@ def _build_supabase(
             )
             # Legacy delete-path chain (kept for jobs.py compatibility).
             t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-                [{"target_id": _TEST_TARGET_ID}]
-                if owns_posting and posting_with_target
-                else []
+                [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
             )
         elif name == "scores":
             # Status route: ``.eq("job_posting_id", id).in_("target_id", [...]).limit(1).execute()``
             score_rows = (
-                [{"target_id": _TEST_TARGET_ID}]
-                if owns_posting and posting_with_target
-                else []
+                [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
             )
             t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
                 score_rows
@@ -172,12 +164,10 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute.return_value = _Resp(
-                    {"id": "abc"}
+                t.select.return_value.eq.return_value.single.return_value.execute.return_value = (
+                    _Resp({"id": "abc"})
                 )
-                t.update.return_value.eq.return_value.execute.return_value = _Resp(
-                    None
-                )
+                t.update.return_value.eq.return_value.execute.return_value = _Resp(None)
             elif name == "user_targets":
                 t.select.return_value.eq.return_value.execute.return_value = _Resp(
                     [{"target_id": _TEST_TARGET_ID}]
@@ -235,8 +225,8 @@ def test_status_history_scopes_to_caller(client_factory):
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute.return_value = _Resp(
-                    {"id": "abc"}
+                t.select.return_value.eq.return_value.single.return_value.execute.return_value = (
+                    _Resp({"id": "abc"})
                 )
             elif name == "user_targets":
                 t.select.return_value.eq.return_value.execute.return_value = _Resp(
@@ -285,12 +275,8 @@ def test_status_update_only_evicts_owning_target_and_global_views(client_factory
     from app.cache import job_list_cache, jobs_cache_prefix, make_cache_key
 
     sibling_target = "22222222-2222-2222-2222-222222222222"
-    owning_key = make_cache_key(
-        jobs_cache_prefix(target_id=_TEST_TARGET_ID), page=1
-    )
-    sibling_key = make_cache_key(
-        jobs_cache_prefix(target_id=sibling_target), page=1
-    )
+    owning_key = make_cache_key(jobs_cache_prefix(target_id=_TEST_TARGET_ID), page=1)
+    sibling_key = make_cache_key(jobs_cache_prefix(target_id=sibling_target), page=1)
     global_key = make_cache_key(jobs_cache_prefix(target_id=None), page=1)
 
     job_list_cache.set(owning_key, {"v": "owning"})

@@ -133,17 +133,19 @@ def _emit_target(sb: Any, target: Any, fh: Any) -> None:
 
     # ---- Under-graded candidates (every axis >= 65 but overall < 80) ----
     under = [
-        r for r in rows
+        r
+        for r in rows
         if int(r["score"]) < 80
         and r.get("axis_scores")
         and all(
-            isinstance(r["axis_scores"].get(a), int) and r["axis_scores"][a] >= 65
-            for a in AXES
+            isinstance(r["axis_scores"].get(a), int) and r["axis_scores"][a] >= 65 for a in AXES
         )
     ]
     fh.write(f"\n### Under-graded candidates ({len(under)})\n\n")
-    fh.write("_Every axis ≥ 65 but overall < 80. If Sonnet is averaging-down or "
-             "applying a hidden ceiling, these are the cases worth re-grading._\n\n")
+    fh.write(
+        "_Every axis ≥ 65 but overall < 80. If Sonnet is averaging-down or "
+        "applying a hidden ceiling, these are the cases worth re-grading._\n\n"
+    )
     if not under:
         fh.write("_None — no under-graded rows fit the criteria._\n")
     else:

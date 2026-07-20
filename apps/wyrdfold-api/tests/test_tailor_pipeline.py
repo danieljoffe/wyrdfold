@@ -117,9 +117,7 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
         "resume_type": "generic",
         "jd_snapshot": "JD text",
         "jd_snapshot_hash": "hash",
-        "payload": TailoredResume.model_validate_json(
-            _valid_resume_json()
-        ).model_dump(mode="json"),
+        "payload": TailoredResume.model_validate_json(_valid_resume_json()).model_dump(mode="json"),
         "storage_path": None,
         "warnings": [],
         "model": "claude-sonnet-4-6",
@@ -133,9 +131,7 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
 
 def _make_supabase_mock(*, insert_data: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    supabase.table.return_value.insert.return_value.execute.return_value.data = (
-        insert_data
-    )
+    supabase.table.return_value.insert.return_value.execute.return_value.data = insert_data
     supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = []
     supabase.storage.from_.return_value.upload.return_value = None
     return supabase

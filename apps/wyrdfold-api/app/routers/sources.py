@@ -45,12 +45,7 @@ _SOURCE_LIST_COLS = "id, board_token, company_name, provider, enabled, job_count
 # `.execute()` round-trips off the event loop. See #107.
 @router.get("")
 def list_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
-    resp = (
-        supabase.table("sources")
-        .select(_SOURCE_LIST_COLS)
-        .order("company_name")
-        .execute()
-    )
+    resp = supabase.table("sources").select(_SOURCE_LIST_COLS).order("company_name").execute()
     return {"sources": resp.data or []}
 
 
@@ -139,7 +134,5 @@ async def detect_provider(
 
 @router.post("/seed", dependencies=[Depends(verify_api_key)])
 def seed_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
-    supabase.table("sources").upsert(
-        list(COMPANY_SEED), on_conflict="board_token"
-    ).execute()
+    supabase.table("sources").upsert(list(COMPANY_SEED), on_conflict="board_token").execute()
     return {"success": True, "seeded": len(COMPANY_SEED)}

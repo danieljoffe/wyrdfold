@@ -45,9 +45,7 @@ def _load_master_key() -> bytes:
     try:
         key = base64.b64decode(raw, validate=True)
     except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-        raise BYOKNotConfiguredError(
-            "BYOK_MASTER_KEY is not valid base64."
-        ) from exc
+        raise BYOKNotConfiguredError("BYOK_MASTER_KEY is not valid base64.") from exc
     if len(key) != _KEY_BYTES:
         raise BYOKNotConfiguredError(
             f"BYOK_MASTER_KEY must decode to exactly {_KEY_BYTES} bytes "

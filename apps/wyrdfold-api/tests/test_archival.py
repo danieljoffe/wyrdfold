@@ -205,12 +205,8 @@ class TestPollerPurgeGuard:
         assert kept == rows  # a resurrected tombstone beats a broken poll
 
     @pytest.mark.asyncio
-    async def test_flag_off_skips_the_sweep(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            poller_mod.settings, "archival_sweep_enabled", False
-        )
+    async def test_flag_off_skips_the_sweep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(poller_mod.settings, "archival_sweep_enabled", False)
         called = False
 
         async def _fake_sweep(_sb: Any) -> dict[str, int]:
@@ -218,10 +214,7 @@ class TestPollerPurgeGuard:
             called = True
             return {}
 
-        monkeypatch.setattr(
-            "app.services.archival.run_archival_sweep", _fake_sweep
-        )
+        monkeypatch.setattr("app.services.archival.run_archival_sweep", _fake_sweep)
         poller_mod._ARCHIVAL_LAST_RUN = 0.0
         await poller_mod._maybe_run_archival_sweep(object())
         assert called is False
-

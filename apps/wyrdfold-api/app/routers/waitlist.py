@@ -86,9 +86,7 @@ async def join_waitlist(
     if not _EMAIL_RE.match(email):
         # 422 is the shape rejection (well-formed request, bad value). It does
         # NOT depend on prior state, so it leaks nothing about existing rows.
-        raise HTTPException(
-            status_code=422, detail="Please enter a valid email address."
-        )
+        raise HTTPException(status_code=422, detail="Please enter a valid email address.")
 
     try:
         # supabase-py is synchronous; ``to_thread`` keeps the blocking
@@ -132,11 +130,7 @@ def get_signup_mode(
     try:
         rows = cast(
             "list[dict[str, str]]",
-            supabase.table("app_settings")
-            .select("value")
-            .eq("key", "signup_mode")
-            .execute()
-            .data
+            supabase.table("app_settings").select("value").eq("key", "signup_mode").execute().data
             or [],
         )
         if rows and rows[0].get("value") == "open":

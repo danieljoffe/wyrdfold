@@ -124,9 +124,7 @@ def enqueue(
     # initialization order across services unnecessarily.
     from app.services.llm.cost_log_buffer import buffer
 
-    buffer.enqueue(
-        _row_for(user_id=user_id, purpose=purpose, result=result, metadata=metadata)
-    )
+    buffer.enqueue(_row_for(user_id=user_id, purpose=purpose, result=result, metadata=metadata))
 
 
 def list_recent(
@@ -207,11 +205,7 @@ def _total_billable_spend_python(
     rows = cast(list[dict[str, Any]], resp.data or [])
     excluded = set(excluded_purposes)
     return round(
-        sum(
-            float(r["cost_usd"])
-            for r in rows
-            if r.get("purpose") not in excluded
-        ),
+        sum(float(r["cost_usd"]) for r in rows if r.get("purpose") not in excluded),
         6,
     )
 
@@ -241,13 +235,8 @@ def total_billable_spend(
             },
         ).execute()
     except Exception:
-        _log.debug(
-            "total_billable_spend_since RPC unavailable, falling back to "
-            "client-side sum"
-        )
-        return _total_billable_spend_python(
-            supabase, user_id, since, excluded_purposes
-        )
+        _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
+        return _total_billable_spend_python(supabase, user_id, since, excluded_purposes)
 
     raw = resp.data
     if raw is None:
@@ -289,9 +278,7 @@ def total_spend_all(
             {"p_since": since.isoformat() if since is not None else None},
         ).execute()
     except Exception:
-        _log.debug(
-            "total_spend_all_since RPC unavailable, falling back to client-side sum"
-        )
+        _log.debug("total_spend_all_since RPC unavailable, falling back to client-side sum")
         return _total_spend_all_python(supabase, since)
 
     raw = resp.data
@@ -383,9 +370,7 @@ def spend_by_purpose(
             },
         ).execute()
     except Exception:
-        _log.debug(
-            "spend_by_purpose_since RPC unavailable, falling back to client-side group"
-        )
+        _log.debug("spend_by_purpose_since RPC unavailable, falling back to client-side group")
         return _spend_by_purpose_python(supabase, user_id, since)
 
     raw = resp.data

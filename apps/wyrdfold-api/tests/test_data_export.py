@@ -130,9 +130,7 @@ def _seeded() -> _FakeSupabase:
 def _export(sb: _FakeSupabase, service: _FakeSupabase | None = None) -> bytes:
     """Build the export zip; same fake on both clients unless the user/service
     split is what's under test."""
-    return build_export_zip(
-        sb, user_id=_UID, service_supabase=sb if service is None else service
-    )
+    return build_export_zip(sb, user_id=_UID, service_supabase=sb if service is None else service)
 
 
 def _open(blob: bytes) -> zipfile.ZipFile:
@@ -147,8 +145,7 @@ def test_export_inventory_in_lockstep_with_deletion() -> None:
     """Export and erasure must cover the same per-user tables — those deleted
     on erasure plus those anonymized (the user's shared contributions)."""
     assert set(_EXPORT_TABLES) == (
-        set(account_deletion._USER_ID_TABLES)
-        | set(account_deletion._ANONYMIZED_TABLES)
+        set(account_deletion._USER_ID_TABLES) | set(account_deletion._ANONYMIZED_TABLES)
     )
 
 
@@ -302,13 +299,9 @@ def test_rls_gap_tables_read_via_service_client_only() -> None:
             "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID, "src": "service"}],
             "user_jobs": [{"user_id": _UID, "src": "service"}],
             "job_feedback": [{"user_id": _UID, "src": "service"}],
-            "user_api_keys": [
-                {"user_id": _UID, "provider": "openrouter", "last4": "ab12"}
-            ],
+            "user_api_keys": [{"user_id": _UID, "provider": "openrouter", "last4": "ab12"}],
             "reference_jds": [{"user_id": _UID, "jd_text": "my contribution"}],
-            "notifications_sent": [
-                {"user_profile_id": _PROFILE_ID, "channel": "email"}
-            ],
+            "notifications_sent": [{"user_profile_id": _PROFILE_ID, "channel": "email"}],
         },
         {"resume-uploads": {_UID: {"leak.pdf": b"SERVICE-CLIENT-BYTES"}}},
     )

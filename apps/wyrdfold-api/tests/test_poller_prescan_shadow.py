@@ -82,9 +82,7 @@ class TestInertByDefault:
         # The whole shadow feature is gated on this; default off ⇒ merging is inert.
         assert settings.prescan_shadow_enabled is False
 
-    async def test_guard_skips_shadow_when_flag_off(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_guard_skips_shadow_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Reproduce the Stage-2 guard literally: flag off ⇒ ``_shadow_observe``
         is never invoked (no cosine work, no row) even with a scored job."""
         rec = _patch_shadow(monkeypatch)
@@ -106,9 +104,7 @@ class TestInertByDefault:
         assert rec["gate_calls"] == []  # no cosine computation when flag off
         assert rec["recorded"] == []  # no shadow row when flag off
 
-    async def test_guard_runs_shadow_when_flag_on(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_guard_runs_shadow_when_flag_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
         observe_called = {"n": 0}
 
         async def spy_observe(_sb: object, **_kw: Any) -> None:

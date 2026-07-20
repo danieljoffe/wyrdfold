@@ -18,9 +18,7 @@ from app.services.targets import votes
 
 def test_recompute_suppression_calls_the_atomic_rpc() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value.data = [
-        {"suppressed": True, "changed": True}
-    ]
+    sb.rpc.return_value.execute.return_value.data = [{"suppressed": True, "changed": True}]
 
     result = votes.recompute_suppression(sb, reference_jd_id="ref-1", quorum=2)
 
@@ -48,9 +46,7 @@ def test_recompute_suppression_missing_row_is_noop() -> None:
 def test_recompute_suppression_coerces_rpc_booleans() -> None:
     """The RPC returns real booleans; make sure they pass through as a tuple."""
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value.data = [
-        {"suppressed": False, "changed": False}
-    ]
+    sb.rpc.return_value.execute.return_value.data = [{"suppressed": False, "changed": False}]
 
     assert votes.recompute_suppression(sb, reference_jd_id="ref-9", quorum=3) == (
         False,

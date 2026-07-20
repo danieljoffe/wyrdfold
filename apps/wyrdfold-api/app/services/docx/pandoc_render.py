@@ -27,6 +27,14 @@ if TYPE_CHECKING:
 PANDOC_BIN = "pandoc"
 RENDER_TIMEOUT_SECONDS = 30
 
+# Lua filter that removes every image from the AST before the docx writer runs.
+# Rendering `![](url)` to docx makes pandoc fetch <url> server-side to embed it;
+# with user-controlled resume markdown that is an SSRF/LFI primitive. Stripping
+# images at the AST is build-independent and catches inline AND reference-style
+# images uniformly (`--sandbox` would be pandoc-native but breaks docx on the
+# Debian pandoc build). See strip_images.lua for the full rationale.
+_STRIP_IMAGES_LUA = str(Path(__file__).with_name("strip_images.lua"))
+
 
 class PandocNotInstalledError(RuntimeError):
     """Pandoc binary is not on PATH."""
@@ -66,9 +74,21 @@ def md_to_docx(markdown: str, style: ResumeStyleSettings | None = None) -> bytes
         )
 
     # Args list is otherwise constant: PANDOC_BIN is a module-level literal and
-    # the remaining args are static flags. `markdown` is fed via stdin, not
-    # argv. The only dynamic arg is a reference-doc path we create ourselves.
-    args = [PANDOC_BIN, "-f", "markdown", "-t", "docx", "-o", "-"]
+    # the remaining args are static flags (incl. the image-stripping Lua filter,
+    # which neutralises the SSRF/LFI vector — see `_STRIP_IMAGES_LUA`).
+    # `markdown` is fed via stdin, not argv. The only dynamic arg is a
+    # reference-doc path we create ourselves.
+    args = [
+        PANDOC_BIN,
+        "-f",
+        "markdown",
+        "-t",
+        "docx",
+        "--lua-filter",
+        _STRIP_IMAGES_LUA,
+        "-o",
+        "-",
+    ]
     ref_path: str | None = None
     if style is not None:
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
@@ -92,7 +112,5 @@ def md_to_docx(markdown: str, style: ResumeStyleSettings | None = None) -> bytes
 
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise PandocRenderError(
-            f"pandoc exited {result.returncode}: {stderr or '(no stderr)'}"
-        )
+        raise PandocRenderError(f"pandoc exited {result.returncode}: {stderr or '(no stderr)'}")
     return result.stdout

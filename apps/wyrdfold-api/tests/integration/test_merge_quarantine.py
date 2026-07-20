@@ -32,17 +32,13 @@ _CONTRIB_PROFILE = {
     "negative": {"keywords": [], "weight": -10.0},
 }
 _MERGED_NEXT = {
-    "categories": {
-        "core_skills": {"keywords": {"python": 3, "golang": 3}, "weight": 2.0}
-    },
+    "categories": {"core_skills": {"keywords": {"python": 3, "golang": 3}, "weight": 2.0}},
     "negative": {"keywords": [], "weight": -10.0},
 }
 
 
 @pytest.fixture
-def seeded(
-    service_client: Client, two_seeded_users: tuple[str, str]
-) -> Iterator[dict[str, Any]]:
+def seeded(service_client: Client, two_seeded_users: tuple[str, str]) -> Iterator[dict[str, Any]]:
     """A target followed by user A, one live ref JD (user A) and one
     QUARANTINED ref JD (suppressed-at-birth) + its staged merge log row."""
     uid_a, uid_b = two_seeded_users
@@ -101,9 +97,7 @@ def seeded(
                 "kind": "merge",
                 "prev_profile": _BASE_PROFILE,
                 "next_profile": _MERGED_NEXT,
-                "diff": ProfilePatch(
-                    confidence=0.0, rationale=note
-                ).model_dump(mode="json"),
+                "diff": ProfilePatch(confidence=0.0, rationale=note).model_dump(mode="json"),
                 "confidence": 0.0,
                 "rationale": note,
                 "signals_consumed": 0,
@@ -129,15 +123,9 @@ def seeded(
     try:
         yield ctx
     finally:
-        service_client.table("target_learning_log").delete().eq(
-            "target_id", target_id
-        ).execute()
-        service_client.table("reference_jds").delete().eq(
-            "target_id", target_id
-        ).execute()
-        service_client.table("user_targets").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("target_learning_log").delete().eq("target_id", target_id).execute()
+        service_client.table("reference_jds").delete().eq("target_id", target_id).execute()
+        service_client.table("user_targets").delete().eq("target_id", target_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
@@ -169,18 +157,22 @@ def _jd_suppressed(client: Client, jd_id: str) -> bool:
 def test_merge_rpc_writes_profile_and_extras(
     service_client: Client, seeded: dict[str, Any]
 ) -> None:
-    rows = service_client.rpc(
-        "apply_target_profile_merge",
-        {
-            "p_user_id": seeded["uid_a"],
-            "p_target_id": seeded["target_id"],
-            "p_next_profile": _MERGED_NEXT,
-            "p_expected_version": 1,
-            "p_search_keywords": ["golang engineer"],
-            "p_example_promising": ["Golang Engineer"],
-            "p_example_unpromising": None,
-        },
-    ).execute().data
+    rows = (
+        service_client.rpc(
+            "apply_target_profile_merge",
+            {
+                "p_user_id": seeded["uid_a"],
+                "p_target_id": seeded["target_id"],
+                "p_next_profile": _MERGED_NEXT,
+                "p_expected_version": 1,
+                "p_search_keywords": ["golang engineer"],
+                "p_example_promising": ["Golang Engineer"],
+                "p_example_unpromising": None,
+            },
+        )
+        .execute()
+        .data
+    )
     assert rows == [{"outcome": "applied", "new_version": 2}]
     state = _target(service_client, seeded["target_id"])
     assert state["profile_version"] == 2
@@ -196,23 +188,25 @@ def test_merge_rpc_refuses_non_follower_and_stale_version(
         ({"p_user_id": seeded["uid_b"], "p_expected_version": 1}, "not_a_follower"),
         ({"p_user_id": seeded["uid_a"], "p_expected_version": 99}, "version_conflict"),
     ]:
-        rows = service_client.rpc(
-            "apply_target_profile_merge",
-            {
-                "p_target_id": seeded["target_id"],
-                "p_next_profile": _MERGED_NEXT,
-                **params,
-            },
-        ).execute().data
+        rows = (
+            service_client.rpc(
+                "apply_target_profile_merge",
+                {
+                    "p_target_id": seeded["target_id"],
+                    "p_next_profile": _MERGED_NEXT,
+                    **params,
+                },
+            )
+            .execute()
+            .data
+        )
         assert rows[0]["outcome"] == expected
     state = _target(service_client, seeded["target_id"])
     assert state["profile_version"] == 1
     assert state["search_keywords"] == ["python engineer"]
 
 
-def test_merge_rpc_not_executable_by_anon(
-    anon_client: Client, seeded: dict[str, Any]
-) -> None:
+def test_merge_rpc_not_executable_by_anon(anon_client: Client, seeded: dict[str, Any]) -> None:
     with pytest.raises(Exception) as err:
         anon_client.rpc(
             "apply_target_profile_merge",
@@ -271,10 +265,7 @@ def test_reject_staged_merge_keeps_quarantine(
     # Profile untouched, contribution still suppressed — permanently out of
     # every merge unless the vote quorum later rescues it.
     state = _target(service_client, seeded["target_id"])
-    assert (
-        "golang"
-        not in state["scoring_profile"]["categories"]["core_skills"]["keywords"]
-    )
+    assert "golang" not in state["scoring_profile"]["categories"]["core_skills"]["keywords"]
     assert state["profile_version"] == 1
     assert _jd_suppressed(service_client, seeded["quarantined_jd_id"]) is True
 
@@ -283,9 +274,7 @@ def test_apply_staged_merge_gone_contribution_is_none(
     service_client: Client, seeded: dict[str, Any]
 ) -> None:
     """The quarantined JD was deleted while staged — nothing to approve."""
-    service_client.table("reference_jds").delete().eq(
-        "id", seeded["quarantined_jd_id"]
-    ).execute()
+    service_client.table("reference_jds").delete().eq("id", seeded["quarantined_jd_id"]).execute()
 
     result = apply_staged_patch(
         service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]

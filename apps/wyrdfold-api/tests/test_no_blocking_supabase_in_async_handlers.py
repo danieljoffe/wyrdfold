@@ -156,8 +156,7 @@ def _passes_client(call: ast.Call) -> bool:
     if any(isinstance(a, ast.Name) and a.id in _CLIENT_ARG_NAMES for a in call.args):
         return True
     return any(
-        isinstance(k.value, ast.Name) and k.value.id in _CLIENT_ARG_NAMES
-        for k in call.keywords
+        isinstance(k.value, ast.Name) and k.value.id in _CLIENT_ARG_NAMES for k in call.keywords
     )
 
 
@@ -185,11 +184,7 @@ def _blocking_client_call_lines(handler: ast.AsyncFunctionDef) -> list[int]:
             if isinstance(child, ast.Call):
                 if _wrapper_name(child) in _OFFLOAD_WRAPPERS:
                     child_offloaded = True  # everything under it runs off-loop
-                elif (
-                    not offloaded
-                    and id(child) not in awaited
-                    and _passes_client(child)
-                ):
+                elif not offloaded and id(child) not in awaited and _passes_client(child):
                     offenders.append(child.lineno)
             visit(child, child_offloaded)
 
@@ -210,8 +205,7 @@ def _scan_source(source: str) -> list[tuple[str, int, list[int]]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef) and _is_router_handler(node):
             lines = sorted(
-                set(_unwrapped_execute_lines(node))
-                | set(_blocking_client_call_lines(node))
+                set(_unwrapped_execute_lines(node)) | set(_blocking_client_call_lines(node))
             )
             if lines:
                 offenders.append((node.name, node.lineno, lines))
@@ -234,9 +228,7 @@ def test_no_blocking_supabase_execute_in_async_handlers() -> None:
                 f"`await asyncio.to_thread(...)`. See #107 / audit 2026-07-18."
             )
 
-    assert not failures, "Blocking supabase call(s) on the event loop:\n" + "\n".join(
-        failures
-    )
+    assert not failures, "Blocking supabase call(s) on the event loop:\n" + "\n".join(failures)
 
 
 # ---- Self-tests: prove the scanner catches the regression and doesn't

@@ -41,9 +41,7 @@ class FunnelScoreBuckets(BaseModel):
     buckets: dict[str, int]
     total: int
     max_score: int | None
-    floor: int = Field(
-        ..., description="user_profiles.list_min_score for the owning user."
-    )
+    floor: int = Field(..., description="user_profiles.list_min_score for the owning user.")
     above_floor: int = Field(
         ..., description="Count of not-excluded scores ≥ floor — what the UI sees."
     )
@@ -61,9 +59,7 @@ class FunnelStageCounts(BaseModel):
     )
     promising_true: int
     promising_false: int
-    promising_null: int = Field(
-        ..., description="Pre-Phase-1 rows or rows where the gate was off."
-    )
+    promising_null: int = Field(..., description="Pre-Phase-1 rows or rows where the gate was off.")
     by_status: dict[str, int] = Field(
         ..., description="scoring_status → count: stage1, stage2, complete."
     )
@@ -92,15 +88,11 @@ class FunnelUserContext(BaseModel):
     user_id: str
     list_min_score: int | None = Field(
         ...,
-        description=(
-            "Score floor the FE list applies (NULL → server default)."
-        ),
+        description=("Score floor the FE list applies (NULL → server default)."),
     )
     phase2_quota_remaining: int = Field(
         ...,
-        description=(
-            "Sonnet calls left this UTC day for this (target, user)."
-        ),
+        description=("Sonnet calls left this UTC day for this (target, user)."),
     )
 
 

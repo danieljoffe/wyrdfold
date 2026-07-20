@@ -129,9 +129,7 @@ async def test_enables_system_cache() -> None:
 
 async def test_returns_result_with_positive_cost() -> None:
     client = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
-    _, result = await derive_from_prose(
-        client, prose_text="some reasonably long narrative " * 50
-    )
+    _, result = await derive_from_prose(client, prose_text="some reasonably long narrative " * 50)
     assert result.cost_usd > 0
     assert result.usage.input_tokens > 0
     assert result.usage.output_tokens > 0
@@ -151,9 +149,7 @@ async def test_sends_prose_as_user_message() -> None:
 
 async def test_model_override_is_respected() -> None:
     client = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
-    await derive_from_prose(
-        client, prose_text="prose", model="claude-haiku-4-5"
-    )
+    await derive_from_prose(client, prose_text="prose", model="claude-haiku-4-5")
     assert client.calls[0]["model"] == "claude-haiku-4-5"
 
 
@@ -176,9 +172,7 @@ def test_system_prompt_mentions_schema_rules() -> None:
 
 class TestDeriveEndpoint:
     @pytest.mark.asyncio
-    async def test_skips_llm_when_prose_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_skips_llm_when_prose_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Repeat derives on the same prose return the cached doc — no LLM call."""
         from app.routers import experience as exp_router
 
@@ -200,12 +194,8 @@ class TestDeriveEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest", lambda *a, **kw: cached
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
+        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: cached)
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         result = await exp_router.derive_optimized(
@@ -253,9 +243,7 @@ class TestDeriveEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
         monkeypatch.setattr(
             "app.services.experience.optimized.get_latest",
             lambda *a, **kw: previous_user_edit,
@@ -268,9 +256,7 @@ class TestDeriveEndpoint:
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None
 
-        monkeypatch.setattr(
-            "app.services.experience.chunks.upsert_for_optimized", fake_upsert
-        )
+        monkeypatch.setattr("app.services.experience.chunks.upsert_for_optimized", fake_upsert)
         monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
@@ -339,9 +325,7 @@ class TestDeriveStreamEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
 
         with pytest.raises(HTTPException) as exc_info:
             await exp_router.derive_optimized_stream(
@@ -377,12 +361,8 @@ class TestDeriveStreamEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest", lambda *a, **kw: cached
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
+        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: cached)
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
@@ -425,12 +405,8 @@ class TestDeriveStreamEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
+        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
         monkeypatch.setattr(
             "app.services.experience.optimized.create_version",
             lambda *a, **kw: new_doc,
@@ -439,9 +415,7 @@ class TestDeriveStreamEndpoint:
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None
 
-        monkeypatch.setattr(
-            "app.services.experience.chunks.upsert_for_optimized", fake_upsert
-        )
+        monkeypatch.setattr("app.services.experience.chunks.upsert_for_optimized", fake_upsert)
         monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
@@ -475,19 +449,16 @@ class TestDeriveStreamEndpoint:
         from app.routers import experience as exp_router
 
         prose_doc = ProseDoc(
-            id="prose-1", user_id=None, version=3, content="some prose",
+            id="prose-1",
+            user_id=None,
+            version=3,
+            content="some prose",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
+        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
         create = MagicMock()
-        monkeypatch.setattr(
-            "app.services.experience.optimized.create_version", create
-        )
+        monkeypatch.setattr("app.services.experience.optimized.create_version", create)
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
@@ -509,15 +480,14 @@ class TestDeriveStreamEndpoint:
         from app.routers import experience as exp_router
 
         prose_doc = ProseDoc(
-            id="prose-1", user_id=None, version=3, content="some prose",
+            id="prose-1",
+            user_id=None,
+            version=3,
+            content="some prose",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
+        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
 
         response = await exp_router.derive_optimized_stream(
             request=_request(),

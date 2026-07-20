@@ -22,9 +22,7 @@ from app.models.targets import AxisWeights
 _AXES = ("title_fit", "skills_fit", "seniority_fit", "domain_fit")
 
 
-def display_score_from_axes(
-    axes: dict[str, int] | None, weights: AxisWeights
-) -> int:
+def display_score_from_axes(axes: dict[str, int] | None, weights: AxisWeights) -> int:
     """Weighted average of the four axes, rescaled to a 0-100 integer.
 
     Weights are renormalised at read time so the user can't accidentally
@@ -48,10 +46,7 @@ def display_score_from_axes(
         # return 0 so the row sinks to the bottom of the list. The
         # frontend should disallow this anyway, but defend in depth.
         return 0
-    weighted = sum(
-        int(axes.get(axis, 0)) * w
-        for axis, w in zip(_AXES, w_vec, strict=True)
-    )
+    weighted = sum(int(axes.get(axis, 0)) * w for axis, w in zip(_AXES, w_vec, strict=True))
     return round(weighted / total_w)
 
 
