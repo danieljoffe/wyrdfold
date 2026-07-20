@@ -202,3 +202,61 @@ def test_md_lint_allows_normal_length_bullets() -> None:
     result = lint_markdown(md, document_type="resume")
     all_codes = {v.code for v in result.warnings} | {v.code for v in result.errors}
     assert "bullet_length" not in all_codes
+
+
+def test_md_lint_blocks_reference_style_images() -> None:
+    """Reference-style images (``![alt][ref]`` + a ``[ref]: url`` def) bypassed
+    the old inline-only image regex, yet pandoc still fetched them server-side on
+    render — an SSRF bypass. The linter now rejects every image form.
+    """
+    md = (
+        "# Resume\n\n## Experience\n\n![logo][r]\n\n- worked\n\n[r]: https://example.com/logo.png\n"
+    )
+    result = lint_markdown(md, document_type="resume")
+    assert "no_inline_images" in {v.code for v in result.errors}
+
+
+@pandoc_required
+def test_md_to_docx_does_not_fetch_image_urls_ssrf() -> None:
+    """Rendering resume markdown must NOT fetch image URLs server-side.
+
+    pandoc's docx writer fetches ``![](url)`` to embed the image — an SSRF/LFI
+    vector for user-controlled resume markdown
+    (``![x](http://169.254.169.254/...)`` reaches cloud metadata). The
+    image-stripping Lua filter drops images from the AST before the writer, so no
+    fetch happens. This guards both inline AND reference-style forms (the
+    reference form bypassed the input linter). Remove the filter and this test's
+    listener records a hit and fails.
+    """
+    import http.server
+    import socketserver
+    import threading
+    import time
+
+    hits: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            self.wfile.write(b"\x89PNG\r\n\x1a\n")
+
+        def log_message(self, *_a: object) -> None:
+            pass  # keep the test output quiet
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _Handler) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{port}"
+            inline = f"# R\n\n## Experience\n\n- did work ![x]({base}/inline-ssrf)\n"
+            ref_style = f"# R\n\n## Experience\n\n- did work ![x][r]\n\n[r]: {base}/ref-ssrf\n"
+            for md in (inline, ref_style):
+                docx = md_to_docx(md)
+                assert docx[:2] == b"PK"  # a valid .docx is still produced
+            time.sleep(0.25)  # let any erroneous fetch land before asserting
+            assert hits == [], f"pandoc fetched image URLs server-side (SSRF not blocked): {hits}"
+        finally:
+            srv.shutdown()
