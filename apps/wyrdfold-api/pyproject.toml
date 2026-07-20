@@ -7,7 +7,7 @@ readme = "README.md"
 license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.139.0",
+  "fastapi>=0.139.2",
   "uvicorn[standard]>=0.51.0",
   "httpx>=0.28",
   "supabase>=2.13",
@@ -21,7 +21,7 @@ dependencies = [
   "anthropic>=0.116.0",
   "voyageai>=0.5.0",
   "twilio>=9.0",
-  "sentry-sdk[fastapi]>=2.64.0",
+  "sentry-sdk[fastapi]>=2.66.0",
   "apscheduler>=3.11",
   "slowapi>=0.1.9",
   "stripe>=15.3.0",
