@@ -148,13 +148,19 @@ describe('proxy middleware: Content-Security-Policy-Report-Only (audit #29 M1)',
     expect(reportOnly).toMatch(/script-src [^;]*'nonce-[^']+'/);
   });
 
-  it('is STRICTER than enforced: report-only style-src drops unsafe-inline for a nonce', async () => {
-    // This is the whole point of the report-only policy — measure what removing
-    // `'unsafe-inline'` from style-src would break before enforcing it.
+  it('report-only style-src is ALIGNED with enforced (nonce-tightening measured as infeasible)', async () => {
+    // Dropping style-src to a nonce flooded every user's console — inline styles
+    // are pervasive (Next/Tailwind + per-component width/height/padding +
+    // env(safe-area-inset)). With no report-uri sink those reports were pure
+    // noise, and a nonce-only style-src would need ~every inline style refactored
+    // for marginal gain (real XSS vectors are already blocked by the nonce'd
+    // script-src + object-src 'none' + base-uri 'self'). So report-only keeps
+    // 'unsafe-inline' to match enforced; it still earns its keep via the
+    // script-src https: drop (below).
     const { reportOnly, enforced } = await cspFor('https://app.test/dashboard');
     expect(enforced).toContain("style-src 'self' 'unsafe-inline'");
-    expect(reportOnly).toMatch(/style-src 'self' 'nonce-[^']+'/);
-    expect(reportOnly).not.toContain("style-src 'self' 'unsafe-inline'");
+    expect(reportOnly).toContain("style-src 'self' 'unsafe-inline'");
+    expect(reportOnly).not.toMatch(/style-src 'self' 'nonce-/);
   });
 
   it('is STRICTER than enforced: report-only script-src drops the https: host fallback', async () => {
