@@ -53,20 +53,25 @@ function buildCspValue(
 // *tightening of the enforced policy* would catch, before we make that change.
 //
 // The enforced `buildCspValue` above already covers the M1 ask (a real
-// document-level CSP exists). The two deliberately-loose spots left in it are:
+// document-level CSP exists). It left two deliberately-loose spots to measure
+// here — one is now RESOLVED:
 //
-//   1. `style-src 'unsafe-inline'` — kept because Tailwind/Next emit inline
-//      styles. Here we drop `'unsafe-inline'` and switch to a nonce so reports
-//      reveal exactly which inline styles we'd have to nonce/refactor first.
+//   1. `style-src 'unsafe-inline'` — MEASURED, and the report-only kept
+//      `'unsafe-inline'` (i.e. aligned with enforced). Dropping it to a nonce
+//      flooded every user's console: inline styles are pervasive (Next/Tailwind
+//      + per-component width/height/padding + `env(safe-area-inset-*)`), so a
+//      nonce-only `style-src` would require refactoring ~every inline style for
+//      marginal gain (the real XSS vectors are already blocked by the nonce'd
+//      `script-src` + `object-src 'none'` + `base-uri 'self'`). With no
+//      report-uri sink the reports only clutter the console, so we do NOT
+//      pursue this tightening. Left inline to document the decision.
 //   2. `script-src … https:` — a host fallback that `'strict-dynamic'` already
-//      neuters in supporting browsers. Here we drop `https:` to confirm nothing
-//      legitimately loads scripts from an arbitrary https host.
+//      neuters in supporting browsers. Still dropped here to confirm nothing
+//      legitimately loads scripts from an arbitrary https host (this one is
+//      quiet, so it stays under report-only observation).
 //
-// Everything else mirrors the enforced policy so the report-only signal is about
-// *only* these two tightenings, not unrelated noise. Reusing the same per-request
-// `nonce` keeps Next's nonce-stamped <script>/<style> tags valid under both
-// headers. Flipping these tightenings into the enforced policy is a deliberate
-// follow-up, after the reports confirm they're safe.
+// Reusing the same per-request `nonce` keeps Next's nonce-stamped
+// <script>/<style> tags valid under both headers.
 function buildReportOnlyCspValue(
   request: NextRequest,
   nonce: string,
@@ -77,7 +82,7 @@ function buildReportOnlyCspValue(
     script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${
       !isProduction() ? ` 'unsafe-eval'` : ''
     };
-    style-src 'self' 'nonce-${nonce}';
+    style-src 'self' 'unsafe-inline';
     font-src 'self' https: data:;
     object-src 'none';
     base-uri 'self';
