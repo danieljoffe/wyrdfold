@@ -210,9 +210,7 @@ class _FakeSupabase:
     def push_response(self, table: str, op: str | None, data: Any) -> None:
         self._responses.append((table, op, data))
 
-    def next_response(
-        self, table: str, op: str | None, _filters: Any
-    ) -> Any:
+    def next_response(self, table: str, op: str | None, _filters: Any) -> Any:
         for i, (t, o, d) in enumerate(self._responses):
             if t == table and o == op:
                 self._responses.pop(i)
@@ -252,9 +250,7 @@ class TestMaybeRunLearner:
         )
         assert maybe_run_learner(fake, user_id="u", target_id="t") is None  # type: ignore[arg-type]
 
-    def test_skips_token_already_in_negative_list(
-        self, fake: _FakeSupabase
-    ) -> None:
+    def test_skips_token_already_in_negative_list(self, fake: _FakeSupabase) -> None:
         # Reasons where only "sales" passes both the token + frequency
         # filters — picking a single-word reason avoids accidentally
         # promoting a stopword-adjacent helper into the negative list.
@@ -280,9 +276,7 @@ class TestMaybeRunLearner:
         # "sales" is already a negative — nothing new to apply.
         assert result is None
 
-    def test_applies_new_negative_and_bumps_version(
-        self, fake: _FakeSupabase
-    ) -> None:
+    def test_applies_new_negative_and_bumps_version(self, fake: _FakeSupabase) -> None:
         # 3 unapplied rows, all share "sales".
         fake.push_response(
             "job_feedback",
@@ -317,9 +311,7 @@ class TestMaybeRunLearner:
         assert result.signals_consumed == 3
         assert result.profile_version_after == 2
         # An update on targets was logged.
-        target_updates = [
-            r for r in fake.log if r["table"] == "targets" and r["op"] == "update"
-        ]
+        target_updates = [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
         assert target_updates, "expected a targets update"
         payload = target_updates[0]["payload"]
         assert payload["profile_version"] == 2

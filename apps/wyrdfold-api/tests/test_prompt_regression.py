@@ -175,8 +175,7 @@ def test_scorer_examples_are_evidence_first() -> None:
         for reasoning in examples:
             for word_re, word in zip(banned_res, BANNED_CONFIDENCE_WORDS, strict=True):
                 assert not word_re.search(reasoning), (
-                    f"{label} few-shot example uses banned confidence word "
-                    f"{word!r}: {reasoning!r}"
+                    f"{label} few-shot example uses banned confidence word {word!r}: {reasoning!r}"
                 )
 
     # The banned list is a single source of truth (rubric.py). Pin that the

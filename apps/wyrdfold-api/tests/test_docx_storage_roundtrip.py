@@ -63,9 +63,7 @@ def test_upload_then_download_returns_same_bytes() -> None:
     sb = _supabase_with_fake_storage()
     payload = b"PK\x03\x04 fake docx bytes"
 
-    path = persistence.upload_docx(
-        sb, user_id="user-1", resume_id="resume-1", docx_bytes=payload
-    )
+    path = persistence.upload_docx(sb, user_id="user-1", resume_id="resume-1", docx_bytes=payload)
     got = persistence.download_docx(sb, path)
 
     assert got == payload
@@ -76,9 +74,7 @@ def test_upload_path_is_user_namespaced() -> None:
     that keeps one user's .docx out of another's prefix."""
     sb = _supabase_with_fake_storage()
 
-    path = persistence.upload_docx(
-        sb, user_id="user-abc", resume_id="r-9", docx_bytes=b"x"
-    )
+    path = persistence.upload_docx(sb, user_id="user-abc", resume_id="r-9", docx_bytes=b"x")
 
     assert path == "user-abc/r-9.docx"
     assert path in sb.storage.buckets[persistence.STORAGE_BUCKET]
@@ -89,9 +85,7 @@ def test_storage_path_is_namespaced_under_user_id() -> None:
     legacy `anon/` fallback is gone, and storage RLS keys on this prefix."""
     sb = _supabase_with_fake_storage()
 
-    path = persistence.upload_docx(
-        sb, user_id="user-1", resume_id="r-1", docx_bytes=b"y"
-    )
+    path = persistence.upload_docx(sb, user_id="user-1", resume_id="r-1", docx_bytes=b"y")
 
     assert path == "user-1/r-1.docx"
 
@@ -102,12 +96,8 @@ def test_two_users_same_resume_id_do_not_collide() -> None:
     another's artifact."""
     sb = _supabase_with_fake_storage()
 
-    p1 = persistence.upload_docx(
-        sb, user_id="user-1", resume_id="shared-id", docx_bytes=b"one"
-    )
-    p2 = persistence.upload_docx(
-        sb, user_id="user-2", resume_id="shared-id", docx_bytes=b"two"
-    )
+    p1 = persistence.upload_docx(sb, user_id="user-1", resume_id="shared-id", docx_bytes=b"one")
+    p2 = persistence.upload_docx(sb, user_id="user-2", resume_id="shared-id", docx_bytes=b"two")
 
     assert p1 != p2
     assert persistence.download_docx(sb, p1) == b"one"
@@ -130,9 +120,7 @@ def test_upload_sets_docx_content_type() -> None:
     bucket = MagicMock()
     sb.storage.from_.return_value = bucket
 
-    persistence.upload_docx(
-        sb, user_id="u", resume_id="r", docx_bytes=b"z"
-    )
+    persistence.upload_docx(sb, user_id="u", resume_id="r", docx_bytes=b"z")
 
     _, kwargs = bucket.upload.call_args
     assert kwargs["file_options"]["content-type"] == persistence.DOCX_CONTENT_TYPE

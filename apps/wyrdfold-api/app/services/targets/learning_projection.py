@@ -29,9 +29,7 @@ from app.services.scoring import score_job_with_profile
 ScoredJobText = tuple[str, str]
 
 
-def fetch_recent_scored_jobs(
-    supabase: Client, target_id: str, limit: int
-) -> list[ScoredJobText]:
+def fetch_recent_scored_jobs(supabase: Client, target_id: str, limit: int) -> list[ScoredJobText]:
     """The (title, description_html) of a target's most recently scored jobs.
 
     Bounded by ``limit`` to keep the deterministic re-score projection cheap.
@@ -51,10 +49,7 @@ def fetch_recent_scored_jobs(
     if not job_ids:
         return []
     jobs_resp = (
-        supabase.table("jobs")
-        .select("id, title, description_html")
-        .in_("id", job_ids)
-        .execute()
+        supabase.table("jobs").select("id, title, description_html").in_("id", job_ids).execute()
     )
     job_rows = cast(list[dict[str, Any]], jobs_resp.data or [])
     return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
@@ -76,9 +71,7 @@ def project_profile_impact(
     project against — the caller then applies without a learning-rate check
     (nothing to over-churn yet).
     """
-    jobs = fetch_recent_scored_jobs(
-        supabase, target_id, settings.learning_rescore_sample_size
-    )
+    jobs = fetch_recent_scored_jobs(supabase, target_id, settings.learning_rescore_sample_size)
     if not jobs:
         return None
     return project_rescore(
@@ -118,9 +111,7 @@ def project_rescore(
     # "after" side with the keywords that would actually be installed, or
     # the projection under/over-estimates movement (Copilot on #204). The
     # learner never changes keywords, so the default keeps both sides equal.
-    after_keywords = (
-        next_search_keywords if next_search_keywords is not None else search_keywords
-    )
+    after_keywords = next_search_keywords if next_search_keywords is not None else search_keywords
     moved = 0
     max_abs_delta = 0
     for title, description_html in jobs:

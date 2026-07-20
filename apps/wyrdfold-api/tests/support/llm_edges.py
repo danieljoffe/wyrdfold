@@ -62,9 +62,7 @@ def schema_violations(
     required = schema.model_json_schema().get("required", [])
     cases: list[tuple[str, dict[str, Any]]] = []
     for field in required:
-        cases.append(
-            (f"missing_required_{field}", {k: v for k, v in valid.items() if k != field})
-        )
+        cases.append((f"missing_required_{field}", {k: v for k, v in valid.items() if k != field}))
         flipped = dict(valid)
         flipped[field] = 12345 if not isinstance(valid.get(field), int | float) else "twelve"
         cases.append((f"wrong_type_{field}", flipped))

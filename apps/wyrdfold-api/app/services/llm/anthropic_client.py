@@ -72,9 +72,7 @@ def _api_message_content(message: Message) -> Any:
 
 
 def _api_messages(messages: list[Message]) -> list[dict[str, Any]]:
-    return [
-        {"role": m.role, "content": _api_message_content(m)} for m in messages
-    ]
+    return [{"role": m.role, "content": _api_message_content(m)} for m in messages]
 
 
 class AnthropicLLMClient:
@@ -133,9 +131,7 @@ class AnthropicLLMClient:
         cache_system: bool = False,
     ) -> LLMResult:
         if not messages:
-            raise ValueError(
-                "AnthropicLLMClient.complete requires at least one message"
-            )
+            raise ValueError("AnthropicLLMClient.complete requires at least one message")
 
         # System parameter: list form with cache_control when caching is requested;
         # plain string otherwise. Empty strings become "" (SDK accepts that).
@@ -178,9 +174,7 @@ class AnthropicLLMClient:
         usage = LLMUsage(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=(
-                getattr(response.usage, "cache_read_input_tokens", 0) or 0
-            ),
+            cache_read_input_tokens=(getattr(response.usage, "cache_read_input_tokens", 0) or 0),
             cache_creation_input_tokens=(
                 getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             ),
@@ -218,9 +212,7 @@ class AnthropicLLMClient:
         default); ``complete_json`` pins it to 0 for deterministic output.
         """
         if not messages:
-            raise ValueError(
-                "AnthropicLLMClient.complete_tool_use requires at least one message"
-            )
+            raise ValueError("AnthropicLLMClient.complete_tool_use requires at least one message")
 
         system_param: Any
         if cache_system and system:
@@ -297,9 +289,7 @@ class AnthropicLLMClient:
         usage = LLMUsage(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=(
-                getattr(response.usage, "cache_read_input_tokens", 0) or 0
-            ),
+            cache_read_input_tokens=(getattr(response.usage, "cache_read_input_tokens", 0) or 0),
             cache_creation_input_tokens=(
                 getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             ),
@@ -326,9 +316,7 @@ class AnthropicLLMClient:
         cache_system: bool = False,
     ) -> AsyncIterator[LLMStreamEvent]:
         if not messages:
-            raise ValueError(
-                "AnthropicLLMClient.stream requires at least one message"
-            )
+            raise ValueError("AnthropicLLMClient.stream requires at least one message")
 
         system_param: Any
         if cache_system and system:

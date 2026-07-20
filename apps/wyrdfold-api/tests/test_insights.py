@@ -1753,7 +1753,12 @@ class TestPostingTargetMapPagination:
             for i in range(2500, 2530)
         ]
         rows += [
-            {"id": f"{i:08d}", "job_posting_id": f"jobo-{i}", "target_id": "OTHER", "excluded": False}
+            {
+                "id": f"{i:08d}",
+                "job_posting_id": f"jobo-{i}",
+                "target_id": "OTHER",
+                "excluded": False,
+            }
             for i in range(2530, 2570)
         ]
         client = _paginating_client(rows)
@@ -1773,10 +1778,20 @@ class TestPostingTargetMapPagination:
         rows: list[dict] = []
         for i in range(1500):
             rows.append(
-                {"id": f"a{i:07d}", "job_posting_id": f"job-{i}", "target_id": "T1", "excluded": False}
+                {
+                    "id": f"a{i:07d}",
+                    "job_posting_id": f"job-{i}",
+                    "target_id": "T1",
+                    "excluded": False,
+                }
             )
             rows.append(
-                {"id": f"b{i:07d}", "job_posting_id": f"job-{i}", "target_id": "T2", "excluded": False}
+                {
+                    "id": f"b{i:07d}",
+                    "job_posting_id": f"job-{i}",
+                    "target_id": "T2",
+                    "excluded": False,
+                }
             )
         client = _paginating_client(rows)
 

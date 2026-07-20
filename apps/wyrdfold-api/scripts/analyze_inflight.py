@@ -66,7 +66,7 @@ def analyze(path: Path) -> None:
     models: dict[str, str] = data.get("models", {})
 
     print(f"\n# Snapshot — {path.name}")
-    print(f"Completed: {completed}/{total} cases ({100*completed//total}%)\n")
+    print(f"Completed: {completed}/{total} cases ({100 * completed // total}%)\n")
 
     # Per-model stats
     per_model_scores: dict[str, list[int]] = defaultdict(list)
@@ -75,9 +75,7 @@ def analyze(path: Path) -> None:
     per_model_fail: dict[str, int] = defaultdict(int)
     per_model_pairs: dict[str, list[tuple[float, float]]] = defaultdict(list)
     # by band
-    per_model_by_band: dict[str, dict[str, list[int]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
+    per_model_by_band: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
 
     total_cost = 0.0
     for case in cases:
@@ -101,8 +99,7 @@ def analyze(path: Path) -> None:
 
     print("## Per-model stats")
     print(
-        "| Model | n | Mean | Stdev | Failures | $ total | $/call | "
-        "Latency p50 | ρ vs baseline |"
+        "| Model | n | Mean | Stdev | Failures | $ total | $/call | Latency p50 | ρ vs baseline |"
     )
     print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for model in models:
@@ -111,14 +108,8 @@ def analyze(path: Path) -> None:
         mean = round(statistics.mean(scores), 1) if scores else 0
         stdev = round(statistics.pstdev(scores), 1) if len(scores) > 1 else 0
         total_attempts = n + per_model_fail[model]
-        cost_per_call = (
-            per_model_cost[model] / total_attempts if total_attempts else 0.0
-        )
-        lat_p50 = (
-            int(statistics.median(per_model_lat[model]))
-            if per_model_lat[model]
-            else 0
-        )
+        cost_per_call = per_model_cost[model] / total_attempts if total_attempts else 0.0
+        lat_p50 = int(statistics.median(per_model_lat[model])) if per_model_lat[model] else 0
         rho = _spearman(per_model_pairs[model])
         print(
             f"| {model} | {n} | {mean} | {stdev} | {per_model_fail[model]} "
@@ -146,9 +137,7 @@ def analyze(path: Path) -> None:
     spreads: list[int] = []
     for case in cases:
         case_scores = {
-            r["model"]: r.get("fit_score")
-            for r in case.get("results") or []
-            if r.get("schema_ok")
+            r["model"]: r.get("fit_score") for r in case.get("results") or [] if r.get("schema_ok")
         }
         if len(case_scores) == len(models):
             vals = [s for s in case_scores.values() if isinstance(s, int)]
@@ -158,10 +147,13 @@ def analyze(path: Path) -> None:
         print(f"- Cases with all {len(models)} models reporting: **{len(spreads)}**")
         print(f"- Median per-case max-min spread: **{int(statistics.median(spreads))}**")
         print(f"- Mean spread: **{round(statistics.mean(spreads), 1)}**")
-        print(f"- Cases with spread ≥30 (strong disagreement): "
-              f"**{sum(1 for s in spreads if s >= 30)}**")
-        print(f"- Cases with spread ≤10 (strong agreement): "
-              f"**{sum(1 for s in spreads if s <= 10)}**")
+        print(
+            f"- Cases with spread ≥30 (strong disagreement): "
+            f"**{sum(1 for s in spreads if s >= 30)}**"
+        )
+        print(
+            f"- Cases with spread ≤10 (strong agreement): **{sum(1 for s in spreads if s <= 10)}**"
+        )
 
     print()
 

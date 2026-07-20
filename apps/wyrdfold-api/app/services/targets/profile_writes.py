@@ -29,15 +29,11 @@ from supabase import Client
 Outcome = str  # 'applied' | 'version_conflict' | 'not_a_follower' | 'target_not_found'
 
 
-def _call(
-    supabase: Client, fn: str, params: dict[str, Any]
-) -> tuple[Outcome, int | None]:
+def _call(supabase: Client, fn: str, params: dict[str, Any]) -> tuple[Outcome, int | None]:
     resp = supabase.rpc(fn, params).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
-        raise RuntimeError(
-            f"{fn} returned no row — RPC missing or grants misconfigured"
-        )
+        raise RuntimeError(f"{fn} returned no row — RPC missing or grants misconfigured")
     return (
         cast(str, rows[0]["outcome"]),
         cast(int | None, rows[0]["new_version"]),

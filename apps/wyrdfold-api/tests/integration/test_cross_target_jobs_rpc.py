@@ -56,13 +56,19 @@ def seeded_cross_target(service_client: Client) -> Iterator[tuple[str, set[str]]
     t_null = str(uuid.uuid4())  # role_family = NULL (ungated)
 
     # jobs: (key, family, is_us, archived, purged, first_seen offset days)
-    j = {k: str(uuid.uuid4()) for k in (
-        "hi", "lo", "pend", "offdrop", "offkeep", "nonus", "arch", "purged", "dedup"
-    )}
+    j = {
+        k: str(uuid.uuid4())
+        for k in ("hi", "lo", "pend", "offdrop", "offkeep", "nonus", "arch", "purged", "dedup")
+    }
     board = f"x365-{uuid.uuid4().hex[:10]}"
     try:
         service_client.table("sources").insert(
-            {"id": source_id, "board_token": board, "company_name": "Acme", "provider": "greenhouse"}
+            {
+                "id": source_id,
+                "board_token": board,
+                "company_name": "Acme",
+                "provider": "greenhouse",
+            }
         ).execute()
         service_client.table("targets").insert(
             [
@@ -82,17 +88,100 @@ def seeded_cross_target(service_client: Client) -> Iterator[tuple[str, set[str]]
                 # Exercises the decay-aware sort; raw score keeps it top with
                 # decay off. (Distinct age also keeps created_at/first_seen sort
                 # deterministic.)
-                _job(j["hi"], source_id, "Alpha Graded High", "Acme", "engineering", is_us=True, fs=now - timedelta(days=40), created=now - timedelta(days=40)),
-                _job(j["lo"], source_id, "Bravo Graded Low", "Bristol", "engineering", is_us=True, fs=now - timedelta(days=2), created=now - timedelta(days=2)),
-                _job(j["pend"], source_id, "Charlie Pending", "Cargo", None, is_us=True, fs=now - timedelta(hours=3), created=now - timedelta(hours=3)),
+                _job(
+                    j["hi"],
+                    source_id,
+                    "Alpha Graded High",
+                    "Acme",
+                    "engineering",
+                    is_us=True,
+                    fs=now - timedelta(days=40),
+                    created=now - timedelta(days=40),
+                ),
+                _job(
+                    j["lo"],
+                    source_id,
+                    "Bravo Graded Low",
+                    "Bristol",
+                    "engineering",
+                    is_us=True,
+                    fs=now - timedelta(days=2),
+                    created=now - timedelta(days=2),
+                ),
+                _job(
+                    j["pend"],
+                    source_id,
+                    "Charlie Pending",
+                    "Cargo",
+                    None,
+                    is_us=True,
+                    fs=now - timedelta(hours=3),
+                    created=now - timedelta(hours=3),
+                ),
                 # Scored HIGH by the off-family (eng) target → best rep is off-family → dropped.
-                _job(j["offdrop"], source_id, "Delta OffFamily Drop", "Dynatech", "finance", is_us=True, fs=now, created=now),
+                _job(
+                    j["offdrop"],
+                    source_id,
+                    "Delta OffFamily Drop",
+                    "Dynatech",
+                    "finance",
+                    is_us=True,
+                    fs=now,
+                    created=now,
+                ),
                 # Scored best by the null-family target → ungated → kept.
-                _job(j["offkeep"], source_id, "Echo OffFamily Keep", "Echelon", "finance", is_us=True, fs=now - timedelta(hours=1), created=now - timedelta(hours=1)),
-                _job(j["nonus"], source_id, "Foxtrot NonUS", "Foundry", "engineering", is_us=False, fs=now, created=now),
-                _job(j["arch"], source_id, "Golf Archived", "Grid", "engineering", is_us=True, fs=now, created=now, archived=now),
-                _job(j["purged"], source_id, "Hotel Purged", "Helix", "engineering", is_us=True, fs=now, created=now, purged=now),
-                _job(j["dedup"], source_id, "India Dedup", "Ionic", "engineering", is_us=True, fs=now - timedelta(days=3), created=now - timedelta(days=3)),
+                _job(
+                    j["offkeep"],
+                    source_id,
+                    "Echo OffFamily Keep",
+                    "Echelon",
+                    "finance",
+                    is_us=True,
+                    fs=now - timedelta(hours=1),
+                    created=now - timedelta(hours=1),
+                ),
+                _job(
+                    j["nonus"],
+                    source_id,
+                    "Foxtrot NonUS",
+                    "Foundry",
+                    "engineering",
+                    is_us=False,
+                    fs=now,
+                    created=now,
+                ),
+                _job(
+                    j["arch"],
+                    source_id,
+                    "Golf Archived",
+                    "Grid",
+                    "engineering",
+                    is_us=True,
+                    fs=now,
+                    created=now,
+                    archived=now,
+                ),
+                _job(
+                    j["purged"],
+                    source_id,
+                    "Hotel Purged",
+                    "Helix",
+                    "engineering",
+                    is_us=True,
+                    fs=now,
+                    created=now,
+                    purged=now,
+                ),
+                _job(
+                    j["dedup"],
+                    source_id,
+                    "India Dedup",
+                    "Ionic",
+                    "engineering",
+                    is_us=True,
+                    fs=now - timedelta(days=3),
+                    created=now - timedelta(days=3),
+                ),
             ]
         ).execute()
         service_client.table("scores").insert(
@@ -263,8 +352,8 @@ def test_rpc_company_and_search_filters_match_python(
     columns don't carry title/company). Assert it still matches Python."""
     user_id, target_ids = seeded_cross_target
     for kw in (
-        {"company": "Acme"},          # only "Alpha Graded High"
-        {"search": "Graded"},         # "Alpha Graded High" + "Bravo Graded Low"
+        {"company": "Acme"},  # only "Alpha Graded High"
+        {"search": "Graded"},  # "Alpha Graded High" + "Bravo Graded Low"
         {"company": "Bristol", "search": "Bravo"},  # both filters together
     ):
         rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False, **kw)
@@ -281,15 +370,37 @@ def test_jobs_archival_trigger_syncs_and_drops(
     the RPC drops the now-dead job — matching the Python path, which reads jobs
     live. This is the failure mode denormalization introduces; pin it."""
     user_id, target_ids = seeded_cross_target
-    before = {p["title"] for p in _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)["postings"]}
+    before = {
+        p["title"]
+        for p in _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)[
+            "postings"
+        ]
+    }
     assert "Alpha Graded High" in before
 
-    job = service_client.table("jobs").select("id").eq("title", "Alpha Graded High").single().execute().data
-    service_client.table("jobs").update({"archived_at": _iso(datetime.now(UTC))}).eq("id", job["id"]).execute()
+    job = (
+        service_client.table("jobs")
+        .select("id")
+        .eq("title", "Alpha Graded High")
+        .single()
+        .execute()
+        .data
+    )
+    service_client.table("jobs").update({"archived_at": _iso(datetime.now(UTC))}).eq(
+        "id", job["id"]
+    ).execute()
 
     # Trigger flipped every score row's denormalized liveness.
-    rows = service_client.table("scores").select("job_is_live").eq("job_posting_id", job["id"]).execute().data
-    assert rows and all(r["job_is_live"] is False for r in rows), "jobs trigger did not sync job_is_live"
+    rows = (
+        service_client.table("scores")
+        .select("job_is_live")
+        .eq("job_posting_id", job["id"])
+        .execute()
+        .data
+    )
+    assert rows and all(r["job_is_live"] is False for r in rows), (
+        "jobs trigger did not sync job_is_live"
+    )
 
     # And the RPC now drops it, still matching the live-reading Python path.
     rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
@@ -306,11 +417,26 @@ def test_jobs_refamily_trigger_syncs_and_gates(
     re-evaluates against the denormalized value — matching Python."""
     user_id, target_ids = seeded_cross_target
     # "Bravo Graded Low" is engineering, scored only by the eng target → kept.
-    job = service_client.table("jobs").select("id").eq("title", "Bravo Graded Low").single().execute().data
+    job = (
+        service_client.table("jobs")
+        .select("id")
+        .eq("title", "Bravo Graded Low")
+        .single()
+        .execute()
+        .data
+    )
     service_client.table("jobs").update({"role_family": "finance"}).eq("id", job["id"]).execute()
 
-    rows = service_client.table("scores").select("job_role_family").eq("job_posting_id", job["id"]).execute().data
-    assert rows and all(r["job_role_family"] == "finance" for r in rows), "jobs trigger did not sync role_family"
+    rows = (
+        service_client.table("scores")
+        .select("job_role_family")
+        .eq("job_posting_id", job["id"])
+        .execute()
+        .data
+    )
+    assert rows and all(r["job_role_family"] == "finance" for r in rows), (
+        "jobs trigger did not sync role_family"
+    )
 
     # Now off-family for the eng target → gated out, matching Python.
     rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
@@ -333,15 +459,28 @@ def test_per_target_score_sort_routes_through_cross_target_and_gates(
     user_id, target_ids = seeded_cross_target
     tmap = {
         t["id"]: t["role_family"]
-        for t in service_client.table("targets").select("id,role_family").in_("id", list(target_ids)).execute().data
+        for t in service_client.table("targets")
+        .select("id,role_family")
+        .in_("id", list(target_ids))
+        .execute()
+        .data
     }
     t_eng = next(t for t, fam in tmap.items() if fam == "engineering")
     common: dict = {
-        "target_id": t_eng, "page_size": 50, "sort": "score", "ascending": False,
-        "min_score": None, "status": None, "company": None, "search": None,
-        "exclude_terms": [], "only_terms": [], "cursor": {}, "user_id": user_id,
+        "target_id": t_eng,
+        "page_size": 50,
+        "sort": "score",
+        "ascending": False,
+        "min_score": None,
+        "status": None,
+        "company": None,
+        "search": None,
+        "exclude_terms": [],
+        "only_terms": [],
+        "cursor": {},
+        "user_id": user_id,
     }
-    new = _list_jobs_for_target(service_client, **common)           # new routing
+    new = _list_jobs_for_target(service_client, **common)  # new routing
     old = _list_jobs_for_target_two_query(service_client, **common)  # prior behavior
     new_titles = [p["title"] for p in new["postings"]]
     old_titles = [p["title"] for p in old["postings"]]
@@ -367,13 +506,19 @@ def test_rpc_offset_pagination_and_has_more(
     cursor: dict = {}
     for _ in range(10):  # bounded walk
         page = _rpc_page(
-            service_client, user_id, target_ids,
-            sort="score", ascending=False, page_size=2, cursor=cursor,
+            service_client,
+            user_id,
+            target_ids,
+            sort="score",
+            ascending=False,
+            page_size=2,
+            cursor=cursor,
         )
         seen.extend(_ids(page))
         if not page["next_cursor"]:
             break
         from app.routers.jobs import _decode_cursor
+
         cursor = _decode_cursor(page["next_cursor"])
 
     assert seen == full  # no gaps, no dupes, same order as the single-page fetch

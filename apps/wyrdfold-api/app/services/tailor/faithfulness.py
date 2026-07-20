@@ -74,9 +74,7 @@ inflated but arguable; low = minor.
 - If everything is faithful, return an empty `flags` list."""
 
 
-def _review_user_message(
-    resume: TailoredResume, optimized: OptimizedPayload
-) -> str:
+def _review_user_message(resume: TailoredResume, optimized: OptimizedPayload) -> str:
     return (
         "[SOURCE experience]\n"
         + optimized.model_dump_json(indent=2)
@@ -99,9 +97,7 @@ async def review_resume_faithfulness(
         llm,
         model=model,
         system=FAITHFULNESS_REVIEW_SYSTEM,
-        messages=[
-            Message(content=_review_user_message(resume, optimized), role="user")
-        ],
+        messages=[Message(content=_review_user_message(resume, optimized), role="user")],
         schema=FaithfulnessReview,
         purpose=purpose,
         cache_system=True,

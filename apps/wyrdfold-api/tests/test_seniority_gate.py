@@ -92,13 +92,8 @@ class TestPassesSeniorityGate:
         assert passes_seniority_gate("Customer Experience", "director") is True
 
     def test_tolerance_zero_drops_manager(self) -> None:
-        assert (
-            passes_seniority_gate("Customer Success Manager", "director", tolerance=0)
-            is False
-        )
-        assert (
-            passes_seniority_gate("Director of CX", "director", tolerance=0) is True
-        )
+        assert passes_seniority_gate("Customer Success Manager", "director", tolerance=0) is False
+        assert passes_seniority_gate("Director of CX", "director", tolerance=0) is True
 
     def test_offdomain_director_still_passes(self) -> None:
         # Documented blind spot: the gate is seniority-only, so a wrong-domain

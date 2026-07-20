@@ -48,9 +48,7 @@ def test_get_lists_meta_when_available(client, monkeypatch):
     from app.routers import keys as router_mod
 
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
-    monkeypatch.setattr(
-        router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()]
-    )
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()])
 
     resp = client.get("/profile/keys")
 
@@ -112,9 +110,7 @@ def test_put_replacing_existing_key_marks_rotation(client, monkeypatch):
 
     set_calls: list[dict] = []
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
-    monkeypatch.setattr(
-        router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()]
-    )
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()])
 
     def _set_key(*_a, **k):
         set_calls.append(k)

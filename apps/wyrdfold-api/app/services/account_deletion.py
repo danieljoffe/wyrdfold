@@ -142,9 +142,7 @@ def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
     #     the votes above can leave a contribution's ``suppressed`` flag
     #     momentarily stale, but it stays consistent with the already-merged
     #     profile and self-heals on the next vote (which re-tallies + re-merges).
-    report["reference_jds_anonymized"] = _anonymize_user_id(
-        supabase, "reference_jds", user_id
-    )
+    report["reference_jds_anonymized"] = _anonymize_user_id(supabase, "reference_jds", user_id)
 
     # 3. Scrub this user's PII off the shared scores rows for their targets.
     report["scores_scrubbed"] = _scrub_shared_scores(supabase, target_ids)

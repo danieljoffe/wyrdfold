@@ -24,9 +24,7 @@ from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
 
 
-def resolve_target_payers(
-    supabase: Client, target_ids: list[str]
-) -> dict[str, str | None]:
+def resolve_target_payers(supabase: Client, target_ids: list[str]) -> dict[str, str | None]:
     """Map each target id to its payer user id (or None if orphaned)."""
     if not target_ids:
         return {}
@@ -83,9 +81,7 @@ class PayerBudgetGate:
         )
 
 
-def build_budget_gate(
-    supabase: Client, target_ids: list[str]
-) -> PayerBudgetGate:
+def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGate:
     """Build the cycle snapshot: payers, overrides + activity, spends.
 
     Three queries total (payers IN, profiles IN, one spend RPC per
@@ -121,9 +117,7 @@ def build_budget_gate(
     idle: set[str] = set()
 
     idle_cutoff = (
-        now - timedelta(days=settings.idle_defer_days)
-        if settings.idle_defer_days > 0
-        else None
+        now - timedelta(days=settings.idle_defer_days) if settings.idle_defer_days > 0 else None
     )
     for uid in distinct:
         if uid in disabled:

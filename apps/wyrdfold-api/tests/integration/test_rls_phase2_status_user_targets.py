@@ -157,8 +157,18 @@ def test_status_log_select_scoped_to_caller(
     uid_a, uid_b = two_seeded_users
     service_client.table("status_log").insert(
         [
-            {"posting_id": seeded_posting, "old_status": "new", "new_status": "applied", "user_id": uid_a},
-            {"posting_id": seeded_posting, "old_status": "new", "new_status": "rejected", "user_id": uid_b},
+            {
+                "posting_id": seeded_posting,
+                "old_status": "new",
+                "new_status": "applied",
+                "user_id": uid_a,
+            },
+            {
+                "posting_id": seeded_posting,
+                "old_status": "new",
+                "new_status": "rejected",
+                "user_id": uid_b,
+            },
         ]
     ).execute()
     client_a = user_client_factory(uid_a)

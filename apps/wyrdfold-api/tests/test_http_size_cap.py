@@ -29,9 +29,7 @@ async def test_blocks_redirect_to_unsafe_host(monkeypatch):
 
     try:
         with pytest.raises(hc.UnsafeURLError):
-            await hc.get_with_size_cap(
-                "http://evil.test/", validate_host=validate_host
-            )
+            await hc.get_with_size_cap("http://evil.test/", validate_host=validate_host)
     finally:
         await client.aclose()
 
@@ -49,9 +47,7 @@ async def test_follows_safe_redirect(monkeypatch):
     monkeypatch.setattr(hc, "get_safe_http_client", lambda: client)
 
     try:
-        resp, body = await hc.get_with_size_cap(
-            "http://start.test/", validate_host=lambda _h: None
-        )
+        resp, body = await hc.get_with_size_cap("http://start.test/", validate_host=lambda _h: None)
         assert resp.status_code == 200
         assert body == b"<html>final</html>"
         assert resp.url.host == "end.test"

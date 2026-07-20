@@ -218,10 +218,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # auth admin API — a future `with TestClient(app)` test must not create
     # real users or need a live stack.
     supabase_for_owner = get_supabase_pool()
-    if (
-        supabase_for_owner is not None
-        and os.environ.get("WYRDFOLD_API_TESTING") != "1"
-    ):
+    if supabase_for_owner is not None and os.environ.get("WYRDFOLD_API_TESTING") != "1":
         provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
     # Background cost-log flush task. Cron paths enqueue rows and the
@@ -259,9 +256,7 @@ app.state.limiter = limiter
 
 
 @app.exception_handler(RateLimitExceeded)
-async def _rate_limit_exceeded_handler(
-    request: Request, exc: RateLimitExceeded
-) -> JSONResponse:
+async def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     _log.info(
         "rate_limit_exceeded path=%s detail=%s",
         request.url.path,
@@ -349,9 +344,7 @@ async def _log_slow_requests(
 
 
 @app.exception_handler(LLMServiceError)
-async def _llm_service_error_handler(
-    request: Request, exc: LLMServiceError
-) -> JSONResponse:
+async def _llm_service_error_handler(request: Request, exc: LLMServiceError) -> JSONResponse:
     """Translate typed LLM provider failures into a user-safe JSON
     response. Sentry breadcrumb keeps the upstream status + provider
     reason searchable without exposing them to end users.
@@ -454,9 +447,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     _log.exception("unhandled exception on %s %s", request.method, request.url.path)
     body: dict[str, str] = {
         "detail": (
-            f"{type(exc).__name__}: {exc}"
-            if settings.debug_errors
-            else "Internal server error"
+            f"{type(exc).__name__}: {exc}" if settings.debug_errors else "Internal server error"
         ),
         "path": request.url.path,
     }
@@ -529,9 +520,7 @@ async def ready() -> JSONResponse:
         )
     try:
         await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: supabase.table("sources").select("id").limit(1).execute()
-            ),
+            asyncio.to_thread(lambda: supabase.table("sources").select("id").limit(1).execute()),
             timeout=_READY_PING_TIMEOUT_S,
         )
     except Exception as exc:

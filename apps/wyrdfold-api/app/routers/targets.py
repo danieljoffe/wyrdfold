@@ -567,9 +567,7 @@ async def suggest_from_query(
     except ValidationError:
         # Structurally malformed model response (wrong types/missing fields).
         # An upstream hiccup, not a server bug — tell the client to retry.
-        logger.warning(
-            "suggest-from-query: model returned malformed suggestions", exc_info=True
-        )
+        logger.warning("suggest-from-query: model returned malformed suggestions", exc_info=True)
         raise HTTPException(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
@@ -1262,9 +1260,7 @@ async def create_target_from_posting(
     absolute_url: str | None = posting.get("absolute_url")
 
     # Create the target
-    target = await asyncio.to_thread(
-        crud.create, supabase, payload=TargetCreate(label=title)
-    )
+    target = await asyncio.to_thread(crud.create, supabase, payload=TargetCreate(label=title))
 
     # Derive scoring profile from description if substantial
     jd_text = strip_html(description_html)

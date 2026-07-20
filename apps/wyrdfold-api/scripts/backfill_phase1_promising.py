@@ -62,9 +62,7 @@ logger = logging.getLogger("backfill_phase1")
 PAGE_SIZE = 1000
 
 
-async def _fetch_ungraded_jobs_for_target(
-    supabase: Client, target_id: str
-) -> list[dict[str, Any]]:
+async def _fetch_ungraded_jobs_for_target(supabase: Client, target_id: str) -> list[dict[str, Any]]:
     """Return ``[{score_id, job_posting_id, title}, ...]`` for rows whose
     ``promising IS NULL`` for this target.
 
@@ -101,12 +99,7 @@ async def _fetch_ungraded_jobs_for_target(
     in_chunk = 100
     for i in range(0, len(job_ids), in_chunk):
         batch = job_ids[i : i + in_chunk]
-        resp2 = (
-            supabase.table("jobs")
-            .select("id, title")
-            .in_("id", batch)
-            .execute()
-        )
+        resp2 = supabase.table("jobs").select("id, title").in_("id", batch).execute()
         for j in cast(list[dict[str, Any]], resp2.data or []):
             job_titles[j["id"]] = j.get("title") or ""
 
@@ -162,9 +155,7 @@ async def _grade_and_persist_target(
         titles = [c["title"] for c in chunk]
 
         if dry_run:
-            logger.info(
-                "  [dry-run] would grade batch of %d (start=%d)", len(chunk), start
-            )
+            logger.info("  [dry-run] would grade batch of %d (start=%d)", len(chunk), start)
             continue
 
         verdicts, result = await triage_titles(llm, target=target, titles=titles)
@@ -215,9 +206,7 @@ async def _grade_and_persist_target(
                 update_payload["excluded"] = True
 
             try:
-                supabase.table("scores").update(update_payload).eq(
-                    "id", row["score_id"]
-                ).execute()
+                supabase.table("scores").update(update_payload).eq("id", row["score_id"]).execute()
                 if promising:
                     promising_count += 1
                 else:

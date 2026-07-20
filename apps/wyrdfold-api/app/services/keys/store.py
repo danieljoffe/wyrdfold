@@ -27,8 +27,7 @@ _META_COLS = "provider, last4, created_at, updated_at, rotated_at"
 def _validate_provider(provider: str) -> None:
     if provider not in _ALLOWED_PROVIDERS:
         raise ValueError(
-            f"unknown provider {provider!r}; expected one of "
-            f"{sorted(_ALLOWED_PROVIDERS)}"
+            f"unknown provider {provider!r}; expected one of {sorted(_ALLOWED_PROVIDERS)}"
         )
 
 
@@ -68,11 +67,7 @@ def set_key(
     if rotating:
         row["rotated_at"] = now
 
-    resp = (
-        supabase.table(TABLE)
-        .upsert(row, on_conflict="user_id,provider")
-        .execute()
-    )
+    resp = supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         # PostgREST returns the upserted representation by default; an empty
@@ -107,9 +102,7 @@ def get_key(
     return crypto.decrypt(rows[0]["ciphertext"])
 
 
-def has_usable_key(
-    supabase: Client, *, user_id: str, provider: Provider
-) -> bool:
+def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> bool:
     """Whether ``get_client`` would actually route spend to the user's
     key — the budget resolver's "who pays" check (Phase 3).
 
@@ -122,9 +115,7 @@ def has_usable_key(
     if not crypto.is_configured():
         return False
     try:
-        return (
-            get_key(supabase, user_id=user_id, provider=provider) is not None
-        )
+        return get_key(supabase, user_id=user_id, provider=provider) is not None
     except crypto.BYOKDecryptError:
         return False
 
@@ -133,11 +124,7 @@ def list_key_meta(supabase: Client, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""
     resp = (
-        supabase.table(TABLE)
-        .select(_META_COLS)
-        .eq("user_id", user_id)
-        .order("provider")
-        .execute()
+        supabase.table(TABLE).select(_META_COLS).eq("user_id", user_id).order("provider").execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [UserApiKeyMeta.model_validate(r) for r in rows]
@@ -152,11 +139,5 @@ def delete_key(
     """Delete a user's key for ``provider``. Returns True if a row was
     removed, False if there was nothing to delete."""
     _validate_provider(provider)
-    resp = (
-        supabase.table(TABLE)
-        .delete()
-        .eq("user_id", user_id)
-        .eq("provider", provider)
-        .execute()
-    )
+    resp = supabase.table(TABLE).delete().eq("user_id", user_id).eq("provider", provider).execute()
     return bool(resp.data)

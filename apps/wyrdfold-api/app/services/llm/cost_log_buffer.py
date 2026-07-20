@@ -211,8 +211,7 @@ class CostLogBuffer:
                 remaining = rows[start:]
                 self._requeue(remaining)
                 _log.exception(
-                    "cost-log buffer flush failed after %d row(s); "
-                    "re-queued %d row(s)",
+                    "cost-log buffer flush failed after %d row(s); re-queued %d row(s)",
                     written,
                     len(remaining),
                 )
@@ -229,9 +228,7 @@ class CostLogBuffer:
         try:
             while not self._stopping:
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        wakeup.wait(), timeout=self._flush_interval_s
-                    )
+                    await asyncio.wait_for(wakeup.wait(), timeout=self._flush_interval_s)
                 wakeup.clear()
                 with contextlib.suppress(Exception):
                     # `flush` already logs the exception; the loop just

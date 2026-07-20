@@ -65,9 +65,7 @@ def _mint_user_jwt(user_id: str) -> str:
 
 def _stack_reachable() -> bool:
     try:
-        resp = httpx.get(
-            f"{LOCAL_URL}/rest/v1/", headers={"apikey": ANON_KEY}, timeout=2.0
-        )
+        resp = httpx.get(f"{LOCAL_URL}/rest/v1/", headers={"apikey": ANON_KEY}, timeout=2.0)
     except httpx.HTTPError:
         return False
     return resp.status_code < 500
@@ -76,10 +74,7 @@ def _stack_reachable() -> bool:
 @pytest.fixture(scope="session")
 def _require_stack() -> None:
     if not _stack_reachable():
-        pytest.skip(
-            "local Supabase stack not reachable at "
-            f"{LOCAL_URL} — run `supabase start`"
-        )
+        pytest.skip(f"local Supabase stack not reachable at {LOCAL_URL} — run `supabase start`")
 
 
 @pytest.fixture
@@ -121,9 +116,7 @@ def create_auth_user(service_client: Client) -> str:
     FK. Random email keeps parallel/repeat runs from colliding.
     """
     email = f"rls-{uuid.uuid4().hex[:12]}@test.local"
-    return service_client.auth.admin.create_user(
-        {"email": email, "email_confirm": True}
-    ).user.id
+    return service_client.auth.admin.create_user({"email": email, "email_confirm": True}).user.id
 
 
 def delete_auth_user(service_client: Client, user_id: str) -> None:

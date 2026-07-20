@@ -73,9 +73,7 @@ def _quota(
     from app.services.keys import store as keys_store
 
     monkeypatch.setattr(settings, "deployment_mode", mode)
-    monkeypatch.setattr(
-        keys_store, "has_usable_key", lambda sb, *, user_id, provider: has_key
-    )
+    monkeypatch.setattr(keys_store, "has_usable_key", lambda sb, *, user_id, provider: has_key)
     return budget.resolve_llm_quota(_profile_supabase(rows), user_id=_UID)
 
 
@@ -90,9 +88,7 @@ def test_quota_self_host_is_pre_tier_behavior(
         has_key=True,  # even with a key: self_host semantics unchanged
         rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}],
     )
-    assert q == budget.ResolvedQuota(
-        settings.user_llm_monthly_budget_usd, True, None
-    )
+    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None)
 
     q = _quota(
         monkeypatch,
@@ -166,9 +162,7 @@ def test_quota_saas_broken_key_row_stays_metered(
 
     monkeypatch.setattr(keys_store, "get_key", _broken_get_key)
     q = budget.resolve_llm_quota(
-        _profile_supabase(
-            [{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}]
-        ),
+        _profile_supabase([{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}]),
         user_id=_UID,
     )
     # Managed accounting applies — NOT the unmetered BYOK-payer path.
@@ -184,36 +178,19 @@ def test_has_usable_key_mirrors_get_client_fallbacks(
 
     # Master key not configured → host pays regardless of rows.
     monkeypatch.setattr(keys_store.crypto, "is_configured", lambda: False)
-    assert (
-        keys_store.has_usable_key(
-            MagicMock(), user_id=_UID, provider="openrouter"
-        )
-        is False
-    )
+    assert keys_store.has_usable_key(MagicMock(), user_id=_UID, provider="openrouter") is False
 
     # Configured + decryptable → the user's key pays.
     monkeypatch.setattr(keys_store.crypto, "is_configured", lambda: True)
-    monkeypatch.setattr(
-        keys_store, "get_key", lambda sb, *, user_id, provider: "sk-x"
-    )
-    assert (
-        keys_store.has_usable_key(
-            MagicMock(), user_id=_UID, provider="openrouter"
-        )
-        is True
-    )
+    monkeypatch.setattr(keys_store, "get_key", lambda sb, *, user_id, provider: "sk-x")
+    assert keys_store.has_usable_key(MagicMock(), user_id=_UID, provider="openrouter") is True
 
     # Row present but undecryptable → host pays → NOT usable.
     def _broken(sb: Any, *, user_id: str, provider: str) -> str:
         raise BYOKDecryptError("rotated")
 
     monkeypatch.setattr(keys_store, "get_key", _broken)
-    assert (
-        keys_store.has_usable_key(
-            MagicMock(), user_id=_UID, provider="openrouter"
-        )
-        is False
-    )
+    assert keys_store.has_usable_key(MagicMock(), user_id=_UID, provider="openrouter") is False
 
 
 def test_quota_saas_free_without_key_keeps_default_cap(
@@ -272,9 +249,7 @@ def test_monthly_429_fires_on_billable_spend(
 
     from app.services.llm import cost_log
 
-    monkeypatch.setattr(
-        cost_log, "total_spend", lambda sb, user_id, since=None: 0.0
-    )
+    monkeypatch.setattr(cost_log, "total_spend", lambda sb, user_id, since=None: 0.0)
     monkeypatch.setattr(
         cost_log,
         "total_billable_spend",
@@ -332,9 +307,7 @@ def test_get_client_saas_missing_profile_is_refused(
 def test_get_client_saas_managed_tier_uses_host_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _client_probe(
-        monkeypatch, mode="saas", plan_rows=[{"plan": "pro"}]
-    )
+    client = _client_probe(monkeypatch, mode="saas", plan_rows=[{"plan": "pro"}])
     assert client is not None  # instance-key client, no refusal
 
 
@@ -343,9 +316,7 @@ def test_get_client_self_host_free_plan_keeps_env_fallback(
 ) -> None:
     """self_host ignores the plan column entirely (the instance env key
     IS the owner's BYOK)."""
-    client = _client_probe(
-        monkeypatch, mode="self_host", plan_rows=[{"plan": "free"}]
-    )
+    client = _client_probe(monkeypatch, mode="self_host", plan_rows=[{"plan": "free"}])
     assert client is not None
 
 

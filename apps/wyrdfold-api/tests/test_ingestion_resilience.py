@@ -343,9 +343,7 @@ async def test_source_counts_use_head_true(monkeypatch) -> None:
 
     sources_table = sb.table("sources")
     count_selects = [
-        call
-        for call in sources_table.select.call_args_list
-        if call.kwargs.get("count") == "exact"
+        call for call in sources_table.select.call_args_list if call.kwargs.get("count") == "exact"
     ]
     # Exactly the total + disabled source counts, both HEAD-only.
     assert len(count_selects) == 2

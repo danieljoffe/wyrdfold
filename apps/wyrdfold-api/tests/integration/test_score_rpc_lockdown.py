@@ -35,7 +35,12 @@ def test_score_write_rpcs_locked_to_service_role(
     # check would PASS — the only thing that can block the call is the revoked
     # EXECUTE grant. (Without this, an unfollowed target would raise the
     # follower check's own 42501 and the test would false-pass on a re-grant.)
-    tid = service_client.table("targets").insert({"label": f"Lockdown {uid[:8]}"}).execute().data[0]["id"]
+    tid = (
+        service_client.table("targets")
+        .insert({"label": f"Lockdown {uid[:8]}"})
+        .execute()
+        .data[0]["id"]
+    )
     service_client.table("user_targets").insert(
         {"user_id": uid, "target_id": tid, "is_active": True}
     ).execute()

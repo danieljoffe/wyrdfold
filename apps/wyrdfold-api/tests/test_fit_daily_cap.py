@@ -19,15 +19,7 @@ from app.services.fit.job_fit import JOB_FIT_PURPOSE
 def _supabase_with_count(count: int) -> MagicMock:
     """Build a mock whose Phase 2 cost query returns ``count`` entries."""
     supabase = MagicMock()
-    chain = (
-        supabase.table.return_value
-        .select.return_value
-        .eq.return_value
-        .eq.return_value
-        .gte.return_value
-        .limit.return_value
-        .execute
-    )
+    chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.gte.return_value.limit.return_value.execute
     chain.return_value.count = count
     return supabase
 

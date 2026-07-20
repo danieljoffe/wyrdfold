@@ -23,7 +23,9 @@ def test_attempted_promising_admits() -> None:
 
 
 def test_attempted_reject_excludes() -> None:
-    assert _phase1_promising(_v(False), attempted=True, gate_active=True, min_confidence=40) is False
+    assert (
+        _phase1_promising(_v(False), attempted=True, gate_active=True, min_confidence=40) is False
+    )
 
 
 def test_attempted_missing_verdict_failopens() -> None:
@@ -41,7 +43,9 @@ def test_budget_deferred_defers_not_admits() -> None:
 def test_attempted_low_confidence_excludes() -> None:
     # A promising verdict below the confidence floor is not admitted (#47).
     assert (
-        _phase1_promising(_v(True, confidence=20), attempted=True, gate_active=True, min_confidence=40)
+        _phase1_promising(
+            _v(True, confidence=20), attempted=True, gate_active=True, min_confidence=40
+        )
         is False
     )
 

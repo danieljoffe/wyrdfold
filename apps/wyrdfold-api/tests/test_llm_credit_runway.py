@@ -40,18 +40,14 @@ def credit_check_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "llm_credit_min_remaining_usd", 2.0)
 
 
-def _patch_probe(
-    monkeypatch: pytest.MonkeyPatch, *, remaining: float | None
-) -> list[int]:
+def _patch_probe(monkeypatch: pytest.MonkeyPatch, *, remaining: float | None) -> list[int]:
     calls: list[int] = []
 
     async def fake_probe(client: Any = None) -> float | None:
         calls.append(1)
         return remaining
 
-    monkeypatch.setattr(
-        "app.services.ingestion_health._openrouter_remaining_usd", fake_probe
-    )
+    monkeypatch.setattr("app.services.ingestion_health._openrouter_remaining_usd", fake_probe)
     return calls
 
 
@@ -62,9 +58,7 @@ def _patch_week_spend(monkeypatch: pytest.MonkeyPatch, usd: float) -> list[int]:
         calls.append(1)
         return usd
 
-    monkeypatch.setattr(
-        "app.services.ingestion_health.cost_log.total_spend_all", fake_spend
-    )
+    monkeypatch.setattr("app.services.ingestion_health.cost_log.total_spend_all", fake_spend)
     return calls
 
 
@@ -133,9 +127,7 @@ class TestCreditRunwayCheck:
         async def boom(client: Any = None) -> float | None:
             raise httpx.ConnectError("dns down")
 
-        monkeypatch.setattr(
-            "app.services.ingestion_health._openrouter_remaining_usd", boom
-        )
+        monkeypatch.setattr("app.services.ingestion_health._openrouter_remaining_usd", boom)
         spend_calls = _patch_week_spend(monkeypatch, 35.0)
 
         report = await check_ingestion_health(object(), now=_NOW)  # must not raise

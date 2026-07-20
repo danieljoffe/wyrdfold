@@ -85,12 +85,8 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
         "target_learning_log": log_mock,
     }[name]
 
-    monkeypatch.setattr(
-        "app.routers.targets._require_user_owns_target", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        "app.routers.targets.crud.get", lambda *a, **k: _target()
-    )
+    monkeypatch.setattr("app.routers.targets._require_user_owns_target", lambda *a, **k: None)
+    monkeypatch.setattr("app.routers.targets.crud.get", lambda *a, **k: _target())
     monkeypatch.setattr(
         "app.routers.targets.crud.count_user_reference_jds",
         lambda *a, **k: 0,
@@ -105,9 +101,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
             created_at=datetime.now(UTC),
         ),
     )
-    monkeypatch.setattr(
-        "app.routers.targets.crud.list_reference_jds", lambda *a, **k: []
-    )
+    monkeypatch.setattr("app.routers.targets.crud.list_reference_jds", lambda *a, **k: [])
     monkeypatch.setattr(
         "app.routers.targets.merge_reference_jds",
         lambda *_a: ScoringProfile(),
@@ -123,9 +117,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
         )
 
     monkeypatch.setattr("app.routers.targets.derive_profile_from_jd", _derive)
-    monkeypatch.setattr(
-        "app.routers.targets.cost_log.record", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.routers.targets.cost_log.record", lambda *a, **k: None)
 
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: None
     app.dependency_overrides[get_supabase] = lambda: sb
@@ -147,9 +139,7 @@ def test_capped_contribution_is_quarantined_not_applied(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = MagicMock(name="project", return_value=_capped_projection())
-    monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact", project
-    )
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", project)
     rpc = MagicMock(name="merge_rpc")
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
 
@@ -179,9 +169,7 @@ def test_capped_contribution_is_quarantined_not_applied(
 def test_uncapped_contribution_writes_through_merge_rpc(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
     rpc = MagicMock(name="merge_rpc", return_value=("applied", 4))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
 
@@ -201,9 +189,7 @@ def test_uncapped_contribution_writes_through_merge_rpc(
 def test_unresolvable_version_conflict_is_409(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
     rpc = MagicMock(name="merge_rpc", return_value=("version_conflict", 9))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
 

@@ -127,9 +127,7 @@ def main() -> None:
     logger.info("Grading %d golden cases with the live Phase-2 grader...", len(cases))
     scores = asyncio.run(_grade_cases(fixture, cases))
     for case, score in zip(cases, scores, strict=True):
-        logger.info(
-            "  %-28s expected=%-4s -> score=%s", case["name"], case["expected_band"], score
-        )
+        logger.info("  %-28s expected=%-4s -> score=%s", case["name"], case["expected_band"], score)
     report = _report(fixture, cases, scores)
     logger.info(
         "grading correctness: band_accuracy=%.1f%% (n=%d, skipped=%d)",

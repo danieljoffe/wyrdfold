@@ -106,9 +106,7 @@ def mock_service_layer(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
 async def test_handle_turn_persists_user_then_assistant(
     mock_service_layer: dict[str, Any],
 ) -> None:
-    llm = MockLLMClient(
-        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response()}
-    )
+    llm = MockLLMClient(scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response()})
     await orchestrator.handle_turn(
         MagicMock(),
         llm,
@@ -235,9 +233,7 @@ async def test_handle_turn_does_not_append_when_no_prose_content(
     mock_service_layer: dict[str, Any],
 ) -> None:
     llm = MockLLMClient(
-        scripted={
-            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(prose_append=None)
-        }
+        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(prose_append=None)}
     )
     result = await orchestrator.handle_turn(
         MagicMock(),
@@ -254,9 +250,7 @@ async def test_handle_turn_does_not_append_when_no_prose_content(
 async def test_handle_turn_cost_logs_with_correct_purpose_for_update_mode(
     mock_service_layer: dict[str, Any],
 ) -> None:
-    llm = MockLLMClient(
-        scripted={orchestrator.PURPOSE_TURN_UPDATE: _llm_response()}
-    )
+    llm = MockLLMClient(scripted={orchestrator.PURPOSE_TURN_UPDATE: _llm_response()})
     await orchestrator.handle_turn(
         MagicMock(),
         llm,
@@ -283,9 +277,7 @@ async def test_handle_turn_annotates_skipped_history(
         seen["messages"] = messages
         return _llm_response()
 
-    llm = MockLLMClient(
-        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: responder}
-    )
+    llm = MockLLMClient(scripted={orchestrator.PURPOSE_TURN_ONBOARDING: responder})
     await orchestrator.handle_turn(
         MagicMock(),
         llm,
@@ -303,9 +295,7 @@ async def test_next_probe_returns_default_when_no_optimized_doc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(optimized_mod, "get_latest", lambda _s, user_id: None)
-    result = await orchestrator.next_probe(
-        MagicMock(), MockLLMClient(), user_id=None
-    )
+    result = await orchestrator.next_probe(MagicMock(), MockLLMClient(), user_id=None)
     assert result.gap is None
     assert "most recent role" in result.question.lower()
 
@@ -341,9 +331,7 @@ async def test_next_probe_phrases_gap_via_llm(
     monkeypatch.setattr(cost_log_mod, "record", MagicMock())
 
     llm = MockLLMClient(
-        scripted={
-            orchestrator.PURPOSE_PROBE: "What number would you lead with from FC?"
-        }
+        scripted={orchestrator.PURPOSE_PROBE: "What number would you lead with from FC?"}
     )
     result = await orchestrator.next_probe(MagicMock(), llm, user_id=None)
     assert result.gap is not None
@@ -467,9 +455,7 @@ async def test_handle_turn_caps_history_to_the_configured_window(
     turns — never the old unbounded 1M (#29)."""
     from app.config import settings
 
-    llm = MockLLMClient(
-        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response()}
-    )
+    llm = MockLLMClient(scripted={orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response()})
     await orchestrator.handle_turn(
         MagicMock(),
         llm,

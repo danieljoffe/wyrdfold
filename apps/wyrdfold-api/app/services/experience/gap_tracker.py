@@ -47,12 +47,7 @@ def detect_gaps(payload: OptimizedPayload) -> list[Gap]:
     """Return all gaps, sorted by priority ascending (most urgent first)."""
     gaps: list[Gap] = []
 
-    if (
-        not payload.roles
-        and not payload.skills
-        and not payload.outcomes
-        and not payload.summary
-    ):
+    if not payload.roles and not payload.skills and not payload.outcomes and not payload.summary:
         gaps.append(
             Gap(
                 kind="content.empty",
@@ -109,10 +104,7 @@ def detect_gaps(payload: OptimizedPayload) -> list[Gap]:
                     kind="outcome.missing_metric",
                     ref=outcome.description[:80],
                     priority=20,
-                    context=(
-                        f"Outcome lacks a quantified metric: "
-                        f"'{outcome.description[:80]}'"
-                    ),
+                    context=(f"Outcome lacks a quantified metric: '{outcome.description[:80]}'"),
                 )
             )
 
@@ -150,9 +142,7 @@ def can_generate(payload: OptimizedPayload) -> GateResult:
             outcome_refs_by_role[o.role_ref] = True
 
     roles_without = sum(
-        1
-        for role in payload.roles
-        if not role.outcome_refs and role.id not in outcome_refs_by_role
+        1 for role in payload.roles if not role.outcome_refs and role.id not in outcome_refs_by_role
     )
 
     if roles_without > len(payload.roles) / 2:
@@ -173,9 +163,7 @@ def gap_health(payload: OptimizedPayload) -> GapHealthResult:
     gaps = detect_gaps(payload)
 
     if any(g.kind == "content.empty" for g in gaps):
-        return GapHealthResult(
-            gap_pct=100.0, tier="red", gaps=gaps, total_weight=0, gap_weight=0
-        )
+        return GapHealthResult(gap_pct=100.0, tier="red", gaps=gaps, total_weight=0, gap_weight=0)
 
     n_roles = len(payload.roles)
     n_outcomes = len(payload.outcomes)
@@ -191,9 +179,7 @@ def gap_health(payload: OptimizedPayload) -> GapHealthResult:
     )
 
     if total_weight == 0:
-        return GapHealthResult(
-            gap_pct=0.0, tier="green", gaps=gaps, total_weight=0, gap_weight=0
-        )
+        return GapHealthResult(gap_pct=0.0, tier="green", gaps=gaps, total_weight=0, gap_weight=0)
 
     gap_weight = sum(GAP_WEIGHTS.get(g.kind, 0) for g in gaps)
     gap_pct = round((gap_weight / total_weight) * 100, 1)

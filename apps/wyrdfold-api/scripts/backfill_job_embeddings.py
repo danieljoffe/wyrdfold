@@ -167,13 +167,20 @@ def _iter_jobs(
     if not include_archived:
         job_filters["archived_at"] = None
     job_ids = _page_ids(
-        sb, table="jobs", cols="id", order_col="created_at",
-        page_size=page_size, **job_filters,
+        sb,
+        table="jobs",
+        cols="id",
+        order_col="created_at",
+        page_size=page_size,
+        **job_filters,
     )
     embedded_rows = _page_ids(
-        sb, table="job_embeddings", cols="job_posting_id",
+        sb,
+        table="job_embeddings",
+        cols="job_posting_id",
         order_col="job_posting_id",  # no created_at on this table
-        page_size=page_size, model=DEFAULT_MODEL,
+        page_size=page_size,
+        model=DEFAULT_MODEL,
     )
     embedded = {r["job_posting_id"] for r in embedded_rows}
     missing = [r["id"] for r in job_ids if r["id"] not in embedded]

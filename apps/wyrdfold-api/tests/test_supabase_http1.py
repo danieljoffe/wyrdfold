@@ -40,12 +40,8 @@ def test_build_http1_client_disables_http2() -> None:
 
 @pytest.fixture
 def _service_role_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        settings, "supabase_url", "https://test-project.supabase.co"
-    )
-    monkeypatch.setattr(
-        settings, "supabase_service_role_key", "test-service-role-key"
-    )
+    monkeypatch.setattr(settings, "supabase_url", "https://test-project.supabase.co")
+    monkeypatch.setattr(settings, "supabase_service_role_key", "test-service-role-key")
     monkeypatch.setattr(settings, "supabase_anon_key", "test-anon-key")
 
 

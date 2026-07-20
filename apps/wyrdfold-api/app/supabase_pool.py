@@ -167,9 +167,7 @@ def get_user_client(access_token: str) -> Client:
     under that user, so RLS policies apply. Reuses the shared httpx pool.
     """
     options = ClientOptions(httpx_client=_get_user_httpx())
-    client = create_client(
-        settings.supabase_url, settings.supabase_anon_key, options
-    )
+    client = create_client(settings.supabase_url, settings.supabase_anon_key, options)
     # Bind the bearer on this per-request client only. Safe vs. the
     # service-role singleton's bleed risk because nothing else holds a
     # reference to this client (each call builds a fresh one).

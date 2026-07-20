@@ -68,8 +68,7 @@ def test_location_triggers_post_fetch_filter() -> None:
 
 def test_seniority_triggers_post_fetch_filter() -> None:
     assert (
-        _preferences_have_post_fetch_filter(TargetPreferences(pref_seniority_min="staff"))
-        is True
+        _preferences_have_post_fetch_filter(TargetPreferences(pref_seniority_min="staff")) is True
     )
 
 
@@ -87,10 +86,7 @@ def test_employment_type_keeps_job_with_null_tag() -> None:
 
 
 def test_seniority_keeps_job_with_absent_tag() -> None:
-    assert (
-        _seniority_passes(_job(), seniority_min="senior", seniority_max="director")
-        is True
-    )
+    assert _seniority_passes(_job(), seniority_min="senior", seniority_max="director") is True
 
 
 def test_seniority_keeps_job_with_offladder_tag() -> None:
@@ -104,12 +100,7 @@ def test_seniority_keeps_job_with_offladder_tag() -> None:
 
 
 def test_location_keeps_job_with_no_metro_and_no_location() -> None:
-    assert (
-        _location_pref_passes(
-            _job(location=None), locations=["berlin"], remote_ok=False
-        )
-        is True
-    )
+    assert _location_pref_passes(_job(location=None), locations=["berlin"], remote_ok=False) is True
 
 
 def test_apply_preferences_filter_is_noop_when_all_tags_absent() -> None:
@@ -152,7 +143,9 @@ def test_apply_preferences_filter_drops_by_employment_type() -> None:
 
 
 def test_seniority_drops_below_min() -> None:
-    assert _seniority_passes(_job(seniority="ic"), seniority_min="senior", seniority_max=None) is False
+    assert (
+        _seniority_passes(_job(seniority="ic"), seniority_min="senior", seniority_max=None) is False
+    )
 
 
 def test_seniority_drops_above_max() -> None:
@@ -169,11 +162,15 @@ def test_seniority_keeps_in_range_inclusive() -> None:
     )
     # Inclusive on both ends.
     assert (
-        _seniority_passes(_job(seniority="senior"), seniority_min="senior", seniority_max="director")
+        _seniority_passes(
+            _job(seniority="senior"), seniority_min="senior", seniority_max="director"
+        )
         is True
     )
     assert (
-        _seniority_passes(_job(seniority="director"), seniority_min="senior", seniority_max="director")
+        _seniority_passes(
+            _job(seniority="director"), seniority_min="senior", seniority_max="director"
+        )
         is True
     )
 
@@ -183,10 +180,7 @@ def test_seniority_keeps_in_range_inclusive() -> None:
 
 def test_location_matches_metro_tag() -> None:
     assert (
-        _location_pref_passes(
-            _job(metro="berlin"), locations=["berlin"], remote_ok=False
-        )
-        is True
+        _location_pref_passes(_job(metro="berlin"), locations=["berlin"], remote_ok=False) is True
     )
 
 
@@ -212,9 +206,7 @@ def test_location_falls_back_to_free_text_location() -> None:
 def test_location_free_text_avoids_substring_false_positive() -> None:
     """Reuses the location-chip matcher, so 'us' doesn't match 'Austin'."""
     assert (
-        _location_pref_passes(
-            _job(location="Austin, TX"), locations=["us"], remote_ok=False
-        )
+        _location_pref_passes(_job(location="Austin, TX"), locations=["us"], remote_ok=False)
         is False
     )
 
@@ -332,20 +324,26 @@ def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_across_user_targets_rpc",
-        lambda supabase, **kw: calls.__setitem__("cross_rpc", calls["cross_rpc"] + 1)
-        or {"postings": [], "next_cursor": None, "total": None},
+        lambda supabase, **kw: (
+            calls.__setitem__("cross_rpc", calls["cross_rpc"] + 1)
+            or {"postings": [], "next_cursor": None, "total": None}
+        ),
     )
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_for_target_rpc",
-        lambda supabase, **kw: calls.__setitem__("target_rpc", calls["target_rpc"] + 1)
-        or {"postings": [], "next_cursor": None, "total": 0},
+        lambda supabase, **kw: (
+            calls.__setitem__("target_rpc", calls["target_rpc"] + 1)
+            or {"postings": [], "next_cursor": None, "total": 0}
+        ),
     )
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_for_target_two_query",
-        lambda supabase, **kw: calls.__setitem__("two_query", calls["two_query"] + 1)
-        or {"postings": [], "next_cursor": None, "total": 0},
+        lambda supabase, **kw: (
+            calls.__setitem__("two_query", calls["two_query"] + 1)
+            or {"postings": [], "next_cursor": None, "total": 0}
+        ),
     )
 
     _list_jobs_for_target(
@@ -486,9 +484,7 @@ def test_integration_employment_type_filter_drops_known_mismatch() -> None:
         search=None,
         exclude_terms=[],
         only_terms=[],
-        preferences=TargetPreferences(
-            pref_score_cutoff=40, pref_employment_types=["full_time"]
-        ),
+        preferences=TargetPreferences(pref_score_cutoff=40, pref_employment_types=["full_time"]),
     )
 
     assert {p["id"] for p in result["postings"]} == {"ft", "unk"}

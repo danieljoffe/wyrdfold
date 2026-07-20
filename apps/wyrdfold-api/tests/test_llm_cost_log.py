@@ -82,9 +82,7 @@ def test_total_spend_falls_back_to_python_when_rpc_unavailable() -> None:
         [{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}]
     )
 
-    result = cost_log.total_spend(
-        sb, user_id="u1", since=datetime.now(UTC) - timedelta(hours=1)
-    )
+    result = cost_log.total_spend(sb, user_id="u1", since=datetime.now(UTC) - timedelta(hours=1))
     assert result == pytest.approx(0.40)
 
 
@@ -94,13 +92,9 @@ def test_total_spend_fallback_reads_system_partition_for_none_user() -> None:
     sb = MagicMock()
     sb.rpc.side_effect = Exception("not deployed")
     sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.gte.return_value.execute.return_value = _Resp(
-        [{"cost_usd": 0.5}]
-    )
+    sel.eq.return_value.gte.return_value.execute.return_value = _Resp([{"cost_usd": 0.5}])
 
-    result = cost_log.total_spend(
-        sb, user_id=None, since=datetime.now(UTC) - timedelta(hours=1)
-    )
+    result = cost_log.total_spend(sb, user_id=None, since=datetime.now(UTC) - timedelta(hours=1))
 
     assert result == pytest.approx(0.5)
     sel.eq.assert_called_once_with("user_id", SYSTEM_USER_ID)
@@ -118,9 +112,7 @@ def test_total_spend_rounds_to_six_decimals() -> None:
 
 def test_spend_by_purpose_uses_rpc_when_available() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = _Resp(
-        {"job_analysis": "1.25", "tailor": "0.50"}
-    )
+    sb.rpc.return_value.execute.return_value = _Resp({"job_analysis": "1.25", "tailor": "0.50"})
 
     result = cost_log.spend_by_purpose(sb, user_id="u1")
 
@@ -191,9 +183,7 @@ def test_cache_metrics_all_zero_when_no_rows() -> None:
 def test_enqueue_adds_one_row_to_module_buffer() -> None:
     # Drain anything left from prior tests.
     buffer._drain()
-    cost_log.enqueue(
-        user_id="u1", purpose="poll_scoring", result=_llm_result(cost=0.07)
-    )
+    cost_log.enqueue(user_id="u1", purpose="poll_scoring", result=_llm_result(cost=0.07))
 
     drained = buffer._drain()
     assert len(drained) == 1

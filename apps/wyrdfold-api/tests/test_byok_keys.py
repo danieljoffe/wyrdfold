@@ -62,9 +62,7 @@ def test_decrypt_rejects_wrong_master_key(
 ) -> None:
     token = crypto.encrypt("secret")
     # Rotate the master key — old ciphertext must no longer decrypt.
-    monkeypatch.setattr(
-        settings, "byok_master_key", base64.b64encode(bytes(32)).decode("ascii")
-    )
+    monkeypatch.setattr(settings, "byok_master_key", base64.b64encode(bytes(32)).decode("ascii"))
     with pytest.raises(crypto.BYOKDecryptError):
         crypto.decrypt(token)
 
@@ -81,9 +79,7 @@ def test_missing_master_key_raises_not_configured(
 def test_wrong_length_master_key_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        settings, "byok_master_key", base64.b64encode(b"tooshort").decode("ascii")
-    )
+    monkeypatch.setattr(settings, "byok_master_key", base64.b64encode(b"tooshort").decode("ascii"))
     with pytest.raises(crypto.BYOKNotConfiguredError, match="32 bytes"):
         crypto.encrypt("x")
 
@@ -146,11 +142,7 @@ class _FakeQuery:
             return SimpleNamespace(data=[new])
         if self._op == "select":
             cols = [c.strip() for c in (self._cols or "").split(",")]
-            out = [
-                {c: row.get(c) for c in cols}
-                for row in self._store
-                if self._matches(row)
-            ]
+            out = [{c: row.get(c) for c in cols} for row in self._store if self._matches(row)]
             return SimpleNamespace(data=out)
         if self._op == "delete":
             removed = [r for r in self._store if self._matches(r)]
@@ -173,9 +165,7 @@ class _FakeSupabase:
 
 def test_set_then_get_round_trips_plaintext() -> None:
     sb = _FakeSupabase()
-    keys.set_key(
-        sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-secret9999"
-    )
+    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-secret9999")
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "sk-or-v1-secret9999"
 
 
@@ -212,9 +202,7 @@ def test_rotate_stamps_rotated_at() -> None:
     sb = _FakeSupabase()
     keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="old")
     assert sb.rows[0]["rotated_at"] is None
-    keys.set_key(
-        sb, user_id="u1", provider="openrouter", plaintext="new", rotating=True
-    )
+    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="new", rotating=True)
     assert sb.rows[0]["rotated_at"] is not None
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "new"
 
@@ -224,15 +212,16 @@ def test_set_key_returns_upserted_meta() -> None:
     # (a concurrent delete could empty that read and spuriously 500 — found
     # by P4 stress testing). set_key returns the upsert's own row metadata.
     sb = _FakeSupabase()
-    meta = keys.set_key(
-        sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-abcd"
-    )
+    meta = keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-abcd")
     assert meta.provider == "openrouter"
     assert meta.last4 == "abcd"
     assert meta.rotated_at is None
 
     rotated = keys.set_key(
-        sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-wxyz",
+        sb,
+        user_id="u1",
+        provider="openrouter",
+        plaintext="sk-or-v1-wxyz",
         rotating=True,
     )
     assert rotated.last4 == "wxyz"

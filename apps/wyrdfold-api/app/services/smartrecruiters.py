@@ -39,9 +39,7 @@ def _build_content(posting_detail: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
-async def _fetch_one_posting_detail(
-    company_id: str, posting_id: str
-) -> dict[str, Any] | None:
+async def _fetch_one_posting_detail(company_id: str, posting_id: str) -> dict[str, Any] | None:
     """GET ``/postings/{posting_id}`` — the detail endpoint, which is the
     only one that actually returns ``jobAd.sections.*.text`` and the human
     facing ``postingUrl``. The list endpoint returns shells with empty
@@ -158,11 +156,7 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
         # in order: applyUrl → ref (API URL — last resort, the previous
         # code used this and that's why the LLM analyzer was handed a
         # JSON endpoint to parse as HTML).
-        absolute_url = (
-            detail.get("postingUrl")
-            or detail.get("applyUrl")
-            or detail.get("ref", "")
-        )
+        absolute_url = detail.get("postingUrl") or detail.get("applyUrl") or detail.get("ref", "")
 
         jobs.append(
             StandardJob(

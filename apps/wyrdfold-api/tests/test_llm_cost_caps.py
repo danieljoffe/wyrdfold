@@ -38,9 +38,7 @@ def _spend_by_window(hour: float, day: float, month: float):
 
 
 def test_monthly_breach_raises_429(monkeypatch):
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.0))
     with pytest.raises(HTTPException) as exc:
         budget.check_user_budget(
             MagicMock(),
@@ -55,9 +53,7 @@ def test_monthly_breach_raises_429(monkeypatch):
 
 
 def test_monthly_zero_disables(monkeypatch):
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 999.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 999.0))
     budget.check_user_budget(
         MagicMock(),
         user_id="u-1",
@@ -68,9 +64,7 @@ def test_monthly_zero_disables(monkeypatch):
 
 
 def test_under_monthly_cap_passes(monkeypatch):
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 4.99)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 4.99))
     budget.check_user_budget(
         MagicMock(),
         user_id="u-1",
@@ -82,9 +76,7 @@ def test_under_monthly_cap_passes(monkeypatch):
 
 def test_hourly_trips_before_monthly(monkeypatch):
     """Burst protection: the smaller window raises first."""
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(1.0, 1.0, 5.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(1.0, 1.0, 5.0))
     with pytest.raises(HTTPException) as exc:
         budget.check_user_budget(
             MagicMock(),
@@ -113,18 +105,14 @@ def test_llm_account_defaults_when_no_profile():
 
 
 def test_llm_account_null_override_is_none():
-    sb = _supabase_profile(
-        [{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}]
-    )
+    sb = _supabase_profile([{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}])
     account = budget.get_llm_account(sb, user_id="u-1")
     assert account.monthly_override_usd is None
     assert account.plan == "free"
 
 
 def test_llm_account_reads_override_and_plan():
-    sb = _supabase_profile(
-        [{"llm_monthly_budget_usd": 25, "llm_enabled": False, "plan": "pro"}]
-    )
+    sb = _supabase_profile([{"llm_monthly_budget_usd": 25, "llm_enabled": False, "plan": "pro"}])
     account = budget.get_llm_account(sb, user_id="u-1")
     assert account == budget.LlmAccount(25.0, False, "pro")
 
@@ -134,10 +122,7 @@ def test_llm_account_reads_override_and_plan():
 
 def _supabase_count(count: int) -> MagicMock:
     supabase = MagicMock()
-    chain = (
-        supabase.table.return_value.select.return_value.eq.return_value
-        .eq.return_value.gte.return_value.execute
-    )
+    chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.gte.return_value.execute
     chain.return_value.count = count
     return supabase
 
@@ -170,10 +155,7 @@ def test_daily_count_zero_limit_disables():
 
 def _supabase_user_targets(rows: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    chain = (
-        supabase.table.return_value.select.return_value.eq.return_value
-        .in_.return_value.order.return_value.order.return_value.execute
-    )
+    chain = supabase.table.return_value.select.return_value.eq.return_value.in_.return_value.order.return_value.order.return_value.execute
     chain.return_value.data = rows
     return supabase
 
@@ -233,9 +215,7 @@ def test_build_gate_classifies_over_budget_payer(monkeypatch):
     )
     # No overrides → settings default cap applies.
     sb = MagicMock()
-    profile_chain = (
-        sb.table.return_value.select.return_value.in_.return_value.execute
-    )
+    profile_chain = sb.table.return_value.select.return_value.in_.return_value.execute
     profile_chain.return_value.data = []
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(
@@ -252,9 +232,7 @@ def test_build_gate_classifies_over_budget_payer(monkeypatch):
 def test_build_gate_zero_cap_disables_gating(monkeypatch):
     import app.services.targets.payers as payers_mod
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"}
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 0.0)
@@ -308,20 +286,12 @@ def test_build_gate_override_raises_cap(monkeypatch):
     """A user_profiles override above the spend keeps the payer unblocked."""
     import app.services.targets.payers as payers_mod
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-vip"}
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-vip"})
     sb = MagicMock()
-    profile_chain = (
-        sb.table.return_value.select.return_value.in_.return_value.execute
-    )
-    profile_chain.return_value.data = [
-        {"user_id": "u-vip", "llm_monthly_budget_usd": 50}
-    ]
+    profile_chain = sb.table.return_value.select.return_value.in_.return_value.execute
+    profile_chain.return_value.data = [{"user_id": "u-vip", "llm_monthly_budget_usd": 50}]
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(
-        payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 20.0
-    )
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 20.0)
 
     gate = build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False  # 20 < 50 override
@@ -341,9 +311,7 @@ def _clear_approaching_dedup():
 def test_budget_exceeded_captures_sentry_warning(monkeypatch):
     """A 429 must come with a Sentry breadcrumb so operators see
     per-user budget hits, not just the FE-facing response (#26 F2)."""
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.0))
 
     import sentry_sdk
 
@@ -374,9 +342,7 @@ def test_approaching_cap_emits_warning_once(monkeypatch):
     """Crossing 80% triggers a one-shot Sentry warning per (user, scope)
     so the operator sees the run-up before the 429 spike (#26 F3)."""
     # 4.5 / 5.0 = 90% — over the 80% threshold, under the cap.
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 4.5)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 4.5))
 
     import sentry_sdk
 
@@ -407,9 +373,7 @@ def test_approaching_cap_emits_warning_once(monkeypatch):
 def test_approaching_cap_silent_under_threshold(monkeypatch):
     """Under 80%, no telemetry — we don't want to page on healthy spend."""
     # 3.0 / 5.0 = 60% — well under the threshold.
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 3.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 3.0))
 
     import sentry_sdk
 
@@ -434,9 +398,7 @@ def test_approaching_cap_silent_under_threshold(monkeypatch):
 def test_approaching_cap_silent_when_already_over(monkeypatch):
     """When spend has already crossed the cap, the 429 path owns the
     telemetry — don't double-warn here."""
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.5)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 0.0, 5.5))
 
     import sentry_sdk
 

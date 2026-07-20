@@ -87,7 +87,7 @@ class TestResolveForTarget:
         emph, excl, de = resolve_for_target(anns, "PM")
         assert len(excl) == 1  # global exclude
         assert len(emph) == 1  # PM-specific emphasize
-        assert len(de) == 1    # global de-emphasize
+        assert len(de) == 1  # global de-emphasize
 
     def test_no_target_label_returns_only_global(self) -> None:
         anns = [
@@ -126,18 +126,14 @@ class TestApplyExclusions:
         payload = OptimizedPayload(
             skills=[Skill(name="React"), Skill(name="Java")],
         )
-        result = apply_exclusions(
-            payload, [_ann(ref_type="skill", ref_value="Java")]
-        )
+        result = apply_exclusions(payload, [_ann(ref_type="skill", ref_value="Java")])
         assert [s.name for s in result.skills] == ["React"]
 
     def test_exclude_skill_case_insensitive(self) -> None:
         payload = OptimizedPayload(
             skills=[Skill(name="React"), Skill(name="Java")],
         )
-        result = apply_exclusions(
-            payload, [_ann(ref_type="skill", ref_value="java")]
-        )
+        result = apply_exclusions(payload, [_ann(ref_type="skill", ref_value="java")])
         assert [s.name for s in result.skills] == ["React"]
 
     def test_exclude_outcome_by_substring(self) -> None:
@@ -147,9 +143,7 @@ class TestApplyExclusions:
                 _outcome("Built dashboard"),
             ],
         )
-        result = apply_exclusions(
-            payload, [_ann(ref_type="outcome", ref_value="Cut LCP")]
-        )
+        result = apply_exclusions(payload, [_ann(ref_type="outcome", ref_value="Cut LCP")])
         assert len(result.outcomes) == 1
         assert result.outcomes[0].description == "Built dashboard"
 
@@ -167,10 +161,16 @@ class TestApplyExclusions:
         ann = _ann(action="emphasize", ref_value="a")
         payload = OptimizedPayload(
             roles=[_role("a"), _role("b")],
-            annotations=[Annotation(
-                id="keep-me", action="emphasize", ref_type="role",
-                ref_value="a", target_label=None, reason=None,
-            )],
+            annotations=[
+                Annotation(
+                    id="keep-me",
+                    action="emphasize",
+                    ref_type="role",
+                    ref_value="a",
+                    target_label=None,
+                    reason=None,
+                )
+            ],
         )
         result = apply_exclusions(payload, [_ann(ref_value="b")])
         assert len(result.annotations) == 1

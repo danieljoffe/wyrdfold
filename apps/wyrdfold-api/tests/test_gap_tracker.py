@@ -152,12 +152,8 @@ def test_later_roles_get_lower_priority_boost() -> None:
         ],
     )
     gaps = detect_gaps(payload)
-    newest_summary = next(
-        g for g in gaps if g.kind == "role.missing_summary" and g.ref == "newest"
-    )
-    older_summary = next(
-        g for g in gaps if g.kind == "role.missing_summary" and g.ref == "older"
-    )
+    newest_summary = next(g for g in gaps if g.kind == "role.missing_summary" and g.ref == "newest")
+    older_summary = next(g for g in gaps if g.kind == "role.missing_summary" and g.ref == "older")
     assert newest_summary.priority < older_summary.priority
 
 

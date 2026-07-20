@@ -55,21 +55,15 @@ _CLIENT_CACHE_SIZE = 32
 
 
 @lru_cache(maxsize=_CLIENT_CACHE_SIZE)
-def _cached_anthropic(
-    api_key: str | None, timeout: float, max_retries: int
-) -> AnthropicLLMClient:
-    return AnthropicLLMClient(
-        api_key=api_key, timeout=timeout, max_retries=max_retries
-    )
+def _cached_anthropic(api_key: str | None, timeout: float, max_retries: int) -> AnthropicLLMClient:
+    return AnthropicLLMClient(api_key=api_key, timeout=timeout, max_retries=max_retries)
 
 
 @lru_cache(maxsize=_CLIENT_CACHE_SIZE)
 def _cached_openrouter(
     api_key: str | None, timeout: float, max_retries: int
 ) -> OpenRouterLLMClient:
-    return OpenRouterLLMClient(
-        api_key=api_key, timeout=timeout, max_retries=max_retries
-    )
+    return OpenRouterLLMClient(api_key=api_key, timeout=timeout, max_retries=max_retries)
 
 
 def reset_llm_client_cache() -> None:
@@ -144,9 +138,7 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
             )
         # Global flag (the pre-tier hosted posture) OR the user's plan
         # requires their own key (saas free tier, Phase 3 slice 2).
-        if settings.byok_require_user_keys or _plan_requires_byok(
-            supabase, user_id
-        ):
+        if settings.byok_require_user_keys or _plan_requires_byok(supabase, user_id):
             raise MissingUserKeyError("openrouter")
 
     return get_default_client()
@@ -172,12 +164,7 @@ def _plan_requires_byok(supabase: "Client", user_id: str) -> bool:
 
     plan: str | None = None
     try:
-        resp = (
-            supabase.table("user_profiles")
-            .select("plan")
-            .eq("user_id", user_id)
-            .execute()
-        )
+        resp = supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
         rows = cast("list[dict[str, Any]]", resp.data or [])
         plan = cast("str | None", rows[0].get("plan")) if rows else None
     except Exception:

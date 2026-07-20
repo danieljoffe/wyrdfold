@@ -95,9 +95,7 @@ def test_init_logging_text_is_noop(caplog: pytest.LogCaptureFixture) -> None:
 def test_init_logging_json_attaches_handler() -> None:
     """`json` adds one StreamHandler with a JsonFormatter to root."""
     root = logging.getLogger()
-    before_count = sum(
-        1 for h in root.handlers if isinstance(h.formatter, JsonFormatter)
-    )
+    before_count = sum(1 for h in root.handlers if isinstance(h.formatter, JsonFormatter))
 
     init_logging("json")
 
@@ -119,9 +117,7 @@ def test_init_logging_json_is_idempotent() -> None:
     try:
         init_logging("json")
         init_logging("json")
-        json_handlers = [
-            h for h in root.handlers if isinstance(h.formatter, JsonFormatter)
-        ]
+        json_handlers = [h for h in root.handlers if isinstance(h.formatter, JsonFormatter)]
         assert len(json_handlers) == 1
     finally:
         for h in list(root.handlers):

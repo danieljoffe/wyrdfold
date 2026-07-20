@@ -97,17 +97,13 @@ def test_outcome_ref_is_stable_for_same_description() -> None:
 
 
 def test_skill_with_no_years_omits_paren() -> None:
-    chunks = chunks_for_optimized(
-        _payload(skills=[Skill(name="TypeScript", years=None)])
-    )
+    chunks = chunks_for_optimized(_payload(skills=[Skill(name="TypeScript", years=None)]))
     skill_chunk = next(c for c in chunks if c.chunk_type == "skill")
     assert "(" not in skill_chunk.content
 
 
 def test_skill_chunk_ref_is_lowercased() -> None:
-    chunks = chunks_for_optimized(
-        _payload(skills=[Skill(name="GraphQL", years=None)])
-    )
+    chunks = chunks_for_optimized(_payload(skills=[Skill(name="GraphQL", years=None)]))
     skill_chunk = next(c for c in chunks if c.chunk_type == "skill")
     assert skill_chunk.chunk_ref == "graphql"
 

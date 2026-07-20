@@ -185,6 +185,6 @@ class TestParseJD:
         for heading in variants:
             html = f"<h3>{heading}</h3><p>React</p>"
             result = parse_jd(html)
-            assert any(
-                s.name == "requirements" for s in result.sections
-            ), f"'{heading}' not classified as requirements"
+            assert any(s.name == "requirements" for s in result.sections), (
+                f"'{heading}' not classified as requirements"
+            )

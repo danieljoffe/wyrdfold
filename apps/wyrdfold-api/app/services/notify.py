@@ -96,20 +96,13 @@ async def send_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str
     return sent
 
 
-async def _families_by_target(
-    supabase: Client, target_ids: list[str]
-) -> dict[str, str | None]:
+async def _families_by_target(supabase: Client, target_ids: list[str]) -> dict[str, str | None]:
     """``target_id -> role_family`` for the family gate (#282). NULL family
     (unlabeled target) is kept — the gate treats it as match-anything."""
     if not target_ids:
         return {}
     resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("targets")
-            .select("id, role_family")
-            .in_("id", target_ids)
-            .execute()
-        )
+        lambda: supabase.table("targets").select("id, role_family").in_("id", target_ids).execute()
     )
     out: dict[str, str | None] = {}
     for row in cast(list[dict[str, Any]], resp.data or []):

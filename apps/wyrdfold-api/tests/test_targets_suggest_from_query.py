@@ -167,9 +167,7 @@ async def test_suggest_and_match_from_query_excludes_existing(
             )
         }
     )
-    matched, _ = await suggest_and_match_from_query(
-        object(), llm, query="frontend", user_id="u1"
-    )
+    matched, _ = await suggest_and_match_from_query(object(), llm, query="frontend", user_id="u1")
     assert [m.suggestion.label for m in matched.matches] == ["Staff DevOps Engineer"]
     assert matched.matches[0].is_new is True
 
@@ -181,9 +179,7 @@ async def test_suggest_and_match_from_query_without_payload(
     monkeypatch.setattr(match_module, "get_user_target_ids", lambda *_a: set())
     monkeypatch.setattr(match_module, "find_matching_target", lambda *_a: None)
 
-    llm = MockLLMClient(
-        scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json("Data Scientist")}
-    )
+    llm = MockLLMClient(scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json("Data Scientist")})
     matched, _ = await suggest_and_match_from_query(
         object(), llm, query="data scientist", user_id="u1", payload=None
     )
@@ -211,9 +207,7 @@ def _client(llm: MockLLMClient, user_id: str = "u1") -> TestClient:
     return TestClient(app)
 
 
-def _stub_endpoint_deps(
-    monkeypatch: pytest.MonkeyPatch, *, doc: object | None
-) -> None:
+def _stub_endpoint_deps(monkeypatch: pytest.MonkeyPatch, *, doc: object | None) -> None:
     from app.routers import targets as mod
 
     monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: doc)
@@ -256,9 +250,7 @@ def test_endpoint_tailors_when_a_profile_exists(
     llm = MockLLMClient(
         scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json("Senior Frontend Engineer")}
     )
-    resp = _client(llm).post(
-        "/targets/suggest-from-query", json={"query": "frontend"}
-    )
+    resp = _client(llm).post("/targets/suggest-from-query", json={"query": "frontend"})
     assert resp.status_code == 200
     # The profile got folded into the prompt to tailor the neighbours.
     sent = llm.calls[0]["messages"][-1].content
@@ -275,14 +267,10 @@ def test_endpoint_malformed_model_output_is_502(
     _stub_endpoint_deps(monkeypatch, doc=None)
     llm = MockLLMClient(
         scripted={
-            QUERY_DEFAULT_PURPOSE: json.dumps(
-                {"suggestions": [{"description": "no label here"}]}
-            )
+            QUERY_DEFAULT_PURPOSE: json.dumps({"suggestions": [{"description": "no label here"}]})
         }
     )
-    resp = _client(llm).post(
-        "/targets/suggest-from-query", json={"query": "frontend"}
-    )
+    resp = _client(llm).post("/targets/suggest-from-query", json={"query": "frontend"})
     assert resp.status_code == 502
 
 
@@ -290,12 +278,8 @@ def test_endpoint_empty_suggestions_returns_200_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_endpoint_deps(monkeypatch, doc=None)
-    llm = MockLLMClient(
-        scripted={QUERY_DEFAULT_PURPOSE: json.dumps({"suggestions": []})}
-    )
-    resp = _client(llm).post(
-        "/targets/suggest-from-query", json={"query": "zzunknownrole"}
-    )
+    llm = MockLLMClient(scripted={QUERY_DEFAULT_PURPOSE: json.dumps({"suggestions": []})})
+    resp = _client(llm).post("/targets/suggest-from-query", json={"query": "zzunknownrole"})
     assert resp.status_code == 200
     assert resp.json()["matches"] == []
 
@@ -306,12 +290,8 @@ def test_endpoint_injection_label_round_trips_as_data(
     """A prompt-injection string in a label is content, not a command — it must
     round-trip verbatim as a suggestion label, never be interpreted."""
     _stub_endpoint_deps(monkeypatch, doc=None)
-    llm = MockLLMClient(
-        scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json(INJECTION_LABEL)}
-    )
-    resp = _client(llm).post(
-        "/targets/suggest-from-query", json={"query": "frontend"}
-    )
+    llm = MockLLMClient(scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json(INJECTION_LABEL)})
+    resp = _client(llm).post("/targets/suggest-from-query", json={"query": "frontend"})
     assert resp.status_code == 200
     assert resp.json()["matches"][0]["suggestion"]["label"] == INJECTION_LABEL
 

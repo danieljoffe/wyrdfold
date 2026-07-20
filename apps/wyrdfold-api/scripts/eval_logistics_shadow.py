@@ -61,9 +61,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_logistics_shadow")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 _MODEL_SHORT = "sonnet-4.6"
@@ -100,9 +98,7 @@ async def _grade(
         jd_text=case.get("jd_text", ""),
     )
     system_prompt = (
-        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM
-        if extract_logistics
-        else _SYSTEM_PROMPT
+        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM if extract_logistics else _SYSTEM_PROMPT
     )
     # Match prod max_tokens: 1280 with logistics, 1024 without.
     max_tokens = 1280 if extract_logistics else 1024
@@ -124,11 +120,7 @@ async def _grade(
                 fit_score = int(fs)
             ax = parsed.get("axes")
             if isinstance(ax, dict):
-                axes = {
-                    k: int(v)
-                    for k, v in ax.items()
-                    if isinstance(v, int | float)
-                }
+                axes = {k: int(v) for k, v in ax.items() if isinstance(v, int | float)}
         except Exception:
             pass
 
@@ -182,9 +174,7 @@ async def _run(
     pending = {asyncio.create_task(_bounded(j)) for j in jobs}
     completed = 0
     while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             results.append(t.result())
             completed += 1
@@ -262,22 +252,14 @@ def _report(results: list[dict[str, Any]]) -> dict[str, Any]:
             off_axes = off.get("axes") or {}
             on_axes = on.get("axes") or {}
             if axis in off_axes and axis in on_axes:
-                pairs_per_axis[axis].append(
-                    (float(off_axes[axis]), float(on_axes[axis]))
-                )
+                pairs_per_axis[axis].append((float(off_axes[axis]), float(on_axes[axis])))
 
     spearman_overall = _spearman(pairs_overall)
     spearman_per_axis = {a: _spearman(p) for a, p in pairs_per_axis.items()}
 
     # Per-flag aggregates.
-    total_cost_off = sum(
-        r.get("cost_usd", 0.0)
-        for r in results
-        if not r["extract_logistics"]
-    )
-    total_cost_on = sum(
-        r.get("cost_usd", 0.0) for r in results if r["extract_logistics"]
-    )
+    total_cost_off = sum(r.get("cost_usd", 0.0) for r in results if not r["extract_logistics"])
+    total_cost_on = sum(r.get("cost_usd", 0.0) for r in results if r["extract_logistics"])
 
     return {
         "paired_cases": paired,
@@ -323,9 +305,7 @@ def _write_report(
     md.append("| Axis | ρ | Passes ≥0.9? |")
     md.append("| --- | --- | --- |")
     for axis, rho in report["spearman_per_axis"].items():
-        md.append(
-            f"| {axis} | {rho:.4f} | {'yes' if rho >= 0.9 else 'NO'} |"
-        )
+        md.append(f"| {axis} | {rho:.4f} | {'yes' if rho >= 0.9 else 'NO'} |")
     rho_overall = report["spearman_overall"]
     md.append(
         f"| **fit_score (overall)** | **{rho_overall:.4f}** | "
@@ -360,11 +340,7 @@ def main() -> None:
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
-    base = (
-        Path(args.output)
-        if args.output
-        else (_RESULTS_DIR / f"eval_logistics_shadow_{ts}")
-    )
+    base = Path(args.output) if args.output else (_RESULTS_DIR / f"eval_logistics_shadow_{ts}")
     base.parent.mkdir(parents=True, exist_ok=True)
     inflight = base.with_suffix(".inflight.json")
 

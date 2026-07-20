@@ -74,9 +74,7 @@ def backfill(*, dry_run: bool) -> tuple[int, int]:
             continue
 
         try:
-            supabase.table(TABLE).update({"payload_md": markdown}).eq(
-                "id", rid
-            ).execute()
+            supabase.table(TABLE).update({"payload_md": markdown}).eq("id", rid).execute()
             updated += 1
             logger.info("updated %s (%d chars)", rid, len(markdown))
         except Exception as exc:

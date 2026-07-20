@@ -56,26 +56,21 @@ import httpx
 import yaml  # type: ignore[import-untyped]
 
 DEFAULT_URL = (
-    "https://raw.githubusercontent.com/santifer/career-ops/main/"
-    "templates/portals.example.yml"
+    "https://raw.githubusercontent.com/santifer/career-ops/main/templates/portals.example.yml"
 )
 
 SUPPORTED_PROVIDERS = {"greenhouse", "ashby", "lever", "smartrecruiters"}
 
 # Slug extractors. Order matters — Greenhouse `api:` is the most reliable
 # signal so we check it first; the careers_url patterns are fallbacks.
-GREENHOUSE_API_RE = re.compile(
-    r"https?://boards-api\.greenhouse\.io/v\d+/boards/([^/]+)/jobs"
-)
+GREENHOUSE_API_RE = re.compile(r"https?://boards-api\.greenhouse\.io/v\d+/boards/([^/]+)/jobs")
 GREENHOUSE_CAREERS_RES = (
     re.compile(r"https?://job-boards\.greenhouse\.io/([^/?#]+)"),
     re.compile(r"https?://boards\.greenhouse\.io/([^/?#]+)"),
 )
 LEVER_CAREERS_RE = re.compile(r"https?://jobs\.lever\.co/([^/?#]+)")
 ASHBY_CAREERS_RE = re.compile(r"https?://jobs\.ashbyhq\.com/([^/?#]+)")
-SMARTRECRUITERS_CAREERS_RE = re.compile(
-    r"https?://jobs\.smartrecruiters\.com/([^/?#]+)"
-)
+SMARTRECRUITERS_CAREERS_RE = re.compile(r"https?://jobs\.smartrecruiters\.com/([^/?#]+)")
 
 
 @dataclass(frozen=True)
@@ -118,9 +113,7 @@ def classify(entry: dict[str, Any]) -> Source | None:
 
     m = SMARTRECRUITERS_CAREERS_RE.search(careers)
     if m:
-        return Source(
-            "smartrecruiters", m.group(1), name.strip(), entry.get("notes")
-        )
+        return Source("smartrecruiters", m.group(1), name.strip(), entry.get("notes"))
 
     return None
 

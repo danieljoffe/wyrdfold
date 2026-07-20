@@ -168,9 +168,9 @@ def test_set_scores_included_is_service_role_only(
 ) -> None:
     """SEC-H2: user_set_scores_included is service_role-only; the backend writes."""
     uid_a, _uid_b, job_id, target_a, _target_b, _aid = seeded_for_blend
-    service_client.table("scores").update({"excluded": True}).eq(
-        "job_posting_id", job_id
-    ).eq("target_id", target_a).execute()
+    service_client.table("scores").update({"excluded": True}).eq("job_posting_id", job_id).eq(
+        "target_id", target_a
+    ).execute()
 
     with pytest.raises(APIError):
         user_client_factory(uid_a).rpc(
@@ -221,9 +221,7 @@ def test_anon_cannot_call_score_write_rpcs(
         ).execute()
 
     with pytest.raises(APIError):
-        anon_client.rpc(
-            "user_upsert_score", {"p_row": _row(job_id, target_a, 99)}
-        ).execute()
+        anon_client.rpc("user_upsert_score", {"p_row": _row(job_id, target_a, 99)}).execute()
 
     with pytest.raises(APIError):
         anon_client.rpc(

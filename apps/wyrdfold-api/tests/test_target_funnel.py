@@ -53,8 +53,16 @@ def test_bucketize_empty_input_gives_zeroed_buckets() -> None:
     buckets = _bucketize([])
     assert sum(buckets.values()) == 0
     assert set(buckets) == {
-        "0-9", "10-19", "20-29", "30-39", "40-49",
-        "50-59", "60-69", "70-79", "80-89", "90-100",
+        "0-9",
+        "10-19",
+        "20-29",
+        "30-39",
+        "40-49",
+        "50-59",
+        "60-69",
+        "70-79",
+        "80-89",
+        "90-100",
     }
 
 
@@ -108,41 +116,27 @@ def _reference_stage_counts(
         promising_false=sum(1 for r in rows if r.get("promising") is False),
         promising_null=sum(1 for r in rows if r.get("promising") is None),
         by_status={
-            status: sum(
-                1 for r in rows if r.get("scoring_status") == status
-            )
+            status: sum(1 for r in rows if r.get("scoring_status") == status)
             for status in ("stage1", "stage2", "complete")
         },
         excluded_true=sum(1 for r in rows if r.get("excluded") is True),
         excluded_false=sum(1 for r in rows if r.get("excluded") is False),
         graded=sum(
-            1
-            for r in rows
-            if r.get("promising") is True
-            and r.get("scoring_status") != "stage1"
+            1 for r in rows if r.get("promising") is True and r.get("scoring_status") != "stage1"
         ),
-        complete=sum(
-            1 for r in rows if r.get("scoring_status") == "complete"
-        ),
+        complete=sum(1 for r in rows if r.get("scoring_status") == "complete"),
         stuck_in_stage1=sum(
-            1
-            for r in rows
-            if r.get("promising") is True
-            and r.get("scoring_status") == "stage1"
+            1 for r in rows if r.get("promising") is True and r.get("scoring_status") == "stage1"
         ),
     )
 
 
-def _reference_histogram(
-    rows: list[dict[str, Any]], floor: int
-) -> FunnelScoreBuckets:
+def _reference_histogram(rows: list[dict[str, Any]], floor: int) -> FunnelScoreBuckets:
     """Reference impl mirroring the old ``select score where excluded=false``
     scan: only ``excluded = false`` rows reach the histogram (NULL and True
     are dropped, matching SQL ``= false`` semantics)."""
     scores = [
-        int(r["score"])
-        for r in rows
-        if r.get("excluded") is False and r.get("score") is not None
+        int(r["score"]) for r in rows if r.get("excluded") is False and r.get("score") is not None
     ]
     return FunnelScoreBuckets(
         buckets=_bucketize(scores),
@@ -176,18 +170,9 @@ def _representative_score_rows() -> list[dict[str, Any]]:
     #  - a NULL score (dropped from the histogram)
     #  - a NULL excluded (dropped from the histogram, counted nowhere
     #    in excluded_true/false)
-    rows.append(
-        {"promising": True, "scoring_status": "archived",
-         "excluded": False, "score": 88}
-    )
-    rows.append(
-        {"promising": True, "scoring_status": "complete",
-         "excluded": False, "score": None}
-    )
-    rows.append(
-        {"promising": True, "scoring_status": "complete",
-         "excluded": None, "score": 73}
-    )
+    rows.append({"promising": True, "scoring_status": "archived", "excluded": False, "score": 88})
+    rows.append({"promising": True, "scoring_status": "complete", "excluded": False, "score": None})
+    rows.append({"promising": True, "scoring_status": "complete", "excluded": None, "score": 73})
     return rows
 
 
@@ -211,19 +196,13 @@ def test_stage_counts_hardcoded_expected_values() -> None:
     """A small hand-counted dataset, asserting exact field values (not just
     equality to the reference) so a bug in *both* impls can't pass."""
     rows = [
-        {"promising": True, "scoring_status": "stage1",
-         "excluded": False, "score": 10},
-        {"promising": True, "scoring_status": "stage2",
-         "excluded": False, "score": 20},
-        {"promising": True, "scoring_status": "complete",
-         "excluded": True, "score": 30},
-        {"promising": False, "scoring_status": "stage1",
-         "excluded": False, "score": 40},
-        {"promising": None, "scoring_status": "stage1",
-         "excluded": True, "score": 50},
+        {"promising": True, "scoring_status": "stage1", "excluded": False, "score": 10},
+        {"promising": True, "scoring_status": "stage2", "excluded": False, "score": 20},
+        {"promising": True, "scoring_status": "complete", "excluded": True, "score": 30},
+        {"promising": False, "scoring_status": "stage1", "excluded": False, "score": 40},
+        {"promising": None, "scoring_status": "stage1", "excluded": True, "score": 50},
         # status outside the known three — counted in total only.
-        {"promising": True, "scoring_status": "weird",
-         "excluded": False, "score": 60},
+        {"promising": True, "scoring_status": "weird", "excluded": False, "score": 60},
     ]
     counts = _stage_counts(rows)
     assert counts.scores_total == 6
@@ -250,9 +229,7 @@ def _make_target() -> JobTarget:
         normalized_label="director of cx ops",
         scoring_profile=ScoringProfile(
             categories={
-                "core_skills": CategoryProfile(
-                    keywords={"customer": 3, "ops": 3}, weight=2.0
-                ),
+                "core_skills": CategoryProfile(keywords={"customer": 3, "ops": 3}, weight=2.0),
             },
             seniority=SeniorityProfile(signals=["director"]),
         ),
@@ -315,9 +292,7 @@ class _FakeSupabase:
 def _scripted_response(target: JobTarget) -> Any:
     """Hard-coded responses keyed by (table, filter signature)."""
 
-    def respond(
-        table: str, filters: list[tuple[str, str, Any]], count: str | None
-    ) -> Any:
+    def respond(table: str, filters: list[tuple[str, str, Any]], count: str | None) -> Any:
         # Targets lookup — single row.
         if table == "targets":
             return SimpleNamespace(
@@ -349,35 +324,39 @@ def _scripted_response(target: JobTarget) -> Any:
             # scored rows reproduce the histogram [45,55,65,75,85,95].
             return SimpleNamespace(
                 data=[
-                    {"promising": True, "scoring_status": "complete",
-                     "excluded": False, "score": 95},
-                    {"promising": True, "scoring_status": "stage2",
-                     "excluded": False, "score": 85},
-                    {"promising": True, "scoring_status": "stage1",
-                     "excluded": False, "score": 75},
-                    {"promising": False, "scoring_status": "stage1",
-                     "excluded": False, "score": 65},
-                    {"promising": None, "scoring_status": "stage1",
-                     "excluded": False, "score": 55},
-                    {"promising": True, "scoring_status": "stage1",
-                     "excluded": False, "score": 45},
+                    {
+                        "promising": True,
+                        "scoring_status": "complete",
+                        "excluded": False,
+                        "score": 95,
+                    },
+                    {"promising": True, "scoring_status": "stage2", "excluded": False, "score": 85},
+                    {"promising": True, "scoring_status": "stage1", "excluded": False, "score": 75},
+                    {
+                        "promising": False,
+                        "scoring_status": "stage1",
+                        "excluded": False,
+                        "score": 65,
+                    },
+                    {"promising": None, "scoring_status": "stage1", "excluded": False, "score": 55},
+                    {"promising": True, "scoring_status": "stage1", "excluded": False, "score": 45},
                     # Excluded row — counts toward excluded_true but is
                     # filtered out of the histogram.
-                    {"promising": True, "scoring_status": "complete",
-                     "excluded": True, "score": 99},
+                    {
+                        "promising": True,
+                        "scoring_status": "complete",
+                        "excluded": True,
+                        "score": 99,
+                    },
                 ],
                 count=None,
             )
 
         if table == "user_targets":
-            return SimpleNamespace(
-                data=[{"user_id": "u-1", "is_active": True}], count=None
-            )
+            return SimpleNamespace(data=[{"user_id": "u-1", "is_active": True}], count=None)
 
         if table == "user_profiles":
-            return SimpleNamespace(
-                data=[{"user_id": "u-1", "list_min_score": 60}], count=None
-            )
+            return SimpleNamespace(data=[{"user_id": "u-1", "list_min_score": 60}], count=None)
 
         if table == "sources":
             return SimpleNamespace(
@@ -414,17 +393,13 @@ def test_compute_target_funnel_assembles_full_report(monkeypatch: Any) -> None:
 
     # The funnel's nomenclature path goes via crud.get(target_id). We
     # patch that instead of round-tripping through the fake table call.
-    monkeypatch.setattr(
-        "app.services.diagnostics.funnel.crud.get", _fake_get
-    )
+    monkeypatch.setattr("app.services.diagnostics.funnel.crud.get", _fake_get)
 
     sb = _FakeSupabase(_scripted_response(target))
     report = compute_target_funnel(sb, target.id)
 
     assert report.nomenclature.label == "Director of CX Ops"
-    assert report.nomenclature.example_promising_titles == [
-        "Director, CX Operations"
-    ]
+    assert report.nomenclature.example_promising_titles == ["Director, CX Operations"]
     # Histogram bins reflect the scripted scores [45,55,65,75,85,95].
     assert report.scores_histogram.total == 6
     assert report.scores_histogram.max_score == 95

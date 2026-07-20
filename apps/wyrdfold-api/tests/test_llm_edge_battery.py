@@ -87,9 +87,7 @@ def _valid_analysis_dict() -> dict[str, Any]:
     return JobAnalysis(
         scorecard=Scorecard(
             skills_matched=[
-                SkillMatch(
-                    name="React", matched=True, confidence="high", evidence="skills list"
-                )
+                SkillMatch(name="React", matched=True, confidence="high", evidence="skills list")
             ],
             skills_missing=["GraphQL"],
             nice_to_haves=[],
@@ -192,12 +190,8 @@ SURFACES = [
         purpose="target.suggest_from_query",
         schema=TargetSuggestions,
         valid=_valid_suggest_from_query_dict,
-        call=lambda llm: suggest_targets_from_query(
-            llm, query="senior frontend engineer"
-        ),
-        text_field=lambda res: (
-            res[0].suggestions[0].description if res[0].suggestions else None
-        ),
+        call=lambda llm: suggest_targets_from_query(llm, query="senior frontend engineer"),
+        text_field=lambda res: res[0].suggestions[0].description if res[0].suggestions else None,
     ),
 ]
 

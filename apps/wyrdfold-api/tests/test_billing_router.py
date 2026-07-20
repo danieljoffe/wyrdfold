@@ -62,20 +62,14 @@ def _client(sb: MagicMock) -> TestClient:
 
 
 def _plan_updates(sb: MagicMock) -> list[dict[str, Any]]:
-    return [
-        c.args[0]
-        for c in sb.table.return_value.update.call_args_list
-        if "plan" in c.args[0]
-    ]
+    return [c.args[0] for c in sb.table.return_value.update.call_args_list if "plan" in c.args[0]]
 
 
 def _signed(payload: dict[str, Any], secret: str = _WHSEC) -> tuple[bytes, str]:
     """Sign a payload exactly the way Stripe does (t + HMAC-SHA256 v1)."""
     body = json.dumps(payload).encode()
     ts = int(time.time())
-    mac = hmac.new(
-        secret.encode(), f"{ts}.".encode() + body, hashlib.sha256
-    ).hexdigest()
+    mac = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
     return body, f"t={ts},v1={mac}"
 
 
@@ -175,9 +169,7 @@ def test_checkout_unconfigured_price_is_503(
     assert r.status_code == 503
 
 
-def test_portal_requires_existing_customer(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_portal_requires_existing_customer(saas_billing: None, sb: MagicMock) -> None:
     """Negative: no billing account yet → 409, no Stripe call."""
     r = _client(sb).post("/billing/portal-session")
     assert r.status_code == 409
@@ -192,9 +184,7 @@ def test_webhook_forged_signature_is_400_and_writes_nothing(
     """Negative: a valid-looking event signed with the WRONG secret is
     refused by the real verification code — and nothing is written."""
     body, sig = _signed(_sub_event(), secret="whsec_attacker")
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 400
     sb.table.return_value.update.assert_not_called()
 
@@ -214,73 +204,49 @@ def test_webhook_unset_secret_is_503(
     """Negative: never process billing events unsigned."""
     monkeypatch.setattr(settings, "stripe_webhook_secret", "")
     body, sig = _signed(_sub_event())
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 503
 
 
-def test_webhook_active_subscription_sets_plan_by_price(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_active_subscription_sets_plan_by_price(saas_billing: None, sb: MagicMock) -> None:
     body, sig = _signed(_sub_event(price=_PRO_PRICE, status="active"))
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == [{"plan": "pro"}]
 
 
-def test_webhook_non_entitled_status_downgrades_to_free(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_non_entitled_status_downgrades_to_free(saas_billing: None, sb: MagicMock) -> None:
     """Negative-direction: past_due never keeps a paid tier."""
     body, sig = _signed(_sub_event(status="past_due"))
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == [{"plan": "free"}]
 
 
-def test_webhook_subscription_deleted_downgrades_to_free(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_subscription_deleted_downgrades_to_free(saas_billing: None, sb: MagicMock) -> None:
     body, sig = _signed(_sub_event("customer.subscription.deleted"))
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == [{"plan": "free"}]
 
 
-def test_webhook_unknown_price_is_ignored(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_unknown_price_is_ignored(saas_billing: None, sb: MagicMock) -> None:
     """Negative: an unmapped price must never grant or revoke a tier."""
     body, sig = _signed(_sub_event(price="price_someone_elses"))
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == []
 
 
-def test_webhook_unknown_customer_is_ignored(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_unknown_customer_is_ignored(saas_billing: None, sb: MagicMock) -> None:
     """Negative: no metadata user + no profile match → no write."""
     body, sig = _signed(_sub_event(user_meta=None, customer="cus_stranger"))
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == []
 
 
-def test_webhook_checkout_completed_links_customer(
-    saas_billing: None, sb: MagicMock
-) -> None:
+def test_webhook_checkout_completed_links_customer(saas_billing: None, sb: MagicMock) -> None:
     body, sig = _signed(
         {
             "id": "evt_2",
@@ -295,9 +261,7 @@ def test_webhook_checkout_completed_links_customer(
             },
         }
     )
-    r = _client(sb).post(
-        "/billing/webhook", content=body, headers={"stripe-signature": sig}
-    )
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     saved = [
         c.args[0]
@@ -325,9 +289,7 @@ def test_billing_account_reports_plan_and_state(
         "get_llm_account",
         lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, "starter"),
     )
-    monkeypatch.setattr(
-        keys_store, "has_usable_key", lambda s, *, user_id, provider: True
-    )
+    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: True)
     sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
         {"stripe_customer_id": "cus_x"}
     ]
@@ -353,9 +315,7 @@ def test_billing_account_defaults_free_no_account(
         "get_llm_account",
         lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, None),
     )
-    monkeypatch.setattr(
-        keys_store, "has_usable_key", lambda s, *, user_id, provider: False
-    )
+    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: False)
 
     r = _client(sb).get("/billing/account")
 

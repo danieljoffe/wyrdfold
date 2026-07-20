@@ -73,9 +73,7 @@ def seeded_export_user(
         .execute()
         .data[0]["id"]
     )
-    service_client.table("user_targets").insert(
-        {"user_id": uid_a, "target_id": followed}
-    ).execute()
+    service_client.table("user_targets").insert({"user_id": uid_a, "target_id": followed}).execute()
     ref_followed = (
         service_client.table("reference_jds")
         .insert(
@@ -156,9 +154,7 @@ def seeded_export_user(
         service_client.storage.from_(_BUCKET).remove([path])
         service_client.table("jobs").delete().eq("id", job_id).execute()
         service_client.table("sources").delete().eq("id", source_id).execute()
-        service_client.table("targets").delete().in_(
-            "id", [followed, unfollowed]
-        ).execute()
+        service_client.table("targets").delete().in_("id", [followed, unfollowed]).execute()
 
 
 def _normalized(data: dict[str, list[dict[str, Any]]]) -> dict[str, list[str]]:
@@ -180,9 +176,7 @@ def test_dual_client_export_identical_to_service_role(
     flipped = collect_user_data(
         user_client_factory(uid_a), user_id=uid_a, service_supabase=service_client
     )
-    pre_flip = collect_user_data(
-        service_client, user_id=uid_a, service_supabase=service_client
-    )
+    pre_flip = collect_user_data(service_client, user_id=uid_a, service_supabase=service_client)
     assert _normalized(flipped) == _normalized(pre_flip)
     # The seeds actually landed — an empty==empty pass would prove nothing.
     for table in (
@@ -217,9 +211,7 @@ def test_zip_inventory_identical_across_clients(
     flipped = build_export_zip(
         user_client_factory(uid_a), user_id=uid_a, service_supabase=service_client
     )
-    pre_flip = build_export_zip(
-        service_client, user_id=uid_a, service_supabase=service_client
-    )
+    pre_flip = build_export_zip(service_client, user_id=uid_a, service_supabase=service_client)
     zf_flipped = zipfile.ZipFile(io.BytesIO(flipped))
     zf_pre = zipfile.ZipFile(io.BytesIO(pre_flip))
     assert sorted(zf_flipped.namelist()) == sorted(zf_pre.namelist())
@@ -287,6 +279,4 @@ def test_rls_backstop_blocks_cross_user_export(
     # No profile row visible -> the notifications_sent service read never runs.
     assert "notifications_sent" not in stolen
     # And B's client cannot list A's Storage prefix.
-    assert (
-        user_client_factory(uid_b).storage.from_(_BUCKET).list(uid_a) or []
-    ) == []
+    assert (user_client_factory(uid_b).storage.from_(_BUCKET).list(uid_a) or []) == []

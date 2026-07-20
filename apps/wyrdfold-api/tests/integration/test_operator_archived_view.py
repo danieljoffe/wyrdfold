@@ -105,9 +105,7 @@ def test_operator_archived_audit_view(
         .execute()
     )
     ids = {r["id"] for r in (resp.data or [])}
-    assert ids == {
-        archived_id
-    }, f"archived view should show only the archived job, got {ids!r}"
+    assert ids == {archived_id}, f"archived view should show only the archived job, got {ids!r}"
 
 
 def test_jobs_status_column_is_gone(
@@ -118,6 +116,4 @@ def test_jobs_status_column_is_gone(
     must error."""
     live_id, _archived_id = seeded_live_and_archived
     with pytest.raises(Exception):
-        service_client.table("jobs").select("status").eq(
-            "id", live_id
-        ).execute()
+        service_client.table("jobs").select("status").eq("id", live_id).execute()

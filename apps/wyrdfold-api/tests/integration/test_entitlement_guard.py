@@ -48,9 +48,7 @@ def test_entitlement_columns_immutable_to_user(
     assert row["max_active_targets"] is None
 
     # 2. A genuine preference still updates through the same client.
-    user.table("user_profiles").update({"list_min_score": 77}).eq(
-        "user_id", uid
-    ).execute()
+    user.table("user_profiles").update({"list_min_score": 77}).eq("user_id", uid).execute()
     assert (
         service_client.table("user_profiles")
         .select("list_min_score")
@@ -62,9 +60,7 @@ def test_entitlement_columns_immutable_to_user(
     )
 
     # 3. The service-role client (billing webhook / admin) CAN set entitlements.
-    service_client.table("user_profiles").update({"plan": "pro"}).eq(
-        "user_id", uid
-    ).execute()
+    service_client.table("user_profiles").update({"plan": "pro"}).eq("user_id", uid).execute()
     assert (
         service_client.table("user_profiles")
         .select("plan")
@@ -77,10 +73,6 @@ def test_entitlement_columns_immutable_to_user(
 
     # 4. sms_daily_limit: a valid value works, an abusive one is rejected by the
     #    DB CHECK (the Pydantic 1..50 bound, now enforced past PostgREST too).
-    user.table("user_profiles").update({"sms_daily_limit": 30}).eq(
-        "user_id", uid
-    ).execute()
+    user.table("user_profiles").update({"sms_daily_limit": 30}).eq("user_id", uid).execute()
     with pytest.raises(Exception):
-        user.table("user_profiles").update({"sms_daily_limit": 999}).eq(
-            "user_id", uid
-        ).execute()
+        user.table("user_profiles").update({"sms_daily_limit": 999}).eq("user_id", uid).execute()

@@ -38,9 +38,7 @@ def get_api_key() -> str:
             m = re.match(rf'\s*(?:export\s+)?{_KEY_ENV}=["\']?([^"\'\s]+)', line)
             if m:
                 return m.group(1)
-    raise RuntimeError(
-        f"{_KEY_ENV} not set. Export it in your shell or add to ~/.zshrc."
-    )
+    raise RuntimeError(f"{_KEY_ENV} not set. Export it in your shell or add to ~/.zshrc.")
 
 
 # Canonical model slugs the eval harness uses. OpenRouter routes the

@@ -275,9 +275,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         cache_system: bool = False,
     ) -> AsyncIterator[LLMStreamEvent]:
         if model in _OPENAI_SHAPED_MODELS:
-            raise NotImplementedError(
-                f"{model!r} is OpenAI-shaped and does not support stream()."
-            )
+            raise NotImplementedError(f"{model!r} is OpenAI-shaped and does not support stream().")
         return super().stream(
             model=model,
             system=system,
@@ -378,9 +376,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
                 f"{str(err.get('message'))[:200]!r}"
             )
 
-        tool_input = _parse_openai_tool_response(
-            data, tool_name=tool_name, max_tokens=max_tokens
-        )
+        tool_input = _parse_openai_tool_response(data, tool_name=tool_name, max_tokens=max_tokens)
         usage = _openai_usage(data)
         cost = calculate_cost(model, usage)
         result = LLMResult(

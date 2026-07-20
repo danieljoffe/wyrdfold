@@ -68,9 +68,7 @@ def llm() -> MockLLMClient:
 
 @pytest.mark.asyncio
 async def test_derive_returns_derived_target(llm: MockLLMClient):
-    derived, result = await derive_profile_from_jd(
-        llm, jd_text=_VALID_JD
-    )
+    derived, result = await derive_profile_from_jd(llm, jd_text=_VALID_JD)
     assert isinstance(derived, DerivedTarget)
     assert derived.scoring_profile.categories["core_skills"].keywords["React"] == 3
     assert derived.scoring_profile.seniority.level == "senior"
@@ -109,9 +107,7 @@ async def test_derive_returns_result_with_cost(llm: MockLLMClient):
 
 @pytest.mark.asyncio
 async def test_derive_model_override():
-    client = MockLLMClient(
-        scripted={"custom.purpose": _sample_derived_json()}
-    )
+    client = MockLLMClient(scripted={"custom.purpose": _sample_derived_json()})
     derived, _ = await derive_profile_from_jd(
         client,
         jd_text=_VALID_JD,

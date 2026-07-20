@@ -33,13 +33,7 @@ def _resolve_target_id_for_email(sb: Any, email: str) -> str:
     If multiple active targets, picks the most recently updated one and
     notes it on stderr so the operator can re-run with an explicit id.
     """
-    prof = (
-        sb.table("user_profiles")
-        .select("user_id")
-        .eq("email", email)
-        .limit(1)
-        .execute()
-    )
+    prof = sb.table("user_profiles").select("user_id").eq("email", email).limit(1).execute()
     prof_rows = cast(list[dict[str, Any]], prof.data or [])
     if not prof_rows:
         sys.exit(f"No user_profiles row for email={email!r}")
@@ -160,12 +154,8 @@ def main() -> None:
         nargs="?",
         help="Target UUID. Omit to use --email instead.",
     )
-    parser.add_argument(
-        "--email", help="Resolve target_id from this user's primary active target."
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="Emit the raw JSON response."
-    )
+    parser.add_argument("--email", help="Resolve target_id from this user's primary active target.")
+    parser.add_argument("--json", action="store_true", help="Emit the raw JSON response.")
     args = parser.parse_args()
 
     if not args.target_id and not args.email:

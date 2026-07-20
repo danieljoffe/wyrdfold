@@ -49,9 +49,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("multi_model_judge")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 # Per-model output ceilings. Sized to fit the actual JSON output of each
@@ -130,11 +128,7 @@ async def _grade_one_model(
             ax = parsed.get("axes")
             if isinstance(ax, dict):
                 # Coerce floats / strings to int defensively.
-                axes = {
-                    k: int(v)
-                    for k, v in ax.items()
-                    if isinstance(v, int | float)
-                }
+                axes = {k: int(v) for k, v in ax.items() if isinstance(v, int | float)}
         except Exception:
             pass
 
@@ -182,9 +176,7 @@ async def _grade_one_case(
                 api_key=api_key,
             )
 
-    per_model = await asyncio.gather(
-        *(_bounded(short, slug) for short, slug in models.items())
-    )
+    per_model = await asyncio.gather(*(_bounded(short, slug) for short, slug in models.items()))
     return {
         "case_meta": {
             "job_posting_id": case.get("job_posting_id"),
@@ -212,9 +204,7 @@ def _per_model_stats(
         latencies: list[int] = []
         failures = 0
         for case in per_case:
-            r = next(
-                (x for x in case["results"] if x["model"] == short), None
-            )
+            r = next((x for x in case["results"] if x["model"] == short), None)
             if r is None:
                 continue
             if r["schema_ok"] and r["fit_score"] is not None:
@@ -251,13 +241,15 @@ def _per_case_disagreement(
         if len(scores) < 2:
             continue
         spread = max(scores.values()) - min(scores.values())
-        rows.append({
-            "title": case["case_meta"]["title"][:80],
-            "band": case["case_meta"]["band"],
-            "baseline": case["case_meta"]["baseline_score"],
-            "scores": scores,
-            "spread": spread,
-        })
+        rows.append(
+            {
+                "title": case["case_meta"]["title"][:80],
+                "band": case["case_meta"]["band"],
+                "baseline": case["case_meta"]["baseline_score"],
+                "scores": scores,
+                "spread": spread,
+            }
+        )
     rows.sort(key=lambda r: -r["spread"])
     return rows
 
@@ -273,9 +265,7 @@ def _baseline_correlation(
         pairs: list[tuple[int, int]] = []
         for case in per_case:
             base = case["case_meta"].get("baseline_score")
-            r = next(
-                (x for x in case["results"] if x["model"] == short), None
-            )
+            r = next((x for x in case["results"] if x["model"] == short), None)
             if base is None or r is None or r["fit_score"] is None:
                 continue
             pairs.append((int(base), r["fit_score"]))
@@ -344,48 +334,50 @@ def _write_markdown_report(
             f"| {s['avg_latency_ms']}ms |"
         )
 
-    lines.extend([
-        "",
-        "## Correlation with baseline fit_score (Spearman ρ)",
-        "",
-        "Production baseline = Sonnet 4.6 grades captured in the fixture. "
-        "High ρ = model's ranking aligns with production. Low ρ = model "
-        "scores the same cases differently than today's pipeline does — "
-        "not necessarily worse, just a different shape.",
-        "",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Correlation with baseline fit_score (Spearman ρ)",
+            "",
+            "Production baseline = Sonnet 4.6 grades captured in the fixture. "
+            "High ρ = model's ranking aligns with production. Low ρ = model "
+            "scores the same cases differently than today's pipeline does — "
+            "not necessarily worse, just a different shape.",
+            "",
+        ]
+    )
     for short, rho in sorted(correlations.items(), key=lambda kv: -kv[1]):
         lines.append(f"- **{short}**: ρ = {rho:.3f}")
 
-    lines.extend([
-        "",
-        "## Highest-disagreement cases (top 10)",
-        "",
-        "These are the cases where models diverge most on the overall "
-        "fit_score. They're the calibration edge cases — worth eyeballing "
-        "to understand which models are over- or under-scoring.",
-        "",
-        "| Spread | Band | Baseline | Title |"
-        + "".join(f" {m} |" for m in models),
-        "| --- | --- | --- | --- |"
-        + "".join(" --- |" for _ in models),
-    ])
+    lines.extend(
+        [
+            "",
+            "## Highest-disagreement cases (top 10)",
+            "",
+            "These are the cases where models diverge most on the overall "
+            "fit_score. They're the calibration edge cases — worth eyeballing "
+            "to understand which models are over- or under-scoring.",
+            "",
+            "| Spread | Band | Baseline | Title |" + "".join(f" {m} |" for m in models),
+            "| --- | --- | --- | --- |" + "".join(" --- |" for _ in models),
+        ]
+    )
     for row in disagreement[:10]:
-        per_model_cells = "".join(
-            f" {row['scores'].get(m, '—')} |" for m in models
-        )
+        per_model_cells = "".join(f" {row['scores'].get(m, '—')} |" for m in models)
         lines.append(
             f"| {row['spread']} | {row['band']} | {row['baseline']} "
             f"| {row['title']} |{per_model_cells}"
         )
 
-    lines.extend([
-        "",
-        "## Cost per call (mean)",
-        "",
-        "| Model | Cost / call |",
-        "| --- | --- |",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Cost per call (mean)",
+            "",
+            "| Model | Cost / call |",
+            "| --- | --- |",
+        ]
+    )
     for short, s in stats.items():
         per_call = s["total_cost_usd"] / max(1, s["n"] + s["failures"])
         lines.append(f"| {short} | ${per_call:.5f} |")
@@ -446,8 +438,7 @@ async def main() -> int:
     # Some models cheaper (DeepSeek 20× less), some same. Estimate high.
     rough_cost = n_calls * 0.003
     logger.info(
-        "About to grade %d cases × %d models = %d calls. "
-        "Rough cost ceiling: ~$%.2f.",
+        "About to grade %d cases × %d models = %d calls. Rough cost ceiling: ~$%.2f.",
         len(cases),
         len(models),
         n_calls,
@@ -473,9 +464,7 @@ async def main() -> int:
         target = targets.get(case["target_id"])
         payload = payloads.get(case["target_id"])
         if target is None or payload is None:
-            logger.warning(
-                "Skipping case %s — target/payload missing", case.get("title")
-            )
+            logger.warning("Skipping case %s — target/payload missing", case.get("title"))
             continue
         graded = await _grade_one_case(
             case,
@@ -510,9 +499,7 @@ async def main() -> int:
         )
 
     elapsed = int(time.perf_counter() - start)
-    total_cost = sum(
-        r["cost_usd"] for case in per_case for r in case["results"]
-    )
+    total_cost = sum(r["cost_usd"] for case in per_case for r in case["results"])
     stats = _per_model_stats(per_case, models)
     correlations = _baseline_correlation(per_case, models)
     disagreement = _per_case_disagreement(per_case, models)

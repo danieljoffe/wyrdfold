@@ -34,9 +34,7 @@ def test_uninvited_otp_signup_is_rejected(anon_client: Client) -> None:
         anon_client.auth.sign_in_with_otp({"email": email})
 
 
-def test_invited_otp_signup_is_admitted(
-    anon_client: Client, service_client: Client
-) -> None:
+def test_invited_otp_signup_is_admitted(anon_client: Client, service_client: Client) -> None:
     email = _email("invited")
     service_client.table("wyrdfold_beta_invites").insert({"email": email}).execute()
     try:
@@ -58,18 +56,14 @@ def test_invited_otp_signup_is_admitted(
         for u in getattr(listed, "users", listed):
             if u.email == email:
                 delete_auth_user(service_client, u.id)
-        service_client.table("wyrdfold_beta_invites").delete().eq(
-            "email", email
-        ).execute()
+        service_client.table("wyrdfold_beta_invites").delete().eq("email", email).execute()
 
 
 def test_admin_create_bypasses_the_hook(service_client: Client) -> None:
     """Owner provisioning + every conftest fixture depend on this: the hook
     gates self-service signup, NOT admin-API creation."""
     email = _email("admin-bypass")
-    resp = service_client.auth.admin.create_user(
-        {"email": email, "email_confirm": True}
-    )
+    resp = service_client.auth.admin.create_user({"email": email, "email_confirm": True})
     try:
         assert resp.user is not None and resp.user.email == email
     finally:
@@ -99,9 +93,7 @@ def test_signup_mode_open_admits_uninvited_then_closed_rejects_again(
     try:
         _set_mode(service_client, "open")
         anon_client.auth.sign_in_with_otp({"email": email})
-        users = [
-            u for u in service_client.auth.admin.list_users() if u.email == email
-        ]
+        users = [u for u in service_client.auth.admin.list_users() if u.email == email]
         assert len(users) == 1, "open mode must admit an uninvited signup"
         created_id = users[0].id
     finally:

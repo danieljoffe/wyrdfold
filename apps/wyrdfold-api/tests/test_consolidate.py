@@ -27,9 +27,7 @@ class TestConsolidateProse:
     async def test_short_content_skips_llm(self) -> None:
         content = "Just a short bio paragraph."
         llm = MockLLMClient()
-        consolidated, result, fallback_reason = await consolidate_prose(
-            llm, content=content
-        )
+        consolidated, result, fallback_reason = await consolidate_prose(llm, content=content)
         assert consolidated == content
         assert result is None
         assert fallback_reason is None
@@ -55,9 +53,7 @@ class TestConsolidateProse:
         clean = clean_unit * (target_chars // len(clean_unit) + 1)
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: clean})
 
-        consolidated, result, fallback_reason = await consolidate_prose(
-            llm, content=bloated
-        )
+        consolidated, result, fallback_reason = await consolidate_prose(llm, content=bloated)
         assert consolidated == clean.strip()
         assert len(consolidated) < len(bloated)
         assert result is not None
@@ -70,9 +66,7 @@ class TestConsolidateProse:
         too_short = "Engineer."
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: too_short})
 
-        consolidated, result, fallback_reason = await consolidate_prose(
-            llm, content=long_doc
-        )
+        consolidated, result, fallback_reason = await consolidate_prose(llm, content=long_doc)
         assert consolidated == long_doc  # safety fallback
         assert result is not None  # but LLM call still made (for cost log)
         assert fallback_reason == "output_too_short"
@@ -95,9 +89,7 @@ class TestConsolidateProse:
         # short-circuit threshold.
         assert len(bloated) >= MIN_CONSOLIDATE_CHARS
 
-        consolidated, result, fallback_reason = await consolidate_prose(
-            llm, content=bloated
-        )
+        consolidated, result, fallback_reason = await consolidate_prose(llm, content=bloated)
 
         # The 12%-ish output must NOT trip the floor.
         assert consolidated == consolidated_one_copy.strip()
@@ -138,9 +130,7 @@ class TestConsolidateEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: None
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
 
         with pytest.raises(HTTPException) as exc_info:
             await exp_router.consolidate_prose(
@@ -149,9 +139,7 @@ class TestConsolidateEndpoint:
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_no_op_when_doc_too_short(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_op_when_doc_too_short(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.routers import experience as exp_router
 
         existing = ProseDoc(
@@ -161,9 +149,7 @@ class TestConsolidateEndpoint:
             content="Short bio.",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: existing
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: existing)
 
         # Should never be called when doc is short — but guard if it is.
         create_called = {"count": 0}
@@ -172,9 +158,7 @@ class TestConsolidateEndpoint:
             create_called["count"] += 1
             return existing
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.create_version", fake_create
-        )
+        monkeypatch.setattr("app.services.experience.prose.create_version", fake_create)
 
         result = await exp_router.consolidate_prose(
             request=MagicMock(), supabase=MagicMock(), llm=MockLLMClient()
@@ -184,9 +168,7 @@ class TestConsolidateEndpoint:
         assert create_called["count"] == 0
 
     @pytest.mark.asyncio
-    async def test_persists_consolidated_version(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_persists_consolidated_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.routers import experience as exp_router
 
         bloated = "Senior FE Engineer at Acme. Built React apps. " * 200
@@ -199,9 +181,7 @@ class TestConsolidateEndpoint:
         )
         clean = "Senior FE Engineer at Acme. Built React apps."
 
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest", lambda *a, **kw: existing
-        )
+        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: existing)
 
         new_doc = ProseDoc(
             id="prose-2",
@@ -214,15 +194,11 @@ class TestConsolidateEndpoint:
             "app.services.experience.prose.create_version",
             lambda *a, **kw: new_doc,
         )
-        monkeypatch.setattr(
-            "app.services.llm.cost_log.record", MagicMock()
-        )
+        monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
 
         # Set scripted output well above the MIN_OUTPUT_RATIO floor (0.05);
         # 25% of bloated length keeps a wide safety margin.
-        scripted_clean = clean + " More detail. " * (
-            (len(bloated) // 4) // len(" More detail. ")
-        )
+        scripted_clean = clean + " More detail. " * ((len(bloated) // 4) // len(" More detail. "))
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: scripted_clean})
 
         # Sanity: input must clear MIN_CONSOLIDATE_CHARS for the LLM to run.

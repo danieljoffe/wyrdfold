@@ -1545,9 +1545,7 @@ def test_bulk_title_score_no_matches_writes_nothing(
     (and the keyset loop still terminates)."""
     batch_update = MagicMock()
     monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
-    supabase = _RetroSupabase(
-        [{"id": "j01", "title": "Plumber"}, {"id": "j02", "title": "Chef"}]
-    )
+    supabase = _RetroSupabase([{"id": "j01", "title": "Plumber"}, {"id": "j02", "title": "Chef"}])
     target = _target(core={"React": 3})
 
     written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]

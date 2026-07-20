@@ -70,8 +70,8 @@ _SALARY_RE = re.compile(
     r"\$\s*[\d,]+(?:\.\d+)?[kK]?"  # first amount
     r"\s*[-–—to]+\s*"  # separator
     r"\$?\s*[\d,]+(?:\.\d+)?[kK]?"  # second amount
-    r"(?:\s*/?\s*(?:yr|year|annually|per\s+year|hr|hour|hourly|per\s+hour))?"  # unit
-    , re.I
+    r"(?:\s*/?\s*(?:yr|year|annually|per\s+year|hr|hour|hourly|per\s+hour))?",  # unit
+    re.I,
 )
 
 
