@@ -12,6 +12,11 @@
 -- empty/small `scores` table. Do NOT run it against prod (the ledger row makes
 -- `db push` skip it there; running it would non-concurrently rebuild the live
 -- index under a brief write lock).
+--
+-- index-lock-ok: prod got the ONLINE CREATE/DROP INDEX CONCURRENTLY treatment
+-- out-of-band and skips this file via the ledger (#112); the plain CREATE below
+-- only ever runs on a FRESH/staging DB where `scores` is empty, so its brief
+-- build lock is a non-issue.
 DROP INDEX IF EXISTS public.idx_scores_target_excl_score_jpid;
 CREATE INDEX IF NOT EXISTS idx_scores_target_excl_score_jpid
   ON public.scores
