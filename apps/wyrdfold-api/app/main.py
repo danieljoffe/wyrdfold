@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from postgrest.exceptions import APIError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from starlette.middleware.cors import CORSMiddleware
@@ -382,6 +383,47 @@ async def _llm_service_error_handler(
         status_code=exc.http_status,
         content={"detail": exc.user_message, "code": exc.reason},
     )
+
+
+@app.exception_handler(APIError)
+async def _postgrest_error_handler(request: Request, exc: APIError) -> JSONResponse:
+    """Map a PostgREST ``22P02`` (invalid text representation) to a clean 404.
+
+    A malformed path id — ``GET /jobs/not-a-uuid`` — flows into
+    ``.eq("id", <value>)``, and PostgREST rejects the cast with
+    ``22P02 invalid input syntax for type uuid``. Uncaught, that ``APIError``
+    falls through to the generic 500 handler below: a *server* error for what
+    is really client-supplied garbage — 500 log noise, and the wrong contract
+    (the resource simply isn't there).
+
+    **404** (not 400 or 500) is deliberate: it makes a malformed id behave
+    exactly like a well-formed-but-absent one, it doesn't leak whether an id
+    was merely malformed vs. genuinely missing, and it's the only status the
+    web UI renders as a calm "not found" page rather than a red error toast
+    (the job detail view special-cases 404). A ``22P02`` reaching here is
+    overwhelmingly a malformed-UUID path id — other malformed inputs (ints,
+    enums) are typed by Pydantic and rejected as 422 well before Postgres.
+
+    Any *other* PostgREST error is re-raised so the generic handler logs the
+    traceback and returns 500 unchanged. The code is logged here (never the raw
+    PostgREST message, which can echo the offending input) so a genuinely
+    *internal* ``22P02`` — one the app caused, not the client — stays visible
+    in the logs instead of silently becoming a 404.
+
+    A route that already catches ``APIError`` locally (e.g. the manual-job
+    persist path → 502) still wins: a local ``except`` handles the exception
+    before it can ever propagate to this app-wide net.
+    """
+    if exc.code == "22P02":
+        _log.info(
+            "postgrest 22P02 (invalid text representation) -> 404 on %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+    # Not a malformed-input error — hand off to the generic 500 handler, which
+    # logs the traceback and applies the fail-closed body posture.
+    raise exc
 
 
 @app.exception_handler(Exception)
