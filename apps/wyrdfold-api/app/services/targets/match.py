@@ -53,9 +53,7 @@ _SIMILARITY_THRESHOLD = 0.7
 _normalize_label = normalize_label
 
 
-def find_matching_target(
-    supabase: Client, label: str
-) -> JobTarget | None:
+def find_matching_target(supabase: Client, label: str) -> JobTarget | None:
     """Find an existing target matching a label, or None.
 
     Tries exact match first, then fuzzy via pg_trgm similarity.
@@ -157,8 +155,6 @@ async def suggest_and_match_from_query(
     Returns (matched_suggestions, llm_result) so callers can log cost.
     """
     existing_ids = get_user_target_ids(supabase, user_id)
-    suggestions, result = await suggest_targets_from_query(
-        llm, query=query, payload=payload
-    )
+    suggestions, result = await suggest_targets_from_query(llm, query=query, payload=payload)
     matches = _match_suggestions(supabase, suggestions.suggestions, existing_ids)
     return MatchedSuggestions(matches=matches), result

@@ -138,9 +138,7 @@ def _histogram(rows: list[dict[str, Any]], floor: int) -> FunnelScoreBuckets:
     ``.eq("excluded", False)`` server-side filter) before bucketizing.
     """
     scores = [
-        int(r["score"])
-        for r in rows
-        if r.get("excluded") is False and r.get("score") is not None
+        int(r["score"]) for r in rows if r.get("excluded") is False and r.get("score") is not None
     ]
     above = sum(1 for s in scores if s >= floor)
     return FunnelScoreBuckets(
@@ -152,9 +150,7 @@ def _histogram(rows: list[dict[str, Any]], floor: int) -> FunnelScoreBuckets:
     )
 
 
-def _user_context(
-    supabase: Client, target_id: str
-) -> list[FunnelUserContext]:
+def _user_context(supabase: Client, target_id: str) -> list[FunnelUserContext]:
     """One entry per user with an active link to this target.
 
     Batched: the per-user ``user_profiles`` N+1 is collapsed into a
@@ -204,9 +200,7 @@ def _user_context(
         out.append(
             FunnelUserContext(
                 user_id=user_id,
-                list_min_score=(
-                    int(list_min_score) if list_min_score is not None else None
-                ),
+                list_min_score=(int(list_min_score) if list_min_score is not None else None),
                 phase2_quota_remaining=quota,
             )
         )
@@ -227,9 +221,7 @@ def _hours_since(ts: datetime | None) -> float | None:
 def _sources(supabase: Client) -> list[FunnelSourceStaleness]:
     resp = (
         supabase.table("sources")
-        .select(
-            "id, company_name, provider, enabled, last_polled_at, job_count"
-        )
+        .select("id, company_name, provider, enabled, last_polled_at, job_count")
         .order("last_polled_at", desc=True, nullsfirst=True)
         .execute()
     )
@@ -238,9 +230,7 @@ def _sources(supabase: Client) -> list[FunnelSourceStaleness]:
     for r in rows:
         last_polled_raw = r.get("last_polled_at")
         last_polled = (
-            datetime.fromisoformat(last_polled_raw)
-            if isinstance(last_polled_raw, str)
-            else None
+            datetime.fromisoformat(last_polled_raw) if isinstance(last_polled_raw, str) else None
         )
         out.append(
             FunnelSourceStaleness(
@@ -264,9 +254,7 @@ def _default_floor_from_users(users: list[FunnelUserContext]) -> int:
     return min(floors) if floors else 0
 
 
-def compute_target_funnel(
-    supabase: Client, target_id: str
-) -> TargetFunnelResponse:
+def compute_target_funnel(supabase: Client, target_id: str) -> TargetFunnelResponse:
     """Build the full funnel report for ``target_id``.
 
     Read-only. The response is designed so a console paste makes the

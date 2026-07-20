@@ -94,9 +94,7 @@ class TestBackfillEmbedMissing:
         calls["chain"].order.assert_called_once_with("created_at", desc=True)
 
     @pytest.mark.asyncio
-    async def test_zero_or_negative_limit_is_a_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_zero_or_negative_limit_is_a_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_embed(monkeypatch)
         sb = MagicMock()
 
@@ -107,9 +105,7 @@ class TestBackfillEmbedMissing:
         assert rec["embedded"] == []
 
     @pytest.mark.asyncio
-    async def test_empty_selection_skips_embed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_empty_selection_skips_embed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: dict[str, Any] = {}
         sb = _sweep_supabase([], calls)
         rec = _patch_embed(monkeypatch)
@@ -119,9 +115,7 @@ class TestBackfillEmbedMissing:
         assert rec["embedded"] == []
 
     @pytest.mark.asyncio
-    async def test_select_failure_is_swallowed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_select_failure_is_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A DB error must never raise into the poll cycle — the sweep just
         # skips this cycle and retries next time.
         rec = _patch_embed(monkeypatch)

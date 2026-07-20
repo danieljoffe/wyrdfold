@@ -111,8 +111,6 @@ async def test_get_with_size_cap_pins_against_rebind(monkeypatch):
     monkeypatch.setattr(sh, "_resolve_ips", _returns("169.254.169.254"))
     try:
         with pytest.raises(httpx.HTTPError):  # ConnectError is an HTTPError
-            await hc.get_with_size_cap(
-                "http://rebind.test/", validate_host=lambda _h: None
-            )
+            await hc.get_with_size_cap("http://rebind.test/", validate_host=lambda _h: None)
     finally:
         await hc.close_safe_http_client()

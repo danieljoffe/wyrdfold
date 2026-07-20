@@ -65,12 +65,10 @@ def _profile_row() -> dict[str, Any]:
     }
 
 
-def test_get_returns_capabilities_false_when_unconfigured(
-    client_factory, _reset_channel_settings
-):
+def test_get_returns_capabilities_false_when_unconfigured(client_factory, _reset_channel_settings):
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
-        _Resp([_profile_row()])
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
+        [_profile_row()]
     )
     client = client_factory(sb)
     r = client.get("/profile/notifications")
@@ -90,8 +88,8 @@ def test_get_returns_capabilities_true_when_configured(
     monkeypatch.setattr(settings, "twilio_phone_number", "+15551234567")
 
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
-        _Resp([_profile_row()])
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
+        [_profile_row()]
     )
     client = client_factory(sb)
     r = client.get("/profile/notifications")
@@ -101,9 +99,7 @@ def test_get_returns_capabilities_true_when_configured(
     assert body["sms_available"] is True
 
 
-def test_patch_rejects_enabling_email_when_unconfigured(
-    client_factory, _reset_channel_settings
-):
+def test_patch_rejects_enabling_email_when_unconfigured(client_factory, _reset_channel_settings):
     sb = MagicMock()
     client = client_factory(sb)
     r = client.patch(
@@ -114,9 +110,7 @@ def test_patch_rejects_enabling_email_when_unconfigured(
     assert "Email notifications are unavailable" in r.json()["detail"]
 
 
-def test_patch_rejects_enabling_sms_when_unconfigured(
-    client_factory, _reset_channel_settings
-):
+def test_patch_rejects_enabling_sms_when_unconfigured(client_factory, _reset_channel_settings):
     sb = MagicMock()
     client = client_factory(sb)
     r = client.patch(
@@ -133,12 +127,10 @@ def test_patch_allows_disabling_email_even_when_unconfigured(
     """Operator may have removed the credentials after the user enabled
     the channel — the user must still be able to turn it off."""
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
-        _Resp([_profile_row()])
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
+        [_profile_row()]
     )
-    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
-        _Resp(None)
-    )
+    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
     # /profile UPDATE no longer reads back the row id — `.eq("user_id", ...)`
     # targets the row directly.
     client = client_factory(sb)

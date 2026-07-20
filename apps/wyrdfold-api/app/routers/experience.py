@@ -249,9 +249,7 @@ async def upload_resume(
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
     if not parsed.text.strip():
-        raise HTTPException(
-            status_code=422, detail="No text could be extracted from file"
-        )
+        raise HTTPException(status_code=422, detail="No text could be extracted from file")
 
     warnings = list(parsed.warnings)
 
@@ -307,16 +305,12 @@ async def upload_resume(
         "file_size_bytes": len(file_bytes),
         "warnings": warnings,
     }
-    await asyncio.to_thread(
-        lambda: supabase.table("uploaded_resumes").insert(upload_row).execute()
-    )
+    await asyncio.to_thread(lambda: supabase.table("uploaded_resumes").insert(upload_row).execute())
 
     # Optional: auto-derive
     optimized_doc_id: str | None = None
     if auto_derive:
-        payload, result = await derive.derive_from_prose(
-            llm, prose_text=prose_doc.content
-        )
+        payload, result = await derive.derive_from_prose(llm, prose_text=prose_doc.content)
         await asyncio.to_thread(
             cost_log.record,
             supabase,
@@ -330,9 +324,7 @@ async def upload_resume(
         # the LLM extracted from inline prose comments this round (#499).
         previous_opt = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
         carried = (
-            annotations.validate_annotation_refs(
-                previous_opt.payload.annotations, payload
-            )
+            annotations.validate_annotation_refs(previous_opt.payload.annotations, payload)
             if previous_opt and previous_opt.payload.annotations
             else []
         )
@@ -430,11 +422,7 @@ async def derive_optimized(
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
     previous = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
-    if (
-        previous is not None
-        and previous.prose_doc_id == prose_doc.id
-        and previous.source == "llm"
-    ):
+    if previous is not None and previous.prose_doc_id == prose_doc.id and previous.source == "llm":
         return previous
 
     payload, result = await derive.derive_from_prose(
@@ -453,9 +441,7 @@ async def derive_optimized(
     # Carry forward annotations from the previous doc and merge with any
     # the LLM extracted from inline prose comments this round (#499).
     carried = (
-        annotations.validate_annotation_refs(
-            previous.payload.annotations, payload
-        )
+        annotations.validate_annotation_refs(previous.payload.annotations, payload)
         if previous and previous.payload.annotations
         else []
     )
@@ -515,15 +501,11 @@ async def derive_optimized_stream(
     have already been sent. Pre-flight errors (missing prose) still come
     back as HTTP 404 before any SSE frame is written.
     """
-    prose_doc = await asyncio.to_thread(
-        lambda: prose.get_latest(supabase, user_id=user_id)
-    )
+    prose_doc = await asyncio.to_thread(lambda: prose.get_latest(supabase, user_id=user_id))
     if prose_doc is None:
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
-    previous = await asyncio.to_thread(
-        lambda: optimized.get_latest(supabase, user_id=user_id)
-    )
+    previous = await asyncio.to_thread(lambda: optimized.get_latest(supabase, user_id=user_id))
 
     async def generate() -> AsyncIterator[bytes]:
         if (
@@ -569,15 +551,11 @@ async def derive_optimized_stream(
                     result = event.result
 
             if result is None:
-                yield _sse_event(
-                    "error", {"detail": "stream ended without a final event"}
-                )
+                yield _sse_event("error", {"detail": "stream ended without a final event"})
                 return
 
             try:
-                payload = OptimizedPayload.model_validate_json(
-                    strip_markdown_fence(result.content)
-                )
+                payload = OptimizedPayload.model_validate_json(strip_markdown_fence(result.content))
             except ValidationError as exc:
                 yield _sse_event("error", {"detail": f"invalid payload: {exc}"})
                 return
@@ -597,9 +575,7 @@ async def derive_optimized_stream(
             )
 
             carried = (
-                annotations.validate_annotation_refs(
-                    previous.payload.annotations, payload
-                )
+                annotations.validate_annotation_refs(previous.payload.annotations, payload)
                 if previous and previous.payload.annotations
                 else []
             )
@@ -632,9 +608,7 @@ async def derive_optimized_stream(
             # the SSE cleanly with a terminal ``error`` frame rather than a
             # truncated stream the client can only detect by timeout (#29 M-r2-4).
             logger.exception("derive/stream failed for user=%s", user_id)
-            yield _sse_event(
-                "error", {"detail": "the derive stream failed; please retry"}
-            )
+            yield _sse_event("error", {"detail": "the derive stream failed; please retry"})
         finally:
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:

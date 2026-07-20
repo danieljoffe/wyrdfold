@@ -66,9 +66,7 @@ def _job_exists(supabase: Client, job_id: str) -> bool:
     return bool(resp.data)
 
 
-def _target_exists_for_user(
-    supabase: Client, user_id: str, target_id: str
-) -> bool:
+def _target_exists_for_user(supabase: Client, user_id: str, target_id: str) -> bool:
     resp = (
         supabase.table("user_targets")
         .select("target_id")
@@ -116,9 +114,7 @@ def create_feedback(
     # for "which positive token to weight" is harder).
     queued = body.signal == "irrelevant"
     if queued:
-        background.add_task(
-            _safe_run_learner, service_supabase, user_id, body.target_id
-        )
+        background.add_task(_safe_run_learner, service_supabase, user_id, body.target_id)
 
     return FeedbackCreateResponse(feedback=row, queued_learn_run=queued)
 
@@ -207,14 +203,10 @@ async def run_llm_learner_now(
     # Genuinely async (awaits the LLM), so it stays `async def`; the
     # blocking supabase precheck is offloaded to a thread so it doesn't
     # freeze the event loop before the await (#107).
-    exists = await asyncio.to_thread(
-        _target_exists_for_user, supabase, user_id, target_id
-    )
+    exists = await asyncio.to_thread(_target_exists_for_user, supabase, user_id, target_id)
     if not exists:
         raise HTTPException(status_code=404, detail="Target not found for user")
-    return await run_llm_learner(
-        supabase, llm, user_id=user_id, target_id=target_id
-    )
+    return await run_llm_learner(supabase, llm, user_id=user_id, target_id=target_id)
 
 
 # Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
@@ -226,9 +218,7 @@ async def run_llm_learner_now(
 )
 def list_learning_log(
     target_id: str,
-    status: str | None = Query(
-        default=None, pattern="^(applied|staged|rejected)$"
-    ),
+    status: str | None = Query(default=None, pattern="^(applied|staged|rejected)$"),
     limit: int = Query(50, ge=1, le=200),
     user_id: str = Depends(get_current_user_id),
     # #79 R1: read through the caller's JWT (target_learning_log self-SELECT

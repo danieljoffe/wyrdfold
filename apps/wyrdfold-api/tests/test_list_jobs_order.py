@@ -541,16 +541,36 @@ def test_two_query_pending_sorts_by_recency_not_keyword_score(
     first-seen fetch (the case the ``force`` flag exists for)."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     ts_rows = [
-        {"job_posting_id": "g-hi", "score": 80, "score_breakdown": {},
-         "scoring_status": "complete", "fit_reasoning": "strong match"},
-        {"job_posting_id": "g-lo", "score": 60, "score_breakdown": {},
-         "scoring_status": "complete", "fit_reasoning": "ok match"},
+        {
+            "job_posting_id": "g-hi",
+            "score": 80,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "strong match",
+        },
+        {
+            "job_posting_id": "g-lo",
+            "score": 60,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "ok match",
+        },
         # Pending (no fit_reasoning) with keyword placeholders: the stale one
         # carries the HIGHER keyword score.
-        {"job_posting_id": "p-old-hi", "score": 90, "score_breakdown": {},
-         "scoring_status": "stage2", "fit_reasoning": None},
-        {"job_posting_id": "p-new-lo", "score": 40, "score_breakdown": {},
-         "scoring_status": "stage2", "fit_reasoning": None},
+        {
+            "job_posting_id": "p-old-hi",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "stage2",
+            "fit_reasoning": None,
+        },
+        {
+            "job_posting_id": "p-new-lo",
+            "score": 40,
+            "score_breakdown": {},
+            "scoring_status": "stage2",
+            "fit_reasoning": None,
+        },
     ]
     jobs_rows = [
         {"id": "g-hi", "title": "graded hi", "first_seen_at": "2026-07-05"},

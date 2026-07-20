@@ -55,9 +55,7 @@ def test_get_returns_defaults_when_unset(client_factory):
 
 def test_get_returns_stored_style(client_factory):
     sb = MagicMock()
-    _select_returns(
-        sb, {"resume_style_settings": {"preset": "classic", "accent": "navy"}}
-    )
+    _select_returns(sb, {"resume_style_settings": {"preset": "classic", "accent": "navy"}})
     client = client_factory(sb)
     r = client.get("/profile/resume-style")
     assert r.status_code == 200
@@ -66,12 +64,8 @@ def test_get_returns_stored_style(client_factory):
 
 def test_patch_merges_single_axis_onto_stored(client_factory):
     sb = MagicMock()
-    _select_returns(
-        sb, {"resume_style_settings": {"preset": "compact", "accent": "slate"}}
-    )
-    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(
-        None
-    )
+    _select_returns(sb, {"resume_style_settings": {"preset": "compact", "accent": "slate"}})
+    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
     client = client_factory(sb)
     r = client.patch("/profile/resume-style", json={"accent": "forest"})
     assert r.status_code == 200
@@ -79,16 +73,12 @@ def test_patch_merges_single_axis_onto_stored(client_factory):
     assert r.json() == {"preset": "compact", "accent": "forest"}
     # persisted as the full merged object
     update_arg = sb.table.return_value.update.call_args[0][0]
-    assert update_arg == {
-        "resume_style_settings": {"preset": "compact", "accent": "forest"}
-    }
+    assert update_arg == {"resume_style_settings": {"preset": "compact", "accent": "forest"}}
 
 
 def test_patch_empty_body_returns_current_without_writing(client_factory):
     sb = MagicMock()
-    _select_returns(
-        sb, {"resume_style_settings": {"preset": "executive", "accent": "black"}}
-    )
+    _select_returns(sb, {"resume_style_settings": {"preset": "executive", "accent": "black"}})
     client = client_factory(sb)
     r = client.patch("/profile/resume-style", json={})
     assert r.status_code == 200

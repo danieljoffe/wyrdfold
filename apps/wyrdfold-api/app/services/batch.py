@@ -44,10 +44,7 @@ def create_batch(
     job_posting_ids: list[str],
 ) -> BatchJob:
     """Insert a new batch_runs row with all items pending."""
-    items = [
-        BatchItem(job_posting_id=jid).model_dump(mode="json")
-        for jid in job_posting_ids
-    ]
+    items = [BatchItem(job_posting_id=jid).model_dump(mode="json") for jid in job_posting_ids]
     row: dict[str, Any] = {
         "user_id": user_id,
         "status": "pending",
@@ -61,9 +58,7 @@ def create_batch(
     return BatchJob.model_validate(data)
 
 
-def get_batch(
-    supabase: Client, batch_id: str, *, user_id: str | None
-) -> BatchJob | None:
+def get_batch(supabase: Client, batch_id: str, *, user_id: str | None) -> BatchJob | None:
     """Fetch a batch by ID, scoped to the caller.
 
     Filters by both ``id`` AND ``user_id`` so a JWT caller can't poll
@@ -148,16 +143,13 @@ async def process_batch(
     scoring_keywords: set[str] | None = None
     if target_id and not force_fresh:
         target_resp = await asyncio.to_thread(
-            lambda: supabase.table("targets")
-            .select("scoring_profile")
-            .eq("id", target_id)
-            .execute()
+            lambda: (
+                supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
+            )
         )
         if target_resp.data:
             target_row = cast(dict[str, Any], target_resp.data[0])
-            profile = ScoringProfile.model_validate(
-                target_row["scoring_profile"]
-            )
+            profile = ScoringProfile.model_validate(target_row["scoring_profile"])
             scoring_keywords = extract_profile_keywords(profile)
 
     _update_batch(supabase, batch_id, status="processing")
@@ -189,9 +181,7 @@ async def process_batch(
                     items[i]["reused_from"] = reusable.id
                     completed += 1
 
-                    persistence.mark_job_resume_draft(
-                        supabase, job_posting_id, user_id=user_id
-                    )
+                    persistence.mark_job_resume_draft(supabase, job_posting_id, user_id=user_id)
 
                     _update_batch(
                         supabase,
@@ -221,9 +211,7 @@ async def process_batch(
                 items[i]["resume_record_id"] = result.record.id
                 completed += 1
 
-                persistence.mark_job_resume_draft(
-                    supabase, job_posting_id, user_id=user_id
-                )
+                persistence.mark_job_resume_draft(supabase, job_posting_id, user_id=user_id)
             else:
                 # Lint failure
                 violations = [v.message for v in result.lint.violations]

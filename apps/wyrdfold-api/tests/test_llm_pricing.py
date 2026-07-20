@@ -38,16 +38,12 @@ def test_sonnet_mixed() -> None:
 
 def test_haiku_cheaper_than_sonnet_on_identical_usage() -> None:
     usage = LLMUsage(input_tokens=10_000, output_tokens=1_000)
-    assert calculate_cost("claude-haiku-4-5", usage) < calculate_cost(
-        "claude-sonnet-4-6", usage
-    )
+    assert calculate_cost("claude-haiku-4-5", usage) < calculate_cost("claude-sonnet-4-6", usage)
 
 
 def test_cache_read_is_one_tenth_of_input() -> None:
     full_input = calculate_cost("claude-sonnet-4-6", LLMUsage(input_tokens=1_000_000))
-    cache_read = calculate_cost(
-        "claude-sonnet-4-6", LLMUsage(cache_read_input_tokens=1_000_000)
-    )
+    cache_read = calculate_cost("claude-sonnet-4-6", LLMUsage(cache_read_input_tokens=1_000_000))
     assert cache_read == pytest.approx(full_input * 0.1, rel=1e-6)
 
 

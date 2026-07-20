@@ -39,10 +39,7 @@ def seeded_parents(service_client: Client) -> Iterator[dict[str, str]]:
         .data[0]["id"]
     )
     target_id = (
-        service_client.table("targets")
-        .insert({"label": "FK Int Target"})
-        .execute()
-        .data[0]["id"]
+        service_client.table("targets").insert({"label": "FK Int Target"}).execute().data[0]["id"]
     )
     job_id = (
         service_client.table("jobs")
@@ -133,23 +130,11 @@ def test_auth_user_delete_cascades_all_four_tables(
         for table, row in _rows(seeded_parents, uid).items():
             service_client.table(table).insert(row).execute()
         for table in tables:
-            got = (
-                service_client.table(table)
-                .select("user_id")
-                .eq("user_id", uid)
-                .execute()
-                .data
-            )
+            got = service_client.table(table).select("user_id").eq("user_id", uid).execute().data
             assert len(got) == 1, f"{table}: seed row missing before delete"
     finally:
         delete_auth_user(service_client, uid)
 
     for table in tables:
-        leftover = (
-            service_client.table(table)
-            .select("user_id")
-            .eq("user_id", uid)
-            .execute()
-            .data
-        )
+        leftover = service_client.table(table).select("user_id").eq("user_id", uid).execute().data
         assert leftover == [], f"{table}: row survived auth-user delete: {leftover}"

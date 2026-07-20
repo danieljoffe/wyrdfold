@@ -27,6 +27,7 @@ AnnotationRefType = Literal["role", "skill", "outcome"]
 # to something in this structure.
 # ---------------------------------------------------------------------------
 
+
 class Outcome(BaseModel):
     description: str
     metric: str | None = None
@@ -103,6 +104,7 @@ class PreferencesPayload(BaseModel):
 # Row models (DB read shapes)
 # ---------------------------------------------------------------------------
 
+
 class ProseDoc(BaseModel):
     id: str
     user_id: str | None
@@ -157,6 +159,7 @@ class Preferences(BaseModel):
 # Request shapes (router inputs)
 # ---------------------------------------------------------------------------
 
+
 class AnnotationCreate(BaseModel):
     action: AnnotationAction
     ref_type: AnnotationRefType
@@ -184,9 +187,7 @@ class OptimizedDocUpsert(BaseModel):
     def _bound_payload_size(self) -> "OptimizedDocUpsert":
         size = len(self.payload.model_dump_json().encode("utf-8"))
         if size > self._MAX_PAYLOAD_BYTES:
-            raise ValueError(
-                f"payload too large: {size} bytes (max {self._MAX_PAYLOAD_BYTES})"
-            )
+            raise ValueError(f"payload too large: {size} bytes (max {self._MAX_PAYLOAD_BYTES})")
         return self
 
 
@@ -205,6 +206,7 @@ class TurnAppend(BaseModel):
 # ---------------------------------------------------------------------------
 # Response shapes (router outputs)
 # ---------------------------------------------------------------------------
+
 
 class ResumeUploadResponse(BaseModel):
     success: bool

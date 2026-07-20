@@ -90,16 +90,16 @@ def test_client_built_with_configured_limits_and_explicit_timeout() -> None:
 
 def _ping_ok_supabase() -> MagicMock:
     sb = MagicMock()
-    sb.table.return_value.select.return_value.limit.return_value.execute.return_value = (
-        MagicMock(data=[{"id": "s1"}])
+    sb.table.return_value.select.return_value.limit.return_value.execute.return_value = MagicMock(
+        data=[{"id": "s1"}]
     )
     return sb
 
 
 def _ping_failing_supabase() -> MagicMock:
     sb = MagicMock()
-    sb.table.return_value.select.return_value.limit.return_value.execute.side_effect = (
-        Exception("supabase down")
+    sb.table.return_value.select.return_value.limit.return_value.execute.side_effect = Exception(
+        "supabase down"
     )
     return sb
 

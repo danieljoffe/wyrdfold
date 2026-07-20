@@ -33,12 +33,8 @@ def seeded_signup(service_client: Client) -> Iterator[str]:
         for u in users:
             if u.email == email:
                 service_client.auth.admin.delete_user(u.id)
-        service_client.table("wyrdfold_beta_invites").delete().eq(
-            "email", email
-        ).execute()
-        service_client.table("waitlist_signups").delete().eq(
-            "email", email
-        ).execute()
+        service_client.table("wyrdfold_beta_invites").delete().eq("email", email).execute()
+        service_client.table("waitlist_signups").delete().eq("email", email).execute()
 
 
 def _client(service_client: Client) -> TestClient:
@@ -52,17 +48,13 @@ def test_invite_creates_real_user_and_stamps_funnel(
 ) -> None:
     email = seeded_signup
     try:
-        r = _client(service_client).post(
-            "/admin/waitlist/invite", json={"email": email}
-        )
+        r = _client(service_client).post("/admin/waitlist/invite", json={"email": email})
 
         assert r.status_code == 200
         assert r.json()["from_waitlist"] is True
 
         # A REAL auth user now exists for the address.
-        users = [
-            u for u in service_client.auth.admin.list_users() if u.email == email
-        ]
+        users = [u for u in service_client.auth.admin.list_users() if u.email == email]
         assert len(users) == 1
         # The hook allowlist has the row.
         invites = (
@@ -87,9 +79,7 @@ def test_invite_creates_real_user_and_stamps_funnel(
         # Re-inviting a PENDING (unaccepted) user is a resend — 200, not an
         # error. GoTrue only refuses once the address belongs to a
         # confirmed account (next test).
-        r2 = _client(service_client).post(
-            "/admin/waitlist/invite", json={"email": email}
-        )
+        r2 = _client(service_client).post("/admin/waitlist/invite", json={"email": email})
         assert r2.status_code == 200
     finally:
         app.dependency_overrides.clear()
@@ -98,17 +88,11 @@ def test_invite_creates_real_user_and_stamps_funnel(
 def test_inviting_a_confirmed_user_is_409(service_client: Client) -> None:
     """Negative: an address with a confirmed account can't be re-invited."""
     email = f"confirmed-{uuid.uuid4().hex[:8]}@example.com"
-    created = service_client.auth.admin.create_user(
-        {"email": email, "email_confirm": True}
-    )
+    created = service_client.auth.admin.create_user({"email": email, "email_confirm": True})
     try:
-        r = _client(service_client).post(
-            "/admin/waitlist/invite", json={"email": email}
-        )
+        r = _client(service_client).post("/admin/waitlist/invite", json={"email": email})
         assert r.status_code == 409
     finally:
         app.dependency_overrides.clear()
         service_client.auth.admin.delete_user(created.user.id)
-        service_client.table("wyrdfold_beta_invites").delete().eq(
-            "email", email
-        ).execute()
+        service_client.table("wyrdfold_beta_invites").delete().eq("email", email).execute()

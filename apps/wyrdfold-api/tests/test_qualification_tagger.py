@@ -568,9 +568,7 @@ class TestSchemaAndFailSoft:
 
         monkeypatch.setattr(tagger_mod, "complete_json", quota_boom)
         with pytest.raises(LLMQuotaExhaustedError):
-            await tag_job(
-                MockLLMClient(), title="x", company="y", location="z", description="d"
-            )
+            await tag_job(MockLLMClient(), title="x", company="y", location="z", description="d")
 
     @pytest.mark.asyncio
     async def test_calls_haiku_with_qualification_purpose(
@@ -684,13 +682,9 @@ class TestModelResolution:
         return captured
 
     @pytest.mark.asyncio
-    async def test_defaults_to_configured_model(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_defaults_to_configured_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured = self._capture_model(monkeypatch)
-        await tag_job(
-            MockLLMClient(), title="T", company=None, location=None, description=None
-        )
+        await tag_job(MockLLMClient(), title="T", company=None, location=None, description=None)
         assert captured["model"] == tagger_mod.QUALIFICATION_MODEL
 
     @pytest.mark.asyncio
@@ -701,15 +695,11 @@ class TestModelResolution:
 
         monkeypatch.setattr(settings, "qualification_model", "deepseek-v3-2")
         captured = self._capture_model(monkeypatch)
-        await tag_job(
-            MockLLMClient(), title="T", company=None, location=None, description=None
-        )
+        await tag_job(MockLLMClient(), title="T", company=None, location=None, description=None)
         assert captured["model"] == "deepseek-v3-2"
 
     @pytest.mark.asyncio
-    async def test_explicit_model_wins_over_settings(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_explicit_model_wins_over_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.config import settings
 
         monkeypatch.setattr(settings, "qualification_model", "deepseek-v3-2")
@@ -730,6 +720,5 @@ class TestModelResolution:
         from app.config import Settings
 
         assert (
-            Settings.model_fields["qualification_model"].default
-            == tagger_mod.QUALIFICATION_MODEL
+            Settings.model_fields["qualification_model"].default == tagger_mod.QUALIFICATION_MODEL
         )

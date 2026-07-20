@@ -60,9 +60,7 @@ def parse_pdf(file_bytes: bytes, filename: str) -> ParsedResume:
             # would otherwise burn CPU page-by-page. Reject fast with a 422
             # (the router's parse timeout can't hard-kill the worker thread).
             if page_count > MAX_PDF_PAGES:
-                raise ParseError(
-                    f"PDF has too many pages: {page_count} (max {MAX_PDF_PAGES})"
-                )
+                raise ParseError(f"PDF has too many pages: {page_count} (max {MAX_PDF_PAGES})")
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 if not text.strip():
@@ -161,9 +159,7 @@ def parse_resume(
     or oversized file.
     """
     if len(file_bytes) > MAX_FILE_SIZE:
-        raise ValueError(
-            f"File too large: {len(file_bytes)} bytes (max {MAX_FILE_SIZE})"
-        )
+        raise ValueError(f"File too large: {len(file_bytes)} bytes (max {MAX_FILE_SIZE})")
 
     file_type = ACCEPTED_CONTENT_TYPES.get(content_type)
 

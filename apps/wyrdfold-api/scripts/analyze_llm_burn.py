@@ -60,7 +60,9 @@ def main() -> None:
 
     print("BY PURPOSE (cost desc):")
     for p, costs in sorted(by_purpose.items(), key=lambda kv: -sum(kv[1])):
-        print(f"  {p:35} ${sum(costs):8.2f}  calls={len(costs):6d}  avg=${sum(costs)/len(costs):.4f}")
+        print(
+            f"  {p:35} ${sum(costs):8.2f}  calls={len(costs):6d}  avg=${sum(costs) / len(costs):.4f}"
+        )
 
     print("\nBY DAY:")
     for d in sorted(by_day):

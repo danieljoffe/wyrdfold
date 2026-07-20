@@ -313,9 +313,7 @@ def test_structural_garbage_still_fails_loud() -> None:
 
     # Wrong TYPE is a real malformed response, not verbosity — must raise.
     with pytest.raises(ValidationError):
-        LateralSuggestion.model_validate(
-            _valid_kwargs(lateral_relationship=["not", "a", "string"])
-        )
+        LateralSuggestion.model_validate(_valid_kwargs(lateral_relationship=["not", "a", "string"]))
     # And a too-short label stays a hard error (min_length is a floor,
     # not a prose cap).
     with pytest.raises(ValidationError):

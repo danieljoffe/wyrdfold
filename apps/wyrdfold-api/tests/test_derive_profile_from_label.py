@@ -48,9 +48,7 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 async def test_derivation_is_label_only_via_generic_prompt(
     captured: dict[str, Any],
 ) -> None:
-    derived, result = await derive_profile_from_label(
-        object(), label="Senior Frontend Engineer"
-    )
+    derived, result = await derive_profile_from_label(object(), label="Senior Frontend Engineer")
 
     assert (derived, result) == ("DERIVED", "RESULT")
     assert captured["system"] is SYSTEM_PROMPT_GENERIC

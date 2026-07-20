@@ -20,24 +20,45 @@ def _seed_costs(service_client: Client, user_id: str) -> None:
     service_client.table("llm_costs").insert(
         [
             # Billable (interactive).
-            {"user_id": user_id, "model": "m", "purpose": "job_analysis",
-             "input_tokens": 1, "output_tokens": 1, "cost_usd": 1.25},
-            {"user_id": user_id, "model": "m", "purpose": "tailor.resume",
-             "input_tokens": 1, "output_tokens": 1, "cost_usd": 0.50},
+            {
+                "user_id": user_id,
+                "model": "m",
+                "purpose": "job_analysis",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 1.25,
+            },
+            {
+                "user_id": user_id,
+                "model": "m",
+                "purpose": "tailor.resume",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 0.50,
+            },
             # Background (excluded from managed quotas).
-            {"user_id": user_id, "model": "m", "purpose": "fit.job",
-             "input_tokens": 1, "output_tokens": 1, "cost_usd": 3.00},
-            {"user_id": user_id, "model": "m",
-             "purpose": "relevance.title_triage",
-             "input_tokens": 1, "output_tokens": 1, "cost_usd": 2.00},
+            {
+                "user_id": user_id,
+                "model": "m",
+                "purpose": "fit.job",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 3.00,
+            },
+            {
+                "user_id": user_id,
+                "model": "m",
+                "purpose": "relevance.title_triage",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 2.00,
+            },
         ]
     ).execute()
 
 
 @pytest.fixture
-def seeded_costs(
-    service_client: Client, two_seeded_users: tuple[str, str]
-) -> Any:
+def seeded_costs(service_client: Client, two_seeded_users: tuple[str, str]) -> Any:
     uid_a, uid_b = two_seeded_users
     _seed_costs(service_client, uid_a)
     try:
@@ -56,17 +77,25 @@ def test_billable_rpc_excludes_background_purposes(
     # user A — billable by blocklist semantics (unknown purposes default
     # to billable, the safe-for-cost direction).
     uid_a, _ = seeded_costs
-    total = service_client.rpc(
-        "total_billable_spend_since",
-        {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": _EXCLUDED},
-    ).execute().data
+    total = (
+        service_client.rpc(
+            "total_billable_spend_since",
+            {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": _EXCLUDED},
+        )
+        .execute()
+        .data
+    )
     assert float(total) == pytest.approx(2.75)  # 1.25 + 0.50 + 1.00, not 7.75
 
     # NULL exclusion list = everything (parity with total_spend_since).
-    total_all = service_client.rpc(
-        "total_billable_spend_since",
-        {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": None},
-    ).execute().data
+    total_all = (
+        service_client.rpc(
+            "total_billable_spend_since",
+            {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": None},
+        )
+        .execute()
+        .data
+    )
     assert float(total_all) == pytest.approx(7.75)
 
 
@@ -78,18 +107,26 @@ def test_billable_rpc_guard_hides_other_users_spend(
     total_spend_since)."""
     uid_a, uid_b = seeded_costs
     client_b = user_client_factory(uid_b)
-    total = client_b.rpc(
-        "total_billable_spend_since",
-        {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": None},
-    ).execute().data
+    total = (
+        client_b.rpc(
+            "total_billable_spend_since",
+            {"p_user_id": uid_a, "p_since": None, "p_excluded_purposes": None},
+        )
+        .execute()
+        .data
+    )
     assert float(total) == 0.0
 
     # …while their own query returns their real spend (the fixture's
     # $2.00 baseline row), proving the guard scopes rather than breaks.
-    own = client_b.rpc(
-        "total_billable_spend_since",
-        {"p_user_id": uid_b, "p_since": None, "p_excluded_purposes": None},
-    ).execute().data
+    own = (
+        client_b.rpc(
+            "total_billable_spend_since",
+            {"p_user_id": uid_b, "p_since": None, "p_excluded_purposes": None},
+        )
+        .execute()
+        .data
+    )
     assert float(own) == pytest.approx(2.0)
 
 
@@ -101,9 +138,7 @@ def test_plan_check_constraint_rejects_unknown_tier(
         service_client.table("user_profiles").upsert(
             {"user_id": uid_a, "plan": "gold"}, on_conflict="user_id"
         ).execute()
-    assert "user_profiles_plan_check" in str(err.value) or "23514" in str(
-        err.value
-    )
+    assert "user_profiles_plan_check" in str(err.value) or "23514" in str(err.value)
 
     # Valid tiers upsert cleanly.
     service_client.table("user_profiles").upsert(

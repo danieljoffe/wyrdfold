@@ -47,9 +47,7 @@ def provision_owner(supabase: Client, s: Settings) -> None:
         return
 
     try:
-        supabase.auth.admin.create_user(
-            {"email": email, "email_confirm": True}
-        )
+        supabase.auth.admin.create_user({"email": email, "email_confirm": True})
     except Exception as exc:
         message = str(exc)
         if "already" in message.lower() and (
@@ -70,7 +68,6 @@ def provision_owner(supabase: Client, s: Settings) -> None:
     # the single most important first-run message invisible in the deploy
     # log. This fires once per instance lifetime.
     logger.warning(
-        "owner_provisioning: created owner %s — sign in via the magic-link "
-        "form to get started.",
+        "owner_provisioning: created owner %s — sign in via the magic-link form to get started.",
         email,
     )

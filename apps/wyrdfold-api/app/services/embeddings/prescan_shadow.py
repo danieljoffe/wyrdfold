@@ -55,9 +55,7 @@ async def record_shadow_observation(
         "threshold": threshold,
     }
     try:
-        await asyncio.to_thread(
-            lambda: supabase.table(TABLE).insert(row).execute()
-        )
+        await asyncio.to_thread(lambda: supabase.table(TABLE).insert(row).execute())
     except Exception:
         logger.exception(
             "Pre-scan shadow observation write failed for job %s / target %s",

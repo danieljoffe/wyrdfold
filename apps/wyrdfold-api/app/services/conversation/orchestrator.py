@@ -61,11 +61,7 @@ def _system_for(conv_type: ConversationType) -> str:
 
 
 def _purpose_for(conv_type: ConversationType) -> str:
-    return (
-        PURPOSE_TURN_ONBOARDING
-        if conv_type == "onboarding"
-        else PURPOSE_TURN_UPDATE
-    )
+    return PURPOSE_TURN_ONBOARDING if conv_type == "onboarding" else PURPOSE_TURN_UPDATE
 
 
 # A bare number, optionally with thousands separators / a decimal. Compared on
@@ -146,8 +142,7 @@ def _prose_append_warnings(prose_append: str, user_content: str) -> list[str]:
         bad_numbers.append(raw)
     if bad_numbers:
         warnings.append(
-            f"prose_append introduced number(s) not in the user's message: "
-            f"{bad_numbers}"
+            f"prose_append introduced number(s) not in the user's message: {bad_numbers}"
         )
 
     bad_names: list[str] = []
@@ -161,10 +156,7 @@ def _prose_append_warnings(prose_append: str, user_content: str) -> list[str]:
         seen_name.add(low)
         bad_names.append(token)
     if bad_names:
-        warnings.append(
-            f"prose_append introduced name(s) not in the user's message: "
-            f"{bad_names}"
-        )
+        warnings.append(f"prose_append introduced name(s) not in the user's message: {bad_names}")
 
     return warnings
 
@@ -230,9 +222,7 @@ async def handle_turn(
         prose_doc_id=current_prose.id if current_prose else None,
     )
 
-    messages = _history_as_messages(
-        history, "[skipped question]" if skipped else user_content
-    )
+    messages = _history_as_messages(history, "[skipped question]" if skipped else user_content)
     if current_prose and current_prose.content.strip():
         prose_context = "[context: current prose doc]\n" + current_prose.content
         messages.insert(
@@ -279,9 +269,7 @@ async def handle_turn(
         # keep the content (it may be real) but log + surface so it gets a
         # human check before it hardens into "truth".
         skip_token = skipped or not user_content.strip()
-        prose_warnings = (
-            [] if skip_token else _prose_append_warnings(append_text, user_content)
-        )
+        prose_warnings = [] if skip_token else _prose_append_warnings(append_text, user_content)
         if prose_warnings:
             logger.warning(
                 "prose_append faithfulness flags (user_id=%s, type=%s): %s",
@@ -297,14 +285,8 @@ async def handle_turn(
             # marker makes it confirm-or-fix instead of silently "truth".
             append_text = f"{UNVERIFIED_MARKER}\n{append_text}"
         existing = current_prose.content if current_prose else ""
-        new_content = (
-            (existing + "\n\n" + append_text).strip()
-            if existing
-            else append_text
-        )
-        new_doc = prose.create_version(
-            supabase, user_id=user_id, content=new_content
-        )
+        new_content = (existing + "\n\n" + append_text).strip() if existing else append_text
+        new_doc = prose.create_version(supabase, user_id=user_id, content=new_content)
         new_prose_version = new_doc.version
         prose_updated = True
 
@@ -391,8 +373,7 @@ async def next_probe(
     if current is None:
         return ProbeResult(
             question=(
-                "Tell me about your most recent role — company, title, and one "
-                "win you'd lead with."
+                "Tell me about your most recent role — company, title, and one win you'd lead with."
             ),
             gap=None,
         )

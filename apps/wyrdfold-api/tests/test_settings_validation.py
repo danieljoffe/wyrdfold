@@ -62,16 +62,12 @@ def test_missing_supabase_anon_key_fails_boot() -> None:
 
 def test_anthropic_provider_without_key_fails_boot() -> None:
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
-        _validate_settings(
-            _good_settings(llm_provider="anthropic", anthropic_api_key="")
-        )
+        _validate_settings(_good_settings(llm_provider="anthropic", anthropic_api_key=""))
 
 
 def test_voyage_provider_without_key_fails_boot() -> None:
     with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
-        _validate_settings(
-            _good_settings(embeddings_provider="voyage", voyage_api_key="")
-        )
+        _validate_settings(_good_settings(embeddings_provider="voyage", voyage_api_key=""))
 
 
 # ---- Supabase key liveness probe (_probe_supabase_keys) --------------------

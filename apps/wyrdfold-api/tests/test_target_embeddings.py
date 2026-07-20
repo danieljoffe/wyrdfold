@@ -50,7 +50,9 @@ def _target(
 
 
 def test_embed_text_combines_label_and_keywords() -> None:
-    text = embed_text_for_target(_target(label="Staff Frontend Engineer", keywords=["React", "TypeScript"]))
+    text = embed_text_for_target(
+        _target(label="Staff Frontend Engineer", keywords=["React", "TypeScript"])
+    )
     assert text == "Staff Frontend Engineer. Related roles and skills: React, TypeScript"
 
 

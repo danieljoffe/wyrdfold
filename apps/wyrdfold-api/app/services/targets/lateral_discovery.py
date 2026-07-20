@@ -204,9 +204,7 @@ director, vp, c_level.
 Return ONLY the JSON object. No prose, no markdown, no code fences."""
 
 
-def _build_user_message(
-    payload: OptimizedPayload, current_targets: list[JobTarget]
-) -> str:
+def _build_user_message(payload: OptimizedPayload, current_targets: list[JobTarget]) -> str:
     """Compose the user message: profile summary + exclusion list."""
     parts: list[str] = []
 
@@ -221,9 +219,7 @@ def _build_user_message(
                 line += f" ({t.seniority_hint})"
             parts.append(line)
     else:
-        parts.append(
-            "## Already pursuing\n_(none — this is the first lateral pass)_"
-        )
+        parts.append("## Already pursuing\n_(none — this is the first lateral pass)_")
 
     parts.append(
         f"## Task\nPropose up to {_MAX_SUGGESTIONS} lateral targets. "
@@ -264,8 +260,6 @@ async def suggest_lateral_targets(
     # truncate rather than reject — the top N by confidence are still
     # useful even if the model went over.
     if len(parsed.suggestions) > _MAX_SUGGESTIONS:
-        trimmed = sorted(
-            parsed.suggestions, key=lambda s: -s.confidence
-        )[:_MAX_SUGGESTIONS]
+        trimmed = sorted(parsed.suggestions, key=lambda s: -s.confidence)[:_MAX_SUGGESTIONS]
         parsed = LateralSuggestions(suggestions=trimmed)
     return parsed, result

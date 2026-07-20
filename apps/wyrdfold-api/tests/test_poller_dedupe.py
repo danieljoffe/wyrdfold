@@ -100,12 +100,8 @@ def test_cross_batch_dedupe_skips_when_existing_has_different_ext_id() -> None:
     """Cross-cycle case: the duplicate landed in a previous poll. The
     new poll cycle should drop the new candidate since the same role
     is already in the DB under a different external_id."""
-    existing = [
-        _row(ext_id="ext-from-prev-cycle", company="Smartsheet", title="PS BDD Director")
-    ]
-    rows = [
-        _row(ext_id="ext-new", company="Smartsheet", title="PS BDD Director")
-    ]
+    existing = [_row(ext_id="ext-from-prev-cycle", company="Smartsheet", title="PS BDD Director")]
+    rows = [_row(ext_id="ext-new", company="Smartsheet", title="PS BDD Director")]
     deduped = _dedupe_by_content(rows, existing=existing, source="Smartsheet")
     assert deduped == []
 
@@ -141,9 +137,9 @@ def test_both_within_and_cross_apply() -> None:
         _row(ext_id="ext-old", company="Acme", title="Senior FE"),
     ]
     rows = [
-        _row(ext_id="ext-1", company="Acme", title="Senior FE"),    # cross dup
-        _row(ext_id="ext-2", company="Acme", title="Staff FE"),     # unique
-        _row(ext_id="ext-3", company="Acme", title="Staff FE"),     # within dup
+        _row(ext_id="ext-1", company="Acme", title="Senior FE"),  # cross dup
+        _row(ext_id="ext-2", company="Acme", title="Staff FE"),  # unique
+        _row(ext_id="ext-3", company="Acme", title="Staff FE"),  # within dup
     ]
     deduped = _dedupe_by_content(rows, existing=existing, source="Acme")
     assert len(deduped) == 1

@@ -94,9 +94,7 @@ def seeded_shared_job(
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
-def _list_rows(
-    client: Client, target_id: str, user_id: str | None
-) -> list[dict[str, object]]:
+def _list_rows(client: Client, target_id: str, user_id: str | None) -> list[dict[str, object]]:
     """The exact ``get_target_jobs`` call the list endpoint makes."""
     resp = client.rpc(
         "get_target_jobs",

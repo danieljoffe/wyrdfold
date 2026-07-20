@@ -24,7 +24,15 @@ def test_user_deletion_anonymizes_but_keeps_reference_jd(
     target = service_client.table("targets").insert({"label": "RefJD FK"}).execute().data[0]
     ref = (
         service_client.table("reference_jds")
-        .insert({"target_id": target["id"], "user_id": uid, "jd_text": "shared JD text", "extracted_profile": {}, "suppressed": False})
+        .insert(
+            {
+                "target_id": target["id"],
+                "user_id": uid,
+                "jd_text": "shared JD text",
+                "extracted_profile": {},
+                "suppressed": False,
+            }
+        )
         .execute()
         .data[0]
     )

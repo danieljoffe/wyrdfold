@@ -74,9 +74,7 @@ def seeded_target(
     )
     # Link the user to the target — the #191 RPC refuses shared-profile
     # writes from non-followers, so the apply path needs a real link.
-    service_client.table("user_targets").insert(
-        {"user_id": uid, "target_id": target_id}
-    ).execute()
+    service_client.table("user_targets").insert({"user_id": uid, "target_id": target_id}).execute()
     job_ids: list[str] = []
     for i in range(_N_JOBS):
         jid = (
@@ -118,15 +116,11 @@ def seeded_target(
     try:
         yield uid, target_id
     finally:
-        service_client.table("target_learning_log").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("target_learning_log").delete().eq("target_id", target_id).execute()
         service_client.table("job_feedback").delete().eq("target_id", target_id).execute()
         service_client.table("scores").delete().eq("target_id", target_id).execute()
         service_client.table("jobs").delete().eq("source_id", source_id).execute()
-        service_client.table("user_targets").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("user_targets").delete().eq("target_id", target_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
         service_client.table("sources").delete().eq("id", source_id).execute()
 
@@ -163,15 +157,16 @@ async def test_outlier_patch_is_staged_not_applied(
     # "contract" hard-excludes every seeded job (it's in each title) WITHOUT
     # colliding with the target's own python terms, so it survives the
     # self-collision guard and reaches the learning-rate cap (#47).
-    patch_obj = ProfilePatch(
-        add_negative=["contract"], confidence=0.95, rationale="all irrelevant"
-    )
+    patch_obj = ProfilePatch(add_negative=["contract"], confidence=0.95, rationale="all irrelevant")
     with patch(
         "app.services.llm_learner.complete_json",
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client, object(), user_id=uid, target_id=target_id  # type: ignore[arg-type]
+            service_client,
+            object(),
+            user_id=uid,
+            target_id=target_id,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -202,15 +197,16 @@ async def test_self_colliding_negative_is_dropped_before_apply(
     # engineer" search keyword — adding it as a negative would hard-zero every
     # legitimate job. The guard drops it before apply, so nothing self-harming
     # lands on the shared profile (#47).
-    patch_obj = ProfilePatch(
-        add_negative=["python"], confidence=0.95, rationale="all irrelevant"
-    )
+    patch_obj = ProfilePatch(add_negative=["python"], confidence=0.95, rationale="all irrelevant")
     with patch(
         "app.services.llm_learner.complete_json",
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client, object(), user_id=uid, target_id=target_id  # type: ignore[arg-type]
+            service_client,
+            object(),
+            user_id=uid,
+            target_id=target_id,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -240,7 +236,10 @@ async def test_irrelevant_patch_auto_applies(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client, object(), user_id=uid, target_id=target_id  # type: ignore[arg-type]
+            service_client,
+            object(),
+            user_id=uid,
+            target_id=target_id,  # type: ignore[arg-type]
         )
 
     assert result is not None

@@ -92,7 +92,5 @@ def md_to_docx(markdown: str, style: ResumeStyleSettings | None = None) -> bytes
 
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise PandocRenderError(
-            f"pandoc exited {result.returncode}: {stderr or '(no stderr)'}"
-        )
+        raise PandocRenderError(f"pandoc exited {result.returncode}: {stderr or '(no stderr)'}")
     return result.stdout

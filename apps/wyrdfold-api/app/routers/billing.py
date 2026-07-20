@@ -101,12 +101,10 @@ def _get_stripe_customer_id(supabase: Client, user_id: str) -> str | None:
     return cast("str | None", rows[0].get("stripe_customer_id")) if rows else None
 
 
-def _save_stripe_customer_id(
-    supabase: Client, user_id: str, customer_id: str
-) -> None:
-    supabase.table("user_profiles").update(
-        {"stripe_customer_id": customer_id}
-    ).eq("user_id", user_id).execute()
+def _save_stripe_customer_id(supabase: Client, user_id: str, customer_id: str) -> None:
+    supabase.table("user_profiles").update({"stripe_customer_id": customer_id}).eq(
+        "user_id", user_id
+    ).execute()
 
 
 def _ensure_customer(supabase: Client, user_id: str) -> str:
@@ -163,11 +161,8 @@ def get_billing_account(
     account = budget.get_llm_account(supabase, user_id=user_id)
     return BillingAccountResponse(
         plan=account.plan or "free",
-        has_billing_account=_get_stripe_customer_id(supabase, user_id)
-        is not None,
-        byok=keys_store.has_usable_key(
-            supabase, user_id=user_id, provider="openrouter"
-        ),
+        has_billing_account=_get_stripe_customer_id(supabase, user_id) is not None,
+        byok=keys_store.has_usable_key(supabase, user_id=user_id, provider="openrouter"),
     )
 
 
@@ -256,9 +251,7 @@ def _resolve_user_id(
 
 
 def _set_plan(supabase: Client, user_id: str, plan: str) -> None:
-    supabase.table("user_profiles").update({"plan": plan}).eq(
-        "user_id", user_id
-    ).execute()
+    supabase.table("user_profiles").update({"plan": plan}).eq("user_id", user_id).execute()
     logger.info("billing: plan=%s user=%s", plan, user_id)
 
 
@@ -290,9 +283,7 @@ def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
     ):
         items = cast(dict[str, Any], obj.get("items") or {})
         first = (cast(list[Any], items.get("data") or []) or [{}])[0]
-        price_id = cast(
-            str, (cast(dict[str, Any], first).get("price") or {}).get("id") or ""
-        )
+        price_id = cast(str, (cast(dict[str, Any], first).get("price") or {}).get("id") or "")
         metadata = cast(dict[str, Any], obj.get("metadata") or {})
         user_id = _resolve_user_id(
             supabase,

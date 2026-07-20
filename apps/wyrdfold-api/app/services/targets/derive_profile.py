@@ -190,9 +190,7 @@ def _cache_hit_result(model: ModelId) -> LLMResult:
     )
 
 
-def _get_cached(
-    supabase: Client, key: str
-) -> DerivedTarget | None:
+def _get_cached(supabase: Client, key: str) -> DerivedTarget | None:
     """Return the cached DerivedTarget for ``key``, or None on miss."""
     try:
         resp = (
@@ -215,9 +213,7 @@ def _get_cached(
     except Exception:
         # A schema drift in stored payloads would otherwise poison the
         # cache row indefinitely; treat as miss so the LLM rewrites it.
-        logger.warning(
-            "derive-jd cache row failed validation; treating as miss", exc_info=True
-        )
+        logger.warning("derive-jd cache row failed validation; treating as miss", exc_info=True)
         return None
 
 
@@ -225,11 +221,7 @@ def _record_cache_hit(supabase: Client, key: str) -> None:
     """Best-effort hit_count + last_hit_at bump. Failures are swallowed."""
     try:
         current = (
-            supabase.table(_CACHE_TABLE)
-            .select("hit_count")
-            .eq("jd_hash", key)
-            .single()
-            .execute()
+            supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key).single().execute()
         )
         row = cast(dict[str, Any], current.data or {})
         next_count = int(row.get("hit_count", 0)) + 1

@@ -45,9 +45,7 @@ router = APIRouter(
 # response_model=None: the handler returns either a JobAnalysisRecord or a 200
 # JSONResponse marker (the no-profile empty state, #105), which FastAPI can't
 # express as a single response model — it serializes each return as-is.
-@router.post(
-    "/{job_id}", response_model=None, dependencies=[Depends(enforce_llm_budget)]
-)
+@router.post("/{job_id}", response_model=None, dependencies=[Depends(enforce_llm_budget)])
 async def create_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
@@ -96,10 +94,7 @@ async def create_analysis(
             status_code=200,
             content={
                 "code": "no_profile",
-                "message": (
-                    "Set up your experience profile to generate a "
-                    "job-fit analysis."
-                ),
+                "message": ("Set up your experience profile to generate a job-fit analysis."),
             },
         )
 
@@ -153,11 +148,13 @@ async def create_analysis(
 
     # 4. Fetch job posting (existence + description in one round-trip)
     resp = await asyncio.to_thread(
-        lambda: caller_supabase.table("jobs")
-        .select("id, description_html")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
+        lambda: (
+            caller_supabase.table("jobs")
+            .select("id, description_html")
+            .eq("id", job_id)
+            .limit(1)
+            .execute()
+        )
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -170,9 +167,8 @@ async def create_analysis(
         )
 
     # 5. Run LLM analysis with target context
-    target_context = (
-        f"Target: {target.label}"
-        + (f"\nDescription: {target.description}" if target.description else "")
+    target_context = f"Target: {target.label}" + (
+        f"\nDescription: {target.description}" if target.description else ""
     )
     analysis, llm_result = await analyze_job(
         llm,
@@ -276,12 +272,8 @@ def _apply_llm_blend(
         # detail endpoint refreshes correctly because it doesn't go
         # through the list cache. Scope to the owning target + the
         # untargeted global view; sibling targets aren't affected.
-        job_list_cache.invalidate(
-            prefix=f"{jobs_cache_prefix(target_id=target_id)}:"
-        )
-        job_list_cache.invalidate(
-            prefix=f"{jobs_cache_prefix(target_id=None)}:"
-        )
+        job_list_cache.invalidate(prefix=f"{jobs_cache_prefix(target_id=target_id)}:")
+        job_list_cache.invalidate(prefix=f"{jobs_cache_prefix(target_id=None)}:")
     except Exception:
         # Best-effort: a stale write here doesn't fail the user's
         # request (the analysis itself succeeded + was returned), but

@@ -35,10 +35,7 @@ def seeded_feedback(
         .data[0]["id"]
     )
     target_id = (
-        service_client.table("targets")
-        .insert({"label": "RLS Int Target"})
-        .execute()
-        .data[0]["id"]
+        service_client.table("targets").insert({"label": "RLS Int Target"}).execute().data[0]["id"]
     )
     job_id = (
         service_client.table("jobs")
@@ -73,9 +70,7 @@ def seeded_feedback(
         yield uid_a, uid_b
     finally:
         # Deleting the job/target would cascade the feedback, but be explicit.
-        service_client.table("job_feedback").delete().in_(
-            "user_id", [uid_a, uid_b]
-        ).execute()
+        service_client.table("job_feedback").delete().in_("user_id", [uid_a, uid_b]).execute()
         service_client.table("jobs").delete().eq("id", job_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
         service_client.table("sources").delete().eq("id", source_id).execute()
@@ -88,15 +83,11 @@ def test_job_feedback_select_is_rls_scoped(
     uid_a, uid_b = seeded_feedback
 
     # No `.eq("user_id", ...)` anywhere — RLS alone must scope the result.
-    rows_a = (
-        user_client_factory(uid_a).table("job_feedback").select("user_id").execute().data
-    )
+    rows_a = user_client_factory(uid_a).table("job_feedback").select("user_id").execute().data
     assert rows_a, "user A should see their own feedback"
     assert all(r["user_id"] == uid_a for r in rows_a), f"cross-tenant leak: {rows_a}"
 
-    rows_b = (
-        user_client_factory(uid_b).table("job_feedback").select("user_id").execute().data
-    )
+    rows_b = user_client_factory(uid_b).table("job_feedback").select("user_id").execute().data
     assert all(r["user_id"] == uid_b for r in rows_b), f"cross-tenant leak: {rows_b}"
 
 
@@ -119,7 +110,12 @@ def seeded_fb_parents(
     job_id = (
         service_client.table("jobs")
         .insert(
-            {"external_id": "rls-w-1", "source_id": source_id, "title": "Eng", "company_name": "RLS W"}
+            {
+                "external_id": "rls-w-1",
+                "source_id": source_id,
+                "title": "Eng",
+                "company_name": "RLS W",
+            }
         )
         .execute()
         .data[0]["id"]
@@ -150,7 +146,12 @@ def test_job_feedback_write_own_succeeds_cross_tenant_denied(
     own = (
         client_a.table("job_feedback")
         .insert(
-            {"user_id": uid_a, "job_posting_id": job_id, "target_id": target_id, "signal": "relevant"}
+            {
+                "user_id": uid_a,
+                "job_posting_id": job_id,
+                "target_id": target_id,
+                "signal": "relevant",
+            }
         )
         .execute()
         .data
@@ -160,16 +161,19 @@ def test_job_feedback_write_own_succeeds_cross_tenant_denied(
     # Inserting a row stamped as user B is rejected by the INSERT WITH CHECK.
     with pytest.raises(APIError):
         client_a.table("job_feedback").insert(
-            {"user_id": uid_b, "job_posting_id": job_id, "target_id": target_id, "signal": "relevant"}
+            {
+                "user_id": uid_b,
+                "job_posting_id": job_id,
+                "target_id": target_id,
+                "signal": "relevant",
+            }
         ).execute()
 
     # Own delete succeeds (removes the row).
     client_a.table("job_feedback").delete().eq("user_id", uid_a).eq(
         "job_posting_id", job_id
     ).execute()
-    remaining = (
-        client_a.table("job_feedback").select("user_id").eq("user_id", uid_a).execute().data
-    )
+    remaining = client_a.table("job_feedback").select("user_id").eq("user_id", uid_a).execute().data
     assert remaining == []
 
 
@@ -194,11 +198,7 @@ def test_target_learning_log_select_is_rls_scoped(
     ).execute()
 
     rows_a = (
-        user_client_factory(uid_a)
-        .table("target_learning_log")
-        .select("user_id")
-        .execute()
-        .data
+        user_client_factory(uid_a).table("target_learning_log").select("user_id").execute().data
     )
     assert rows_a, "user A should see their own learning-log row"
     assert all(r["user_id"] == uid_a for r in rows_a), f"cross-tenant leak: {rows_a}"

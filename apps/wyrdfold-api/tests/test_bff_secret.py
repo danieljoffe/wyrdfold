@@ -69,9 +69,7 @@ def test_guard_accepts_correct_header() -> None:
 
 def _client(secret: str) -> TestClient:
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
-    app.dependency_overrides[get_settings] = lambda: Settings(
-        wyrdfold_bff_secret=secret
-    )
+    app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret=secret)
     return TestClient(app)
 
 
@@ -101,7 +99,5 @@ def test_signup_mode_rejects_direct_hit_without_secret_when_configured() -> None
 
 
 def test_signup_mode_accepts_request_carrying_the_secret() -> None:
-    resp = _client("s3cret").get(
-        "/signup-mode", headers={"x-wyrdfold-bff": "s3cret"}
-    )
+    resp = _client("s3cret").get("/signup-mode", headers={"x-wyrdfold-bff": "s3cret"})
     assert resp.status_code != 403

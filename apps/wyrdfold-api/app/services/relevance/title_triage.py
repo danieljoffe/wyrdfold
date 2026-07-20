@@ -265,8 +265,7 @@ def _split_user_message(target: JobTarget, titles: list[str]) -> tuple[str, str]
 
     dynamic_lines: list[str] = [""]
     dynamic_lines.append(
-        f"Grade the following {len(titles)} candidate titles. Return one "
-        "verdict per id."
+        f"Grade the following {len(titles)} candidate titles. Return one verdict per id."
     )
     dynamic_lines.append("")
     # The titles are scraped, attacker-controllable text. Fence the whole

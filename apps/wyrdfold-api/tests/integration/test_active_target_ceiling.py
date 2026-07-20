@@ -29,9 +29,7 @@ def _active_count(service_client: Client, uid: str) -> int:
     return resp.count or 0
 
 
-def test_active_target_ceiling(
-    service_client: Client, two_seeded_users: tuple[str, str]
-) -> None:
+def test_active_target_ceiling(service_client: Client, two_seeded_users: tuple[str, str]) -> None:
     uid_a, uid_b = two_seeded_users
     tids: list[str] = []
     try:

@@ -74,9 +74,7 @@ class TestSsrfHostCheck:
 
         import app.services.validate as v
 
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("127.0.0.1")]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("127.0.0.1")])
         with pytest.raises(ValueError, match="disallowed"):
             assert_safe_host("anything.evil")
 
@@ -114,9 +112,7 @@ class TestSsrfHostCheck:
         import app.services.validate as v
 
         secret_ip = "169.254.169.254"
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)])
         with pytest.raises(ValueError) as exc_info:
             assert_safe_host("metadata.evil")
         message = str(exc_info.value)
@@ -124,9 +120,7 @@ class TestSsrfHostCheck:
         assert "metadata.evil" in message  # caller-supplied host is fine
         assert "disallowed" in message
 
-    async def test_validate_job_url_rejection_reason_has_no_resolved_ip(
-        self, monkeypatch
-    ):
+    async def test_validate_job_url_rejection_reason_has_no_resolved_ip(self, monkeypatch):
         """The `rejection_reason` returned by `validate_job_url` is echoed to
         clients verbatim (POST /jobs/validate-url, `Invalid JD URL: ...`), so
         the resolved internal IP must not appear in it (#192/#29 R3 H8)."""
@@ -135,9 +129,7 @@ class TestSsrfHostCheck:
         import app.services.validate as v
 
         secret_ip = "169.254.169.254"
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address(secret_ip)])
         result = await v.validate_job_url("https://metadata.evil/job/1")
         assert result.is_valid is False
         assert result.rejection_reason is not None
@@ -158,9 +150,7 @@ class TestSsrfHostCheck:
 
         host = "internal-secret.corp"
         # Case A: the host resolves to an internal IP.
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("10.0.0.5")]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("10.0.0.5")])
         resolves_internal = await v.validate_job_url(f"https://{host}/job/1")
         # Case B: the host does not resolve at all.
         monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [])
@@ -179,9 +169,7 @@ class TestSsrfHostCheck:
 
         import app.services.validate as v
 
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("::1")]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("::1")])
         with pytest.raises(ValueError, match="disallowed"):
             assert_safe_host("v6-loopback")
 
@@ -190,9 +178,7 @@ class TestSsrfHostCheck:
 
         import app.services.validate as v
 
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("fc00::1")]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("fc00::1")])
         with pytest.raises(ValueError, match="disallowed"):
             assert_safe_host("v6-ula")
 
@@ -222,9 +208,7 @@ class TestSsrfHostCheck:
 
         import app.services.validate as v
 
-        monkeypatch.setattr(
-            v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("1.1.1.1")]
-        )
+        monkeypatch.setattr(v, "_resolve_addresses", lambda _h: [ipaddress.ip_address("1.1.1.1")])
         assert_safe_host("public.example")  # no exception
 
     def test_cgnat_shared_address_space_blocked(self, monkeypatch):
@@ -520,7 +504,7 @@ class TestValidateJobUrl:
 
     @pytest.mark.asyncio
     async def test_domain_changing_redirect_warning(self):
-        html = '<html><head><title>Job Opening at Acme</title></head><body></body></html>'
+        html = "<html><head><title>Job Opening at Acme</title></head><body></body></html>"
         mock_resp = _mock_response(
             url="https://different-domain.com/jobs/123",
             text=html,
@@ -582,9 +566,7 @@ class TestValidateJobUrl:
     async def test_too_many_redirects_warning(self):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(
-            side_effect=httpx.TooManyRedirects(
-                "Exceeded max redirects", request=MagicMock()
-            )
+            side_effect=httpx.TooManyRedirects("Exceeded max redirects", request=MagicMock())
         )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)

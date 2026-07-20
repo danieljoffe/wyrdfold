@@ -63,9 +63,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_phase1_triage")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 # Candidate slugs — select a subset via --models. sonnet-4.6 is the usual
@@ -250,9 +248,7 @@ async def _run_evaluation(
     pending = {asyncio.create_task(_bounded(j)) for j in jobs}
     completed = 0
     while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             results.append(t.result())
             completed += 1
@@ -366,8 +362,7 @@ def _agreement_report(
             "missing_verdicts_in_ref": missing_in_ref,
             "total_cost_usd": round(by_model_cost[model], 5),
             "avg_latency_ms": int(
-                sum(by_model_latency[model])
-                / max(1, len(by_model_latency[model]))
+                sum(by_model_latency[model]) / max(1, len(by_model_latency[model]))
             ),
             "errored_batches": by_model_errors[model],
         }
@@ -376,8 +371,7 @@ def _agreement_report(
     per_model[reference] = {
         "total_cost_usd": round(by_model_cost[reference], 5),
         "avg_latency_ms": int(
-            sum(by_model_latency[reference])
-            / max(1, len(by_model_latency[reference]))
+            sum(by_model_latency[reference]) / max(1, len(by_model_latency[reference]))
         ),
         "errored_batches": by_model_errors[reference],
     }
@@ -398,9 +392,7 @@ def _agreement_report(
                         total += 1
                         if mod_v[vid] == ref_prom:
                             agree += 1
-            per_target_agreement[tid][model] = (
-                round(agree / total, 4) if total else 0.0
-            )
+            per_target_agreement[tid][model] = round(agree / total, 4) if total else 0.0
 
     return {
         "reference_model": reference,
@@ -550,9 +542,7 @@ def _write_report(
     md.append("")
     md.append("## Per-target agreement")
     md.append("")
-    md.append("| Target | " + " | ".join(
-        m for m in final["models"] if m != ref
-    ) + " |")
+    md.append("| Target | " + " | ".join(m for m in final["models"] if m != ref) + " |")
     md.append("| --- |" + " --- |" * (len(final["models"]) - 1))
     for tid, by_model in report["per_target_agreement"].items():
         label = targets[tid].label if tid in targets else tid
@@ -618,9 +608,7 @@ def main() -> None:
         )
 
     n_titles = sum(len(v) for v in titles_by_target.values())
-    n_batches = sum(
-        len(_chunk(v, args.batch_size)) for v in titles_by_target.values()
-    )
+    n_batches = sum(len(_chunk(v, args.batch_size)) for v in titles_by_target.values())
     logger.info(
         "Fixture: %d titles across %d targets → %d batches × %d models = %d calls",
         n_titles,
@@ -634,9 +622,7 @@ def main() -> None:
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
-    base = Path(args.output) if args.output else (
-        _RESULTS_DIR / f"eval_phase1_triage_{ts}"
-    )
+    base = Path(args.output) if args.output else (_RESULTS_DIR / f"eval_phase1_triage_{ts}")
     base.parent.mkdir(parents=True, exist_ok=True)
     inflight = base.with_suffix(".inflight.json")
 
@@ -652,9 +638,7 @@ def main() -> None:
         )
     )
 
-    report = _agreement_report(
-        final["results"], titles_by_target, models, reference=args.reference
-    )
+    report = _agreement_report(final["results"], titles_by_target, models, reference=args.reference)
     # Correctness vs ground-truth labels when the fixture carries them (#193):
     # measures each model against TRUTH, not just cross-model agreement. Skipped
     # (empty) for unlabeled real-data snapshots.

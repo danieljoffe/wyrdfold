@@ -32,25 +32,12 @@ def test_cross_tenant_update_affects_zero_rows(
     client_a = user_client_factory(uid_a)
 
     # User A tries to overwrite user B's row. RLS must match zero rows.
-    resp = (
-        client_a.table("user_profiles")
-        .update({"name": "hacked"})
-        .eq("user_id", uid_b)
-        .execute()
-    )
+    resp = client_a.table("user_profiles").update({"name": "hacked"}).eq("user_id", uid_b).execute()
     assert resp.data == [], "RLS leak: user A's UPDATE matched user B's row"
 
     # Verify via service-role that B's row is untouched.
-    rows = (
-        service_client.table("user_profiles")
-        .select("name")
-        .eq("user_id", uid_b)
-        .execute()
-        .data
-    )
-    assert rows and rows[0]["name"] == "User B", (
-        "RLS leak: user B's profile was mutated by user A"
-    )
+    rows = service_client.table("user_profiles").select("name").eq("user_id", uid_b).execute().data
+    assert rows and rows[0]["name"] == "User B", "RLS leak: user B's profile was mutated by user A"
 
 
 def test_own_row_update_succeeds_and_persists(
@@ -69,13 +56,5 @@ def test_own_row_update_succeeds_and_persists(
     )
     assert resp.data, "user A's UPDATE of its own row returned no rows"
 
-    rows = (
-        service_client.table("user_profiles")
-        .select("name")
-        .eq("user_id", uid_a)
-        .execute()
-        .data
-    )
-    assert rows and rows[0]["name"] == "User A renamed", (
-        "user A's own-row UPDATE did not persist"
-    )
+    rows = service_client.table("user_profiles").select("name").eq("user_id", uid_a).execute().data
+    assert rows and rows[0]["name"] == "User A renamed", "user A's own-row UPDATE did not persist"

@@ -139,11 +139,7 @@ def find_reusable_resume(
     docs_query = docs_query.eq("user_id", resolve_owner(user_id))
     rows = cast(list[dict[str, Any]], docs_query.execute().data or [])
     posting_ids = list(
-        {
-            cast(str, r.get("job_posting_id"))
-            for r in rows
-            if r.get("job_posting_id")
-        }
+        {cast(str, r.get("job_posting_id")) for r in rows if r.get("job_posting_id")}
     )
     if not posting_ids:
         return None
@@ -155,16 +151,11 @@ def find_reusable_resume(
         .in_("job_posting_id", posting_ids)
         .execute()
     )
-    in_target = {
-        cast(dict[str, Any], r)["job_posting_id"]
-        for r in (scores_resp.data or [])
-    }
+    in_target = {cast(dict[str, Any], r)["job_posting_id"] for r in (scores_resp.data or [])}
     if not in_target:
         return None
 
-    candidates = [
-        r for r in rows if r.get("job_posting_id") in in_target
-    ][:_MAX_CANDIDATES]
+    candidates = [r for r in rows if r.get("job_posting_id") in in_target][:_MAX_CANDIDATES]
 
     # Resumes built from an older master doc version would clone stale,
     # pre-edit content — refuse them so the caller regenerates fresh (#47).

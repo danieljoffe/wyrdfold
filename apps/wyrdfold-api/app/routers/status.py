@@ -22,9 +22,7 @@ router = APIRouter(
 )
 
 
-def _assert_user_owns_posting(
-    supabase: Client, posting_id: str, user_id: str
-) -> dict[str, Any]:
+def _assert_user_owns_posting(supabase: Client, posting_id: str, user_id: str) -> dict[str, Any]:
     """Return ``{status, target_id}`` for the posting only if the caller is
     linked (via ``user_targets``) to at least one target that has scored
     this posting. 404 on either missing or unowned — don't leak existence
@@ -39,13 +37,7 @@ def _assert_user_owns_posting(
     # 1. Confirm the posting exists. ``jobs.status`` was dropped in #75 C4
     # (per-user status now lives in ``user_jobs``); select ``id`` purely as
     # an existence probe.
-    posting_resp = (
-        supabase.table("jobs")
-        .select("id")
-        .eq("id", posting_id)
-        .single()
-        .execute()
-    )
+    posting_resp = supabase.table("jobs").select("id").eq("id", posting_id).single().execute()
     if not posting_resp.data:
         raise HTTPException(status_code=404, detail="Posting not found")
     posting = cast(dict[str, Any], posting_resp.data)
@@ -53,15 +45,9 @@ def _assert_user_owns_posting(
     # 2. Get the caller's active+inactive target ids (auth boundary, not a
     # filter — the user can act on jobs even from a deactivated target).
     user_targets_resp = (
-        supabase.table("user_targets")
-        .select("target_id")
-        .eq("user_id", user_id)
-        .execute()
+        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     )
-    user_target_ids = {
-        cast(dict[str, Any], r)["target_id"]
-        for r in user_targets_resp.data or []
-    }
+    user_target_ids = {cast(dict[str, Any], r)["target_id"] for r in user_targets_resp.data or []}
     if not user_target_ids:
         raise HTTPException(status_code=404, detail="Posting not found")
 
@@ -139,9 +125,7 @@ def update_status(
         .execute()
     )
     old_status_rows = cast(list[dict[str, Any]], old_status_resp.data or [])
-    old_status = (
-        cast(str, old_status_rows[0]["status"]) if old_status_rows else "new"
-    )
+    old_status = cast(str, old_status_rows[0]["status"]) if old_status_rows else "new"
 
     supabase.table("status_log").insert(
         {

@@ -71,9 +71,7 @@ def _ascii_bar(count: int, max_count: int, width: int = 40) -> str:
     return "█" * filled + "·" * (width - filled)
 
 
-def _fetch_complete_scores(
-    sb: Any, target_id: str
-) -> list[dict[str, Any]]:
+def _fetch_complete_scores(sb: Any, target_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     offset = 0
     while True:
@@ -120,10 +118,12 @@ def _summarize_target(sb: Any, target: Any) -> None:
 
     # ---- Overall stats ----
     print(f"\n  n = {n}")
-    print(f"  overall: mean={statistics.mean(overall):.1f}  "
-          f"median={statistics.median(overall)}  "
-          f"stdev={statistics.stdev(overall) if n > 1 else 0:.1f}  "
-          f"min={min(overall)}  max={max(overall)}")
+    print(
+        f"  overall: mean={statistics.mean(overall):.1f}  "
+        f"median={statistics.median(overall)}  "
+        f"stdev={statistics.stdev(overall) if n > 1 else 0:.1f}  "
+        f"min={min(overall)}  max={max(overall)}"
+    )
 
     # ---- Per-axis stats + correlation with overall ----
     print(f"\n  {'axis':<14} {'n':>5} {'mean':>6} {'median':>7} {'stdev':>7} {'corr_overall':>13}")
@@ -134,8 +134,7 @@ def _summarize_target(sb: Any, target: Any) -> None:
             continue
         # Pair only rows where the axis exists with the corresponding overall.
         paired_overall = [
-            int(r["score"]) for r in rows
-            if isinstance((r.get("axis_scores") or {}).get(a), int)
+            int(r["score"]) for r in rows if isinstance((r.get("axis_scores") or {}).get(a), int)
         ]
         corr = _pearson(vs, paired_overall)
         sd = statistics.stdev(vs) if len(vs) > 1 else 0.0
@@ -144,8 +143,10 @@ def _summarize_target(sb: Any, target: Any) -> None:
             marker = "  ← DEAD (stdev<5)"
         elif abs(corr) < 0.2:
             marker = "  ← DECORRELATED (|r|<0.2)"
-        print(f"  {a:<14} {len(vs):>5} {statistics.mean(vs):>6.1f} "
-              f"{statistics.median(vs):>7.1f} {sd:>7.1f} {corr:>13.2f}{marker}")
+        print(
+            f"  {a:<14} {len(vs):>5} {statistics.mean(vs):>6.1f} "
+            f"{statistics.median(vs):>7.1f} {sd:>7.1f} {corr:>13.2f}{marker}"
+        )
 
     # ---- Histogram of overall scores ----
     print("\n  overall score histogram (bin=5):")

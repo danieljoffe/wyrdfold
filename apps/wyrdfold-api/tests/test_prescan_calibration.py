@@ -120,7 +120,9 @@ def test_recall_floor_is_respected_when_relaxed() -> None:
     # cosine range so dropping the floor genuinely changes the chosen cutoff.
     data = [(0.30 + i * 0.05, 75.0 + i) for i in range(12)] + [(0.15, 10.0), (0.12, 5.0)]
     strict = calibrate_threshold(cosines_with_labels=data, positive_cutoff=70.0, target_recall=0.95)
-    relaxed = calibrate_threshold(cosines_with_labels=data, positive_cutoff=70.0, target_recall=0.60)
+    relaxed = calibrate_threshold(
+        cosines_with_labels=data, positive_cutoff=70.0, target_recall=0.60
+    )
     assert strict.note == "" and relaxed.note == ""
     assert relaxed.threshold >= strict.threshold
     assert relaxed.recall >= 0.60

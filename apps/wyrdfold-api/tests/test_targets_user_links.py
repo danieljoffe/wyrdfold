@@ -69,9 +69,7 @@ def test_set_user_target_inactive_updates_user_targets_table() -> None:
     )
     update_chain.return_value.data = [_user_target_row(is_active=False)]
 
-    result = crud.set_user_target_inactive(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    result = crud.set_user_target_inactive(supabase, user_id="user-1", target_id="target-1")
 
     supabase.table.assert_called_with("user_targets")
     update_args = supabase.table.return_value.update.call_args.args[0]
@@ -88,9 +86,7 @@ def test_set_user_target_inactive_returns_none_when_no_row() -> None:
     )
     update_chain.return_value.data = []
 
-    result = crud.set_user_target_inactive(
-        supabase, user_id="user-1", target_id="missing"
-    )
+    result = crud.set_user_target_inactive(supabase, user_id="user-1", target_id="missing")
 
     assert result is None
 
@@ -139,7 +135,9 @@ def _mock_supabase_for_link(
     table = supabase.table.return_value
 
     # Existing-row check: select().eq().eq().limit().execute()
-    existing_chain = table.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute
+    existing_chain = (
+        table.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute
+    )
     existing_chain.return_value.data = [existing_row] if existing_row else []
 
     # Count check: select().eq().eq().limit().execute() — same chain in
@@ -150,15 +148,11 @@ def _mock_supabase_for_link(
     # a distinct chain on the mock.
     override_chain = table.select.return_value.eq.return_value.execute
     override_chain.return_value.data = (
-        [{"max_active_targets": max_active_override}]
-        if max_active_override is not None
-        else []
+        [{"max_active_targets": max_active_override}] if max_active_override is not None else []
     )
 
     # Upsert: returns a row that matches what we wrote.
-    table.upsert.return_value.execute.return_value.data = [
-        _user_target_row(is_active=True)
-    ]
+    table.upsert.return_value.execute.return_value.data = [_user_target_row(is_active=True)]
     return supabase
 
 
@@ -176,9 +170,7 @@ def test_link_user_to_target_allows_when_under_limit() -> None:
 def test_link_user_to_target_honors_max_active_override() -> None:
     """A per-user ``max_active_targets`` override (the operator's "add
     credits" lever) raises the cap above the global default of 1."""
-    supabase = _mock_supabase_for_link(
-        existing_row=None, active_count=2, max_active_override=3
-    )
+    supabase = _mock_supabase_for_link(existing_row=None, active_count=2, max_active_override=3)
 
     result = crud.link_user_to_target(
         supabase, user_id="user-1", target_id="target-1", is_active=True
@@ -195,9 +187,7 @@ def test_link_user_to_target_raises_when_at_limit_and_new_target() -> None:
     )
 
     with pytest.raises(crud.ActiveTargetLimitError) as ex:
-        crud.link_user_to_target(
-            supabase, user_id="user-1", target_id="new-target", is_active=True
-        )
+        crud.link_user_to_target(supabase, user_id="user-1", target_id="new-target", is_active=True)
     assert ex.value.current_count == crud.MAX_ACTIVE_TARGETS_PER_USER
     assert ex.value.limit == crud.MAX_ACTIVE_TARGETS_PER_USER
     # And critically: no upsert fired.

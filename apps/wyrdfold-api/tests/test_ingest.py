@@ -246,9 +246,7 @@ class TestMergeIntoProse:
             file_type="pdf",
         )
         llm = MockLLMClient()
-        merged, result = await merge_into_prose(
-            llm, existing_content=None, parsed=parsed
-        )
+        merged, result = await merge_into_prose(llm, existing_content=None, parsed=parsed)
         assert merged == "My resume content"
         assert result is None
         assert llm.calls == []  # no LLM call on first upload
@@ -260,9 +258,7 @@ class TestMergeIntoProse:
             file_type="pdf",
         )
         llm = MockLLMClient()
-        merged, result = await merge_into_prose(
-            llm, existing_content="   ", parsed=parsed
-        )
+        merged, result = await merge_into_prose(llm, existing_content="   ", parsed=parsed)
         assert merged == "My resume content"
         assert result is None
         assert llm.calls == []
@@ -287,9 +283,7 @@ class TestMergeIntoProse:
         )
         llm = MockLLMClient(scripted={MERGE_PURPOSE: merged_doc})
 
-        merged, result = await merge_into_prose(
-            llm, existing_content=existing, parsed=parsed
-        )
+        merged, result = await merge_into_prose(llm, existing_content=existing, parsed=parsed)
 
         assert merged == merged_doc
         assert result is not None
@@ -306,9 +300,7 @@ class TestMergeIntoProse:
         too_short = "y" * int(len(existing) * MIN_PRESERVATION_RATIO - 10)
         llm = MockLLMClient(scripted={MERGE_PURPOSE: too_short})
 
-        merged, result = await merge_into_prose(
-            llm, existing_content=existing, parsed=parsed
-        )
+        merged, result = await merge_into_prose(llm, existing_content=existing, parsed=parsed)
 
         # Should NOT be the paraphrased output — should be the legacy
         # divider-concat fallback that preserves both inputs intact.

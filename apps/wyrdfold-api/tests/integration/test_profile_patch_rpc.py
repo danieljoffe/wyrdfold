@@ -89,9 +89,7 @@ def seeded_target(
     try:
         yield uid_a, uid_b, target_id
     finally:
-        service_client.table("user_targets").delete().eq(
-            "target_id", target_id
-        ).execute()
+        service_client.table("user_targets").delete().eq("target_id", target_id).execute()
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
@@ -100,9 +98,7 @@ def test_follower_apply_updates_profile_and_bumps_version(
 ) -> None:
     uid_a, _, target_id = seeded_target
 
-    rows = _rpc(
-        service_client, user_id=uid_a, target_id=target_id, expected_version=1
-    )
+    rows = _rpc(service_client, user_id=uid_a, target_id=target_id, expected_version=1)
 
     assert rows == [{"outcome": "applied", "new_version": 2}]
     state = _target_state(service_client, target_id)
@@ -117,9 +113,7 @@ def test_non_follower_is_refused_and_profile_untouched(
     write even on the service-role client (the Python-bug backstop)."""
     _, uid_b, target_id = seeded_target
 
-    rows = _rpc(
-        service_client, user_id=uid_b, target_id=target_id, expected_version=1
-    )
+    rows = _rpc(service_client, user_id=uid_b, target_id=target_id, expected_version=1)
 
     assert rows == [{"outcome": "not_a_follower", "new_version": 1}]
     state = _target_state(service_client, target_id)
@@ -134,9 +128,7 @@ def test_stale_expected_version_is_refused(
     since moved to v2 — the lost-update guard."""
     uid_a, _, target_id = seeded_target
 
-    first = _rpc(
-        service_client, user_id=uid_a, target_id=target_id, expected_version=1
-    )
+    first = _rpc(service_client, user_id=uid_a, target_id=target_id, expected_version=1)
     assert first[0]["outcome"] == "applied"
 
     poisoned = {"negative": {"keywords": ["everything"], "weight": -10.0}}
@@ -177,16 +169,12 @@ def test_anon_and_authenticated_cannot_execute(
 
     with pytest.raises(Exception) as anon_err:
         _rpc(anon_client, user_id=uid_a, target_id=target_id)
-    assert "42501" in str(anon_err.value) or "permission denied" in str(
-        anon_err.value
-    )
+    assert "42501" in str(anon_err.value) or "permission denied" in str(anon_err.value)
 
     user_client = user_client_factory(uid_a)
     with pytest.raises(Exception) as user_err:
         _rpc(user_client, user_id=uid_a, target_id=target_id)
-    assert "42501" in str(user_err.value) or "permission denied" in str(
-        user_err.value
-    )
+    assert "42501" in str(user_err.value) or "permission denied" in str(user_err.value)
 
     # Neither refused call touched the shared profile.
     state = _target_state(service_client, target_id)

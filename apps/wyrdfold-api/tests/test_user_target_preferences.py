@@ -72,9 +72,7 @@ def test_get_preferences_returns_defaults_for_fresh_row() -> None:
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
 
-    prefs = crud.get_user_target_preferences(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    prefs = crud.get_user_target_preferences(supabase, user_id="user-1", target_id="target-1")
 
     assert prefs is not None
     assert prefs.pref_score_cutoff == 40
@@ -101,9 +99,7 @@ def test_get_preferences_hydrates_stored_values() -> None:
         ],
     )
 
-    prefs = crud.get_user_target_preferences(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    prefs = crud.get_user_target_preferences(supabase, user_id="user-1", target_id="target-1")
 
     assert prefs is not None
     assert prefs.pref_score_cutoff == 75
@@ -119,9 +115,7 @@ def test_get_preferences_returns_none_when_row_missing() -> None:
     supabase = MagicMock()
     _wire_select(supabase, [])
 
-    prefs = crud.get_user_target_preferences(
-        supabase, user_id="user-1", target_id="missing"
-    )
+    prefs = crud.get_user_target_preferences(supabase, user_id="user-1", target_id="missing")
 
     assert prefs is None
 
@@ -136,9 +130,7 @@ def test_get_preferences_tolerates_null_pref_columns() -> None:
         [_row(pref_score_cutoff=None, pref_remote_ok=None, pref_include_unknown_salary=None)],
     )
 
-    prefs = crud.get_user_target_preferences(
-        supabase, user_id="user-1", target_id="target-1"
-    )
+    prefs = crud.get_user_target_preferences(supabase, user_id="user-1", target_id="target-1")
 
     assert prefs is not None
     assert prefs.pref_score_cutoff == 40
@@ -304,9 +296,7 @@ def test_put_idor_other_users_link_404(client: TestClient) -> None:
     supabase.table.return_value.update.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "value,expected", [(0, 200), (200, 200), (40, 200), (-1, 422), (201, 422)]
-)
+@pytest.mark.parametrize("value,expected", [(0, 200), (200, 200), (40, 200), (-1, 422), (201, 422)])
 def test_put_score_cutoff_boundary_validation(
     client: TestClient, value: int, expected: int
 ) -> None:
@@ -374,9 +364,7 @@ def test_preferences_route_does_not_collide_with_get_target(
     _wire_select(supabase, [_row(pref_score_cutoff=33)])
     app.dependency_overrides[get_user_supabase] = lambda: supabase
     # GET /targets/{id} ownership-checks the caller; the fixture user owns it.
-    monkeypatch.setattr(
-        router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"}
-    )
+    monkeypatch.setattr(router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"})
     monkeypatch.setattr(
         router_mod.crud,
         "get",

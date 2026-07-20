@@ -175,10 +175,12 @@ def _align_by_case(
         if any(r["row"].get("variant_score") is None for r in rows):
             continue  # skip cases where any variant failed
         # All present — use the first row's `case` for prompt assembly.
-        aligned.append({
-            "case": rows[0]["row"]["case"],
-            "candidates": rows,
-        })
+        aligned.append(
+            {
+                "case": rows[0]["row"]["case"],
+                "candidates": rows,
+            }
+        )
     return aligned
 
 
@@ -197,18 +199,18 @@ async def _judge_one(
     # opaque labels A/B/C/... to the model, then unshuffle.
     indexed = list(enumerate(candidates))
     rng.shuffle(indexed)
-    label_to_run_idx = {
-        chr(ord("A") + i): ic[0] for i, ic in enumerate(indexed)
-    }
+    label_to_run_idx = {chr(ord("A") + i): ic[0] for i, ic in enumerate(indexed)}
     cand_for_prompt: list[tuple[str, int, dict[str, int], str]] = []
     for i, (_orig_idx, c) in enumerate(indexed):
         label = chr(ord("A") + i)
-        cand_for_prompt.append((
-            label,
-            int(c["row"]["variant_score"]),
-            c["row"]["variant_axes"] or {},
-            c["row"].get("variant_reasoning") or "",
-        ))
+        cand_for_prompt.append(
+            (
+                label,
+                int(c["row"]["variant_score"]),
+                c["row"]["variant_axes"] or {},
+                c["row"].get("variant_reasoning") or "",
+            )
+        )
 
     user_msg = _build_judge_user_msg(
         target_label=target_label,
@@ -257,9 +259,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     # Pull a target_label index from the first run's eval_set fixture so
     # the judge sees the target name, not the UUID.
-    fixture_path = (
-        Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-    )
+    fixture_path = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
     target_labels: dict[str, str] = {}
     if fixture_path.exists():
         fixture = json.loads(fixture_path.read_text())
@@ -271,12 +271,12 @@ async def main_async(args: argparse.Namespace) -> None:
         aligned = aligned[: args.limit]
     n_calls = len(aligned)
     if n_calls > _MAX_CALLS_PER_RUN:
-        raise RuntimeError(
-            f"Refusing to make {n_calls} judge calls (cap={_MAX_CALLS_PER_RUN})."
-        )
+        raise RuntimeError(f"Refusing to make {n_calls} judge calls (cap={_MAX_CALLS_PER_RUN}).")
     logger.info(
         "Will judge %d case(s) × %d variant(s) each (= %d Sonnet calls).",
-        n_calls, len(runs), n_calls,
+        n_calls,
+        len(runs),
+        n_calls,
     )
     if args.dry_run:
         return
@@ -290,8 +290,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     # Per-variant accumulators
     metrics: dict[str, dict[str, list[int]]] = {
-        vid: {"appropriateness": [], "reasoning": [], "calibration": []}
-        for vid in variant_ids
+        vid: {"appropriateness": [], "reasoning": [], "calibration": []} for vid in variant_ids
     }
     notes: dict[str, list[dict[str, Any]]] = defaultdict(list)
     failures = 0
@@ -316,11 +315,13 @@ async def main_async(args: argparse.Namespace) -> None:
             metrics[vid]["appropriateness"].append(int(j["score_appropriateness"]))
             metrics[vid]["reasoning"].append(int(j["reasoning_quality"]))
             metrics[vid]["calibration"].append(int(j["calibration"]))
-            notes[vid].append({
-                "title": ac["case"]["title"][:80],
-                "company": ac["case"].get("company", ""),
-                "scores": j,
-            })
+            notes[vid].append(
+                {
+                    "title": ac["case"]["title"][:80],
+                    "company": ac["case"].get("company", ""),
+                    "scores": j,
+                }
+            )
 
     # ---- Report ----
     print()
@@ -353,12 +354,14 @@ async def main_async(args: argparse.Namespace) -> None:
         print("Head-to-head win rate (% of cases where row > col on combined score):")
         per_case: dict[str, list[float]] = {}
         for vid in variant_ids:
-            triples = list(zip(
-                metrics[vid]["appropriateness"],
-                metrics[vid]["reasoning"],
-                metrics[vid]["calibration"],
-                strict=True,
-            ))
+            triples = list(
+                zip(
+                    metrics[vid]["appropriateness"],
+                    metrics[vid]["reasoning"],
+                    metrics[vid]["calibration"],
+                    strict=True,
+                )
+            )
             per_case[vid] = [(a + r + c) / 3.0 for (a, r, c) in triples]
         n_paired = min(len(v) for v in per_case.values()) if per_case else 0
         for a_id in variant_ids:
@@ -375,9 +378,7 @@ async def main_async(args: argparse.Namespace) -> None:
             print(f"  {a_id[:30]:<32} " + " ".join(cells))
 
     # ---- Save dump ----
-    out_path = (
-        _LOG_DIR / f"judge-{int(time.time())}.json"
-    )
+    out_path = _LOG_DIR / f"judge-{int(time.time())}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     dump = {
         "judge_model": args.judge_model,
@@ -388,15 +389,18 @@ async def main_async(args: argparse.Namespace) -> None:
             vid: {
                 "appropriateness_mean": (
                     statistics.mean(metrics[vid]["appropriateness"])
-                    if metrics[vid]["appropriateness"] else None
+                    if metrics[vid]["appropriateness"]
+                    else None
                 ),
                 "reasoning_mean": (
                     statistics.mean(metrics[vid]["reasoning"])
-                    if metrics[vid]["reasoning"] else None
+                    if metrics[vid]["reasoning"]
+                    else None
                 ),
                 "calibration_mean": (
                     statistics.mean(metrics[vid]["calibration"])
-                    if metrics[vid]["calibration"] else None
+                    if metrics[vid]["calibration"]
+                    else None
                 ),
             }
             for vid in variant_ids
@@ -410,23 +414,30 @@ async def main_async(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="LLM-as-judge for grading variants")
     parser.add_argument(
-        "results", nargs="+",
+        "results",
+        nargs="+",
         help="Two or more per-row JSON dumps from eval_grading_prompts --save-results.",
     )
     parser.add_argument(
-        "--judge-model", default=_DEFAULT_JUDGE_MODEL,
+        "--judge-model",
+        default=_DEFAULT_JUDGE_MODEL,
         help="Model that does the judging (default Sonnet 4.6).",
     )
     parser.add_argument(
-        "--limit", type=int, default=None,
+        "--limit",
+        type=int,
+        default=None,
         help="Cap the number of cases to judge (default: all aligned cases).",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Show how many calls would be made, don't actually judge.",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="RNG seed for variant shuffling (anti-position-bias).",
     )
     args = parser.parse_args()

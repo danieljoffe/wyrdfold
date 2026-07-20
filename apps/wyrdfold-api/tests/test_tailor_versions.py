@@ -122,9 +122,7 @@ def _checkpoint_supabase(
     def table_factory(name: str) -> MagicMock:
         chain = MagicMock()
         if name == "documents":
-            chain.select.return_value.eq.return_value.single.return_value.execute.return_value.data = (
-                resume_row
-            )
+            chain.select.return_value.eq.return_value.single.return_value.execute.return_value.data = resume_row
             return chain
         assert name == "document_versions"
 
@@ -136,9 +134,7 @@ def _checkpoint_supabase(
 
         chain.insert.side_effect = insert_capturing
         # Last-version select (terminates with `.limit(1).execute()`).
-        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data = (
-            last_versions
-        )
+        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data = last_versions
         # Prune select (terminates with `.order().execute()` — no .limit).
         chain.select.return_value.eq.return_value.order.return_value.execute.return_value.data = (
             last_versions
@@ -192,9 +188,7 @@ def test_checkpoint_records_when_no_prior_versions() -> None:
 
 def test_checkpoint_returns_false_when_resume_missing() -> None:
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value.data = (
-        None
-    )
+    supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value.data = None
 
     wrote = versions.checkpoint(supabase, "missing")
 

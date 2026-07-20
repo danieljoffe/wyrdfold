@@ -28,7 +28,11 @@ def _tool_calls(args_str: str) -> list[dict]:
 
 
 def _resp(tool_calls: list[dict], *, finish: str = "tool_calls", content: object = None) -> dict:
-    return {"choices": [{"finish_reason": finish, "message": {"content": content, "tool_calls": tool_calls}}]}
+    return {
+        "choices": [
+            {"finish_reason": finish, "message": {"content": content, "tool_calls": tool_calls}}
+        ]
+    }
 
 
 # ---- _parse_openai_tool_response edge battery -------------------------------
@@ -131,9 +135,7 @@ def test_usage_cache_decomposition_prices_hit_cheaper_than_miss() -> None:
     # cost LESS when 900 of it came from cache than when none did.
     from app.services.llm.pricing import calculate_cost
 
-    miss = _openai_usage(
-        {"usage": {"prompt_tokens": 1000, "completion_tokens": 100}}
-    )
+    miss = _openai_usage({"usage": {"prompt_tokens": 1000, "completion_tokens": 100}})
     hit = _openai_usage(
         {
             "usage": {
@@ -406,7 +408,12 @@ async def test_transient_error_body_maps_to_upstream_unavailable(monkeypatch) ->
 async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
     client = _error_body_client(
         monkeypatch,
-        {"error": {"message": "Failed to compile json grammar: Cannot find field $defs", "code": 400}},
+        {
+            "error": {
+                "message": "Failed to compile json grammar: Cannot find field $defs",
+                "code": 400,
+            }
+        },
     )
     # NOT a confusing "no choices" — a clear error-body message with the code.
     with pytest.raises(ValueError, match=r"error body.*code=400"):

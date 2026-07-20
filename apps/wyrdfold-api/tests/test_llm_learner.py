@@ -81,7 +81,10 @@ class TestStripSelfCollidingNegatives:
 
     def test_noop_when_no_negatives_or_no_protected_terms(self) -> None:
         p1 = self._patch([])
-        assert _strip_self_colliding_negatives(p1, search_keywords=["x"], core_skills=[]) == (p1, [])
+        assert _strip_self_colliding_negatives(p1, search_keywords=["x"], core_skills=[]) == (
+            p1,
+            [],
+        )
         p2 = self._patch(["junior"])
         assert _strip_self_colliding_negatives(p2, search_keywords=[], core_skills=[]) == (p2, [])
 
@@ -170,9 +173,7 @@ class TestApplyPatchToProfile:
         profile: dict[str, Any] = {
             "negative": {"keywords": ["a"], "weight": -10.0},
         }
-        patch = ProfilePatch(
-            add_negative=["b"], confidence=0.9, rationale="x"
-        )
+        patch = ProfilePatch(add_negative=["b"], confidence=0.9, rationale="x")
         _apply_patch_to_profile(profile, patch)
         assert profile["negative"]["keywords"] == ["a"]
 
@@ -222,9 +223,7 @@ class _FakeQuery:
         return self
 
     def execute(self) -> Any:
-        self._fake.log.append(
-            {"table": self._table, "op": self._op, "payload": self._payload}
-        )
+        self._fake.log.append({"table": self._table, "op": self._op, "payload": self._payload})
         data = self._fake.next_response(self._table, self._op)
         if self._single:
             data = data[0] if data else None
@@ -299,11 +298,12 @@ def fake() -> _FakeSupabase:
 @pytest.mark.asyncio
 async def test_below_threshold_returns_none(fake: _FakeSupabase) -> None:
     fake.push("job_feedback", "select", [_fb_row() for _ in range(2)])
-    with patch(
-        "app.services.llm_learner.complete_json"
-    ) as mock_complete:
+    with patch("app.services.llm_learner.complete_json") as mock_complete:
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
     assert result is None
     mock_complete.assert_not_called()
@@ -322,16 +322,27 @@ async def test_high_confidence_patch_auto_applies(
         "rpc",
         [{"outcome": "applied", "new_version": 2}],
     )
-    fake.push("target_learning_log", "insert", [
-        {
-            "id": "run-1", "user_id": "u", "target_id": "t",
-            "status": "applied",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.9, "rationale": "r", "signals_consumed": 3,
-            "applied_run_id": "rid", "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
+    fake.push(
+        "target_learning_log",
+        "insert",
+        [
+            {
+                "id": "run-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "applied",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.9,
+                "rationale": "r",
+                "signals_consumed": 3,
+                "applied_run_id": "rid",
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    )
     fake.push("job_feedback", "update", [{"id": "fb-sales"}])
 
     patch_obj = ProfilePatch(
@@ -344,7 +355,10 @@ async def test_high_confidence_patch_auto_applies(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -355,8 +369,7 @@ async def test_high_confidence_patch_auto_applies(
     # the acting user and the version the patch was computed against.
     assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
     rpc_calls = [
-        r for r in fake.log
-        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
     ]
     assert len(rpc_calls) == 1
     params = rpc_calls[0]["payload"]
@@ -381,35 +394,45 @@ async def test_auto_apply_version_conflict_stages_instead(
         "rpc",
         [{"outcome": "version_conflict", "new_version": 2}],
     )
-    fake.push("target_learning_log", "insert", [
-        {
-            "id": "race-1", "user_id": "u", "target_id": "t",
-            "status": "staged",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.9, "rationale": "r", "signals_consumed": 3,
-            "applied_run_id": None,
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
-
-    patch_obj = ProfilePatch(
-        add_negative=["sales"], confidence=0.9, rationale="confident"
+    fake.push(
+        "target_learning_log",
+        "insert",
+        [
+            {
+                "id": "race-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "staged",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.9,
+                "rationale": "r",
+                "signals_consumed": 3,
+                "applied_run_id": None,
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
     )
+
+    patch_obj = ProfilePatch(add_negative=["sales"], confidence=0.9, rationale="confident")
     with patch(
         "app.services.llm_learner.complete_json",
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is not None
     assert result.applied is False
     # Staged with the race note; no raw target write, no feedback stamp.
     log_insert = next(
-        r for r in fake.log
-        if r["table"] == "target_learning_log" and r["op"] == "insert"
+        r for r in fake.log if r["table"] == "target_learning_log" and r["op"] == "insert"
     )
     assert log_insert["payload"]["status"] == "staged"
     assert "changed during the learn run" in log_insert["payload"]["rationale"]
@@ -433,15 +456,16 @@ async def test_auto_apply_refused_for_non_follower_writes_nothing(
         [{"outcome": "not_a_follower", "new_version": 1}],
     )
 
-    patch_obj = ProfilePatch(
-        add_negative=["sales"], confidence=0.9, rationale="confident"
-    )
+    patch_obj = ProfilePatch(add_negative=["sales"], confidence=0.9, rationale="confident")
     with patch(
         "app.services.llm_learner.complete_json",
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is None
@@ -459,34 +483,55 @@ async def test_high_confidence_outlier_patch_is_staged_by_learning_rate_cap(
     fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
     fake.push("targets", "select", [_target_row(profile_version=1)])
     fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
-    fake.push("target_learning_log", "insert", [
-        {
-            "id": "cap-1", "user_id": "u", "target_id": "t",
-            "status": "staged",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.95, "rationale": "outlier",
-            "signals_consumed": 3, "applied_run_id": None,
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
+    fake.push(
+        "target_learning_log",
+        "insert",
+        [
+            {
+                "id": "cap-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "staged",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.95,
+                "rationale": "outlier",
+                "signals_consumed": 3,
+                "applied_run_id": None,
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    )
 
     capped = RescoreProjection(
-        jobs_considered=20, jobs_moved=12, moved_fraction=0.6,
-        max_abs_delta=40, move_threshold=20, max_moved_fraction=0.30, capped=True,
+        jobs_considered=20,
+        jobs_moved=12,
+        moved_fraction=0.6,
+        max_abs_delta=40,
+        move_threshold=20,
+        max_moved_fraction=0.30,
+        capped=True,
     )
     patch_obj = ProfilePatch(
         add_negative=["sales"], confidence=0.95, rationale="confident but broad"
     )
-    with patch(
-        "app.services.llm_learner.complete_json",
-        return_value=(patch_obj, _llm_result()),
-    ), patch(
-        "app.services.llm_learner._project_patch_impact",
-        return_value=capped,
+    with (
+        patch(
+            "app.services.llm_learner.complete_json",
+            return_value=(patch_obj, _llm_result()),
+        ),
+        patch(
+            "app.services.llm_learner._project_patch_impact",
+            return_value=capped,
+        ),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -496,8 +541,7 @@ async def test_high_confidence_outlier_patch_is_staged_by_learning_rate_cap(
     assert [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"] == []
     # The staged row records the projection + an auto-stage note in the rationale.
     log_insert = next(
-        r for r in fake.log
-        if r["table"] == "target_learning_log" and r["op"] == "insert"
+        r for r in fake.log if r["table"] == "target_learning_log" and r["op"] == "insert"
     )
     assert log_insert["payload"]["status"] == "staged"
     assert log_insert["payload"]["projection"] == capped.model_dump(mode="json")
@@ -511,17 +555,27 @@ async def test_low_confidence_patch_stages_without_mutating_target(
     fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
     fake.push("targets", "select", [_target_row()])
     fake.push("jobs", "select", [{"id": "j-sales ", "title": "Sales Rep"}])
-    fake.push("target_learning_log", "insert", [
-        {
-            "id": "stage-1", "user_id": "u", "target_id": "t",
-            "status": "staged",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.4, "rationale": "uncertain",
-            "signals_consumed": 3, "applied_run_id": None,
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
+    fake.push(
+        "target_learning_log",
+        "insert",
+        [
+            {
+                "id": "stage-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "staged",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.4,
+                "rationale": "uncertain",
+                "signals_consumed": 3,
+                "applied_run_id": None,
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    )
 
     patch_obj = ProfilePatch(
         add_negative=["sales"],
@@ -533,7 +587,10 @@ async def test_low_confidence_patch_stages_without_mutating_target(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -554,28 +611,39 @@ async def test_empty_patch_consumes_feedback_without_mutating_profile(
     fake.push("job_feedback", "select", [_fb_row() for _ in range(3)])
     fake.push("targets", "select", [_target_row()])
     fake.push("jobs", "select", [])
-    fake.push("target_learning_log", "insert", [
-        {
-            "id": "noop-1", "user_id": "u", "target_id": "t",
-            "status": "applied",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.9, "rationale": "noise",
-            "signals_consumed": 3, "applied_run_id": "rid",
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
+    fake.push(
+        "target_learning_log",
+        "insert",
+        [
+            {
+                "id": "noop-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "applied",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.9,
+                "rationale": "noise",
+                "signals_consumed": 3,
+                "applied_run_id": "rid",
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    )
     fake.push("job_feedback", "update", [{"id": "fb-sales"}])
 
-    patch_obj = ProfilePatch(
-        confidence=0.9, rationale="no learnable pattern"
-    )
+    patch_obj = ProfilePatch(confidence=0.9, rationale="no learnable pattern")
     with patch(
         "app.services.llm_learner.complete_json",
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            fake, object(), user_id="u", target_id="t"  # type: ignore[arg-type]
+            fake,
+            object(),
+            user_id="u",
+            target_id="t",  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -597,17 +665,27 @@ def test_reject_staged_patch_does_not_stamp_feedback(
     """Rejecting a stage means "wrong interpretation, try again later"
     — the underlying feedback rows must stay unapplied so a future learn
     run can revisit them with the same evidence."""
-    fake.push("target_learning_log", "update", [
-        {
-            "id": "stage-1", "user_id": "u", "target_id": "t",
-            "status": "rejected",
-            "prev_profile": {}, "next_profile": {}, "diff": {},
-            "confidence": 0.4, "rationale": "x",
-            "signals_consumed": 3, "applied_run_id": None,
-            "created_at": datetime.now(UTC).isoformat(),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ])
+    fake.push(
+        "target_learning_log",
+        "update",
+        [
+            {
+                "id": "stage-1",
+                "user_id": "u",
+                "target_id": "t",
+                "status": "rejected",
+                "prev_profile": {},
+                "next_profile": {},
+                "diff": {},
+                "confidence": 0.4,
+                "rationale": "x",
+                "signals_consumed": 3,
+                "applied_run_id": None,
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    )
     result = reject_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
     assert result is not None
     assert result.applied is False
@@ -628,12 +706,15 @@ def test_apply_staged_patch_returns_none_when_no_match(
 def _staged_log_row(status: str = "staged") -> dict[str, Any]:
     now = datetime.now(UTC).isoformat()
     return {
-        "id": "stage-1", "user_id": "u", "target_id": "t",
+        "id": "stage-1",
+        "user_id": "u",
+        "target_id": "t",
         "status": status,
         # Stage-time snapshot — deliberately computed against an OLD profile
         # so the recompute tests can prove the snapshot is NOT what gets
         # written (Copilot on #202).
-        "prev_profile": {}, "next_profile": {"negative": {"keywords": ["sales"]}},
+        "prev_profile": {},
+        "next_profile": {"negative": {"keywords": ["sales"]}},
         "diff": {
             "add_negative": ["sales"],
             "remove_negative": [],
@@ -642,9 +723,12 @@ def _staged_log_row(status: str = "staged") -> dict[str, Any]:
             "confidence": 0.4,
             "rationale": "r",
         },
-        "confidence": 0.4, "rationale": "r",
-        "signals_consumed": 3, "applied_run_id": None,
-        "created_at": now, "updated_at": now,
+        "confidence": 0.4,
+        "rationale": "r",
+        "signals_consumed": 3,
+        "applied_run_id": None,
+        "created_at": now,
+        "updated_at": now,
     }
 
 
@@ -673,8 +757,7 @@ def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
     assert result.profile_version_after == 4
     assert [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"] == []
     rpc_calls = [
-        r for r in fake.log
-        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
     ]
     assert len(rpc_calls) == 1
     assert rpc_calls[0]["payload"]["p_expected_version"] == 3
@@ -720,8 +803,7 @@ def test_apply_staged_patch_preserves_intervening_changes(
     assert result is not None
     assert result.profile_version_after == 6
     params = next(
-        r for r in fake.log
-        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
     )["payload"]
     assert params["p_expected_version"] == 5
     # The intervening merge's category is preserved AND the patch applied.
@@ -732,8 +814,7 @@ def test_apply_staged_patch_preserves_intervening_changes(
     # including `diff` (the UI renders it; Copilot on #203). No strip
     # happened here, so it equals the staged patch.
     log_update = next(
-        r for r in fake.log
-        if r["table"] == "target_learning_log" and r["op"] == "update"
+        r for r in fake.log if r["table"] == "target_learning_log" and r["op"] == "update"
     )["payload"]
     assert log_update["prev_profile"] == current_profile
     assert log_update["next_profile"] == written
@@ -779,14 +860,12 @@ def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
     assert result is not None
     # The colliding negative was NOT applied…
     params = next(
-        r for r in fake.log
-        if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
     )["payload"]
     assert params["p_next_profile"]["negative"]["keywords"] == ["junior"]
     # …and the audit row says so: diff shrank, rationale carries the note.
     log_update = next(
-        r for r in fake.log
-        if r["table"] == "target_learning_log" and r["op"] == "update"
+        r for r in fake.log if r["table"] == "target_learning_log" and r["op"] == "update"
     )["payload"]
     assert log_update["diff"]["add_negative"] == []
     assert "self-colliding negatives" in log_update["rationale"]
@@ -811,7 +890,6 @@ def test_apply_staged_patch_conflict_raises_and_stays_staged(
 
     # No status flip, no feedback stamp — the stage is still reviewable.
     assert [
-        r for r in fake.log
-        if r["table"] == "target_learning_log" and r["op"] == "update"
+        r for r in fake.log if r["table"] == "target_learning_log" and r["op"] == "update"
     ] == []
     assert [r for r in fake.log if r["table"] == "job_feedback"] == []

@@ -103,9 +103,7 @@ async def run_tailor_pipeline(
         # folder — there is no anonymous tailoring path anymore.
         raise ValueError("tailored generation requires an authenticated user")
     # Resolve annotations for the target (#499)
-    emphasize, exclude, de_emph = resolve_for_target(
-        optimized.payload.annotations, target_label
-    )
+    emphasize, exclude, de_emph = resolve_for_target(optimized.payload.annotations, target_label)
     filtered_payload = apply_exclusions(optimized.payload, exclude)
     annotations_text = build_annotations_text(emphasize, de_emph)
 
@@ -207,10 +205,12 @@ async def run_tailor_pipeline(
         storage_path = None
     if storage_path:
         await asyncio.to_thread(
-            lambda: supabase.table(persistence.TABLE)
-            .update({"storage_path": storage_path})
-            .eq("id", record.id)
-            .execute()
+            lambda: (
+                supabase.table(persistence.TABLE)
+                .update({"storage_path": storage_path})
+                .eq("id", record.id)
+                .execute()
+            )
         )
         record = record.model_copy(update={"storage_path": storage_path})
 
@@ -274,9 +274,7 @@ async def run_cover_letter_pipeline(
         # Stored under the caller's <user_id>/ Storage folder — no anonymous path.
         raise ValueError("cover-letter generation requires an authenticated user")
     # Resolve annotations for the target (#499)
-    emphasize, exclude, de_emph = resolve_for_target(
-        optimized.payload.annotations, target_label
-    )
+    emphasize, exclude, de_emph = resolve_for_target(optimized.payload.annotations, target_label)
     filtered_payload = apply_exclusions(optimized.payload, exclude)
     annotations_text = build_annotations_text(emphasize, de_emph)
 
@@ -347,10 +345,12 @@ async def run_cover_letter_pipeline(
         storage_path = None
     if storage_path:
         await asyncio.to_thread(
-            lambda: supabase.table(persistence.TABLE)
-            .update({"storage_path": storage_path})
-            .eq("id", record.id)
-            .execute()
+            lambda: (
+                supabase.table(persistence.TABLE)
+                .update({"storage_path": storage_path})
+                .eq("id", record.id)
+                .execute()
+            )
         )
         record = record.model_copy(update={"storage_path": storage_path})
 

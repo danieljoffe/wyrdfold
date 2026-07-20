@@ -44,9 +44,7 @@ def test_prose_select_is_rls_scoped_without_python_filter(
     client_a = user_client_factory(uid_a)
 
     # No .eq("user_id", ...) — RLS alone must scope this.
-    rows = (
-        client_a.table("experience_prose_docs").select("user_id, content").execute().data
-    )
+    rows = client_a.table("experience_prose_docs").select("user_id, content").execute().data
 
     seen = {r["user_id"] for r in rows}
     assert uid_a in seen

@@ -77,9 +77,7 @@ from scripts._openrouter import MODELS, call_model, get_api_key
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_target_suggestion")
 
-_FIXTURE_PATH = (
-    Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
-)
+_FIXTURE_PATH = Path(__file__).parent.parent / "tests" / "fixtures" / "eval_set.json"
 _RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 _CANDIDATE_MODELS: dict[str, str] = {
@@ -108,9 +106,7 @@ def _rehydrate_users(fixture: dict[str, Any]) -> list[dict[str, Any]]:
     users: list[dict[str, Any]] = []
     for tid, meta in fixture["targets"].items():
         payload_dict = meta["payload"]
-        h = hashlib.sha256(
-            json.dumps(payload_dict, sort_keys=True).encode()
-        ).hexdigest()[:12]
+        h = hashlib.sha256(json.dumps(payload_dict, sort_keys=True).encode()).hexdigest()[:12]
         if h in seen:
             continue
         seen.add(h)
@@ -125,9 +121,7 @@ def _rehydrate_users(fixture: dict[str, Any]) -> list[dict[str, Any]]:
     return users
 
 
-def _extract_suggestions(
-    parsed: dict[str, Any] | None, mode: str
-) -> list[dict[str, Any]]:
+def _extract_suggestions(parsed: dict[str, Any] | None, mode: str) -> list[dict[str, Any]]:
     if not isinstance(parsed, dict):
         return []
     arr = parsed.get("suggestions")
@@ -331,10 +325,7 @@ def _write_report(
         json.dumps(
             {
                 "captured_at_unix": int(time.time()),
-                "users": [
-                    {"user_id": u["user_id"], "target_id": u["target_id"]}
-                    for u in users
-                ],
+                "users": [{"user_id": u["user_id"], "target_id": u["target_id"]} for u in users],
                 "gen_results": gen_results,
                 "judge_results": judge_flat,
                 "anon": anon_flat,
@@ -350,9 +341,7 @@ def _write_report(
         cost_by_model[r["model"]] = cost_by_model.get(r["model"], 0) + r["cost_usd"]
         latency_by_model.setdefault(r["model"], []).append(r["latency_ms"])
         if not r["schema_ok"]:
-            schema_fail_by_model[r["model"]] = (
-                schema_fail_by_model.get(r["model"], 0) + 1
-            )
+            schema_fail_by_model[r["model"]] = schema_fail_by_model.get(r["model"], 0) + 1
     judge_cost = sum(j.get("cost_usd", 0.0) for j in judge_results.values())
 
     judge_total_by_model: dict[str, list[int]] = {}
@@ -360,9 +349,7 @@ def _write_report(
         p = j.get("parsed") or {}
         try:
             tot = (
-                int(p.get("coherence", 0))
-                + int(p.get("relevance", 0))
-                + int(p.get("diversity", 0))
+                int(p.get("coherence", 0)) + int(p.get("relevance", 0)) + int(p.get("diversity", 0))
             )
             judge_total_by_model.setdefault(model, []).append(tot)
         except (TypeError, ValueError):
@@ -377,9 +364,7 @@ def _write_report(
     md.append("")
     md.append("## Per-model summary")
     md.append("")
-    md.append(
-        "| Model | Schema fails | $ total | Avg latency | Mean judge score (max 6) |"
-    )
+    md.append("| Model | Schema fails | $ total | Avg latency | Mean judge score (max 6) |")
     md.append("| --- | --- | --- | --- | --- |")
     for m in _CANDIDATE_MODELS:
         lat = latency_by_model.get(m, [])
@@ -414,17 +399,9 @@ def _write_report(
                 md.append(f"#### Output {label}")
                 md.append("")
                 for s in r["suggestions"]:
-                    title = (
-                        s.get("label")
-                        or s.get("title")
-                        or s.get("role")
-                        or "(unlabeled)"
-                    )
+                    title = s.get("label") or s.get("title") or s.get("role") or "(unlabeled)"
                     reasoning = (
-                        s.get("one_line_reasoning")
-                        or s.get("reasoning")
-                        or s.get("why")
-                        or ""
+                        s.get("one_line_reasoning") or s.get("reasoning") or s.get("why") or ""
                     )
                     md.append(f"- **{title}** — {reasoning[:280]}")
                 md.append("")
@@ -492,11 +469,7 @@ def main() -> None:
     api_key = get_api_key()
 
     ts = time.strftime("%Y%m%dT%H%M%S")
-    base = (
-        Path(args.output)
-        if args.output
-        else (_RESULTS_DIR / f"eval_target_suggestion_{ts}")
-    )
+    base = Path(args.output) if args.output else (_RESULTS_DIR / f"eval_target_suggestion_{ts}")
     base.parent.mkdir(parents=True, exist_ok=True)
     inflight = base.with_suffix(".inflight.json")
 
@@ -535,9 +508,7 @@ def main() -> None:
         completed = 0
         total = len(gen_jobs)
         while pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 gen_results.append(t.result())
                 completed += 1
@@ -588,9 +559,7 @@ def main() -> None:
             completed = 0
             total = len(judge_jobs)
             while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     key, payload = t.result()
                     out[key] = payload

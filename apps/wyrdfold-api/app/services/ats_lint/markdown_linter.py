@@ -91,8 +91,7 @@ def lint_markdown(
             LintViolation(
                 code="no_inline_images",
                 message=(
-                    "Markdown contains an inline image. ATS parsers "
-                    "routinely drop image content."
+                    "Markdown contains an inline image. ATS parsers routinely drop image content."
                 ),
                 severity="error",
             )
@@ -176,10 +175,7 @@ def lint_markdown(
         violations.append(
             LintViolation(
                 code="page_count",
-                message=(
-                    f"Markdown has {line_count} non-empty lines; "
-                    f"likely exceeds 2 pages."
-                ),
+                message=(f"Markdown has {line_count} non-empty lines; likely exceeds 2 pages."),
                 severity="warning",
             )
         )

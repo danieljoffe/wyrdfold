@@ -77,18 +77,14 @@ async def backfill() -> int:
             )
             continue
 
-        target_resp = (
-            supabase.table(TARGETS_TABLE).select("*").eq("id", target_id).execute()
-        )
+        target_resp = supabase.table(TARGETS_TABLE).select("*").eq("id", target_id).execute()
         target_rows = cast(list[dict[str, Any]], target_resp.data or [])
         if not target_rows:
             logger.warning("Target %s not found, skipping", target_id)
             continue
         target = _parse_target(target_rows[0])
 
-        fit_result, llm_result = await derive_fit_score(
-            llm, payload=payload, target=target
-        )
+        fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
         cost_log.record(
             supabase,
             user_id=None,

@@ -26,9 +26,9 @@ def test_create_inserts_when_no_conflict() -> None:
     """No existing row → the upsert inserts and returns the new target, and it
     uses the race-safe on-conflict/ignore-duplicates idiom."""
     supabase = MagicMock()
-    (
-        supabase.table.return_value.upsert.return_value.execute.return_value.data
-    ) = [_target_row("Data Scientist")]
+    (supabase.table.return_value.upsert.return_value.execute.return_value.data) = [
+        _target_row("Data Scientist")
+    ]
 
     t = crud.create(supabase, TargetCreate(label="Data Scientist"))
 

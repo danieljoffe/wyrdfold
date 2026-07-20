@@ -62,9 +62,7 @@ def _dev_suggest_from_query(latest_user: str, _messages: list[Message]) -> str:
     is a fake — the real LLM tailors these to the query and the user's
     experience; the descriptions say so plainly.
     """
-    first_line = next(
-        (line.strip() for line in latest_user.splitlines() if line.strip()), ""
-    )
+    first_line = next((line.strip() for line in latest_user.splitlines() if line.strip()), "")
     query = first_line[:120] or "Target Role"
     canonical = query.title()
     words = canonical.split()
@@ -88,8 +86,7 @@ def _dev_suggest_from_query(latest_user: str, _messages: list[Message]) -> str:
         {
             "label": label,
             "description": (
-                f"Roles similar to “{query}”. "
-                "(Local mock suggestion — the real LLM tailors these.)"
+                f"Roles similar to “{query}”. (Local mock suggestion — the real LLM tailors these.)"
             ),
             "core_skills": [],
         }
@@ -197,9 +194,7 @@ class MockLLMClient:
         or tool_use absence).
         """
         if not messages:
-            raise ValueError(
-                "MockLLMClient.complete_tool_use requires at least one message"
-            )
+            raise ValueError("MockLLMClient.complete_tool_use requires at least one message")
 
         latest_user = next(
             (m.content for m in reversed(messages) if m.role == "user"),
@@ -216,8 +211,7 @@ class MockLLMClient:
             )
 
         usage = LLMUsage(
-            input_tokens=_approx_tokens(system)
-            + sum(_approx_tokens(m.content) for m in messages),
+            input_tokens=_approx_tokens(system) + sum(_approx_tokens(m.content) for m in messages),
             output_tokens=_approx_tokens(response_text),
             cache_read_input_tokens=0,
             cache_creation_input_tokens=_approx_tokens(system) if cache_system else 0,
@@ -304,9 +298,7 @@ class MockLLMClient:
             )
         )
 
-    def _render_response(
-        self, purpose: str, latest_user: str, messages: list[Message]
-    ) -> str:
+    def _render_response(self, purpose: str, latest_user: str, messages: list[Message]) -> str:
         source = self._scripted.get(purpose)
         if source is None:
             return json.dumps({"mock": True, "purpose": purpose, "echo": latest_user})

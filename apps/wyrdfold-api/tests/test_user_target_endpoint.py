@@ -66,9 +66,7 @@ def test_returns_user_target_with_target_data(
 ) -> None:
     from app.routers import targets as router_mod
 
-    monkeypatch.setattr(
-        router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target()
-    )
+    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
     monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: _job_target())
 
     resp = client.get("/targets/target-1/user-target")
@@ -81,9 +79,7 @@ def test_returns_user_target_with_target_data(
     assert body["target"]["label"] == "Director of CX Operations"
 
 
-def test_404_when_no_user_target_row(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_404_when_no_user_target_row(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """The user might query a target they've never linked to. 404."""
     from app.routers import targets as router_mod
 
@@ -102,9 +98,7 @@ def test_404_when_user_target_exists_but_target_missing(
     deleted. Surface as 404 rather than a 500."""
     from app.routers import targets as router_mod
 
-    monkeypatch.setattr(
-        router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target()
-    )
+    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
     monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: None)
 
     resp = client.get("/targets/target-1/user-target")
@@ -124,14 +118,10 @@ def test_does_not_collide_with_get_target_route(
 
     # Stub both endpoints; the test passes as long as the right handler is hit.
     monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: _job_target())
-    monkeypatch.setattr(
-        router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target()
-    )
+    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
     # GET /targets/{id} ownership-checks the caller (#29 round 3 / M3); the
     # fixture user owns target-1.
-    monkeypatch.setattr(
-        router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"}
-    )
+    monkeypatch.setattr(router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"})
 
     plain = client.get("/targets/target-1")
     assert plain.status_code == 200

@@ -240,9 +240,7 @@ async def get_with_size_cap(
             if resp.status_code in _REDIRECT_CODES and "location" in resp.headers:
                 current = current.join(resp.headers["location"])
                 if current.scheme not in ("http", "https"):
-                    raise UnsafeURLError(
-                        f"redirect to non-http(s) scheme: {current.scheme!r}"
-                    )
+                    raise UnsafeURLError(f"redirect to non-http(s) scheme: {current.scheme!r}")
                 continue
             return resp, await _read_body_capped(resp, max_bytes)
 

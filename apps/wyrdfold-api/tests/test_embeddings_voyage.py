@@ -31,9 +31,7 @@ def _client_with_mocked_sdk(response: Any) -> tuple[VoyageEmbeddingsClient, Asyn
 
 async def test_embed_returns_parsed_result() -> None:
     vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(embeddings=vectors, total_tokens=42)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(embeddings=vectors, total_tokens=42))
     result = await client.embed(
         model="voyage-3",
         inputs=["a", "b"],
@@ -45,9 +43,7 @@ async def test_embed_returns_parsed_result() -> None:
 
 
 async def test_embed_passes_model_and_input_type_to_sdk() -> None:
-    client, embed_mock = _client_with_mocked_sdk(
-        _fake_response(embeddings=[[0.1]], total_tokens=1)
-    )
+    client, embed_mock = _client_with_mocked_sdk(_fake_response(embeddings=[[0.1]], total_tokens=1))
     await client.embed(
         model="voyage-3",
         inputs=["hello"],
@@ -61,9 +57,7 @@ async def test_embed_passes_model_and_input_type_to_sdk() -> None:
 
 async def test_embed_forwards_query_input_type_to_sdk() -> None:
     # Phase 0: the query side threads straight to the Voyage SDK.
-    client, embed_mock = _client_with_mocked_sdk(
-        _fake_response(embeddings=[[0.1]], total_tokens=1)
-    )
+    client, embed_mock = _client_with_mocked_sdk(_fake_response(embeddings=[[0.1]], total_tokens=1))
     await client.embed(
         model="voyage-3",
         inputs=["a search query"],
@@ -83,24 +77,18 @@ async def test_input_type_propagates_through_split_batches() -> None:
 
     async def _fake_embed(*, texts: list[str], input_type: str, **_: Any) -> Any:
         seen_types.append(input_type)
-        return _fake_response(
-            embeddings=[[0.0]] * len(texts), total_tokens=len(texts)
-        )
+        return _fake_response(embeddings=[[0.0]] * len(texts), total_tokens=len(texts))
 
     client = VoyageEmbeddingsClient(api_key="test-key")
     client._client.embed = _fake_embed  # type: ignore[method-assign]
 
-    await client.embed(
-        model="voyage-3", inputs=inputs, purpose="test", input_type="query"
-    )
+    await client.embed(model="voyage-3", inputs=inputs, purpose="test", input_type="query")
     assert len(seen_types) == 2  # split into two sub-batches
     assert seen_types == ["query", "query"]
 
 
 async def test_embed_passes_voyage_3_lite_model() -> None:
-    client, embed_mock = _client_with_mocked_sdk(
-        _fake_response(embeddings=[[0.0]], total_tokens=1)
-    )
+    client, embed_mock = _client_with_mocked_sdk(_fake_response(embeddings=[[0.0]], total_tokens=1))
     await client.embed(
         model="voyage-3-lite",
         inputs=["x"],
@@ -123,9 +111,7 @@ async def test_embed_empty_inputs_short_circuits_without_api_call() -> None:
 
 
 async def test_cost_calculated_from_total_tokens() -> None:
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(embeddings=[[0.1]], total_tokens=1_000_000)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(embeddings=[[0.1]], total_tokens=1_000_000))
     result = await client.embed(
         model="voyage-3",
         inputs=["x"],
@@ -136,9 +122,7 @@ async def test_cost_calculated_from_total_tokens() -> None:
 
 
 async def test_latency_is_measured() -> None:
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(embeddings=[[0.1]], total_tokens=1)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(embeddings=[[0.1]], total_tokens=1))
     result = await client.embed(
         model="voyage-3",
         inputs=["x"],
@@ -150,9 +134,7 @@ async def test_latency_is_measured() -> None:
 async def test_embeddings_list_is_copied_not_shared() -> None:
     """Defensive: don't hand out the SDK's internal list reference."""
     sdk_vectors = [[0.1, 0.2]]
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(embeddings=sdk_vectors, total_tokens=1)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(embeddings=sdk_vectors, total_tokens=1))
     result = await client.embed(
         model="voyage-3",
         inputs=["x"],
@@ -164,9 +146,7 @@ async def test_embeddings_list_is_copied_not_shared() -> None:
 
 async def test_batch_of_inputs_passes_full_texts_list() -> None:
     client, embed_mock = _client_with_mocked_sdk(
-        _fake_response(
-            embeddings=[[0.0], [0.1], [0.2]], total_tokens=30
-        )
+        _fake_response(embeddings=[[0.0], [0.1], [0.2]], total_tokens=30)
     )
     await client.embed(
         model="voyage-3",

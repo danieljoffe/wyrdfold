@@ -70,9 +70,7 @@ class EndpointStats:
     errors: int = 0
 
 
-async def mint_local_jwt(
-    supabase_url: str, service_role: str, email: str
-) -> str:
+async def mint_local_jwt(supabase_url: str, service_role: str, email: str) -> str:
     """Mint a real access token for ``email`` via the GoTrue admin magic-link
     flow (no mailbox needed). Creates the user if absent, generates a
     magic-link ``hashed_token``, then verifies it into a session.
@@ -159,9 +157,7 @@ def _percentile(values: list[float], pct: float) -> float:
     return sv[k]
 
 
-def _print_report(
-    stats: dict[str, EndpointStats], elapsed: float, vus: int, polls: int
-) -> None:
+def _print_report(stats: dict[str, EndpointStats], elapsed: float, vus: int, polls: int) -> None:
     total = sum(len(s.durations_ms) for s in stats.values())
     errors = sum(s.errors for s in stats.values())
     rps = total / elapsed if elapsed > 0 else 0
@@ -232,15 +228,22 @@ def main() -> None:
         "--base-url",
         default=os.environ.get("WYRDFOLD_API_BASE_URL", "http://localhost:8001"),
     )
-    parser.add_argument("--token", default=os.environ.get("WYRDFOLD_JWT", ""),
-                        help="Bearer JWT for user endpoints (else auto-mint)")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("WYRDFOLD_JWT", ""),
+        help="Bearer JWT for user endpoints (else auto-mint)",
+    )
     parser.add_argument("--supabase-url", default=os.environ.get("SUPABASE_URL", ""))
     parser.add_argument("--service-role", default=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
     parser.add_argument("--user-email", default="loadtest@example.com")
-    parser.add_argument("--with-poll", action="store_true",
-                        help="fire POST /poll during the run (contention mode)")
-    parser.add_argument("--poll-key", default=os.environ.get("WYRDFOLD_API_KEY", ""),
-                        help="operator key for POST /poll (required with --with-poll)")
+    parser.add_argument(
+        "--with-poll", action="store_true", help="fire POST /poll during the run (contention mode)"
+    )
+    parser.add_argument(
+        "--poll-key",
+        default=os.environ.get("WYRDFOLD_API_KEY", ""),
+        help="operator key for POST /poll (required with --with-poll)",
+    )
     parser.add_argument("--poll-interval", type=float, default=8.0)
     args = parser.parse_args()
 
@@ -252,8 +255,9 @@ def main() -> None:
             )
             print(f"minted local JWT for {args.user_email}")
         else:
-            print("warning: no --token and no --supabase-url/--service-role — "
-                  "user endpoints will 401")
+            print(
+                "warning: no --token and no --supabase-url/--service-role — user endpoints will 401"
+            )
 
     poll_key = args.poll_key if args.with_poll else None
     if args.with_poll and not poll_key:

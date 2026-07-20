@@ -550,15 +550,11 @@ class TestProviderFastFail:
             raise LLMRateLimitedError(upstream_status=429)
 
         monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
-        await poller_mod._qualify_one_job(
-            MagicMock(), _supabase_capturing_updates(rec), _row()
-        )
+        await poller_mod._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
         assert poller_mod._provider_fatal_active()
 
     @pytest.mark.asyncio
-    async def test_active_breaker_skips_the_llm_call(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_active_breaker_skips_the_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         poller_mod._provider_fatal_until = time.monotonic() + 300.0  # latched
         sb = _supabase_capturing_updates(rec)

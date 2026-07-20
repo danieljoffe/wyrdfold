@@ -51,8 +51,8 @@ def test_signup_mode_fails_safe_to_closed(sb: MagicMock, value: Any) -> None:
 
 def test_signup_mode_read_error_reports_closed(sb: MagicMock) -> None:
     """Negative: a DB failure must never present an open perimeter."""
-    sb.table.return_value.select.return_value.eq.return_value.execute.side_effect = (
-        RuntimeError("db down")
+    sb.table.return_value.select.return_value.eq.return_value.execute.side_effect = RuntimeError(
+        "db down"
     )
     r = TestClient(app).get("/signup-mode")
     assert r.status_code == 200

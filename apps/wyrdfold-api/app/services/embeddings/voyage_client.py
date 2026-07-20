@@ -96,9 +96,7 @@ class VoyageEmbeddingsClient:
             ]
             results = await asyncio.gather(
                 *(
-                    self._embed_one_batch(
-                        model=model, inputs=sub, input_type=input_type
-                    )
+                    self._embed_one_batch(model=model, inputs=sub, input_type=input_type)
                     for sub in sub_batches
                 )
             )

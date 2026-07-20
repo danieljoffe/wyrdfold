@@ -81,9 +81,7 @@ def _resume() -> TailoredResume:
         ],
         skills=["React", "TypeScript", "Next.js"],
         education=[
-            TailoredEducation(
-                school="UCLA", degree="BA, Design Media Arts", dates="2010 - 2014"
-            )
+            TailoredEducation(school="UCLA", degree="BA, Design Media Arts", dates="2010 - 2014")
         ],
     )
 
@@ -144,9 +142,7 @@ def test_role_dates_formatted_human() -> None:
 
 def test_bullets_rendered_as_list_bullet_style() -> None:
     doc = _parse(render_docx(_resume()))
-    bullet_texts = [
-        p.text for p in doc.paragraphs if p.style.name == "List Bullet"
-    ]
+    bullet_texts = [p.text for p in doc.paragraphs if p.style.name == "List Bullet"]
     assert "Cut mobile load times from 10s to 2s." in bullet_texts
     assert "Led the PDP rebuild." in bullet_texts
 

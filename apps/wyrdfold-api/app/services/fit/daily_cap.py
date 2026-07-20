@@ -39,9 +39,7 @@ either get next-day quota or grade on click-through.
 
 def _utc_day_start() -> str:
     """ISO-8601 UTC midnight of today."""
-    return datetime.combine(
-        datetime.now(UTC).date(), time.min, tzinfo=UTC
-    ).isoformat()
+    return datetime.combine(datetime.now(UTC).date(), time.min, tzinfo=UTC).isoformat()
 
 
 def phase2_quota_remaining(
@@ -70,8 +68,7 @@ def phase2_quota_remaining(
         )
     except Exception:
         logger.exception(
-            "phase2_quota_remaining: count failed for target %s; "
-            "refusing to spend",
+            "phase2_quota_remaining: count failed for target %s; refusing to spend",
             target_id,
         )
         return 0

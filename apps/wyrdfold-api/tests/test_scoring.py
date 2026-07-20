@@ -37,9 +37,7 @@ def _profile(
         cats["core_skills"] = CategoryProfile(keywords=core, weight=core_weight)
     return ScoringProfile(
         categories=cats,
-        seniority=SeniorityProfile(
-            level=seniority_level, signals=seniority_signals or []
-        ),
+        seniority=SeniorityProfile(level=seniority_level, signals=seniority_signals or []),
         negative=NegativeProfile(keywords=negative_keywords or []),
     )
 
@@ -146,9 +144,7 @@ def test_senior_target_excludes_customer_service_representative():
         # user only listed the LLM-default negatives
         negative_keywords=["junior", "intern"],
     )
-    result = score_title_against_profile(
-        "Customer Service Representative", profile
-    )
+    result = score_title_against_profile("Customer Service Representative", profile)
     assert result.excluded is True
     assert result.score == 0
 
@@ -163,9 +159,7 @@ def test_senior_target_excludes_self_storage_manager_via_associate():
         core={"Zendesk": 3, "AI Chatbots": 3},
         seniority_level="director",
     )
-    result = score_title_against_profile(
-        "Customer Service - Self Storage Manager", profile
-    )
+    result = score_title_against_profile("Customer Service - Self Storage Manager", profile)
     # Manager is tier 3, Director is tier 6 → delta -3 → -20 raw points.
     assert result.score == 0
 
@@ -280,12 +274,8 @@ def test_incidental_single_word_title_hit_scores_below_true_match() -> None:
     even when both are offered the same keyword set."""
     profile = _profile(core={"React": 3, "TypeScript": 3})
     keywords = ["frontend engineer", "ui engineer", "engineer"]
-    true_match = score_title_against_profile(
-        "Frontend Engineer", profile, search_keywords=keywords
-    )
-    off_role = score_title_against_profile(
-        "Sales Engineer", profile, search_keywords=keywords
-    )
+    true_match = score_title_against_profile("Frontend Engineer", profile, search_keywords=keywords)
+    off_role = score_title_against_profile("Sales Engineer", profile, search_keywords=keywords)
     # True match hits a 2-word keyword (full credit); the off-role hits only the
     # lone "engineer" (half), so it ranks strictly lower.
     assert true_match.breakdown.role_titles == off_role.breakdown.role_titles * 2

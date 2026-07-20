@@ -99,6 +99,7 @@ class _RpcIneligibleError(RuntimeError):
     #365). Subclasses ``RuntimeError`` so any pre-existing broad
     ``except RuntimeError`` still catches it."""
 
+
 # Operator location-filter path fetches pre-filter rows into Python (location
 # can't be filtered server-side), so cap the scan to keep it bounded as `jobs`
 # grows (#113). A hit is logged, never silently truncated.
@@ -1094,8 +1095,7 @@ def _list_jobs_for_target(
             )
         except _RpcIneligibleError as exc:
             logger.debug(
-                "cross-target RPC ineligible for per-target score sort (%s); "
-                "using two-query path",
+                "cross-target RPC ineligible for per-target score sort (%s); using two-query path",
                 exc,
             )
         except Exception:
@@ -1215,12 +1215,7 @@ def _list_jobs_across_user_targets(
     path."""
     has_location_filter = bool(exclude_terms or only_terms)
     has_logistics = logistics is not None and logistics.active
-    if (
-        weights_by_target
-        or has_location_filter
-        or has_logistics
-        or status == "archived"
-    ):
+    if weights_by_target or has_location_filter or has_logistics or status == "archived":
         return _list_jobs_across_user_targets_two_query(
             supabase,
             user_target_ids=user_target_ids,
@@ -1253,9 +1248,7 @@ def _list_jobs_across_user_targets(
             user_id=user_id,
         )
     except _RpcIneligibleError as exc:
-        logger.debug(
-            "get_cross_target_jobs ineligible (%s); using two-query path", exc
-        )
+        logger.debug("get_cross_target_jobs ineligible (%s); using two-query path", exc)
     except Exception:
         logger.warning(
             "get_cross_target_jobs RPC FAILED; degrading to the slower two-query path",

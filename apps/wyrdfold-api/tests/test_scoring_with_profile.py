@@ -27,18 +27,12 @@ def _profile(
     if core is not None:
         cats["core_skills"] = CategoryProfile(keywords=core, weight=core_weight)
     if secondary is not None:
-        cats["secondary_skills"] = CategoryProfile(
-            keywords=secondary, weight=secondary_weight
-        )
+        cats["secondary_skills"] = CategoryProfile(keywords=secondary, weight=secondary_weight)
     return ScoringProfile(
         categories=cats,
-        seniority=SeniorityProfile(
-            level=seniority_level, signals=seniority_signals or []
-        ),
+        seniority=SeniorityProfile(level=seniority_level, signals=seniority_signals or []),
         domain=DomainProfile(signals=domain_signals or [], weight=domain_weight),
-        negative=NegativeProfile(
-            keywords=negative_keywords or [], weight=negative_weight
-        ),
+        negative=NegativeProfile(keywords=negative_keywords or [], weight=negative_weight),
     )
 
 
@@ -119,9 +113,7 @@ def test_body_negative_penalizes_but_does_not_exclude():
     # the matched-React score lands mid-range and the -10 penalty is
     # visible rather than clamped at 100.
     core = {"React": 3, "Kubernetes": 3, "GraphQL": 3, "Terraform": 3}
-    base = score_job_with_profile(
-        title, body, _profile(core=core, seniority_level=None)
-    )
+    base = score_job_with_profile(title, body, _profile(core=core, seniority_level=None))
     penalized = score_job_with_profile(
         title,
         body,
@@ -169,13 +161,9 @@ def test_category_weight_multiplier():
     )
 
     # Only core matches → large fraction of max possible
-    result_core = score_job_with_profile(
-        "Engineer", "<p>React developer.</p>", profile
-    )
+    result_core = score_job_with_profile("Engineer", "<p>React developer.</p>", profile)
     # Only secondary matches → small fraction of max possible
-    result_secondary = score_job_with_profile(
-        "Engineer", "<p>Docker expert.</p>", profile
-    )
+    result_secondary = score_job_with_profile("Engineer", "<p>Docker expert.</p>", profile)
 
     assert result_core.score > result_secondary.score
 
@@ -294,12 +282,8 @@ def test_search_keywords_none_preserves_legacy_behavior():
     exact pre-fix scoring — no max_possible inflation, no role_titles."""
     profile = _profile(core={"React": 3})
     a = score_job_with_profile("React Engineer", "<p>React.</p>", profile)
-    b = score_job_with_profile(
-        "React Engineer", "<p>React.</p>", profile, search_keywords=[]
-    )
-    c = score_job_with_profile(
-        "React Engineer", "<p>React.</p>", profile, search_keywords=None
-    )
+    b = score_job_with_profile("React Engineer", "<p>React.</p>", profile, search_keywords=[])
+    c = score_job_with_profile("React Engineer", "<p>React.</p>", profile, search_keywords=None)
     assert a.score == b.score == c.score
     assert b.breakdown.role_titles == 0
 

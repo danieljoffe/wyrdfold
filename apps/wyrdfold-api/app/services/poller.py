@@ -212,6 +212,7 @@ def _provider_fatal_active() -> bool:
     """True while the provider-fatal breaker is latched (within the cooldown)."""
     return time.monotonic() < _provider_fatal_until
 
+
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
 # ``app/services/qualification/heuristics.py`` so the poller's ingestion gate
 # and the #60 qualification tagger's L1 share ONE implementation (single source

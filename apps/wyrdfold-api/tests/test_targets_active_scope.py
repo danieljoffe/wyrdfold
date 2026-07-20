@@ -40,9 +40,7 @@ def _target(tid: str, label: str) -> JobTarget:
 def test_jwt_caller_gets_only_their_active_targets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    global_spy = MagicMock(
-        return_value=[_target("t-other", "Someone Else's Role")]
-    )
+    global_spy = MagicMock(return_value=[_target("t-other", "Someone Else's Role")])
     per_user_spy = MagicMock(return_value=[_target("t-mine", "My Role")])
     monkeypatch.setattr(router_mod.crud, "get_active", global_spy)
     monkeypatch.setattr(router_mod.crud, "get_active_for_user", per_user_spy)

@@ -94,9 +94,7 @@ def test_detector_flags_destructive_and_ignores_comments() -> None:
     assert not _DESTRUCTIVE.search(
         _strip_sql_comments("-- this could TRUNCATE the tail\nSELECT 1;")
     )
-    assert not _DESTRUCTIVE.search(
-        _strip_sql_comments("/* DROP COLUMN note */ SELECT 1;")
-    )
+    assert not _DESTRUCTIVE.search(_strip_sql_comments("/* DROP COLUMN note */ SELECT 1;"))
     # Additive DDL is fine.
     assert not _DESTRUCTIVE.search(_strip_sql_comments("ALTER TABLE t ADD COLUMN c int;"))
 
@@ -176,28 +174,19 @@ def test_new_index_on_hot_table_is_concurrent_or_marked() -> None:
 def test_index_grandfather_list_has_no_stale_entries() -> None:
     names = {path.name for path in _migration_files()}
     missing = sorted(INDEX_GRANDFATHERED - names)
-    assert not missing, (
-        f"INDEX_GRANDFATHERED lists migrations that no longer exist: {missing}"
-    )
+    assert not missing, f"INDEX_GRANDFATHERED lists migrations that no longer exist: {missing}"
 
 
 def test_index_detector_flags_plain_hot_and_ignores_concurrent() -> None:
     # Plain index on a hot table is flagged.
     assert _plain_hot_index_tables("CREATE INDEX foo ON public.jobs (x);") == ["jobs"]
-    assert _plain_hot_index_tables(
-        'CREATE INDEX "i" ON "public"."llm_costs" (x);'
-    ) == ["llm_costs"]
+    assert _plain_hot_index_tables('CREATE INDEX "i" ON "public"."llm_costs" (x);') == ["llm_costs"]
     # CONCURRENTLY is allowed.
-    assert (
-        _plain_hot_index_tables("CREATE INDEX CONCURRENTLY foo ON public.jobs (x);")
-        == []
-    )
+    assert _plain_hot_index_tables("CREATE INDEX CONCURRENTLY foo ON public.jobs (x);") == []
     # Cold tables are not guarded (small-table builds are fine, per #112).
     assert _plain_hot_index_tables("CREATE INDEX foo ON public.user_profiles (x);") == []
     # Comment-only mentions don't count (comments are stripped first).
     assert (
-        _plain_hot_index_tables(
-            _strip_sql_comments("-- CREATE INDEX foo ON jobs (x)\nSELECT 1;")
-        )
+        _plain_hot_index_tables(_strip_sql_comments("-- CREATE INDEX foo ON jobs (x)\nSELECT 1;"))
         == []
     )

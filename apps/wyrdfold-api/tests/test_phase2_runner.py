@@ -444,16 +444,35 @@ async def test_orders_candidates_by_cosine_desc_over_confidence(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 2)
     rows = [
-        {"job_posting_id": "j-hicos", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 30},
-        {"job_posting_id": "j-midcos", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 90},
-        {"job_posting_id": "j-locos", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 95},
+        {
+            "job_posting_id": "j-hicos",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 30,
+        },
+        {
+            "job_posting_id": "j-midcos",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 90,
+        },
+        {
+            "job_posting_id": "j-locos",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 95,
+        },
     ]
     jobs = [
-        {"id": jid, "title": "x", "description_html": "",
-         "first_seen_at": "2026-04-01T00:00:00+00:00"}
+        {
+            "id": jid,
+            "title": "x",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        }
         for jid in ("j-hicos", "j-midcos", "j-locos")
     ]
 
@@ -479,14 +498,28 @@ async def test_missing_cosine_sorts_below_a_scored_one(
     graded = _patch_grader(monkeypatch)
     _patch_quota(monkeypatch, 1)
     rows = [
-        {"job_posting_id": "j-scored", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 50},
-        {"job_posting_id": "j-unscored", "promising": True, "scoring_status": "stage2",
-         "scored_profile_version": 1, "phase1_confidence": 99},
+        {
+            "job_posting_id": "j-scored",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 50,
+        },
+        {
+            "job_posting_id": "j-unscored",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+            "phase1_confidence": 99,
+        },
     ]
     jobs = [
-        {"id": jid, "title": "x", "description_html": "",
-         "first_seen_at": "2026-04-01T00:00:00+00:00"}
+        {
+            "id": jid,
+            "title": "x",
+            "description_html": "",
+            "first_seen_at": "2026-04-01T00:00:00+00:00",
+        }
         for jid in ("j-scored", "j-unscored")
     ]
 

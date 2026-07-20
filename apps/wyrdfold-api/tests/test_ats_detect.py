@@ -58,16 +58,12 @@ class TestParseInput:
         assert slug == "netlify"
 
     def test_workday_url(self):
-        provider, slug = _parse_input(
-            "https://salesforce.wd12.myworkdayjobs.com/en-US/External"
-        )
+        provider, slug = _parse_input("https://salesforce.wd12.myworkdayjobs.com/en-US/External")
         assert provider == "workday"
         assert slug == "salesforce"
 
     def test_smartrecruiters_api_url(self):
-        provider, slug = _parse_input(
-            "https://api.smartrecruiters.com/v1/companies/VISA"
-        )
+        provider, slug = _parse_input("https://api.smartrecruiters.com/v1/companies/VISA")
         assert provider == "smartrecruiters"
         assert slug == "visa"
 
@@ -300,8 +296,7 @@ async def test_detect_workday_from_posting_url():
     # The probe hits the CXS list endpoint with a limit-1 page.
     args, kwargs = mock_client.post.call_args
     assert args[0] == (
-        "https://salesforce.wd12.myworkdayjobs.com/wday/cxs/salesforce"
-        "/External_Career_Site/jobs"
+        "https://salesforce.wd12.myworkdayjobs.com/wday/cxs/salesforce/External_Career_Site/jobs"
     )
     assert kwargs["json"]["limit"] == 1
 
@@ -337,9 +332,7 @@ async def test_detect_workday_probe_failure_returns_none():
     mock_client.post.return_value = _make_http_response(404, {})
 
     with patch("app.services.ats_detect.httpx.AsyncClient", return_value=mock_client):
-        result = await detect_ats(
-            "https://acme.wd5.myworkdayjobs.com/en-US/careers"
-        )
+        result = await detect_ats("https://acme.wd5.myworkdayjobs.com/en-US/careers")
 
     assert result is None
 
@@ -361,9 +354,7 @@ async def test_detect_smartrecruiters_from_api_url():
         "app.services.ats_detect.httpx.AsyncClient",
         return_value=mock_client,
     ):
-        result = await detect_ats(
-            "https://api.smartrecruiters.com/v1/companies/VISA"
-        )
+        result = await detect_ats("https://api.smartrecruiters.com/v1/companies/VISA")
 
     assert result is not None
     assert result.provider == "smartrecruiters"

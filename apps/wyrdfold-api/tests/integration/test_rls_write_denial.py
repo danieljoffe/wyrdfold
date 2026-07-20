@@ -209,12 +209,7 @@ def test_user_cannot_update_job(
     _a, _b, posting_id, _src = seeded_catalog
     client_a = user_client_factory(uid_a)
 
-    resp = (
-        client_a.table("jobs")
-        .update({"title": "Defaced"})
-        .eq("id", posting_id)
-        .execute()
-    )
+    resp = client_a.table("jobs").update({"title": "Defaced"}).eq("id", posting_id).execute()
     assert resp.data == [], "RLS leak: user UPDATE matched a shared jobs row"
 
     rows = service_client.table("jobs").select("title").eq("id", posting_id).execute().data
@@ -295,9 +290,7 @@ def test_user_cannot_update_or_delete_reference_jd(
     del_ = client_a.table("reference_jds").delete().eq("id", ref_id).execute()
     assert del_.data == [], "RLS leak: user DELETE matched another user's reference_jd"
 
-    rows = (
-        service_client.table("reference_jds").select("jd_text").eq("id", ref_id).execute().data
-    )
+    rows = service_client.table("reference_jds").select("jd_text").eq("id", ref_id).execute().data
     assert rows and rows[0]["jd_text"] == "B's reference jd", (
         "RLS leak: reference_jd was mutated/deleted by a non-owner"
     )

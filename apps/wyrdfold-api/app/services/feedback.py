@@ -49,14 +49,64 @@ _MIN_TOKEN_FREQUENCY = 3
 # repeatedly — they're either generic or already structural.
 _LEARN_STOPWORDS: frozenset[str] = frozenset(
     {
-        "a", "an", "and", "the", "or", "but", "if", "of", "to", "for",
-        "in", "on", "at", "by", "with", "as", "is", "are", "was", "were",
-        "be", "been", "being", "this", "that", "these", "those", "it",
-        "its", "i", "me", "my", "we", "us", "our", "you", "your", "he",
-        "she", "they", "them", "not", "no", "too", "very", "so", "than",
-        "then", "just", "really",
+        "a",
+        "an",
+        "and",
+        "the",
+        "or",
+        "but",
+        "if",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "at",
+        "by",
+        "with",
+        "as",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "i",
+        "me",
+        "my",
+        "we",
+        "us",
+        "our",
+        "you",
+        "your",
+        "he",
+        "she",
+        "they",
+        "them",
+        "not",
+        "no",
+        "too",
+        "very",
+        "so",
+        "than",
+        "then",
+        "just",
+        "really",
         # Domain-generic words that would zero-out half the corpus if learned.
-        "job", "role", "position", "company", "team", "work", "opportunity",
+        "job",
+        "role",
+        "position",
+        "company",
+        "team",
+        "work",
+        "opportunity",
     }
 )
 
@@ -102,9 +152,7 @@ def upsert_feedback(
     return _parse_row(rows[0])
 
 
-def delete_feedback(
-    supabase: Client, *, user_id: str, job_posting_id: str, target_id: str
-) -> bool:
+def delete_feedback(supabase: Client, *, user_id: str, job_posting_id: str, target_id: str) -> bool:
     """Remove a feedback row. Returns True if a row was deleted."""
     resp = (
         supabase.table(TABLE)
@@ -157,9 +205,7 @@ def _extract_tokens(reason: str | None) -> list[str]:
     ]
 
 
-def _frequent_tokens(
-    rows: list[FeedbackRow], threshold: int
-) -> list[str]:
+def _frequent_tokens(rows: list[FeedbackRow], threshold: int) -> list[str]:
     """Tokens that appear in ``>= threshold`` distinct rows. Order: most
     frequent first, ties broken by first-seen order so the result is
     stable across runs."""
@@ -190,9 +236,7 @@ def maybe_run_learner(
         .limit(50)
         .execute()
     )
-    pending = [
-        _parse_row(r) for r in cast(list[dict[str, Any]], pending_resp.data or [])
-    ]
+    pending = [_parse_row(r) for r in cast(list[dict[str, Any]], pending_resp.data or [])]
     if len(pending) < _MIN_FEEDBACK_FOR_LEARN:
         return None
 
@@ -202,31 +246,20 @@ def maybe_run_learner(
         # learn from. v2's LLM step is what handles this case.
         return None
 
-    target_resp = (
-        supabase.table("targets")
-        .select("*")
-        .eq("id", target_id)
-        .single()
-        .execute()
-    )
+    target_resp = supabase.table("targets").select("*").eq("id", target_id).single().execute()
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
     profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
     negative = cast(dict[str, Any], profile.get("negative") or {})
-    existing = {
-        kw.lower()
-        for kw in cast(list[str], negative.get("keywords") or [])
-    }
+    existing = {kw.lower() for kw in cast(list[str], negative.get("keywords") or [])}
     truly_new = [t for t in new_tokens if t not in existing]
     if not truly_new:
         # All frequent tokens are already in the negative list — nothing
         # to do. Don't bump version, don't stamp rows.
         return None
 
-    negative["keywords"] = cast(
-        list[str], negative.get("keywords") or []
-    ) + truly_new
+    negative["keywords"] = cast(list[str], negative.get("keywords") or []) + truly_new
     if "weight" not in negative:
         # Mirror the default the LLM derivation emits so the merged profile
         # remains a valid ``NegativeProfile``.

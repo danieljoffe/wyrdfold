@@ -20,18 +20,16 @@ from supabase import Client
 VOTES_TABLE = "contribution_votes"
 
 
-def set_user_vote(
-    user_client: Client, *, reference_jd_id: str, user_id: str, value: int
-) -> None:
+def set_user_vote(user_client: Client, *, reference_jd_id: str, user_id: str, value: int) -> None:
     """Record (or clear) the caller's vote via their RLS client.
 
     ``value`` 0 deletes the caller's vote; -1/+1 upserts it. RLS's WITH CHECK
     (``auth.uid() = user_id``) guarantees a caller can only write their own row.
     """
     if value == 0:
-        user_client.table(VOTES_TABLE).delete().eq(
-            "reference_jd_id", reference_jd_id
-        ).eq("user_id", user_id).execute()
+        user_client.table(VOTES_TABLE).delete().eq("reference_jd_id", reference_jd_id).eq(
+            "user_id", user_id
+        ).execute()
         return
     user_client.table(VOTES_TABLE).upsert(
         {
@@ -44,9 +42,7 @@ def set_user_vote(
     ).execute()
 
 
-def get_user_vote(
-    user_client: Client, *, reference_jd_id: str, user_id: str
-) -> int:
+def get_user_vote(user_client: Client, *, reference_jd_id: str, user_id: str) -> int:
     """The caller's own vote for a contribution (0 if they haven't voted)."""
     resp = (
         user_client.table(VOTES_TABLE)

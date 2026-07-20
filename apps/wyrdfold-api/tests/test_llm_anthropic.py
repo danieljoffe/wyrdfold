@@ -130,9 +130,7 @@ async def test_cache_system_true_but_empty_system_stays_empty_string() -> None:
 
 
 async def test_cache_tokens_flow_through() -> None:
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(cache_read=500, cache_creation=1200)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(cache_read=500, cache_creation=1200))
     result = await client.complete(
         model="claude-sonnet-4-6",
         system="sys",
@@ -156,9 +154,7 @@ async def test_max_tokens_passed_to_sdk() -> None:
 
 
 async def test_cost_calculated_from_usage() -> None:
-    client, _ = _client_with_mocked_sdk(
-        _fake_response(input_tokens=1_000_000, output_tokens=0)
-    )
+    client, _ = _client_with_mocked_sdk(_fake_response(input_tokens=1_000_000, output_tokens=0))
     result = await client.complete(
         model="claude-sonnet-4-6",
         system="sys",
@@ -395,9 +391,7 @@ async def test_cache_prefix_chars_splits_message_into_two_blocks() -> None:
     await client.complete(
         model="claude-haiku-4-5",
         system="sys",
-        messages=[
-            Message(role="user", content=content, cache_prefix_chars=prefix_len)
-        ],
+        messages=[Message(role="user", content=content, cache_prefix_chars=prefix_len)],
         purpose="test",
     )
     (msg,) = create_mock.call_args.kwargs["messages"]
@@ -446,9 +440,7 @@ async def test_cache_prefix_covering_whole_message_uses_single_block() -> None:
 async def test_cache_prefix_chars_applies_to_tool_use_path() -> None:
     client = AnthropicLLMClient(api_key="test-key")
     create_mock = AsyncMock(
-        return_value=_fake_tool_use_response(
-            tool_name="grade", tool_input={"ok": True}
-        )
+        return_value=_fake_tool_use_response(tool_name="grade", tool_input={"ok": True})
     )
     client._client.messages.create = create_mock  # type: ignore[method-assign]
     await client.complete_tool_use(

@@ -260,8 +260,9 @@ def test_validate_keeps_bullets_matching_role_summary_substring() -> None:
 # ---- claim-level faithfulness (#47) ---------------------------------------
 
 
-def _resume_with_bullet(text: str, ref: str, *, skills: list[str] | None = None,
-                        summary: str = "Senior FE.") -> TailoredResume:
+def _resume_with_bullet(
+    text: str, ref: str, *, skills: list[str] | None = None, summary: str = "Senior FE."
+) -> TailoredResume:
     return TailoredResume(
         summary=summary,
         contact=_contact(),
@@ -326,7 +327,8 @@ def test_validate_drops_unknown_skill_from_resume() -> None:
     # fix 2). "react" (lowercase) and "TypeScript" survive via the canonical
     # map, proving the tolerance carries over from the cover-letter path.
     resume = _resume_with_bullet(
-        "Led the PDP rebuild.", "Led the PDP rebuild",
+        "Led the PDP rebuild.",
+        "Led the PDP rebuild",
         skills=["react", "TypeScript", "Kafka"],
     )
     cleaned, warnings = validate_trace_refs(resume, _optimized())
@@ -337,8 +339,15 @@ def test_validate_drops_unknown_skill_from_resume() -> None:
 def test_validate_enforces_skills_cap() -> None:
     # 25 valid skills must be trimmed to the 20 cap, with a warning.
     payload = OptimizedPayload(
-        roles=[Role(id="fc", company="FightCamp", title="FE", start="2021-11",
-                    summary="Built things across the stack with care.")],
+        roles=[
+            Role(
+                id="fc",
+                company="FightCamp",
+                title="FE",
+                start="2021-11",
+                summary="Built things across the stack with care.",
+            )
+        ],
         skills=[Skill(name=f"Skill{i}") for i in range(25)],
     )
     resume = TailoredResume(
@@ -356,7 +365,8 @@ def test_validate_warns_on_fabricated_summary_number_without_stripping() -> None
     # The summary is required text (min_length=1), so a fabricated number is
     # WARNed and surfaced, not stripped (#47 fix 2/conservative policy).
     resume = _resume_with_bullet(
-        "Led the PDP rebuild.", "Led the PDP rebuild",
+        "Led the PDP rebuild.",
+        "Led the PDP rebuild",
         summary="Senior FE who grew revenue 300% in 18 months.",
     )
     cleaned, warnings = validate_trace_refs(resume, _optimized())
@@ -368,7 +378,8 @@ def test_validate_summary_with_grounded_number_is_silent() -> None:
     # Source corpus has "10s"/"2s"; a summary number that matches the digits
     # ("2" -> "2s" in source) must not warn.
     resume = _resume_with_bullet(
-        "Led the PDP rebuild.", "Led the PDP rebuild",
+        "Led the PDP rebuild.",
+        "Led the PDP rebuild",
         summary="Cut load to 2s on the flagship surface.",
     )
     _, warnings = validate_trace_refs(resume, _optimized())
@@ -640,9 +651,7 @@ def _cover_letter(skill_refs: list[str]) -> TailoredCoverLetter:
 
 def test_validate_cover_letter_accepts_canonical_skill() -> None:
     optimized = _optimized()  # has skills "React" + "TypeScript"
-    letter, warnings = validate_cover_letter_refs(
-        _cover_letter(["React"]), optimized
-    )
+    letter, warnings = validate_cover_letter_refs(_cover_letter(["React"]), optimized)
     assert letter.source_skill_refs == ["React"]
     assert warnings == []
 
@@ -664,9 +673,7 @@ def test_validate_cover_letter_drops_truly_unknown_skill() -> None:
     """Tolerance must not over-match: a skill that genuinely isn't in
     the optimized doc still gets dropped + warned."""
     optimized = _optimized()
-    letter, warnings = validate_cover_letter_refs(
-        _cover_letter(["Kafka"]), optimized
-    )
+    letter, warnings = validate_cover_letter_refs(_cover_letter(["Kafka"]), optimized)
     assert letter.source_skill_refs == []
     assert any("Kafka" in w for w in warnings)
 

@@ -165,16 +165,14 @@ async def fetch_workday_jobs(board_token: str) -> list[StandardJob]:
         # ``externalPath`` already started with ``/job/...`` (it always
         # does). The correct construction is base + site + path.
         absolute_url = (
-            detail_result.get("externalUrl")
-            or f"{base_url}/{site}{external_path}"
+            detail_result.get("externalUrl") or f"{base_url}/{site}{external_path}"
             if external_path
             else ""
         )
 
         jobs.append(
             StandardJob(
-                external_id=external_path
-                or str(list_item.get("bulletFields", [""])[0]),
+                external_id=external_path or str(list_item.get("bulletFields", [""])[0]),
                 title=detail_result.get("title", list_item.get("title", "")),
                 location_name=list_item.get("locationsText"),
                 department=None,
