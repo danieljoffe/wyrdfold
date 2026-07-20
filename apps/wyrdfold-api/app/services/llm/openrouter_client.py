@@ -26,7 +26,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -59,6 +59,41 @@ _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 _BACKOFF_BASE_SECONDS = 0.5
+
+
+def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return *schema* with every ``$ref: #/$defs/X`` replaced by its inlined
+    definition and the ``$defs`` block removed — a self-contained schema.
+
+    Pydantic v2 emits ``$defs`` + ``$ref`` for nested models (e.g. a
+    ``JobFitResult`` with a nested ``AxisScores``). OpenRouter's OpenAI-shaped
+    structured-output grammar compiler can't resolve those — it 400s with
+    ``Failed to compile json grammar: Cannot find field $defs in
+    #/$defs/AxisScores`` (HTTP 200, error in the body), which systematically
+    breaks grading on a ``$defs``-bearing schema. Inlining sidesteps it; the
+    result is equivalent JSON Schema, valid for the Anthropic path too (so this
+    is safe if ever shared). Self-referential models can't be inlined — ours
+    aren't — so a back-reference degrades to a permissive ``{"type": "object"}``.
+    """
+    defs = schema.get("$defs")
+    if not isinstance(defs, dict) or not defs:
+        return schema
+
+    def resolve(node: Any, seen: frozenset[str]) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/") :]
+                if name in seen:  # recursive model — leave permissive
+                    return {"type": "object"}
+                return resolve(defs.get(name, {"type": "object"}), seen | {name})
+            return {k: resolve(v, seen) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [resolve(v, seen) for v in node]
+        return node
+
+    body = {k: v for k, v in schema.items() if k != "$defs"}
+    return cast("dict[str, Any]", resolve(body, frozenset()))
 
 
 def _parse_openai_tool_response(
@@ -281,7 +316,9 @@ class OpenRouterLLMClient(AnthropicLLMClient):
                     "function": {
                         "name": tool_name,
                         "description": tool_description,
-                        "parameters": tool_input_schema,
+                        # Inline $defs/$ref: OpenRouter's grammar compiler can't
+                        # resolve them and 400s on a nested-model schema.
+                        "parameters": _inline_defs(tool_input_schema),
                     },
                 }
             ],
@@ -324,6 +361,22 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             data = resp.json()
         except json.JSONDecodeError as exc:
             raise LLMUpstreamUnavailableError() from exc
+
+        # OpenRouter sometimes returns HTTP 200 with the upstream error in the
+        # BODY (a transient 5xx/timeout, or a grammar-compile 400) — the
+        # status-based retry above never saw it, and _parse_openai_tool_response
+        # would surface it as a confusing "no choices". Detect it: map transient
+        # codes to the retryable upstream error (engages the caller's fallback);
+        # surface the rest clearly with the provider message.
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            code = err.get("code")
+            if isinstance(code, int) and code in _TRANSIENT_STATUSES:
+                raise LLMUpstreamUnavailableError()
+            raise ValueError(
+                f"OpenRouter error body for {tool_name!r} (code={code}): "
+                f"{str(err.get('message'))[:200]!r}"
+            )
 
         tool_input = _parse_openai_tool_response(
             data, tool_name=tool_name, max_tokens=max_tokens

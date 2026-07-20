@@ -6,6 +6,8 @@ forced function call can come back wrong must fail LOUD (the caller's fallback
 then engages) rather than leak a silently-wrong dict into scoring.
 """
 
+import json
+
 import httpx
 import pytest
 
@@ -15,6 +17,7 @@ from app.services.llm.openrouter_client import (
     _OPENAI_SHAPED_MODELS,
     _OPENROUTER_OPENAI_URL,
     OpenRouterLLMClient,
+    _inline_defs,
     _openai_usage,
     _parse_openai_tool_response,
 )
@@ -282,3 +285,129 @@ async def test_claude_model_routes_to_anthropic_super(monkeypatch) -> None:
     )
     assert out == {"routed": "anthropic"}
     assert seen["model"] == "claude-haiku-4-5"
+
+
+# ---- $defs inlining (the grammar-compile 400 corpus, prod 2026-07-19) --------
+# OpenRouter's OpenAI-shaped grammar compiler can't resolve $defs/$ref (Pydantic
+# emits them for nested models). Prod returned HTTP 200 with the body
+# {'error': {'code': 400, 'message': 'Failed to compile json grammar: Cannot
+# find field $defs in #/$defs/AxisScores'}} → grading systematically failed.
+
+
+def test_inline_defs_dereferences_nested_model() -> None:
+    sch = {
+        "type": "object",
+        "properties": {
+            "axis": {"$ref": "#/$defs/AxisScores"},
+            "n": {"type": "integer"},
+        },
+        "$defs": {"AxisScores": {"type": "object", "properties": {"a": {"type": "number"}}}},
+    }
+    out = _inline_defs(sch)
+    assert "$defs" not in out
+    assert json.dumps(out).count("$ref") == 0
+    assert out["properties"]["axis"] == {
+        "type": "object",
+        "properties": {"a": {"type": "number"}},
+    }
+
+
+def test_inline_defs_passthrough_without_defs() -> None:
+    sch = {"type": "object", "properties": {"n": {"type": "integer"}}}
+    assert _inline_defs(sch) == sch
+
+
+def test_inline_defs_recursive_ref_terminates() -> None:
+    # A self-referential model can't be fully inlined — degrade to a permissive
+    # object instead of recursing forever (our grading schemas aren't recursive).
+    sch = {
+        "type": "object",
+        "properties": {"child": {"$ref": "#/$defs/Node"}},
+        "$defs": {"Node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}},
+    }
+    out = _inline_defs(sch)
+    assert "$defs" not in out  # terminated, no RecursionError
+
+
+@pytest.mark.asyncio
+async def test_openai_path_posts_inlined_schema(monkeypatch) -> None:
+    """Regression: a nested-model schema must go OUT inlined (no $defs/$ref) so
+    the grammar compiler doesn't 400."""
+    client = OpenRouterLLMClient(api_key="sk-test")
+    payload = {
+        "choices": [
+            {"finish_reason": "tool_calls", "message": {"tool_calls": _tool_calls('{"ok": true}')}}
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    fake = _FakeHttp(
+        httpx.Response(200, request=httpx.Request("POST", _OPENROUTER_OPENAI_URL), json=payload)
+    )
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+
+    schema = {
+        "type": "object",
+        "properties": {"axis": {"$ref": "#/$defs/AxisScores"}},
+        "$defs": {"AxisScores": {"type": "object"}},
+    }
+    await client.complete_tool_use(
+        model="deepseek-v3-2",
+        system="S",
+        messages=[Message(role="user", content="U")],
+        tool_name="return_X",
+        tool_description="d",
+        tool_input_schema=schema,
+        purpose="relevance.title_triage",
+        temperature=0.0,
+    )
+    params = fake.posted["body"]["tools"][0]["function"]["parameters"]
+    assert "$defs" not in params
+    assert json.dumps(params).count("$ref") == 0
+
+
+# ---- HTTP-200-with-error-body corpus (prod 2026-07-19) ----------------------
+# OpenRouter can return HTTP 200 with the upstream error in the body, which the
+# status-based retry never sees. Map transient codes to the retryable upstream
+# error; surface the rest clearly (not a confusing "no choices").
+
+
+def _error_body_client(monkeypatch, body: dict) -> "OpenRouterLLMClient":
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttp(
+        httpx.Response(200, request=httpx.Request("POST", _OPENROUTER_OPENAI_URL), json=body)
+    )
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+    return client
+
+
+async def _call(client: "OpenRouterLLMClient") -> object:
+    return await client.complete_tool_use(
+        model="deepseek-v3-2",
+        system="S",
+        messages=[Message(role="user", content="U")],
+        tool_name="return_X",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="relevance.title_triage",
+        temperature=0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_error_body_maps_to_upstream_unavailable(monkeypatch) -> None:
+    client = _error_body_client(
+        monkeypatch, {"error": {"message": "The operation was aborted", "code": 504}}
+    )
+    with pytest.raises(LLMUpstreamUnavailableError):
+        await _call(client)
+
+
+@pytest.mark.asyncio
+async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
+    client = _error_body_client(
+        monkeypatch,
+        {"error": {"message": "Failed to compile json grammar: Cannot find field $defs", "code": 400}},
+    )
+    # NOT a confusing "no choices" — a clear error-body message with the code.
+    with pytest.raises(ValueError, match=r"error body.*code=400"):
+        await _call(client)
