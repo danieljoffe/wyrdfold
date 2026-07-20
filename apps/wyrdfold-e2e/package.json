@@ -4,6 +4,6 @@
   "private": true,
   "dependencies": {
     "@axe-core/playwright": "^4.12.1",
-    "@supabase/supabase-js": "2.110.3"
+    "@supabase/supabase-js": "2.110.7"
   }
 }
