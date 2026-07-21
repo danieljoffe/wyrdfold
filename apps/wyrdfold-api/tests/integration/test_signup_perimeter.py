@@ -116,3 +116,45 @@ def test_unknown_mode_value_fails_safe_to_closed(
             anon_client.auth.sign_in_with_otp({"email": _email("corrupt-mode")})
     finally:
         _set_mode(service_client, "closed")
+
+
+# A domain seeded into blocked_email_domains (20260721060000).
+_BLOCKED_DOMAIN = "mailinator.com"
+
+
+def test_open_signup_rejects_disposable_email_domain(
+    anon_client: Client, service_client: Client
+) -> None:
+    """Open-signup abuse control: even with the perimeter OPEN, a seeded
+    disposable-email domain is rejected by the hook, and no user is created.
+    The finally restores 'closed' so a failure can't leave the stack open."""
+    email = f"disposable-{uuid.uuid4().hex[:8]}@{_BLOCKED_DOMAIN}"
+    try:
+        _set_mode(service_client, "open")
+        with pytest.raises(Exception, match=r"permanent email"):
+            anon_client.auth.sign_in_with_otp({"email": email})
+        created = [u for u in service_client.auth.admin.list_users() if u.email == email]
+        assert not created, "a blocked disposable domain must not create a user"
+    finally:
+        _set_mode(service_client, "closed")
+
+
+def test_disposable_block_is_open_only_invited_admitted_regardless(
+    anon_client: Client, service_client: Client
+) -> None:
+    """The disposable check fires ONLY on the open path: a beta-INVITED address
+    on a blocked domain is still admitted while closed (invites are pre-vetted),
+    proving the new check didn't leak into the closed-beta invite gate."""
+    email = f"invited-blocked-{uuid.uuid4().hex[:8]}@{_BLOCKED_DOMAIN}"
+    created_id: str | None = None
+    service_client.table("wyrdfold_beta_invites").insert({"email": email}).execute()
+    try:
+        # mode stays 'closed' (default) — invited admits despite the domain.
+        anon_client.auth.sign_in_with_otp({"email": email})
+        users = [u for u in service_client.auth.admin.list_users() if u.email == email]
+        assert len(users) == 1, "closed+invited must admit regardless of domain"
+        created_id = users[0].id
+    finally:
+        if created_id:
+            delete_auth_user(service_client, created_id)
+        service_client.table("wyrdfold_beta_invites").delete().eq("email", email).execute()
