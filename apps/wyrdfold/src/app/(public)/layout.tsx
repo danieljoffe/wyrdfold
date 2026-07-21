@@ -71,6 +71,11 @@ const SOCIAL_LINKS: SocialLink[] = [
 
 const PORTFOLIO_URL = 'https://danieljoffe.com';
 
+const LEGAL_LINKS = [
+  { label: 'Terms', href: '/terms' },
+  { label: 'Privacy', href: '/privacy' },
+] as const;
+
 /**
  * Public marketing shell — no sidebar, no mobile nav, no auth required.
  * Auth gating for `/` (the only route currently in this group) is handled
@@ -147,23 +152,39 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
             </span>{' '}
             © {year}
           </p>
-          <ul className='flex flex-wrap items-center gap-x-5 gap-y-2'>
-            {SOCIAL_LINKS.map(({ label, href, icon: Icon, external }) => (
-              <li key={label}>
-                <a
-                  href={href}
-                  {...(external && {
-                    target: '_blank',
-                    rel: 'noopener noreferrer',
-                  })}
-                  className='inline-flex items-center gap-1.5 rounded-sm text-text-tertiary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
-                >
-                  <Icon className='size-4' aria-hidden='true' />
-                  <span>{label}</span>
-                </a>
-              </li>
-            ))}
-          </ul>
+          <div className='flex flex-col gap-4 md:flex-row md:items-center md:gap-6'>
+            <nav aria-label='Legal'>
+              <ul className='flex items-center gap-x-5'>
+                {LEGAL_LINKS.map(({ label, href }) => (
+                  <li key={label}>
+                    <Link
+                      href={href}
+                      className='rounded-sm text-text-tertiary underline underline-offset-2 transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
+                    >
+                      {label}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+            <ul className='flex flex-wrap items-center gap-x-5 gap-y-2'>
+              {SOCIAL_LINKS.map(({ label, href, icon: Icon, external }) => (
+                <li key={label}>
+                  <a
+                    href={href}
+                    {...(external && {
+                      target: '_blank',
+                      rel: 'noopener noreferrer',
+                    })}
+                    className='inline-flex items-center gap-1.5 rounded-sm text-text-tertiary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
+                  >
+                    <Icon className='size-4' aria-hidden='true' />
+                    <span>{label}</span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       </footer>
     </div>

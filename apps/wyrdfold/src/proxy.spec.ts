@@ -199,3 +199,39 @@ describe('proxy middleware: Content-Security-Policy-Report-Only (audit #29 M1)',
     expect(reportOnly).toBeTruthy();
   });
 });
+
+describe('proxy middleware: public legal pages', () => {
+  const original: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    original[URL_VAR] = process.env[URL_VAR];
+    original[ANON_VAR] = process.env[ANON_VAR];
+    setEnv(URL_VAR, 'https://proj.supabase.co');
+    setEnv(ANON_VAR, 'anon-key');
+    // Anonymous visitor — the case that matters for public legal pages.
+    mockGetUser.mockResolvedValue({ data: { user: null } });
+  });
+
+  afterEach(() => {
+    setEnv(URL_VAR, original[URL_VAR]);
+    setEnv(ANON_VAR, original[ANON_VAR]);
+    mockGetUser.mockReset();
+  });
+
+  it.each(['/terms', '/privacy'])(
+    'serves %s to anonymous visitors without redirecting to /login',
+    async path => {
+      const res = await proxy(new NextRequest(`https://app.test${path}`));
+      // A public page response carries no redirect Location...
+      expect(res.headers.get('location')).toBeNull();
+      // ...and still ships the enforced CSP like every other route.
+      expect(res.headers.get(ENFORCED_HEADER)).toBeTruthy();
+    }
+  );
+
+  it('still redirects a protected route (/dashboard) to /login when anonymous', async () => {
+    // Contrast: the allowlist is exact, not a blanket open-up.
+    const res = await proxy(new NextRequest('https://app.test/dashboard'));
+    expect(res.headers.get('location')).toContain('/login');
+  });
+});
