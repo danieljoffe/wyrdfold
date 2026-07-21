@@ -8,10 +8,12 @@ packages:
 # webpack-dev-server) so the osv-scanner CI gate starts green.
 overrides:
   adm-zip: '>=0.6.0' # GHSA-xcpc-8h2w-3j85 zip-slip (transitive dev-only, @nx module-federation)
-  axios: ^1.16.0
+  axios: ^1.18.0 # GHSA-gcfj-64vw-6mp9 + cluster (was ^1.16.0 → resolved vuln 1.16.1)
   tmp: ^0.2.4
   form-data: ^4.0.6
-  js-yaml: ^4.2.0
+  js-yaml: ^4.3.0 # GHSA-52cp-r559-cp3m (was ^4.2.0, which still allowed the vuln)
+  body-parser: '>=1.20.6' # GHSA-v422-hmwv-36x6 DoS
+  'brace-expansion@5': 5.0.7 # GHSA-3jxr-9vmj-r5cp ReDoS (scoped to 5.x; 1.x/2.x untouched)
   '@opentelemetry/core': 2.8.0
   '@opentelemetry/resources': 2.8.0
   '@opentelemetry/sdk-trace-base': 2.8.0
