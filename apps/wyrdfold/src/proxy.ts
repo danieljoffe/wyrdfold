@@ -248,6 +248,19 @@ export async function proxy(request: NextRequest) {
     return supabaseResponse;
   }
 
+  // Public legal pages — readable by everyone, signed in or not (unlike `/`,
+  // which bounces signed-in users to /dashboard). They must be reachable
+  // pre-signup: prospective users read them before creating an account, and
+  // the payment processor requires public Terms/Privacy URLs.
+  if (pathname === '/terms' || pathname === '/privacy') {
+    supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
+    return supabaseResponse;
+  }
+
   if (!user) {
     const url = request.nextUrl.clone();
     url.pathname = '/login';
