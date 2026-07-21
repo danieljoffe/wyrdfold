@@ -2,8 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
 
-// Placeholder — confirm the real legal-contact mailbox before publishing.
-const CONTACT_EMAIL = 'legal@wyrdfold.com';
+const LEGAL_EMAIL = 'legal@wyrdfold.com';
 
 export const metadata: Metadata = {
   title: 'Terms of Service — WyrdFold',
@@ -18,12 +17,14 @@ const SECTIONS: LegalSection[] = [
     body: (
       <p>
         These Terms of Service (“Terms”) govern your use of WyrdFold, operated
-        by [Legal Entity Name] (“we”, “us”). By creating an account or using the
-        service, you agree to these Terms and to our{' '}
+        by [Legal Entity Name] (“we”, “us”). Please read these Terms together
+        with our{' '}
         <Link className='underline underline-offset-2' href='/privacy'>
           Privacy Policy
         </Link>
-        . If you do not agree, do not use WyrdFold.
+        , which forms part of your agreement with WyrdFold. By creating an
+        account or using the service, you agree to these Terms. If you do not
+        agree, do not use WyrdFold.
       </p>
     ),
   },
@@ -40,12 +41,21 @@ const SECTIONS: LegalSection[] = [
   {
     heading: 'What WyrdFold does',
     body: (
-      <p>
-        WyrdFold surfaces job postings relevant to your profile, scores how well
-        they fit, and uses AI to draft tailored resumes and cover letters based
-        on the experience you provide. It is a tool to assist your job search —
-        it is not a recruiter, employment agency, or career advisor.
-      </p>
+      <>
+        <p>
+          WyrdFold is software designed to assist your job search: it surfaces
+          job postings relevant to your profile, scores how well they fit, and
+          uses AI to draft tailored resumes and cover letters from the
+          experience you provide. It is <b>not</b> a recruiter, employment
+          agency, staffing service, career advisor, or legal or professional
+          advisor, and no employment relationship is created through your use of
+          the service.
+        </p>
+        <p>
+          Job listings originate from third-party sources and may change or be
+          removed at any time without notice.
+        </p>
+      </>
     ),
   },
   {
@@ -67,6 +77,10 @@ const SECTIONS: LegalSection[] = [
         <ul className='ml-5 list-disc space-y-1'>
           <li>
             use WyrdFold for any unlawful, misleading, or fraudulent purpose;
+          </li>
+          <li>
+            use the service in violation of applicable export-control or
+            sanctions laws;
           </li>
           <li>
             upload data about other people that you do not have the right to
@@ -103,6 +117,15 @@ const SECTIONS: LegalSection[] = [
     ),
   },
   {
+    heading: 'Feedback',
+    body: (
+      <p>
+        If you send us suggestions, ideas, or feedback about WyrdFold, you grant
+        us the right to use that feedback without compensation or restriction.
+      </p>
+    ),
+  },
+  {
     heading: 'AI-generated content — no guarantees',
     body: (
       <>
@@ -110,7 +133,9 @@ const SECTIONS: LegalSection[] = [
           Match scores, role suggestions, and generated documents are produced
           by automated AI systems. They may be{' '}
           <b>inaccurate, incomplete, or unsuitable</b>, and they are provided to
-          assist — not replace — your own judgment.
+          assist — not replace — your own judgment. AI-generated content may
+          resemble content generated for other users and is not guaranteed to be
+          unique.
         </p>
         <p>
           <b>
@@ -129,12 +154,12 @@ const SECTIONS: LegalSection[] = [
     body: (
       <p>
         WyrdFold offers a free tier and paid subscription plans. Paid plans are
-        billed in advance on a recurring basis through Stripe until cancelled.
-        You can cancel at any time from your account; cancellation takes effect
-        at the end of the current billing period. Fees are [non-refundable
-        except where required by law / subject to the refund terms stated at
-        checkout]. Prices and taxes are as shown at purchase and may change on
-        notice.
+        billed in advance on a recurring basis until cancelled. Billing is
+        handled by Stripe under its own terms and privacy practices. You can
+        cancel at any time from your account; cancellation takes effect at the
+        end of the current billing period. Fees are non-refundable except where
+        required by law. Prices and taxes are as shown at purchase and may
+        change on notice.
       </p>
     ),
   },
@@ -142,10 +167,12 @@ const SECTIONS: LegalSection[] = [
     heading: 'Bring-your-own-key (BYOK)',
     body: (
       <p>
-        If you supply your own AI provider API key, you are responsible for all
-        usage and costs incurred on that key and for complying with that
-        provider’s terms. You may remove your key at any time; we store it only
-        to make requests on your behalf.
+        If you supply your own AI provider API key, you authorize us to send
+        requests to that provider using it on your behalf. You are responsible
+        for all usage and costs incurred on that key and for complying with that
+        provider’s terms. If the key is removed, revoked, or becomes invalid, AI
+        features may stop working. We store the key only to make requests on
+        your behalf and use it for no other purpose.
       </p>
     ),
   },
@@ -161,6 +188,22 @@ const SECTIONS: LegalSection[] = [
     ),
   },
   {
+    heading: 'Copyright complaints',
+    body: (
+      <p>
+        If you believe content on WyrdFold infringes your copyright, contact us
+        at{' '}
+        <a
+          className='underline underline-offset-2'
+          href={`mailto:${LEGAL_EMAIL}`}
+        >
+          {LEGAL_EMAIL}
+        </a>{' '}
+        with the details, and we will review it.
+      </p>
+    ),
+  },
+  {
     heading: 'Third-party services',
     body: (
       <p>
@@ -172,13 +215,24 @@ const SECTIONS: LegalSection[] = [
     ),
   },
   {
+    heading: 'Beta features',
+    body: (
+      <p>
+        We may offer experimental or beta features. These may be changed or
+        discontinued at any time and are provided without warranty.
+      </p>
+    ),
+  },
+  {
     heading: 'Disclaimers',
     body: (
       <p>
         The service is provided “as is” and “as available,” without warranties
         of any kind, whether express or implied, including fitness for a
         particular purpose and non-infringement, to the fullest extent permitted
-        by law.
+        by law. We do not guarantee that the service will be uninterrupted,
+        timely, secure, or error-free — third-party AI providers and
+        infrastructure may be unavailable at times.
       </p>
     ),
   },
@@ -189,9 +243,8 @@ const SECTIONS: LegalSection[] = [
         To the fullest extent permitted by law, we will not be liable for any
         indirect, incidental, or consequential damages, or for lost
         opportunities or employment outcomes. Our total liability for any claim
-        relating to the service is limited to [the greater of the amount you
-        paid us in the prior 12 months or USD $100]. [Confirm the cap and
-        carve-outs with counsel.]
+        relating to the service is limited to the greater of the amount you paid
+        us in the prior 12 months or USD&nbsp;$100.
       </p>
     ),
   },
@@ -203,8 +256,41 @@ const SECTIONS: LegalSection[] = [
         suspend or terminate access if you breach these Terms or to protect the
         service or other users. On termination, your right to use the service
         ends; sections that by their nature should survive will remain in
-        effect.
+        effect. Following account deletion, we may retain certain information
+        where required by law, for fraud prevention, dispute resolution, or to
+        enforce these Terms — as described in our{' '}
+        <Link className='underline underline-offset-2' href='/privacy'>
+          Privacy Policy
+        </Link>
+        .
       </p>
+    ),
+  },
+  {
+    heading: 'General',
+    body: (
+      <ul className='ml-5 list-disc space-y-1'>
+        <li>
+          <b>Entire agreement.</b> These Terms and the Privacy Policy constitute
+          the entire agreement between you and WyrdFold regarding the service.
+        </li>
+        <li>
+          <b>Severability.</b> If any provision is found unenforceable, the
+          remainder of these Terms continues in effect.
+        </li>
+        <li>
+          <b>Waiver.</b> Our failure to enforce any provision does not waive our
+          right to enforce it later.
+        </li>
+        <li>
+          <b>Assignment.</b> We may assign these Terms in connection with a
+          merger, acquisition, or sale of assets.
+        </li>
+        <li>
+          <b>Force majeure.</b> We are not liable for any failure or delay
+          caused by events beyond our reasonable control.
+        </li>
+      </ul>
     ),
   },
   {
@@ -224,7 +310,7 @@ const SECTIONS: LegalSection[] = [
       <p>
         These Terms are governed by the laws of [Jurisdiction], without regard
         to its conflict-of-laws rules, and any disputes will be resolved in the
-        courts of [Jurisdiction]. [Confirm with counsel.]
+        courts of [Jurisdiction].
       </p>
     ),
   },
@@ -235,9 +321,9 @@ const SECTIONS: LegalSection[] = [
         Questions about these Terms? Email{' '}
         <a
           className='underline underline-offset-2'
-          href={`mailto:${CONTACT_EMAIL}`}
+          href={`mailto:${LEGAL_EMAIL}`}
         >
-          {CONTACT_EMAIL}
+          {LEGAL_EMAIL}
         </a>
         .
       </p>
@@ -249,11 +335,11 @@ export default function TermsPage() {
   return (
     <LegalDocument
       title='Terms of Service'
-      effective='[Effective date — set on legal sign-off]'
+      effective='July 21, 2026'
       intro={
         <p>
-          These terms govern your use of WyrdFold. Please read them alongside
-          our{' '}
+          These terms govern your use of WyrdFold. Please read them together
+          with our{' '}
           <Link className='underline underline-offset-2' href='/privacy'>
             Privacy Policy
           </Link>
