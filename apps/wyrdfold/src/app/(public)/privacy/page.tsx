@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
 
-// Placeholder — confirm the real legal-contact mailbox before publishing.
-const CONTACT_EMAIL = 'privacy@wyrdfold.com';
+const PRIVACY_EMAIL = 'privacy@wyrdfold.com';
+const LEGAL_EMAIL = 'legal@wyrdfold.com';
 
 export const metadata: Metadata = {
   title: 'Privacy Policy — WyrdFold',
@@ -11,6 +11,14 @@ export const metadata: Metadata = {
     'How WyrdFold collects, uses, and protects your data — including how your resume and job information are processed by AI.',
   robots: { index: true, follow: true },
 };
+
+function MailLink({ address }: { address: string }) {
+  return (
+    <a className='underline underline-offset-2' href={`mailto:${address}`}>
+      {address}
+    </a>
+  );
+}
 
 const SECTIONS: LegalSection[] = [
   {
@@ -20,14 +28,7 @@ const SECTIONS: LegalSection[] = [
         WyrdFold (“we”, “us”) is operated by [Legal Entity Name], [registered
         address]. This policy explains what personal data we process when you
         use WyrdFold and the choices you have. For any privacy question, contact
-        us at{' '}
-        <a
-          className='underline underline-offset-2'
-          href={`mailto:${CONTACT_EMAIL}`}
-        >
-          {CONTACT_EMAIL}
-        </a>
-        .
+        us at <MailLink address={PRIVACY_EMAIL} />.
       </p>
     ),
   },
@@ -51,9 +52,10 @@ const SECTIONS: LegalSection[] = [
             WyrdFold drafts for you.
           </li>
           <li>
-            <b>Usage &amp; device data</b> — basic analytics and log data (pages
-            visited, actions taken, IP address, browser) used to operate and
-            improve the service.
+            <b>Usage &amp; device data</b> — we may collect your IP address,
+            browser type, device identifiers, pages visited, referring URLs,
+            timestamps, and interactions with the service, used to operate and
+            improve it.
           </li>
           <li>
             <b>Billing data</b> — if you subscribe, your payment is handled by
@@ -82,9 +84,15 @@ const SECTIONS: LegalSection[] = [
         <p>
           To score matches and draft applications, the relevant parts of your
           profile and the job text are sent to third-party large-language-model
-          providers through <b>OpenRouter</b>. <b>Zero-Data-Retention</b> is
-          enabled on that account, so those providers do not retain your content
-          after processing your request.
+          providers through <b>OpenRouter</b> (a service that securely routes
+          requests to AI model providers).{' '}
+          <b>Only the information necessary to complete your request is sent</b>
+          , and <b>Zero-Data-Retention</b> is enabled on that account, so those
+          providers do not retain your content after processing your request.
+        </p>
+        <p>
+          If you provide your own AI provider API key (BYOK), we use it only to
+          make requests on your behalf and for no other purpose.
         </p>
         <p>We rely on the following sub-processors to run WyrdFold:</p>
         <ul className='ml-5 list-disc space-y-1'>
@@ -109,46 +117,82 @@ const SECTIONS: LegalSection[] = [
             product analytics.
           </li>
         </ul>
-        <p className='text-text-tertiary'>
-          [Confirm this list and each provider’s region/DPA with counsel before
-          publishing.]
-        </p>
       </>
     ),
   },
   {
     heading: 'Legal bases for processing',
     body: (
-      <p>
-        Where the GDPR or similar laws apply, we process your data to perform
-        our contract with you (running the service), on the basis of your
-        consent (e.g. optional alerts and analytics), and for our legitimate
-        interests in operating and securing WyrdFold. [Confirm the applicable
-        bases for your jurisdiction.]
-      </p>
+      <>
+        <p>
+          Where the GDPR or similar laws apply, we rely on the following legal
+          bases:
+        </p>
+        <ul className='ml-5 list-disc space-y-1'>
+          <li>
+            <b>Running the service</b> (matching, generation, account) —
+            performance of our contract with you.
+          </li>
+          <li>
+            <b>Billing and receipts</b> — performance of our contract.
+          </li>
+          <li>
+            <b>Security and fraud prevention</b> — our legitimate interests.
+          </li>
+          <li>
+            <b>Analytics</b> — your consent, where required.
+          </li>
+          <li>
+            <b>Optional job-alert emails</b> — your consent.
+          </li>
+        </ul>
+      </>
     ),
   },
   {
     heading: 'How we share data',
     body: (
-      <p>
-        We share your data only with the sub-processors listed above, where you
-        direct us to (for example, exporting a document), and where required by
-        law. We do not sell your personal data.
-      </p>
+      <>
+        <p>
+          We share your data only with the sub-processors listed above, where
+          you direct us to (for example, exporting a document), and where
+          required by law — such as in response to a court order, subpoena, or a
+          fraud investigation.
+        </p>
+        <p>
+          If WyrdFold is acquired, merged, or sells assets, your data may
+          transfer as part of that transaction.{' '}
+          <b>We do not sell your personal data</b>, and we do not use your
+          personal information for cross-context behavioral advertising.
+        </p>
+      </>
     ),
   },
   {
     heading: 'Data retention and deletion',
     body: (
-      <p>
-        We keep your data for as long as your account is active. You can
-        permanently delete your account and its data at any time from{' '}
-        <span className='font-mono text-sm'>Settings → Delete account</span>,
-        which erases your profile, generated documents, and associated records.
-        Some records may be retained where the law requires (for example,
-        billing records).
-      </p>
+      <>
+        <p>
+          We keep your data for as long as your account is active. You can
+          permanently delete your account and its data at any time from{' '}
+          <span className='font-mono text-sm'>Settings → Delete account</span>.
+          Indicative retention periods:
+        </p>
+        <ul className='ml-5 list-disc space-y-1'>
+          <li>
+            deleted accounts and their profile data are removed within 30 days;
+          </li>
+          <li>
+            backups that may still contain the data are cycled out within 30
+            days;
+          </li>
+          <li>
+            billing records are retained for up to 7 years where required by
+            law.
+          </li>
+        </ul>
+        <p>Generated resumes and cover letters remain your content.</p>
+      </>
     ),
   },
   {
@@ -157,28 +201,52 @@ const SECTIONS: LegalSection[] = [
       <p>
         Depending on where you live, you may have the right to access, correct,
         delete, export, or object to the processing of your personal data, and
-        to withdraw consent. You can exercise most of these in-app, or contact
-        us at{' '}
-        <a
-          className='underline underline-offset-2'
-          href={`mailto:${CONTACT_EMAIL}`}
-        >
-          {CONTACT_EMAIL}
-        </a>
-        . You also have the right to complain to your local data-protection
-        authority.
+        to withdraw consent — for example under the GDPR (EEA/UK) or the
+        CCPA/CPRA (California). You can exercise most of these in-app, or
+        contact us at <MailLink address={PRIVACY_EMAIL} />. You also have the
+        right to complain to your local data-protection authority.
       </p>
     ),
   },
   {
-    heading: 'Cookies',
+    heading: 'California privacy rights',
     body: (
-      <p>
-        We use essential cookies to keep you signed in and to secure the
-        service, and analytics cookies to understand usage. You can control
-        non-essential cookies through your browser or any consent controls we
-        provide.
-      </p>
+      <>
+        <p>
+          If you are a California resident, the CCPA/CPRA gives you the right to
+          know what personal information we collect and how we use it, to
+          request access to or deletion of it, to correct it, and not to be
+          discriminated against for exercising these rights.
+        </p>
+        <p>
+          We do not sell your personal information and do not use it for
+          cross-context behavioral advertising. To exercise your rights, contact
+          us at <MailLink address={PRIVACY_EMAIL} />.
+        </p>
+      </>
+    ),
+  },
+  {
+    heading: 'Cookies and tracking',
+    body: (
+      <>
+        <p>We use a small number of cookies and similar technologies:</p>
+        <ul className='ml-5 list-disc space-y-1'>
+          <li>
+            <b>Essential &amp; authentication</b> — to keep you signed in and to
+            secure the service. These are required for WyrdFold to work.
+          </li>
+          <li>
+            <b>Analytics</b> — Google Analytics uses cookies and/or local
+            storage to help us understand usage.
+          </li>
+        </ul>
+        <p>
+          You can control non-essential cookies through your browser or any
+          consent controls we provide. WyrdFold does not currently respond to
+          browser “Do Not Track” signals.
+        </p>
+      </>
     ),
   },
   {
@@ -187,8 +255,7 @@ const SECTIONS: LegalSection[] = [
       <p>
         Your data may be processed in countries other than your own, including
         the United States. Where required, we rely on appropriate safeguards
-        (such as Standard Contractual Clauses) for those transfers. [Confirm
-        with counsel.]
+        (such as Standard Contractual Clauses) for those transfers.
       </p>
     ),
   },
@@ -196,9 +263,13 @@ const SECTIONS: LegalSection[] = [
     heading: 'Security',
     body: (
       <p>
-        We protect your data with per-user access controls (row-level security),
-        encryption in transit, scoped credentials, and regular security review.
-        No system is perfectly secure, but we work to keep your data safe.
+        We protect your data with technical and organizational safeguards,
+        including encryption in transit, access controls, and least-privilege
+        permissions. Because sign-in is a magic link, we encourage you to
+        protect access to your email account, since it is used to authenticate
+        you. No system is perfectly secure, but we work to keep your data safe,
+        and if required by law we will notify affected users of a personal data
+        breach.
       </p>
     ),
   },
@@ -225,14 +296,9 @@ const SECTIONS: LegalSection[] = [
     heading: 'Contact',
     body: (
       <p>
-        Questions about your privacy? Email{' '}
-        <a
-          className='underline underline-offset-2'
-          href={`mailto:${CONTACT_EMAIL}`}
-        >
-          {CONTACT_EMAIL}
-        </a>{' '}
-        or write to [Legal Entity Name], [registered address].
+        Questions about your privacy? Email <MailLink address={PRIVACY_EMAIL} />{' '}
+        (privacy) or <MailLink address={LEGAL_EMAIL} /> (legal), or write to
+        [Legal Entity Name], [registered address].
       </p>
     ),
   },
@@ -242,11 +308,11 @@ export default function PrivacyPage() {
   return (
     <LegalDocument
       title='Privacy Policy'
-      effective='[Effective date — set on legal sign-off]'
+      effective='July 21, 2026'
       intro={
         <p>
-          This policy explains how WyrdFold handles your personal data. It sits
-          alongside our{' '}
+          This Privacy Policy explains how WyrdFold handles your personal data.
+          It should be read together with our{' '}
           <Link className='underline underline-offset-2' href='/terms'>
             Terms of Service
           </Link>
