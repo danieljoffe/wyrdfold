@@ -100,14 +100,19 @@ async def _apply_fit_score(
     in ``fit_score`` / ``fit_score_reasoning`` once the LLM returns.
     """
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
-    cost_log.record(
+    # supabase-py is sync; this runs inside a BackgroundTask that FastAPI *awaits*
+    # on the event loop (an async bg task is not threadpooled), so each blocking
+    # round-trip is offloaded to keep it off the loop (#107).
+    await asyncio.to_thread(
+        cost_log.record,
         supabase,
         user_id=user_id,
         purpose=FIT_SCORE_PURPOSE,
         result=llm_result,
         metadata={"target_id": target.id, "user_id": user_id},
     )
-    crud.link_user_to_target(
+    await asyncio.to_thread(
+        crud.link_user_to_target,
         supabase,
         user_id=user_id,
         target_id=target.id,
@@ -143,14 +148,19 @@ async def derive_manual_target_bg(
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
             derived, derive_result = await derive_profile_from_label(llm, label=label)
-            cost_log.record(
+            # Blocking supabase calls run in the threadpool: this bg task is an
+            # async fn FastAPI awaits on the event loop, so a bare call would
+            # block every concurrent request (#107).
+            await asyncio.to_thread(
+                cost_log.record,
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_LABEL_PURPOSE,
                 result=derive_result,
                 metadata={"user_id": user_id, "label": label},
             )
-            updated = crud.update(
+            updated = await asyncio.to_thread(
+                crud.update,
                 supabase,
                 target_id,
                 TargetUpdate(
@@ -181,10 +191,14 @@ async def derive_manual_target_bg(
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
+        )
     except Exception:
         logger.exception("Deferred manual-target derivation failed for target %s", target_id)
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
+        )
 
 
 def _contribute_reference_jd(
@@ -288,7 +302,12 @@ async def derive_url_target_bg(
             derived, derive_result = await derive_profile_from_jd(
                 llm, jd_text=jd_text, supabase=supabase
             )
-            cost_log.record(
+            # Blocking supabase work runs in the threadpool: this bg task is an
+            # async fn FastAPI awaits on the event loop, so bare calls would
+            # freeze every concurrent request (#107). _contribute_reference_jd
+            # bundles its own several round-trips, so one to_thread covers them.
+            await asyncio.to_thread(
+                cost_log.record,
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_JD_PURPOSE,
@@ -296,7 +315,8 @@ async def derive_url_target_bg(
                 metadata={"user_id": user_id, "jd_url": final_url},
             )
 
-            _contribute_reference_jd(
+            await asyncio.to_thread(
+                _contribute_reference_jd,
                 supabase,
                 user_id=user_id,
                 target_id=target_id,
@@ -308,8 +328,10 @@ async def derive_url_target_bg(
 
             # Flip activation status (a per-target column, not the shared
             # profile) and re-read the canonical post-merge target for scoring.
-            crud.update(supabase, target_id, TargetUpdate(activation_status="idle"))
-            target = crud.get(supabase, target_id)
+            await asyncio.to_thread(
+                crud.update, supabase, target_id, TargetUpdate(activation_status="idle")
+            )
+            target = await asyncio.to_thread(crud.get, supabase, target_id)
             if target is None:
                 logger.error("Target %s vanished during deferred URL derive", target_id)
                 return
@@ -320,10 +342,14 @@ async def derive_url_target_bg(
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
+        )
     except Exception:
         logger.exception("Deferred URL-target derivation failed for target %s", target_id)
-        crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await asyncio.to_thread(
+            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
+        )
 
 
 # ---- Inline create-or-link orchestration -----------------------------------
