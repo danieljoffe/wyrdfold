@@ -257,6 +257,14 @@ async def get_with_size_cap(
 # caller decides whether to swallow (e.g. 404 = empty board) or surface.
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
+# Upper bound on a honored ``Retry-After``. A remote server (a job board we
+# don't control, sometimes a user-supplied careers URL) could otherwise send
+# ``Retry-After: 86400`` and park a poll worker until the poll-cycle watchdog
+# cancels the whole cycle — starving every source not yet polled that tick
+# (hardening review 2026-07-21, Perf-F3). Sits well under the cycle timeout yet
+# above any legitimate short back-off.
+_MAX_RETRY_AFTER_S = 60.0
+
 
 class FetchExhaustedError(Exception):
     """Raised by ``request_with_retry`` when all retry attempts fail.
@@ -342,7 +350,15 @@ async def request_with_retry(
         if attempt == retries:
             break
 
-        delay = _retry_after_seconds(resp) or _backoff_seconds(attempt, backoff_base, backoff_cap)
+        retry_after = _retry_after_seconds(resp)
+        if retry_after is None:
+            delay = _backoff_seconds(attempt, backoff_base, backoff_cap)
+        else:
+            # Honor Retry-After, but clamp so no single server can park the
+            # worker arbitrarily long (Perf-F3). Explicit None check (not `or`)
+            # so a legitimate ``Retry-After: 0`` means "retry now", not "fall
+            # back to backoff".
+            delay = min(retry_after, _MAX_RETRY_AFTER_S)
         logger.warning(
             "retrying %s %s after %s in %.2fs (attempt %d/%d)",
             method,

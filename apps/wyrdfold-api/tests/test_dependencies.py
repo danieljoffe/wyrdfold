@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
@@ -16,6 +17,8 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase_for_caller,
+    refresh_jwks_cache,
+    try_decode_jwt_sub_cache_only,
     verify_api_key,
     verify_api_key_or_jwt,
     verify_supabase_jwt,
@@ -600,3 +603,120 @@ def test_caller_client_no_auth_401():
     with pytest.raises(HTTPException) as exc:
         get_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
+
+
+# ---- Warm JWKS cache / on-loop rate-limit key_func (Perf-F1) -----------------
+
+
+class _FakePyJWK:
+    """PyJWK-shaped: a key id + the verifying key."""
+
+    def __init__(self, kid: Any, key: Any) -> None:
+        self.key_id = kid
+        self.key = key
+
+
+class _FakeJWKSet:
+    def __init__(self, keys: list[Any]) -> None:
+        self.keys = keys
+
+
+class _JWKSClientWithSet:
+    """Fake PyJWKClient exposing get_jwk_set (what refresh_jwks_cache calls)."""
+
+    def __init__(self, keys: list[Any]) -> None:
+        self._keys = keys
+        self.fetches = 0
+
+    def get_jwk_set(self, refresh: bool = False) -> _FakeJWKSet:
+        self.fetches += 1
+        return _FakeJWKSet(self._keys)
+
+
+class _ExplodingJWKSClient:
+    """Any use is a blocking fetch we must never make on the event loop."""
+
+    def get_jwk_set(self, refresh: bool = False) -> Any:
+        raise AssertionError("cache-only path must not fetch JWKS")
+
+    def get_signing_key_from_jwt(self, token: str) -> Any:
+        raise AssertionError("cache-only path must not fetch JWKS")
+
+
+@pytest.fixture
+def warm_cache() -> Iterator[None]:
+    """Clear the module-level warm key set around each test (it's global)."""
+    from app import dependencies
+
+    dependencies._jwks_keys.clear()
+    yield
+    dependencies._jwks_keys.clear()
+
+
+def test_refresh_jwks_cache_populates_warm_set(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    client = _JWKSClientWithSet([_FakePyJWK(TEST_KID, _PUBLIC_KEY), _FakePyJWK(None, _PUBLIC_KEY)])
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: client)
+
+    n = refresh_jwks_cache(_settings())
+
+    # The keyless entry is skipped; the kid'd one lands in the warm set.
+    assert n == 1
+    assert dependencies._jwks_keys[TEST_KID].key is _PUBLIC_KEY
+
+
+def test_cache_only_decode_returns_sub_for_cached_kid(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    dependencies._jwks_keys[TEST_KID] = _FakeSigningKey(_PUBLIC_KEY)
+    # Prove no fetch: any JWKS network use raises.
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    req = _make_request({"authorization": f"Bearer {_mint()}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) == USER_SUB
+
+
+def test_cache_only_decode_unknown_kid_returns_none_without_fetch(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    # Warm set has a DIFFERENT kid — the token's kid is unknown.
+    dependencies._jwks_keys["some-other-kid"] = _FakeSigningKey(_PUBLIC_KEY)
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    req = _make_request({"authorization": f"Bearer {_mint(kid='attacker-kid')}"})
+    # None → the key_func falls back to IP keying instead of blocking on a fetch.
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_cold_cache_returns_none(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+    req = _make_request({"authorization": f"Bearer {_mint()}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_rejects_wrong_signature(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    dependencies._jwks_keys[TEST_KID] = _FakeSigningKey(_PUBLIC_KEY)
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    # Signed by the other key → signature check against the cached key fails.
+    req = _make_request({"authorization": f"Bearer {_mint(private_pem=_OTHER_PRIVATE_PEM)}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_no_bearer_returns_none(warm_cache: None) -> None:
+    assert try_decode_jwt_sub_cache_only(_make_request(), _settings()) is None
