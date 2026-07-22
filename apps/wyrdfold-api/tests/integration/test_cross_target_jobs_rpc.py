@@ -170,6 +170,10 @@ def seeded_cross_target(service_client: Client) -> Iterator[tuple[str, set[str]]
                     is_us=True,
                     fs=now,
                     created=now,
+                    # purged implies archived (jobs_purged_implies_archived CHECK,
+                    # 20260721120000): a tombstone is always archived first. Set
+                    # both so the fixture models a reachable prod state.
+                    archived=now,
                     purged=now,
                 ),
                 _job(

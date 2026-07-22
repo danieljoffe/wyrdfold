@@ -127,3 +127,60 @@ async def test_unsupported_method_raises_value_error(mock_http_client: Any) -> N
             await request_with_retry("BREW", "https://example.com")
     finally:
         http_mod._client = original
+
+
+@pytest.mark.asyncio
+async def test_retry_after_clamped_to_ceiling(mock_http_client: Any, monkeypatch: Any) -> None:
+    """A huge Retry-After is clamped so one server can't park the worker until
+    the poll-cycle watchdog cancels the whole cycle (Perf-F3)."""
+    import app.http_client as http_mod
+
+    delays: list[float] = []
+
+    async def _capture(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(http_mod, "_sleep", _capture)
+    mock_http_client.get = AsyncMock(
+        side_effect=[_resp(429, headers={"retry-after": "86400"}), _resp(200)]
+    )
+    resp = await request_with_retry("GET", "https://example.com", retries=1)
+    assert resp.status_code == 200
+    assert delays == [http_mod._MAX_RETRY_AFTER_S]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_small_value_honored(mock_http_client: Any, monkeypatch: Any) -> None:
+    """A reasonable Retry-After (below the ceiling) is used verbatim."""
+    import app.http_client as http_mod
+
+    delays: list[float] = []
+
+    async def _capture(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(http_mod, "_sleep", _capture)
+    mock_http_client.get = AsyncMock(
+        side_effect=[_resp(429, headers={"retry-after": "5"}), _resp(200)]
+    )
+    await request_with_retry("GET", "https://example.com", retries=1)
+    assert delays == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_zero_means_retry_now(mock_http_client: Any, monkeypatch: Any) -> None:
+    """``Retry-After: 0`` means retry immediately — not fall back to backoff
+    (the old `or` treated 0.0 as falsy)."""
+    import app.http_client as http_mod
+
+    delays: list[float] = []
+
+    async def _capture(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr(http_mod, "_sleep", _capture)
+    mock_http_client.get = AsyncMock(
+        side_effect=[_resp(429, headers={"retry-after": "0"}), _resp(200)]
+    )
+    await request_with_retry("GET", "https://example.com", retries=1)
+    assert delays == [0.0]

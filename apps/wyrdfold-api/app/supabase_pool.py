@@ -39,6 +39,12 @@ _async_httpx: httpx.AsyncClient | None = None
 # headers are allocated per call.
 _user_httpx: httpx.Client | None = None
 
+# Deliberate ceiling for each sync postgrest pool (service-role singleton + the
+# shared user pool). The poller's to_thread fan-out is already gated well below
+# this by its own semaphores; this just caps the accidental worst case.
+_SYNC_MAX_CONNECTIONS = 25
+_SYNC_MAX_KEEPALIVE = 10
+
 
 def _build_http1_client() -> httpx.Client:
     """httpx transport for supabase clients — HTTP/1.1, never HTTP/2.
@@ -66,6 +72,17 @@ def _build_http1_client() -> httpx.Client:
         http2=False,
         follow_redirects=True,
         timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
+        # Bound the pool deliberately. Without limits httpx defaults to 100 max
+        # connections — and there are TWO sync pools (service-role singleton +
+        # shared user pool), so the worst case is 200 sockets to the Supabase
+        # pooler, undercutting the small-instance IO posture the async pool is
+        # explicitly capped for. In practice anyio's threadpool bounds it, but
+        # that ceiling was accidental; make it intentional (hardening review
+        # 2026-07-21, Perf-F6).
+        limits=httpx.Limits(
+            max_connections=_SYNC_MAX_CONNECTIONS,
+            max_keepalive_connections=_SYNC_MAX_KEEPALIVE,
+        ),
     )
 
 

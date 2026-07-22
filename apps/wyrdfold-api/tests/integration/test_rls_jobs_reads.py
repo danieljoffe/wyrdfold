@@ -218,7 +218,12 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "source_id": source_id,
                     "title": f"Job {name}",
                     "company_name": "Acme",
+                    # purged implies archived (jobs_purged_implies_archived CHECK,
+                    # 20260721120000) — a tombstone is always archived first, so a
+                    # purged-but-unarchived row is a state prod can't produce. Set
+                    # archived_at alongside purged_at to match the invariant.
                     "purged_at": ("2026-01-01T00:00:00Z" if name == "purged_pass" else None),
+                    "archived_at": ("2026-01-01T00:00:00Z" if name == "purged_pass" else None),
                 }
                 for name, jid in jobs.items()
             ]

@@ -108,13 +108,16 @@ def pipeline_insights(
     # the per-user tables underneath the service-layer user_id filters.
     supabase: Client = Depends(get_user_supabase),
 ) -> PipelineInsights:
-    target_ids = get_user_target_ids(supabase, user_id)
-    if not target_ids:
-        return _empty_pipeline()
+    # Cache first: the key is (user, period), so a hit needs no DB at all. The
+    # user_targets lookup only runs on a miss — the empty-targets early-return
+    # stays uncached so freshly-added targets show up immediately (Perf-F7).
     cache_key = make_cache_key(f"insights:pipeline:u={user_id}", period=period)
     cached: PipelineInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
+    target_ids = get_user_target_ids(supabase, user_id)
+    if not target_ids:
+        return _empty_pipeline()
     result = compute_pipeline(
         supabase,
         _since(period),
@@ -132,13 +135,13 @@ def target_insights(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> TargetInsights:
-    target_ids = get_user_target_ids(supabase, user_id)
-    if not target_ids:
-        return _empty_targets()
     cache_key = make_cache_key(f"insights:targets:u={user_id}", period=period)
     cached: TargetInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
+    target_ids = get_user_target_ids(supabase, user_id)
+    if not target_ids:
+        return _empty_targets()
     result = compute_targets(supabase, _since(period), target_ids=target_ids, user_id=user_id)
     insights_cache.set(cache_key, result)
     return result
@@ -150,13 +153,13 @@ def skills_cost_insights(
     user_id: str = Depends(get_current_user_id),
     supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> SkillsCostInsights:
-    target_ids = get_user_target_ids(supabase, user_id)
-    if not target_ids:
-        return _empty_skills_cost()
     cache_key = make_cache_key(f"insights:skills-cost:u={user_id}", period=period)
     cached: SkillsCostInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
+    target_ids = get_user_target_ids(supabase, user_id)
+    if not target_ids:
+        return _empty_skills_cost()
     result = compute_skills_cost(supabase, _since(period), user_id=user_id, target_ids=target_ids)
     insights_cache.set(cache_key, result)
     return result

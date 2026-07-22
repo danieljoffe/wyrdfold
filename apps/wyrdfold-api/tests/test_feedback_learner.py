@@ -220,6 +220,15 @@ class _FakeSupabase:
     def table(self, name: str) -> _FakeQuery:
         return _FakeQuery(self, name)
 
+    def rpc(self, fn: str, params: Any) -> _FakeQuery:
+        # The shared-profile write now goes through apply_target_profile_patch
+        # (SEC-2). Match a pushed response on (fn, "rpc"); params are logged as
+        # the payload so tests can assert p_next_profile / p_expected_version.
+        query = _FakeQuery(self, fn)
+        query._op = "rpc"
+        query._payload = params
+        return query
+
 
 @pytest.fixture()
 def fake() -> _FakeSupabase:
@@ -296,9 +305,12 @@ class TestMaybeRunLearner:
                 }
             ],
         )
-        # Update calls for targets + job_feedback. Push empty responses so
-        # the fake doesn't raise.
-        fake.push_response("targets", "update", [{"id": "t"}])
+        # The shared-profile write goes through the version-checked patch RPC
+        # (SEC-2), which returns the applied outcome + new version; the
+        # signal-consuming job_feedback update follows.
+        fake.push_response(
+            "apply_target_profile_patch", "rpc", [{"outcome": "applied", "new_version": 2}]
+        )
         fake.push_response("job_feedback", "update", [])
 
         result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
@@ -310,12 +322,41 @@ class TestMaybeRunLearner:
         assert "rep" in result.added_negative_keywords
         assert result.signals_consumed == 3
         assert result.profile_version_after == 2
-        # An update on targets was logged.
-        target_updates = [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
-        assert target_updates, "expected a targets update"
-        payload = target_updates[0]["payload"]
-        assert payload["profile_version"] == 2
+        # The profile write went through the RPC, version-checked against the
+        # version we read (1), not a raw targets .update().
+        rpc_calls = [
+            r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        ]
+        assert rpc_calls, "expected an apply_target_profile_patch RPC call"
+        params = rpc_calls[0]["payload"]
+        assert params["p_expected_version"] == 1
+        assert not [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
         # New negatives appended; existing "junior" preserved.
-        new_negatives = payload["scoring_profile"]["negative"]["keywords"]
+        new_negatives = params["p_next_profile"]["negative"]["keywords"]
         assert "junior" in new_negatives
         assert "sales" in new_negatives
+
+    def test_version_conflict_does_not_consume_signals(self, fake: _FakeSupabase) -> None:
+        # A concurrent writer bumped the profile: the patch RPC returns
+        # version_conflict, so the learner applies nothing AND leaves the
+        # pending signals unconsumed for a later run to retry (SEC-2).
+        fake.push_response(
+            "job_feedback",
+            "select",
+            [_row("sales rep").model_dump(mode="json") for _ in range(3)],
+        )
+        fake.push_response(
+            "targets",
+            "select",
+            [{"id": "t", "scoring_profile": {}, "profile_version": 1}],
+        )
+        fake.push_response(
+            "apply_target_profile_patch",
+            "rpc",
+            [{"outcome": "version_conflict", "new_version": None}],
+        )
+
+        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        assert result is None
+        # No job_feedback update means the signals stay pending for a retry.
+        assert not [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"]

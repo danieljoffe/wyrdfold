@@ -30,6 +30,7 @@ import pydantic
 from fastapi import BackgroundTasks, HTTPException
 from supabase import Client
 
+from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult
 from app.models.targets import (
@@ -62,13 +63,14 @@ from app.services.targets.fit_score import (
     derive_fit_score,
 )
 from app.services.targets.match import find_matching_target
-from app.services.targets.merge import merge_profiles
+from app.services.targets.merge import merge_reference_jds
 from app.services.targets.normalize_manual import (
     DEFAULT_PURPOSE as NORMALIZE_PURPOSE,
 )
 from app.services.targets.normalize_manual import (
     normalize_manual_input,
 )
+from app.services.targets.profile_writes import apply_profile_merge_rpc
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +187,83 @@ async def derive_manual_target_bg(
         crud.update(supabase, target_id, TargetUpdate(activation_status="error"))
 
 
+def _contribute_reference_jd(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    jd_text: str,
+    jd_url: str,
+    extracted_profile: ScoringProfile,
+    search_keywords: list[str],
+) -> None:
+    """Append a reference JD to a shared target and re-merge its profile under
+    the shared-profile write controls: the #47 per-user contribution cap, the
+    #5 contributor de-bias, and the #191 version-checked / follower-re-checked
+    merge RPC.
+
+    Mirrors ``POST /targets/{id}/reference-jds``. The URL corpus-builder used to
+    bypass all three — writing the JD unattributed, merging flat (so one
+    contributor's JDs dominated by count), and updating the shared profile with
+    a raw version-unguarded ``.update()`` — which let any authenticated follower
+    tilt a shared target's scoring profile (hardening review 2026-07-21, SEC-1).
+
+    Runs inside the deferred BackgroundTask, so an over-cap contribution is
+    logged and skipped (the caller still fit-scores against the current profile)
+    rather than surfaced as an HTTP error.
+    """
+    # #47 per-user cap — bounds a single follower's footprint on the shared
+    # profile. Over cap: skip the contribution entirely (do NOT touch the shared
+    # profile).
+    contributed = crud.count_user_reference_jds(supabase, target_id=target_id, user_id=user_id)
+    if contributed >= settings.reference_jd_max_per_user_per_target:
+        logger.info(
+            "URL corpus contribution skipped: user %s at reference-JD cap (%d) for target %s",
+            user_id,
+            settings.reference_jd_max_per_user_per_target,
+            target_id,
+        )
+        return
+
+    # Attributed to the contributing user so the merge can de-bias by contributor.
+    crud.add_reference_jd(
+        supabase,
+        target_id=target_id,
+        jd_text=jd_text,
+        jd_url=jd_url,
+        extracted_profile=extracted_profile,
+        user_id=user_id,
+    )
+
+    # De-biased re-merge written through the #191 merge RPC (in-DB follower
+    # re-check + optimistic version guard). Retry once on a concurrent-write
+    # version conflict, mirroring the reference-JD router.
+    for _attempt in range(2):
+        current = crud.get(supabase, target_id)
+        if current is None:
+            logger.error("Target %s vanished during URL corpus merge", target_id)
+            return
+        composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
+        outcome, _new_version = apply_profile_merge_rpc(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=composite.model_dump(),
+            expected_version=current.profile_version,
+            search_keywords=search_keywords,
+        )
+        if outcome == "version_conflict":
+            continue
+        if outcome != "applied":
+            logger.warning(
+                "URL corpus merge for target %s did not apply (outcome=%s)", target_id, outcome
+            )
+        return
+    logger.warning(
+        "URL corpus merge for target %s exhausted retries on version conflict", target_id
+    )
+
+
 async def derive_url_target_bg(
     supabase: Client,
     llm: LLMClient,
@@ -194,15 +273,15 @@ async def derive_url_target_bg(
     jd_text: str,
     final_url: str,
     payload: OptimizedPayload,
-    is_new: bool,
 ) -> None:
-    """Derive profile-from-JD, append the reference JD, re-merge, then fit score.
+    """Derive profile-from-JD, contribute the reference JD, re-merge, fit score.
 
     Runs as a ``BackgroundTask`` for both the new-target and matched
-    (corpus-building) URL flows. ``is_new`` controls whether the profile
-    version is bumped — matched targets bump so lazy re-scoring picks up
-    the newly-merged profile; brand-new targets stay at version 1. On
-    failure (or timeout) the target flips to ``error``.
+    (corpus-building) URL flows. The shared-profile write goes through
+    :func:`_contribute_reference_jd` so the corpus builder is held to the same
+    per-user cap + contributor de-bias + version-checked RPC as
+    ``POST /targets/{id}/reference-jds`` (SEC-1). On failure (or timeout) the
+    target flips to ``error``.
     """
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
@@ -217,35 +296,20 @@ async def derive_url_target_bg(
                 metadata={"user_id": user_id, "jd_url": final_url},
             )
 
-            crud.add_reference_jd(
+            _contribute_reference_jd(
                 supabase,
+                user_id=user_id,
                 target_id=target_id,
                 jd_text=jd_text,
                 jd_url=final_url,
                 extracted_profile=derived.scoring_profile,
-            )
-            all_jds = crud.list_reference_jds(supabase, target_id)
-            composite = (
-                merge_profiles([jd.extracted_profile for jd in all_jds])
-                if all_jds
-                else ScoringProfile()
+                search_keywords=derived.search_keywords,
             )
 
-            current = crud.get(supabase, target_id)
-            next_version = (
-                (current.profile_version + 1) if (not is_new and current is not None) else None
-            )
-            updated = crud.update(
-                supabase,
-                target_id,
-                TargetUpdate(
-                    scoring_profile=composite,
-                    search_keywords=derived.search_keywords,
-                    profile_version=next_version,
-                    activation_status="idle",
-                ),
-            )
-            target = updated or current
+            # Flip activation status (a per-target column, not the shared
+            # profile) and re-read the canonical post-merge target for scoring.
+            crud.update(supabase, target_id, TargetUpdate(activation_status="idle"))
+            target = crud.get(supabase, target_id)
             if target is None:
                 logger.error("Target %s vanished during deferred URL derive", target_id)
                 return
@@ -482,7 +546,6 @@ async def from_url(
             jd_text=jd_text,
             final_url=final_url,
             payload=payload,
-            is_new=False,
         )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
@@ -498,6 +561,5 @@ async def from_url(
         jd_text=jd_text,
         final_url=final_url,
         payload=payload,
-        is_new=True,
     )
     return CreateOrLinkResult(user_target=link, target=target, was_matched=False)

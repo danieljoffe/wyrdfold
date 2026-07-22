@@ -29,6 +29,7 @@ from app.models.feedback import (
     FeedbackSignal,
     LearnerPatchSummary,
 )
+from app.services.targets.profile_writes import apply_profile_patch_rpc
 
 logger = logging.getLogger(__name__)
 
@@ -266,14 +267,33 @@ def maybe_run_learner(
         negative["weight"] = -10.0
     profile["negative"] = negative
 
-    next_version = int(target_row.get("profile_version") or 1) + 1
-    supabase.table("targets").update(
-        {
-            "scoring_profile": profile,
-            "profile_version": next_version,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", target_id).execute()
+    # Write the shared profile through the #191 version-checked / follower-
+    # re-checked patch RPC — the same path the LLM learner and reference-JD
+    # merges use — instead of a raw read-modify-write ``.update()``. That closed
+    # the last un-migrated direct write to a shared ``scoring_profile``: a
+    # Python authz slip can't poison a profile every follower shares, and two
+    # concurrent learner runs (or a learner racing an LLM-learner / ref-JD
+    # merge) can't lose an update (hardening review 2026-07-21, SEC-2).
+    expected_version = int(target_row.get("profile_version") or 1)
+    outcome, new_version = apply_profile_patch_rpc(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        next_profile=profile,
+        expected_version=expected_version,
+    )
+    if outcome != "applied" or new_version is None:
+        # Concurrent writer bumped the version (version_conflict) or the in-DB
+        # membership re-check failed — leave the pending signals unconsumed so a
+        # later run retries against fresh state. The learner is re-runnable.
+        logger.info(
+            "Feedback learner deferred for (user=%s, target=%s): patch RPC outcome=%s",
+            user_id,
+            target_id,
+            outcome,
+        )
+        return None
+    next_version = new_version
 
     run_id = str(uuid.uuid4())
     consumed_ids = [r.id for r in pending]
