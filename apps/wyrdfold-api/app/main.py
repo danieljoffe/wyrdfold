@@ -17,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import Receive, Scope, Send
 
 from app.config import Settings, settings
+from app.dependencies import prewarm_and_start_jwks_refresher
 from app.http_client import close_http_client, close_safe_http_client
 from app.logging_config import init_logging
 from app.observability import init_sentry
@@ -46,6 +47,7 @@ from app.services.owner_provisioning import provision_owner
 from app.supabase_pool import (
     close_async_supabase,
     close_supabase,
+    get_async_supabase,
     get_supabase_pool,
     init_async_supabase,
     init_supabase,
@@ -221,6 +223,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if supabase_for_owner is not None and os.environ.get("WYRDFOLD_API_TESTING") != "1":
         provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
+    # Pre-warm the JWKS key set and start its out-of-band refresher, so the
+    # rate-limit key_func (which runs on the event loop) never blocks on a JWKS
+    # fetch (Perf-F1). Same test-flag guard as the other network-touching
+    # startup steps — no test boots the lifespan or should hit auth's network.
+    jwks_refresher = None
+    if os.environ.get("WYRDFOLD_API_TESTING") != "1":
+        jwks_refresher = await prewarm_and_start_jwks_refresher(settings)
     # Background cost-log flush task. Cron paths enqueue rows and the
     # buffer drains them in a single bulk INSERT every few seconds.
     # Started only when supabase is configured (otherwise enqueued rows
@@ -231,6 +240,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if jwks_refresher is not None:
+            jwks_refresher.cancel()
+            await asyncio.gather(jwks_refresher, return_exceptions=True)
         if scheduler is not None:
             scheduler.shutdown(wait=False)
         if supabase_for_buffer is not None:
@@ -507,22 +519,31 @@ async def ready() -> JSONResponse:
     alerting but leave liveness as the thing that decides "kill and
     restart". See railway.toml and the Dockerfile HEALTHCHECK.
 
-    Wrapped in ``asyncio.to_thread`` because supabase-py is synchronous;
-    a bare ``.execute()`` here would block the event loop (repo #107
-    convention, enforced by
-    ``tests/test_no_blocking_supabase_in_async_handlers.py``).
+    Prefers the async service-role client: ``asyncio.wait_for`` actually cancels
+    an in-flight async httpx request on timeout, so a slow Supabase can't strand
+    a threadpool worker for the full 120s postgrest client timeout — which, at LB
+    probe cadence, would starve the shared executor every ``to_thread`` handler
+    depends on (Perf-F4). Falls back to a ``to_thread``-wrapped sync ping (repo
+    #107 convention) when the async client isn't configured; a bare on-loop
+    ``.execute()`` would block the event loop.
     """
-    supabase = get_supabase_pool()
-    if supabase is None:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "dependency": "supabase", "reason": "unconfigured"},
-        )
+    async_supabase = get_async_supabase()
+    if async_supabase is not None:
+        ping = async_supabase.table("sources").select("id").limit(1).execute()
+    else:
+        supabase = get_supabase_pool()
+        if supabase is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "dependency": "supabase",
+                    "reason": "unconfigured",
+                },
+            )
+        ping = asyncio.to_thread(lambda: supabase.table("sources").select("id").limit(1).execute())
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(lambda: supabase.table("sources").select("id").limit(1).execute()),
-            timeout=_READY_PING_TIMEOUT_S,
-        )
+        await asyncio.wait_for(ping, timeout=_READY_PING_TIMEOUT_S)
     except Exception as exc:
         # Covers asyncio.TimeoutError (== TimeoutError in 3.11+) from the
         # wait_for deadline and any transport/SDK error from the ping.

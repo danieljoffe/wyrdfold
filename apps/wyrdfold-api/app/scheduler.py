@@ -414,6 +414,16 @@ def build_scheduler(
     return scheduler
 
 
+# APScheduler's default misfire grace is ~1s, so an interval tick that can't fire
+# on time because the loop is busy (a poll gather burst, a JWKS stall) is SILENTLY
+# SKIPPED — the job then waits a full extra interval, and the ledger catch-up only
+# heals it at next boot (hardening review 2026-07-21, Perf-F2). A grace window lets
+# a late tick still run; coalesce=True (set per-job) collapses multiple missed
+# ticks into one so the grace can't cause a backlog stampede.
+_POLL_MISFIRE_GRACE_S = 300  # 30-min tick — a few minutes late is harmless
+_SWEEP_MISFIRE_GRACE_S = 3600  # 12-24h sweeps — an hour of slack, matches the catch-ups
+
+
 def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
     """Build, start, and return the scheduler, or ``None`` when disabled.
 
@@ -456,6 +466,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            misfire_grace_time=_POLL_MISFIRE_GRACE_S,
         )
         logger.info(
             "poll scheduler registered (tick every %d min)",
@@ -470,6 +481,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
@@ -499,6 +511,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
@@ -528,6 +541,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
         # The interval above measures from PROCESS START, and this app deploys
         # near-daily — so a 24h tick effectively never elapsed (discovery ran
@@ -563,6 +577,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
         scheduler.add_job(
             _anchor_job_from_ledger,

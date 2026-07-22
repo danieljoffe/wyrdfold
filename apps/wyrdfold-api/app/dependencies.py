@@ -1,12 +1,14 @@
+import asyncio
 import hmac
 import logging
+import threading
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import jwt
 from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
-from jwt import PyJWKClient, PyJWKClientError
+from jwt import PyJWK, PyJWKClient, PyJWKClientError
 from supabase import Client
 
 from app.config import Settings, settings
@@ -274,6 +276,140 @@ def _decode_supabase_jwt(token: str, s: Settings) -> dict[str, object]:
     if not isinstance(sub, str) or not sub:
         raise HTTPException(status_code=401, detail="Invalid auth token")
     return payload
+
+
+# ---- Warm JWKS cache for the on-loop rate-limit key_func --------------------
+#
+# slowapi's middleware calls the limiter key_func synchronously inside its async
+# dispatch — on the event loop, on EVERY request. Decoding the JWT there via
+# PyJWKClient can trigger a BLOCKING JWKS network fetch: on the 300s cache
+# expiry, and — the attacker lever — on any token whose ``kid`` isn't cached
+# (PyJWT force-refreshes on an unknown kid). A flood of garbage-kid tokens
+# becomes a flood of blocking HTTPS round-trips serialized on the loop, stalling
+# every in-flight request (hardening review 2026-07-21, Perf-F1).
+#
+# Fix: the key_func decodes against THIS warm, in-memory key set and NEVER
+# fetches — an unknown kid just falls back to IP keying. It is pre-warmed at
+# startup and refreshed out-of-band (``prewarm_and_start_jwks_refresher``). The
+# authoritative route-dependency decode (``_decode_supabase_jwt``) is unchanged:
+# it runs in FastAPI's threadpool, where a fetch is off-loop and safe.
+_jwks_keys_lock = threading.Lock()
+_jwks_keys: dict[str, PyJWK] = {}
+
+
+def refresh_jwks_cache(s: Settings) -> int:
+    """Blocking JWKS fetch → repopulate the warm key set. Returns the key count.
+
+    Call from a worker thread (``asyncio.to_thread``), never on the event loop.
+    """
+    jwk_set = _get_jwks_client(s).get_jwk_set(refresh=True)
+    fresh: dict[str, PyJWK] = {}
+    for key in jwk_set.keys:
+        kid = key.key_id
+        if kid:
+            fresh[kid] = key
+    with _jwks_keys_lock:
+        _jwks_keys.clear()
+        _jwks_keys.update(fresh)
+    return len(fresh)
+
+
+def _decode_jwt_cache_only(token: str, s: Settings) -> dict[str, object] | None:
+    """Verify a Supabase JWT against the warm key set ONLY — never fetches.
+
+    Returns the claims on success; None on an unknown kid, a cold cache, or an
+    invalid signature/claim. Same verification options as ``_decode_supabase_jwt``
+    (algorithms, exp/sub required, audience + issuer), so a returned ``sub`` is
+    authentic — the key_func can safely bucket by it.
+    """
+    try:
+        kid = jwt.get_unverified_header(token).get("kid")
+    except jwt.PyJWTError:
+        return None
+    if not isinstance(kid, str) or not kid:
+        return None
+    with _jwks_keys_lock:
+        signing_key = _jwks_keys.get(kid)
+    if signing_key is None:
+        return None
+    try:
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=_JWT_ALGORITHMS,
+            options={"require": ["exp", "sub"]},
+            audience=s.supabase_jwt_audience,
+            issuer=_issuer(s),
+        )
+    except jwt.PyJWTError:
+        return None
+
+
+def try_decode_jwt_sub_cache_only(request: Request, s: Settings) -> str | None:
+    """``sub`` from a valid Bearer token, decoded against the warm key set only.
+
+    For the rate-limit key_func, which runs on the event loop where a blocking
+    JWKS fetch would stall all in-flight requests. An unknown kid / cold cache
+    returns None so the caller IP-keys instead. Stamps the Sentry scope on
+    success (mirrors ``_try_decode_jwt_sub``, #26 F1).
+    """
+    if not s.supabase_url:
+        return None
+    token = _extract_bearer_token(request)
+    if not token:
+        return None
+    payload = _decode_jwt_cache_only(token, s)
+    if payload is None:
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return None
+    try:
+        import sentry_sdk
+
+        sentry_sdk.set_user({"id": sub})
+    except ImportError:  # pragma: no cover
+        pass
+    return sub
+
+
+# < PyJWKClient's 300s cache lifespan so the warm set never expires between
+# refreshes; also picks up a Supabase signing-key rotation within this window.
+_JWKS_REFRESH_INTERVAL_S = 240
+
+
+async def _jwks_refresh_loop(s: Settings) -> None:
+    while True:
+        await asyncio.sleep(_JWKS_REFRESH_INTERVAL_S)
+        try:
+            n = await asyncio.to_thread(refresh_jwks_cache, s)
+            logger.debug("jwks warm cache refreshed (%d keys)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("jwks warm-cache refresh failed: %s: %s", type(exc).__name__, exc)
+
+
+async def prewarm_and_start_jwks_refresher(s: Settings) -> "asyncio.Task[None] | None":
+    """Pre-warm the JWKS key set and start the out-of-band refresher.
+
+    Returns the refresher task (cancel it on shutdown) or None when Supabase
+    isn't configured. A pre-warm failure is logged, not raised — the rate
+    limiter degrades to IP keying until a refresh succeeds, and auth still works
+    (the route dependency fetches in the threadpool).
+    """
+    if not s.supabase_url:
+        return None
+    try:
+        n = await asyncio.to_thread(refresh_jwks_cache, s)
+        logger.info("jwks warm cache pre-warmed (%d keys)", n)
+    except Exception as exc:
+        logger.warning(
+            "jwks pre-warm failed (rate limiter IP-keys until refresh): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+    return asyncio.create_task(_jwks_refresh_loop(s))
 
 
 def verify_supabase_jwt(

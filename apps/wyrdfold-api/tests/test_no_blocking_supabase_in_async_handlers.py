@@ -44,9 +44,11 @@ not false-positive:
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from pathlib import Path
 
-ROUTERS_DIR = Path(__file__).resolve().parent.parent / "app" / "routers"
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
+ROUTERS_DIR = APP_DIR / "routers"
 
 
 def _is_router_handler(node: ast.AsyncFunctionDef) -> bool:
@@ -197,13 +199,21 @@ def _blocking_client_call_lines(handler: ast.AsyncFunctionDef) -> list[int]:
     return sorted(offenders)
 
 
-def _scan_source(source: str) -> list[tuple[str, int, list[int]]]:
-    """Return ``(handler_name, def_lineno, offending_lines)`` — both a bare
-    ``.execute()`` on the loop and a blocking client-passing helper call."""
+def _scan_source(
+    source: str,
+    should_scan: Callable[[ast.AsyncFunctionDef], bool] = _is_router_handler,
+) -> list[tuple[str, int, list[int]]]:
+    """Return ``(fn_name, def_lineno, offending_lines)`` — both a bare
+    ``.execute()`` on the loop and a blocking client-passing helper call.
+
+    ``should_scan`` selects which ``async def``s to check. It defaults to router
+    handlers; the background-task scan (below) passes a name predicate to reuse
+    the exact same blocking-call detection on service-layer bg functions.
+    """
     tree = ast.parse(source)
     offenders: list[tuple[str, int, list[int]]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and _is_router_handler(node):
+        if isinstance(node, ast.AsyncFunctionDef) and should_scan(node):
             lines = sorted(
                 set(_unwrapped_execute_lines(node)) | set(_blocking_client_call_lines(node))
             )
@@ -229,6 +239,54 @@ def test_no_blocking_supabase_execute_in_async_handlers() -> None:
             )
 
     assert not failures, "Blocking supabase call(s) on the event loop:\n" + "\n".join(failures)
+
+
+# ---- Form (3): async background-task functions (add_task / spawn_detached
+# ---- targets). FastAPI *awaits* an async bg task on the event loop rather than
+# ---- threadpooling it (only a plain `def` bg task is threadpooled), so a
+# ---- blocking supabase call inside one freezes every concurrent request — the
+# ---- same failure as an async route handler, but in app/services where the
+# ---- router scan above never looks. The detection is identical; only the set
+# ---- of scanned functions differs.
+#
+# Scoped, for now, to the target-derivation module's bg functions (the ones the
+# 2026-07-21 hardening review threaded). Broadening to the poll / discovery /
+# learner bg tasks (run_force_poll_locked, run_discovery_all_targets_locked,
+# _safe_run_learner) needs each audited/threaded first, so it's a follow-up —
+# adding them here before that would just flip this guard red.
+_BG_TASK_MODULES: dict[Path, frozenset[str]] = {
+    APP_DIR
+    / "services"
+    / "targets"
+    / "from_input.py": frozenset(
+        {"derive_url_target_bg", "derive_manual_target_bg", "_apply_fit_score"}
+    ),
+}
+
+
+def _async_def_names(source: str) -> set[str]:
+    return {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef)}
+
+
+def test_no_blocking_supabase_in_background_tasks() -> None:
+    failures: list[str] = []
+    for path, names in _BG_TASK_MODULES.items():
+        assert path.exists(), f"bg-task module moved? {path}"
+        source = path.read_text()
+        # Guard the guard: if a tracked function is renamed/removed, fail loudly
+        # rather than silently covering nothing (offender-only scans can't do this,
+        # since a correctly-threaded function has no offending lines to report).
+        missing = names - _async_def_names(source)
+        assert not missing, f"tracked bg functions not found in {path.name}: {sorted(missing)}"
+        for name, def_line, exec_lines in _scan_source(source, lambda n, ns=names: n.name in ns):
+            failures.append(
+                f"{path.name}:{def_line} async def {name}() runs a blocking supabase "
+                f"round-trip on the event loop (lines {exec_lines}). It is an async "
+                f"BackgroundTask (add_task awaits it on the loop), so wrap each blocking "
+                f"call in `await asyncio.to_thread(...)`. See #107."
+            )
+
+    assert not failures, "Blocking supabase call(s) in background tasks:\n" + "\n".join(failures)
 
 
 # ---- Self-tests: prove the scanner catches the regression and doesn't
@@ -385,6 +443,34 @@ def test_scanner_passes_awaited_async_helper() -> None:
 
 def test_scanner_passes_background_task_add() -> None:
     assert _scan_source(_BACKGROUND_TASK_OK) == []
+
+
+# ---- Form (3) self-test: the bg-task function scan (name predicate) -----------
+
+_BG_TASK_SOURCE = """
+import asyncio
+
+async def worker_bg(supabase, llm):
+    await llm.call()
+    crud.update(supabase, "t", body)                       # blocks the loop
+
+async def clean_bg(supabase, llm):
+    await llm.call()
+    await asyncio.to_thread(crud.update, supabase, "t", body)   # offloaded — safe
+
+async def not_tracked_bg(supabase):
+    crud.update(supabase, "t", body)                       # blocks, but not scanned
+"""
+
+
+def test_bg_scan_flags_blocking_call_only_in_tracked_functions() -> None:
+    tracked = {"worker_bg", "clean_bg"}
+    offenders = {
+        name for name, _l, _e in _scan_source(_BG_TASK_SOURCE, lambda n: n.name in tracked)
+    }
+    # worker_bg blocks and is tracked → flagged; clean_bg is threaded → clean;
+    # not_tracked_bg blocks but is outside the tracked set → not scanned.
+    assert offenders == {"worker_bg"}
 
 
 _THREADPOOL_SUBMIT_OK = """
