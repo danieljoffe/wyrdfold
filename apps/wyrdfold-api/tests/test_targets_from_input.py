@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import BackgroundTasks
 
+from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, LLMUsage
 from app.models.targets import (
@@ -198,6 +199,10 @@ def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder
             activation_status=body.activation_status or "idle",
             profile_version=body.profile_version or 1,
         )
+
+    # Default the URL corpus path under the per-user reference-JD cap; the
+    # cap-specific test overrides this. Only derive_url_target_bg reads it.
+    monkeypatch.setattr(crud, "count_user_reference_jds", lambda _s, **kw: 0)
 
     monkeypatch.setattr(crud, "link_user_to_target", fake_link)
     monkeypatch.setattr(crud, "update", fake_update)
@@ -619,7 +624,7 @@ async def test_from_url_matched_links_inline_defers_derivation(
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """Matched URL → link inline, schedule corpus-building derivation (is_new=False)."""
+    """Matched URL → link inline, schedule corpus-building derivation."""
     supabase = MagicMock()
     matched = _target(id="existing", profile_version=4)
     monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
@@ -649,7 +654,6 @@ async def test_from_url_matched_links_inline_defers_derivation(
     assert len(scheduled) == 1
     func, kwargs = scheduled[0]
     assert func is from_input.derive_url_target_bg
-    assert kwargs["is_new"] is False
     assert kwargs["target_id"] == "existing"
     assert kwargs["jd_text"] == "x" * 200
 
@@ -660,7 +664,7 @@ async def test_from_url_new_creates_deriving_and_schedules(
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """New URL → create in 'deriving', link, schedule derivation (is_new=True)."""
+    """New URL → create in 'deriving', link, schedule derivation."""
     supabase = MagicMock()
     monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: None)
 
@@ -695,7 +699,6 @@ async def test_from_url_new_creates_deriving_and_schedules(
     assert len(scheduled) == 1
     func, kwargs = scheduled[0]
     assert func is from_input.derive_url_target_bg
-    assert kwargs["is_new"] is True
     assert kwargs["target_id"] == "new"
 
 
@@ -746,12 +749,14 @@ async def test_from_url_label_resolution(
 
 
 @pytest.mark.asyncio
-async def test_derive_url_target_bg_new_does_not_bump_version(
+async def test_derive_url_target_bg_new_attributes_and_rpc_merges(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """New URL target: derive JD → add ref → merge → status idle, version untouched."""
+    """New URL target: the JD is attributed to the contributor and the shared
+    profile is written through the #191 merge RPC (not a raw ``.update()``),
+    then the status flips idle and the fit score follows (SEC-1)."""
     supabase = MagicMock()
 
     add_ref_calls: list[dict[str, Any]] = []
@@ -763,8 +768,14 @@ async def test_derive_url_target_bg_new_does_not_bump_version(
         ),  # type: ignore[func-returns-value]
     )
     monkeypatch.setattr(crud, "list_reference_jds", lambda _s, _t: [_ref_jd(target_id="new")])
-    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="new"))
-    monkeypatch.setattr(from_input, "merge_profiles", lambda _p: ScoringProfile())
+    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="new", profile_version=1))
+
+    rpc_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        from_input,
+        "apply_profile_merge_rpc",
+        lambda _s, **kw: rpc_calls.append(kw) or ("applied", 2),  # type: ignore[func-returns-value]
+    )
 
     await from_input.derive_url_target_bg(
         supabase,
@@ -774,25 +785,28 @@ async def test_derive_url_target_bg_new_does_not_bump_version(
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     assert "derive_from_jd" in stub_llm_helpers.names()
-    assert add_ref_calls and add_ref_calls[0]["target_id"] == "new"
+    # JD attributed to the contributor (enables the #5 contributor de-bias + #47 cap).
+    assert add_ref_calls and add_ref_calls[0]["user_id"] == "user-1"
+    # Shared-profile write went through the version-checked merge RPC, not .update().
+    assert rpc_calls and rpc_calls[0]["user_id"] == "user-1"
+    assert rpc_calls[0]["expected_version"] == 1
+    # Status flip (non-shared column) + fit score still happen.
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
-    assert update_body.profile_version is None  # new → no bump
-    # Fit score follows.
     assert stub_crud.by_name("link")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
-async def test_derive_url_target_bg_matched_bumps_version(
+async def test_derive_url_target_bg_matched_merges_via_rpc(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """Matched URL target: profile_version bumps from the current value."""
+    """Matched (corpus-building) URL target: the merge RPC is version-checked
+    against the target's current profile_version (SEC-1)."""
     supabase = MagicMock()
 
     monkeypatch.setattr(crud, "add_reference_jd", lambda _s, **kw: _ref_jd())
@@ -802,7 +816,13 @@ async def test_derive_url_target_bg_matched_bumps_version(
         lambda _s, _t: [_ref_jd(target_id="existing"), _ref_jd(target_id="existing")],
     )
     monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="existing", profile_version=4))
-    monkeypatch.setattr(from_input, "merge_profiles", lambda _p: ScoringProfile())
+
+    rpc_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        from_input,
+        "apply_profile_merge_rpc",
+        lambda _s, **kw: rpc_calls.append(kw) or ("applied", 5),  # type: ignore[func-returns-value]
+    )
 
     await from_input.derive_url_target_bg(
         supabase,
@@ -812,12 +832,57 @@ async def test_derive_url_target_bg_matched_bumps_version(
         jd_text="x" * 200,
         final_url="https://example.com/jobs/123",
         payload=OptimizedPayload(),
-        is_new=False,
     )
 
+    assert rpc_calls and rpc_calls[0]["expected_version"] == 4  # version-checked
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
-    assert update_body.profile_version == 5  # bumped from 4
     assert update_body.activation_status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_derive_url_target_bg_over_cap_skips_shared_write(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """A contributor already at the per-user reference-JD cap makes NO change to
+    the shared profile — no JD stored, no merge RPC — but still gets a fit score
+    against the existing profile (SEC-1 cap)."""
+    supabase = MagicMock()
+    monkeypatch.setattr(
+        crud,
+        "count_user_reference_jds",
+        lambda _s, **kw: settings.reference_jd_max_per_user_per_target,
+    )
+    add_ref_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        crud,
+        "add_reference_jd",
+        lambda _s, **kw: add_ref_calls.append(kw),  # type: ignore[func-returns-value]
+    )
+    rpc_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        from_input,
+        "apply_profile_merge_rpc",
+        lambda _s, **kw: rpc_calls.append(kw) or ("applied", 2),  # type: ignore[func-returns-value]
+    )
+    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="existing", profile_version=4))
+
+    await from_input.derive_url_target_bg(
+        supabase,
+        MagicMock(),
+        user_id="user-1",
+        target_id="existing",
+        jd_text="x" * 200,
+        final_url="https://example.com/jobs/123",
+        payload=OptimizedPayload(),
+    )
+
+    # Over cap → no shared-profile mutation at all.
+    assert add_ref_calls == []
+    assert rpc_calls == []
+    # But the user still gets their fit score.
+    assert stub_crud.by_name("link")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -841,7 +906,6 @@ async def test_derive_url_target_bg_marks_error_on_failure(
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     update_bodies = [c["body"] for c in stub_crud.by_name("update")]
@@ -873,7 +937,6 @@ async def test_derive_url_target_bg_marks_error_on_timeout(
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     update_bodies = [c["body"] for c in stub_crud.by_name("update")]
