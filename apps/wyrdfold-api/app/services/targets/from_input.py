@@ -41,6 +41,7 @@ from app.models.targets import (
     TargetSuggestion,
     TargetUpdate,
 )
+from app.services.experience.resolve import resolve_current_payload
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.targets import crud
@@ -98,7 +99,18 @@ async def _apply_fit_score(
     The user is already linked (the inline path created the
     ``user_targets`` row), so this is an idempotent upsert that just fills
     in ``fit_score`` / ``fit_score_reasoning`` once the LLM returns.
+
+    Scores against a payload FRESH vs. the user's current master document
+    (``resolve_current_payload``), not the one captured inline at request time.
+    A profile edited just before this target was created must affect its fit —
+    otherwise the score is silently computed against stale experience (BUG 2,
+    the stale-payload seam). ``payload`` (captured inline) is kept only as a
+    fallback for the rare case the live resolve yields nothing.
     """
+    fresh = await resolve_current_payload(
+        supabase, llm, cost_supabase=supabase, user_id=user_id
+    )
+    payload = fresh if fresh is not None else payload
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
     # supabase-py is sync; this runs inside a BackgroundTask that FastAPI *awaits*
     # on the event loop (an async bg task is not threadpooled), so each blocking
