@@ -21,10 +21,12 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.config import settings
 from app.services.experience import prose
 from app.services.experience.resolve import resolve_current_payload
-from app.services.llm import cost_log
+from app.services.llm import cost_log, provider_breaker
 from app.services.llm.client import LLMClient
+from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
 from app.services.targets import crud
 from app.services.targets.fit_score import DEFAULT_PURPOSE as FIT_SCORE_PURPOSE
 from app.services.targets.fit_score import derive_fit_score
@@ -85,9 +87,15 @@ async def refresh_stale_fit_scores(
     Runs as a FastAPI ``BackgroundTask`` (an async fn awaited on the event loop),
     so every blocking supabase round-trip is off-loaded to the threadpool (#107).
     """
-    payload, prose_doc_id = await resolve_current_payload(
-        supabase, llm, cost_supabase=supabase, user_id=user_id
-    )
+    try:
+        payload, prose_doc_id = await resolve_current_payload(
+            supabase, llm, cost_supabase=supabase, user_id=user_id
+        )
+    except (LLMQuotaExhaustedError, LLMRateLimitedError) as exc:
+        # resolve may itself derive from prose (an LLM call). If the provider is
+        # fatal, latch the breaker + bail — no point walking the targets.
+        provider_breaker.trip_provider_fatal(exc)
+        return 0
     if payload is None or prose_doc_id is None:
         return 0
 
@@ -124,9 +132,45 @@ async def refresh_stale_fit_scores(
                 fit_score_prose_doc_id=prose_doc_id,
             )
             refreshed += 1
+        except (LLMQuotaExhaustedError, LLMRateLimitedError) as exc:
+            # Provider-fatal (out of credits / sustained 429): every remaining
+            # target would fail the same way. Latch the shared breaker so this
+            # user's next /mine — and the poller — skip the doomed calls, and stop
+            # this batch here instead of hammering. This is what stops a credits
+            # outage from turning every /mine into a churn of failed refreshes.
+            provider_breaker.trip_provider_fatal(exc)
+            break
         except Exception:
             logger.exception("lazy fit-score refresh failed for target %s", target_id)
 
     if refreshed:
         logger.info("lazy fit-score refresh: %d target(s) for user %s", refreshed, user_id)
     return refreshed
+
+
+async def refresh_stale_for_user(supabase: Client, llm: LLMClient, *, user_id: str) -> None:
+    """Background entrypoint for the lazy refresh (E2): compute the user's current
+    profile version + which of their targets are stale, then refresh them —
+    ENTIRELY off the ``/targets/mine`` response path (the caller just schedules
+    this and returns the cached scores immediately).
+
+    Skips at the door when the provider-fatal breaker is latched (a credits
+    outage / sustained 429), so a down provider can't make every ``/mine`` view
+    re-schedule a doomed refresh + re-run the staleness query. The refresh itself
+    trips the breaker on the first fatal error, so the very first outage latches
+    it for the whole cooldown.
+    """
+    if provider_breaker.provider_fatal_active():
+        return
+    prose_doc_id = await asyncio.to_thread(current_prose_doc_id, supabase, user_id)
+    if prose_doc_id is None:
+        return
+    stale = await asyncio.to_thread(
+        stale_target_ids,
+        supabase,
+        user_id=user_id,
+        current_prose_doc_id=prose_doc_id,
+        limit=settings.fit_score_refresh_max_per_view,
+    )
+    if stale:
+        await refresh_stale_fit_scores(supabase, llm, user_id=user_id, target_ids=stale)

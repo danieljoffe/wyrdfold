@@ -12,7 +12,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.models.targets import JobTarget, ScoringProfile
+from app.services.llm import provider_breaker
+from app.services.llm.errors import LLMQuotaExhaustedError
 from app.services.targets import fit_refresh
+
+
+@pytest.fixture(autouse=True)
+def _reset_breaker() -> object:
+    """The provider-fatal latch is process-global; reset around each test."""
+    provider_breaker.reset_for_tests()
+    yield
+    provider_breaker.reset_for_tests()
 
 
 def _target(id: str = "t1") -> JobTarget:
@@ -167,3 +177,104 @@ async def test_refresh_noop_when_no_profile(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert n == 0
     assert updated == []
+
+
+# ---- provider-fatal breaker (the anti-churn guard) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_fatal_mid_batch_latches_and_aborts(
+    refresh_patches: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 402 mid-batch latches the shared breaker and stops the remaining targets
+    — no point hammering a provider that's out of credits."""
+    scored: list[str] = []
+
+    async def out_of_credits(llm, *, payload, target):  # type: ignore[no-untyped-def]
+        scored.append(target.id)
+        raise LLMQuotaExhaustedError(upstream_status=402)
+
+    monkeypatch.setattr(fit_refresh, "derive_fit_score", out_of_credits)
+
+    assert not provider_breaker.provider_fatal_active()
+    n = await fit_refresh.refresh_stale_fit_scores(
+        MagicMock(), MagicMock(), user_id="u1", target_ids=["a", "b", "c"]
+    )
+    assert n == 0
+    assert scored == ["a"]  # aborted after the first fatal — b, c never attempted
+    assert provider_breaker.provider_fatal_active()  # breaker latched
+
+
+@pytest.mark.asyncio
+async def test_provider_fatal_from_resolve_latches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider-fatal error from the payload resolve latches the breaker + bails
+    before walking any targets."""
+
+    async def resolve_402(supabase, llm, *, cost_supabase, user_id):  # type: ignore[no-untyped-def]
+        raise LLMQuotaExhaustedError(upstream_status=402)
+
+    monkeypatch.setattr(fit_refresh, "resolve_current_payload", resolve_402)
+
+    n = await fit_refresh.refresh_stale_fit_scores(
+        MagicMock(), MagicMock(), user_id="u1", target_ids=["a"]
+    )
+    assert n == 0
+    assert provider_breaker.provider_fatal_active()
+
+
+# ---- refresh_stale_for_user (the /mine background entrypoint) ----------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_for_user_skips_at_the_door_when_breaker_latched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Breaker latched → NO staleness query, NO refresh. This is what stops a
+    credits outage from making every /mine re-run the sweep + reschedule doom."""
+    provider_breaker.trip_provider_fatal(LLMQuotaExhaustedError(upstream_status=402))
+    touched = {"prose": 0, "stale": 0}
+
+    def prose_spy(_s, _u):  # type: ignore[no-untyped-def]
+        touched["prose"] += 1
+        return "p2"
+
+    def stale_spy(*_a, **_k):  # type: ignore[no-untyped-def]
+        touched["stale"] += 1
+        return []
+
+    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", prose_spy)
+    monkeypatch.setattr(fit_refresh, "stale_target_ids", stale_spy)
+
+    await fit_refresh.refresh_stale_for_user(MagicMock(), MagicMock(), user_id="u1")
+    assert touched == {"prose": 0, "stale": 0}  # short-circuited at the breaker
+
+
+@pytest.mark.asyncio
+async def test_refresh_for_user_delegates_when_clear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not latched + a profile + stale targets → delegates to the batch refresh."""
+    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: "p2")
+    monkeypatch.setattr(fit_refresh, "stale_target_ids", lambda _s, **_k: ["a", "b"])
+    got: dict = {}
+
+    async def spy(_s, _llm, *, user_id, target_ids):  # type: ignore[no-untyped-def]
+        got["user_id"] = user_id
+        got["target_ids"] = target_ids
+
+    monkeypatch.setattr(fit_refresh, "refresh_stale_fit_scores", spy)
+
+    await fit_refresh.refresh_stale_for_user(MagicMock(), MagicMock(), user_id="u1")
+    assert got == {"user_id": "u1", "target_ids": ["a", "b"]}
+
+
+@pytest.mark.asyncio
+async def test_refresh_for_user_noop_without_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: None)
+    called = {"n": 0}
+
+    async def spy(_s, _llm, *, user_id, target_ids):  # type: ignore[no-untyped-def]
+        called["n"] += 1
+
+    monkeypatch.setattr(fit_refresh, "refresh_stale_fit_scores", spy)
+
+    await fit_refresh.refresh_stale_for_user(MagicMock(), MagicMock(), user_id="u1")
+    assert called["n"] == 0

@@ -25,6 +25,7 @@ import pytest
 
 from app.config import settings as live_settings
 from app.services import poller as poller_mod
+from app.services.llm import provider_breaker
 from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
 from app.services.qualification import QualificationTags, qualification_hash
 
@@ -519,9 +520,11 @@ class TestProviderFastFail:
 
     @pytest.fixture(autouse=True)
     def _reset_latch(self) -> Any:
-        poller_mod._provider_fatal_until = 0.0
+        # The latch now lives in the shared provider_breaker module (imported into
+        # poller as the same private names); reset it there so it can't leak.
+        provider_breaker.reset_for_tests()
         yield
-        poller_mod._provider_fatal_until = 0.0
+        provider_breaker.reset_for_tests()
 
     @pytest.mark.asyncio
     async def test_402_latches_breaker_and_leaves_row_null(
@@ -556,7 +559,7 @@ class TestProviderFastFail:
     @pytest.mark.asyncio
     async def test_active_breaker_skips_the_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        poller_mod._provider_fatal_until = time.monotonic() + 300.0  # latched
+        provider_breaker._provider_fatal_until = time.monotonic() + 300.0  # latched
         sb = _supabase_capturing_updates(rec)
 
         await poller_mod._qualify_one_job(MagicMock(), sb, _row())
@@ -589,9 +592,9 @@ class TestProviderFastFail:
 
     @pytest.mark.asyncio
     async def test_triage_gate_honors_the_breaker(self) -> None:
-        poller_mod._provider_fatal_until = time.monotonic() + 300.0
+        provider_breaker._provider_fatal_until = time.monotonic() + 300.0
         assert await poller_mod._triage_budget_blocks(MagicMock()) is True
 
     def test_breaker_auto_clears_after_cooldown(self) -> None:
-        poller_mod._provider_fatal_until = time.monotonic() - 1.0  # in the past
+        provider_breaker._provider_fatal_until = time.monotonic() - 1.0  # in the past
         assert not poller_mod._provider_fatal_active()
