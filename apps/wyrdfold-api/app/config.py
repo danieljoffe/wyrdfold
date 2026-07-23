@@ -649,6 +649,14 @@ class Settings(BaseSettings):
     # subsequent views. 0 disables the lazy refresh entirely.
     fit_score_refresh_max_per_view: int = Field(default=3, ge=0, le=50)
 
+    # Concurrency cap for the pre-scan embedding write fan-out (job_embeddings
+    # HNSW upserts). Much lower than DB_WRITE_CONCURRENCY (12) on purpose: HNSW
+    # index inserts largely serialize internally + are IO-heavy, so a wide
+    # fan-out just piles contention on a small instance and STARVES foreground
+    # reads (the /jobs statement-timeouts, 2026-07-23) without real throughput.
+    # A few in flight keeps ingestion moving while leaving IO for user reads.
+    embedding_write_concurrency: int = Field(default=3, ge=1, le=32)
+
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
     # queries; ops opt-in via env var. When enabled the scheduler ticks every

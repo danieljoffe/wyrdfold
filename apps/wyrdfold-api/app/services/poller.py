@@ -1101,7 +1101,10 @@ async def _embed_jobs(
         logger.exception("Pre-scan embed: embeddings client unavailable; skipping")
         return
 
-    sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
+    # Dedicated, SMALL cap (not DB_WRITE_CONCURRENCY): concurrent HNSW inserts
+    # contend + starve foreground reads on a small instance (2026-07-23). A few
+    # in flight keeps ingestion moving without saturating IO.
+    sem = asyncio.Semaphore(settings.embedding_write_concurrency)
 
     async def _one(row: dict[str, Any]) -> None:
         async with sem:
