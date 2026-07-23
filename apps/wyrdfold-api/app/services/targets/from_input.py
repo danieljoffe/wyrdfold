@@ -582,6 +582,52 @@ async def from_suggestion(
     )
 
 
+def _schedule_url_bg_tasks(
+    background_tasks: BackgroundTasks,
+    supabase: Client,
+    llm: LLMClient,
+    *,
+    user_id: str,
+    target_id: str,
+    jd_text: str,
+    final_url: str,
+    extracted_title: str | None,
+    company_name: str | None,
+    location: str | None,
+    salary_text: str | None,
+    payload: OptimizedPayload,
+) -> None:
+    """Schedule the two deferred halves of the from-url flow for ``target_id``.
+
+    1. ``derive_url_target_bg`` — profile derivation, reference-JD contribution,
+       fit score, and job materialization.
+    2. ``register_source_from_url`` — register the company's board as a pollable
+       source (best-effort, capped) so we pull MORE jobs from it going forward.
+
+    Registration is scheduled AFTER derive so the user-visible deriving→ready
+    flip isn't held behind the ATS probe. Shared by both the matched and
+    newly-created branches so their scheduling can't drift (a new
+    ``derive_url_target_bg`` arg added to one branch but missed in the other).
+    """
+    background_tasks.add_task(
+        derive_url_target_bg,
+        supabase,
+        llm,
+        user_id=user_id,
+        target_id=target_id,
+        jd_text=jd_text,
+        final_url=final_url,
+        extracted_title=extracted_title,
+        company_name=company_name,
+        location=location,
+        salary_text=salary_text,
+        payload=payload,
+    )
+    background_tasks.add_task(
+        register_source_from_url, supabase, user_id=user_id, final_url=final_url
+    )
+
+
 async def from_url(
     supabase: Client,
     llm: LLMClient,
@@ -611,8 +657,8 @@ async def from_url(
         link = crud.link_user_to_target(
             supabase, user_id=user_id, target_id=matched.id, is_active=False
         )
-        background_tasks.add_task(
-            derive_url_target_bg,
+        _schedule_url_bg_tasks(
+            background_tasks,
             supabase,
             llm,
             user_id=user_id,
@@ -625,20 +671,13 @@ async def from_url(
             salary_text=salary_text,
             payload=payload,
         )
-        # Also feed the job search: register the company's board as a pollable
-        # source (best-effort, capped) so we pull MORE jobs from it going
-        # forward. Scheduled AFTER derive so the user-visible deriving→ready
-        # flip isn't held behind the ATS probe.
-        background_tasks.add_task(
-            register_source_from_url, supabase, user_id=user_id, final_url=final_url
-        )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
     target = crud.create(supabase, payload=TargetCreate(label=label))
     target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
     link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
-    background_tasks.add_task(
-        derive_url_target_bg,
+    _schedule_url_bg_tasks(
+        background_tasks,
         supabase,
         llm,
         user_id=user_id,
@@ -650,9 +689,5 @@ async def from_url(
         location=location,
         salary_text=salary_text,
         payload=payload,
-    )
-    # Also feed the job search — see the matched branch above.
-    background_tasks.add_task(
-        register_source_from_url, supabase, user_id=user_id, final_url=final_url
     )
     return CreateOrLinkResult(user_target=link, target=target, was_matched=False)
