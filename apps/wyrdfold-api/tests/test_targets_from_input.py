@@ -169,6 +169,13 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
         recorder.record("fit_score", target_id=target.id)
         return FitScoreResult(fit_score=82, reasoning="Strong fit."), _llm_result()
 
+    # _apply_fit_score resolves a payload fresh vs. the current master doc
+    # (BUG 2 seam) before scoring; stub it so the fit path has an experience
+    # payload without hitting the real prose/optimized reads.
+    async def fake_resolve(supabase, llm, *, cost_supabase, user_id):  # type: ignore[no-untyped-def]
+        recorder.record("resolve_payload", user_id=user_id)
+        return OptimizedPayload()
+
     def fake_cost_record(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("cost_log", **kwargs)
 
@@ -176,6 +183,7 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
     monkeypatch.setattr(from_input, "derive_profile_from_label", fake_derive_label)
     monkeypatch.setattr(from_input, "derive_profile_from_jd", fake_derive_jd)
     monkeypatch.setattr(from_input, "derive_fit_score", fake_fit_score)
+    monkeypatch.setattr(from_input, "resolve_current_payload", fake_resolve)
     monkeypatch.setattr(cost_log, "record", fake_cost_record)
     return recorder
 

@@ -63,6 +63,7 @@ from app.models.targets import (
 from app.rate_limit import limiter
 from app.services.diagnostics.funnel import compute_target_funnel
 from app.services.experience import optimized
+from app.services.experience.resolve import resolve_current_payload
 from app.services.extract import (
     ExtractionResult,
     _extract_from_firecrawl,
@@ -1053,9 +1054,14 @@ async def link_target(
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
-    if doc is not None:
-        fit_result, result = await derive_fit_score(llm, payload=doc.payload, target=target)
+    # Fresh vs. the current master document, not a possibly-stale persisted
+    # optimized doc (BUG 2, the stale-payload seam) — a profile edited just
+    # before this link must affect the fit.
+    payload = await resolve_current_payload(
+        supabase, llm, cost_supabase=supabase, user_id=user_id
+    )
+    if payload is not None:
+        fit_result, result = await derive_fit_score(llm, payload=payload, target=target)
         await asyncio.to_thread(
             cost_log.record,
             supabase,
