@@ -179,11 +179,28 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
     def fake_cost_record(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("cost_log", **kwargs)
 
+    # The from-url flow now materializes the posting as a job (job_ingest) +
+    # saves it (user_jobs). Stub both so the orchestration tests stay offline;
+    # they record so tests can assert the posting was materialized + saved.
+    async def fake_materialize(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        recorder.record(
+            "materialize_job",
+            title=kwargs.get("title"),
+            company_name=kwargs.get("company_name"),
+            target_ids=[t.id for t in kwargs.get("targets", [])],
+        )
+        return "posting-1"
+
+    def fake_upsert_user_job(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        recorder.record("user_job", **kwargs)
+
     monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
     monkeypatch.setattr(from_input, "derive_profile_from_label", fake_derive_label)
     monkeypatch.setattr(from_input, "derive_profile_from_jd", fake_derive_jd)
     monkeypatch.setattr(from_input, "derive_fit_score", fake_fit_score)
     monkeypatch.setattr(from_input, "resolve_current_payload", fake_resolve)
+    monkeypatch.setattr(from_input, "materialize_and_score_job", fake_materialize)
+    monkeypatch.setattr(from_input.persistence, "upsert_user_job", fake_upsert_user_job)
     monkeypatch.setattr(cost_log, "record", fake_cost_record)
     return recorder
 
@@ -646,7 +663,9 @@ async def test_from_url_matched_links_inline_defers_derivation(
         final_url="https://example.com/jobs/123",
         extracted_title="Senior Frontend Engineer",
         jd_text="x" * 200,
-        label_override=None,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -693,7 +712,9 @@ async def test_from_url_new_creates_deriving_and_schedules(
         final_url="https://example.com/jobs/abc",
         extracted_title="Senior Frontend Engineer",
         jd_text="x" * 200,
-        label_override=None,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -712,22 +733,23 @@ async def test_from_url_new_creates_deriving_and_schedules(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("label_override", "extracted_title", "expected"),
+    ("extracted_title", "expected"),
     [
-        ("My Custom Label", "Different Extracted Title", "My Custom Label"),
-        (None, "Extracted Title", "Extracted Title"),
-        (None, None, "Untitled Target"),
+        ("Extracted Title", "Extracted Title"),
+        ("  Spaced Title  ", "Spaced Title"),  # trimmed
+        (None, "Untitled Target"),
+        ("   ", "Untitled Target"),  # whitespace-only → fallback
     ],
 )
 async def test_from_url_label_resolution(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
-    label_override: str | None,
     extracted_title: str | None,
     expected: str,
 ) -> None:
-    """Label precedence: override > extracted title > 'Untitled Target'."""
+    """Label always derives from the posting title (there is no user override) —
+    trimmed, with a blank/whitespace-only title falling back to 'Untitled Target'."""
     supabase = MagicMock()
     seen_labels: list[str] = []
     monkeypatch.setattr(
@@ -746,7 +768,9 @@ async def test_from_url_label_resolution(
         final_url="https://example.com/jobs/x",
         extracted_title=extracted_title,
         jd_text="x" * 200,
-        label_override=label_override,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -792,6 +816,10 @@ async def test_derive_url_target_bg_new_attributes_and_rpc_merges(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -839,12 +867,61 @@ async def test_derive_url_target_bg_matched_merges_via_rpc(
         target_id="existing",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/123",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
     assert rpc_calls and rpc_calls[0]["expected_version"] == 4  # version-checked
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_derive_url_target_bg_materializes_and_saves_posting(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """The URL posting itself becomes a real, tailorable job: scored against the
+    freshly-derived target (``targets=[target]``) and saved to the user's pipeline
+    (``status='saved'``). This is the gap the from-url flow used to have — the JD
+    was dissolved into the profile as a reference JD and never became a job, so no
+    resume/cover letter could be generated for it."""
+    supabase = MagicMock()
+    monkeypatch.setattr(crud, "add_reference_jd", lambda _s, **kw: _ref_jd(target_id="new"))
+    monkeypatch.setattr(crud, "list_reference_jds", lambda _s, _t: [_ref_jd(target_id="new")])
+    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="new", profile_version=1))
+    monkeypatch.setattr(
+        from_input,
+        "apply_profile_merge_rpc",
+        lambda _s, **kw: ("applied", 2),
+    )
+
+    await from_input.derive_url_target_bg(
+        supabase,
+        MagicMock(),
+        user_id="user-1",
+        target_id="new",
+        jd_text="x" * 200,
+        final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    # Posting scored against the just-derived target (the re-read canonical row).
+    mat = stub_llm_helpers.by_name("materialize_job")
+    assert mat and mat[0]["target_ids"] == ["new"]
+    assert mat[0]["title"] == "Senior Frontend Engineer"
+    # ...and saved to the user's pipeline so it shows in /jobs + is tailorable.
+    saved = stub_llm_helpers.by_name("user_job")
+    assert saved and saved[0]["status"] == "saved"
+    assert saved[0]["job_posting_id"] == "posting-1"
 
 
 @pytest.mark.asyncio
@@ -883,6 +960,10 @@ async def test_derive_url_target_bg_over_cap_skips_shared_write(
         target_id="existing",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/123",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -913,6 +994,10 @@ async def test_derive_url_target_bg_marks_error_on_failure(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -944,6 +1029,10 @@ async def test_derive_url_target_bg_marks_error_on_timeout(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 

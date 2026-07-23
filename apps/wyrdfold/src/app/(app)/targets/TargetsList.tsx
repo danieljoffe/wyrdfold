@@ -344,7 +344,9 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const handleSubmitUrl = useCallback(
     (payload: UrlSubmission) => {
-      void runCreate('/api/targets/from-url', payload, payload.label ?? '');
+      // Empty pending label: the title is derived server-side from the posting,
+      // so the optimistic card shows the URL-mode skeleton until it resolves.
+      void runCreate('/api/targets/from-url', payload, '');
     },
     [runCreate]
   );

@@ -423,7 +423,7 @@ async def create_target_from_url(
         )
     final_url = vr.final_url
 
-    extracted_title, jd_text = await _fetch_jd_from_url(final_url)
+    extraction = await _fetch_jd_from_url(final_url)
 
     return await from_input.from_url(
         supabase,
@@ -431,9 +431,11 @@ async def create_target_from_url(
         background_tasks,
         user_id=user_id,
         final_url=final_url,
-        extracted_title=extracted_title,
-        jd_text=jd_text,
-        label_override=body.label,
+        extracted_title=extraction.title,
+        jd_text=extraction.description_html or "",
+        company_name=extraction.company_name,
+        location=extraction.location,
+        salary_text=extraction.salary_text,
         payload=doc.payload,
     )
 
@@ -1354,7 +1356,7 @@ async def create_target_from_posting(
 # ---- Reference JDs ---------------------------------------------------------
 
 
-async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
+async def _fetch_jd_from_url(url: str) -> ExtractionResult:
     """Fetch a JD page and run the extraction cascade (JSON-LD → meta → Firecrawl).
 
     Returns ``(title, jd_text)``. The title comes from the same extraction
@@ -1438,7 +1440,10 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
                 "Try pasting the JD text directly."
             ),
         )
-    return extraction.title, jd_text
+    # Return the whole extraction (title + company + location + description +
+    # salary) so the from-url flow can materialize a full job, not just derive
+    # a profile. jd_text above only validated that description_html is usable.
+    return extraction
 
 
 @router.post(
@@ -1512,7 +1517,16 @@ async def add_reference_jd(
     if not body.jd_text:
         if not body.jd_url:
             raise HTTPException(status_code=422, detail="Either jd_text or jd_url is required")
-        _, body.jd_text = await _fetch_jd_from_url(body.jd_url)
+        body.jd_text = (await _fetch_jd_from_url(body.jd_url)).description_html
+
+    if not body.jd_text:
+        # _fetch_jd_from_url validates a usable description before returning, but
+        # the model field is nullable — guard so the type narrows to str and the
+        # deferred closure below can't capture a None.
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract a job description from that URL.",
+        )
 
     # Bind to a non-None local: ``body.jd_text`` is guaranteed set past this
     # point, but the narrowing wouldn't survive into the deferred to_thread

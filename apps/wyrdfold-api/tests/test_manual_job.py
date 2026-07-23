@@ -125,6 +125,7 @@ class TestManualJobEndpoint:
 
         from app.models.targets import JobTarget, ScoringProfile
         from app.routers import jobs as jobs_router
+        from app.services import job_ingest
 
         target = JobTarget(
             id="tgt-1",
@@ -135,7 +136,9 @@ class TestManualJobEndpoint:
             updated_at=datetime.now(UTC),
         )
         monkeypatch.setattr(jobs_router, "get_active_for_user", lambda *_a, **_kw: [target])
-        monkeypatch.setattr(jobs_router, "update_global_score", lambda *_a, **_kw: None)
+        # Scoring + global-score moved into the shared job_ingest service; the
+        # router now delegates. Patch there.
+        monkeypatch.setattr(job_ingest, "update_global_score", lambda *_a, **_kw: None)
 
         captured: dict[str, object] = {}
 
@@ -144,7 +147,7 @@ class TestManualJobEndpoint:
             captured["gated"] = kwargs.get("gated")
             return None
 
-        monkeypatch.setattr(jobs_router, "target_score_and_upsert", fake_score)
+        monkeypatch.setattr(job_ingest, "score_and_upsert", fake_score)
 
         mock_service = MagicMock()
         mock_service.table.return_value.upsert.return_value.execute = MagicMock(

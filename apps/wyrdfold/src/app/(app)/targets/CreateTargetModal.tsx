@@ -16,7 +16,6 @@ export interface ManualSubmission {
 
 export interface UrlSubmission {
   jd_url: string;
-  label: string | undefined;
 }
 
 type Mode = 'search' | 'manual' | 'url';
@@ -44,13 +43,11 @@ export default function CreateTargetModal({
   const [mode, setMode] = useState<Mode>('search');
   const [label, setLabel] = useState('');
   const [description, setDescription] = useState('');
-  const [urlLabel, setUrlLabel] = useState('');
   const [jdUrl, setJdUrl] = useState('');
 
   const reset = useCallback(() => {
     setLabel('');
     setDescription('');
-    setUrlLabel('');
     setJdUrl('');
     setMode('search');
   }, []);
@@ -72,23 +69,11 @@ export default function CreateTargetModal({
     } else {
       const trimmedUrl = jdUrl.trim();
       if (!trimmedUrl) return;
-      const trimmedLabel = urlLabel.trim();
-      onSubmitUrl({
-        jd_url: trimmedUrl,
-        label: trimmedLabel || undefined,
-      });
+      // No user-supplied title — the label is always derived from the posting.
+      onSubmitUrl({ jd_url: trimmedUrl });
     }
     reset();
-  }, [
-    mode,
-    label,
-    description,
-    urlLabel,
-    jdUrl,
-    onSubmitManual,
-    onSubmitUrl,
-    reset,
-  ]);
+  }, [mode, label, description, jdUrl, onSubmitManual, onSubmitUrl, reset]);
 
   const canSubmit =
     mode === 'manual'
@@ -138,19 +123,11 @@ export default function CreateTargetModal({
         <div className='flex flex-col gap-4 pt-4'>
           <Input
             label='Job description URL'
-            helperText="We'll fetch the page and derive a scoring profile from the job description."
+            helperText="We'll fetch the page, derive a scoring profile, and add the posting as a saved job — the title comes from the posting itself."
             placeholder='https://...'
             value={jdUrl}
             onChange={e => setJdUrl(e.target.value)}
             type='url'
-          />
-          <Input
-            label='Title (optional)'
-            helperText='Leave blank to use the role title from the job posting.'
-            placeholder='e.g. Senior Frontend Engineer'
-            value={urlLabel}
-            onChange={e => setUrlLabel(e.target.value)}
-            maxLength={200}
           />
         </div>
       ),
