@@ -237,6 +237,20 @@ def _job(jid, source_id, title, company, family, *, is_us, fs, created, archived
     return row
 
 
+def _axes(score: int) -> dict[str, int]:
+    """Distinct-per-axis payload (#457): a non-uniform weight vector produces a
+    blend that differs from — and can reorder vs — the raw score, so the weighted
+    parity test isn't vacuous. Equal (default) weights reproduce the raw score
+    exactly: the four offsets sum to zero, so their mean is ``score`` (every
+    fixture score is in [10, 90], so nothing clamps)."""
+    return {
+        "title_fit": min(100, score + 5),
+        "skills_fit": max(0, score - 10),
+        "seniority_fit": min(100, score + 10),
+        "domain_fit": max(0, score - 5),
+    }
+
+
 def _score(job_id, target_id, score, *, graded):
     return {
         "job_posting_id": job_id,
@@ -245,7 +259,7 @@ def _score(job_id, target_id, score, *, graded):
         "excluded": False,
         "scoring_status": "complete" if graded else "stage2",
         # axis_scores present ⇔ graded (the real _is_pending signal).
-        "axis_scores": {"skills": score} if graded else None,
+        "axis_scores": _axes(score) if graded else None,
     }
 
 
@@ -261,6 +275,7 @@ def _rpc_page(service_client, user_id, target_ids, **kw):
         company=kw.get("company"),
         search=kw.get("search"),
         cursor=kw.get("cursor", {}),
+        weights_by_target=kw.get("weights_by_target"),
         user_id=user_id,
     )
 
@@ -279,7 +294,7 @@ def _py_page(service_client, user_id, target_ids, **kw):
         exclude_terms=[],
         only_terms=[],
         cursor=kw.get("cursor", {}),
-        weights_by_target=None,
+        weights_by_target=kw.get("weights_by_target"),
         user_id=user_id,
     )
 
@@ -322,6 +337,84 @@ def test_rpc_matches_python_across_matrix(
     rpc_meta = {p["id"]: (p["status"], p["pending"]) for p in rpc["postings"]}
     py_meta = {p["id"]: (p["status"], p["pending"]) for p in py["postings"]}
     assert rpc_meta == py_meta
+
+
+# Skewed axis weights (title + seniority heavy) that pull the blend off the raw
+# score — sums to 1.0 so the renormalization is a no-op the math still exercises.
+_SKEWED = {"title_fit": 0.4, "skills_fit": 0.1, "seniority_fit": 0.4, "domain_fit": 0.1}
+
+
+@pytest.mark.parametrize("decay", [False, True], ids=["decay-off", "decay-on"])
+@pytest.mark.parametrize("ascending", [False, True])
+@pytest.mark.parametrize("min_score", [0, 60])
+def test_rpc_weighted_blend_matches_python(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    decay: bool,
+    ascending: bool,
+    min_score: int,
+) -> None:
+    """#457: with custom axis weights the RPC computes the weighted display blend
+    DB-side (``p_weights`` -> wyrdfold_display_score) instead of falling to the
+    scan-everything Python path. It must match the Python two-query overlay
+    EXACTLY — same order AND same per-row displayed score — across the same
+    divergence-prone fixture (dedup, off-family, liveness, Pending floor, decay).
+    This is the guardrail against SQL-vs-Python blend drift."""
+    from app.config import settings
+    from app.models.targets import AxisWeights
+
+    monkeypatch.setattr(settings, "recency_decay_enabled", decay)
+    user_id, target_ids = seeded_cross_target
+    weights = {tid: AxisWeights(**_SKEWED) for tid in target_ids}
+    kw = {
+        "sort": "score",
+        "ascending": ascending,
+        "min_score": min_score,
+        "weights_by_target": weights,
+    }
+    rpc = _rpc_page(service_client, user_id, target_ids, **kw)
+    py = _py_page(service_client, user_id, target_ids, **kw)
+
+    assert _ids(rpc) == _ids(py), (
+        f"weighted order drift asc={ascending} min={min_score} decay={decay}: "
+        f"rpc={_ids(rpc)} py={_ids(py)}"
+    )
+    # The displayed (weighted, undecayed-then-decayed) score matches per row.
+    rpc_score = {p["id"]: p["score"] for p in rpc["postings"]}
+    py_score = {p["id"]: p["score"] for p in py["postings"]}
+    assert rpc_score == py_score, f"weighted score drift: rpc={rpc_score} py={py_score}"
+
+
+def test_weighted_blend_actually_moves_the_score(
+    service_client: Client,
+    seeded_cross_target: tuple[str, set[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard against a vacuous parity test: prove the skewed weights actually pull
+    the displayed score off the raw score for at least one row. Without this, the
+    RPC==Python assertion would still pass if the blend were silently a no-op
+    (both returning the raw score)."""
+    from app.config import settings
+    from app.models.targets import AxisWeights
+
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    user_id, target_ids = seeded_cross_target
+    weights = {tid: AxisWeights(**_SKEWED) for tid in target_ids}
+
+    weighted = _rpc_page(
+        service_client, user_id, target_ids, sort="score", ascending=False,
+        weights_by_target=weights,
+    )
+    # raw_score rides along on every RPC row now (#457) — the undecayed Sonnet fit.
+    moved = [
+        p for p in weighted["postings"]
+        if not p["pending"] and p["score"] != p["raw_score"]
+    ]
+    assert moved, (
+        "skewed weights moved no displayed score off raw_score — the DB-side "
+        f"blend was not applied: {[(p['title'], p['score'], p['raw_score']) for p in weighted['postings']]}"
+    )
 
 
 def test_rpc_drops_offfamily_liveness_and_dedups(

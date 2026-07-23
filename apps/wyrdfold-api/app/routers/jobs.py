@@ -995,10 +995,12 @@ def _list_jobs_for_target(
     The two-query path also takes over when location filters are active, since
     the RPC paginates server-side with no knowledge of the location filter.
 
-    When ``axis_weights`` is set we skip the RPC and use the two-query path —
-    the RPC doesn't return ``axis_scores`` so it can't apply the overlay. This
-    keeps the v1 behaviour: the displayed ``score`` is the weighted blend,
-    sort order is unchanged (still raw / recency).
+    When ``axis_weights`` is set, the SCORE sort routes through the cross-target
+    RPC (restricted to this target), which now computes the weighted blend
+    DB-side (#457) — so a custom-weight target no longer scans everything into
+    Python to rank. NON-score sorts with weights still take the two-query path:
+    their keyset RPC (``get_target_jobs``) returns the raw score, so only the
+    Python overlay shows the weighted number.
 
     ``preferences`` is the caller's per-(user, target) read-time filter (#60).
     The score cutoff is folded into ``min_score`` by the caller (server-side);
@@ -1026,8 +1028,11 @@ def _list_jobs_for_target(
     # SQL, so only the two-query path can surface globally-archived rows
     # (UX/IA §5 Stage 1 "still reachable").
     has_logistics = logistics is not None and logistics.active
+    # A weighted SCORE sort no longer forces the scan — it routes through the
+    # cross-target RPC below, which blends DB-side (#457). Weighted NON-score
+    # sorts still need the two-query overlay (their keyset RPC returns raw score).
     if (
-        axis_weights is not None
+        (axis_weights is not None and sort != "score")
         or _preferences_have_post_fetch_filter(preferences)
         or has_logistics
         or status == "archived"
@@ -1065,6 +1070,10 @@ def _list_jobs_for_target(
                 company=company,
                 search=search,
                 cursor=cursor,
+                # #457: the RPC blends this target's custom weights DB-side.
+                weights_by_target=(
+                    {target_id: axis_weights} if axis_weights is not None else None
+                ),
                 user_id=user_id,
             )
         except _RpcIneligibleError as exc:
@@ -1078,8 +1087,15 @@ def _list_jobs_for_target(
                 "the slower two-query path",
                 exc_info=True,
             )
+        # Reached for a weighted score sort with a location / multi-word filter
+        # (the RPC can't express those) — keep axis_weights so the overlay still
+        # shows the blend, not the raw score.
         return _list_jobs_for_target_two_query(
-            supabase, preferences=preferences, logistics=logistics, **kwargs
+            supabase,
+            axis_weights=axis_weights,
+            preferences=preferences,
+            logistics=logistics,
+            **kwargs,
         )
     try:
         return _list_jobs_for_target_rpc(supabase, **kwargs)
@@ -1090,8 +1106,14 @@ def _list_jobs_for_target(
             "get_target_jobs RPC FAILED; degrading to the slower two-query path",
             exc_info=True,
         )
+    # Non-score keyset fallback: axis_weights is None here (weighted non-score
+    # sorts bail to two-query above), passed for consistency / future-proofing.
     return _list_jobs_for_target_two_query(
-        supabase, preferences=preferences, logistics=logistics, **kwargs
+        supabase,
+        axis_weights=axis_weights,
+        preferences=preferences,
+        logistics=logistics,
+        **kwargs,
     )
 
 
@@ -1107,6 +1129,7 @@ def _list_jobs_across_user_targets_rpc(
     company: str | None,
     search: str | None,
     cursor: dict[str, Any],
+    weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
     """Untargeted list via the server-side dedup+sort+paginate RPC (#365).
@@ -1119,10 +1142,20 @@ def _list_jobs_across_user_targets_rpc(
     statement-timeout path, #365). Offset-paginated to match the two-query
     cursor contract. Raises to fall back to the two-query path for the shapes
     the RPC can't express DB-side (the dispatcher gates most; multi-word search
-    is caught here since it uses OR semantics the RPC's single ILIKE can't)."""
+    is caught here since it uses OR semantics the RPC's single ILIKE can't).
+
+    ``weights_by_target`` (#457): per-target custom axis weights. When present
+    the RPC computes the weighted display blend DB-side (``p_weights``), so a
+    custom-weight view uses this fast path instead of the scan-everything
+    two-query fallback. Empty/None ⇒ the RPC ranks + returns the raw score
+    exactly as before (index-only)."""
     if search and len(_tokenize_search(search)) > 1:
         raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     offset = _offset_from_cursor(cursor)
+    # target_id -> axis-weight object, the JSONB map the RPC blends by. Only
+    # genuinely-customized weights reach here (defaults persist as NULL), so this
+    # is empty for the common case and the RPC stays on its index-only plan.
+    p_weights = {tid: w.model_dump() for tid, w in (weights_by_target or {}).items()}
     resp = supabase.rpc(
         "get_cross_target_jobs",
         {
@@ -1143,6 +1176,7 @@ def _list_jobs_across_user_targets_rpc(
             # (prod). The shared _apply_display_recency post-step still sets the
             # shown number; the RPC only needs the ORDER to match.
             "p_recency_decay": settings.recency_decay_enabled,
+            "p_weights": p_weights,
         },
     ).execute()
     if not isinstance(resp.data, list):
@@ -1180,16 +1214,17 @@ def _list_jobs_across_user_targets(
     Tries the server-side ``get_cross_target_jobs`` RPC first (single
     round-trip, DB-side status filter + dedup + rank + paginate — #365), then
     falls back to the two-query Python path. The RPC is skipped for shapes it
-    can't express: custom axis weights (the displayed score — hence the sort —
-    is a per-target blend the RPC can't reproduce), post-fetch location /
-    logistics filters (the RPC paginates with no knowledge of them, so its page
-    would carry pre-filter rows), and the archived view (the RPC gates to live
-    rows). Read-time recency decay is NOT a skip — the RPC ranks by the decayed
-    score DB-side (``p_recency_decay``). Those exceptions keep the two-query
-    path."""
+    can't express: post-fetch location / logistics filters (the RPC paginates
+    with no knowledge of them, so its page would carry pre-filter rows), and the
+    archived view (the RPC gates to live rows). Custom axis weights are NO LONGER
+    a skip (#457) — the RPC computes the per-target weighted blend DB-side
+    (``p_weights``), so custom-weight views take this fast path instead of the
+    scan-everything two-query fallback. Read-time recency decay is likewise not a
+    skip — the RPC ranks by the decayed score DB-side (``p_recency_decay``).
+    Those exceptions keep the two-query path."""
     has_location_filter = bool(exclude_terms or only_terms)
     has_logistics = logistics is not None and logistics.active
-    if weights_by_target or has_location_filter or has_logistics or status == "archived":
+    if has_location_filter or has_logistics or status == "archived":
         return _list_jobs_across_user_targets_two_query(
             supabase,
             user_target_ids=user_target_ids,
@@ -1219,6 +1254,7 @@ def _list_jobs_across_user_targets(
             company=company,
             search=search,
             cursor=cursor,
+            weights_by_target=weights_by_target,
             user_id=user_id,
         )
     except _RpcIneligibleError as exc:
