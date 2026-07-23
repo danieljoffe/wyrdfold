@@ -14,6 +14,7 @@ Covers ``poller._embed_jobs`` and the flag-gated on-ingest hook:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -120,6 +121,31 @@ class TestEmbedJobs:
         await poller_mod._embed_jobs(sb, [])
 
         assert rec["upsert_calls"] == []
+
+    async def test_fan_out_respects_embedding_write_concurrency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The embed fan-out is capped at ``settings.embedding_write_concurrency``
+        — concurrent HNSW inserts starve foreground reads on a small instance
+        (2026-07-23), so a burst of rows can't thundering-herd the DB."""
+        monkeypatch.setattr(settings, "embedding_write_concurrency", 2)
+        inflight = {"cur": 0, "max": 0}
+
+        async def tracking_upsert(_sb, _client, *, job_id, title, description_html, **_kw):  # type: ignore[no-untyped-def]
+            inflight["cur"] += 1
+            inflight["max"] = max(inflight["max"], inflight["cur"])
+            await asyncio.sleep(0.01)  # hold the slot so concurrency can build
+            inflight["cur"] -= 1
+            return "embedded"
+
+        monkeypatch.setattr(poller_mod, "get_embeddings_client", lambda: MagicMock())
+        monkeypatch.setattr(poller_mod, "upsert_job_embedding", tracking_upsert)
+
+        await poller_mod._embed_jobs(MagicMock(), [_row(id=str(i)) for i in range(8)])
+
+        # 8 rows, cap 2 → never more than 2 HNSW upserts in flight, and it does
+        # use the parallelism up to the cap (not serialized to 1).
+        assert inflight["max"] == 2
 
 
 class TestInertByDefault:
