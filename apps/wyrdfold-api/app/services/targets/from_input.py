@@ -110,7 +110,7 @@ async def _apply_fit_score(
     the stale-payload seam). ``payload`` (captured inline) is kept only as a
     fallback for the rare case the live resolve yields nothing.
     """
-    fresh = await resolve_current_payload(
+    fresh, prose_doc_id = await resolve_current_payload(
         supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     payload = fresh if fresh is not None else payload
@@ -134,6 +134,7 @@ async def _apply_fit_score(
         is_active=False,
         fit_score=fit_result.fit_score,
         fit_score_reasoning=fit_result.reasoning,
+        fit_score_prose_doc_id=prose_doc_id,
     )
 
 

@@ -644,6 +644,11 @@ class Settings(BaseSettings):
     # sources aren't attributed to a user and don't count against it.
     source_registration_cap_per_user: int = Field(default=25, ge=0, le=1000)
 
+    # Lazy fit-score refresh (E2): max stale targets recomputed per /targets/mine
+    # view. Bounds the LLM cost one page load can trigger; the rest refresh on
+    # subsequent views. 0 disables the lazy refresh entirely.
+    fit_score_refresh_max_per_view: int = Field(default=3, ge=0, le=50)
+
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
     # queries; ops opt-in via env var. When enabled the scheduler ticks every
