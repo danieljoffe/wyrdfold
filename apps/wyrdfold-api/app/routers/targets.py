@@ -629,23 +629,15 @@ async def get_my_targets(
     """
     items = await asyncio.to_thread(crud.list_user_targets_with_summary, supabase, user_id)
 
-    prose_doc_id = await asyncio.to_thread(fit_refresh.current_prose_doc_id, supabase, user_id)
-    if prose_doc_id is not None:
-        stale = await asyncio.to_thread(
-            fit_refresh.stale_target_ids,
-            supabase,
-            user_id=user_id,
-            current_prose_doc_id=prose_doc_id,
-            limit=settings.fit_score_refresh_max_per_view,
+    # The staleness scan + refresh run ENTIRELY in the background — /mine adds no
+    # queries of its own to the response path. Only schedule when the user has
+    # targets (nothing to refresh otherwise); the task itself no-ops immediately
+    # if the LLM provider is fatal (credits out), so an outage can't make this
+    # churn the DB on every view.
+    if items:
+        background_tasks.add_task(
+            fit_refresh.refresh_stale_for_user, supabase, llm, user_id=user_id
         )
-        if stale:
-            background_tasks.add_task(
-                fit_refresh.refresh_stale_fit_scores,
-                supabase,
-                llm,
-                user_id=user_id,
-                target_ids=stale,
-            )
     return MyTargetsSummaryListResponse(targets=items)
 
 

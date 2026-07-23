@@ -56,6 +56,12 @@ from app.services.llm.errors import (
     LLMRateLimitedError,
     LLMServiceError,
 )
+from app.services.llm.provider_breaker import (
+    provider_fatal_active as _provider_fatal_active,
+)
+from app.services.llm.provider_breaker import (
+    trip_provider_fatal as _trip_provider_fatal,
+)
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -180,37 +186,15 @@ LLM_SCORE_THRESHOLD = 40
 QUALIFICATION_BUDGET_RECHECK_EVERY = 50
 
 # --- Provider-fatal fast-fail breaker (audit PERF-M "402/429 fast-fail") -------
-# ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. This
-# breaker catches the *provider* rejecting every call — OpenRouter out of
-# credits (402) or sustained rate-limiting (429, after the client's own
-# retries) — which can happen while we're still UNDER budget (a low account
-# balance with a high cap). The first such error from the tagger latches this
-# for a cooldown so the qualify fan-out stops firing hundreds of doomed calls
-# per cycle; it auto-clears (monotonic), so the first cycle after the cooldown
-# retries once (credits may be topped up / the 429 window may have passed).
-# Module-level + in-process is fine on the single poller worker (same rationale
-# as the lifecycle sweep below).
-_PROVIDER_FATAL_COOLDOWN_S = 300.0
-_provider_fatal_until = 0.0
-
-
-def _trip_provider_fatal(exc: BaseException) -> None:
-    """Latch the fast-fail breaker for the cooldown after a provider 402/429."""
-    global _provider_fatal_until
-    _provider_fatal_until = time.monotonic() + _PROVIDER_FATAL_COOLDOWN_S
-    logger.warning(
-        "LLM provider fast-fail latched for %.0fs — provider rejecting calls "
-        "(%s: %s). Deferring the rest of this cycle's tagging; it retries after "
-        "the cooldown. If this is a 402, top up OpenRouter credits.",
-        _PROVIDER_FATAL_COOLDOWN_S,
-        type(exc).__name__,
-        exc,
-    )
-
-
-def _provider_fatal_active() -> bool:
-    """True while the provider-fatal breaker is latched (within the cooldown)."""
-    return time.monotonic() < _provider_fatal_until
+# ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. The
+# provider-fatal breaker catches the *provider* rejecting every call — OpenRouter
+# out of credits (402) or sustained rate-limiting (429) — which can happen while
+# we're still UNDER budget. The first such error from the tagger latches it for a
+# cooldown so the qualify fan-out stops firing doomed calls; it auto-clears
+# (monotonic). It now lives in ``app.services.llm.provider_breaker`` (imported at
+# the top as ``_provider_fatal_active`` / ``_trip_provider_fatal``) so the E2 lazy
+# fit-score refresh shares the SAME latch — a credits outage caught by either
+# backs the other off too.
 
 
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
@@ -1117,7 +1101,10 @@ async def _embed_jobs(
         logger.exception("Pre-scan embed: embeddings client unavailable; skipping")
         return
 
-    sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
+    # Dedicated, SMALL cap (not DB_WRITE_CONCURRENCY): concurrent HNSW inserts
+    # contend + starve foreground reads on a small instance (2026-07-23). A few
+    # in flight keeps ingestion moving without saturating IO.
+    sem = asyncio.Semaphore(settings.embedding_write_concurrency)
 
     async def _one(row: dict[str, Any]) -> None:
         async with sem:
@@ -2517,7 +2504,6 @@ LIFECYCLE_SWEEP_INTERVAL_S = 6 * 3600.0
 async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
     """Run the idle-account sweep at most every 6h, never blocking polls."""
     global _LIFECYCLE_LAST_RUN
-    import time
 
     from app.services.lifecycle import run_lifecycle_sweep
 
@@ -2542,7 +2528,6 @@ async def _maybe_run_archival_sweep(supabase: Client) -> None:
     inert until the operator flips ``ARCHIVAL_SWEEP_ENABLED``.
     """
     global _ARCHIVAL_LAST_RUN
-    import time
 
     from app.services.archival import run_archival_sweep
 

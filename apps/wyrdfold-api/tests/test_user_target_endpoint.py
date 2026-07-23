@@ -23,7 +23,13 @@ from app.dependencies import (
     verify_api_key_or_jwt,
 )
 from app.main import app
-from app.models.targets import JobTarget, ScoringProfile, UserTarget
+from app.models.targets import (
+    JobTarget,
+    JobTargetSummary,
+    ScoringProfile,
+    UserTarget,
+    UserTargetWithSummary,
+)
 from app.services.targets import fit_refresh
 
 
@@ -64,46 +70,56 @@ def client() -> TestClient:
     app.dependency_overrides.clear()
 
 
-def test_mine_schedules_lazy_refresh_for_stale_targets(
+def _summary_item() -> UserTargetWithSummary:
+    now = datetime.now(UTC)
+    return UserTargetWithSummary(
+        user_target=_user_target(),
+        target=JobTargetSummary(
+            id="target-1", label="X", is_active=True, created_at=now, updated_at=now
+        ),
+    )
+
+
+def test_mine_schedules_lazy_refresh_when_user_has_targets(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """GET /targets/mine returns the cached summaries immediately AND schedules a
-    background refresh of the stale ones (E2). TestClient runs background tasks
-    after the response, so the spy is invoked with the stale ids."""
-    monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
-    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: "prose-2")
+    SINGLE background refresh task (E2) — the whole staleness scan runs in the
+    background, off the response path. TestClient runs background tasks after the
+    response, so the spy is invoked with the user id."""
     monkeypatch.setattr(
-        fit_refresh, "stale_target_ids", lambda _s, **_k: ["stale-a", "stale-b"]
+        fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [_summary_item()]
     )
     scheduled: dict[str, object] = {}
 
-    async def spy_refresh(_s, _llm, *, user_id, target_ids):  # type: ignore[no-untyped-def]
+    async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
         scheduled["user_id"] = user_id
-        scheduled["target_ids"] = target_ids
 
-    monkeypatch.setattr(fit_refresh, "refresh_stale_fit_scores", spy_refresh)
+    monkeypatch.setattr(fit_refresh, "refresh_stale_for_user", spy_refresh)
 
     resp = client.get("/targets/mine")
 
     assert resp.status_code == 200
-    assert scheduled == {"user_id": "user-1", "target_ids": ["stale-a", "stale-b"]}
+    assert scheduled == {"user_id": "user-1"}
 
 
-def test_mine_skips_refresh_when_no_profile(
+def test_mine_skips_refresh_when_no_targets(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No prose master (current_prose_doc_id None) → no staleness sweep, no task."""
+    """No linked targets → nothing to refresh → no background task scheduled at
+    all (the staleness/no-profile short-circuits now live inside the task)."""
     monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
-    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: None)
     called = {"n": 0}
-    monkeypatch.setattr(
-        fit_refresh, "stale_target_ids", lambda *_a, **_k: called.__setitem__("n", called["n"] + 1)
-    )
+
+    async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
+        called["n"] += 1
+
+    monkeypatch.setattr(fit_refresh, "refresh_stale_for_user", spy_refresh)
 
     resp = client.get("/targets/mine")
 
     assert resp.status_code == 200
-    assert called["n"] == 0  # never even computed staleness
+    assert called["n"] == 0
 
 
 def test_returns_user_target_with_target_data(
