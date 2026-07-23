@@ -45,6 +45,7 @@ from app.services.experience.resolve import resolve_current_payload
 from app.services.job_ingest import materialize_and_score_job
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
+from app.services.source_registration import register_source_from_url
 from app.services.tailor import persistence
 from app.services.targets import crud
 from app.services.targets.derive_profile import (
@@ -623,6 +624,13 @@ async def from_url(
             salary_text=salary_text,
             payload=payload,
         )
+        # Also feed the job search: register the company's board as a pollable
+        # source (best-effort, capped) so we pull MORE jobs from it going
+        # forward. Scheduled AFTER derive so the user-visible deriving→ready
+        # flip isn't held behind the ATS probe.
+        background_tasks.add_task(
+            register_source_from_url, supabase, user_id=user_id, final_url=final_url
+        )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
     target = crud.create(supabase, payload=TargetCreate(label=label))
@@ -641,5 +649,9 @@ async def from_url(
         location=location,
         salary_text=salary_text,
         payload=payload,
+    )
+    # Also feed the job search — see the matched branch above.
+    background_tasks.add_task(
+        register_source_from_url, supabase, user_id=user_id, final_url=final_url
     )
     return CreateOrLinkResult(user_target=link, target=target, was_matched=False)

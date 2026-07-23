@@ -65,6 +65,10 @@ _USER_ID_TABLES: tuple[str, ...] = (
     "user_jobs",
     "status_log",
     "user_targets",
+    # The user's personal link to a shared ``sources`` row (from-url board
+    # registration). Deleted like ``user_targets``: the shared source survives
+    # for the corpus, only this user's ownership/attribution is erased.
+    "source_ownerships",
     "contribution_votes",  # the user's anonymous ref-JD votes (#5 P3)
     "user_api_keys",
 )
