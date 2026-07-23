@@ -547,7 +547,16 @@ class Settings(BaseSettings):
 
     # Slow-request log threshold (ms). Requests slower than this get logged
     # at WARNING with method/path/duration. Set to 0 to log every request.
-    slow_request_threshold_ms: int = Field(default=500, ge=0, le=60_000)
+    #
+    # 750, not 500: on the current (small) prod instance a healthy authed read
+    # is ~500-650ms (query + the API-to-Supabase round-trip + payload + JWT), so
+    # a 500ms bar flagged nearly every request -- noise, not signal. 750 flags
+    # the genuine anomalies (the /jobs family at 2.7-9s, /analysis LLM ~26s) and
+    # stays quiet on baseline reads (measured 2026-07-23). Prod already runs this
+    # via the SLOW_REQUEST_THRESHOLD_MS env override; this makes it the default so
+    # a cleared env var doesn't silently revert to the noisy 500. Lower it again
+    # once the instance is upsized and the baseline drops.
+    slow_request_threshold_ms: int = Field(default=750, ge=0, le=60_000)
 
     # Application log format (#26 F5). `text` keeps stdlib/uvicorn
     # defaults for local DX; `json` attaches a JSON formatter to the
