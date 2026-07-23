@@ -678,11 +678,16 @@ async def test_from_url_matched_links_inline_defers_derivation(
     assert link_kwargs["target_id"] == "existing"
     assert link_kwargs["is_active"] is False
     scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
+    # Two bg tasks: the profile derive, then the source registration.
+    assert len(scheduled) == 2
     func, kwargs = scheduled[0]
     assert func is from_input.derive_url_target_bg
     assert kwargs["target_id"] == "existing"
     assert kwargs["jd_text"] == "x" * 200
+    # Source registration is scheduled AFTER derive, carrying the pasted URL.
+    reg_func, reg_kwargs = scheduled[1]
+    assert reg_func is from_input.register_source_from_url
+    assert reg_kwargs["final_url"] == "https://example.com/jobs/123"
 
 
 @pytest.mark.asyncio
@@ -725,10 +730,13 @@ async def test_from_url_new_creates_deriving_and_schedules(
     assert len(create_calls) == 1
     assert create_calls[0].label == "Senior Frontend Engineer"
     scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
+    assert len(scheduled) == 2
     func, kwargs = scheduled[0]
     assert func is from_input.derive_url_target_bg
     assert kwargs["target_id"] == "new"
+    reg_func, reg_kwargs = scheduled[1]
+    assert reg_func is from_input.register_source_from_url
+    assert reg_kwargs["final_url"] == "https://example.com/jobs/abc"
 
 
 @pytest.mark.asyncio
