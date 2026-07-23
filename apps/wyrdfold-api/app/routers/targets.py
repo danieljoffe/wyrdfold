@@ -78,7 +78,7 @@ from app.services.source_discovery import (
     run_discovery_for_target,
 )
 from app.services.target_scoring import bulk_title_score_for_target
-from app.services.targets import crud, from_input, votes
+from app.services.targets import crud, fit_refresh, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -610,16 +610,42 @@ def get_active_targets(
 
 
 @router.get("/mine", response_model=MyTargetsSummaryListResponse)
-def get_my_targets(
+async def get_my_targets(
+    background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MyTargetsSummaryListResponse:
     """Return the current user's linked targets with fit scores.
 
     List projection (#863): the heavy ``scoring_profile`` JSONB is omitted;
     the full target is available via ``GET /targets/{id}``.
+
+    Lazy fit-score refresh (E2): any cached score computed against an older
+    profile version is recomputed in the background (capped), so a profile edit
+    eventually re-scores existing targets too — not just new ones. The response
+    returns the current cached scores immediately; fresh ones land by the next
+    view.
     """
-    items = crud.list_user_targets_with_summary(supabase, user_id)
+    items = await asyncio.to_thread(crud.list_user_targets_with_summary, supabase, user_id)
+
+    prose_doc_id = await asyncio.to_thread(fit_refresh.current_prose_doc_id, supabase, user_id)
+    if prose_doc_id is not None:
+        stale = await asyncio.to_thread(
+            fit_refresh.stale_target_ids,
+            supabase,
+            user_id=user_id,
+            current_prose_doc_id=prose_doc_id,
+            limit=settings.fit_score_refresh_max_per_view,
+        )
+        if stale:
+            background_tasks.add_task(
+                fit_refresh.refresh_stale_fit_scores,
+                supabase,
+                llm,
+                user_id=user_id,
+                target_ids=stale,
+            )
     return MyTargetsSummaryListResponse(targets=items)
 
 
@@ -1059,7 +1085,7 @@ async def link_target(
     # Fresh vs. the current master document, not a possibly-stale persisted
     # optimized doc (BUG 2, the stale-payload seam) — a profile edited just
     # before this link must affect the fit.
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     if payload is not None:
@@ -1083,6 +1109,7 @@ async def link_target(
             target_id=target_id,
             fit_score=fit_score,
             fit_score_reasoning=fit_reasoning,
+            fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
         raise HTTPException(

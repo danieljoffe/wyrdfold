@@ -174,7 +174,8 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
     # payload without hitting the real prose/optimized reads.
     async def fake_resolve(supabase, llm, *, cost_supabase, user_id):  # type: ignore[no-untyped-def]
         recorder.record("resolve_payload", user_id=user_id)
-        return OptimizedPayload()
+        # (payload, prose_doc_id) — the id is the E2 fit-score version marker.
+        return OptimizedPayload(), "prose-doc-1"
 
     def fake_cost_record(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("cost_log", **kwargs)

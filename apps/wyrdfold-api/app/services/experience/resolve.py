@@ -40,25 +40,32 @@ async def resolve_current_payload(
     *,
     cost_supabase: Client,
     user_id: str | None,
-) -> OptimizedPayload | None:
-    """An ``OptimizedPayload`` fresh vs. the user's latest master document.
+) -> tuple[OptimizedPayload | None, str | None]:
+    """An ``OptimizedPayload`` fresh vs. the user's latest master document, paired
+    with the id of the prose master doc it reflects.
 
-    Returns ``None`` when there is nothing to score against (no prose and no
-    optimized doc). ``cost_supabase`` is the service-role client for the cost
+    The prose doc id is the *version marker* a caller stamps onto a cached score
+    (``user_targets.fit_score_prose_doc_id``, E2) so a later profile edit makes
+    the score detectably stale. It is ``None`` only when there is no prose master
+    (the fallback-to-optimized path) — an unversioned score that stays stale.
+
+    Returns ``(None, None)`` when there is nothing to score against (no prose and
+    no optimized doc). ``cost_supabase`` is the service-role client for the cost
     ledger (``llm_costs`` has no ``authenticated`` INSERT policy); it may be the
     same client as ``supabase`` in service-role contexts.
     """
     prose_doc = await asyncio.to_thread(prose.get_latest, supabase, user_id)
     latest = await asyncio.to_thread(optimized.get_latest, supabase, user_id)
 
-    # Nothing to derive from → fall back to whatever optimized doc exists.
+    # Nothing to derive from → fall back to whatever optimized doc exists. No
+    # prose master ⇒ no version marker.
     if prose_doc is None:
-        return latest.payload if latest is not None else None
+        return (latest.payload if latest is not None else None), None
 
     # The common path: the derived doc already reflects the current master
     # document. Cheap cache read, no LLM.
     if latest is not None and latest.prose_doc_id == prose_doc.id:
-        return latest.payload
+        return latest.payload, prose_doc.id
 
     # Stale (prose advanced past the derived doc) or never derived → freshen
     # transiently from the current prose so scoring reflects the live profile.
@@ -71,4 +78,4 @@ async def resolve_current_payload(
         result=result,
         metadata={"reason": "fit_payload_refresh", "prose_doc_id": prose_doc.id},
     )
-    return payload
+    return payload, prose_doc.id

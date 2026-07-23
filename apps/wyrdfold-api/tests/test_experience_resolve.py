@@ -49,10 +49,11 @@ async def test_fresh_optimized_doc_is_returned_without_deriving(
 
     monkeypatch.setattr(derive, "derive_from_prose", _must_not_derive)
 
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         MagicMock(), MagicMock(), cost_supabase=MagicMock(), user_id=None
     )
     assert payload is not None and payload.summary == "fresh"
+    assert prose_doc_id == "p2"  # E2 marker = the current prose master id
 
 
 @pytest.mark.asyncio
@@ -78,11 +79,12 @@ async def test_stale_optimized_doc_derives_from_current_prose(
     cost_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(cost_log, "record", lambda *_a, **k: cost_calls.append(k) or None)
 
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         MagicMock(), MagicMock(), cost_supabase=MagicMock(), user_id=None
     )
     assert payload is not None and payload.summary == "freshly-derived"
     assert derived_from == ["NEW master doc"]  # derived from the live master doc
+    assert prose_doc_id == "p3"  # marker = the CURRENT prose, not the stale p2
     assert cost_calls and cost_calls[0]["purpose"] == derive.DEFAULT_PURPOSE
 
 
@@ -98,10 +100,11 @@ async def test_never_derived_derives_from_prose(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(derive, "derive_from_prose", _derive)
     monkeypatch.setattr(cost_log, "record", lambda *_a, **_k: None)
 
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         MagicMock(), MagicMock(), cost_supabase=MagicMock(), user_id=None
     )
     assert payload is not None and payload.summary == "from-prose"
+    assert prose_doc_id == "p1"
 
 
 @pytest.mark.asyncio
@@ -115,17 +118,19 @@ async def test_no_prose_falls_back_to_optimized(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(derive, "derive_from_prose", _must_not_derive)
 
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         MagicMock(), MagicMock(), cost_supabase=MagicMock(), user_id=None
     )
     assert payload is not None and payload.summary == "only-optimized"
+    assert prose_doc_id is None  # no prose master → unversioned (stays stale)
 
 
 @pytest.mark.asyncio
 async def test_nothing_at_all_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(prose, "get_latest", lambda _s, _u: None)
     monkeypatch.setattr(optimized, "get_latest", lambda _s, _u: None)
-    payload = await resolve_current_payload(
+    payload, prose_doc_id = await resolve_current_payload(
         MagicMock(), MagicMock(), cost_supabase=MagicMock(), user_id=None
     )
     assert payload is None
+    assert prose_doc_id is None

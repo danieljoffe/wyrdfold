@@ -18,11 +18,13 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
+    get_llm_client,
     get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
 from app.models.targets import JobTarget, ScoringProfile, UserTarget
+from app.services.targets import fit_refresh
 
 
 def _job_target() -> JobTarget:
@@ -57,8 +59,51 @@ def client() -> TestClient:
     # ownership-checks it (#29 round 3 / M3), so the fixture must supply it.
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
+    app.dependency_overrides[get_llm_client] = lambda: MagicMock()
     yield TestClient(app)
     app.dependency_overrides.clear()
+
+
+def test_mine_schedules_lazy_refresh_for_stale_targets(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /targets/mine returns the cached summaries immediately AND schedules a
+    background refresh of the stale ones (E2). TestClient runs background tasks
+    after the response, so the spy is invoked with the stale ids."""
+    monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
+    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: "prose-2")
+    monkeypatch.setattr(
+        fit_refresh, "stale_target_ids", lambda _s, **_k: ["stale-a", "stale-b"]
+    )
+    scheduled: dict[str, object] = {}
+
+    async def spy_refresh(_s, _llm, *, user_id, target_ids):  # type: ignore[no-untyped-def]
+        scheduled["user_id"] = user_id
+        scheduled["target_ids"] = target_ids
+
+    monkeypatch.setattr(fit_refresh, "refresh_stale_fit_scores", spy_refresh)
+
+    resp = client.get("/targets/mine")
+
+    assert resp.status_code == 200
+    assert scheduled == {"user_id": "user-1", "target_ids": ["stale-a", "stale-b"]}
+
+
+def test_mine_skips_refresh_when_no_profile(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No prose master (current_prose_doc_id None) → no staleness sweep, no task."""
+    monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
+    monkeypatch.setattr(fit_refresh, "current_prose_doc_id", lambda _s, _u: None)
+    called = {"n": 0}
+    monkeypatch.setattr(
+        fit_refresh, "stale_target_ids", lambda *_a, **_k: called.__setitem__("n", called["n"] + 1)
+    )
+
+    resp = client.get("/targets/mine")
+
+    assert resp.status_code == 200
+    assert called["n"] == 0  # never even computed staleness
 
 
 def test_returns_user_target_with_target_data(

@@ -532,6 +532,7 @@ def link_user_to_target(
     is_active: bool = True,
     fit_score: int | None = None,
     fit_score_reasoning: str | None = None,
+    fit_score_prose_doc_id: str | None = None,
     enforce_active_limit: bool = True,
 ) -> UserTarget:
     """Link a user to a target (upsert). The DB trigger syncs targets.is_active.
@@ -576,12 +577,66 @@ def link_user_to_target(
         row["fit_score"] = fit_score
     if fit_score_reasoning is not None:
         row["fit_score_reasoning"] = fit_score_reasoning
+    # Stamp the profile version this score was computed against (E2), so a later
+    # profile edit makes it detectably stale. Written alongside the score.
+    if fit_score_prose_doc_id is not None:
+        row["fit_score_prose_doc_id"] = fit_score_prose_doc_id
 
     resp = supabase.table(USER_TARGETS_TABLE).upsert(row, on_conflict="user_id,target_id").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert user_targets row")
     return _parse_user_target(rows[0])
+
+
+def get_fit_score_prose_doc_id(
+    supabase: Client, *, user_id: str, target_id: str
+) -> str | None:
+    """The prose-doc version marker on the user's link (E2), or None if the link
+    is gone or was never scored. Read right before a lazy refresh recomputes, so
+    a concurrent refresh (two quick views) doesn't double-spend the LLM."""
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("fit_score_prose_doc_id")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0].get("fit_score_prose_doc_id") if rows else None
+
+
+def update_fit_score(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    fit_score: int,
+    fit_score_reasoning: str | None,
+    fit_score_prose_doc_id: str | None,
+) -> None:
+    """Update ONLY the fit-score columns on an existing link (E2 lazy refresh).
+
+    A targeted UPDATE, not an upsert through ``link_user_to_target`` — that path
+    always writes ``is_active`` and would flip the active flag (and trip the
+    active-target cap) as a side effect of a background rescore. This touches
+    nothing but the score, its reasoning, and the version marker.
+    """
+    (
+        supabase.table(USER_TARGETS_TABLE)
+        .update(
+            {
+                "fit_score": fit_score,
+                "fit_score_reasoning": fit_score_reasoning,
+                "fit_score_prose_doc_id": fit_score_prose_doc_id,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
 
 
 def unlink_user_from_target(supabase: Client, user_id: str, target_id: str) -> bool:
