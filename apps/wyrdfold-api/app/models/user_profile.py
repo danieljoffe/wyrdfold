@@ -13,21 +13,41 @@ _E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
 
 
 def _normalize_phone(value: str | None) -> str | None:
-    """Normalize and validate an E.164 phone number. Empty/whitespace → None
-    (treated as "clear the field"). Otherwise must match E.164 after stripping
-    spaces/hyphens/parentheses for forgiving input."""
+    """Normalize a phone number to E.164, formatting on the user's behalf.
+
+    Accepts the way people actually type numbers — ``(415) 555-2671``,
+    ``415-555-2671``, ``4155552671``, ``+1 415 555 2671``, ``1.415.555.2671`` —
+    and returns E.164 (``+14155552671``). A bare 10-digit number (or 11 digits
+    starting with ``1``) is assumed **US**, since the corpus is US-only; a
+    genuinely international number must carry a leading ``+`` and country code
+    because we can't infer the country otherwise. Empty / whitespace → ``None``
+    ("clear the field"). Raises only when the input can't be resolved to a valid
+    E.164 number at all.
+    """
     if value is None:
         return None
     stripped = value.strip()
     if not stripped:
         return None
-    cleaned = re.sub(r"[\s\-()]", "", stripped)
-    if not _E164_RE.match(cleaned):
+    # Preserve a leading '+' (international dialing prefix) then keep only
+    # digits — drops spaces, hyphens, parentheses, dots, and stray letters.
+    has_plus = stripped.startswith("+")
+    digits = re.sub(r"\D", "", stripped)
+    if has_plus:
+        candidate = "+" + digits
+    elif len(digits) == 11 and digits.startswith("1"):
+        candidate = "+" + digits  # US number typed with its country code, no '+'
+    elif len(digits) == 10:
+        candidate = "+1" + digits  # bare US 10-digit → assume +1
+    else:
+        candidate = digits  # unknown length / country → fail the check below
+    if not _E164_RE.match(candidate):
         raise ValueError(
-            "Phone number must be in E.164 format "
-            "(e.g. +14155552671 — country code, no spaces/dashes)"
+            "Couldn't read that as a phone number — enter a 10-digit US number "
+            "(e.g. 415-555-2671) or an international number with its country "
+            "code (e.g. +44 20 7946 0958)."
         )
-    return cleaned
+    return candidate
 
 
 class NotificationPreferences(BaseModel):
