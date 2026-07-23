@@ -487,12 +487,12 @@ class TargetFromManual(BaseModel):
 class TargetFromUrl(BaseModel):
     """Create a target from a JD URL.
 
-    The label is optional — when omitted, the job title extracted from the
-    page is used. Falls back to "Untitled Target" if neither is available.
+    The label is ALWAYS derived from the posting's own title — there is no
+    user-supplied title (an inaccurate one poisons matching + the shared
+    catalog). Falls back to "Untitled Target" if the page has no title.
     """
 
     jd_url: str = Field(max_length=2048)
-    label: str | None = Field(default=None, max_length=200)
 
 
 class ReferenceJDAdd(BaseModel):
