@@ -59,6 +59,11 @@ Rules:
 role at the same company, the same accomplishment with different wording, \
 the same skill listed in multiple places — and merge each into a single \
 canonical mention.
+- CRITICAL — never drop or absorb a DISTINCT role. Consolidation merges \
+DUPLICATES of the SAME position (same company and title); it must never fold a \
+genuinely separate role into a skills list, a summary/intro, or another role. \
+Every distinct company+title in the input (with its dates and accomplishments) \
+MUST survive as its own role in the output. If in doubt, keep it as a role.
 - Preserve every unique fact across the duplicates. If one copy lists a \
 quantified outcome, a date, a skill, or a detail that another copy omits, \
 keep it in the consolidated version.

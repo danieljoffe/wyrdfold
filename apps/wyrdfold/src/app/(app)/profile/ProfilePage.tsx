@@ -346,14 +346,20 @@ export default function ProfilePage() {
           variant: 'info',
           title: 'No duplicates found in master document',
         });
+        await fetchData();
       } else {
         const removed = body.chars_before - body.chars_after;
         toast({
           variant: 'success',
           title: `Consolidated — removed ${removed.toLocaleString()} characters of duplicate content`,
         });
+        // Consolidation rewrote the master document, so the derived experience
+        // + skills it feeds are now stale. Chain the re-derive so the panels
+        // (and downstream fit scoring) reflect the consolidated document
+        // instead of silently lagging it. handleDerive streams the refresh and
+        // fetchData()s on its own.
+        await handleDerive();
       }
-      await fetchData();
     } catch (err) {
       toast({
         variant: 'error',
@@ -362,7 +368,7 @@ export default function ProfilePage() {
     } finally {
       setConsolidating(false);
     }
-  }, [fetchData, toast]);
+  }, [fetchData, toast, handleDerive]);
 
   const handleDelete = useCallback(async () => {
     setDeleting(true);

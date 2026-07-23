@@ -224,3 +224,13 @@ def test_module_exports() -> None:
     assert consolidate.DEFAULT_PURPOSE == "experience.prose_consolidate"
     assert consolidate.DEFAULT_MODEL == "claude-sonnet-4-6"
     assert consolidate.MIN_CONSOLIDATE_CHARS > 0
+
+
+def test_prompt_forbids_folding_a_distinct_role() -> None:
+    """The consolidation prompt must forbid folding a distinct role into a
+    skills list or summary (D1). A role described in the master doc was
+    flattened into a Technical Skills line and vanished as a role; this pins
+    the preservation rule so it can't be silently dropped."""
+    lowered = consolidate.SYSTEM_PROMPT.lower()
+    assert "never drop or absorb a distinct role" in lowered
+    assert "must survive as its own role" in lowered
