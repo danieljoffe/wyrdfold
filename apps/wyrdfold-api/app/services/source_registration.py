@@ -26,7 +26,7 @@ from typing import Any
 from supabase import Client
 
 from app.config import settings
-from app.services.ats_detect import detect_ats
+from app.services.ats_detect import detect_ats, is_ats_url
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,14 @@ async def register_source_from_url(supabase: Client, *, user_id: str, final_url:
     probe or RPC failed), or one of the RPC statuses ``registered`` / ``linked``
     / ``already_owned`` / ``cap_reached``.
     """
+    # Gate on a *recognized ATS host* before probing. detect_ats otherwise falls
+    # back to guessing a slug from the domain stem and probing every provider, so
+    # an arbitrary URL (linkedin.com/jobs/… → guessed slug "linkedin") can match
+    # an unrelated board and register a wrong global source. Discovery never hits
+    # this (its inputs are site-restricted); arbitrary user URLs do.
+    if not is_ats_url(final_url):
+        return "unclassified"
+
     try:
         async with asyncio.timeout(_DETECT_TIMEOUT_S):
             detect = await detect_ats(final_url)

@@ -45,17 +45,49 @@ def _patch_detect(monkeypatch: pytest.MonkeyPatch, result: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unclassified_url_not_registered(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-ATS URL (LinkedIn, custom careers page) can't be polled — no RPC."""
-    _patch_detect(monkeypatch, None)
+async def test_non_ats_url_skipped_without_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-ATS URL (LinkedIn, custom careers page) is refused BEFORE the probe.
+
+    detect_ats otherwise falls back to guessing a slug from the domain stem and
+    probing every provider — ``linkedin.com/jobs/view/…`` coincidentally matches
+    a Greenhouse ``linkedin`` board (verified live), which would register a wrong
+    global source. The is_ats_url gate must short-circuit first.
+    """
+    probed = False
+
+    async def _spy(_url: str) -> object:
+        nonlocal probed
+        probed = True
+        return None
+
+    monkeypatch.setattr(source_registration, "detect_ats", _spy)
     supabase = _supabase()
 
     outcome = await source_registration.register_source_from_url(
-        supabase, user_id="u1", final_url="https://www.linkedin.com/jobs/view/123"
+        supabase, user_id="u1", final_url="https://www.linkedin.com/jobs/view/123456"
     )
 
     assert outcome == "unclassified"
+    assert probed is False  # gated out before the network probe
     supabase.rpc.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://jobs.ashbyhq.com/hadrian-automation/68286f52", True),
+        ("https://boards.greenhouse.io/acme", True),
+        ("https://jobs.lever.co/acme/abc", True),
+        ("https://acme.wd1.myworkdayjobs.com/careers", True),
+        ("https://www.linkedin.com/jobs/view/123456", False),  # non-ATS host
+        ("https://stripe.com/careers", False),  # company page, not its ATS board
+        ("Hadrian", False),  # a bare company name is not a URL
+    ],
+)
+def test_is_ats_url(url: str, expected: bool) -> None:
+    from app.services.ats_detect import is_ats_url
+
+    assert is_ats_url(url) is expected
 
 
 @pytest.mark.asyncio
