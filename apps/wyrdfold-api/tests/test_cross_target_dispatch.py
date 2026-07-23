@@ -4,8 +4,9 @@
 the shapes it can express DB-side and falls back to the Python two-query path
 for the rest. These pin that routing decision with spies (the RPC/two-query
 bodies have their own tests), so a future edit can't silently send an
-RPC-ineligible query (custom weights, recency decay, post-fetch filters, the
-archived view) down the fast path — or fail to use the fast path at all."""
+RPC-ineligible query (post-fetch filters, the archived view) down the fast
+path — or fail to use the fast path at all. Custom weights + recency decay are
+NOW expressed DB-side (#457 / #365), so both stay on the fast path."""
 
 from __future__ import annotations
 
@@ -63,10 +64,29 @@ def test_simple_status_query_uses_rpc(spies: dict[str, MagicMock]) -> None:
     spies["two"].assert_not_called()
 
 
-def test_custom_weights_force_two_query(spies: dict[str, MagicMock]) -> None:
-    _call(weights_by_target={"t-1": AxisWeights()})
+def test_custom_weights_use_rpc_with_blend(spies: dict[str, MagicMock]) -> None:
+    # #457: custom axis weights are NO LONGER a skip — the RPC now computes the
+    # weighted blend DB-side (p_weights), so a custom-weight view takes the fast
+    # path instead of scanning everything into Python. The weights map threads
+    # through to the RPC helper so the blend can be computed.
+    weights = {"t-1": AxisWeights(title_fit=0.4, skills_fit=0.2, seniority_fit=0.2, domain_fit=0.2)}
+    _call(weights_by_target=weights)
+    spies["rpc"].assert_called_once()
+    spies["two"].assert_not_called()
+    assert spies["rpc"].call_args.kwargs["weights_by_target"] == weights
+
+
+def test_custom_weights_plus_post_fetch_filter_still_two_query(
+    spies: dict[str, MagicMock],
+) -> None:
+    # A post-fetch filter (location here) still forces the two-query path even
+    # with weights — the RPC paginates with no knowledge of it. The weights must
+    # ride along so the Python overlay still shows the blend, not the raw score.
+    weights = {"t-1": AxisWeights(title_fit=0.4, skills_fit=0.2, seniority_fit=0.2, domain_fit=0.2)}
+    _call(weights_by_target=weights, exclude_terms=["remote"])
     spies["two"].assert_called_once()
     spies["rpc"].assert_not_called()
+    assert spies["two"].call_args.kwargs["weights_by_target"] == weights
 
 
 def test_recency_decay_still_uses_rpc(
