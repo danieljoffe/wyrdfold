@@ -20,6 +20,34 @@ jest.mock('@/app/_components/ConversationChatModal', () => ({
   default: () => null,
 }));
 
+// Stub the SSE reader so the re-derive stream "completes" with a doc without a
+// real ReadableStream. Only handleDerive uses it; other tests never call it.
+jest.mock('@/lib/consumeSse', () => ({
+  consumeSse: jest.fn(
+    async (_res: unknown, cb: (event: string, data: unknown) => void) => {
+      cb('done', {
+        doc: {
+          id: 'opt-2',
+          user_id: null,
+          prose_doc_id: 'prose-2',
+          version: 2,
+          payload: {
+            summary: 's2',
+            roles: [],
+            skills: [],
+            outcomes: [],
+            annotations: [],
+          },
+          markdown_view: null,
+          source: 'llm',
+          created_at: '2026-06-18',
+        },
+        cached: false,
+      });
+    }
+  ),
+}));
+
 const originalFetch = global.fetch;
 
 function jsonRes(body: unknown, status = 200) {
@@ -69,6 +97,75 @@ describe('ProfilePage', () => {
       expect(mockToast).toHaveBeenCalledWith(
         expect.objectContaining({ variant: 'error' })
       );
+    });
+  });
+
+  it('chains a re-derive after a non-noop consolidate so derived skills refresh (D1)', async () => {
+    const optimizedDoc = {
+      id: 'opt-1',
+      user_id: null,
+      prose_doc_id: 'prose-1',
+      version: 1,
+      payload: {
+        summary: 's',
+        roles: [],
+        skills: [],
+        outcomes: [],
+        annotations: [],
+      },
+      markdown_view: null,
+      source: 'llm',
+      created_at: '2026-06-18',
+    };
+    const fetchMock = jest.fn().mockImplementation((url: string) => {
+      if (url.includes('/prose/consolidate'))
+        return Promise.resolve(
+          jsonRes({ no_op: false, chars_before: 5000, chars_after: 3000 })
+        );
+      if (url.includes('/derive/stream'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+        } as unknown as Response);
+      if (url.includes('/optimized'))
+        return Promise.resolve(jsonRes({ optimized: optimizedDoc }));
+      if (url.includes('/gap-health'))
+        return Promise.resolve(
+          jsonRes({ tier: 'green', gap_pct: 0, gaps: [] })
+        );
+      if (url.includes('/prose'))
+        return Promise.resolve(
+          jsonRes({
+            id: 'prose-1',
+            user_id: null,
+            version: 1,
+            content: 'A long master document with duplicate sections.',
+            created_at: '2026-06-18',
+          })
+        );
+      return Promise.resolve(jsonRes({}, 404));
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<ProfilePage />);
+    const user = userEvent.setup();
+    const consolidateBtn = await screen.findByRole('button', {
+      name: /^Consolidate$/i,
+    });
+    await user.click(consolidateBtn);
+
+    const postedTo = (fragment: string) =>
+      fetchMock.mock.calls.some(
+        ([u, i]) =>
+          typeof u === 'string' &&
+          u.includes(fragment) &&
+          (i as RequestInit | undefined)?.method === 'POST'
+      );
+    // The consolidate POST fires, then the chained re-derive POST — without it,
+    // the derived experience/skills would silently lag the consolidated doc.
+    await waitFor(() => {
+      expect(postedTo('/prose/consolidate')).toBe(true);
+      expect(postedTo('/derive/stream')).toBe(true);
     });
   });
 

@@ -41,8 +41,12 @@ from app.models.targets import (
     TargetSuggestion,
     TargetUpdate,
 )
+from app.services.experience.resolve import resolve_current_payload
+from app.services.job_ingest import materialize_and_score_job
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
+from app.services.source_registration import register_source_from_url
+from app.services.tailor import persistence
 from app.services.targets import crud
 from app.services.targets.derive_profile import (
     DEFAULT_PURPOSE as DERIVE_JD_PURPOSE,
@@ -98,7 +102,18 @@ async def _apply_fit_score(
     The user is already linked (the inline path created the
     ``user_targets`` row), so this is an idempotent upsert that just fills
     in ``fit_score`` / ``fit_score_reasoning`` once the LLM returns.
+
+    Scores against a payload FRESH vs. the user's current master document
+    (``resolve_current_payload``), not the one captured inline at request time.
+    A profile edited just before this target was created must affect its fit —
+    otherwise the score is silently computed against stale experience (BUG 2,
+    the stale-payload seam). ``payload`` (captured inline) is kept only as a
+    fallback for the rare case the live resolve yields nothing.
     """
+    fresh, prose_doc_id = await resolve_current_payload(
+        supabase, llm, cost_supabase=supabase, user_id=user_id
+    )
+    payload = fresh if fresh is not None else payload
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
     # supabase-py is sync; this runs inside a BackgroundTask that FastAPI *awaits*
     # on the event loop (an async bg task is not threadpooled), so each blocking
@@ -119,6 +134,7 @@ async def _apply_fit_score(
         is_active=False,
         fit_score=fit_result.fit_score,
         fit_score_reasoning=fit_result.reasoning,
+        fit_score_prose_doc_id=prose_doc_id,
     )
 
 
@@ -286,9 +302,14 @@ async def derive_url_target_bg(
     target_id: str,
     jd_text: str,
     final_url: str,
+    extracted_title: str | None,
+    company_name: str | None,
+    location: str | None,
+    salary_text: str | None,
     payload: OptimizedPayload,
 ) -> None:
-    """Derive profile-from-JD, contribute the reference JD, re-merge, fit score.
+    """Derive profile-from-JD, contribute the reference JD, re-merge, fit score,
+    then materialize the posting itself as a saved, tailorable job.
 
     Runs as a ``BackgroundTask`` for both the new-target and matched
     (corpus-building) URL flows. The shared-profile write goes through
@@ -336,6 +357,31 @@ async def derive_url_target_bg(
                 logger.error("Target %s vanished during deferred URL derive", target_id)
                 return
             await _apply_fit_score(supabase, llm, user_id=user_id, target=target, payload=payload)
+
+            # Materialize the posting itself as a real job: a ``scores`` row
+            # under THIS target (so it shows in /jobs and the resume/cover tailor
+            # can key on its job_posting_id) plus a "saved" user_jobs row — the
+            # user deliberately added this posting. Shared with POST /jobs/manual
+            # via materialize_and_score_job. Without this the URL was dissolved
+            # into the target profile as a reference JD and never became a job.
+            posting_id = await materialize_and_score_job(
+                supabase,
+                final_url=final_url,
+                title=extracted_title,
+                company_name=company_name,
+                location=location,
+                description_html=jd_text,
+                salary_text=salary_text,
+                targets=[target],
+            )
+            if posting_id is not None:
+                await asyncio.to_thread(
+                    persistence.upsert_user_job,
+                    supabase,
+                    user_id=user_id,
+                    job_posting_id=posting_id,
+                    status="saved",
+                )
     except TimeoutError:
         logger.error(
             "Deferred URL-target derivation timed out after %ss for target %s",
@@ -536,6 +582,52 @@ async def from_suggestion(
     )
 
 
+def _schedule_url_bg_tasks(
+    background_tasks: BackgroundTasks,
+    supabase: Client,
+    llm: LLMClient,
+    *,
+    user_id: str,
+    target_id: str,
+    jd_text: str,
+    final_url: str,
+    extracted_title: str | None,
+    company_name: str | None,
+    location: str | None,
+    salary_text: str | None,
+    payload: OptimizedPayload,
+) -> None:
+    """Schedule the two deferred halves of the from-url flow for ``target_id``.
+
+    1. ``derive_url_target_bg`` — profile derivation, reference-JD contribution,
+       fit score, and job materialization.
+    2. ``register_source_from_url`` — register the company's board as a pollable
+       source (best-effort, capped) so we pull MORE jobs from it going forward.
+
+    Registration is scheduled AFTER derive so the user-visible deriving→ready
+    flip isn't held behind the ATS probe. Shared by both the matched and
+    newly-created branches so their scheduling can't drift (a new
+    ``derive_url_target_bg`` arg added to one branch but missed in the other).
+    """
+    background_tasks.add_task(
+        derive_url_target_bg,
+        supabase,
+        llm,
+        user_id=user_id,
+        target_id=target_id,
+        jd_text=jd_text,
+        final_url=final_url,
+        extracted_title=extracted_title,
+        company_name=company_name,
+        location=location,
+        salary_text=salary_text,
+        payload=payload,
+    )
+    background_tasks.add_task(
+        register_source_from_url, supabase, user_id=user_id, final_url=final_url
+    )
+
+
 async def from_url(
     supabase: Client,
     llm: LLMClient,
@@ -545,32 +637,38 @@ async def from_url(
     final_url: str,
     extracted_title: str | None,
     jd_text: str,
-    label_override: str | None,
+    company_name: str | None,
+    location: str | None,
+    salary_text: str | None,
     payload: OptimizedPayload,
 ) -> CreateOrLinkResult:
     """URL flow: validated URL + already-fetched JD.
 
-    Matching keys off the resolved label (not the JD-derived profile), so
-    duplicate detection runs inline without any LLM call. The profile
-    derivation + merge + fit score are all deferred to a BackgroundTask.
+    The label is ALWAYS derived from the posting's own title — there is no
+    user-supplied title override (an inaccurate one poisons matching + the
+    shared catalog). Matching keys off that derived title, so duplicate
+    detection runs inline without any LLM call. The profile derivation + merge
+    + fit score + job materialization are all deferred to a BackgroundTask.
     """
-    label = (
-        (label_override or "").strip() or (extracted_title or "").strip() or "Untitled Target"
-    )[:200]
+    label = ((extracted_title or "").strip() or "Untitled Target")[:200]
 
     matched = find_matching_target(supabase, label)
     if matched is not None:
         link = crud.link_user_to_target(
             supabase, user_id=user_id, target_id=matched.id, is_active=False
         )
-        background_tasks.add_task(
-            derive_url_target_bg,
+        _schedule_url_bg_tasks(
+            background_tasks,
             supabase,
             llm,
             user_id=user_id,
             target_id=matched.id,
             jd_text=jd_text,
             final_url=final_url,
+            extracted_title=extracted_title,
+            company_name=company_name,
+            location=location,
+            salary_text=salary_text,
             payload=payload,
         )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
@@ -578,14 +676,18 @@ async def from_url(
     target = crud.create(supabase, payload=TargetCreate(label=label))
     target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
     link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
-    background_tasks.add_task(
-        derive_url_target_bg,
+    _schedule_url_bg_tasks(
+        background_tasks,
         supabase,
         llm,
         user_id=user_id,
         target_id=target.id,
         jd_text=jd_text,
         final_url=final_url,
+        extracted_title=extracted_title,
+        company_name=company_name,
+        location=location,
+        salary_text=salary_text,
         payload=payload,
     )
     return CreateOrLinkResult(user_target=link, target=target, was_matched=False)

@@ -132,6 +132,23 @@ def _parse_input(raw: str) -> tuple[str | None, str]:
     return (None, raw.lower().strip())
 
 
+def is_ats_url(raw: str) -> bool:
+    """True iff ``raw`` is a URL on a *recognized ATS host* (matches a known ATS
+    URL pattern in ``_URL_PATTERNS``).
+
+    This distinguishes a real board URL (``jobs.ashbyhq.com/acme/…``) from an
+    arbitrary URL whose domain stem :func:`_parse_input` would otherwise fall
+    back to guessing as a slug — which :func:`detect_ats` then probes against
+    every provider. That guess path is fine for discovery (its inputs are Brave
+    results already site-restricted to ATS hosts) and for company-name lookups,
+    but WRONG for arbitrary user-pasted URLs: e.g. ``linkedin.com/jobs/view/…``
+    guesses the slug ``linkedin`` and coincidentally matches a Greenhouse board,
+    so from-url registration must gate on this first or it would register
+    unrelated global sources from non-ATS URLs.
+    """
+    return any(pattern.search(raw) for pattern, _ in _URL_PATTERNS)
+
+
 async def _probe_greenhouse(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
     # Probe the jobs list, not the board root. The root endpoint
     # (``/v1/boards/{slug}``) returns only ``{name, content}`` — the old

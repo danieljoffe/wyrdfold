@@ -637,6 +637,18 @@ class Settings(BaseSettings):
     # per-target cap — the legacy behavior that scales with target count).
     discovery_query_budget_per_run: int = Field(default=60, ge=0, le=20000)
 
+    # Per-user cap on boards a single account can register by creating targets
+    # from job URLs (the from-url flow — see source_registration). Sources are
+    # global + forever-polled, so this bounds the cost a single account can
+    # impose: at most this many DISTINCT boards per user. Discovery-inserted
+    # sources aren't attributed to a user and don't count against it.
+    source_registration_cap_per_user: int = Field(default=25, ge=0, le=1000)
+
+    # Lazy fit-score refresh (E2): max stale targets recomputed per /targets/mine
+    # view. Bounds the LLM cost one page load can trigger; the rest refresh on
+    # subsequent views. 0 disables the lazy refresh entirely.
+    fit_score_refresh_max_per_view: int = Field(default=3, ge=0, le=50)
+
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
     # queries; ops opt-in via env var. When enabled the scheduler ticks every

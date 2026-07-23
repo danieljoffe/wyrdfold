@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import re
@@ -42,25 +41,18 @@ from app.models.schemas import (
 from app.models.targets import SENIORITY_ORDER, AxisWeights, TargetPreferences
 from app.rate_limit import limiter
 from app.services.extract import (
-    MANUAL_SOURCE_ID,
-    MANUAL_SOURCE_ROW,
     ExtractionResult,
     _extract_from_firecrawl,
     extract_job_from_html,
     extract_salary_from_text,
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
-from app.services.jd_parser import parse_jd
+from app.services.job_ingest import materialize_and_score_job
 from app.services.recency import display_recency_score
-from app.services.sanitize import sanitize_html
 from app.services.scoring import strip_html
 from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
-    update_global_score,
-)
-from app.services.target_scoring import (
-    score_and_upsert as target_score_and_upsert,
 )
 from app.services.targets.crud import get as get_target
 from app.services.targets.crud import get_active as get_active_target
@@ -122,24 +114,6 @@ _JP_SELECT_COLS = (
 # UI can render the JD body in the detail panel; analysis/tailor flows
 # already read ``description_html`` directly off ``jobs``.
 _JP_DETAIL_SELECT_COLS = _JP_SELECT_COLS + ", description_html"
-
-
-def _ensure_manual_source(supabase: Client) -> None:
-    """Idempotently ensure the "manual" pseudo-source row exists.
-
-    Jobs added via POST /jobs/manual are filed under a fixed pseudo-source
-    (``MANUAL_SOURCE_ID``) to satisfy the NOT-NULL ``job_postings.source_id``
-    FK. A seed migration creates this row, but if it's ever missing (fresh DB
-    that skipped the seed, a manual wipe, etc.) the job upsert violates the FK
-    and 500s. This upserts the row first so the path self-heals.
-
-    ``on_conflict="id"`` makes it a no-op when the row already exists — the
-    common case — so this adds one cheap round-trip and never overwrites an
-    operator's edits to the row.
-    """
-    supabase.table("sources").upsert(
-        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
-    ).execute()
 
 
 def _tokenize_search(raw: str | None) -> list[str]:
@@ -2261,136 +2235,35 @@ async def add_manual_job(
             needs_manual_fields=True,
         )
 
-    # Generate external_id from URL — must be numeric (bigint column)
-    external_id = str(int(hashlib.sha256(final_url.encode()).hexdigest()[:15], 16))
-
-    # Extract salary from extraction result or description
-    salary = extraction.salary_text
-    if not salary and description_html:
-        salary = extract_salary_from_text(strip_html(description_html))
-
-    # Upsert into jobs (score starts at 0, updated by target pipeline)
-    row: dict[str, Any] = {
-        "external_id": external_id,
-        "source_id": MANUAL_SOURCE_ID,
-        "title": title,
-        "company_name": company_name,
-        "location": location,
-        "department": None,
-        "description_html": sanitize_html(description_html) if description_html else "",
-        "absolute_url": final_url,
-        "score": 0,
-        "score_breakdown": {},
-        "greenhouse_updated_at": datetime.now(UTC).isoformat(),
-        "salary_text": salary,
-    }
-
-    # Make sure the manual pseudo-source exists before inserting the job —
-    # otherwise the source_id FK fails. Wrap both writes so a DB/PostgREST
-    # error surfaces as a clean 502 instead of leaking the raw Postgres
-    # message (e.g. the FK-violation string) to the client.
+    # Materialize the posting as a real job + score it against the caller's OWN
+    # active targets. Scoping to the caller's targets is a privacy boundary: an
+    # unscoped fan-out would write scores under every user's active target,
+    # surfacing one user's pasted URL in every other user's /jobs list via the
+    # scores→user_targets join. Operator/api-key callers (user_id None) keep the
+    # global fan-out for cron/admin back-compat. Shared with the from-url target
+    # flow via materialize_and_score_job (upsert + score + global + force-include).
+    if user_id is not None:
+        active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
+    else:
+        active_targets = await asyncio.to_thread(get_active_target, supabase)
     try:
-
-        def _persist() -> Any:
-            _ensure_manual_source(supabase)
-            return supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
-
-        resp_db = await asyncio.to_thread(_persist)
+        posting_id = await materialize_and_score_job(
+            supabase,
+            final_url=final_url,
+            title=title,
+            company_name=company_name,
+            location=location,
+            description_html=description_html,
+            salary_text=extraction.salary_text,
+            targets=active_targets,
+        )
     except APIError as exc:
+        # A clean 502 rather than leaking the raw Postgres/FK message.
         logger.error("Manual job upsert failed for url=%s: %s", final_url, exc, exc_info=exc)
         raise HTTPException(
             status_code=502,
             detail="Couldn't save this job right now — please try again.",
         ) from exc
-
-    posting_id = None
-    if resp_db.data:
-        data = cast(dict[str, Any], resp_db.data[0])
-        posting_id = data.get("id")
-
-    # Score against the caller's active targets (stages 1+2 inline for manual
-    # entry). Scoping to the JWT caller's targets is a privacy boundary: the
-    # previous global fan-out wrote scores for every user's active target,
-    # surfacing one user's pasted URL in every other user's /jobs list via
-    # the scores→user_targets join. Operator/api-key callers (user_id is None)
-    # retain the global fan-out for back-compat with cron + admin tooling.
-    # Each per-target scoring call is independent and IO-bound (the Supabase
-    # SDK is sync, so we hand each one to the threadpool and gather). For 10
-    # active targets this turns ~10 sequential round-trips into ~1 wall-time.
-    if posting_id and title:
-        if user_id is not None:
-            active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
-        else:
-            active_targets = await asyncio.to_thread(get_active_target, supabase)
-        parsed = parse_jd(description_html)
-        # Score against the caller's OWN active_targets (scoped above), writing
-        # through the gated user_upsert_score RPC on the SERVICE-ROLE client
-        # (SEC-H2): that RPC is now service_role-only, and the ownership scope
-        # is the active_targets set, not a per-call follower check.
-        results = await asyncio.gather(
-            *[
-                asyncio.to_thread(
-                    target_score_and_upsert,
-                    supabase,
-                    job_posting_id=posting_id,
-                    title=title,
-                    description_html=description_html,
-                    target=t,
-                    parsed_jd=parsed,
-                    gated=True,
-                )
-                for t in active_targets
-            ],
-            return_exceptions=True,
-        )
-        for t, result in zip(active_targets, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.error(
-                    "Target scoring failed for manual job %s target %s",
-                    posting_id,
-                    t.id,
-                    exc_info=result,
-                )
-        try:
-            await asyncio.to_thread(update_global_score, supabase, posting_id)
-        except Exception:
-            logger.exception("Global score update failed for manual job %s", posting_id)
-
-        # Force-include this posting in the user's /jobs view regardless of
-        # what the negative-keyword pass decided. The scorer flags
-        # ``excluded=True`` whenever a negative keyword matches in the title
-        # or any "requirements"/"default" section of the JD — perfectly
-        # sensible for the poller (which fires for jobs nobody asked for),
-        # but wrong here: the user explicitly pasted this URL. Mentions of
-        # "mentor junior engineers" or "collaborate with the data analyst
-        # team" silently buried the job. Keep the score breakdown honest
-        # (the negative penalty stays in the breakdown so the badge color
-        # still tells the user this isn't a great fit) but make the row
-        # visible so the user can act on it.
-        # Scoped to the targets scored above: when the posting already
-        # existed (poller ingest or another user's paste), an unscoped
-        # update would also flip rows under OTHER users' targets,
-        # overriding their negative-keyword exclusions (audit #24 F4).
-        scored_target_ids = [t.id for t in active_targets]
-        if scored_target_ids:
-            try:
-                await asyncio.to_thread(
-                    # SEC-H2: service-role client — user_set_scores_included is
-                    # now service_role-only; the target ids are the caller's own
-                    # active_targets (scoped above).
-                    lambda: supabase.rpc(
-                        "user_set_scores_included",
-                        {
-                            "p_job_posting_id": posting_id,
-                            "p_target_ids": scored_target_ids,
-                        },
-                    ).execute()
-                )
-            except Exception:
-                logger.exception("Force-include update failed for manual job %s", posting_id)
-
-    # Invalidate job list cache after adding a new posting
-    job_list_cache.invalidate()
 
     return ManualJobResponse(
         success=True,

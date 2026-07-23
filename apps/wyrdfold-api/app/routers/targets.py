@@ -63,6 +63,7 @@ from app.models.targets import (
 from app.rate_limit import limiter
 from app.services.diagnostics.funnel import compute_target_funnel
 from app.services.experience import optimized
+from app.services.experience.resolve import resolve_current_payload
 from app.services.extract import (
     ExtractionResult,
     _extract_from_firecrawl,
@@ -77,7 +78,7 @@ from app.services.source_discovery import (
     run_discovery_for_target,
 )
 from app.services.target_scoring import bulk_title_score_for_target
-from app.services.targets import crud, from_input, votes
+from app.services.targets import crud, fit_refresh, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -422,7 +423,7 @@ async def create_target_from_url(
         )
     final_url = vr.final_url
 
-    extracted_title, jd_text = await _fetch_jd_from_url(final_url)
+    extraction = await _fetch_jd_from_url(final_url)
 
     return await from_input.from_url(
         supabase,
@@ -430,9 +431,11 @@ async def create_target_from_url(
         background_tasks,
         user_id=user_id,
         final_url=final_url,
-        extracted_title=extracted_title,
-        jd_text=jd_text,
-        label_override=body.label,
+        extracted_title=extraction.title,
+        jd_text=extraction.description_html or "",
+        company_name=extraction.company_name,
+        location=extraction.location,
+        salary_text=extraction.salary_text,
         payload=doc.payload,
     )
 
@@ -607,16 +610,42 @@ def get_active_targets(
 
 
 @router.get("/mine", response_model=MyTargetsSummaryListResponse)
-def get_my_targets(
+async def get_my_targets(
+    background_tasks: BackgroundTasks,
     supabase: Client = Depends(get_supabase),
+    llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MyTargetsSummaryListResponse:
     """Return the current user's linked targets with fit scores.
 
     List projection (#863): the heavy ``scoring_profile`` JSONB is omitted;
     the full target is available via ``GET /targets/{id}``.
+
+    Lazy fit-score refresh (E2): any cached score computed against an older
+    profile version is recomputed in the background (capped), so a profile edit
+    eventually re-scores existing targets too — not just new ones. The response
+    returns the current cached scores immediately; fresh ones land by the next
+    view.
     """
-    items = crud.list_user_targets_with_summary(supabase, user_id)
+    items = await asyncio.to_thread(crud.list_user_targets_with_summary, supabase, user_id)
+
+    prose_doc_id = await asyncio.to_thread(fit_refresh.current_prose_doc_id, supabase, user_id)
+    if prose_doc_id is not None:
+        stale = await asyncio.to_thread(
+            fit_refresh.stale_target_ids,
+            supabase,
+            user_id=user_id,
+            current_prose_doc_id=prose_doc_id,
+            limit=settings.fit_score_refresh_max_per_view,
+        )
+        if stale:
+            background_tasks.add_task(
+                fit_refresh.refresh_stale_fit_scores,
+                supabase,
+                llm,
+                user_id=user_id,
+                target_ids=stale,
+            )
     return MyTargetsSummaryListResponse(targets=items)
 
 
@@ -1053,9 +1082,14 @@ async def link_target(
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
-    if doc is not None:
-        fit_result, result = await derive_fit_score(llm, payload=doc.payload, target=target)
+    # Fresh vs. the current master document, not a possibly-stale persisted
+    # optimized doc (BUG 2, the stale-payload seam) — a profile edited just
+    # before this link must affect the fit.
+    payload, prose_doc_id = await resolve_current_payload(
+        supabase, llm, cost_supabase=supabase, user_id=user_id
+    )
+    if payload is not None:
+        fit_result, result = await derive_fit_score(llm, payload=payload, target=target)
         await asyncio.to_thread(
             cost_log.record,
             supabase,
@@ -1075,6 +1109,7 @@ async def link_target(
             target_id=target_id,
             fit_score=fit_score,
             fit_score_reasoning=fit_reasoning,
+            fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
         raise HTTPException(
@@ -1348,7 +1383,7 @@ async def create_target_from_posting(
 # ---- Reference JDs ---------------------------------------------------------
 
 
-async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
+async def _fetch_jd_from_url(url: str) -> ExtractionResult:
     """Fetch a JD page and run the extraction cascade (JSON-LD → meta → Firecrawl).
 
     Returns ``(title, jd_text)``. The title comes from the same extraction
@@ -1432,7 +1467,10 @@ async def _fetch_jd_from_url(url: str) -> tuple[str | None, str]:
                 "Try pasting the JD text directly."
             ),
         )
-    return extraction.title, jd_text
+    # Return the whole extraction (title + company + location + description +
+    # salary) so the from-url flow can materialize a full job, not just derive
+    # a profile. jd_text above only validated that description_html is usable.
+    return extraction
 
 
 @router.post(
@@ -1506,7 +1544,16 @@ async def add_reference_jd(
     if not body.jd_text:
         if not body.jd_url:
             raise HTTPException(status_code=422, detail="Either jd_text or jd_url is required")
-        _, body.jd_text = await _fetch_jd_from_url(body.jd_url)
+        body.jd_text = (await _fetch_jd_from_url(body.jd_url)).description_html
+
+    if not body.jd_text:
+        # _fetch_jd_from_url validates a usable description before returning, but
+        # the model field is nullable — guard so the type narrows to str and the
+        # deferred closure below can't capture a None.
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract a job description from that URL.",
+        )
 
     # Bind to a non-None local: ``body.jd_text`` is guaranteed set past this
     # point, but the narrowing wouldn't survive into the deferred to_thread
