@@ -136,6 +136,20 @@ export interface JobAnalysis {
   created_at: string;
 }
 
+/**
+ * Poll marker for the non-blocking analysis flow (#459). The kick-off POST
+ * returns this (202) on a cache miss, and GET returns it while the detached
+ * run hasn't finished:
+ *  - `running` — in flight; keep polling.
+ *  - `error`   — the run failed; offer a retry.
+ *  - `idle`    — nothing cached and nothing in flight (e.g. a server restart
+ *    dropped the run); re-kick via POST.
+ */
+export interface AnalysisStatus {
+  status: 'running' | 'error' | 'idle';
+  message?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Resume lifecycle types (#505)
 // ---------------------------------------------------------------------------
