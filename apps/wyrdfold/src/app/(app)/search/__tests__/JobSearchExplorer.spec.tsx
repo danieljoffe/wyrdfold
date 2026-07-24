@@ -16,6 +16,34 @@ jest.mock('next/link', () => ({
   }) => <a href={href}>{children}</a>,
 }));
 
+// Reactive next/navigation mock: router.replace updates the mocked
+// searchParams and forces subscribed components to re-render, so the URL-driven
+// search round-trip (submit/filter → URL → effect → fetch) runs in the unit.
+let mockSearchParams = new URLSearchParams();
+const mockNavListeners = new Set<() => void>();
+const mockReplace = jest.fn((url: string) => {
+  const i = url.indexOf('?');
+  mockSearchParams = new URLSearchParams(i >= 0 ? url.slice(i + 1) : '');
+  mockNavListeners.forEach(l => l());
+});
+jest.mock('next/navigation', () => {
+  const react = require('react');
+  return {
+    useRouter: () => ({ replace: mockReplace, push: jest.fn() }),
+    usePathname: () => '/search',
+    useSearchParams: () => {
+      const [, force] = react.useReducer((x: number) => x + 1, 0);
+      react.useEffect(() => {
+        mockNavListeners.add(force);
+        return () => {
+          mockNavListeners.delete(force);
+        };
+      }, []);
+      return mockSearchParams;
+    },
+  };
+});
+
 const mockToast = jest.fn();
 jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
@@ -51,7 +79,11 @@ function mockSearch(results: JobSearchResult[], hasMore = false) {
   }) as unknown as typeof fetch;
 }
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockSearchParams = new URLSearchParams();
+  mockNavListeners.clear();
+});
 afterAll(() => {
   global.fetch = ORIGINAL_FETCH;
 });
@@ -95,7 +127,7 @@ describe('JobSearchExplorer', () => {
     // payload + the JobSearchResult type; here just assert the row is a plain
     // preview).
     expect(global.fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/jobs/search?q=frontend%20engineer')
+      expect.stringContaining('/api/jobs/search?q=frontend+engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
   });
@@ -258,6 +290,76 @@ describe('JobSearchExplorer', () => {
     typeAndSearch('frontend');
 
     expect(await screen.findByText(/search exploded/i)).toBeInTheDocument();
+  });
+
+  // ---- URL-synced query + filters (#467) ---------------------------------
+
+  it('restores the search straight from URL params on mount (back/bookmark)', async () => {
+    mockSearch([result({ title: 'Frontend Engineer' })]);
+    mockSearchParams = new URLSearchParams('q=engineer');
+    render(<JobSearchExplorer />);
+
+    // No typing — the search runs off the URL alone.
+    expect(
+      await screen.findByRole('link', { name: 'Frontend Engineer' })
+    ).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/jobs/search?q=engineer')
+    );
+  });
+
+  it('commits the query to the URL on submit', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    typeAndSearch('backend developer');
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('q=backend+developer'),
+        expect.anything()
+      )
+    );
+  });
+
+  it('applies the recency filter to the URL and the request', async () => {
+    mockSearch([result()]);
+    mockSearchParams = new URLSearchParams('q=engineer');
+    render(<JobSearchExplorer />);
+    await screen.findByRole('link', { name: 'Frontend Engineer' });
+
+    fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
+      target: { value: '30' },
+    });
+
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('posted_within=30'),
+        expect.anything()
+      )
+    );
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('posted_within_days=30')
+      )
+    );
+  });
+
+  it('applies the location filter to the request', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    fireEvent.change(
+      screen.getByLabelText(/search jobs by title or keyword/i),
+      { target: { value: 'engineer' } }
+    );
+    fireEvent.change(screen.getByLabelText(/filter by location/i), {
+      target: { value: 'Remote' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^search$/i }));
+
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('location=Remote')
+      )
+    );
   });
 
   // ---- "Add to target" picker (#467 power-action) ------------------------

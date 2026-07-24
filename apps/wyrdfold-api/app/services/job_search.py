@@ -23,6 +23,7 @@ easily extended; embedding re-rank is a later, logged-in-only enhancement.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from supabase import Client
@@ -48,6 +49,9 @@ DEFAULT_PAGE_SIZE = 20
 # Hard ceiling on the pagination offset — there's nothing to page past the
 # ranked candidate window, so reject offsets beyond it at the edge.
 MAX_OFFSET = _CANDIDATE_CAP
+# Recency-filter ceiling — a year back is effectively "any time" for this corpus,
+# and bounding it keeps the DB predicate sane.
+MAX_POSTED_WITHIN_DAYS = 365
 
 # Canonical role/seniority groups → surface forms (all lowercase). Members of a
 # group are treated as synonyms for both the DB pre-filter and the overlap rank.
@@ -145,6 +149,8 @@ def search_jobs(
     q: str,
     limit: int = DEFAULT_PAGE_SIZE,
     offset: int = 0,
+    location: str | None = None,
+    posted_within_days: int | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
     """Search the live, US jobs corpus by title. Service-role client (the corpus
     is shared, non-user data).
@@ -154,6 +160,15 @@ def search_jobs(
     the candidate window). Empty/whitespace/punctuation-only queries return
     ``([], False)`` (the honest empty state — see #467). ``limit`` is clamped to
     ``[1, MAX_PAGE_SIZE]``.
+
+    Optional refinements (both narrow the same candidate window the ranker sees):
+    ``posted_within_days`` filters ``created_at`` DB-side (a clean date bound,
+    clamped to ``[1, MAX_POSTED_WITHIN_DAYS]``); ``location`` is a case-
+    insensitive substring match applied in Python over the fetched candidates
+    (mirrors the ``/jobs`` location filter — avoids PostgREST ilike wildcard/
+    escaping over a free-text value, and location text is too irregular to index
+    on anyway). Both are refinements over the title match, so they operate within
+    the capped candidate window — the same V1 bound as pagination.
     """
     limit = max(1, min(limit, MAX_PAGE_SIZE))
     offset = max(0, offset)
@@ -166,7 +181,7 @@ def search_jobs(
     ilike_terms = sorted({form for tok in tokens for form in _forms_for(tok)})
     or_filter = ",".join(f"title.ilike.*{term}*" for term in ilike_terms)
 
-    resp = (
+    query = (
         supabase.table("jobs")
         .select(_SEARCH_COLS)
         # Live + US corpus gate (mirrors the scores-layer live predicate:
@@ -175,12 +190,23 @@ def search_jobs(
         .is_("purged_at", "null")
         .not_.is_("is_us", "false")
         .or_(or_filter)
+    )
+    if posted_within_days is not None:
+        days = max(1, min(posted_within_days, MAX_POSTED_WITHIN_DAYS))
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        query = query.gte("created_at", cutoff)
+
+    resp = (
         # Bias the capped candidate pull toward recent postings before re-ranking.
-        .order("created_at", desc=True)
-        .limit(_CANDIDATE_CAP)
-        .execute()
+        query.order("created_at", desc=True).limit(_CANDIDATE_CAP).execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
+
+    # Location refine (Python, post-fetch): case-insensitive substring over the
+    # candidate window. A blank/whitespace value is a no-op.
+    if location and location.strip():
+        needle = location.strip().lower()
+        rows = [r for r in rows if needle in str(r.get("location") or "").lower()]
 
     query_groups = _groups(tokens)
     rows.sort(key=lambda r: _rank_key(query_groups, r), reverse=True)
