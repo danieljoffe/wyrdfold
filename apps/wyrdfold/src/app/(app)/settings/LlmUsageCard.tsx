@@ -27,8 +27,9 @@ interface LlmUsage {
 }
 
 /** Amber past 70%, red past 90% — the same tiers the hand-rolled meter used,
- *  now expressed as the shared ProgressBar's `variant` (accent = the brand fill). */
-function usageVariant(
+ *  now expressed as the shared ProgressBar's `variant` (accent = the brand fill).
+ *  Exported for unit tests to lock the tier boundaries + the zero-limit case. */
+export function usageVariant(
   spent: number,
   limit: number
 ): 'accent' | 'warning' | 'error' {
