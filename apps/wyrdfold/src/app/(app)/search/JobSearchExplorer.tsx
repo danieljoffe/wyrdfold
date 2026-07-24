@@ -11,6 +11,7 @@ import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { ChevronDown } from 'lucide-react';
 import { Input } from '@danieljoffe/shared-ui/Input';
+import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
@@ -24,7 +25,7 @@ const PAGE_SIZE = 20;
 
 /** Recency filter presets. The value is the `posted_within` day-count carried in
  *  the URL + sent to the API (`''` = any time). */
-const RECENCY_OPTIONS: { value: string; label: string }[] = [
+const RECENCY_OPTIONS: SelectOption[] = [
   { value: '', label: 'Any time' },
   { value: '7', label: 'Past week' },
   { value: '30', label: 'Past month' },
@@ -552,24 +553,18 @@ export default function JobSearchExplorer() {
               aria-label='Filter by location'
             />
           </div>
-          <label className='sr-only' htmlFor='job-search-recency'>
-            Filter by date posted
-          </label>
-          <select
-            id='job-search-recency'
-            value={urlDays}
-            // h-12 + text-base match the shared-ui Input's height/font so the
-            // two filter controls line up (the Input renders taller than a
-            // default-padded select).
-            onChange={e => changeRecency(e.target.value)}
-            className='h-12 rounded-md border border-border bg-surface-base px-3 text-base text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
-          >
-            {RECENCY_OPTIONS.map(o => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
+          {/* Shared-ui Select — same design-system control (and default size)
+              as the Input above, so the two line up without hand-tuned heights.
+              aria-label instead of a visible label to keep the row compact. */}
+          <div className='w-44'>
+            <Select
+              id='job-search-recency'
+              aria-label='Filter by date posted'
+              value={urlDays}
+              onChange={e => changeRecency(e.target.value)}
+              options={RECENCY_OPTIONS}
+            />
+          </div>
           {hasActiveFilters && (
             <button
               type='button'
