@@ -139,7 +139,7 @@ def test_result_row_carries_no_score_and_no_jd_body() -> None:
 def test_search_endpoint_returns_ranked_results() -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import get_supabase, require_bff_secret
+    from app.dependencies import get_supabase, verify_api_key_or_jwt
     from app.main import app
 
     rows = [
@@ -147,7 +147,7 @@ def test_search_endpoint_returns_ranked_results() -> None:
         _row("be", "Backend Developer", "2026-01-09"),
     ]
     app.dependency_overrides[get_supabase] = lambda: _mock_supabase(rows)
-    app.dependency_overrides[require_bff_secret] = lambda: None
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test-user"
     try:
         resp = TestClient(app).get("/search?q=frontend+developer")
         assert resp.status_code == 200
@@ -161,14 +161,26 @@ def test_search_endpoint_returns_ranked_results() -> None:
         app.dependency_overrides.clear()
 
 
+def test_search_endpoint_requires_auth() -> None:
+    """Abuse control (#467): no anonymous access — the endpoint is gated to
+    logged-in sessions while the feature is beta-only."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    # No auth override → the router-level verify_api_key_or_jwt rejects.
+    resp = TestClient(app).get("/search?q=frontend")
+    assert resp.status_code in (401, 403)
+
+
 def test_search_endpoint_requires_a_query() -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import get_supabase, require_bff_secret
+    from app.dependencies import get_supabase, verify_api_key_or_jwt
     from app.main import app
 
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
-    app.dependency_overrides[require_bff_secret] = lambda: None
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test-user"
     try:
         assert TestClient(app).get("/search").status_code == 422  # q is required
     finally:
