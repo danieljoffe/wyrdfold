@@ -10,6 +10,7 @@ import {
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { ChevronDown } from 'lucide-react';
+import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
@@ -501,12 +502,15 @@ export default function JobSearchExplorer() {
   };
 
   return (
-    <div className='mx-auto max-w-3xl space-y-6'>
-      <header className='space-y-1'>
-        <h1 className='text-2xl font-semibold text-text-primary'>
+    // Page shell matches the other (app) pages (Jobs / Targets): a full-width
+    // `flex flex-col gap-6` column with a hero `Heading` — not a centered
+    // max-w-3xl block with a bespoke text-2xl h1.
+    <div className='flex flex-col gap-6'>
+      <div>
+        <Heading variant='hero' as='h1'>
           Search jobs
-        </h1>
-        <Text variant='body' className='text-text-secondary'>
+        </Heading>
+        <Text variant='body' className='mt-1 text-text-secondary'>
           Browse the full job pool by keyword. These results aren’t scored
           against your profile — head to{' '}
           <Link href='/jobs' className='underline underline-offset-2'>
@@ -514,7 +518,7 @@ export default function JobSearchExplorer() {
           </Link>{' '}
           to see how you match.
         </Text>
-      </header>
+      </div>
 
       <div className='space-y-2'>
         <div className='flex gap-2'>
