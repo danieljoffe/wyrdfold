@@ -37,12 +37,17 @@ _SEARCH_COLS = (
     "salary_text, absolute_url, first_seen_at, created_at"
 )
 
-# How many title-matching candidates to pull for Python re-ranking, and the hard
-# ceiling on returned rows. A single capped page (no deep pagination) bounds
-# corpus enumeration by scrapers (#467 abuse decision).
-_CANDIDATE_CAP = 100
+# How many title-matching candidates to pull for Python re-ranking. This also
+# bounds how deep pagination can go (we rank the candidate window, then page
+# through it): ~250 ranked matches across ~12 pages is ample for the curated
+# corpus and keeps the light-column fetch cheap on the small instance. Truly
+# unbounded paging would need DB-side ranking (an RPC) — a later optimization.
+_CANDIDATE_CAP = 250
 MAX_PAGE_SIZE = 25
 DEFAULT_PAGE_SIZE = 20
+# Hard ceiling on the pagination offset — there's nothing to page past the
+# ranked candidate window, so reject offsets beyond it at the edge.
+MAX_OFFSET = _CANDIDATE_CAP
 
 # Canonical role/seniority groups → surface forms (all lowercase). Members of a
 # group are treated as synonyms for both the DB pre-filter and the overlap rank.
@@ -135,18 +140,26 @@ def _rank_key(query_groups: set[str], row: dict[str, Any]) -> tuple[int, str]:
 
 
 def search_jobs(
-    supabase: Client, *, q: str, limit: int = DEFAULT_PAGE_SIZE
-) -> list[JobSearchResult]:
+    supabase: Client,
+    *,
+    q: str,
+    limit: int = DEFAULT_PAGE_SIZE,
+    offset: int = 0,
+) -> tuple[list[JobSearchResult], bool]:
     """Search the live, US jobs corpus by title. Service-role client (the corpus
-    is shared, non-user data). Returns a single ranked, capped page.
+    is shared, non-user data).
 
-    Empty/whitespace/punctuation-only queries return ``[]`` (the honest empty
-    state — see #467). ``limit`` is clamped to ``[1, MAX_PAGE_SIZE]``.
+    Returns ``(page, has_more)``: the ranked results in
+    ``[offset, offset + limit)`` and whether more ranked matches remain (up to
+    the candidate window). Empty/whitespace/punctuation-only queries return
+    ``([], False)`` (the honest empty state — see #467). ``limit`` is clamped to
+    ``[1, MAX_PAGE_SIZE]``.
     """
     limit = max(1, min(limit, MAX_PAGE_SIZE))
+    offset = max(0, offset)
     tokens = _tokenize(q)
     if not tokens:
-        return []
+        return [], False
 
     # OR of ``title ILIKE *form*`` across every query token's synonym forms —
     # index-backed via the title trigram GIN. Tokens are sanitized above.
@@ -171,4 +184,6 @@ def search_jobs(
 
     query_groups = _groups(tokens)
     rows.sort(key=lambda r: _rank_key(query_groups, r), reverse=True)
-    return [JobSearchResult.model_validate(r) for r in rows[:limit]]
+    page = rows[offset : offset + limit]
+    has_more = len(rows) > offset + limit
+    return [JobSearchResult.model_validate(r) for r in page], has_more

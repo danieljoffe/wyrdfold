@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import JobSearchExplorer from '../JobSearchExplorer';
 import type { JobSearchResult } from '../types';
 
@@ -33,11 +33,16 @@ function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
   };
 }
 
-function mockSearch(results: JobSearchResult[]) {
+function mockSearch(results: JobSearchResult[], hasMore = false) {
   global.fetch = jest.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    json: async () => ({ query: 'q', count: results.length, results }),
+    json: async () => ({
+      query: 'q',
+      count: results.length,
+      has_more: hasMore,
+      results,
+    }),
   }) as unknown as typeof fetch;
 }
 
@@ -88,6 +93,54 @@ describe('JobSearchExplorer', () => {
       expect.stringContaining('/api/jobs/search?q=frontend%20engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
+  });
+
+  it('paginates via "Load more" and appends the next page (#467)', async () => {
+    const page1 = [
+      result({ id: '1', title: 'Frontend Engineer' }),
+      result({ id: '2', title: 'Senior Frontend Engineer' }),
+    ];
+    const page2 = [result({ id: '3', title: 'Staff Frontend Engineer' })];
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      const first = url.includes('offset=0');
+      const results = first ? page1 : page2;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: results.length,
+          has_more: first, // more after page 1, none after page 2
+          results,
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    // Page 1 + a "Load more" affordance.
+    expect(
+      await screen.findByRole('link', { name: 'Frontend Engineer' })
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }));
+
+    // Page 2 appended (page 1 rows still present), and "Load more" is gone.
+    expect(
+      await screen.findByRole('link', { name: 'Staff Frontend Engineer' })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('link', { name: 'Frontend Engineer' })
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: /load more/i })
+      ).not.toBeInTheDocument()
+    );
+    // The second request paged from offset=2 (page 1 length).
+    expect(global.fetch).toHaveBeenLastCalledWith(
+      expect.stringContaining('offset=2')
+    );
   });
 
   it('shows an honest empty state when nothing matches', async () => {

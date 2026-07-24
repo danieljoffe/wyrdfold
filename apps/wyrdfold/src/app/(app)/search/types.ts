@@ -18,5 +18,6 @@ export interface JobSearchResult {
 export interface JobSearchResponse {
   query: string;
   count: number;
+  has_more: boolean;
   results: JobSearchResult[];
 }

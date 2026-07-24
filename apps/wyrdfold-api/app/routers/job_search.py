@@ -48,22 +48,30 @@ async def search_jobs_endpoint(
     page_size: int = Query(
         job_search.DEFAULT_PAGE_SIZE, ge=1, le=job_search.MAX_PAGE_SIZE
     ),
+    offset: int = Query(0, ge=0, le=job_search.MAX_OFFSET, description="Pagination offset"),
     supabase: Client = Depends(get_supabase),
 ) -> JobSearchResponse:
-    """Keyword search over the live, US jobs corpus.
+    """Keyword search over the live, US jobs corpus (one page).
 
     ``request`` is required by slowapi to key the rate limit (per-user for an
-    authed caller). Results carry NO match score and NO JD body — a preview that
+    authed caller). ``offset`` pages through the ranked candidate window (see
+    the service). Results carry NO match score and NO JD body — a preview that
     links to the source posting; the full JD + "how you match" stay in the
     matched experience.
     """
-    cache_key = make_cache_key(_CACHE_PREFIX, q=q.strip().lower(), page_size=page_size)
+    cache_key = make_cache_key(
+        _CACHE_PREFIX, q=q.strip().lower(), page_size=page_size, offset=offset
+    )
     cached = job_list_cache.get(cache_key)
     if cached is not None:
         return cast(JobSearchResponse, cached)
 
     # supabase-py is blocking; offload the round-trip off the event loop.
-    results = await asyncio.to_thread(job_search.search_jobs, supabase, q=q, limit=page_size)
-    response = JobSearchResponse(query=q, count=len(results), results=results)
+    results, has_more = await asyncio.to_thread(
+        job_search.search_jobs, supabase, q=q, limit=page_size, offset=offset
+    )
+    response = JobSearchResponse(
+        query=q, count=len(results), has_more=has_more, results=results
+    )
     job_list_cache.set(cache_key, response)
     return response

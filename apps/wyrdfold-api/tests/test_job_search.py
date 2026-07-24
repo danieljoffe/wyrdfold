@@ -76,7 +76,8 @@ def test_frontend_engineer_outranks_backend_developer() -> None:
     ]
     supabase = _mock_supabase(rows)
 
-    results = job_search.search_jobs(supabase, q="frontend developer")
+    results, has_more = job_search.search_jobs(supabase, q="frontend developer")
+    assert has_more is False  # only 3 matches, one page
     ids = [r.id for r in results]
 
     # Both frontend roles (overlap 2) rank above the backend role (overlap 1)...
@@ -90,16 +91,34 @@ def test_frontend_engineer_outranks_backend_developer() -> None:
 
 def test_empty_query_returns_empty_without_hitting_db() -> None:
     supabase = _mock_supabase([_row("x", "Anything", "2026-01-01")])
-    assert job_search.search_jobs(supabase, q="   ") == []
-    assert job_search.search_jobs(supabase, q="*,()") == []
+    assert job_search.search_jobs(supabase, q="   ") == ([], False)
+    assert job_search.search_jobs(supabase, q="*,()") == ([], False)
     supabase.table.assert_not_called()
 
 
 def test_limit_is_clamped_to_max_page_size() -> None:
     rows = [_row(str(i), "Frontend Engineer", "2026-01-15") for i in range(1, 40)]
     supabase = _mock_supabase(rows)
-    results = job_search.search_jobs(supabase, q="frontend", limit=999)
+    results, has_more = job_search.search_jobs(supabase, q="frontend", limit=999)
     assert len(results) == job_search.MAX_PAGE_SIZE
+    assert has_more is True  # 39 matches > one clamped page of 25
+
+
+def test_pagination_offset_and_has_more() -> None:
+    # 30 identical-overlap matches → deterministic order by recency.
+    rows = [
+        _row(f"j{i:02d}", "Frontend Engineer", f"2026-01-{i:02d}T00:00:00+00:00")
+        for i in range(1, 31)
+    ]
+    supabase = _mock_supabase(rows)
+
+    page1, more1 = job_search.search_jobs(supabase, q="frontend", limit=20, offset=0)
+    page2, more2 = job_search.search_jobs(supabase, q="frontend", limit=20, offset=20)
+
+    assert len(page1) == 20 and more1 is True  # 30 > 20
+    assert len(page2) == 10 and more2 is False  # last page, nothing after
+    # No overlap between pages, and page 2 continues the ranked order.
+    assert {r.id for r in page1}.isdisjoint(r.id for r in page2)
 
 
 # --- corpus gate + filter --------------------------------------------------

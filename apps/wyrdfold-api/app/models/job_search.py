@@ -30,9 +30,14 @@ class JobSearchResult(BaseModel):
 
 
 class JobSearchResponse(BaseModel):
-    """Envelope for a public search — a single capped page (no deep pagination,
-    to bound corpus enumeration)."""
+    """Envelope for one page of search results.
+
+    ``count`` is the size of THIS page (not the total corpus match count, which
+    a title-ranked search doesn't compute); ``has_more`` drives the client's
+    "Load more" affordance.
+    """
 
     query: str
     count: int
+    has_more: bool
     results: list[JobSearchResult]

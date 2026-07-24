@@ -21,6 +21,8 @@ export async function GET(request: NextRequest) {
   const searchParams = new URLSearchParams({ q });
   const pageSize = sp.get('page_size');
   if (pageSize) searchParams.set('page_size', pageSize);
+  const offset = sp.get('offset');
+  if (offset) searchParams.set('offset', offset);
 
   return proxyToWyrdfoldAPI('/search', { searchParams });
 }
