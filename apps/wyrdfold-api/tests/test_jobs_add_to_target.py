@@ -1,21 +1,23 @@
 """Router tests for POST /jobs/{job_id}/add-to-target (#467 power-action).
 
 The endpoint scores an EXISTING posting (a search result's ``jobs.id``) against
-one of the caller's own targets and saves it to their pipeline. The assertions
-that matter here are the security wiring — SEC-H2:
+one of the caller's own targets and saves it to their pipeline. The security
+wiring — post the SEC-H2 lockdown (migration 20260718010000):
 
-  * the gated score write + force-include + user_job save ride the caller's
-    JWT client (Postgres enforces target ownership in-DB), NOT service-role;
-  * only the shared-catalog global-score recompute uses service-role;
-  * a target the caller doesn't follow 404s with the same message as a missing
-    one (no cross-tenant id leak);
+  * the score write + force-include + user_job save all go on the SERVICE-ROLE
+    client — the user_upsert_score / user_set_scores_included RPCs are no longer
+    ``authenticated``-executable (their follower-check is insufficient for a
+    shared, ownerless target catalog), so with auth.uid() NULL they take the
+    service-role-exempt branch — exactly like ``POST /jobs/manual``;
+  * OWNERSHIP is enforced in the API: ``get_user_target`` on the caller's
+    (RLS-backstopped) client — a target the caller doesn't follow 404s with the
+    same message as a missing one (no cross-tenant id leak);
   * a dead / unknown posting 404s;
   * it NEVER calls ``materialize_and_score_job`` (which would duplicate the row
     under the manual pseudo-source).
 
-The in-DB ownership enforcement itself (the RPC + RLS) is proven against a live
-stack in the integration suite; here we prove the router hands the right client
-to the right call.
+(The earlier caller-client "gated" path 502'd in prod — the grant was revoked;
+this pins the corrected wiring.)
 """
 
 from __future__ import annotations
@@ -117,7 +119,7 @@ def _wire(
     app.dependency_overrides[get_current_user_id] = lambda: _USER_ID
 
 
-def test_add_to_target_scores_existing_job_via_caller_client(
+def test_add_to_target_writes_via_service_role_ownership_checked_on_caller(
     overrides: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user_sb = MagicMock(name="user_client")
@@ -142,21 +144,23 @@ def test_add_to_target_scores_existing_job_via_caller_client(
         "target_id": _TARGET_ID,
         "score": 71,
     }
-    # SEC-H2: the gated score write, force-include, and user_job save ride the
-    # caller's JWT client; only the shared global-score recompute is service-role.
-    assert captured["score_client"] is user_sb
+    # Post-lockdown: ALL score writes go on the service-role client (the RPCs
+    # aren't authenticated-executable); ownership was checked on the caller's
+    # client. This is the regression the prod 502 exposed.
+    assert captured["ownership_client"] is user_sb  # get_user_target on caller
+    assert captured["score_client"] is service_sb
     assert captured["score_kwargs"]["gated"] is True
     assert captured["score_kwargs"]["job_posting_id"] == _JOB_ID
-    assert captured["userjob_client"] is user_sb
+    assert captured["userjob_client"] is service_sb
     assert captured["userjob_kwargs"]["status"] == "saved"
     assert captured["global_client"] is service_sb
-    # Force-include goes through the gated RPC on the caller's client, scoped to
-    # just this one target.
-    user_sb.rpc.assert_called_once_with(
+    # Force-include goes through the RPC on the service-role client, scoped to
+    # this one target; the caller client is NEVER used for a score write.
+    service_sb.rpc.assert_called_once_with(
         "user_set_scores_included",
         {"p_job_posting_id": _JOB_ID, "p_target_ids": [_TARGET_ID]},
     )
-    service_sb.rpc.assert_not_called()
+    user_sb.rpc.assert_not_called()
 
 
 def test_add_to_target_404s_when_user_does_not_follow_target(
@@ -237,8 +241,8 @@ def test_add_to_target_survives_secondary_bookkeeping_failure(
 
     assert r.status_code == 200
     assert r.json()["success"] is True
-    # The core score write still happened on the caller's client.
-    assert captured["score_client"] is user_sb
+    # The core score write still happened (on the service-role client).
+    assert captured["score_client"] is service_sb
 
 
 def _query_stub(rows: list[dict[str, Any]]) -> tuple[MagicMock, MagicMock]:
