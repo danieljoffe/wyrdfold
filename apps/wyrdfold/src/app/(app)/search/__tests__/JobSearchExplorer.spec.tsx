@@ -16,6 +16,11 @@ jest.mock('next/link', () => ({
   }) => <a href={href}>{children}</a>,
 }));
 
+const mockToast = jest.fn();
+jest.mock('@/state/Toast/ToastProvider', () => ({
+  useToast: () => ({ toast: mockToast }),
+}));
+
 const ORIGINAL_FETCH = global.fetch;
 
 function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
@@ -93,6 +98,58 @@ describe('JobSearchExplorer', () => {
       expect.stringContaining('/api/jobs/search?q=frontend%20engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
+  });
+
+  it('creates a target from a listing via the from-url flow (#467)', async () => {
+    const created = {
+      user_target: { id: 'ut1' },
+      target: { id: 't1', label: 'Frontend Engineer' },
+      was_matched: false,
+    };
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.includes('/api/targets/from-url')) {
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          json: async () => created,
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: 1,
+          has_more: false,
+          results: [result({ absolute_url: 'https://ext.example/1' })],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    const createBtn = await screen.findByRole('button', {
+      name: /create target/i,
+    });
+    fireEvent.click(createBtn);
+
+    // Reuses the existing from-url flow with the listing's URL.
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/targets/from-url',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    const fromUrlCall = (global.fetch as jest.Mock).mock.calls.find(
+      c => typeof c[0] === 'string' && c[0].includes('/api/targets/from-url')
+    );
+    expect(fromUrlCall?.[1]?.body).toContain('https://ext.example/1'); // jd_url = the listing
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'success' })
+      )
+    );
   });
 
   it('paginates via "Load more" and appends the next page (#467)', async () => {
