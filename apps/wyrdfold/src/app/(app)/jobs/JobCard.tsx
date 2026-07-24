@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { ExternalLink, Maximize2, MoreVertical, Trash2 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
+import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import ConfirmModal from '@/components/ConfirmModal';
@@ -85,14 +86,16 @@ export default function JobCard({
     >
       <header className='flex items-start justify-between gap-2'>
         <div className='flex min-w-0 items-center gap-2'>
-          <input
-            type='checkbox'
-            checked={selected}
-            onChange={onSelectToggle}
-            onClick={e => e.stopPropagation()}
-            aria-label={`Select ${job.title}`}
-            className='mt-0.5 shrink-0 accent-brand-500'
-          />
+          {/* stopPropagation on the wrapper (not the control): the shared
+              Checkbox's visible box is a separate element whose click would
+              otherwise bubble to the card's onClick. */}
+          <span onClick={e => e.stopPropagation()} className='mt-0.5 shrink-0'>
+            <Checkbox
+              checked={selected}
+              onChange={onSelectToggle}
+              aria-label={`Select ${job.title}`}
+            />
+          </span>
           <ScoreBadge
             score={job.score}
             scoringStatus={job.scoring_status}

@@ -2,6 +2,7 @@
 
 import { Fragment, useState } from 'react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
+import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
 import Button from '@/components/kit/Button';
 import ScoreBadge from '@/components/ScoreBadge';
 import { cn } from '@/lib/cn';
@@ -106,12 +107,10 @@ export default function JobsListTable({
           <thead>
             <tr className='border-b border-border text-left'>
               <th scope='col' className='px-3 py-2 w-10'>
-                <input
-                  type='checkbox'
+                <Checkbox
                   checked={allOnPageSelected}
                   onChange={toggleSelectAll}
                   aria-label='Select all on this page'
-                  className='accent-brand-500'
                 />
               </th>
               <th
@@ -181,14 +180,16 @@ export default function JobsListTable({
                   aria-label={`${job.title} at ${job.company_name}, press Enter to ${expandedId === job.id ? 'collapse' : 'expand'} details`}
                 >
                   <td className='px-3 py-2'>
-                    <input
-                      type='checkbox'
-                      checked={selectedIds.has(job.id)}
-                      onChange={() => toggleSelect(job.id)}
-                      onClick={e => e.stopPropagation()}
-                      aria-label={`Select ${job.title}`}
-                      className='accent-brand-500'
-                    />
+                    {/* stopPropagation on the wrapper, not the control: the
+                        shared Checkbox's visible box is a separate element whose
+                        click would otherwise bubble to the row's expand handler. */}
+                    <span onClick={e => e.stopPropagation()}>
+                      <Checkbox
+                        checked={selectedIds.has(job.id)}
+                        onChange={() => toggleSelect(job.id)}
+                        aria-label={`Select ${job.title}`}
+                      />
+                    </span>
                   </td>
                   <td className='px-3 py-2'>
                     <StatusIndicator status={job.status} />
