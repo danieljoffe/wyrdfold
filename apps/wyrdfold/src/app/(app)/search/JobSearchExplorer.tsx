@@ -1,7 +1,8 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { ChevronDown } from 'lucide-react';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
@@ -9,10 +10,25 @@ import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { createOrLinkTarget } from '../targets/targetFlows';
+import { addJobToTarget, createOrLinkTarget } from '../targets/targetFlows';
 import type { JobSearchResponse, JobSearchResult } from './types';
 
 const PAGE_SIZE = 20;
+
+/** Minimal projection of a user's target for the "Add to target" picker. */
+interface TargetOption {
+  id: string;
+  label: string;
+}
+
+/** Shared (fetch-once) state for the user's targets, threaded to every row's
+ *  picker so 20 rows don't each refetch `/api/targets/mine`. */
+interface TargetsSource {
+  targets: TargetOption[] | null;
+  loading: boolean;
+  error: string | null;
+  ensureLoaded: () => void;
+}
 
 /** Two-letter monogram from a company name. */
 function initials(name: string): string {
@@ -46,12 +62,153 @@ function CompanyAvatar({ name }: { name: string }) {
 }
 
 /**
+ * Per-row "Add to target" picker (#467 power-action). Opens a small menu of the
+ * caller's targets (loaded once, lazily, on first open — see TargetsSource) and
+ * adds THIS existing posting to the chosen one: the API scores the already-
+ * ingested posting against that target and saves it to the pipeline. Distinct
+ * from "Create target", which derives a whole NEW target from the listing URL.
+ * Mirrors JobsLocationFilter's open / outside-click / Escape idiom for
+ * consistent behaviour + a11y.
+ */
+function AddToTargetMenu({
+  jobId,
+  source,
+}: {
+  jobId: string;
+  source: TargetsSource;
+}) {
+  const { toast } = useToast();
+  const [open, setOpen] = useState(false);
+  const [pendingId, setPendingId] = useState<string | null>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const { targets, loading, error, ensureLoaded } = source;
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) ensureLoaded(); // lazy fetch on first open — side effect stays
+    // out of the setState updater (which must be pure; ensureLoaded sets the
+    // parent's state).
+  };
+
+  // Close on outside click / Escape — same idiom as JobsLocationFilter. The kit
+  // Button isn't a forwardRef, so restore focus to the trigger by querying it
+  // inside the wrapper rather than holding a ref to it.
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (!wrapperRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        setOpen(false);
+        (
+          wrapperRef.current?.querySelector(
+            'button[aria-haspopup="menu"]'
+          ) as HTMLElement | null
+        )?.focus();
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const pick = async (target: TargetOption) => {
+    setPendingId(target.id);
+    try {
+      await addJobToTarget(jobId, target.id);
+      toast({
+        variant: 'success',
+        title: `Added to “${target.label}”`,
+        description: 'Saved to your Jobs and scored against this target.',
+      });
+      setOpen(false);
+    } catch (e) {
+      toast({
+        variant: 'error',
+        title: 'Couldn’t add to target',
+        ...(e instanceof Error ? { description: e.message } : {}),
+      });
+    } finally {
+      setPendingId(null);
+    }
+  };
+
+  return (
+    <div ref={wrapperRef} className='relative'>
+      <Button
+        name='search-add-to-target'
+        variant='secondary'
+        size='sm'
+        aria-haspopup='menu'
+        aria-expanded={open}
+        onClick={toggle}
+      >
+        Add to target
+        <ChevronDown className='ml-1 size-3.5 text-text-tertiary' aria-hidden />
+      </Button>
+      {open && (
+        <div
+          role='menu'
+          aria-label='Add to one of your targets'
+          className='absolute left-0 z-20 mt-1 max-h-64 w-64 max-w-[calc(100vw-2rem)] overflow-auto rounded-lg border border-border bg-surface-elevated p-1 shadow-lg'
+        >
+          {loading && (
+            <div className='flex items-center gap-2 px-2 py-1.5' role='status'>
+              <Spinner size='sm' aria-label='Loading targets' />
+              <Text variant='meta'>Loading targets…</Text>
+            </div>
+          )}
+          {error && !loading && (
+            <Text variant='error' role='alert' className='block px-2 py-1.5'>
+              {error}
+            </Text>
+          )}
+          {targets && !loading && targets.length === 0 && (
+            <Text
+              variant='meta'
+              className='block px-2 py-1.5 text-text-secondary'
+            >
+              No targets yet — create one first.
+            </Text>
+          )}
+          {targets &&
+            !loading &&
+            targets.map(t => (
+              <button
+                key={t.id}
+                type='button'
+                role='menuitem'
+                onClick={() => pick(t)}
+                disabled={pendingId !== null}
+                className='block w-full truncate rounded-md px-2 py-1.5 text-left text-sm text-text-primary hover:bg-surface-tertiary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-60'
+              >
+                {pendingId === t.id ? 'Adding…' : t.label}
+              </button>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * Manual keyword job search (#467). Kept deliberately DISTINCT from the matched
  * Jobs view: no match scores here (results aren't ranked against the user's
  * profile), so search is never mistaken for the quality of the matching engine —
  * and "see your matches" stays the reason to use Jobs. Logged-in only.
  */
-function JobSearchRow({ job }: { job: JobSearchResult }) {
+function JobSearchRow({
+  job,
+  targetsSource,
+}: {
+  job: JobSearchResult;
+  targetsSource: TargetsSource;
+}) {
   const { toast } = useToast();
   const [creating, setCreating] = useState(false);
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
@@ -125,22 +282,26 @@ function JobSearchRow({ job }: { job: JobSearchResult }) {
               {timeAgo(job.created_at)}
             </Text>
           </div>
-          {/* Action lives BELOW the listing info (not beside it) so the info
+          {/* Actions live BELOW the listing info (not beside it) so the info
               reads as one unit when skimming — avoids the awkward right-edge
-              break against the salary/date. */}
-          {job.absolute_url && (
-            <Button
-              name='search-create-target'
-              variant='secondary'
-              size='sm'
-              onClick={createTarget}
-              disabled={creating}
-              aria-busy={creating}
-              className='mt-2'
-            >
-              {creating ? 'Creating…' : 'Create target'}
-            </Button>
-          )}
+              break against the salary/date. "Create target" derives a new
+              target from this listing's URL; "Add to target" scores it against
+              one you already have. */}
+          <div className='mt-2 flex flex-wrap items-center gap-2'>
+            {job.absolute_url && (
+              <Button
+                name='search-create-target'
+                variant='secondary'
+                size='sm'
+                onClick={createTarget}
+                disabled={creating}
+                aria-busy={creating}
+              >
+                {creating ? 'Creating…' : 'Create target'}
+              </Button>
+            )}
+            <AddToTargetMenu jobId={job.id} source={targetsSource} />
+          </div>
         </div>
       </div>
     </li>
@@ -155,6 +316,49 @@ export default function JobSearchExplorer() {
   const [loading, setLoading] = useState(false); // fresh search
   const [loadingMore, setLoadingMore] = useState(false); // "Load more"
   const [error, setError] = useState<string | null>(null);
+
+  // The user's targets for every row's "Add to target" picker — fetched ONCE,
+  // lazily, the first time any menu opens. ``targetsRequested`` stops the N
+  // rows from each kicking a fetch; it resets on failure so a later open retries.
+  const [targets, setTargets] = useState<TargetOption[] | null>(null);
+  const [targetsLoading, setTargetsLoading] = useState(false);
+  const [targetsError, setTargetsError] = useState<string | null>(null);
+  const targetsRequested = useRef(false);
+
+  const ensureTargets = useCallback(() => {
+    if (targetsRequested.current) return;
+    targetsRequested.current = true;
+    setTargetsLoading(true);
+    setTargetsError(null);
+    void (async () => {
+      try {
+        const res = await fetch('/api/targets/mine');
+        if (!res.ok) {
+          throw new Error(await extractApiError(res, 'Failed to load targets'));
+        }
+        const data = (await res.json()) as {
+          targets: { target: { id: string; label: string } }[];
+        };
+        setTargets(
+          data.targets.map(t => ({ id: t.target.id, label: t.target.label }))
+        );
+      } catch (e) {
+        targetsRequested.current = false; // allow a retry on the next open
+        setTargetsError(
+          e instanceof Error ? e.message : 'Failed to load targets.'
+        );
+      } finally {
+        setTargetsLoading(false);
+      }
+    })();
+  }, []);
+
+  const targetsSource: TargetsSource = {
+    targets,
+    loading: targetsLoading,
+    error: targetsError,
+    ensureLoaded: ensureTargets,
+  };
 
   const fetchPage = useCallback(async (q: string, offset: number) => {
     const res = await fetch(
@@ -274,7 +478,11 @@ export default function JobSearchExplorer() {
             <>
               <ul className='divide-y divide-border overflow-hidden rounded-md border border-border'>
                 {results.map(job => (
-                  <JobSearchRow key={job.id} job={job} />
+                  <JobSearchRow
+                    key={job.id}
+                    job={job}
+                    targetsSource={targetsSource}
+                  />
                 ))}
               </ul>
               {hasMore && (

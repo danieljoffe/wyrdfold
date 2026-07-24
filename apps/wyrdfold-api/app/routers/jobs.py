@@ -33,6 +33,8 @@ from app.http_client import (
     get_with_size_cap,
 )
 from app.models.schemas import (
+    AddToTargetRequest,
+    AddToTargetResponse,
     ManualJobRequest,
     ManualJobResponse,
     UrlValidateRequest,
@@ -53,6 +55,8 @@ from app.services.scoring import strip_html
 from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
+    score_and_upsert,
+    update_global_score,
 )
 from app.services.targets.crud import get as get_target
 from app.services.targets.crud import get_active as get_active_target
@@ -2308,6 +2312,131 @@ async def add_manual_job(
         extraction_tier=extraction.tier,
         warnings=warnings,
         needs_manual_fields=False,
+    )
+
+
+def _load_live_job(supabase: Client, job_id: str) -> dict[str, Any] | None:
+    """Load a LIVE, US posting's scoring inputs (title + JD body) by id, or None.
+
+    Mirrors ``job_search``'s live+US predicate exactly (archived_at IS NULL AND
+    purged_at IS NULL AND is_us IS NOT FALSE) so "addable" ⇔ "searchable": a
+    dead / purged / non-US id 404s instead of letting a caller resurrect a
+    hidden row into their pipeline by guessing its UUID.
+    """
+    resp = (
+        supabase.table("jobs")
+        .select("id, title, description_html")
+        .eq("id", job_id)
+        .is_("archived_at", "null")
+        .is_("purged_at", "null")
+        .not_.is_("is_us", "false")
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0] if rows else None
+
+
+# Sync `def` (not `async def`): all the work is blocking supabase round-trips
+# (score compute + gated upserts), so FastAPI runs it in its threadpool and
+# keeps them off the event loop. See #107.
+@router.post("/{job_id}/add-to-target", response_model=AddToTargetResponse)
+@limiter.limit("30/minute")
+def add_job_to_target(
+    request: Request,
+    job_id: str,
+    body: AddToTargetRequest,
+    user_id: str = Depends(get_current_user_id),
+    # SEC-H2: the gated score writes ride the caller's JWT client so Postgres
+    # enforces target ownership in-DB (user_upsert_score / user_set_scores_included
+    # are SECURITY DEFINER). The only shared-catalog write — the posting's global
+    # score aggregate — needs the service-role client.
+    caller_supabase: Client = Depends(get_user_supabase),
+    service_supabase: Client = Depends(get_supabase),
+) -> AddToTargetResponse:
+    """Score an EXISTING posting (a search result's ``jobs.id``) against one of
+    the caller's own targets and save it to their pipeline (#467 power-action).
+
+    Unlike ``POST /jobs/manual`` this NEVER materializes a new job row — the
+    posting is already in the shared corpus — so it can't create the
+    manual-pseudo-source duplicate that ``materialize_and_score_job`` would.
+    """
+    # Load the posting's scoring inputs. Must be a live+US posting (exactly what
+    # search surfaces); a dead / purged / unknown id 404s.
+    job = _load_live_job(caller_supabase, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Ownership gate (app layer). Same 404 for "target doesn't exist" and "not
+    # yours" so the response never leaks another user's target ids. The gated
+    # RPCs below are the in-DB backstop (SEC-H2).
+    if get_user_target(caller_supabase, user_id, body.target_id) is None:
+        raise HTTPException(status_code=404, detail="Target not found for user")
+
+    target = get_target(service_supabase, body.target_id)
+    if target is None:  # catalog row vanished between the two reads — defensive
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    # Stage-2 score the existing posting against the chosen target. ``gated=True``
+    # routes the scores upsert through user_upsert_score on the caller's client.
+    try:
+        result = score_and_upsert(
+            caller_supabase,
+            job_posting_id=job_id,
+            title=job["title"] or "",
+            description_html=job["description_html"] or "",
+            target=target,
+            gated=True,
+        )
+    except APIError as exc:
+        logger.error(
+            "add-to-target scoring failed job=%s target=%s: %s",
+            job_id,
+            body.target_id,
+            exc,
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't add this job right now — please try again.",
+        ) from exc
+
+    # Best-effort bookkeeping AFTER the score row is committed (mirrors
+    # materialize_and_score_job): a transient failure in any of these must not
+    # fail the whole action — the score (the core effect) is already written, so
+    # a 500 here would read as "nothing happened" when the job IS scored and
+    # will show under the target. Each step is independent and logged.
+    #  1. Recompute the posting's global aggregate (shared column → service-role).
+    try:
+        update_global_score(service_supabase, job_id)
+    except Exception:
+        logger.exception("add-to-target global-score update failed for job %s", job_id)
+    #  2. Force-include under THIS one target so a negative-keyword ``excluded``
+    #     flag can't hide a job the user deliberately added — scoped to the single
+    #     target via the gated RPC on the caller's client (audit #24 F4).
+    try:
+        caller_supabase.rpc(
+            "user_set_scores_included",
+            {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
+        ).execute()
+    except Exception:
+        logger.exception("add-to-target force-include failed for job %s", job_id)
+    #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
+    #     path (targets/from_input.py): a deliberately-added posting is 'saved',
+    #     not the auto-surfaced 'new'.
+    try:
+        persistence.upsert_user_job(
+            caller_supabase, user_id=user_id, job_posting_id=job_id, status="saved"
+        )
+    except Exception:
+        logger.exception("add-to-target user_job save failed for job %s", job_id)
+    job_list_cache.invalidate()
+
+    return AddToTargetResponse(
+        success=True,
+        job_posting_id=job_id,
+        target_id=body.target_id,
+        score=result.score,
     )
 
 
