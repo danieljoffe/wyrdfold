@@ -60,6 +60,34 @@ export async function createOrLinkTarget(
   return (await res.json()) as CreateOrLinkResult;
 }
 
+export interface AddToTargetResult {
+  success: boolean;
+  job_posting_id: string;
+  target_id: string;
+  score: number;
+}
+
+/**
+ * Add an EXISTING posting (a search result's job id) to one of the caller's
+ * targets (#467 power-action). Scores the already-ingested posting against the
+ * chosen target and saves it to the pipeline — no LLM, no new job row (unlike
+ * {@link createOrLinkTarget}, which derives a whole target from a URL).
+ */
+export async function addJobToTarget(
+  jobId: string,
+  targetId: string
+): Promise<AddToTargetResult> {
+  const res = await fetch(`/api/jobs/${jobId}/add-to-target`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_id: targetId }),
+  });
+  if (!res.ok) {
+    throw new Error(await extractApiError(res, 'Couldn’t add to target'));
+  }
+  return (await res.json()) as AddToTargetResult;
+}
+
 /** Project a create-or-link response to the targets-list entry shape (#863). */
 export function toListEntry(result: CreateOrLinkResult): UserTargetWithSummary {
   return {

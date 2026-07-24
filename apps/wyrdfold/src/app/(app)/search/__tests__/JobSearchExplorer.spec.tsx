@@ -16,6 +16,34 @@ jest.mock('next/link', () => ({
   }) => <a href={href}>{children}</a>,
 }));
 
+// Reactive next/navigation mock: router.replace updates the mocked
+// searchParams and forces subscribed components to re-render, so the URL-driven
+// search round-trip (submit/filter → URL → effect → fetch) runs in the unit.
+let mockSearchParams = new URLSearchParams();
+const mockNavListeners = new Set<() => void>();
+const mockReplace = jest.fn((url: string) => {
+  const i = url.indexOf('?');
+  mockSearchParams = new URLSearchParams(i >= 0 ? url.slice(i + 1) : '');
+  mockNavListeners.forEach(l => l());
+});
+jest.mock('next/navigation', () => {
+  const react = require('react');
+  return {
+    useRouter: () => ({ replace: mockReplace, push: jest.fn() }),
+    usePathname: () => '/search',
+    useSearchParams: () => {
+      const [, force] = react.useReducer((x: number) => x + 1, 0);
+      react.useEffect(() => {
+        mockNavListeners.add(force);
+        return () => {
+          mockNavListeners.delete(force);
+        };
+      }, []);
+      return mockSearchParams;
+    },
+  };
+});
+
 const mockToast = jest.fn();
 jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
@@ -51,7 +79,11 @@ function mockSearch(results: JobSearchResult[], hasMore = false) {
   }) as unknown as typeof fetch;
 }
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockSearchParams = new URLSearchParams();
+  mockNavListeners.clear();
+});
 afterAll(() => {
   global.fetch = ORIGINAL_FETCH;
 });
@@ -95,7 +127,7 @@ describe('JobSearchExplorer', () => {
     // payload + the JobSearchResult type; here just assert the row is a plain
     // preview).
     expect(global.fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/jobs/search?q=frontend%20engineer')
+      expect.stringContaining('/api/jobs/search?q=frontend+engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
   });
@@ -258,5 +290,208 @@ describe('JobSearchExplorer', () => {
     typeAndSearch('frontend');
 
     expect(await screen.findByText(/search exploded/i)).toBeInTheDocument();
+  });
+
+  // ---- URL-synced query + filters (#467) ---------------------------------
+
+  it('restores the search straight from URL params on mount (back/bookmark)', async () => {
+    mockSearch([result({ title: 'Frontend Engineer' })]);
+    mockSearchParams = new URLSearchParams('q=engineer');
+    render(<JobSearchExplorer />);
+
+    // No typing — the search runs off the URL alone.
+    expect(
+      await screen.findByRole('link', { name: 'Frontend Engineer' })
+    ).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/jobs/search?q=engineer')
+    );
+  });
+
+  it('commits the query to the URL on submit', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    typeAndSearch('backend developer');
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('q=backend+developer'),
+        expect.anything()
+      )
+    );
+  });
+
+  it('applies the recency filter to the URL and the request', async () => {
+    mockSearch([result()]);
+    mockSearchParams = new URLSearchParams('q=engineer');
+    render(<JobSearchExplorer />);
+    await screen.findByRole('link', { name: 'Frontend Engineer' });
+
+    fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
+      target: { value: '30' },
+    });
+
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('posted_within=30'),
+        expect.anything()
+      )
+    );
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('posted_within_days=30')
+      )
+    );
+  });
+
+  it('applies the location filter to the request', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    fireEvent.change(
+      screen.getByLabelText(/search jobs by title or keyword/i),
+      { target: { value: 'engineer' } }
+    );
+    fireEvent.change(screen.getByLabelText(/filter by location/i), {
+      target: { value: 'Remote' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^search$/i }));
+
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('location=Remote')
+      )
+    );
+  });
+
+  // ---- "Add to target" picker (#467 power-action) ------------------------
+
+  function mockSearchPlus(
+    handlers: (url: string) => Promise<unknown> | null
+  ): void {
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      const handled = typeof url === 'string' ? handlers(url) : null;
+      if (handled) return handled;
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: 1,
+          has_more: false,
+          results: [result()], // one row → one "Add to target" button
+        }),
+      });
+    }) as unknown as typeof fetch;
+  }
+
+  const minePayload = {
+    targets: [{ target: { id: 't1', label: 'Frontend Engineer' } }],
+  };
+
+  it('adds an existing listing to a chosen target via the picker (#467)', async () => {
+    mockSearchPlus(url => {
+      if (url.includes('/api/targets/mine'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => minePayload,
+        });
+      if (url.includes('/add-to-target'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            job_posting_id: '1',
+            target_id: 't1',
+            score: 70,
+          }),
+        });
+      return null;
+    });
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    // Opening the menu lazily loads the user's targets.
+    fireEvent.click(
+      await screen.findByRole('button', { name: /add to target/i })
+    );
+    // A menuitem (distinct from the result's link) for the target.
+    const option = await screen.findByRole('menuitem', {
+      name: 'Frontend Engineer',
+    });
+    fireEvent.click(option);
+
+    // POSTs the EXISTING job id to the add-to-target route with the target_id.
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/jobs/1/add-to-target',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    const addCall = (global.fetch as jest.Mock).mock.calls.find(
+      c => typeof c[0] === 'string' && c[0].includes('/add-to-target')
+    );
+    expect(addCall?.[1]?.body).toContain('t1'); // target_id in the body
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'success' })
+      )
+    );
+  });
+
+  it('surfaces an error toast when add-to-target fails (#467)', async () => {
+    const payload = { detail: 'Target not found for user' };
+    mockSearchPlus(url => {
+      if (url.includes('/api/targets/mine'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => minePayload,
+        });
+      if (url.includes('/add-to-target'))
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: async () => payload,
+          clone: () => ({ json: async () => payload }),
+        });
+      return null;
+    });
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+    fireEvent.click(
+      await screen.findByRole('button', { name: /add to target/i })
+    );
+    fireEvent.click(
+      await screen.findByRole('menuitem', { name: 'Frontend Engineer' })
+    );
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'error' })
+      )
+    );
+  });
+
+  it('shows an empty picker state when the user has no targets (#467)', async () => {
+    mockSearchPlus(url => {
+      if (url.includes('/api/targets/mine'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ targets: [] }),
+        });
+      return null;
+    });
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+    fireEvent.click(
+      await screen.findByRole('button', { name: /add to target/i })
+    );
+
+    expect(await screen.findByText(/no targets yet/i)).toBeInTheDocument();
   });
 });
