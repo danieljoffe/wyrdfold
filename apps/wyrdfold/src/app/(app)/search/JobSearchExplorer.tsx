@@ -52,7 +52,7 @@ function CompanyAvatar({ name }: { name: string }) {
 function JobSearchRow({ job }: { job: JobSearchResult }) {
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
   return (
-    <li className='rounded-md border border-border bg-surface-tertiary p-3'>
+    <li className='p-3 transition-colors hover:bg-surface-tertiary/60 motion-reduce:transition-none'>
       <div className='flex items-start gap-3'>
         <CompanyAvatar name={job.company_name} />
         <div className='min-w-0 flex-1'>
@@ -218,7 +218,7 @@ export default function JobSearchExplorer() {
             </div>
           ) : (
             <>
-              <ul className='space-y-3'>
+              <ul className='divide-y divide-border overflow-hidden rounded-md border border-border'>
                 {results.map(job => (
                   <JobSearchRow key={job.id} job={job} />
                 ))}
