@@ -7,11 +7,15 @@ LLM JSON parse error.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from app.constants import SYSTEM_USER_ID
 from app.models.analysis import (
@@ -542,61 +546,393 @@ async def test_router_cache_hit_skips_llm(
         app.dependency_overrides.clear()
 
 
-async def test_router_cache_miss_runs_llm_and_persists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cache miss → LLM call → cost log → persist → return record."""
+# --- Non-blocking kick-off + poll (#459) ----------------------------------
+#
+# POST no longer awaits the ~26s LLM inline: on a cache miss it returns 202
+# "running" and hands the run to a detached task; the client polls GET until
+# the result lands in the analyses cache. These tests drive the captured task
+# deterministically instead of relying on real background scheduling.
 
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
 
-    inserted_row = _analysis_record_row()
-    monkeypatch.setattr(
-        persistence_mod,
-        "persist",
-        lambda *_a, **kw: JobAnalysisRecord.model_validate(inserted_row),
-    )
+@contextlib.contextmanager
+def _analysis_client(
+    *,
+    supabase: Any,
+    llm: Any = None,
+    user_id: str | None = None,
+    caller: Any = None,
+) -> Iterator[Any]:
+    """A TestClient with the analysis router's deps overridden.
 
-    # Mock optimized.get_latest
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    # Mock targets_crud.get (used to build target_context)
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
-
-    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
-
-    # Mock job posting existence check (now includes description_html)
-    supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-        {"id": "job-1", "description_html": "We want a React engineer."}
-    ]
-
+    Defaults ``caller`` to ``supabase`` (the api-key path resolves the caller
+    client to the same service-role client). Clears overrides on exit.
+    """
     from fastapi.testclient import TestClient
 
     from app.main import app
 
     app.dependency_overrides[get_supabase] = lambda: supabase
-    app.dependency_overrides[get_llm_client] = lambda: llm
+    app.dependency_overrides[get_supabase_for_caller] = (
+        (lambda: caller) if caller is not None else (lambda: supabase)
+    )
+    app.dependency_overrides[get_llm_client] = lambda: (llm if llm is not None else MockLLMClient())
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _capture_spawned(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Patch the router's ``spawn_detached`` to CAPTURE (not run) the task
+    coroutine, so the test awaits it deterministically. Returns the capture
+    list (close each coro in a finally to avoid 'never awaited' warnings)."""
+    import app.routers.analysis as analysis_router
+
+    captured: list[Any] = []
+
+    def _capture(coro: Any, *, name: str) -> MagicMock:
+        captured.append(coro)
+        return MagicMock()
+
+    monkeypatch.setattr(analysis_router, "spawn_detached", _capture)
+    return captured
+
+
+def _job_supabase(description_html: str = "We want a React engineer.") -> MagicMock:
+    """A service-role mock whose jobs SELECT returns one row + whose scores
+    read (for the blend) returns a keyword score."""
+    supabase = MagicMock()
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+        {"id": "job-1", "description_html": description_html}
+    ]
+    # _apply_llm_blend's keyword-score read (.select.eq.eq.limit.execute).
+    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+        {"score": 60}
+    ]
+    return supabase
+
+
+async def test_router_cache_miss_kicks_off_202_and_backgrounds_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cache miss → 202 running, LLM NOT called inside the request; the run is
+    handed to a detached task that (when driven) calls the LLM once, persists,
+    and cost-logs."""
+    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
+    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(
+        persistence_mod,
+        "persist",
+        lambda *_a, **kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+    )
+
+    from app.services.experience import optimized as opt_mod
+
+    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+
+    from app.services.targets import crud as targets_crud_mod
+
+    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
+    supabase = _job_supabase()
+    captured = _capture_spawned(monkeypatch)
 
     try:
-        tc = TestClient(app)
-        resp = tc.post("/analysis/job-1?target_id=tgt-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["id"] == "rec-analysis-1"
+        with _analysis_client(supabase=supabase, llm=llm) as tc:
+            resp = tc.post("/analysis/job-1?target_id=tgt-1")
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "running"
+        # The LLM did NOT run inside the request — it's backgrounded.
+        assert len(llm.calls) == 0
+        assert len(captured) == 1
+
+        # Drive the detached task: LLM runs once, persists, cost-logs.
+        await captured[0]
         assert len(llm.calls) == 1
         cost_log_mod.record.assert_called_once()
     finally:
+        for coro in captured:
+            coro.close()
+
+
+async def test_router_dedup_second_kick_does_not_respawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two kicks for the same (job, target, optimized) key → only ONE detached
+    task; the second dedups to 202 running (no double LLM spend)."""
+    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
+
+    from app.services.experience import optimized as opt_mod
+
+    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+
+    from app.services.targets import crud as targets_crud_mod
+
+    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+
+    supabase = _job_supabase()
+    captured = _capture_spawned(monkeypatch)
+
+    try:
+        with _analysis_client(supabase=supabase) as tc:
+            r1 = tc.post("/analysis/job-1?target_id=tgt-1")
+            r2 = tc.post("/analysis/job-1?target_id=tgt-1")
+        assert r1.status_code == 202
+        assert r2.status_code == 202
+        assert r2.json()["status"] == "running"
+        # Only one task was spawned despite two kicks.
+        assert len(captured) == 1
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+async def test_run_analysis_task_persists_blends_and_clears_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detached worker persists, cost-logs, blends via the service-role
+    RPC, and clears the in-flight flag on success."""
+    from app.routers.analysis import _run_analysis_task
+    from app.services.analysis import run_registry
+
+    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(
+        persistence_mod,
+        "persist",
+        lambda *_a, **kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+    )
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
+    supabase = _job_supabase()
+    key = ("job-1", "tgt-1", "opt-1")
+    run_registry.begin(key, user_id=None)
+
+    await _run_analysis_task(
+        key=key,
+        supabase=supabase,
+        llm=llm,
+        job_id="job-1",
+        target_id="tgt-1",
+        user_id=None,
+        optimized_doc=_optimized_doc(),
+        target_context="Target: Senior FE",
+        description_html="We want a React engineer.",
+    )
+
+    assert len(llm.calls) == 1
+    cost_log_mod.record.assert_called_once()
+    # Blend written via the SECURITY DEFINER RPC on the service-role client.
+    supabase.rpc.assert_called_once()
+    assert supabase.rpc.call_args[0][0] == "user_apply_score_blend"
+    # In-flight flag cleared → a poll now reads the persisted record from cache.
+    assert run_registry.get(key) is None
+
+
+async def test_run_analysis_task_marks_error_on_llm_parse_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed LLM payload must surface as a retryable 'error' the poll can
+    show — never a silent crash — and must NOT persist a broken analysis.
+
+    Regression for the LLM-output edge (the mock is the accumulated bug
+    corpus): backgrounding moved the parse into a detached task, so the failure
+    now has to be captured in the run registry instead of bubbling as a 500.
+    """
+    from app.routers.analysis import _run_analysis_task
+    from app.services.analysis import run_registry
+
+    persist_mock = MagicMock()
+    monkeypatch.setattr(persistence_mod, "persist", persist_mock)
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: "not valid json"})
+    key = ("job-1", "tgt-1", "opt-1")
+    run_registry.begin(key, user_id=None)
+
+    # Must not raise — spawn_detached only logs, so the task swallows + records.
+    await _run_analysis_task(
+        key=key,
+        supabase=MagicMock(),
+        llm=llm,
+        job_id="job-1",
+        target_id="tgt-1",
+        user_id=None,
+        optimized_doc=_optimized_doc(),
+        target_context="Target: X",
+        description_html="JD text",
+    )
+
+    st = run_registry.get(key)
+    assert st is not None
+    assert st.status == "error"
+    assert st.error  # a user-facing retry message
+    persist_mock.assert_not_called()
+
+
+async def test_get_poll_running_idle_error_and_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET reflects each state: running (in flight), idle (nothing), error
+    (failed run), and the persisted record once the cache is populated."""
+    from app.services.analysis import run_registry
+    from app.services.experience import optimized as opt_mod
+
+    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+    key = ("job-1", "tgt-1", "opt-1")
+
+    # idle: no cache, nothing in flight.
+    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
+    with _analysis_client(supabase=MagicMock()) as tc:
+        assert tc.get("/analysis/job-1?target_id=tgt-1").json()["status"] == "idle"
+
+    # running: registry claimed, cache still empty.
+    run_registry.begin(key, user_id=None)
+    with _analysis_client(supabase=MagicMock()) as tc:
+        assert tc.get("/analysis/job-1?target_id=tgt-1").json()["status"] == "running"
+
+    # error: failed run surfaces a message.
+    run_registry.fail(key, message="Analysis failed. Please retry.")
+    with _analysis_client(supabase=MagicMock()) as tc:
+        body = tc.get("/analysis/job-1?target_id=tgt-1").json()
+    assert body["status"] == "error"
+    assert body["message"] == "Analysis failed. Please retry."
+
+    # done: cache hit → the record itself (read-only, no blend on GET).
+    monkeypatch.setattr(
+        persistence_mod,
+        "get_cached",
+        lambda *_a, **_kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+    )
+    supabase = MagicMock()
+    with _analysis_client(supabase=supabase) as tc:
+        resp = tc.get("/analysis/job-1?target_id=tgt-1")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "rec-analysis-1"
+    # GET is read-only: it must not write the score blend.
+    supabase.rpc.assert_not_called()
+
+
+async def test_end_to_end_kick_poll_persists_via_real_async_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real ASGI + real ``spawn_detached``: the POST returns 202 *before* the
+    LLM finishes, the detached task actually runs on the event loop, persists,
+    and a subsequent GET returns the record.
+
+    Unlike the captured-coroutine tests above, this drives the app through
+    ``httpx.ASGITransport`` so ``asyncio.create_task`` schedules the task on the
+    live loop — proving the non-blocking mechanism truly works (task outlives
+    the request and populates the cache the poll reads), not just that a
+    coroutine was handed off.
+    """
+    import httpx
+
+    from app.main import app
+
+    # In-memory analyses cache the task actually writes and the poll reads.
+    store: dict[tuple[str, str, str, str | None], Any] = {}
+
+    def fake_get_cached(
+        _sb: Any,
+        job_posting_id: str,
+        *,
+        target_id: str,
+        optimized_doc_id: str,
+        user_id: str | None,
+    ) -> Any:
+        return store.get((job_posting_id, target_id, optimized_doc_id, user_id))
+
+    def fake_persist(
+        _sb: Any,
+        *,
+        job_posting_id: str,
+        target_id: str,
+        user_id: str | None,
+        optimized_doc_id: str | None,
+        analysis: Any,
+        llm_result: Any,
+    ) -> JobAnalysisRecord:
+        rec = JobAnalysisRecord.model_validate(
+            {**_analysis_record_row(), "user_id": user_id, "optimized_doc_id": optimized_doc_id}
+        )
+        store[(job_posting_id, target_id, cast_str(optimized_doc_id), user_id)] = rec
+        return rec
+
+    monkeypatch.setattr(persistence_mod, "get_cached", fake_get_cached)
+    monkeypatch.setattr(persistence_mod, "persist", fake_persist)
+    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+
+    from app.services.experience import optimized as opt_mod
+
+    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+
+    from app.services.targets import crud as targets_crud_mod
+
+    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
+    supabase = _job_supabase()
+
+    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
+    app.dependency_overrides[get_llm_client] = lambda: llm
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
+    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            kick = await ac.post("/analysis/job-1?target_id=tgt-1")
+            # 202 (not 200 + record) is the non-blocking contract: a blocking
+            # handler would have awaited the LLM and returned the record inline.
+            # (With the instant mock the detached task may already have finished
+            # by the time httpx hands the response back — that's fine, it just
+            # proves spawn_detached really scheduled + ran it on the loop.)
+            assert kick.status_code == 202
+            assert kick.json()["status"] == "running"
+
+            # Poll GET, yielding the loop so the detached task can run to
+            # completion and populate the cache.
+            record: dict[str, Any] | None = None
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                poll = await ac.get("/analysis/job-1?target_id=tgt-1")
+                body = poll.json()
+                if "id" in body:
+                    record = body
+                    break
+                assert body.get("status") in {"running", "idle"}
+
+            assert record is not None, "detached task never persisted the analysis"
+            assert record["id"] == "rec-analysis-1"
+            assert len(llm.calls) == 1  # exactly one LLM call, in the task
+    finally:
         app.dependency_overrides.clear()
+
+
+def test_check_daily_count_counts_in_flight_runs() -> None:
+    """The daily-count gate adds in-flight runs to the persisted count, so a
+    burst of concurrent kicks (whose cost rows land ~26s later) can't slip past
+    a gate that only sees already-written rows (#459)."""
+    from app.services.llm import budget
+
+    supabase = MagicMock()
+    # 2 persisted rows in the 24h window.
+    (
+        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.gte.return_value.execute.return_value.count
+    ) = 2
+
+    # 2 persisted + 0 in-flight < limit 3 → allowed.
+    budget.check_daily_count(
+        supabase, user_id="u", purpose=DEFAULT_PURPOSE, limit=3, in_flight=0
+    )
+    # 2 persisted + 1 in-flight == limit 3 → 429.
+    with pytest.raises(HTTPException) as ei:
+        budget.check_daily_count(
+            supabase, user_id="u", purpose=DEFAULT_PURPOSE, limit=3, in_flight=1
+        )
+    assert ei.value.status_code == 429
 
 
 async def test_router_missing_optimized_doc_returns_404(

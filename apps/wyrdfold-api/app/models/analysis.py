@@ -49,3 +49,23 @@ class JobAnalysisRecord(BaseModel):
     cost_usd: float
     latency_ms: int
     created_at: datetime
+
+
+class AnalysisStatusResponse(BaseModel):
+    """Poll marker for the non-blocking analysis flow (#459).
+
+    Returned (with an appropriate HTTP status) when there is no finished
+    record to hand back yet:
+
+    * ``running`` — the LLM analysis is in flight (``POST`` returns this with
+      ``202``; ``GET`` returns it with ``200`` while polling). The work runs
+      in a detached task and persists regardless of the client, so the caller
+      is free to navigate away and come back.
+    * ``error`` — the background run failed; the client should offer a retry.
+    * ``idle`` — no cached result and nothing in flight (e.g. a restart
+      dropped the run). The client re-kicks via ``POST``. Only ``GET``
+      returns this.
+    """
+
+    status: Literal["running", "error", "idle"]
+    message: str | None = None
