@@ -92,6 +92,29 @@ A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
 
 See also `CONTRIBUTING.md` → "Before opening a PR" and "Touching prompts or scoring code".
 
+## Review before merging — green CI is necessary, not sufficient
+
+Passing CI proves the change **builds and the tests pass**; it does **not** prove the
+change is **correct, complete, or clean**. **Before merging any PR — above all a
+self-merge to `develop`, where no human reviews it — read the full diff (`gh pr diff`)
+and review it adversarially, as if hunting for the reason _not_ to ship it:**
+
+- **Read every hunk**, not the description. Does the code do what the PR claims — and
+  nothing it doesn't? Watch for scope creep and cross-file inconsistency.
+- **Catch what CI can't see:** leftover debug/stub/hack or commented-out code, a
+  local-only shim that shouldn't ship, a weakened guard, a TODO that's really a gap, a
+  test that asserts the wrong thing or doesn't exercise the change.
+- **Make the green earn it:** the new behavior has a test that would fail _without_ the
+  change; negative/edge cases are covered — not merely that _some_ suite passed.
+- **Review the whole final state, not the last commit.** A PR that grew across many
+  commits (review feedback, fixes, dep bumps) is exactly where cruft and drift hide.
+- **Say what you reviewed** — a short pre-merge note (or PR comment): what you read, what
+  you checked, that it's clean — then merge. If the review finds a real problem, fix it
+  first; never merge on green alone.
+
+The failure this prevents: a green-but-wrong or green-but-messy PR shipping unreviewed
+because "CI passed." CI is the floor, not the sign-off.
+
 ## Releases are the pause point — and an integration gate
 
 "Create a release" / "open a PR from `develop` → `main`" is the deliberate checkpoint in
