@@ -25,7 +25,7 @@ overrides:
   '@typescript-eslint/typescript-estree': 8.58.2
   '@typescript-eslint/visitor-keys': 8.58.2
   '@typescript-eslint/scope-manager': 8.58.2
-  'next>postcss': 8.5.15
+  'next>postcss': 8.5.20 # GHSA-r28c-9q8g-f849 (8.5.15 became vulnerable; fix ≥8.5.18, unify with the 8.5.20 already in the tree)
   uuid: ^11.1.1
   vite: 7.3.5
   '@vitest/browser': '>=4.1.6'
