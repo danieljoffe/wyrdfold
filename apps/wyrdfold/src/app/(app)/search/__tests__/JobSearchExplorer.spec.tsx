@@ -152,6 +152,42 @@ describe('JobSearchExplorer', () => {
     );
   });
 
+  it('surfaces an error toast when create-target fails, e.g. no profile (#467)', async () => {
+    const payload = { detail: 'no prose doc to derive from' };
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.includes('/api/targets/from-url')) {
+        return Promise.resolve({
+          ok: false,
+          status: 422,
+          json: async () => payload,
+          clone: () => ({ json: async () => payload }), // extractApiError reads via clone()
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: 1,
+          has_more: false,
+          results: [result()],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+    fireEvent.click(
+      await screen.findByRole('button', { name: /create target/i })
+    );
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'error' })
+      )
+    );
+  });
+
   it('paginates via "Load more" and appends the next page (#467)', async () => {
     const page1 = [
       result({ id: '1', title: 'Frontend Engineer' }),
