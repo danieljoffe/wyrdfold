@@ -10,7 +10,7 @@
     "start": "next start"
   },
   "dependencies": {
-    "@danieljoffe/shared-ui": "^0.8.0",
+    "@danieljoffe/shared-ui": "^0.9.0",
     "@supabase/ssr": "^0.12.3",
     "@tiptap/core": "^3.28.0",
     "@tiptap/extension-link": "^3.28.0",
