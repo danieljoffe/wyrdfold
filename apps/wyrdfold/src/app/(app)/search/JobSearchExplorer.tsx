@@ -558,8 +558,11 @@ export default function JobSearchExplorer() {
           <select
             id='job-search-recency'
             value={urlDays}
+            // h-12 + text-base match the shared-ui Input's height/font so the
+            // two filter controls line up (the Input renders taller than a
+            // default-padded select).
             onChange={e => changeRecency(e.target.value)}
-            className='rounded-md border border-border bg-surface-base px-2.5 py-1.5 text-sm text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
+            className='h-12 rounded-md border border-border bg-surface-base px-3 text-base text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
           >
             {RECENCY_OPTIONS.map(o => (
               <option key={o.value} value={o.value}>
