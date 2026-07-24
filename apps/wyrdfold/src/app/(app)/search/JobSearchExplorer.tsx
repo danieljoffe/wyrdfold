@@ -8,6 +8,8 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { timeAgo } from '@/lib/timeAgo';
+import { useToast } from '@/state/Toast/ToastProvider';
+import { createOrLinkTarget } from '../targets/targetFlows';
 import type { JobSearchResponse, JobSearchResult } from './types';
 
 const PAGE_SIZE = 20;
@@ -50,7 +52,43 @@ function CompanyAvatar({ name }: { name: string }) {
  * and "see your matches" stays the reason to use Jobs. Logged-in only.
  */
 function JobSearchRow({ job }: { job: JobSearchResult }) {
+  const { toast } = useToast();
+  const [creating, setCreating] = useState(false);
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
+
+  // Create a target from this listing (#467 power-action). Reuses the existing
+  // from-url flow: derives a scoring profile in the background, DEDUPS against
+  // your existing targets, links inactive (so it never trips the active-target
+  // cap), and registers the company's ATS board to grow the corpus. Needs an
+  // experience profile — the from-url endpoint 422s otherwise, surfaced here.
+  const createTarget = async () => {
+    if (!job.absolute_url) return;
+    setCreating(true);
+    try {
+      const result = await createOrLinkTarget(
+        '/api/targets/from-url',
+        { jd_url: job.absolute_url },
+        'Couldn’t create target'
+      );
+      toast({
+        variant: 'success',
+        title: result.was_matched
+          ? `Linked to “${result.target.label}”`
+          : `Target created: “${result.target.label}”`,
+        description:
+          'Building your match profile in the background — activate it under Targets to see your matches.',
+      });
+    } catch (e) {
+      toast({
+        variant: 'error',
+        title: 'Couldn’t create target',
+        ...(e instanceof Error ? { description: e.message } : {}),
+      });
+    } finally {
+      setCreating(false);
+    }
+  };
+
   return (
     <li className='p-3 transition-colors hover:bg-surface-tertiary/60 motion-reduce:transition-none'>
       <div className='flex items-start gap-3'>
@@ -87,6 +125,22 @@ function JobSearchRow({ job }: { job: JobSearchResult }) {
               {timeAgo(job.created_at)}
             </Text>
           </div>
+          {/* Action lives BELOW the listing info (not beside it) so the info
+              reads as one unit when skimming — avoids the awkward right-edge
+              break against the salary/date. */}
+          {job.absolute_url && (
+            <Button
+              name='search-create-target'
+              variant='secondary'
+              size='sm'
+              onClick={createTarget}
+              disabled={creating}
+              aria-busy={creating}
+              className='mt-2'
+            >
+              {creating ? 'Creating…' : 'Create target'}
+            </Button>
+          )}
         </div>
       </div>
     </li>
