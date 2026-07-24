@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
@@ -10,6 +11,7 @@ import {
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { ChevronDown } from 'lucide-react';
+import { Avatar } from '@danieljoffe/shared-ui/Avatar';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
@@ -67,15 +69,23 @@ function hueFor(name: string): number {
 }
 
 function CompanyAvatar({ name }: { name: string }) {
-  // Solid colour + white text → self-contained, reads in light and dark themes.
+  // Shared-ui Avatar (square) carrying the deterministic per-company hue. Avatar
+  // exposes no per-instance colour prop — only a static `tileClassName` — so the
+  // computed hsl() rides a CSS variable set on the root and consumed by the inner
+  // tile via `bg-[var(...)]` (a literal class Tailwind emits). Solid colour +
+  // white text stays self-contained and reads in light and dark themes.
   return (
-    <span
+    <Avatar
       aria-hidden
-      className='flex size-9 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-white'
-      style={{ backgroundColor: `hsl(${hueFor(name)} 48% 42%)` }}
-    >
-      {initials(name)}
-    </span>
+      initials={initials(name)}
+      shape='square'
+      size='md'
+      className='shrink-0'
+      tileClassName='bg-[var(--company-hue)] font-semibold text-white'
+      style={
+        { '--company-hue': `hsl(${hueFor(name)} 48% 42%)` } as CSSProperties
+      }
+    />
   );
 }
 
