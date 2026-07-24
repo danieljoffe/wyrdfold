@@ -125,20 +125,23 @@ function JobSearchRow({ job }: { job: JobSearchResult }) {
               {timeAgo(job.created_at)}
             </Text>
           </div>
+          {/* Action lives BELOW the listing info (not beside it) so the info
+              reads as one unit when skimming — avoids the awkward right-edge
+              break against the salary/date. */}
+          {job.absolute_url && (
+            <Button
+              name='search-create-target'
+              variant='secondary'
+              size='sm'
+              onClick={createTarget}
+              disabled={creating}
+              aria-busy={creating}
+              className='mt-2'
+            >
+              {creating ? 'Creating…' : 'Create target'}
+            </Button>
+          )}
         </div>
-        {job.absolute_url && (
-          <Button
-            name='search-create-target'
-            variant='secondary'
-            size='sm'
-            onClick={createTarget}
-            disabled={creating}
-            aria-busy={creating}
-            className='shrink-0'
-          >
-            {creating ? 'Creating…' : 'Create target'}
-          </Button>
-        )}
       </div>
     </li>
   );
