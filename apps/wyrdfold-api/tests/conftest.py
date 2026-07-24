@@ -29,10 +29,17 @@ from app.cache import job_list_cache
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
-    """Prevent cross-test cache pollution from the in-memory TTL cache."""
+    """Prevent cross-test cache pollution from in-memory state."""
+    from app.services.analysis import run_registry
+
     job_list_cache.invalidate()
+    # The in-flight analysis registry (#459) is a module-level dict; a leaked
+    # "running" entry would make the next test's kick dedup to 202 without
+    # spawning (LLM never called).
+    run_registry.clear_all()
     yield
     job_list_cache.invalidate()
+    run_registry.clear_all()
 
 
 @pytest.fixture(autouse=True)

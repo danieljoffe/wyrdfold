@@ -313,6 +313,7 @@ def check_daily_count(
     user_id: str,
     purpose: str,
     limit: int,
+    in_flight: int = 0,
 ) -> None:
     """Raise 429 if the user already has ``limit`` llm_costs rows for
     ``purpose`` in the rolling 24h window.
@@ -320,6 +321,12 @@ def check_daily_count(
     Count-based companion to the $-budget: bounds chatty features (deep
     job analysis) regardless of per-call price. Cache hits never write a
     cost row, so they neither count nor get blocked. ``limit=0`` disables.
+
+    ``in_flight`` is added to the persisted count before the comparison.
+    A backgrounded run (#459) writes its cost row only ~26s later, when the
+    LLM returns, so a burst of concurrent kicks would otherwise all pass a
+    gate that only sees already-persisted rows and blow past ``limit``.
+    Counting the runs currently in flight closes that window.
     """
     if limit <= 0:
         return
@@ -335,13 +342,13 @@ def check_daily_count(
         .count
         or 0
     )
-    if used >= limit:
+    if used + in_flight >= limit:
         raise HTTPException(
             status_code=429,
             detail={
                 "code": "analysis_daily_limit",
                 "purpose": purpose,
                 "limit": limit,
-                "used": used,
+                "used": used + in_flight,
             },
         )
