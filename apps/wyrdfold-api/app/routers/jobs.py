@@ -2347,10 +2347,15 @@ def add_job_to_target(
     job_id: str,
     body: AddToTargetRequest,
     user_id: str = Depends(get_current_user_id),
-    # SEC-H2: the gated score writes ride the caller's JWT client so Postgres
-    # enforces target ownership in-DB (user_upsert_score / user_set_scores_included
-    # are SECURITY DEFINER). The only shared-catalog write — the posting's global
-    # score aggregate — needs the service-role client.
+    # SEC-H2 (migration 20260718010000): the user_upsert_score /
+    # user_set_scores_included SECURITY DEFINER RPCs are NOT executable by
+    # `authenticated` — their in-DB check only verifies the caller *follows* the
+    # target, which is insufficient for a SHARED, ownerless target catalog (a
+    # follower could tamper with co-followers' scores). So all score writes go on
+    # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
+    # branch), and OWNERSHIP is enforced in the API here (``get_user_target``
+    # below) — exactly the model ``POST /jobs/manual`` uses. ``caller_supabase`` is
+    # only for the RLS-backstopped reads (job load + the ownership check).
     caller_supabase: Client = Depends(get_user_supabase),
     service_supabase: Client = Depends(get_supabase),
 ) -> AddToTargetResponse:
@@ -2367,9 +2372,10 @@ def add_job_to_target(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Ownership gate (app layer). Same 404 for "target doesn't exist" and "not
-    # yours" so the response never leaks another user's target ids. The gated
-    # RPCs below are the in-DB backstop (SEC-H2).
+    # Ownership gate — THE enforcement (targets are a shared catalog, so the
+    # service-role writes below carry no in-DB ownership check). Same 404 for
+    # "target doesn't exist" and "not yours" so the response never leaks another
+    # user's target ids. Read on the caller's client so RLS is the backstop.
     if get_user_target(caller_supabase, user_id, body.target_id) is None:
         raise HTTPException(status_code=404, detail="Target not found for user")
 
@@ -2377,11 +2383,13 @@ def add_job_to_target(
     if target is None:  # catalog row vanished between the two reads — defensive
         raise HTTPException(status_code=404, detail="Target not found")
 
-    # Stage-2 score the existing posting against the chosen target. ``gated=True``
-    # routes the scores upsert through user_upsert_score on the caller's client.
+    # Stage-2 score the existing posting against the chosen target on the
+    # SERVICE-ROLE client. ``gated=True`` still routes through user_upsert_score,
+    # but with auth.uid() NULL it takes the function's service-role-exempt branch
+    # (the RPC isn't authenticated-executable post-lockdown — see above).
     try:
         result = score_and_upsert(
-            caller_supabase,
+            service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",
             description_html=job["description_html"] or "",
@@ -2413,9 +2421,9 @@ def add_job_to_target(
         logger.exception("add-to-target global-score update failed for job %s", job_id)
     #  2. Force-include under THIS one target so a negative-keyword ``excluded``
     #     flag can't hide a job the user deliberately added — scoped to the single
-    #     target via the gated RPC on the caller's client (audit #24 F4).
+    #     target, on the service-role client (audit #24 F4).
     try:
-        caller_supabase.rpc(
+        service_supabase.rpc(
             "user_set_scores_included",
             {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
         ).execute()
@@ -2423,10 +2431,10 @@ def add_job_to_target(
         logger.exception("add-to-target force-include failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
-    #     not the auto-surfaced 'new'.
+    #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
     try:
         persistence.upsert_user_job(
-            caller_supabase, user_id=user_id, job_posting_id=job_id, status="saved"
+            service_supabase, user_id=user_id, job_posting_id=job_id, status="saved"
         )
     except Exception:
         logger.exception("add-to-target user_job save failed for job %s", job_id)
