@@ -1,7 +1,14 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import Link from 'next/link';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { ChevronDown } from 'lucide-react';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
@@ -14,6 +21,15 @@ import { addJobToTarget, createOrLinkTarget } from '../targets/targetFlows';
 import type { JobSearchResponse, JobSearchResult } from './types';
 
 const PAGE_SIZE = 20;
+
+/** Recency filter presets. The value is the `posted_within` day-count carried in
+ *  the URL + sent to the API (`''` = any time). */
+const RECENCY_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Any time' },
+  { value: '7', label: 'Past week' },
+  { value: '30', label: 'Past month' },
+  { value: '90', label: 'Past 3 months' },
+];
 
 /** Minimal projection of a user's target for the "Add to target" picker. */
 interface TargetOption {
@@ -309,8 +325,22 @@ function JobSearchRow({
 }
 
 export default function JobSearchExplorer() {
-  const [draft, setDraft] = useState('');
-  const [query, setQuery] = useState(''); // the last SUBMITTED query
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // The URL is the SINGLE SOURCE OF TRUTH for the search state — query + filters
+  // live in the querystring so back/forward and bookmarks restore an exact
+  // search (a user can leave for a listing and come back to the same results).
+  const urlQ = (searchParams.get('q') ?? '').trim();
+  const urlLocation = searchParams.get('location') ?? '';
+  const urlDays = searchParams.get('posted_within') ?? '';
+
+  // Text-input drafts, seeded from the URL and re-synced whenever it changes
+  // underneath us (back/forward). Submitting commits them back to the URL.
+  const [draftQ, setDraftQ] = useState(urlQ);
+  const [draftLocation, setDraftLocation] = useState(urlLocation);
+
   const [results, setResults] = useState<JobSearchResult[] | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false); // fresh search
@@ -360,44 +390,98 @@ export default function JobSearchExplorer() {
     ensureLoaded: ensureTargets,
   };
 
-  const fetchPage = useCallback(async (q: string, offset: number) => {
-    const res = await fetch(
-      `/api/jobs/search?q=${encodeURIComponent(q)}&page_size=${PAGE_SIZE}&offset=${offset}`
-    );
-    if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
-    return (await res.json()) as JobSearchResponse;
-  }, []);
+  const fetchPage = useCallback(
+    async (opts: {
+      q: string;
+      location: string;
+      days: string;
+      offset: number;
+    }) => {
+      const sp = new URLSearchParams({
+        q: opts.q,
+        page_size: String(PAGE_SIZE),
+        offset: String(opts.offset),
+      });
+      if (opts.location.trim()) sp.set('location', opts.location.trim());
+      if (opts.days) sp.set('posted_within_days', opts.days);
+      const res = await fetch(`/api/jobs/search?${sp.toString()}`);
+      if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
+      return (await res.json()) as JobSearchResponse;
+    },
+    []
+  );
 
-  const runSearch = useCallback(
-    async (raw: string) => {
-      const q = raw.trim();
-      if (!q) return;
-      setLoading(true);
-      setError(null);
-      setQuery(q);
+  // Run the search whenever the URL search-state changes: initial mount, a
+  // submit/filter change (which commits to the URL), or back/forward. This is
+  // the ONLY place a fresh (page-0) search is kicked, so the URL and the results
+  // never drift. An empty query renders the honest empty page.
+  useEffect(() => {
+    setDraftQ(urlQ);
+    setDraftLocation(urlLocation);
+    if (!urlQ) {
       setResults(null);
-      try {
-        const data = await fetchPage(q, 0);
+      setError(null);
+      setHasMore(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setResults(null);
+    fetchPage({ q: urlQ, location: urlLocation, days: urlDays, offset: 0 })
+      .then(data => {
+        if (cancelled) return;
         setResults(data.results);
         setHasMore(data.has_more);
-      } catch (e) {
+      })
+      .catch(e => {
+        if (cancelled) return;
         setError(
           e instanceof Error ? e.message : 'Network error running search.'
         );
         setResults(null);
-      } finally {
-        setLoading(false);
-      }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [urlQ, urlLocation, urlDays, fetchPage]);
+
+  // Commit search state to the URL (replace → the /search entry updates in place,
+  // so "back" from a listing lands on this exact query+filters rather than a
+  // stack of every keystroke). The effect above re-runs the search off the new
+  // URL. `scroll:false` keeps the viewport put on a filter tweak.
+  const commit = useCallback(
+    (next: { q: string; location: string; days: string }) => {
+      const params = new URLSearchParams();
+      if (next.q.trim()) params.set('q', next.q.trim());
+      if (next.location.trim()) params.set('location', next.location.trim());
+      if (next.days) params.set('posted_within', next.days);
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
     },
-    [fetchPage]
+    [router, pathname]
   );
+
+  const submitSearch = () =>
+    commit({ q: draftQ, location: draftLocation, days: urlDays });
+  const changeRecency = (days: string) =>
+    commit({ q: draftQ, location: draftLocation, days });
+  const clearFilters = () => commit({ q: draftQ, location: '', days: '' });
 
   const loadMore = useCallback(async () => {
     if (!results) return;
     setLoadingMore(true);
     setError(null);
     try {
-      const data = await fetchPage(query, results.length);
+      const data = await fetchPage({
+        q: urlQ,
+        location: urlLocation,
+        days: urlDays,
+        offset: results.length,
+      });
       setResults(prev => [...(prev ?? []), ...data.results]);
       setHasMore(data.has_more);
     } catch (e) {
@@ -405,7 +489,15 @@ export default function JobSearchExplorer() {
     } finally {
       setLoadingMore(false);
     }
-  }, [fetchPage, query, results]);
+  }, [fetchPage, urlQ, urlLocation, urlDays, results]);
+
+  const hasActiveFilters = Boolean(urlLocation.trim() || urlDays);
+  const onEnter = (e: ReactKeyboardEvent) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submitSearch();
+    }
+  };
 
   return (
     <div className='mx-auto max-w-3xl space-y-6'>
@@ -423,28 +515,69 @@ export default function JobSearchExplorer() {
         </Text>
       </header>
 
-      <div className='flex gap-2'>
-        <div className='flex-1'>
-          <Input
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                runSearch(draft);
-              }
-            }}
-            placeholder='e.g. senior frontend engineer'
-            aria-label='Search jobs by title or keyword'
-          />
+      <div className='space-y-2'>
+        <div className='flex gap-2'>
+          <div className='flex-1'>
+            <Input
+              value={draftQ}
+              onChange={e => setDraftQ(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder='e.g. senior frontend engineer'
+              aria-label='Search jobs by title or keyword'
+            />
+          </div>
+          <Button
+            name='job-search-submit'
+            onClick={submitSearch}
+            disabled={loading || !draftQ.trim()}
+          >
+            Search
+          </Button>
         </div>
-        <Button
-          name='job-search-submit'
-          onClick={() => runSearch(draft)}
-          disabled={loading || !draft.trim()}
-        >
-          Search
-        </Button>
+
+        {/* Filters — a compact row of location (substring) + recency, both
+            small so they read as refinements under the main search. Both live
+            in the URL so a filtered search is restorable. */}
+        <div className='flex flex-wrap items-center gap-2'>
+          {/* Wrap in a sized box — the shared-ui Input fills its parent (the
+              search row wraps it in flex-1 for the same reason), so a bare
+              width class on the Input alone leaves a full-width wrapper that
+              pushes the date select onto its own line. */}
+          <div className='w-40'>
+            <Input
+              value={draftLocation}
+              onChange={e => setDraftLocation(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder='Location'
+              aria-label='Filter by location'
+            />
+          </div>
+          <label className='sr-only' htmlFor='job-search-recency'>
+            Filter by date posted
+          </label>
+          <select
+            id='job-search-recency'
+            value={urlDays}
+            onChange={e => changeRecency(e.target.value)}
+            className='rounded-md border border-border bg-surface-base px-2.5 py-1.5 text-sm text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
+          >
+            {RECENCY_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          {hasActiveFilters && (
+            <button
+              type='button'
+              name='job-search-clear-filters'
+              onClick={clearFilters}
+              className='rounded text-sm text-text-secondary underline underline-offset-2 hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
       </div>
 
       {loading && (
@@ -468,10 +601,14 @@ export default function JobSearchExplorer() {
         <section aria-live='polite'>
           {results.length === 0 ? (
             <div className='space-y-1'>
-              <Text variant='body'>No roles match “{query}” yet.</Text>
+              <Text variant='body'>
+                No roles match “{urlQ}”
+                {hasActiveFilters ? ' with these filters' : ''} yet.
+              </Text>
               <Text variant='meta' className='text-text-secondary'>
-                We’re expanding coverage — try a broader title, or check back
-                soon.
+                {hasActiveFilters
+                  ? 'Try widening the location or date range, or a broader title.'
+                  : 'We’re expanding coverage — try a broader title, or check back soon.'}
               </Text>
             </div>
           ) : (

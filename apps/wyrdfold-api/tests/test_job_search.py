@@ -204,3 +204,92 @@ def test_search_endpoint_requires_a_query() -> None:
         assert TestClient(app).get("/search").status_code == 422  # q is required
     finally:
         app.dependency_overrides.clear()
+
+
+# --- filters (location + recency) — #467 fast-follow -----------------------
+
+
+def _row_loc(rid: str, location: str | None) -> dict[str, Any]:
+    r = _row(rid, "Frontend Engineer", "2026-01-15")
+    r["location"] = location
+    return r
+
+
+def test_location_filter_is_case_insensitive_substring() -> None:
+    rows = [
+        _row_loc("remote", "Remote (US)"),
+        _row_loc("sf", "San Francisco, CA"),
+        _row_loc("ny", "New York, NY"),
+        _row_loc("none", None),
+    ]
+    supabase = _mock_supabase(rows)
+    # "remote" matches "Remote (US)" case-insensitively; nothing else.
+    results, _ = job_search.search_jobs(supabase, q="frontend", location="ReMoTe")
+    assert {r.id for r in results} == {"remote"}
+
+
+def test_blank_location_is_a_noop() -> None:
+    rows = [_row_loc("a", "Remote"), _row_loc("b", "NYC"), _row_loc("c", None)]
+    supabase = _mock_supabase(rows)
+    results, _ = job_search.search_jobs(supabase, q="frontend", location="   ")
+    assert len(results) == 3  # whitespace-only filter keeps every candidate
+
+
+def test_recency_filter_applies_a_created_at_lower_bound() -> None:
+    from datetime import UTC, datetime
+
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="frontend", posted_within_days=7)
+    qb = supabase.table.return_value
+    assert qb.gte.called
+    col, cutoff = qb.gte.call_args[0]
+    assert col == "created_at"
+    delta_days = (datetime.now(UTC) - datetime.fromisoformat(cutoff)).days
+    assert 6 <= delta_days <= 8  # ~7 days back
+
+
+def test_recency_days_are_clamped_to_the_ceiling() -> None:
+    from datetime import UTC, datetime
+
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="frontend", posted_within_days=99999)
+    _, cutoff = supabase.table.return_value.gte.call_args[0]
+    delta_days = (datetime.now(UTC) - datetime.fromisoformat(cutoff)).days
+    assert delta_days <= job_search.MAX_POSTED_WITHIN_DAYS + 1
+
+
+def test_no_recency_filter_skips_the_created_at_bound() -> None:
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="frontend")
+    assert not supabase.table.return_value.gte.called
+
+
+def test_search_endpoint_forwards_filters_to_the_service(
+    monkeypatch,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_supabase, verify_api_key_or_jwt
+    from app.main import app
+    from app.services import job_search as js
+
+    captured: dict[str, Any] = {}
+
+    def fake_search(supabase, *, q, limit, offset, location, posted_within_days):
+        captured.update(
+            q=q, location=location, posted_within_days=posted_within_days
+        )
+        return [], False
+
+    monkeypatch.setattr(js, "search_jobs", fake_search)
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "u"
+    try:
+        resp = TestClient(app).get(
+            "/search?q=frontend&location=Remote&posted_within_days=30"
+        )
+        assert resp.status_code == 200
+        assert captured["location"] == "Remote"
+        assert captured["posted_within_days"] == 30
+    finally:
+        app.dependency_overrides.clear()
