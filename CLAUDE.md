@@ -33,14 +33,19 @@ the working rhythm. When asked:
    the _exact_ state you just proved. It rides the next release and doesn't block this one. (A
    genuine **bug** the review catches is different: it doesn't ride forward — fix it on
    `develop` and re-run the gate before merging.)
-5. **Migrations ship with the release — a merge is not a deploy.** Railway deploys the
-   API code on `main`, but **nothing applies `supabase/migrations/` to prod**. A release
-   containing migrations is not done until they are applied to the prod DB and
-   **verified**: `list_migrations` shows the new versions and the invariants they create
-   (policies, constraints, backfills) spot-check true. Apply immediately around the merge —
-   migrations are written to be backward-compatible with the running code, so
-   migrations-first is the safe order. This step exists because three releases once shipped
-   RLS code whose policies never reached prod, breaking status writes live.
+5. **A merge is not a deploy — ship the frontend, then the migrations.** Merging
+   `develop → main` auto-deploys only the **API** (Railway is git-connected to `main`).
+   Two things do **not** happen on their own. **(a) The frontend:** Vercel is _not_
+   git-connected, so run `vercel --prod` from the repo root every release, or a merge
+   leaves the OLD frontend live against the new API — the skew that bit #459, so deploy the
+   frontend and the API together. **(b) The migrations:** **nothing applies
+   `supabase/migrations/` to prod**. A release containing migrations is not done until they
+   are applied to the prod DB and **verified**: `list_migrations` shows the new versions and
+   the invariants they create (policies, constraints, backfills) spot-check true. Apply
+   immediately around the merge — migrations are written to be backward-compatible with the
+   running code, so migrations-first is the safe order. This step exists because three
+   releases once shipped RLS code whose policies never reached prod, breaking status writes
+   live.
 6. **After deploy, smoke the running prod app on the changed surface.** Green CI + applied
    migrations still don't prove prod's _environment_ is right — env vars and secrets drift
    independently of code and no pre-merge check sees them. Hit the changed prod endpoints
