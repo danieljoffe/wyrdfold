@@ -30,6 +30,7 @@ from app.routers import (
     experience,
     feedback,
     insights,
+    job_search,
     jobs,
     keys,
     poll,
@@ -475,6 +476,7 @@ app.include_router(discovery.router)
 app.include_router(experience.router)
 app.include_router(feedback.router)
 app.include_router(insights.router)
+app.include_router(job_search.router)
 app.include_router(jobs.router)
 app.include_router(keys.router)
 app.include_router(poll.router)
