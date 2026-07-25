@@ -261,6 +261,22 @@ export async function proxy(request: NextRequest) {
     return supabaseResponse;
   }
 
+  // Public job search (#467 §10) — the auth-adaptive `/search` surface serves
+  // logged-out visitors (the growth funnel) as well as signed-in users at the
+  // same URL. Like the legal pages above, it must be reachable WITHOUT a
+  // session, so it's allowlisted here before the redirect-to-/login gate below.
+  // TARGETED: the exact `/search` path only — every other `(app)/*` route stays
+  // fully gated (an anonymous hit to `/jobs`, `/settings`, … still redirects to
+  // /login). The page/layout branch shell + rendering on `getUser()` themselves.
+  if (pathname === '/search') {
+    supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
+    return supabaseResponse;
+  }
+
   if (!user) {
     const url = request.nextUrl.clone();
     url.pathname = '/login';

@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 
 import { bffSecretHeader } from '@/lib/api/bffSecret';
+import { clientIp } from '@/lib/api/clientIp';
 
 /**
  * Public waitlist signup (non-invited visitors on the marketing homepage).
@@ -46,44 +47,9 @@ function isValidEmail(value: unknown): value is string {
   );
 }
 
-// Only accept a single, well-formed IP literal as the trusted client IP.
-// Anything with a port, comma, whitespace, or junk is rejected — we forward
-// nothing rather than a value we can't vouch for.
-const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
-const IPV6_RE = /^[0-9a-fA-F:]+$/;
-
-function isPlausibleIp(value: string): boolean {
-  if (IPV4_RE.test(value)) {
-    return value.split('.').every(o => Number(o) <= 255);
-  }
-  // IPv6: at least one ':' and only hex/colon chars (loose but junk-proof).
-  return value.includes(':') && IPV6_RE.test(value);
-}
-
-/**
- * Trusted client IP for the backend's per-IP rate limiter.
- *
- * SECURITY (frontend audit 2026-07-01, MEDIUM — do not regress):
- *  - `x-forwarded-for` is NOT a trust boundary here. On Vercel the platform
- *    APPENDS the real peer to whatever the client sent, so the LEFT-most hop
- *    is attacker-controlled — a caller can prepend a fresh fake IP per request
- *    and rotate past the backend's per-IP waitlist limit. Reading `xff[0]`
- *    (the old behavior) forwarded exactly that spoofable value.
- *  - `x-real-ip` is set by Vercel's edge to the true connecting client and
- *    overwrites any client-supplied value, so it is the trustworthy signal.
- *    (`@vercel/functions`' `ipAddress()` reads the same header; we avoid the
- *    extra dependency.)
- *  - If `x-real-ip` is absent or not a clean IP literal, we forward NOTHING
- *    and let the backend key on the connection it actually sees. Fail-closed:
- *    never forward a header we can't vouch for. Off-Vercel/local dev simply
- *    collapses onto the backend's view of the peer, which is acceptable — the
- *    rate limit is a brake, and this path is not the production trust model.
- */
-function clientIp(request: NextRequest): string {
-  const realIp = request.headers.get('x-real-ip')?.trim();
-  if (realIp && isPlausibleIp(realIp)) return realIp;
-  return '';
-}
+// Trusted client-IP extraction (spoof-defeating `x-real-ip` read) lives in the
+// shared `@/lib/api/clientIp` helper — one implementation for every public BFF
+// forwarder (waitlist + `/api/public/search`).
 
 export async function POST(request: NextRequest) {
   let body: WaitlistBody;

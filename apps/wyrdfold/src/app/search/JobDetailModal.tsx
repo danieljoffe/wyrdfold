@@ -1,7 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { ArrowUpRight, Check } from 'lucide-react';
+import Link from 'next/link';
+import { ArrowRight, ArrowUpRight, Check } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Modal } from '@danieljoffe/shared-ui/Modal';
@@ -10,7 +11,9 @@ import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { createOrLinkTarget } from '../targets/targetFlows';
+// `/search` is now a top-level (auth-adaptive) route; the targets flow stays in
+// the authed `(app)` group, so it's imported by absolute alias.
+import { createOrLinkTarget } from '@/app/(app)/targets/targetFlows';
 // Reused from the explorer (the task's "export CompanyAvatar / AddToTargetMenu
 // from JobSearchExplorer"). This is a deliberate import cycle — both modules are
 // client components and only reference each other inside render, never at
@@ -26,6 +29,9 @@ interface JobDetailModalProps {
   job: JobSearchResult;
   /** The caller's targets that already contain this listing (empty = unbound). */
   inTargets: TargetRef[];
+  /** Logged-out: the detail shows info + source link + ONE soft signup allusion
+   *  (#467 §11.5) instead of the bind / LLM actions. Authed: unchanged. */
+  isAuthenticated: boolean;
   targetsSource: TargetsSource;
   onClose: () => void;
   /** Fired when the user binds this listing to a target from inside the modal,
@@ -60,6 +66,7 @@ function InTargetLine({ label }: { label: string }) {
 export default function JobDetailModal({
   job,
   inTargets,
+  isAuthenticated,
   targetsSource,
   onClose,
   onAddedToTarget,
@@ -160,8 +167,33 @@ export default function JobDetailModal({
           </Text>
         )}
 
-        {/* Contextual actions — the bind→unlock crux (§11.3). */}
-        {bound ? (
+        {/* Actions. Logged-out → ONE soft, non-blocking signup allusion (§11.5):
+            browsing stays free; we allude to the member value (match + tailor)
+            and link to signup — never the bind / LLM actions. Logged-in → the
+            bind→unlock crux (§11.3): unbound shows the two bind actions, bound
+            unlocks match/tailor. */}
+        {!isAuthenticated ? (
+          <div className='flex flex-col gap-2 rounded-lg border border-brand-500/25 bg-brand-500/5 p-4'>
+            <Text
+              variant='body'
+              as='p'
+              className='font-semibold text-text-primary'
+            >
+              There’s more here when you’re signed in
+            </Text>
+            <Text variant='meta' as='p' className='text-text-secondary'>
+              Members see how this role matches their profile and can
+              auto-tailor a résumé to it — free with an account.
+            </Text>
+            <Link
+              href='/login'
+              className='mt-1 inline-flex items-center gap-1 self-start text-sm font-semibold text-text-brand underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
+            >
+              Sign up free
+              <ArrowRight className='size-3.5 shrink-0' aria-hidden />
+            </Link>
+          </div>
+        ) : bound ? (
           <div className='flex flex-col gap-3 border-t border-border pt-4'>
             <InTargetLine label={inTargets[0].label} />
             {/* Match + tailor are LINKS to the existing matched surfaces
