@@ -269,3 +269,31 @@ def attach_snippets(
     by_id = {row["id"]: row.get("description_html") for row in rows}
     for r in results:
         r.snippet = _html_to_snippet(by_id.get(r.id), max_len)
+
+
+def search_jobs_with_snippets(
+    supabase: Client,
+    *,
+    q: str,
+    limit: int = DEFAULT_PAGE_SIZE,
+    offset: int = 0,
+    location: str | None = None,
+    posted_within_days: int | None = None,
+) -> tuple[list[JobSearchResult], bool]:
+    """``search_jobs`` + the page-only snippet fetch, composed so both blocking
+    round-trips run in a single worker thread.
+
+    Used by BOTH the authed and public search endpoints: the card-grid UX (#467
+    §11) shows a snippet on every result, so the preview is no longer public-only.
+    The extra read is bounded to the ≤page ids and cached — see ``attach_snippets``.
+    """
+    results, has_more = search_jobs(
+        supabase,
+        q=q,
+        limit=limit,
+        offset=offset,
+        location=location,
+        posted_within_days=posted_within_days,
+    )
+    attach_snippets(supabase, results)
+    return results, has_more

@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.models.job_search import JobSearchResult
 from app.services import job_search
 
@@ -352,3 +354,46 @@ def test_attach_snippets_noop_on_empty_results() -> None:
     sb = MagicMock()
     job_search.attach_snippets(sb, [])
     sb.table.assert_not_called()  # nothing to enrich → no fetch
+
+
+def test_search_jobs_with_snippets_composes_search_and_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared helper (used by BOTH endpoints) = search_jobs + attach_snippets."""
+    results = [JobSearchResult(id="a", title="T", company_name="C")]
+    monkeypatch.setattr(job_search, "search_jobs", lambda sb, **kw: (results, True))
+
+    def _fake_attach(sb: object, res: list[JobSearchResult], **kw: object) -> None:
+        for r in res:
+            r.snippet = "preview"
+
+    monkeypatch.setattr(job_search, "attach_snippets", _fake_attach)
+
+    out, has_more = job_search.search_jobs_with_snippets(MagicMock(), q="x")
+    assert has_more is True
+    assert out[0].snippet == "preview"  # attach ran on search's results
+
+
+def test_authed_search_endpoint_now_returns_snippets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authed /search carries a snippet too (the card-grid UX, #467 §11) —
+    it calls the snippet-bearing composition, not bare search_jobs."""
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_supabase, verify_api_key_or_jwt
+    from app.main import app
+    from app.services import job_search as js
+
+    row = JobSearchResult(
+        id="a", title="Frontend Engineer", company_name="Co", snippet="Build fast UIs."
+    )
+    monkeypatch.setattr(js, "search_jobs_with_snippets", lambda sb, **kw: ([row], False))
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "u"
+    try:
+        resp = TestClient(app).get("/search?q=frontend")
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["snippet"] == "Build fast UIs."
+    finally:
+        app.dependency_overrides.clear()

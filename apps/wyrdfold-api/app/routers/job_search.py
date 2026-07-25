@@ -81,8 +81,10 @@ async def search_jobs_endpoint(
         return cast(JobSearchResponse, cached)
 
     # supabase-py is blocking; offload the round-trip off the event loop.
+    # search + the page snippet (both blocking round-trips in one worker thread).
+    # The card-grid UX (#467 §11) shows a preview on every result, authed too.
     results, has_more = await asyncio.to_thread(
-        job_search.search_jobs,
+        job_search.search_jobs_with_snippets,
         supabase,
         q=q,
         limit=page_size,
