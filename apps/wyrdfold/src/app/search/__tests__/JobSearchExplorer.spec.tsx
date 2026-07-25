@@ -60,6 +60,13 @@ jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
 }));
 
+// Funnel beacon (§10 PR6): assert the tick, never the wire (the emitter is
+// fire-and-forget and must stay invisible to the rest of these tests).
+const mockEmitSearchEvent = jest.fn();
+jest.mock('../searchEvents', () => ({
+  emitSearchEvent: (...args: unknown[]) => mockEmitSearchEvent(...args),
+}));
+
 const ORIGINAL_FETCH = global.fetch;
 
 function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
@@ -234,6 +241,18 @@ describe('JobSearchExplorer', () => {
         screen.getByRole('link', { name: /see how you match/i })
       ).toHaveAttribute('href', '/jobs/1')
     );
+  });
+
+  it('emits a card_open funnel tick (authed surface) when a card is opened', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer isAuthenticated />);
+    typeAndSearch('frontend');
+    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
+    expect(mockEmitSearchEvent).toHaveBeenCalledWith({
+      event_type: 'card_open',
+      surface: 'authed',
+      job_posting_id: '1',
+    });
   });
 
   it('opens the modal from the keyboard (Enter on the focused card)', async () => {
@@ -469,6 +488,18 @@ describe('JobSearchExplorer — logged out (public)', () => {
       .map(c => c[0])
       .filter((u): u is string => typeof u === 'string');
   }
+
+  it('emits a card_open tick with the PUBLIC surface when logged out', async () => {
+    mockPublicPage();
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend');
+    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
+    expect(mockEmitSearchEvent).toHaveBeenCalledWith({
+      event_type: 'card_open',
+      surface: 'public',
+      job_posting_id: '1',
+    });
+  });
 
   it('uses the honest logged-out sub-copy (no "scored against your profile" steer)', () => {
     render(<JobSearchExplorer isAuthenticated={false} />);

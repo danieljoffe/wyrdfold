@@ -28,6 +28,12 @@ jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
 }));
 
+// Funnel beacon (§10 PR6): assert the tick, never the wire.
+const mockEmitSearchEvent = jest.fn();
+jest.mock('../searchEvents', () => ({
+  emitSearchEvent: (...args: unknown[]) => mockEmitSearchEvent(...args),
+}));
+
 const ORIGINAL_FETCH = global.fetch;
 
 function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
@@ -312,6 +318,17 @@ describe('JobDetailModal', () => {
       'href',
       '/login'
     );
+  });
+
+  it('logged-out → clicking "Sign up free" emits the signup_click conversion tick', () => {
+    mockEmitSearchEvent.mockClear();
+    renderModal({ isAuthenticated: false });
+    fireEvent.click(screen.getByRole('link', { name: /sign up free/i }));
+    expect(mockEmitSearchEvent).toHaveBeenCalledWith({
+      event_type: 'signup_click',
+      surface: 'public',
+      job_posting_id: result().id,
+    });
   });
 
   it('logged-out → hides EVERY bind / LLM action (even when passed a bound target)', () => {
