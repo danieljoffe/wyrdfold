@@ -184,3 +184,72 @@ a demand/dedup threshold for seeding.
   needs the go/no-go + abuse readiness (CAPTCHA). Beta testers meanwhile.
 - **[HIGH] Abuse-prevention workstream** — public-search rate-limit / bot
   detection / enumeration caps; open-signup abuse; query-log hygiene.
+
+---
+
+## 10. V1 build plan (implementation)
+
+**Grounded against the codebase (2026-07-24).** The decisions above (§7/§8) are
+locked; this is _how_ V1 gets built. The code confirms the hard parts already
+exist: `search_jobs` is fully un-personalized, the slowapi limiter already keys
+per-IP for tokenless callers, and the **waitlist** (`app/routers/waitlist.py` +
+`src/app/api/waitlist/route.ts`) is a proven unauth, BFF-secret-gated, per-IP
+endpoint to clone. V1 is mostly wiring a second, locked-down front door to
+existing machinery — plus the snippet and instrumentation.
+
+### Linchpin — a separate public endpoint + an auth-adaptive `/search`
+
+- **Don't** make the authed endpoint auth-optional: `verify_api_key_or_jwt` is a
+  **router-level** dependency, so dropping it for one route drops it for the whole
+  router. Add a **distinct** `GET /public/search` (`app/routers/public_search.py`)
+  gated by `require_bff_secret` + a tighter per-IP `@limiter.limit`, calling the
+  same `search_jobs`. The authed surface stays byte-for-byte unchanged.
+- **Don't** host both `(app)/search` and `(public)/search` — same-URL collision.
+  Relocate the one route to an **auth-adaptive** segment `src/app/search/` whose
+  `layout.tsx` calls `getUser()` once and branches shell (app sidebar vs. public
+  header + CTA); extract the shared shell into `AppShell`. Allowlist `/search` in
+  `src/proxy.ts` exactly like the `/terms`·`/privacy` branch (targeted — `(app)/*`
+  stays gated).
+
+### Slices (PRs, security-core first)
+
+1. **Public API endpoint** — `public_search.py`: `require_bff_secret` + per-IP
+   limit (`10/minute;60/hour`) + **hard depth cap** (`page_size ≤ 20`,
+   `offset ≤ 40`, vs. the authed `25`/`250`) → `search_jobs`; mount in `main.py`.
+2. **Snippet projection** — add `snippet` to the model; a page-only
+   `description_html` fetch → strip tags → truncate (~180 ch) for the ≤20 page
+   rows (heavy column never read in bulk). Full JD never leaves the server.
+3. **Public BFF route** — `src/app/api/public/search/route.ts` cloning the
+   waitlist (no Bearer, inject BFF secret, forward trusted `x-real-ip` →
+   `x-forwarded-for`).
+4. **Routing + shell** — extract `AppShell`; relocate `/search` to the
+   auth-adaptive segment; `proxy.ts` allowlist; `noindex` metadata.
+5. **Logged-out rendering** — thread `isAuthenticated` into `JobSearchExplorer`:
+   power actions only when authed; snippet rows + a "sign up to see how you match"
+   CTA when logged-out; pick the public fetch URL.
+6. **Instrumentation** — a `search_events` table (RLS deny-all, service-role
+   writes, **no raw IP / no user_id**), written fire-and-forget/batched (mirror
+   `cost_log_buffer.py`), with a retention purge — the volume / coverage-gap /
+   conversion metrics.
+
+### Cross-cutting risks / prereqs
+
+- **[OWNER go/no-go] Open public signups** — the funnel dead-ends at `/login`
+  until `signup_mode=open`; per §7 ship V1 behind the flag with beta testers and
+  flip separately. Not a build blocker.
+- **`WYRDFOLD_BFF_SECRET` is a hard launch gate** — `require_bff_secret` _fails
+  open_ when unset, so it must be set on **both** Railway and Vercel before
+  `/public/search` is reachable (fine for the low-stakes waitlist; not for a
+  scrape-sensitive route).
+- **Shared cache correctness** — the anonymous `job_list_cache` is shared across
+  audiences ONLY while the projection is audience-identical; if a public-only
+  field ever diverges, add an audience dimension to the cache key.
+- **IO / snippet** — title search rides the existing `idx_job_postings_title_trgm`
+  GIN index; no FTS needed for V1. The only new DB pressure is the snippet's
+  page-bounded `description_html` read (cached); escalate to a denormalized
+  `search_snippet` column only if slow-request logs show it.
+
+_Critical files:_ `app/routers/waitlist.py` (clone target), `app/services/job_search.py`
+(reuse), `app/rate_limit.py` + `app/dependencies.py::require_bff_secret` (posture),
+`src/proxy.ts` (allowlist linchpin), `src/app/(app)/search/JobSearchExplorer.tsx`
+(refactor), `src/app/api/waitlist/route.ts` (public BFF precedent).
