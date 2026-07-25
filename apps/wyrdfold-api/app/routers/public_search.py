@@ -38,7 +38,7 @@ from supabase import Client
 
 from app.cache import job_list_cache, make_cache_key
 from app.dependencies import get_supabase, require_bff_secret
-from app.models.job_search import JobSearchResponse, JobSearchResult
+from app.models.job_search import JobSearchResponse
 from app.rate_limit import limiter
 from app.services import job_search
 
@@ -57,32 +57,10 @@ router = APIRouter(
     dependencies=[Depends(require_bff_secret)],
 )
 
-# Own cache namespace — the public projection carries a ``snippet`` the authed
-# route doesn't, so the two no longer share entries.
+# Own cache namespace — the public route keeps its harder caps + BFF gate, so it
+# holds entries separate from the authed route even though the projection (now
+# with ``snippet`` on both) matches. Search + snippets is the shared service helper.
 _CACHE_PREFIX = "publicsearch:"
-
-
-def _search_with_snippets(
-    supabase: Client,
-    *,
-    q: str,
-    limit: int,
-    offset: int,
-    location: str | None,
-    posted_within_days: int | None,
-) -> tuple[list[JobSearchResult], bool]:
-    """``search_jobs`` + the public-only page snippet fetch, composed so both
-    blocking round-trips run in a single worker thread (off the event loop)."""
-    results, has_more = job_search.search_jobs(
-        supabase,
-        q=q,
-        limit=limit,
-        offset=offset,
-        location=location,
-        posted_within_days=posted_within_days,
-    )
-    job_search.attach_snippets(supabase, results)
-    return results, has_more
 
 
 @router.get("/public/search", response_model=JobSearchResponse)
@@ -136,7 +114,7 @@ async def public_search_endpoint(
     # supabase-py is blocking; offload both round-trips (search + the page snippet
     # fetch) onto one worker thread off the event loop (#107).
     results, has_more = await asyncio.to_thread(
-        _search_with_snippets,
+        job_search.search_jobs_with_snippets,
         supabase,
         q=q,
         limit=page_size,
