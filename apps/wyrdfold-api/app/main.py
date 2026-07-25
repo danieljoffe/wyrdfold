@@ -34,9 +34,11 @@ from app.routers import (
     jobs,
     keys,
     poll,
+    public_search,
     sources,
     status,
     tailor,
+    target_membership,
     targets,
     user_profile,
     waitlist,
@@ -480,9 +482,11 @@ app.include_router(job_search.router)
 app.include_router(jobs.router)
 app.include_router(keys.router)
 app.include_router(poll.router)
+app.include_router(public_search.router)
 app.include_router(sources.router)
 app.include_router(status.router)
 app.include_router(tailor.router)
+app.include_router(target_membership.router)
 app.include_router(targets.router)
 app.include_router(user_profile.router)
 app.include_router(waitlist.router)

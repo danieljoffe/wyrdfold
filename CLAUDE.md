@@ -1,133 +1,23 @@
-# CLAUDE.md
+# CLAUDE.md — wyrdfold
 
-Conventions for AI coding agents (and humans) working in this repo. Kept lean — this
-loads into every session.
+Repo-specific conventions. The machine-wide engineering rules
+([github.com/danieljoffe/claude-rules](https://github.com/danieljoffe/claude-rules),
+loaded into every session via `~/.claude/CLAUDE.md`) already cover the **working rhythm**,
+**durable-over-quick / surface-the-fork**, **prove-the-diagnosis**, **validate-before-PR**,
+**review-before-merging**, and the **`develop`/`main` + `gh`** basics — not repeated here.
+This file adds only what's specific to wyrdfold, and wins on conflict.
 
-## Working rhythm — always propose the next move
-
-Don't end a turn asking whether to stop. There's always worthwhile work; the job is to
-pick the _right_ next thing and name it. When a piece of work lands, propose the next step
-as a short paragraph — **what, why now, and roughly how** — and proceed unless redirected.
-Deliberately alternate two lanes:
-
-- **Build** — the next feature or fix.
-- **Tend** — refactor, restructure, delete, or rethink an approach the code has outgrown.
-  Software is a living set of instructions; it needs periodic revision to stay in working
-  order.
-
-Feature work alone never finishes (a dog chasing its tail), so Tend is a first-class
-choice, not filler — pivot to it deliberately after a run of Build work. The
-proposal-paragraph keeps this honest: it has to justify _why this next_, not "there's
-always more."
-
-## Reach for the durable solution — and surface the fork
-
-When the approach forks — a quick patch vs. a more durable fix — **default to durable on
-anything the code lives with**: shared abstractions, hot paths, data integrity, auth,
-public surface, anything costly to reverse. Quick is the right call for a spike, a
-throwaway, a genuinely trivial change, or when speed was explicitly asked for — but as a
-_deliberate_ choice, not the reflex.
-
-The part with teeth isn't "always do the most work" — that just gold-plates trivia. It's:
-**never present the quick path as if it were the only one.** When you settle on an approach
-and a materially better long-term option exists, name it — what it is, why it's better,
-what skipping it trades away — and lean toward it unless the surface doesn't warrant it.
-The user can down-scope a fork they can see; they can't down-scope one you never showed
-them. Quietly shipping the easy fix when a better one was on the table is the failure this
-prevents.
-
-## Prove the diagnosis before prescribing the fix
-
-Every fix rests on a claim about the cause. **Confirm that claim before proposing the fix —
-and again before applying it**: trace the real code path, and where behavior is in question,
-measure or reproduce it. State the cause as something you _checked_, not a plausible story
-that happens to fit the symptom.
-
-The failure this prevents: fixing the wrong thing. It burns the work, it _feels_ like
-progress so the real bug hides longer, and the change can add a fresh problem while "solving"
-a non-issue. A confident-but-unverified root cause is worse than "not sure yet" — it makes
-everyone act on a guess.
-
-- **Name the hypothesis and how you'll confirm it** (which code path, which measurement)
-  before recommending action. "Likely X" is a lead, not a conclusion.
-- **Before applying, ask what you actually checked that rules out the alternatives.** "It
-  sounds right" is a guess, not a diagnosis — go look.
-- **Validating can flip the fix.** Checking often shows it's already handled, aimed at the
-  wrong layer, or fighting a deliberate design — so "I checked, and we should _not_ do this"
-  is a first-class outcome, not a failure to deliver. Don't run a proposal on autopilot once
-  the ground under it has moved.
-- **Correct an earlier guess out loud** the moment you know better — never let an unverified
-  cause harden into fact in a PR body, a memory, or the next turn.
-
-Seen in one session: a keepalive "fix" for a connection-pool cold-start that a trace showed
-was the _query_ all along (the reconnect was ~73ms), and an "add a healthcheck" fix that was
-already configured and deliberately designed the other way. A code read and a measurement
-caught both before they shipped.
-
-## Validate and stress-test before opening a PR
-
-A PR ships **already-proven**, not "tests to follow." Before `gh pr create`:
-
-- **Run the real checks** for what you touched — tests + lint + typecheck, green. Not a
-  narrow smoke.
-- **Exercise negative and edge cases**, not just the happy path. A guard you add should be
-  shown to fail when it should (a regression test that actually catches the regression; a
-  validator that rejects the bad input).
-- **Validate against real data or a realistic fixture** where feasible — watch it actually
-  run; don't just confirm it imports/compiles.
-- **Live API validation runs the Docker image.** When validation means _running_ the API
-  (release-gate drives, endpoint probes), run the containerized API — the same image CI's
-  Trivy job builds and Railway deploys — pointed at the local stack
-  (`SUPABASE_URL=http://host.docker.internal:54321` on macOS). Host `uvicorn` misses
-  packaging/startup issues (env requirements, pandoc, Python drift) that only the artifact
-  shows. Plain pytest suites stay on the host venv — they don't boot the API.
-- **Grow the LLM mock with every PR that touches LLM surfaces.** A PR touching LLM calls,
-  prompts, or LLM-output parsing must extend the mock's edge battery for the surface it
-  touched (malformed/truncated JSON, fenced output, schema-violating payloads, empty
-  content, injection-looking text echoed as data, mid-stream provider errors, …). Every
-  LLM bug we hit becomes a named mock behavior + regression test — the mock is the
-  accumulated bug corpus, so new endpoints inherit every past failure mode for free.
-- **State what you validated in the PR body** — what ran, what you couldn't test, and the
-  residual risk.
-
-See also `CONTRIBUTING.md` → "Before opening a PR" and "Touching prompts or scoring code".
-
-## Review before merging — green CI is necessary, not sufficient
-
-Passing CI proves the change **builds and the tests pass**; it does **not** prove the
-change is **correct, complete, or clean**. **Before merging any PR — above all a
-self-merge to `develop`, where no human reviews it — read the full diff (`gh pr diff`)
-and review it adversarially, as if hunting for the reason _not_ to ship it:**
-
-- **Read every hunk**, not the description. Does the code do what the PR claims — and
-  nothing it doesn't? Watch for scope creep and cross-file inconsistency.
-- **Catch what CI can't see:** leftover debug/stub/hack or commented-out code, a
-  local-only shim that shouldn't ship, a weakened guard, a TODO that's really a gap, a
-  test that asserts the wrong thing or doesn't exercise the change.
-- **Make the green earn it:** the new behavior has a test that would fail _without_ the
-  change; negative/edge cases are covered — not merely that _some_ suite passed.
-- **Review the whole final state, not the last commit.** A PR that grew across many
-  commits (review feedback, fixes, dep bumps) is exactly where cruft and drift hide.
-- **Say what you reviewed** — a short pre-merge note (or PR comment): what you read, what
-  you checked, that it's clean — then merge. If the review finds a real problem, fix it
-  first; never merge on green alone.
-
-The failure this prevents: a green-but-wrong or green-but-messy PR shipping unreviewed
-because "CI passed." CI is the floor, not the sign-off.
-
-## Releases are the pause point — and an integration gate
+## Releases — the pause point and integration gate
 
 "Create a release" / "open a PR from `develop` → `main`" is the deliberate checkpoint in
-the working rhythm above. When asked:
+the working rhythm. When asked:
 
 1. **Finish or cleanly park** the work in flight first, so the release captures a coherent
    state.
 2. **Review the release itself** — don't just open the merge PR. Read the full
-   `develop`→`main` diff and run the pre-PR bar above ("Validate and stress-test") against
-   the _whole_ release: tests + lint + typecheck green, negative/edge cases, and validation
-   against real data / a realistic fixture — hunting especially for interactions between the
-   merged PRs that no single PR could surface. Record what you validated and the residual
-   risk in the release PR body.
+   `develop`→`main` diff and run the full validate-before-PR bar (general rules) against
+   the _whole_ release — hunting especially for interactions between the merged PRs that no
+   single PR could surface. Record what you validated and the residual risk in the PR body.
 3. **Exercise the running system, not just the suite.** Green tests prove the pieces; they
    don't prove the assembled app works for a user or that the API is hard to abuse. Scoped to
    what the release touched: **drive the real app** (browser) through the changed user
@@ -143,15 +33,19 @@ the working rhythm above. When asked:
    the _exact_ state you just proved. It rides the next release and doesn't block this one. (A
    genuine **bug** the review catches is different: it doesn't ride forward — fix it on
    `develop` and re-run the gate before merging.)
-
-5. **Migrations ship with the release — a merge is not a deploy.** Railway deploys the
-   API code on `main`, but **nothing applies `supabase/migrations/` to prod**. A release
-   containing migrations is not done until they are applied to the prod DB and
-   **verified**: `list_migrations` shows the new versions and the invariants they create
-   (policies, constraints, backfills) spot-check true. Apply immediately around the merge —
-   migrations are written to be backward-compatible with the running code, so
-   migrations-first is the safe order. This step exists because three releases once shipped
-   RLS code whose policies never reached prod, breaking status writes live.
+5. **A merge is not a deploy — ship the frontend, then the migrations.** Merging
+   `develop → main` auto-deploys only the **API** (Railway is git-connected to `main`).
+   Two things do **not** happen on their own. **(a) The frontend:** Vercel is _not_
+   git-connected, so run `vercel --prod` from the repo root every release, or a merge
+   leaves the OLD frontend live against the new API — the skew that bit #459, so deploy the
+   frontend and the API together. **(b) The migrations:** **nothing applies
+   `supabase/migrations/` to prod**. A release containing migrations is not done until they
+   are applied to the prod DB and **verified**: `list_migrations` shows the new versions and
+   the invariants they create (policies, constraints, backfills) spot-check true. Apply
+   immediately around the merge — migrations are written to be backward-compatible with the
+   running code, so migrations-first is the safe order. This step exists because three
+   releases once shipped RLS code whose policies never reached prod, breaking status writes
+   live.
 6. **After deploy, smoke the running prod app on the changed surface.** Green CI + applied
    migrations still don't prove prod's _environment_ is right — env vars and secrets drift
    independently of code and no pre-merge check sees them. Hit the changed prod endpoints
@@ -166,13 +60,24 @@ The release PR is a gate, not a rubber stamp — the step proves the release is 
 (tests + integration), **usable** (the real flows work end-to-end), and **safe** (no widened
 abuse surface), and leaves the code **better refactored** than the release found it.
 
-## Repo & PR governance
+## Validating this repo (beyond the general PR bar)
 
-- **Base branch:** open PRs against `develop`, not `main`. `main` is release-only
-  (`develop` → `main`); `.github/workflows/pr-base-branch.yml` fails PRs opened
-  against `main` from anything but `develop` / `release/*` / `hotfix/*`.
-- **Sign automated comments.** `gh` posts as the repo owner, so when an agent
-  authors an issue/PR comment, sign it (e.g. "— Claude (Claude Code)") so it's
-  distinguishable from a human-authored one.
-- **Reading CI as an agent:** the default `GITHUB_TOKEN` 403s on Actions reads;
-  use `env -u GITHUB_TOKEN gh …` (keychain auth) to watch checks / read job logs.
+- **Live API validation runs the Docker image.** When validation means _running_ the API
+  (release-gate drives, endpoint probes), run the containerized API — the same image CI's
+  Trivy job builds and Railway deploys — pointed at the local stack
+  (`SUPABASE_URL=http://host.docker.internal:54321` on macOS). Host `uvicorn` misses
+  packaging/startup issues (env requirements, pandoc, Python drift) that only the artifact
+  shows. Plain pytest suites stay on the host venv — they don't boot the API.
+- **Grow the LLM mock with every PR that touches LLM surfaces.** A PR touching LLM calls,
+  prompts, or LLM-output parsing must extend the mock's edge battery for the surface it
+  touched (malformed/truncated JSON, fenced output, schema-violating payloads, empty
+  content, injection-looking text echoed as data, mid-stream provider errors, …). Every
+  LLM bug we hit becomes a named mock behavior + regression test — the mock is the
+  accumulated bug corpus, so new endpoints inherit every past failure mode for free.
+
+See also `CONTRIBUTING.md` → "Before opening a PR" and "Touching prompts or scoring code".
+
+## Repo governance specifics
+
+- `.github/workflows/pr-base-branch.yml` fails a PR into `main` from anything but
+  `develop` / `release/*` / `hotfix/*` (so a hotfix may target `main` directly).

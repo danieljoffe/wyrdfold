@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.models.job_search import JobSearchResult
 from app.services import job_search
 
@@ -291,5 +293,107 @@ def test_search_endpoint_forwards_filters_to_the_service(
         assert resp.status_code == 200
         assert captured["location"] == "Remote"
         assert captured["posted_within_days"] == 30
+    finally:
+        app.dependency_overrides.clear()
+
+
+# --- snippet helpers (the public-only JD preview) --------------------------
+
+
+def test_html_to_snippet_strips_tags_and_collapses_whitespace() -> None:
+    assert job_search._html_to_snippet("<p>Build   <b>fast</b>\n\n UIs.</p>") == (
+        "Build fast UIs."
+    )
+
+
+def test_html_to_snippet_truncates_with_ellipsis() -> None:
+    s = job_search._html_to_snippet("<p>" + "word " * 100 + "</p>", max_len=20)
+    assert s is not None
+    assert len(s) <= 21  # ≤ max_len chars + the single ellipsis
+    assert s.endswith("…")
+
+
+def test_html_to_snippet_empty_or_blank_is_none() -> None:
+    assert job_search._html_to_snippet(None) is None
+    assert job_search._html_to_snippet("") is None
+    assert job_search._html_to_snippet("<p>   </p>") is None  # tags only → blank
+
+
+def test_attach_snippets_populates_from_page_ids_only() -> None:
+    results = [
+        JobSearchResult(id="a", title="T", company_name="C"),
+        JobSearchResult(id="b", title="T", company_name="C"),
+    ]
+    qb = MagicMock()
+    qb.select.return_value = qb
+    qb.in_.return_value = qb
+    qb.execute.return_value.data = [{"id": "a", "description_html": "<p>Alpha role.</p>"}]
+    sb = MagicMock()
+    sb.table.return_value = qb
+
+    job_search.attach_snippets(sb, results)
+
+    assert results[0].snippet == "Alpha role."
+    assert results[1].snippet is None  # no html row for b → None
+    qb.in_.assert_called_once_with("id", ["a", "b"])  # bounded to the page ids
+
+
+def test_attach_snippets_is_best_effort_on_fetch_failure() -> None:
+    # A transient fetch failure must NOT fail the search — a snippet is an
+    # enhancement, so it degrades to None (WITHOUT the try/except this raises).
+    results = [JobSearchResult(id="a", title="T", company_name="C")]
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.in_.return_value.execute.side_effect = (
+        RuntimeError("db down")
+    )
+    job_search.attach_snippets(sb, results)  # no raise
+    assert results[0].snippet is None
+
+
+def test_attach_snippets_noop_on_empty_results() -> None:
+    sb = MagicMock()
+    job_search.attach_snippets(sb, [])
+    sb.table.assert_not_called()  # nothing to enrich → no fetch
+
+
+def test_search_jobs_with_snippets_composes_search_and_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared helper (used by BOTH endpoints) = search_jobs + attach_snippets."""
+    results = [JobSearchResult(id="a", title="T", company_name="C")]
+    monkeypatch.setattr(job_search, "search_jobs", lambda sb, **kw: (results, True))
+
+    def _fake_attach(sb: object, res: list[JobSearchResult], **kw: object) -> None:
+        for r in res:
+            r.snippet = "preview"
+
+    monkeypatch.setattr(job_search, "attach_snippets", _fake_attach)
+
+    out, has_more = job_search.search_jobs_with_snippets(MagicMock(), q="x")
+    assert has_more is True
+    assert out[0].snippet == "preview"  # attach ran on search's results
+
+
+def test_authed_search_endpoint_now_returns_snippets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authed /search carries a snippet too (the card-grid UX, #467 §11) —
+    it calls the snippet-bearing composition, not bare search_jobs."""
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_supabase, verify_api_key_or_jwt
+    from app.main import app
+    from app.services import job_search as js
+
+    row = JobSearchResult(
+        id="a", title="Frontend Engineer", company_name="Co", snippet="Build fast UIs."
+    )
+    monkeypatch.setattr(js, "search_jobs_with_snippets", lambda sb, **kw: ([row], False))
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "u"
+    try:
+        resp = TestClient(app).get("/search?q=frontend")
+        assert resp.status_code == 200
+        assert resp.json()["results"][0]["snippet"] == "Build fast UIs."
     finally:
         app.dependency_overrides.clear()

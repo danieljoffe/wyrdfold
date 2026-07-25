@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
@@ -9,7 +10,10 @@ import {
 } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { ChevronDown } from 'lucide-react';
+import { Check, ChevronDown, Plus } from 'lucide-react';
+import { Avatar } from '@danieljoffe/shared-ui/Avatar';
+import { Badge } from '@danieljoffe/shared-ui/Badge';
+import type { ButtonVariant } from '@danieljoffe/shared-ui/Button';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
@@ -19,8 +23,17 @@ import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { addJobToTarget, createOrLinkTarget } from '../targets/targetFlows';
-import type { JobSearchResponse, JobSearchResult } from './types';
+// `/search` now lives at the top level (auth-adaptive), so the targets flow —
+// which stays in the authed `(app)` group — is imported by absolute alias
+// rather than the old `../targets` relative path.
+import { addJobToTarget } from '@/app/(app)/targets/targetFlows';
+import JobDetailModal from './JobDetailModal';
+import type {
+  JobSearchResponse,
+  JobSearchResult,
+  TargetMembershipResponse,
+  TargetRef,
+} from './types';
 
 const PAGE_SIZE = 20;
 
@@ -40,8 +53,9 @@ interface TargetOption {
 }
 
 /** Shared (fetch-once) state for the user's targets, threaded to every row's
- *  picker so 20 rows don't each refetch `/api/targets/mine`. */
-interface TargetsSource {
+ *  picker so 20 rows don't each refetch `/api/targets/mine`. Exported for
+ *  {@link JobDetailModal}, which hosts the "Add to target" picker (#467 §11). */
+export interface TargetsSource {
   targets: TargetOption[] | null;
   loading: boolean;
   error: string | null;
@@ -66,16 +80,31 @@ function hueFor(name: string): number {
   return h;
 }
 
-function CompanyAvatar({ name }: { name: string }) {
-  // Solid colour + white text → self-contained, reads in light and dark themes.
+export function CompanyAvatar({
+  name,
+  size = 'md',
+}: {
+  name: string;
+  /** `md` on the card grid, `lg` in the detail modal header (#467 §11.2). */
+  size?: 'md' | 'lg';
+}) {
+  // Shared-ui Avatar (square) carrying the deterministic per-company hue. Avatar
+  // exposes no per-instance colour prop — only a static `tileClassName` — so the
+  // computed hsl() rides a CSS variable set on the root and consumed by the inner
+  // tile via `bg-[var(...)]` (a literal class Tailwind emits). Solid colour +
+  // white text stays self-contained and reads in light and dark themes.
   return (
-    <span
+    <Avatar
       aria-hidden
-      className='flex size-9 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-white'
-      style={{ backgroundColor: `hsl(${hueFor(name)} 48% 42%)` }}
-    >
-      {initials(name)}
-    </span>
+      initials={initials(name)}
+      shape='square'
+      size={size}
+      className='shrink-0'
+      tileClassName='bg-[var(--company-hue)] font-semibold text-white'
+      style={
+        { '--company-hue': `hsl(${hueFor(name)} 48% 42%)` } as CSSProperties
+      }
+    />
   );
 }
 
@@ -88,12 +117,23 @@ function CompanyAvatar({ name }: { name: string }) {
  * Mirrors JobsLocationFilter's open / outside-click / Escape idiom for
  * consistent behaviour + a11y.
  */
-function AddToTargetMenu({
+export function AddToTargetMenu({
   jobId,
   source,
+  variant = 'secondary',
+  label = 'Add to target',
+  onAdded,
 }: {
   jobId: string;
   source: TargetsSource;
+  /** Button emphasis — `primary` for the unbound modal's bind CTA (#467 §11.3). */
+  variant?: ButtonVariant;
+  /** Trigger label — `Add to another target` once the listing is already bound. */
+  label?: string;
+  /** Called after a successful add so the caller can reflect the new membership
+   *  live — flipping the detail modal to its bound state (unlocking match /
+   *  tailor) and badging the card without waiting for the next search. */
+  onAdded?: (target: TargetOption) => void;
 }) {
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
@@ -119,6 +159,11 @@ function AddToTargetMenu({
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') {
+        // Close the menu only — swallow the Escape so a hosting Modal (which
+        // listens for Escape on window) doesn't also close on the same
+        // keystroke. Menu closed → its listener is gone → Escape closes the
+        // modal, giving the expected nested-dismiss order (#467 §11).
+        e.stopPropagation();
         setOpen(false);
         (
           wrapperRef.current?.querySelector(
@@ -145,6 +190,7 @@ function AddToTargetMenu({
         description: 'Saved to your Jobs and scored against this target.',
       });
       setOpen(false);
+      onAdded?.(target);
     } catch (e) {
       toast({
         variant: 'error',
@@ -160,14 +206,14 @@ function AddToTargetMenu({
     <div ref={wrapperRef} className='relative'>
       <Button
         name='search-add-to-target'
-        variant='secondary'
+        variant={variant}
         size='sm'
         aria-haspopup='menu'
         aria-expanded={open}
         onClick={toggle}
       >
-        Add to target
-        <ChevronDown className='ml-1 size-3.5 text-text-tertiary' aria-hidden />
+        {label}
+        <ChevronDown className='ml-1 size-3.5 opacity-70' aria-hidden />
       </Button>
       {open && (
         <div
@@ -215,121 +261,130 @@ function AddToTargetMenu({
 }
 
 /**
- * Manual keyword job search (#467). Kept deliberately DISTINCT from the matched
- * Jobs view: no match scores here (results aren't ranked against the user's
- * profile), so search is never mistaken for the quality of the matching engine —
- * and "see your matches" stays the reason to use Jobs. Logged-in only.
+ * A single search result (#467 §11.1). Kept deliberately DISTINCT from the
+ * matched Jobs view: no match score here (results aren't ranked against the
+ * user's profile), so search is never mistaken for the matching engine — "see
+ * your matches" stays the reason to use Jobs.
+ *
+ * The WHOLE card is the click target → the listing detail (§11.1): no per-card
+ * external link, no per-card conversion hook (browse-first). The bind/create
+ * power-actions moved into {@link JobDetailModal}. `role="button"` + Enter/Space
+ * keeps it keyboard-operable without nesting an interactive element (the footer
+ * badge is presentational — clicking anywhere on the card opens the modal).
  */
-function JobSearchRow({
+function JobSearchCard({
   job,
-  targetsSource,
+  inTargets,
+  isAuthenticated,
+  onOpen,
 }: {
   job: JobSearchResult;
-  targetsSource: TargetsSource;
+  inTargets: TargetRef[];
+  /** Logged-out cards are a PURE click-target — no pipeline-state / add footer
+   *  (#467 §11.1). The soft signup allusion lives only in the detail (§11.5). */
+  isAuthenticated: boolean;
+  onOpen: () => void;
 }) {
-  const { toast } = useToast();
-  const [creating, setCreating] = useState(false);
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
+  const bound = inTargets.length > 0;
 
-  // Create a target from this listing (#467 power-action). Reuses the existing
-  // from-url flow: derives a scoring profile in the background, DEDUPS against
-  // your existing targets, links inactive (so it never trips the active-target
-  // cap), and registers the company's ATS board to grow the corpus. Needs an
-  // experience profile — the from-url endpoint 422s otherwise, surfaced here.
-  const createTarget = async () => {
-    if (!job.absolute_url) return;
-    setCreating(true);
-    try {
-      const result = await createOrLinkTarget(
-        '/api/targets/from-url',
-        { jd_url: job.absolute_url },
-        'Couldn’t create target'
-      );
-      toast({
-        variant: 'success',
-        title: result.was_matched
-          ? `Linked to “${result.target.label}”`
-          : `Target created: “${result.target.label}”`,
-        description:
-          'Building your match profile in the background — activate it under Targets to see your matches.',
-      });
-    } catch (e) {
-      toast({
-        variant: 'error',
-        title: 'Couldn’t create target',
-        ...(e instanceof Error ? { description: e.message } : {}),
-      });
-    } finally {
-      setCreating(false);
+  const onKeyDown = (e: ReactKeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault(); // Space would otherwise scroll the page
+      onOpen();
     }
   };
 
   return (
-    <li className='p-3 transition-colors hover:bg-surface-tertiary/60 motion-reduce:transition-none'>
+    <article
+      role='button'
+      tabIndex={0}
+      aria-label={`Open ${job.title} at ${job.company_name}`}
+      onClick={onOpen}
+      onKeyDown={onKeyDown}
+      className='group flex cursor-pointer flex-col gap-3 rounded-lg border border-border bg-surface-elevated p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 motion-reduce:transform-none motion-reduce:transition-none'
+    >
+      {/* header: company avatar, then role over company · location */}
       <div className='flex items-start gap-3'>
         <CompanyAvatar name={job.company_name} />
         <div className='min-w-0 flex-1'>
-          {/* Line 1: role + salary */}
-          <div className='flex items-start justify-between gap-3'>
-            {job.absolute_url ? (
-              <a
-                href={job.absolute_url}
-                target='_blank'
-                rel='noopener noreferrer'
-                className='font-medium underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
-              >
-                {job.title}
-              </a>
-            ) : (
-              <span className='font-medium'>{job.title}</span>
-            )}
-            {job.salary_text && (
-              <Text variant='meta' className='shrink-0 text-text-secondary'>
-                {job.salary_text}
-              </Text>
-            )}
-          </div>
-          {/* Line 2: company · location + posted date */}
-          <div className='mt-0.5 flex items-baseline justify-between gap-3'>
-            {meta && (
-              <Text variant='meta' className='truncate text-text-secondary'>
-                {meta}
-              </Text>
-            )}
-            <Text variant='meta' className='shrink-0 text-text-tertiary'>
-              {timeAgo(job.created_at)}
+          <span className='font-semibold transition-colors group-hover:text-text-brand'>
+            {job.title}
+          </span>
+          {meta && (
+            <Text
+              variant='meta'
+              className='mt-0.5 block truncate text-text-secondary'
+            >
+              {meta}
             </Text>
-          </div>
-          {/* Actions live BELOW the listing info (not beside it) so the info
-              reads as one unit when skimming — avoids the awkward right-edge
-              break against the salary/date. "Create target" derives a new
-              target from this listing's URL; "Add to target" scores it against
-              one you already have. */}
-          <div className='mt-2 flex flex-wrap items-center gap-2'>
-            {job.absolute_url && (
-              <Button
-                name='search-create-target'
-                variant='secondary'
-                size='sm'
-                onClick={createTarget}
-                disabled={creating}
-                aria-busy={creating}
-              >
-                {creating ? 'Creating…' : 'Create target'}
-              </Button>
-            )}
-            <AddToTargetMenu jobId={job.id} source={targetsSource} />
-          </div>
+          )}
         </div>
       </div>
-    </li>
+      {/* snippet — the triage payload (2-line clamp) */}
+      {job.snippet && (
+        <Text variant='meta' className='line-clamp-2 text-text-secondary'>
+          {job.snippet}
+        </Text>
+      )}
+      {/* meta row: salary + posted, pinned to the bottom so cards line up */}
+      <div className='mt-auto flex items-baseline justify-between gap-3'>
+        <Text
+          variant='meta'
+          className={
+            job.salary_text
+              ? 'font-medium text-text-primary'
+              : 'text-text-tertiary'
+          }
+        >
+          {job.salary_text || 'Salary not listed'}
+        </Text>
+        <Text variant='meta' className='shrink-0 text-text-tertiary'>
+          {timeAgo(job.created_at)}
+        </Text>
+      </div>
+      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Bound → the "✓ In
+          <target>" badge; otherwise a quiet "Add to target" affordance. Both are
+          presentational — the card itself opens the modal, where the action
+          happens. Logged-out renders no footer: a pure click-target (§11.1). */}
+      {isAuthenticated && (
+        <div className='flex items-center gap-2 border-t border-border pt-3'>
+          {bound ? (
+            <Badge variant='brand' className='max-w-full gap-1'>
+              <Check className='size-3.5 shrink-0' aria-hidden />
+              <span className='truncate'>In “{inTargets[0].label}”</span>
+            </Badge>
+          ) : (
+            <Badge variant='default' className='gap-1'>
+              <Plus className='size-3.5 shrink-0' aria-hidden />
+              Add to target
+            </Badge>
+          )}
+        </div>
+      )}
+    </article>
   );
 }
 
-export default function JobSearchExplorer() {
+export default function JobSearchExplorer({
+  isAuthenticated,
+}: {
+  /** From the page's server-side `getUser()` (#467 §10). Logged-out: fetch the
+   *  public BFF route, no membership, no per-card footer, and a soft signup
+   *  allusion in the detail. Authed: the full bind→unlock experience, unchanged. */
+  isAuthenticated: boolean;
+}) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+
+  // The search BFF differs by audience: the authed route proxies the caller's
+  // JWT (`/api/jobs/search`); the public route is the unauth, BFF-secret-gated,
+  // depth-capped forwarder (`/api/public/search`). Same response shape, so only
+  // the URL changes.
+  const searchEndpoint = isAuthenticated
+    ? '/api/jobs/search'
+    : '/api/public/search';
 
   // The URL is the SINGLE SOURCE OF TRUTH for the search state — query + filters
   // live in the querystring so back/forward and bookmarks restore an exact
@@ -348,6 +403,18 @@ export default function JobSearchExplorer() {
   const [loading, setLoading] = useState(false); // fresh search
   const [loadingMore, setLoadingMore] = useState(false); // "Load more"
   const [error, setError] = useState<string | null>(null);
+
+  // Target-membership for the visible page (#467 §11): which of the caller's
+  // targets already contain each listing → the card's pipeline-state badge and
+  // the detail modal's bound/unbound split. Best-effort; a failure just leaves
+  // the map empty and NEVER blocks search. Keyed by job id.
+  const [membershipByJob, setMembershipByJob] = useState<
+    Record<string, TargetRef[]>
+  >({});
+
+  // The listing whose detail modal is open (null = closed). The whole card opens
+  // it; the modal hosts the bind / create / match / tailor actions (§11.2/§11.3).
+  const [selectedJob, setSelectedJob] = useState<JobSearchResult | null>(null);
 
   // The user's targets for every row's "Add to target" picker — fetched ONCE,
   // lazily, the first time any menu opens. ``targetsRequested`` stops the N
@@ -406,11 +473,40 @@ export default function JobSearchExplorer() {
       });
       if (opts.location.trim()) sp.set('location', opts.location.trim());
       if (opts.days) sp.set('posted_within_days', opts.days);
-      const res = await fetch(`/api/jobs/search?${sp.toString()}`);
+      const res = await fetch(`${searchEndpoint}?${sp.toString()}`);
       if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
       return (await res.json()) as JobSearchResponse;
     },
-    []
+    [searchEndpoint]
+  );
+
+  // Fetch target-membership for a batch of results and merge it into the map
+  // (#467 §11). Strictly best-effort: any failure (auth, network, non-OK) is
+  // swallowed so the badge/modal simply fall back to "unbound" — search must
+  // never depend on this. Runs after each page lands (page 0 + Load more).
+  const fetchMembership = useCallback(
+    async (jobs: JobSearchResult[]) => {
+      // Membership is a per-user concept — never fetched on the logged-out
+      // surface (no session, and the card/detail render no membership UI).
+      if (!isAuthenticated) return;
+      const ids = jobs.map(j => j.id);
+      if (ids.length === 0) return;
+      try {
+        const res = await fetch('/api/jobs/target-membership', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_posting_ids: ids }),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as TargetMembershipResponse;
+        if (data.memberships) {
+          setMembershipByJob(prev => ({ ...prev, ...data.memberships }));
+        }
+      } catch {
+        // best-effort — leave the map as-is
+      }
+    },
+    [isAuthenticated]
   );
 
   // Run the search whenever the URL search-state changes: initial mount, a
@@ -420,6 +516,8 @@ export default function JobSearchExplorer() {
   useEffect(() => {
     setDraftQ(urlQ);
     setDraftLocation(urlLocation);
+    // A fresh search invalidates the previous page's membership map.
+    setMembershipByJob({});
     if (!urlQ) {
       setResults(null);
       setError(null);
@@ -435,6 +533,7 @@ export default function JobSearchExplorer() {
         if (cancelled) return;
         setResults(data.results);
         setHasMore(data.has_more);
+        void fetchMembership(data.results); // best-effort, non-blocking
       })
       .catch(e => {
         if (cancelled) return;
@@ -449,7 +548,7 @@ export default function JobSearchExplorer() {
     return () => {
       cancelled = true;
     };
-  }, [urlQ, urlLocation, urlDays, fetchPage]);
+  }, [urlQ, urlLocation, urlDays, fetchPage, fetchMembership]);
 
   // Commit search state to the URL (replace → the /search entry updates in place,
   // so "back" from a listing lands on this exact query+filters rather than a
@@ -486,12 +585,13 @@ export default function JobSearchExplorer() {
       });
       setResults(prev => [...(prev ?? []), ...data.results]);
       setHasMore(data.has_more);
+      void fetchMembership(data.results); // best-effort, non-blocking
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Network error loading more.');
     } finally {
       setLoadingMore(false);
     }
-  }, [fetchPage, urlQ, urlLocation, urlDays, results]);
+  }, [fetchPage, fetchMembership, urlQ, urlLocation, urlDays, results]);
 
   const hasActiveFilters = Boolean(urlLocation.trim() || urlDays);
   const onEnter = (e: ReactKeyboardEvent) => {
@@ -510,14 +610,24 @@ export default function JobSearchExplorer() {
         <Heading variant='hero' as='h1'>
           Search jobs
         </Heading>
-        <Text variant='body' className='mt-1 text-text-secondary'>
-          Browse the full job pool by keyword. These results aren’t scored
-          against your profile — head to{' '}
-          <Link href='/jobs' className='underline underline-offset-2'>
-            Jobs
-          </Link>{' '}
-          to see how you match.
-        </Text>
+        {/* Sub-copy differs by audience. Authed is UNCHANGED (steers to Jobs for
+            the AI match); logged-out is the honest "no account needed" framing —
+            the conversion moment is deferred to the detail's soft allusion. */}
+        {isAuthenticated ? (
+          <Text variant='body' className='mt-1 text-text-secondary'>
+            Browse the full job pool by keyword. These results aren’t scored
+            against your profile — head to{' '}
+            <Link href='/jobs' className='underline underline-offset-2'>
+              Jobs
+            </Link>{' '}
+            to see how you match.
+          </Text>
+        ) : (
+          <Text variant='body' className='mt-1 text-text-secondary'>
+            Browse the full job pool by keyword — no account needed. Open any
+            role for the details and a link to the original posting.
+          </Text>
+        )}
       </div>
 
       <div className='space-y-2'>
@@ -615,15 +725,17 @@ export default function JobSearchExplorer() {
             </div>
           ) : (
             <>
-              <ul className='divide-y divide-border overflow-hidden rounded-md border border-border'>
+              <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
                 {results.map(job => (
-                  <JobSearchRow
+                  <JobSearchCard
                     key={job.id}
                     job={job}
-                    targetsSource={targetsSource}
+                    inTargets={membershipByJob[job.id] ?? []}
+                    isAuthenticated={isAuthenticated}
+                    onOpen={() => setSelectedJob(job)}
                   />
                 ))}
-              </ul>
+              </div>
               {hasMore && (
                 <div className='mt-4 flex justify-center'>
                   <Button
@@ -640,6 +752,27 @@ export default function JobSearchExplorer() {
             </>
           )}
         </section>
+      )}
+
+      {/* The listing detail (#467 §11.2). One instance, driven by `selectedJob`;
+          `inTargets` decides the bound/unbound actions. Focus returns to the
+          opening card on close (shared-ui Modal restores the prior activeElement). */}
+      {selectedJob && (
+        <JobDetailModal
+          job={selectedJob}
+          inTargets={membershipByJob[selectedJob.id] ?? []}
+          isAuthenticated={isAuthenticated}
+          targetsSource={targetsSource}
+          onAddedToTarget={t =>
+            setMembershipByJob(prev => {
+              const cur = prev[selectedJob.id] ?? [];
+              // Dedup — a second add of the same target is a no-op for the badge.
+              if (cur.some(x => x.target_id === t.target_id)) return prev;
+              return { ...prev, [selectedJob.id]: [...cur, t] };
+            })
+          }
+          onClose={() => setSelectedJob(null)}
+        />
       )}
     </div>
   );

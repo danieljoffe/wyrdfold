@@ -184,3 +184,174 @@ a demand/dedup threshold for seeding.
   needs the go/no-go + abuse readiness (CAPTCHA). Beta testers meanwhile.
 - **[HIGH] Abuse-prevention workstream** — public-search rate-limit / bot
   detection / enumeration caps; open-signup abuse; query-log hygiene.
+
+---
+
+## 10. V1 build plan (implementation)
+
+**Grounded against the codebase (2026-07-24).** The decisions above (§7/§8) are
+locked; this is _how_ V1 gets built. The code confirms the hard parts already
+exist: `search_jobs` is fully un-personalized, the slowapi limiter already keys
+per-IP for tokenless callers, and the **waitlist** (`app/routers/waitlist.py` +
+`src/app/api/waitlist/route.ts`) is a proven unauth, BFF-secret-gated, per-IP
+endpoint to clone. V1 is mostly wiring a second, locked-down front door to
+existing machinery — plus the snippet and instrumentation.
+
+### Linchpin — a separate public endpoint + an auth-adaptive `/search`
+
+- **Don't** make the authed endpoint auth-optional: `verify_api_key_or_jwt` is a
+  **router-level** dependency, so dropping it for one route drops it for the whole
+  router. Add a **distinct** `GET /public/search` (`app/routers/public_search.py`)
+  gated by `require_bff_secret` + a tighter per-IP `@limiter.limit`, calling the
+  same `search_jobs`. The authed surface stays byte-for-byte unchanged.
+- **Don't** host both `(app)/search` and `(public)/search` — same-URL collision.
+  Relocate the one route to an **auth-adaptive** segment `src/app/search/` whose
+  `layout.tsx` calls `getUser()` once and branches shell (app sidebar vs. public
+  header + CTA); extract the shared shell into `AppShell`. Allowlist `/search` in
+  `src/proxy.ts` exactly like the `/terms`·`/privacy` branch (targeted — `(app)/*`
+  stays gated).
+
+### Slices (PRs, security-core first)
+
+1. **Public API endpoint** — `public_search.py`: `require_bff_secret` + per-IP
+   limit (`10/minute;60/hour`) + **hard depth cap** (`page_size ≤ 20`,
+   `offset ≤ 40`, vs. the authed `25`/`250`) → `search_jobs`; mount in `main.py`.
+2. **Snippet projection** — add `snippet` to the model; a page-only
+   `description_html` fetch → strip tags → truncate (~180 ch) for the ≤20 page
+   rows (heavy column never read in bulk). Full JD never leaves the server.
+3. **Public BFF route** — `src/app/api/public/search/route.ts` cloning the
+   waitlist (no Bearer, inject BFF secret, forward trusted `x-real-ip` →
+   `x-forwarded-for`).
+4. **Routing + shell** — extract `AppShell`; relocate `/search` to the
+   auth-adaptive segment; `proxy.ts` allowlist; `noindex` metadata.
+5. **Logged-out rendering** — thread `isAuthenticated` into `JobSearchExplorer`:
+   power actions only when authed; snippet rows + a "sign up to see how you match"
+   CTA when logged-out; pick the public fetch URL.
+6. **Instrumentation** — a `search_events` table (RLS deny-all, service-role
+   writes, **no raw IP / no user_id**), written fire-and-forget/batched (mirror
+   `cost_log_buffer.py`), with a retention purge — the volume / coverage-gap /
+   conversion metrics.
+
+### Cross-cutting risks / prereqs
+
+- **[OWNER go/no-go] Open public signups** — the funnel dead-ends at `/login`
+  until `signup_mode=open`; per §7 ship V1 behind the flag with beta testers and
+  flip separately. Not a build blocker.
+- **`WYRDFOLD_BFF_SECRET` is a hard launch gate** — `require_bff_secret` _fails
+  open_ when unset, so it must be set on **both** Railway and Vercel before
+  `/public/search` is reachable (fine for the low-stakes waitlist; not for a
+  scrape-sensitive route).
+- **Shared cache correctness** — the anonymous `job_list_cache` is shared across
+  audiences ONLY while the projection is audience-identical; if a public-only
+  field ever diverges, add an audience dimension to the cache key.
+- **IO / snippet** — title search rides the existing `idx_job_postings_title_trgm`
+  GIN index; no FTS needed for V1. The only new DB pressure is the snippet's
+  page-bounded `description_html` read (cached); escalate to a denormalized
+  `search_snippet` column only if slow-request logs show it.
+
+_Critical files:_ `app/routers/waitlist.py` (clone target), `app/services/job_search.py`
+(reuse), `app/rate_limit.py` + `app/dependencies.py::require_bff_secret` (posture),
+`src/proxy.ts` (allowlist linchpin), `src/app/(app)/search/JobSearchExplorer.tsx`
+(refactor), `src/app/api/waitlist/route.ts` (public BFF precedent).
+
+---
+
+## 11. Search UX redesign — card grid + contextual detail (PR5 line)
+
+**Settled 2026-07-25, mockup-driven (iterated with Daniel).** Supersedes the row-list
+result layout. Applies to **both** audiences; the differences live in the per-card footer
+and the detail. The guiding prototype is the iterated card-grid + contextual-detail
+mockup (browse-first, bind→unlock).
+
+### 11.1 Card grid (replaces the row-list)
+
+- **3-col responsive grid** (→ 2 tablet → 1 mobile).
+- Card = company monogram (per-company hue; real logos via **#470**) · role title ·
+  `Company · Location` · 2-line snippet · salary (or "Salary not listed") · posted.
+- **The whole card is the click target → the listing detail.** No per-card external
+  link and **no per-card conversion hook** — browse-first (the earlier per-card
+  "See how you match" was removed as too aggressive; it fought the "let them poke
+  around before committing" on-ramp).
+- **Logged-in footer** (per card): a quick **Add to target** (free, feedback-like) —
+  OR a **pipeline-state badge** `✓ In "<target>"` when the listing is already in one of
+  the user's targets. _(Quick-add: always-visible in the mock; hover-reveal is a
+  candidate to keep the resting grid calmer — TBD on feel.)_
+- **Logged-out**: no footer; the card is purely a click-target.
+
+### 11.2 The listing detail (modal with a real URL)
+
+- Opens **over the grid** (keeps browse context). Target: a Next **intercepting route**
+  so `/search/[id]` is shareable / deep-linkable and renders as a full page on a direct
+  hit. **V1 ships a plain client modal; the URL/intercepting-route is a fast-follow.**
+- **Header:** monogram · role title · `Company · Location`, then **"View original
+  posting ↗" as a link on its own line** (both audiences). The full JD lives at the
+  source — we preview, we don't republish.
+- **Body:** chips (salary / posted / location) + the snippet.
+- **Actions — contextual on target-membership** (§11.3).
+- Dismiss: ✕, click-outside, Esc; focus returns to the card.
+
+### 11.3 The target-bind model (the crux)
+
+The LLM actions are **target-level, not listing-level** — you don't match or tailor a
+bare listing, you match/tailor a _listing-in-a-target_. So the detail's actions are a
+**sequence**, gated on whether the listing is bound:
+
+- **Unbound listing → only the two BIND actions:**
+  - **Add to a target** (primary, free) — files the listing against an existing target;
+    **acts as positive feedback** (scores it + sharpens how that target scores). Same
+    effect path as user feedback.
+  - **Create a target from this role** — background **from-url** derivation; returns
+    immediately, **toasts on completion**, the listing lands in the new target's
+    listings. Uses AI credits.
+  - One-liner: _"Add to a target to unlock LLM pipelines."_ **[COPY-TBD:** "LLM
+    pipelines" reads as internal jargon to a job-seeker; candidate softer wording
+    "unlock AI matching & tailoring".**]**
+  - Match/tailor are **not shown** — nothing to score against yet.
+- **Bound listing (already in a target) → the LLM actions UNLOCK:**
+  - **See how you match** (primary) — score this role **against the target it's in**;
+    returns fit + matched skills + gaps. (Answers "how will we know?" — we score against
+    that target.) Uses credits.
+  - **Tailor a résumé for "<target>"** — tailoring scoped to the target (avoids the
+    drift a bare-listing tailor would cause). Uses credits.
+  - **Add to another target** (free).
+  - Shows the state `✓ In "<target>"`.
+
+### 11.4 Credit rules
+
+- **Browsing is always free** — search, the grid, the detail's info + source link. No
+  credits, no gate, for everyone.
+- **LLM actions are credit-gated** — match, tailor, create-target. Surface the cost + the
+  balance.
+- **Out of credits ≠ a wall** — a top-up nudge; search + add-to-target keep working (the
+  out-of-credits manual fallback the epic wanted). Never block browsing.
+- **Add-to-target is free** (feedback path, not LLM).
+
+### 11.5 Funnel (logged-out)
+
+Browse-first, no per-card pressure. Logged-out card = clean click-target → detail. The
+detail carries the info + source link + a **soft, non-blocking allusion** ("there's more
+when you're signed in — members see how they match + tailor a résumé; sign up free").
+One calm conversion moment, in the detail, never on the grid. A quiet "Sign up" in the
+header; no persistent banner.
+
+### 11.6 Build slices
+
+1. **Card grid** — replace `JobSearchExplorer`'s row-list with the 3-col card grid;
+   logged-in footer (add-to-target + pipeline-state); wire add-to-target (exists).
+2. **Contextual detail** — the listing detail (plain modal first; URL fast-follow);
+   header source link; unbound (add/create-target — both exist) vs bound (match/tailor).
+3. **Backend — match a search listing vs a target** — score a specific posting against
+   one of the caller's targets; return fit / matched keywords / gaps. Reuses the scoring
+   layer. LLM/embedding surface → grow the mock + regression tests.
+4. **Backend — tailor for a listing-in-target** — tailoring scoped to the target. LLM
+   surface → mock + tests.
+5. **Wire** the frontend match/tailor actions to (3) + (4).
+6. Public routing + logged-out rendering + instrumentation (§10's PR3–6) fold in behind.
+
+### 11.7 Open / TBD
+
+- Copy: "unlock LLM pipelines" wording (§11.3).
+- Detail as modal-with-URL (intercepting route) vs plain modal — start plain, add URL.
+- Quick-add always-visible vs hover-reveal — decide on feel.
+- Whether match/tailor need dedicated per-listing endpoints or can reuse the
+  target-scoring / tailoring paths with a listing argument — scope in slices 3–4.

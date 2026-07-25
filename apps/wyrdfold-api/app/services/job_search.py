@@ -22,13 +22,17 @@ easily extended; embedding re-rank is a later, logged-in-only enhancement.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from bs4 import BeautifulSoup
 from supabase import Client
 
 from app.models.job_search import JobSearchResult
+
+logger = logging.getLogger(__name__)
 
 # Light projection — NEVER select ``description_html`` (heavy; the public row is
 # a preview that links to the source) nor the legacy ``score``/``score_breakdown``
@@ -52,6 +56,10 @@ MAX_OFFSET = _CANDIDATE_CAP
 # Recency-filter ceiling — a year back is effectively "any time" for this corpus,
 # and bounding it keeps the DB predicate sane.
 MAX_POSTED_WITHIN_DAYS = 365
+
+# Public-row preview length. Long enough to judge a role, short enough that we're
+# not republishing the JD (exposure decision: link to the source for the full text).
+SNIPPET_MAX_LEN = 180
 
 # Canonical role/seniority groups → surface forms (all lowercase). Members of a
 # group are treated as synonyms for both the DB pre-filter and the overlap rank.
@@ -213,3 +221,79 @@ def search_jobs(
     page = rows[offset : offset + limit]
     has_more = len(rows) > offset + limit
     return [JobSearchResult.model_validate(r) for r in page], has_more
+
+
+def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | None:
+    """Tag-strip + whitespace-collapse + truncate a JD's ``description_html`` into
+    a short plaintext preview. ``None`` for empty/blank input; appends an ellipsis
+    when truncated."""
+    if not html:
+        return None
+    text = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ").split())
+    if not text:
+        return None
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "…"
+
+
+def attach_snippets(
+    supabase: Client,
+    results: list[JobSearchResult],
+    *,
+    max_len: int = SNIPPET_MAX_LEN,
+) -> None:
+    """Populate each result's ``snippet`` IN PLACE from a bounded, PAGE-ONLY fetch
+    of ``description_html``.
+
+    ``description_html`` is the heavy column deliberately excluded from the ranked
+    candidate query (:data:`_SEARCH_COLS`), so this fetches it for ONLY the ≤page
+    result ids — never the ~250-row candidate window. **Public surface only**: the
+    authed search leaves snippets ``None``, sparing its hot path this extra read.
+
+    Best-effort: a fetch failure logs and leaves snippets ``None`` rather than
+    failing the search — a snippet is an enhancement, not the result. The caller
+    runs this inside a worker thread (blocking supabase round-trip, #107).
+    """
+    if not results:
+        return
+    ids = [r.id for r in results]  # ≤ page size, so no in_() chunking (#414 guard)
+    try:
+        resp = (
+            supabase.table("jobs").select("id, description_html").in_("id", ids).execute()
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+    except Exception:
+        logger.warning("snippet fetch failed; leaving snippets empty", exc_info=True)
+        return
+    by_id = {row["id"]: row.get("description_html") for row in rows}
+    for r in results:
+        r.snippet = _html_to_snippet(by_id.get(r.id), max_len)
+
+
+def search_jobs_with_snippets(
+    supabase: Client,
+    *,
+    q: str,
+    limit: int = DEFAULT_PAGE_SIZE,
+    offset: int = 0,
+    location: str | None = None,
+    posted_within_days: int | None = None,
+) -> tuple[list[JobSearchResult], bool]:
+    """``search_jobs`` + the page-only snippet fetch, composed so both blocking
+    round-trips run in a single worker thread.
+
+    Used by BOTH the authed and public search endpoints: the card-grid UX (#467
+    §11) shows a snippet on every result, so the preview is no longer public-only.
+    The extra read is bounded to the ≤page ids and cached — see ``attach_snippets``.
+    """
+    results, has_more = search_jobs(
+        supabase,
+        q=q,
+        limit=limit,
+        offset=offset,
+        location=location,
+        posted_within_days=posted_within_days,
+    )
+    attach_snippets(supabase, results)
+    return results, has_more
