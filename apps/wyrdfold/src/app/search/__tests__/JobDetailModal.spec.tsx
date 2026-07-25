@@ -59,6 +59,7 @@ function renderModal(
   opts: {
     job?: JobSearchResult;
     inTargets?: TargetRef[];
+    isAuthenticated?: boolean;
     targetsSource?: TargetsSource;
     onClose?: () => void;
     onAddedToTarget?: (target: TargetRef) => void;
@@ -68,6 +69,9 @@ function renderModal(
     <JobDetailModal
       job={opts.job ?? result()}
       inTargets={opts.inTargets ?? []}
+      // Default authed — the existing suite covers the bind→unlock states; the
+      // logged-out block below passes `isAuthenticated={false}` explicitly.
+      isAuthenticated={opts.isAuthenticated ?? true}
       targetsSource={opts.targetsSource ?? loadedTargets()}
       onClose={opts.onClose ?? jest.fn()}
       onAddedToTarget={opts.onAddedToTarget}
@@ -285,5 +289,51 @@ describe('JobDetailModal', () => {
     renderModal({ onClose });
     fireEvent.click(screen.getByRole('button', { name: /close dialog/i }));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  // ---- Logged-out: info + source link + ONE soft allusion (#467 §11.5) -----
+
+  it('logged-out → shows the source link + the signup allusion (link to /login)', () => {
+    renderModal({ isAuthenticated: false });
+
+    // Browsing stays free: header + source link.
+    expect(
+      screen.getByRole('heading', { name: 'Frontend Engineer' })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('link', { name: /view original posting/i })
+    ).toHaveAttribute('href', 'https://ext.example/1');
+
+    // The soft allusion — alludes to match + tailor, links to signup.
+    expect(
+      screen.getByText(/how this role matches their profile/i)
+    ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /sign up free/i })).toHaveAttribute(
+      'href',
+      '/login'
+    );
+  });
+
+  it('logged-out → hides EVERY bind / LLM action (even when passed a bound target)', () => {
+    // Defence-in-depth: even if a stray `inTargets` were passed for a logged-out
+    // render, the public detail must never expose the authed actions.
+    renderModal({
+      isAuthenticated: false,
+      inTargets: [{ target_id: 't9', label: 'Frontend Roles' }],
+    });
+
+    expect(
+      screen.queryByRole('button', { name: /add to target/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /create a target from this role/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('link', { name: /see how you match/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('link', { name: /tailor a r/i })
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
   });
 });

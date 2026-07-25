@@ -116,7 +116,7 @@ function cardName(title = 'Frontend Engineer', company = 'Acme') {
 
 describe('JobSearchExplorer', () => {
   it('is framed as distinct from the matched Jobs view', () => {
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     expect(
       screen.getByRole('heading', { name: /search jobs/i })
     ).toBeInTheDocument();
@@ -132,7 +132,7 @@ describe('JobSearchExplorer', () => {
 
   it('searches the authed BFF route and renders result cards (no score)', async () => {
     mockSearch([result()]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend engineer');
 
     // The whole result is a button (opens the detail) — not a title link.
@@ -150,7 +150,7 @@ describe('JobSearchExplorer', () => {
 
   it('opens the detail modal when a card is clicked (actions live there now)', async () => {
     mockSearch([result()]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     fireEvent.click(await screen.findByRole('button', { name: cardName() }));
@@ -210,7 +210,7 @@ describe('JobSearchExplorer', () => {
       });
     }) as unknown as typeof fetch;
 
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     fireEvent.click(await screen.findByRole('button', { name: cardName() }));
@@ -238,7 +238,7 @@ describe('JobSearchExplorer', () => {
 
   it('opens the modal from the keyboard (Enter on the focused card)', async () => {
     mockSearch([result()]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     const card = await screen.findByRole('button', { name: cardName() });
@@ -274,7 +274,7 @@ describe('JobSearchExplorer', () => {
       });
     }) as unknown as typeof fetch;
 
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     // The card renders the "✓ In <target>" pipeline-state badge once membership
@@ -292,7 +292,7 @@ describe('JobSearchExplorer', () => {
     mockSearch([
       result({ snippet: 'Build fast, accessible UIs for millions.' }),
     ]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
     expect(
       await screen.findByText('Build fast, accessible UIs for millions.')
@@ -322,7 +322,7 @@ describe('JobSearchExplorer', () => {
       });
     }) as unknown as typeof fetch;
 
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     // Page 1 + a "Load more" affordance.
@@ -354,7 +354,7 @@ describe('JobSearchExplorer', () => {
 
   it('shows an honest empty state when nothing matches', async () => {
     mockSearch([]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('nothingmatches');
 
     expect(await screen.findByText(/no roles match/i)).toBeInTheDocument();
@@ -370,7 +370,7 @@ describe('JobSearchExplorer', () => {
       // extractApiError reads the body via res.clone().json().
       clone: () => ({ json: async () => payload }),
     }) as unknown as typeof fetch;
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
 
     expect(await screen.findByText(/search exploded/i)).toBeInTheDocument();
@@ -381,7 +381,7 @@ describe('JobSearchExplorer', () => {
   it('restores the search straight from URL params on mount (back/bookmark)', async () => {
     mockSearch([result({ title: 'Frontend Engineer' })]);
     mockSearchParams = new URLSearchParams('q=engineer');
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
 
     // No typing — the search runs off the URL alone.
     expect(
@@ -394,7 +394,7 @@ describe('JobSearchExplorer', () => {
 
   it('commits the query to the URL on submit', async () => {
     mockSearch([result()]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('backend developer');
     await waitFor(() =>
       expect(mockReplace).toHaveBeenCalledWith(
@@ -407,7 +407,7 @@ describe('JobSearchExplorer', () => {
   it('applies the recency filter to the URL and the request', async () => {
     mockSearch([result()]);
     mockSearchParams = new URLSearchParams('q=engineer');
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     await screen.findByRole('button', { name: cardName('Frontend Engineer') });
 
     fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
@@ -429,7 +429,7 @@ describe('JobSearchExplorer', () => {
 
   it('applies the location filter to the request', async () => {
     mockSearch([result()]);
-    render(<JobSearchExplorer />);
+    render(<JobSearchExplorer isAuthenticated />);
     fireEvent.change(
       screen.getByLabelText(/search jobs by title or keyword/i),
       { target: { value: 'engineer' } }
@@ -444,5 +444,104 @@ describe('JobSearchExplorer', () => {
         expect.stringContaining('location=Remote')
       )
     );
+  });
+});
+
+// ---- Logged-out (public) surface (#467 §10/§11) --------------------------
+describe('JobSearchExplorer — logged out (public)', () => {
+  /** Every fetch resolves the same one-result page — lets us assert WHICH URLs
+   *  the logged-out explorer hits (and, crucially, which it does not). */
+  function mockPublicPage() {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        query: 'q',
+        count: 1,
+        has_more: false,
+        results: [result()],
+      }),
+    }) as unknown as typeof fetch;
+  }
+
+  function fetchedUrls(): string[] {
+    return (global.fetch as jest.Mock).mock.calls
+      .map(c => c[0])
+      .filter((u): u is string => typeof u === 'string');
+  }
+
+  it('uses the honest logged-out sub-copy (no "scored against your profile" steer)', () => {
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    expect(screen.getByText(/no account needed/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/scored against your profile/i)
+    ).not.toBeInTheDocument();
+    // No steer-to-Jobs link on the public surface.
+    expect(
+      screen.queryByRole('link', { name: 'Jobs' })
+    ).not.toBeInTheDocument();
+  });
+
+  it('fetches the PUBLIC BFF route — never the authed search or membership', async () => {
+    mockPublicPage();
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend engineer');
+
+    await screen.findByRole('button', { name: cardName() });
+
+    // Hits the public BFF route with the query...
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/public/search?q=frontend+engineer')
+    );
+    // ...and NEVER the authed search route or the per-user membership POST.
+    const urls = fetchedUrls();
+    expect(urls.some(u => u.includes('/api/jobs/search'))).toBe(false);
+    expect(urls.some(u => u.includes('/api/jobs/target-membership'))).toBe(
+      false
+    );
+  });
+
+  it('renders a card with NO logged-in footer (pure click-target)', async () => {
+    mockPublicPage();
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend');
+
+    const card = await screen.findByRole('button', { name: cardName() });
+    // The card still opens the detail (below), but carries no add/badge footer.
+    expect(within(card).queryByText(/add to target/i)).not.toBeInTheDocument();
+    expect(within(card).queryByText(/^In /)).not.toBeInTheDocument();
+  });
+
+  it('opens a detail with the source link + the soft signup allusion, not the bind/LLM actions', async () => {
+    mockPublicPage();
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend');
+
+    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
+    const dialog = await screen.findByRole('dialog');
+
+    // Browsing stays free: the source link is present.
+    expect(
+      within(dialog).getByRole('link', { name: /view original posting/i })
+    ).toHaveAttribute('href', 'https://ext.example/1');
+    // The one soft conversion moment → /login.
+    expect(
+      within(dialog).getByRole('link', { name: /sign up free/i })
+    ).toHaveAttribute('href', '/login');
+    // NONE of the logged-in bind / LLM actions leak onto the public detail.
+    expect(
+      within(dialog).queryByText(/unlock llm pipelines/i)
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole('button', {
+        name: /create a target from this role/i,
+      })
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole('button', { name: /add to target/i })
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole('link', { name: /see how you match/i })
+    ).not.toBeInTheDocument();
   });
 });

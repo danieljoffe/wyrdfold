@@ -23,7 +23,10 @@ import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { addJobToTarget } from '../targets/targetFlows';
+// `/search` now lives at the top level (auth-adaptive), so the targets flow —
+// which stays in the authed `(app)` group — is imported by absolute alias
+// rather than the old `../targets` relative path.
+import { addJobToTarget } from '@/app/(app)/targets/targetFlows';
 import JobDetailModal from './JobDetailModal';
 import type {
   JobSearchResponse,
@@ -272,10 +275,14 @@ export function AddToTargetMenu({
 function JobSearchCard({
   job,
   inTargets,
+  isAuthenticated,
   onOpen,
 }: {
   job: JobSearchResult;
   inTargets: TargetRef[];
+  /** Logged-out cards are a PURE click-target — no pipeline-state / add footer
+   *  (#467 §11.1). The soft signup allusion lives only in the detail (§11.5). */
+  isAuthenticated: boolean;
   onOpen: () => void;
 }) {
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
@@ -336,30 +343,48 @@ function JobSearchCard({
           {timeAgo(job.created_at)}
         </Text>
       </div>
-      {/* footer: pipeline-state (§11.1). Bound → the "✓ In <target>" badge;
-          otherwise a quiet "Add to target" affordance. Both are presentational —
-          the card itself opens the modal, where the action actually happens. */}
-      <div className='flex items-center gap-2 border-t border-border pt-3'>
-        {bound ? (
-          <Badge variant='brand' className='max-w-full gap-1'>
-            <Check className='size-3.5 shrink-0' aria-hidden />
-            <span className='truncate'>In “{inTargets[0].label}”</span>
-          </Badge>
-        ) : (
-          <Badge variant='default' className='gap-1'>
-            <Plus className='size-3.5 shrink-0' aria-hidden />
-            Add to target
-          </Badge>
-        )}
-      </div>
+      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Bound → the "✓ In
+          <target>" badge; otherwise a quiet "Add to target" affordance. Both are
+          presentational — the card itself opens the modal, where the action
+          happens. Logged-out renders no footer: a pure click-target (§11.1). */}
+      {isAuthenticated && (
+        <div className='flex items-center gap-2 border-t border-border pt-3'>
+          {bound ? (
+            <Badge variant='brand' className='max-w-full gap-1'>
+              <Check className='size-3.5 shrink-0' aria-hidden />
+              <span className='truncate'>In “{inTargets[0].label}”</span>
+            </Badge>
+          ) : (
+            <Badge variant='default' className='gap-1'>
+              <Plus className='size-3.5 shrink-0' aria-hidden />
+              Add to target
+            </Badge>
+          )}
+        </div>
+      )}
     </article>
   );
 }
 
-export default function JobSearchExplorer() {
+export default function JobSearchExplorer({
+  isAuthenticated,
+}: {
+  /** From the page's server-side `getUser()` (#467 §10). Logged-out: fetch the
+   *  public BFF route, no membership, no per-card footer, and a soft signup
+   *  allusion in the detail. Authed: the full bind→unlock experience, unchanged. */
+  isAuthenticated: boolean;
+}) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+
+  // The search BFF differs by audience: the authed route proxies the caller's
+  // JWT (`/api/jobs/search`); the public route is the unauth, BFF-secret-gated,
+  // depth-capped forwarder (`/api/public/search`). Same response shape, so only
+  // the URL changes.
+  const searchEndpoint = isAuthenticated
+    ? '/api/jobs/search'
+    : '/api/public/search';
 
   // The URL is the SINGLE SOURCE OF TRUTH for the search state — query + filters
   // live in the querystring so back/forward and bookmarks restore an exact
@@ -448,35 +473,41 @@ export default function JobSearchExplorer() {
       });
       if (opts.location.trim()) sp.set('location', opts.location.trim());
       if (opts.days) sp.set('posted_within_days', opts.days);
-      const res = await fetch(`/api/jobs/search?${sp.toString()}`);
+      const res = await fetch(`${searchEndpoint}?${sp.toString()}`);
       if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
       return (await res.json()) as JobSearchResponse;
     },
-    []
+    [searchEndpoint]
   );
 
   // Fetch target-membership for a batch of results and merge it into the map
   // (#467 §11). Strictly best-effort: any failure (auth, network, non-OK) is
   // swallowed so the badge/modal simply fall back to "unbound" — search must
   // never depend on this. Runs after each page lands (page 0 + Load more).
-  const fetchMembership = useCallback(async (jobs: JobSearchResult[]) => {
-    const ids = jobs.map(j => j.id);
-    if (ids.length === 0) return;
-    try {
-      const res = await fetch('/api/jobs/target-membership', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_posting_ids: ids }),
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as TargetMembershipResponse;
-      if (data.memberships) {
-        setMembershipByJob(prev => ({ ...prev, ...data.memberships }));
+  const fetchMembership = useCallback(
+    async (jobs: JobSearchResult[]) => {
+      // Membership is a per-user concept — never fetched on the logged-out
+      // surface (no session, and the card/detail render no membership UI).
+      if (!isAuthenticated) return;
+      const ids = jobs.map(j => j.id);
+      if (ids.length === 0) return;
+      try {
+        const res = await fetch('/api/jobs/target-membership', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_posting_ids: ids }),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as TargetMembershipResponse;
+        if (data.memberships) {
+          setMembershipByJob(prev => ({ ...prev, ...data.memberships }));
+        }
+      } catch {
+        // best-effort — leave the map as-is
       }
-    } catch {
-      // best-effort — leave the map as-is
-    }
-  }, []);
+    },
+    [isAuthenticated]
+  );
 
   // Run the search whenever the URL search-state changes: initial mount, a
   // submit/filter change (which commits to the URL), or back/forward. This is
@@ -579,14 +610,24 @@ export default function JobSearchExplorer() {
         <Heading variant='hero' as='h1'>
           Search jobs
         </Heading>
-        <Text variant='body' className='mt-1 text-text-secondary'>
-          Browse the full job pool by keyword. These results aren’t scored
-          against your profile — head to{' '}
-          <Link href='/jobs' className='underline underline-offset-2'>
-            Jobs
-          </Link>{' '}
-          to see how you match.
-        </Text>
+        {/* Sub-copy differs by audience. Authed is UNCHANGED (steers to Jobs for
+            the AI match); logged-out is the honest "no account needed" framing —
+            the conversion moment is deferred to the detail's soft allusion. */}
+        {isAuthenticated ? (
+          <Text variant='body' className='mt-1 text-text-secondary'>
+            Browse the full job pool by keyword. These results aren’t scored
+            against your profile — head to{' '}
+            <Link href='/jobs' className='underline underline-offset-2'>
+              Jobs
+            </Link>{' '}
+            to see how you match.
+          </Text>
+        ) : (
+          <Text variant='body' className='mt-1 text-text-secondary'>
+            Browse the full job pool by keyword — no account needed. Open any
+            role for the details and a link to the original posting.
+          </Text>
+        )}
       </div>
 
       <div className='space-y-2'>
@@ -690,6 +731,7 @@ export default function JobSearchExplorer() {
                     key={job.id}
                     job={job}
                     inTargets={membershipByJob[job.id] ?? []}
+                    isAuthenticated={isAuthenticated}
                     onOpen={() => setSelectedJob(job)}
                   />
                 ))}
@@ -719,6 +761,7 @@ export default function JobSearchExplorer() {
         <JobDetailModal
           job={selectedJob}
           inTargets={membershipByJob[selectedJob.id] ?? []}
+          isAuthenticated={isAuthenticated}
           targetsSource={targetsSource}
           onAddedToTarget={t =>
             setMembershipByJob(prev => {
