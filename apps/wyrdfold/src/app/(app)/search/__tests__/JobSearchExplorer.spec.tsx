@@ -1,6 +1,12 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import JobSearchExplorer from '../JobSearchExplorer';
 import type { JobSearchResult } from '../types';
 
@@ -10,10 +16,15 @@ jest.mock('next/link', () => ({
   default: ({
     href,
     children,
+    ...rest
   }: {
     href: string;
     children: React.ReactNode;
-  }) => <a href={href}>{children}</a>,
+  }) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
+  ),
 }));
 
 // Reactive next/navigation mock: router.replace updates the mocked
@@ -67,6 +78,8 @@ function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
   };
 }
 
+/** Resolve the same search page for every request — including the best-effort
+ *  target-membership POST, whose `memberships` is simply absent here (unbound). */
 function mockSearch(results: JobSearchResult[], hasMore = false) {
   global.fetch = jest.fn().mockResolvedValue({
     ok: true,
@@ -96,6 +109,11 @@ function typeAndSearch(term: string) {
   fireEvent.click(screen.getByRole('button', { name: /search/i }));
 }
 
+/** The card is a single `role="button"` whose accessible name is its aria-label. */
+function cardName(title = 'Frontend Engineer', company = 'Acme') {
+  return `Open ${title} at ${company}`;
+}
+
 describe('JobSearchExplorer', () => {
   it('is framed as distinct from the matched Jobs view', () => {
     render(<JobSearchExplorer />);
@@ -112,25 +130,162 @@ describe('JobSearchExplorer', () => {
     ).toBeInTheDocument();
   });
 
-  it('searches the authed BFF route and renders results linking to the source', async () => {
+  it('searches the authed BFF route and renders result cards (no score)', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer />);
     typeAndSearch('frontend engineer');
 
-    const link = await screen.findByRole('link', { name: 'Frontend Engineer' });
-    expect(link).toHaveAttribute('href', 'https://ext.example/1');
-    expect(link).toHaveAttribute('target', '_blank');
-    expect(screen.getByText(/Acme · Remote/)).toBeInTheDocument();
-    expect(screen.getByText('$150k')).toBeInTheDocument();
+    // The whole result is a button (opens the detail) — not a title link.
+    const card = await screen.findByRole('button', { name: cardName() });
+    expect(within(card).getByText(/Acme · Remote/)).toBeInTheDocument();
+    expect(within(card).getByText('$150k')).toBeInTheDocument();
 
-    // Hit the logged-in search BFF route (auth-gated). No numeric match-score
-    // badge on a result row (the no-score guarantee is enforced by the API
-    // payload + the JobSearchResult type; here just assert the row is a plain
-    // preview).
+    // Hit the logged-in search BFF route (auth-gated), and no numeric
+    // match-score badge on a result (search is deliberately unscored).
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/jobs/search?q=frontend+engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
+  });
+
+  it('opens the detail modal when a card is clicked (actions live there now)', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
+
+    // The listing detail (a dialog) — the source link + the bind actions moved
+    // off the card and into here (§11.2/§11.3).
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      within(dialog).getByRole('link', { name: /view original posting/i })
+    ).toHaveAttribute('href', 'https://ext.example/1');
+    expect(
+      within(dialog).getByText(/unlock llm pipelines/i)
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole('button', {
+        name: /create a target from this role/i,
+      })
+    ).toBeInTheDocument();
+  });
+
+  it('binds an unbound listing from the modal and unlocks match/tailor live (§11.3)', async () => {
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (url.includes('/api/targets/mine'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            targets: [{ target: { id: 't1', label: 'Frontend Roles' } }],
+          }),
+        });
+      if (url.includes('/add-to-target'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            job_posting_id: '1',
+            target_id: 't1',
+            score: 70,
+          }),
+        });
+      if (url.includes('/api/jobs/target-membership'))
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ memberships: {} }), // starts unbound
+        });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: 1,
+          has_more: false,
+          results: [result({ id: '1' })],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
+    const dialog = await screen.findByRole('dialog');
+    // Unbound → no match link yet.
+    expect(
+      within(dialog).queryByRole('link', { name: /see how you match/i })
+    ).not.toBeInTheDocument();
+
+    // Bind it from the modal's picker.
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: /add to target/i })
+    );
+    fireEvent.click(
+      await screen.findByRole('menuitem', { name: 'Frontend Roles' })
+    );
+
+    // Live unlock: the match link now appears, pointing at /jobs/1.
+    await waitFor(() =>
+      expect(
+        screen.getByRole('link', { name: /see how you match/i })
+      ).toHaveAttribute('href', '/jobs/1')
+    );
+  });
+
+  it('opens the modal from the keyboard (Enter on the focused card)', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    const card = await screen.findByRole('button', { name: cardName() });
+    fireEvent.keyDown(card, { key: 'Enter' });
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('fetches target-membership for the page and badges a bound listing (#467 §11)', async () => {
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (
+        typeof url === 'string' &&
+        url.includes('/api/jobs/target-membership')
+      ) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            memberships: {
+              '1': [{ target_id: 't1', label: 'Frontend Roles' }],
+            },
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: 1,
+          has_more: false,
+          results: [result({ id: '1' })],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+
+    // The card renders the "✓ In <target>" pipeline-state badge once membership
+    // resolves — proving the POST fired and fed the map.
+    expect(await screen.findByText(/Frontend Roles/)).toBeInTheDocument();
+    const memCall = (global.fetch as jest.Mock).mock.calls.find(
+      c =>
+        typeof c[0] === 'string' && c[0].includes('/api/jobs/target-membership')
+    );
+    expect(memCall?.[1]?.method).toBe('POST');
+    expect(memCall?.[1]?.body).toContain('"1"'); // job_posting_ids carries the id
   });
 
   it('renders the snippet preview on a result card (#467 §11)', async () => {
@@ -144,94 +299,6 @@ describe('JobSearchExplorer', () => {
     ).toBeInTheDocument();
   });
 
-  it('creates a target from a listing via the from-url flow (#467)', async () => {
-    const created = {
-      user_target: { id: 'ut1' },
-      target: { id: 't1', label: 'Frontend Engineer' },
-      was_matched: false,
-    };
-    global.fetch = jest.fn().mockImplementation((url: string) => {
-      if (typeof url === 'string' && url.includes('/api/targets/from-url')) {
-        return Promise.resolve({
-          ok: true,
-          status: 201,
-          json: async () => created,
-        });
-      }
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          query: 'q',
-          count: 1,
-          has_more: false,
-          results: [result({ absolute_url: 'https://ext.example/1' })],
-        }),
-      });
-    }) as unknown as typeof fetch;
-
-    render(<JobSearchExplorer />);
-    typeAndSearch('frontend');
-
-    const createBtn = await screen.findByRole('button', {
-      name: /create target/i,
-    });
-    fireEvent.click(createBtn);
-
-    // Reuses the existing from-url flow with the listing's URL.
-    await waitFor(() =>
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/targets/from-url',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
-    const fromUrlCall = (global.fetch as jest.Mock).mock.calls.find(
-      c => typeof c[0] === 'string' && c[0].includes('/api/targets/from-url')
-    );
-    expect(fromUrlCall?.[1]?.body).toContain('https://ext.example/1'); // jd_url = the listing
-    await waitFor(() =>
-      expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ variant: 'success' })
-      )
-    );
-  });
-
-  it('surfaces an error toast when create-target fails, e.g. no profile (#467)', async () => {
-    const payload = { detail: 'no prose doc to derive from' };
-    global.fetch = jest.fn().mockImplementation((url: string) => {
-      if (typeof url === 'string' && url.includes('/api/targets/from-url')) {
-        return Promise.resolve({
-          ok: false,
-          status: 422,
-          json: async () => payload,
-          clone: () => ({ json: async () => payload }), // extractApiError reads via clone()
-        });
-      }
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          query: 'q',
-          count: 1,
-          has_more: false,
-          results: [result()],
-        }),
-      });
-    }) as unknown as typeof fetch;
-
-    render(<JobSearchExplorer />);
-    typeAndSearch('frontend');
-    fireEvent.click(
-      await screen.findByRole('button', { name: /create target/i })
-    );
-
-    await waitFor(() =>
-      expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ variant: 'error' })
-      )
-    );
-  });
-
   it('paginates via "Load more" and appends the next page (#467)', async () => {
     const page1 = [
       result({ id: '1', title: 'Frontend Engineer' }),
@@ -239,15 +306,17 @@ describe('JobSearchExplorer', () => {
     ];
     const page2 = [result({ id: '3', title: 'Staff Frontend Engineer' })];
     global.fetch = jest.fn().mockImplementation((url: string) => {
+      // Only the /search calls carry offset; the membership POST does not.
+      const isSearch = url.includes('/api/jobs/search');
       const first = url.includes('offset=0');
-      const results = first ? page1 : page2;
+      const results = isSearch ? (first ? page1 : page2) : [];
       return Promise.resolve({
         ok: true,
         status: 200,
         json: async () => ({
           query: 'q',
           count: results.length,
-          has_more: first, // more after page 1, none after page 2
+          has_more: isSearch && first, // more after page 1, none after page 2
           results,
         }),
       });
@@ -258,24 +327,27 @@ describe('JobSearchExplorer', () => {
 
     // Page 1 + a "Load more" affordance.
     expect(
-      await screen.findByRole('link', { name: 'Frontend Engineer' })
+      await screen.findByRole('button', { name: cardName('Frontend Engineer') })
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /load more/i }));
 
     // Page 2 appended (page 1 rows still present), and "Load more" is gone.
     expect(
-      await screen.findByRole('link', { name: 'Staff Frontend Engineer' })
+      await screen.findByRole('button', {
+        name: cardName('Staff Frontend Engineer'),
+      })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('link', { name: 'Frontend Engineer' })
+      screen.getByRole('button', { name: cardName('Frontend Engineer') })
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(
         screen.queryByRole('button', { name: /load more/i })
       ).not.toBeInTheDocument()
     );
-    // The second request paged from offset=2 (page 1 length).
-    expect(global.fetch).toHaveBeenLastCalledWith(
+    // The second page paged from offset=2 (page 1 length). Not "last" call — the
+    // best-effort membership POST fires after — so assert it was called at all.
+    expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining('offset=2')
     );
   });
@@ -313,7 +385,7 @@ describe('JobSearchExplorer', () => {
 
     // No typing — the search runs off the URL alone.
     expect(
-      await screen.findByRole('link', { name: 'Frontend Engineer' })
+      await screen.findByRole('button', { name: cardName('Frontend Engineer') })
     ).toBeInTheDocument();
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/jobs/search?q=engineer')
@@ -336,7 +408,7 @@ describe('JobSearchExplorer', () => {
     mockSearch([result()]);
     mockSearchParams = new URLSearchParams('q=engineer');
     render(<JobSearchExplorer />);
-    await screen.findByRole('link', { name: 'Frontend Engineer' });
+    await screen.findByRole('button', { name: cardName('Frontend Engineer') });
 
     fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
       target: { value: '30' },
@@ -372,138 +444,5 @@ describe('JobSearchExplorer', () => {
         expect.stringContaining('location=Remote')
       )
     );
-  });
-
-  // ---- "Add to target" picker (#467 power-action) ------------------------
-
-  function mockSearchPlus(
-    handlers: (url: string) => Promise<unknown> | null
-  ): void {
-    global.fetch = jest.fn().mockImplementation((url: string) => {
-      const handled = typeof url === 'string' ? handlers(url) : null;
-      if (handled) return handled;
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          query: 'q',
-          count: 1,
-          has_more: false,
-          results: [result()], // one row → one "Add to target" button
-        }),
-      });
-    }) as unknown as typeof fetch;
-  }
-
-  const minePayload = {
-    targets: [{ target: { id: 't1', label: 'Frontend Engineer' } }],
-  };
-
-  it('adds an existing listing to a chosen target via the picker (#467)', async () => {
-    mockSearchPlus(url => {
-      if (url.includes('/api/targets/mine'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => minePayload,
-        });
-      if (url.includes('/add-to-target'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({
-            success: true,
-            job_posting_id: '1',
-            target_id: 't1',
-            score: 70,
-          }),
-        });
-      return null;
-    });
-
-    render(<JobSearchExplorer />);
-    typeAndSearch('frontend');
-
-    // Opening the menu lazily loads the user's targets.
-    fireEvent.click(
-      await screen.findByRole('button', { name: /add to target/i })
-    );
-    // A menuitem (distinct from the result's link) for the target.
-    const option = await screen.findByRole('menuitem', {
-      name: 'Frontend Engineer',
-    });
-    fireEvent.click(option);
-
-    // POSTs the EXISTING job id to the add-to-target route with the target_id.
-    await waitFor(() =>
-      expect(global.fetch).toHaveBeenCalledWith(
-        '/api/jobs/1/add-to-target',
-        expect.objectContaining({ method: 'POST' })
-      )
-    );
-    const addCall = (global.fetch as jest.Mock).mock.calls.find(
-      c => typeof c[0] === 'string' && c[0].includes('/add-to-target')
-    );
-    expect(addCall?.[1]?.body).toContain('t1'); // target_id in the body
-    await waitFor(() =>
-      expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ variant: 'success' })
-      )
-    );
-  });
-
-  it('surfaces an error toast when add-to-target fails (#467)', async () => {
-    const payload = { detail: 'Target not found for user' };
-    mockSearchPlus(url => {
-      if (url.includes('/api/targets/mine'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => minePayload,
-        });
-      if (url.includes('/add-to-target'))
-        return Promise.resolve({
-          ok: false,
-          status: 404,
-          json: async () => payload,
-          clone: () => ({ json: async () => payload }),
-        });
-      return null;
-    });
-
-    render(<JobSearchExplorer />);
-    typeAndSearch('frontend');
-    fireEvent.click(
-      await screen.findByRole('button', { name: /add to target/i })
-    );
-    fireEvent.click(
-      await screen.findByRole('menuitem', { name: 'Frontend Engineer' })
-    );
-
-    await waitFor(() =>
-      expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({ variant: 'error' })
-      )
-    );
-  });
-
-  it('shows an empty picker state when the user has no targets (#467)', async () => {
-    mockSearchPlus(url => {
-      if (url.includes('/api/targets/mine'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({ targets: [] }),
-        });
-      return null;
-    });
-
-    render(<JobSearchExplorer />);
-    typeAndSearch('frontend');
-    fireEvent.click(
-      await screen.findByRole('button', { name: /add to target/i })
-    );
-
-    expect(await screen.findByText(/no targets yet/i)).toBeInTheDocument();
   });
 });

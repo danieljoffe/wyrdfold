@@ -24,3 +24,19 @@ export interface JobSearchResponse {
   has_more: boolean;
   results: JobSearchResult[];
 }
+
+/**
+ * A target a listing already belongs to — mirrors the API's `TargetRef` from
+ * `POST /jobs/target-membership`. Drives the card's pipeline-state badge and the
+ * detail modal's bound/unbound split (#467 §11).
+ */
+export interface TargetRef {
+  target_id: string;
+  label: string;
+}
+
+/** `job_posting_id` → the caller's targets that already contain it (absent key /
+ *  empty array = not in any of the caller's targets). */
+export interface TargetMembershipResponse {
+  memberships: Record<string, TargetRef[]>;
+}
