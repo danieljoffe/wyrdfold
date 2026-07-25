@@ -22,10 +22,9 @@ SECURITY POSTURE — mirrors the waitlist, the app's other public endpoint:
   - **Reads via the service-role client** (shared, non-user corpus). Results carry
     NO match score and NO JD body — a preview that links to the source posting;
     the full JD + "how you match" stay behind login.
-  - **Cached**: responses are fully anonymous and share the authed route's
-    ``job_list_cache`` (identical projection) — safe ONLY while the projection
-    stays audience-identical; a future public-only field must add an audience
-    dimension to the cache key.
+  - **Cached**: responses are fully anonymous. The public projection carries a
+    ``snippet`` the authed route doesn't, so it uses its OWN cache namespace
+    (``publicsearch:``) rather than sharing the authed ``jobsearch:`` entries.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from supabase import Client
 
 from app.cache import job_list_cache, make_cache_key
 from app.dependencies import get_supabase, require_bff_secret
-from app.models.job_search import JobSearchResponse
+from app.models.job_search import JobSearchResponse, JobSearchResult
 from app.rate_limit import limiter
 from app.services import job_search
 
@@ -58,9 +57,32 @@ router = APIRouter(
     dependencies=[Depends(require_bff_secret)],
 )
 
-# Shared with the authed ``job_search`` route — the projection is identical, so an
-# anonymous result is cacheable across both surfaces (see the docstring caveat).
-_CACHE_PREFIX = "jobsearch:"
+# Own cache namespace — the public projection carries a ``snippet`` the authed
+# route doesn't, so the two no longer share entries.
+_CACHE_PREFIX = "publicsearch:"
+
+
+def _search_with_snippets(
+    supabase: Client,
+    *,
+    q: str,
+    limit: int,
+    offset: int,
+    location: str | None,
+    posted_within_days: int | None,
+) -> tuple[list[JobSearchResult], bool]:
+    """``search_jobs`` + the public-only page snippet fetch, composed so both
+    blocking round-trips run in a single worker thread (off the event loop)."""
+    results, has_more = job_search.search_jobs(
+        supabase,
+        q=q,
+        limit=limit,
+        offset=offset,
+        location=location,
+        posted_within_days=posted_within_days,
+    )
+    job_search.attach_snippets(supabase, results)
+    return results, has_more
 
 
 @router.get("/public/search", response_model=JobSearchResponse)
@@ -111,9 +133,10 @@ async def public_search_endpoint(
     if cached is not None:
         return cast(JobSearchResponse, cached)
 
-    # supabase-py is blocking; offload the round-trip off the event loop (#107).
+    # supabase-py is blocking; offload both round-trips (search + the page snippet
+    # fetch) onto one worker thread off the event loop (#107).
     results, has_more = await asyncio.to_thread(
-        job_search.search_jobs,
+        _search_with_snippets,
         supabase,
         q=q,
         limit=page_size,

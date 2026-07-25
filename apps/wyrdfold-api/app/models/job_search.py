@@ -27,6 +27,11 @@ class JobSearchResult(BaseModel):
     absolute_url: str | None = None
     first_seen_at: datetime | None = None
     created_at: datetime | None = None
+    # A short PLAINTEXT preview (NOT the full JD body) — populated only for the
+    # PUBLIC surface, where a snippet helps a logged-out visitor judge the role.
+    # Left ``None`` on the authed surface, which spares its hot path the extra
+    # ``description_html`` read. Tag-stripped + truncated server-side.
+    snippet: str | None = None
 
 
 class JobSearchResponse(BaseModel):

@@ -66,6 +66,11 @@ def _stub_search(
         return (results if results is not None else [_result("a")], has_more)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake)
+    # No-op the snippet fetch so the cap / BFF / forwarding tests stay focused;
+    # the snippet path has its own tests below.
+    monkeypatch.setattr(
+        public_search.job_search, "attach_snippets", lambda sb, res, **kw: None
+    )
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
 
 
@@ -134,6 +139,41 @@ def test_forwards_query_and_filters_to_the_service(monkeypatch) -> None:
 def test_requires_a_query(monkeypatch) -> None:
     _stub_search(monkeypatch)
     assert TestClient(app).get("/public/search").status_code == 422  # q is required
+
+
+# ---- snippet (the public-only JD preview) ----------------------------------
+
+
+def test_populates_snippet_from_page_jd_html(monkeypatch) -> None:
+    """The public endpoint runs the real ``attach_snippets`` after ``search_jobs``:
+    a page-only ``description_html`` fetch, tag-stripped into a preview."""
+
+    def fake_search(supabase, *, q, limit, offset, location, posted_within_days):
+        return ([_result("a"), _result("b")], False)
+
+    monkeypatch.setattr(public_search.job_search, "search_jobs", fake_search)
+
+    # supabase whose jobs fetch returns description_html for the page ids only.
+    qb = MagicMock()
+    qb.select.return_value = qb
+    qb.in_.return_value = qb
+    qb.execute.return_value.data = [
+        {"id": "a", "description_html": "<p>Build <b>fast</b> UIs.</p>"},
+        {"id": "b", "description_html": ""},  # empty JD → no snippet
+    ]
+    sb = MagicMock()
+    sb.table.return_value = qb
+    app.dependency_overrides[get_supabase] = lambda: sb
+
+    r = TestClient(app).get("/public/search?q=frontend")
+    assert r.status_code == 200
+    rows = {row["id"]: row for row in r.json()["results"]}
+    assert rows["a"]["snippet"] == "Build fast UIs."  # tags stripped, ws collapsed
+    assert rows["b"]["snippet"] is None
+    # STILL no full JD body in the row — the snippet replaces it, never leaks it.
+    assert "description_html" not in rows["a"]
+    # Fetched only the page ids (bounded — no corpus-wide description read).
+    qb.in_.assert_called_once_with("id", ["a", "b"])
 
 
 # ---- BFF-only posture (the router carries require_bff_secret) ---------------
