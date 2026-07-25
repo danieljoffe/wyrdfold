@@ -292,4 +292,47 @@ describe('proxy middleware: public /search (auth-adaptive surface)', () => {
     const res = await proxy(new NextRequest('https://app.test/search-abuse'));
     expect(res.headers.get('location')).toContain('/login');
   });
+
+  // ---- Shareable listing URLs (#467 §11.2 fast-follow) --------------------
+  // The widened allowlist admits UUID-SHAPED `/search/<id>` paths only. These
+  // pin the shape gate shut: a valid-looking listing URL opens, every
+  // adversarial variant still bounces to /login.
+
+  const LISTING_ID = '123e4567-e89b-42d3-a456-426614174000';
+
+  it('serves /search/<uuid> (a shared listing link) to anonymous visitors', async () => {
+    const res = await proxy(
+      new NextRequest(`https://app.test/search/${LISTING_ID}`)
+    );
+    expect(res.headers.get('location')).toBeNull();
+    // ...and still ships the enforced CSP like every other route.
+    expect(res.headers.get(ENFORCED_HEADER)).toBeTruthy();
+  });
+
+  it('serves an UPPERCASE-uuid detail path too (ids are case-insensitively UUID-shaped)', async () => {
+    const res = await proxy(
+      new NextRequest(`https://app.test/search/${LISTING_ID.toUpperCase()}`)
+    );
+    expect(res.headers.get('location')).toBeNull();
+  });
+
+  it.each([
+    ['a junk segment', '/search/junk'],
+    ['uppercase junk', '/search/NOT-A-UUID-ATALL'],
+    ['a uuid with an extra segment', `/search/${LISTING_ID}/extra`],
+    ['an empty segment', '/search//'],
+    ['a trailing slash on a uuid', `/search/${LISTING_ID}/`],
+    ['a uuid one hex short', '/search/123e4567-e89b-42d3-a456-42661417400'],
+    [
+      'a uuid with a non-hex char',
+      '/search/123e4567-e89b-42d3-a456-42661417400g',
+    ],
+    ['a lookalike prefix carrying a uuid', `/searchx/${LISTING_ID}`],
+  ])(
+    'still redirects %s (%s) to /login — the hole is exactly UUID-shaped',
+    async (_label, path) => {
+      const res = await proxy(new NextRequest(`https://app.test${path}`));
+      expect(res.headers.get('location')).toContain('/login');
+    }
+  );
 });

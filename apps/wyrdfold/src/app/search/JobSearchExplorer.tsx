@@ -27,7 +27,6 @@ import { useToast } from '@/state/Toast/ToastProvider';
 // which stays in the authed `(app)` group — is imported by absolute alias
 // rather than the old `../targets` relative path.
 import { addJobToTarget } from '@/app/(app)/targets/targetFlows';
-import JobDetailModal from './JobDetailModal';
 import { emitSearchEvent } from './searchEvents';
 import type {
   JobSearchResponse,
@@ -35,6 +34,7 @@ import type {
   TargetMembershipResponse,
   TargetRef,
 } from './types';
+import type { TargetOption, TargetsSource } from './useTargetsSource';
 
 const PAGE_SIZE = 20;
 
@@ -46,22 +46,6 @@ const RECENCY_OPTIONS: SelectOption[] = [
   { value: '30', label: 'Past month' },
   { value: '90', label: 'Past 3 months' },
 ];
-
-/** Minimal projection of a user's target for the "Add to target" picker. */
-interface TargetOption {
-  id: string;
-  label: string;
-}
-
-/** Shared (fetch-once) state for the user's targets, threaded to every row's
- *  picker so 20 rows don't each refetch `/api/targets/mine`. Exported for
- *  {@link JobDetailModal}, which hosts the "Add to target" picker (#467 §11). */
-export interface TargetsSource {
-  targets: TargetOption[] | null;
-  loading: boolean;
-  error: string | null;
-  ensureLoaded: () => void;
-}
 
 /** Two-letter monogram from a company name. */
 function initials(name: string): string {
@@ -268,41 +252,42 @@ export function AddToTargetMenu({
  * your matches" stays the reason to use Jobs.
  *
  * The WHOLE card is the click target → the listing detail (§11.1): no per-card
- * external link, no per-card conversion hook (browse-first). The bind/create
- * power-actions moved into {@link JobDetailModal}. `role="button"` + Enter/Space
- * keeps it keyboard-operable without nesting an interactive element (the footer
- * badge is presentational — clicking anywhere on the card opens the modal).
+ * external link, no per-card conversion hook (browse-first). Since the detail
+ * became URL-addressable (§11.2 fast-follow) the card is a REAL `<Link>` to
+ * `/search/<id>`: a soft navigation the `@modal/(.)[id]` interception renders
+ * as the modal over this grid, while copy-link / middle-click / a hard load
+ * get the full page. Keyboard + role semantics come free with the anchor (the
+ * footer badge is presentational — clicking anywhere on the card navigates).
+ * `scroll={false}` keeps the grid's scroll position under the modal.
  */
 function JobSearchCard({
   job,
   inTargets,
   isAuthenticated,
-  onOpen,
 }: {
   job: JobSearchResult;
   inTargets: TargetRef[];
   /** Logged-out cards are a PURE click-target — no pipeline-state / add footer
    *  (#467 §11.1). The soft signup allusion lives only in the detail (§11.5). */
   isAuthenticated: boolean;
-  onOpen: () => void;
 }) {
   const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
   const bound = inTargets.length > 0;
 
-  const onKeyDown = (e: ReactKeyboardEvent) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault(); // Space would otherwise scroll the page
-      onOpen();
-    }
-  };
-
   return (
-    <article
-      role='button'
-      tabIndex={0}
+    <Link
+      href={`/search/${job.id}`}
+      scroll={false}
       aria-label={`Open ${job.title} at ${job.company_name}`}
-      onClick={onOpen}
-      onKeyDown={onKeyDown}
+      onClick={() => {
+        // Funnel tick (§10 PR6) — fire-and-forget (keepalive), never blocks
+        // or delays the navigation into the detail.
+        emitSearchEvent({
+          event_type: 'card_open',
+          surface: isAuthenticated ? 'authed' : 'public',
+          job_posting_id: job.id,
+        });
+      }}
       className='group flex cursor-pointer flex-col gap-3 rounded-lg border border-border bg-surface-elevated p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 motion-reduce:transform-none motion-reduce:transition-none'
     >
       {/* header: company avatar, then role over company · location */}
@@ -363,7 +348,7 @@ function JobSearchCard({
           )}
         </div>
       )}
-    </article>
+    </Link>
   );
 }
 
@@ -412,53 +397,6 @@ export default function JobSearchExplorer({
   const [membershipByJob, setMembershipByJob] = useState<
     Record<string, TargetRef[]>
   >({});
-
-  // The listing whose detail modal is open (null = closed). The whole card opens
-  // it; the modal hosts the bind / create / match / tailor actions (§11.2/§11.3).
-  const [selectedJob, setSelectedJob] = useState<JobSearchResult | null>(null);
-
-  // The user's targets for every row's "Add to target" picker — fetched ONCE,
-  // lazily, the first time any menu opens. ``targetsRequested`` stops the N
-  // rows from each kicking a fetch; it resets on failure so a later open retries.
-  const [targets, setTargets] = useState<TargetOption[] | null>(null);
-  const [targetsLoading, setTargetsLoading] = useState(false);
-  const [targetsError, setTargetsError] = useState<string | null>(null);
-  const targetsRequested = useRef(false);
-
-  const ensureTargets = useCallback(() => {
-    if (targetsRequested.current) return;
-    targetsRequested.current = true;
-    setTargetsLoading(true);
-    setTargetsError(null);
-    void (async () => {
-      try {
-        const res = await fetch('/api/targets/mine');
-        if (!res.ok) {
-          throw new Error(await extractApiError(res, 'Failed to load targets'));
-        }
-        const data = (await res.json()) as {
-          targets: { target: { id: string; label: string } }[];
-        };
-        setTargets(
-          data.targets.map(t => ({ id: t.target.id, label: t.target.label }))
-        );
-      } catch (e) {
-        targetsRequested.current = false; // allow a retry on the next open
-        setTargetsError(
-          e instanceof Error ? e.message : 'Failed to load targets.'
-        );
-      } finally {
-        setTargetsLoading(false);
-      }
-    })();
-  }, []);
-
-  const targetsSource: TargetsSource = {
-    targets,
-    loading: targetsLoading,
-    error: targetsError,
-    ensureLoaded: ensureTargets,
-  };
 
   const fetchPage = useCallback(
     async (opts: {
@@ -733,16 +671,6 @@ export default function JobSearchExplorer({
                     job={job}
                     inTargets={membershipByJob[job.id] ?? []}
                     isAuthenticated={isAuthenticated}
-                    onOpen={() => {
-                      setSelectedJob(job);
-                      // Funnel tick (§10 PR6) — fire-and-forget, never
-                      // blocks the modal open.
-                      emitSearchEvent({
-                        event_type: 'card_open',
-                        surface: isAuthenticated ? 'authed' : 'public',
-                        job_posting_id: job.id,
-                      });
-                    }}
                   />
                 ))}
               </div>
@@ -764,26 +692,11 @@ export default function JobSearchExplorer({
         </section>
       )}
 
-      {/* The listing detail (#467 §11.2). One instance, driven by `selectedJob`;
-          `inTargets` decides the bound/unbound actions. Focus returns to the
-          opening card on close (shared-ui Modal restores the prior activeElement). */}
-      {selectedJob && (
-        <JobDetailModal
-          job={selectedJob}
-          inTargets={membershipByJob[selectedJob.id] ?? []}
-          isAuthenticated={isAuthenticated}
-          targetsSource={targetsSource}
-          onAddedToTarget={t =>
-            setMembershipByJob(prev => {
-              const cur = prev[selectedJob.id] ?? [];
-              // Dedup — a second add of the same target is a no-op for the badge.
-              if (cur.some(x => x.target_id === t.target_id)) return prev;
-              return { ...prev, [selectedJob.id]: [...cur, t] };
-            })
-          }
-          onClose={() => setSelectedJob(null)}
-        />
-      )}
+      {/* The listing detail itself no longer renders here (#467 §11.2
+          fast-follow): a card click soft-navigates to `/search/<id>`, and the
+          layout's `@modal` slot renders the intercepted detail OVER this grid
+          (which stays mounted — state, scroll and all). ListingModal owns the
+          fetch, membership and the bind→unlock live flip. */}
     </div>
   );
 }
