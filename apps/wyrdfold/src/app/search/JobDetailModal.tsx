@@ -23,6 +23,7 @@ import {
   CompanyAvatar,
   type TargetsSource,
 } from './JobSearchExplorer';
+import { emitSearchEvent } from './searchEvents';
 import type { JobSearchResult, TargetRef } from './types';
 
 interface JobDetailModalProps {
@@ -187,6 +188,16 @@ export default function JobDetailModal({
             </Text>
             <Link
               href='/login'
+              onClick={() => {
+                // The public funnel's conversion tick (§10 PR6):
+                // fire-and-forget with keepalive, so it survives the
+                // navigation and can never delay it.
+                emitSearchEvent({
+                  event_type: 'signup_click',
+                  surface: 'public',
+                  job_posting_id: job.id,
+                });
+              }}
               className='mt-1 inline-flex items-center gap-1 self-start text-sm font-semibold text-text-brand underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
             >
               Sign up free

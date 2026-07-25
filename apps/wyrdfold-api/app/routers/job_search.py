@@ -31,7 +31,7 @@ from app.cache import job_list_cache, make_cache_key
 from app.dependencies import get_supabase, verify_api_key_or_jwt
 from app.models.job_search import JobSearchResponse
 from app.rate_limit import limiter
-from app.services import job_search
+from app.services import job_search, search_events
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +76,25 @@ async def search_jobs_endpoint(
         location=(location or "").strip().lower(),
         posted_within_days=posted_within_days or 0,
     )
+    def _instrument(resp: JobSearchResponse) -> None:
+        # Fire-and-forget funnel metrics (#467 §10 PR6): O(1) in-memory
+        # enqueue, flushed in bulk by a background task — never a request
+        # round-trip. Cache hits count too (still a user search).
+        search_events.record_search(
+            surface="authed",
+            q=q,
+            result_count=resp.count,
+            has_more=resp.has_more,
+            offset=offset,
+            location=location,
+            posted_within_days=posted_within_days,
+        )
+
     cached = job_list_cache.get(cache_key)
     if cached is not None:
-        return cast(JobSearchResponse, cached)
+        response = cast(JobSearchResponse, cached)
+        _instrument(response)
+        return response
 
     # supabase-py is blocking; offload the round-trip off the event loop.
     # search + the page snippet (both blocking round-trips in one worker thread).
@@ -96,4 +112,5 @@ async def search_jobs_endpoint(
         query=q, count=len(results), has_more=has_more, results=results
     )
     job_list_cache.set(cache_key, response)
+    _instrument(response)
     return response

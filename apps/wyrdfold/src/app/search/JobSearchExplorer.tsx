@@ -28,6 +28,7 @@ import { useToast } from '@/state/Toast/ToastProvider';
 // rather than the old `../targets` relative path.
 import { addJobToTarget } from '@/app/(app)/targets/targetFlows';
 import JobDetailModal from './JobDetailModal';
+import { emitSearchEvent } from './searchEvents';
 import type {
   JobSearchResponse,
   JobSearchResult,
@@ -732,7 +733,16 @@ export default function JobSearchExplorer({
                     job={job}
                     inTargets={membershipByJob[job.id] ?? []}
                     isAuthenticated={isAuthenticated}
-                    onOpen={() => setSelectedJob(job)}
+                    onOpen={() => {
+                      setSelectedJob(job);
+                      // Funnel tick (§10 PR6) — fire-and-forget, never
+                      // blocks the modal open.
+                      emitSearchEvent({
+                        event_type: 'card_open',
+                        surface: isAuthenticated ? 'authed' : 'public',
+                        job_posting_id: job.id,
+                      });
+                    }}
                   />
                 ))}
               </div>
