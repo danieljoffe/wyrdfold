@@ -62,6 +62,7 @@ function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
     absolute_url: 'https://ext.example/1',
     first_seen_at: null,
     created_at: null,
+    snippet: null,
     ...overrides,
   };
 }
@@ -130,6 +131,17 @@ describe('JobSearchExplorer', () => {
       expect.stringContaining('/api/jobs/search?q=frontend+engineer')
     );
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
+  });
+
+  it('renders the snippet preview on a result card (#467 §11)', async () => {
+    mockSearch([
+      result({ snippet: 'Build fast, accessible UIs for millions.' }),
+    ]);
+    render(<JobSearchExplorer />);
+    typeAndSearch('frontend');
+    expect(
+      await screen.findByText('Build fast, accessible UIs for millions.')
+    ).toBeInTheDocument();
   });
 
   it('creates a target from a listing via the from-url flow (#467)', async () => {
