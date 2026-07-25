@@ -3,7 +3,7 @@ import '@testing-library/jest-dom';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import JobDetailModal from '../JobDetailModal';
 import type { JobSearchResult, TargetRef } from '../types';
-import type { TargetsSource } from '../JobSearchExplorer';
+import type { TargetsSource } from '../useTargetsSource';
 
 // next/link needs the app-router context; stub to a plain anchor (LinkButton —
 // the match/tailor CTAs — renders through next/link).

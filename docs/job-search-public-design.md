@@ -283,6 +283,10 @@ mockup (browse-first, bind→unlock).
 - Opens **over the grid** (keeps browse context). Target: a Next **intercepting route**
   so `/search/[id]` is shareable / deep-linkable and renders as a full page on a direct
   hit. **V1 ships a plain client modal; the URL/intercepting-route is a fast-follow.**
+  **[SHIPPED — fast-follow landed]:** the detail is now URL-addressable — cards link to
+  `/search/<id>`, a soft nav intercepts into the modal (`@modal/(.)[id]`), a hard load
+  renders the standalone page (`GET /public/listings/{id}` behind the BFF; middleware
+  allowlists UUID-shaped `/search/<id>` only; noindex per §10).
 - **Header:** monogram · role title · `Company · Location`, then **"View original
   posting ↗" as a link on its own line** (both audiences). The full JD lives at the
   source — we preview, we don't republish.

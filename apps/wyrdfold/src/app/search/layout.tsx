@@ -17,6 +17,13 @@ import PublicSearchHeader from './PublicSearchHeader';
  *    logged-out visitor reaches this page instead of being bounced to `/login`.
  *    Every OTHER `(app)/*` route stays gated.
  *
+ * `modal` is the `@modal` parallel slot (#467 §11.2 fast-follow): a soft
+ * navigation to `/search/[id]` renders the intercepted listing detail there,
+ * OVER the still-mounted grid; on `/search` itself (and on any hard load,
+ * where interception doesn't apply) the slot resolves to its null `default`.
+ * Rendered in BOTH auth branches — the shareable detail exists for both
+ * audiences.
+ *
  * `getOptionalUser()` is `cache()`-wrapped, so this layout and the page share a
  * single `auth.getUser()` verification for the request (the page reads it too,
  * to thread `isAuthenticated` into the rendering). It never throws — a failure
@@ -24,13 +31,20 @@ import PublicSearchHeader from './PublicSearchHeader';
  */
 export default async function SearchLayout({
   children,
+  modal,
 }: {
   children: ReactNode;
+  modal: ReactNode;
 }) {
   const user = await getOptionalUser();
 
   if (user) {
-    return <AppShell>{children}</AppShell>;
+    return (
+      <AppShell>
+        {children}
+        {modal}
+      </AppShell>
+    );
   }
 
   return (
@@ -42,6 +56,7 @@ export default async function SearchLayout({
       >
         {children}
       </main>
+      {modal}
     </div>
   );
 }

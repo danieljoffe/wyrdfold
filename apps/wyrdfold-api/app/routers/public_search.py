@@ -32,13 +32,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import cast
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from supabase import Client
 
 from app.cache import job_list_cache, make_cache_key
 from app.dependencies import get_supabase, require_bff_secret
-from app.models.job_search import JobSearchResponse
+from app.models.job_search import JobSearchResponse, JobSearchResult
 from app.rate_limit import limiter
 from app.services import job_search, search_events
 
@@ -61,6 +62,10 @@ router = APIRouter(
 # holds entries separate from the authed route even though the projection (now
 # with ``snippet`` on both) matches. Search + snippets is the shared service helper.
 _CACHE_PREFIX = "publicsearch:"
+
+# Single-listing cache namespace (#467 §11.2 fast-follow) — shared TTL cache,
+# distinct prefix so listing entries never collide with search pages.
+_LISTING_CACHE_PREFIX = "publiclisting:"
 
 
 @router.get("/public/search", response_model=JobSearchResponse)
@@ -144,3 +149,38 @@ async def public_search_endpoint(
     job_list_cache.set(cache_key, response)
     _instrument(response)
     return response
+
+
+@router.get("/public/listings/{listing_id}", response_model=JobSearchResult)
+@limiter.limit("30/minute;300/hour")
+async def public_listing_endpoint(
+    request: Request,
+    listing_id: UUID,
+    supabase: Client = Depends(get_supabase),
+) -> JobSearchResult:
+    """One public listing by id — the shareable `/search/<id>` URL's data read
+    (#467 §11.2 fast-follow).
+
+    Same posture as ``/public/search`` (router-level BFF gate, per-IP limit,
+    service-role read of the shared corpus) and the SAME preview projection: no
+    match score, no JD body — snippet + source link only. ``listing_id`` is a
+    typed UUID, so junk ids 422 at the edge without touching the service.
+
+    404s never leak existence: a missing id and a no-longer-eligible row
+    (archived / purged / non-US) are indistinguishable (the service returns
+    ``None`` for both). NO search_events row is recorded here — opening a
+    shared link is not a search, and the ``card_open`` funnel tick stays a
+    client-side beacon. ``request`` is required by slowapi.
+    """
+    cache_key = make_cache_key(_LISTING_CACHE_PREFIX, listing_id=str(listing_id))
+    cached = job_list_cache.get(cache_key)
+    if cached is not None:
+        return cast(JobSearchResult, cached)
+
+    # supabase-py is blocking; offload both round-trips (row + snippet) onto one
+    # worker thread off the event loop (#107).
+    result = await asyncio.to_thread(job_search.get_listing, supabase, str(listing_id))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    job_list_cache.set(cache_key, result)
+    return result
