@@ -230,7 +230,7 @@ function AddToTargetMenu({
  * profile), so search is never mistaken for the quality of the matching engine —
  * and "see your matches" stays the reason to use Jobs. Logged-in only.
  */
-function JobSearchRow({
+function JobSearchCard({
   job,
   targetsSource,
 }: {
@@ -275,64 +275,73 @@ function JobSearchRow({
   };
 
   return (
-    <li className='p-3 transition-colors hover:bg-surface-tertiary/60 motion-reduce:transition-none'>
+    <article className='flex flex-col gap-3 rounded-lg border border-border bg-surface-elevated p-4 shadow-sm transition-shadow hover:shadow-md motion-reduce:transition-none'>
+      {/* header: company avatar, then role over company · location */}
       <div className='flex items-start gap-3'>
         <CompanyAvatar name={job.company_name} />
         <div className='min-w-0 flex-1'>
-          {/* Line 1: role + salary */}
-          <div className='flex items-start justify-between gap-3'>
-            {job.absolute_url ? (
-              <a
-                href={job.absolute_url}
-                target='_blank'
-                rel='noopener noreferrer'
-                className='font-medium underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
-              >
-                {job.title}
-              </a>
-            ) : (
-              <span className='font-medium'>{job.title}</span>
-            )}
-            {job.salary_text && (
-              <Text variant='meta' className='shrink-0 text-text-secondary'>
-                {job.salary_text}
-              </Text>
-            )}
-          </div>
-          {/* Line 2: company · location + posted date */}
-          <div className='mt-0.5 flex items-baseline justify-between gap-3'>
-            {meta && (
-              <Text variant='meta' className='truncate text-text-secondary'>
-                {meta}
-              </Text>
-            )}
-            <Text variant='meta' className='shrink-0 text-text-tertiary'>
-              {timeAgo(job.created_at)}
+          {job.absolute_url ? (
+            <a
+              href={job.absolute_url}
+              target='_blank'
+              rel='noopener noreferrer'
+              className='font-semibold underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
+            >
+              {job.title}
+            </a>
+          ) : (
+            <span className='font-semibold'>{job.title}</span>
+          )}
+          {meta && (
+            <Text
+              variant='meta'
+              className='mt-0.5 block truncate text-text-secondary'
+            >
+              {meta}
             </Text>
-          </div>
-          {/* Actions live BELOW the listing info (not beside it) so the info
-              reads as one unit when skimming — avoids the awkward right-edge
-              break against the salary/date. "Create target" derives a new
-              target from this listing's URL; "Add to target" scores it against
-              one you already have. */}
-          <div className='mt-2 flex flex-wrap items-center gap-2'>
-            {job.absolute_url && (
-              <Button
-                name='search-create-target'
-                variant='secondary'
-                size='sm'
-                onClick={createTarget}
-                disabled={creating}
-                aria-busy={creating}
-              >
-                {creating ? 'Creating…' : 'Create target'}
-              </Button>
-            )}
-            <AddToTargetMenu jobId={job.id} source={targetsSource} />
-          </div>
+          )}
         </div>
       </div>
-    </li>
+      {/* snippet — the triage payload (2-line clamp) */}
+      {job.snippet && (
+        <Text variant='meta' className='line-clamp-2 text-text-secondary'>
+          {job.snippet}
+        </Text>
+      )}
+      {/* meta row: salary + posted, pinned to the bottom so cards line up */}
+      <div className='mt-auto flex items-baseline justify-between gap-3'>
+        <Text
+          variant='meta'
+          className={
+            job.salary_text
+              ? 'font-medium text-text-primary'
+              : 'text-text-tertiary'
+          }
+        >
+          {job.salary_text || 'Salary not listed'}
+        </Text>
+        <Text variant='meta' className='shrink-0 text-text-tertiary'>
+          {timeAgo(job.created_at)}
+        </Text>
+      </div>
+      {/* actions. "Create target" derives a new target from this listing's URL;
+          "Add to target" scores it against one you already have. */}
+      <div className='flex flex-wrap items-center gap-2 border-t border-border pt-3'>
+        {job.absolute_url && (
+          <Button
+            name='search-create-target'
+            variant='secondary'
+            size='sm'
+            onClick={createTarget}
+            disabled={creating}
+            aria-busy={creating}
+          >
+            {creating ? 'Creating…' : 'Create target'}
+          </Button>
+        )}
+        <AddToTargetMenu jobId={job.id} source={targetsSource} />
+      </div>
+    </article>
   );
 }
 
@@ -625,15 +634,15 @@ export default function JobSearchExplorer() {
             </div>
           ) : (
             <>
-              <ul className='divide-y divide-border overflow-hidden rounded-md border border-border'>
+              <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
                 {results.map(job => (
-                  <JobSearchRow
+                  <JobSearchCard
                     key={job.id}
                     job={job}
                     targetsSource={targetsSource}
                   />
                 ))}
-              </ul>
+              </div>
               {hasMore && (
                 <div className='mt-4 flex justify-center'>
                   <Button

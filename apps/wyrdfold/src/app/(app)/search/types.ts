@@ -13,6 +13,9 @@ export interface JobSearchResult {
   absolute_url: string | null;
   first_seen_at: string | null;
   created_at: string | null;
+  // Short plaintext preview (tag-stripped, truncated server-side) — the triage
+  // payload for the card grid (#467 §11). Null when the JD has no usable text.
+  snippet: string | null;
 }
 
 export interface JobSearchResponse {
