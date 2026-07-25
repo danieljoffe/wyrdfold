@@ -253,3 +253,105 @@ _Critical files:_ `app/routers/waitlist.py` (clone target), `app/services/job_se
 (reuse), `app/rate_limit.py` + `app/dependencies.py::require_bff_secret` (posture),
 `src/proxy.ts` (allowlist linchpin), `src/app/(app)/search/JobSearchExplorer.tsx`
 (refactor), `src/app/api/waitlist/route.ts` (public BFF precedent).
+
+---
+
+## 11. Search UX redesign — card grid + contextual detail (PR5 line)
+
+**Settled 2026-07-25, mockup-driven (iterated with Daniel).** Supersedes the row-list
+result layout. Applies to **both** audiences; the differences live in the per-card footer
+and the detail. The guiding prototype is the iterated card-grid + contextual-detail
+mockup (browse-first, bind→unlock).
+
+### 11.1 Card grid (replaces the row-list)
+
+- **3-col responsive grid** (→ 2 tablet → 1 mobile).
+- Card = company monogram (per-company hue; real logos via **#470**) · role title ·
+  `Company · Location` · 2-line snippet · salary (or "Salary not listed") · posted.
+- **The whole card is the click target → the listing detail.** No per-card external
+  link and **no per-card conversion hook** — browse-first (the earlier per-card
+  "See how you match" was removed as too aggressive; it fought the "let them poke
+  around before committing" on-ramp).
+- **Logged-in footer** (per card): a quick **Add to target** (free, feedback-like) —
+  OR a **pipeline-state badge** `✓ In "<target>"` when the listing is already in one of
+  the user's targets. _(Quick-add: always-visible in the mock; hover-reveal is a
+  candidate to keep the resting grid calmer — TBD on feel.)_
+- **Logged-out**: no footer; the card is purely a click-target.
+
+### 11.2 The listing detail (modal with a real URL)
+
+- Opens **over the grid** (keeps browse context). Target: a Next **intercepting route**
+  so `/search/[id]` is shareable / deep-linkable and renders as a full page on a direct
+  hit. **V1 ships a plain client modal; the URL/intercepting-route is a fast-follow.**
+- **Header:** monogram · role title · `Company · Location`, then **"View original
+  posting ↗" as a link on its own line** (both audiences). The full JD lives at the
+  source — we preview, we don't republish.
+- **Body:** chips (salary / posted / location) + the snippet.
+- **Actions — contextual on target-membership** (§11.3).
+- Dismiss: ✕, click-outside, Esc; focus returns to the card.
+
+### 11.3 The target-bind model (the crux)
+
+The LLM actions are **target-level, not listing-level** — you don't match or tailor a
+bare listing, you match/tailor a _listing-in-a-target_. So the detail's actions are a
+**sequence**, gated on whether the listing is bound:
+
+- **Unbound listing → only the two BIND actions:**
+  - **Add to a target** (primary, free) — files the listing against an existing target;
+    **acts as positive feedback** (scores it + sharpens how that target scores). Same
+    effect path as user feedback.
+  - **Create a target from this role** — background **from-url** derivation; returns
+    immediately, **toasts on completion**, the listing lands in the new target's
+    listings. Uses AI credits.
+  - One-liner: _"Add to a target to unlock LLM pipelines."_ **[COPY-TBD:** "LLM
+    pipelines" reads as internal jargon to a job-seeker; candidate softer wording
+    "unlock AI matching & tailoring".**]**
+  - Match/tailor are **not shown** — nothing to score against yet.
+- **Bound listing (already in a target) → the LLM actions UNLOCK:**
+  - **See how you match** (primary) — score this role **against the target it's in**;
+    returns fit + matched skills + gaps. (Answers "how will we know?" — we score against
+    that target.) Uses credits.
+  - **Tailor a résumé for "<target>"** — tailoring scoped to the target (avoids the
+    drift a bare-listing tailor would cause). Uses credits.
+  - **Add to another target** (free).
+  - Shows the state `✓ In "<target>"`.
+
+### 11.4 Credit rules
+
+- **Browsing is always free** — search, the grid, the detail's info + source link. No
+  credits, no gate, for everyone.
+- **LLM actions are credit-gated** — match, tailor, create-target. Surface the cost + the
+  balance.
+- **Out of credits ≠ a wall** — a top-up nudge; search + add-to-target keep working (the
+  out-of-credits manual fallback the epic wanted). Never block browsing.
+- **Add-to-target is free** (feedback path, not LLM).
+
+### 11.5 Funnel (logged-out)
+
+Browse-first, no per-card pressure. Logged-out card = clean click-target → detail. The
+detail carries the info + source link + a **soft, non-blocking allusion** ("there's more
+when you're signed in — members see how they match + tailor a résumé; sign up free").
+One calm conversion moment, in the detail, never on the grid. A quiet "Sign up" in the
+header; no persistent banner.
+
+### 11.6 Build slices
+
+1. **Card grid** — replace `JobSearchExplorer`'s row-list with the 3-col card grid;
+   logged-in footer (add-to-target + pipeline-state); wire add-to-target (exists).
+2. **Contextual detail** — the listing detail (plain modal first; URL fast-follow);
+   header source link; unbound (add/create-target — both exist) vs bound (match/tailor).
+3. **Backend — match a search listing vs a target** — score a specific posting against
+   one of the caller's targets; return fit / matched keywords / gaps. Reuses the scoring
+   layer. LLM/embedding surface → grow the mock + regression tests.
+4. **Backend — tailor for a listing-in-target** — tailoring scoped to the target. LLM
+   surface → mock + tests.
+5. **Wire** the frontend match/tailor actions to (3) + (4).
+6. Public routing + logged-out rendering + instrumentation (§10's PR3–6) fold in behind.
+
+### 11.7 Open / TBD
+
+- Copy: "unlock LLM pipelines" wording (§11.3).
+- Detail as modal-with-URL (intercepting route) vs plain modal — start plain, add URL.
+- Quick-add always-visible vs hover-reveal — decide on feel.
+- Whether match/tailor need dedicated per-listing endpoints or can reuse the
+  target-scoring / tailoring paths with a listing argument — scope in slices 3–4.
