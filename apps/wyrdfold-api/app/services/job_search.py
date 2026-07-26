@@ -256,13 +256,30 @@ def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
     return result
 
 
+# A real tag shape (`<div …>`, `</p>`, `<!--`), NOT a stray "<" in prose like
+# "comp < $200k" — decides whether the second strip pass below is needed.
+_TAGGY_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
+
+
 def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | None:
     """Tag-strip + whitespace-collapse + truncate a JD's ``description_html`` into
     a short plaintext preview. ``None`` for empty/blank input; appends an ellipsis
-    when truncated."""
+    when truncated.
+
+    Defensive double-strip: some boards deliver the JD HTML-**escaped**
+    (Greenhouse's Job Board API — ingestion now unescapes at the source, see
+    ``services/greenhouse.py``), so rows ingested before that fix hold
+    ``&lt;div&gt;…`` — the first ``get_text`` pass *unescapes* those entities
+    into text that still LOOKS like markup (the 2026-07-26 tag-soup-on-cards
+    prod bug). When, and only when, the first pass leaves a real tag shape
+    behind, one bounded second pass strips it; plain prose containing a stray
+    ``<`` is left untouched.
+    """
     if not html:
         return None
     text = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ").split())
+    if text and _TAGGY_RE.search(text):
+        text = " ".join(BeautifulSoup(text, "html.parser").get_text(separator=" ").split())
     if not text:
         return None
     if len(text) <= max_len:

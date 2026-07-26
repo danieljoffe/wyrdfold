@@ -1,3 +1,4 @@
+import html
 import logging
 
 from app.http_client import FetchExhaustedError, request_with_retry
@@ -33,7 +34,13 @@ async def fetch_board_jobs(board_token: str) -> list[StandardJob]:
                 title=item.get("title", ""),
                 location_name=location.get("name") if location else None,
                 department=departments[0]["name"] if departments else None,
-                content=item.get("content", ""),
+                # The Job Board API delivers `content` HTML-ESCAPED
+                # (&lt;div&gt;…), unlike every other board source we ingest.
+                # Unescape here so `description_html` stores REAL markup —
+                # otherwise the snippet builder's tag-strip faithfully
+                # unescapes the entities into literal tag soup on the search
+                # cards (prod bug, 2026-07-26).
+                content=html.unescape(item.get("content", "")),
                 updated_at=item.get("updated_at", ""),
                 absolute_url=item.get("absolute_url", ""),
             )
