@@ -224,6 +224,7 @@ async def _run_scheduled_retention_purge() -> None:
             llm_costs_days=settings.llm_costs_retention_days,
             notifications_sent_days=settings.notifications_sent_retention_days,
             prescan_shadow_days=settings.prescan_shadow_retention_days,
+            search_events_days=settings.search_events_retention_days,
         )
         logger.info("scheduled retention purge: %s", report)
     except Exception:

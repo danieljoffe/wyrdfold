@@ -266,6 +266,10 @@ class Settings(BaseSettings):
     # (#60): explicitly TEMPORARY analysis data with no other lifecycle
     # (2026-07-02 audit). 30d covers an analysis window; 0 = keep forever.
     prescan_shadow_retention_days: int = Field(default=30, ge=0)
+    # search_events.occurred_at — the search-funnel metrics ledger (#467
+    # §10 PR6). `query` is user input, so bounded retention is part of the
+    # privacy posture; 90d covers funnel iteration. 0 = keep forever.
+    search_events_retention_days: int = Field(default=90, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)

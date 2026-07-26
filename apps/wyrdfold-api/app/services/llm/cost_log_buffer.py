@@ -57,14 +57,23 @@ _log = logging.getLogger(__name__)
 
 
 class CostLogBuffer:
+    """Buffered bulk-INSERT writer. Table-agnostic despite the name: the
+    concurrency/bounded-memory machinery is shared, so other append-only
+    ledgers (``search_events``) instantiate it with their own ``table`` +
+    ``label`` rather than forking ~300 lines of thread-safety code."""
+
     def __init__(
         self,
         *,
+        table: str = TABLE,
+        label: str = "cost-log",
         max_size: int = 100,
         flush_interval_s: float = 5.0,
         max_rows: int = 10_000,
         insert_batch_size: int = 500,
     ) -> None:
+        self._table = table
+        self._label = label
         self._max_size = max_size
         self._flush_interval_s = flush_interval_s
         # Hard capacity ceiling, independent of ``max_size`` (which only
@@ -124,9 +133,10 @@ class CostLogBuffer:
             full = len(self._rows) >= self._max_size
         if dropped_now:
             _log.error(
-                "cost-log buffer at capacity (max_rows=%d); dropped %d oldest "
+                "%s buffer at capacity (max_rows=%d); dropped %d oldest "
                 "row(s), %d total dropped this process. Supabase writes are "
                 "failing — check the DB and provider-side spend alerts.",
+                self._label,
                 self._max_rows,
                 dropped_now,
                 total_dropped,
@@ -170,8 +180,9 @@ class CostLogBuffer:
             total_dropped = self._dropped
         if dropped_now:
             _log.error(
-                "cost-log buffer at capacity (max_rows=%d) on re-queue; "
+                "%s buffer at capacity (max_rows=%d) on re-queue; "
                 "dropped %d oldest row(s), %d total dropped this process.",
+                self._label,
                 self._max_rows,
                 dropped_now,
                 total_dropped,
@@ -193,7 +204,7 @@ class CostLogBuffer:
             return 0
 
         def _insert(batch_rows: list[dict[str, Any]]) -> None:
-            supabase.table(TABLE).insert(batch_rows).execute()
+            supabase.table(self._table).insert(batch_rows).execute()
 
         written = 0
         batch = self._insert_batch_size
@@ -211,7 +222,8 @@ class CostLogBuffer:
                 remaining = rows[start:]
                 self._requeue(remaining)
                 _log.exception(
-                    "cost-log buffer flush failed after %d row(s); re-queued %d row(s)",
+                    "%s buffer flush failed after %d row(s); re-queued %d row(s)",
+                    self._label,
                     written,
                     len(remaining),
                 )

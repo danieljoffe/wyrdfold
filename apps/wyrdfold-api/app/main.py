@@ -35,6 +35,7 @@ from app.routers import (
     keys,
     poll,
     public_search,
+    search_events,
     sources,
     status,
     tailor,
@@ -47,6 +48,7 @@ from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
 from app.services.llm.errors import LLMServiceError
 from app.services.owner_provisioning import provision_owner
+from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
     close_async_supabase,
     close_supabase,
@@ -240,6 +242,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     supabase_for_buffer = get_supabase_pool()
     if supabase_for_buffer is not None:
         cost_log_buffer.start(supabase_for_buffer)
+        # Search-funnel metrics ride the same buffered-INSERT machinery
+        # (#467 §10 PR6) — a second instance pointed at search_events.
+        search_events_buffer.start(supabase_for_buffer)
     try:
         yield
     finally:
@@ -250,6 +255,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             scheduler.shutdown(wait=False)
         if supabase_for_buffer is not None:
             await cost_log_buffer.stop(supabase_for_buffer)
+            await search_events_buffer.stop(supabase_for_buffer)
         close_supabase()
         await close_async_supabase()
         await close_http_client()
@@ -483,6 +489,7 @@ app.include_router(jobs.router)
 app.include_router(keys.router)
 app.include_router(poll.router)
 app.include_router(public_search.router)
+app.include_router(search_events.router)
 app.include_router(sources.router)
 app.include_router(status.router)
 app.include_router(tailor.router)

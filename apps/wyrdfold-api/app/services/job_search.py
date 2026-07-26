@@ -223,6 +223,39 @@ def search_jobs(
     return [JobSearchResult.model_validate(r) for r in page], has_more
 
 
+def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
+    """One publicly-eligible listing by id — the shareable-URL detail read
+    (#467 §11.2 fast-follow).
+
+    Returns the SAME projection as one ``search_jobs`` result (``_SEARCH_COLS``
+    + the page-only ``snippet``), gated by the SAME live/US eligibility
+    predicate. A missing id and a no-longer-eligible row (archived / purged /
+    non-US) both return ``None`` — the caller maps both to one indistinguishable
+    404, so a public prober can't learn whether a delisted id ever existed.
+
+    Blocking supabase round-trips (row fetch + snippet fetch) — the caller runs
+    this in a worker thread (#107), mirroring ``search_jobs_with_snippets``.
+    """
+    resp = (
+        supabase.table("jobs")
+        .select(_SEARCH_COLS)
+        # Live + US corpus gate — MUST match search_jobs exactly, or a shared
+        # link could resurface a listing the search surface no longer shows.
+        .is_("archived_at", "null")
+        .is_("purged_at", "null")
+        .not_.is_("is_us", "false")
+        .eq("id", listing_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    result = JobSearchResult.model_validate(rows[0])
+    attach_snippets(supabase, [result])
+    return result
+
+
 def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | None:
     """Tag-strip + whitespace-collapse + truncate a JD's ``description_html`` into
     a short plaintext preview. ``None`` for empty/blank input; appends an ellipsis

@@ -44,7 +44,17 @@ function isPlausibleIp(value: string): boolean {
  * `''` — the caller forwards it as `x-forwarded-for` only when non-empty.
  */
 export function clientIp(request: NextRequest): string {
-  const realIp = request.headers.get('x-real-ip')?.trim();
+  return clientIpFromHeaders(request.headers);
+}
+
+/**
+ * Same trust logic over a bare `Headers` — for Server Components (which read
+ * `headers()` from `next/headers` rather than holding a NextRequest), e.g. the
+ * hard-load `/search/[id]` page's direct API fetch. One implementation for
+ * every caller: the spoof-defeating rules above must not drift.
+ */
+export function clientIpFromHeaders(headers: Headers): string {
+  const realIp = headers.get('x-real-ip')?.trim();
   if (realIp && isPlausibleIp(realIp)) return realIp;
   return '';
 }

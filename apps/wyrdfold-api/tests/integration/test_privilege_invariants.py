@@ -67,6 +67,9 @@ SERVICE_ROLE_ONLY_TABLES: frozenset[str] = frozenset(
     {
         "job_embeddings",
         "prescan_shadow",
+        # #467 §10 PR6 — the search-funnel ledger (identity-free by schema,
+        # service-role buffered writes only; 20260725000000).
+        "search_events",
     }
 )
 

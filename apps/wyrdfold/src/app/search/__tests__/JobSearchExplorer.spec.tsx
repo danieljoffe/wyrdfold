@@ -11,17 +11,31 @@ import JobSearchExplorer from '../JobSearchExplorer';
 import type { JobSearchResult } from '../types';
 
 // next/link needs the app-router context; stub to a plain anchor for the unit.
+// `scroll` is a router hint, not a DOM attribute — strip it; and prevent the
+// default so jsdom doesn't attempt (and log) an unimplemented navigation when
+// a test clicks a result card (now a real link to /search/<id>).
 jest.mock('next/link', () => ({
   __esModule: true,
   default: ({
     href,
     children,
+    scroll: _scroll,
+    onClick,
     ...rest
   }: {
     href: string;
     children: React.ReactNode;
+    scroll?: boolean;
+    onClick?: React.MouseEventHandler<HTMLAnchorElement>;
   }) => (
-    <a href={href} {...rest}>
+    <a
+      href={href}
+      onClick={e => {
+        onClick?.(e);
+        e.preventDefault();
+      }}
+      {...rest}
+    >
       {children}
     </a>
   ),
@@ -58,6 +72,13 @@ jest.mock('next/navigation', () => {
 const mockToast = jest.fn();
 jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
+}));
+
+// Funnel beacon (§10 PR6): assert the tick, never the wire (the emitter is
+// fire-and-forget and must stay invisible to the rest of these tests).
+const mockEmitSearchEvent = jest.fn();
+jest.mock('../searchEvents', () => ({
+  emitSearchEvent: (...args: unknown[]) => mockEmitSearchEvent(...args),
 }));
 
 const ORIGINAL_FETCH = global.fetch;
@@ -109,9 +130,14 @@ function typeAndSearch(term: string) {
   fireEvent.click(screen.getByRole('button', { name: /search/i }));
 }
 
-/** The card is a single `role="button"` whose accessible name is its aria-label. */
+/** The card is a single link (to `/search/<id>`) whose accessible name is its
+ *  aria-label (#467 §11.2 fast-follow — the detail is URL-addressable). */
 function cardName(title = 'Frontend Engineer', company = 'Acme') {
   return `Open ${title} at ${company}`;
+}
+
+function findCard(title?: string, company?: string) {
+  return screen.findByRole('link', { name: cardName(title, company) });
 }
 
 describe('JobSearchExplorer', () => {
@@ -135,8 +161,8 @@ describe('JobSearchExplorer', () => {
     render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend engineer');
 
-    // The whole result is a button (opens the detail) — not a title link.
-    const card = await screen.findByRole('button', { name: cardName() });
+    // The whole result is a single link into the listing detail URL.
+    const card = await findCard();
     expect(within(card).getByText(/Acme · Remote/)).toBeInTheDocument();
     expect(within(card).getByText('$150k')).toBeInTheDocument();
 
@@ -148,102 +174,29 @@ describe('JobSearchExplorer', () => {
     expect(screen.queryByText(/^\d{1,3}$/)).not.toBeInTheDocument();
   });
 
-  it('opens the detail modal when a card is clicked (actions live there now)', async () => {
+  it('renders each card as a link to its shareable detail URL (#467 §11.2 fast-follow)', async () => {
+    mockSearch([result({ id: 'abc-123' })]);
+    render(<JobSearchExplorer isAuthenticated />);
+    typeAndSearch('frontend');
+
+    // A REAL <a href> — soft-nav opens the intercepted modal over the grid,
+    // while copy-link / middle-click / hard load get the standalone page.
+    // Keyboard operability comes free with the anchor. The detail (and its
+    // bind→unlock actions) render in the @modal slot, not the explorer, so
+    // no dialog appears in this unit.
+    expect(await findCard()).toHaveAttribute('href', '/search/abc-123');
+  });
+
+  it('emits a card_open funnel tick (authed surface) when a card is opened', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
     typeAndSearch('frontend');
-
-    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
-
-    // The listing detail (a dialog) — the source link + the bind actions moved
-    // off the card and into here (§11.2/§11.3).
-    const dialog = await screen.findByRole('dialog');
-    expect(
-      within(dialog).getByRole('link', { name: /view original posting/i })
-    ).toHaveAttribute('href', 'https://ext.example/1');
-    expect(
-      within(dialog).getByText(/unlock llm pipelines/i)
-    ).toBeInTheDocument();
-    expect(
-      within(dialog).getByRole('button', {
-        name: /create a target from this role/i,
-      })
-    ).toBeInTheDocument();
-  });
-
-  it('binds an unbound listing from the modal and unlocks match/tailor live (§11.3)', async () => {
-    global.fetch = jest.fn().mockImplementation((url: string) => {
-      if (url.includes('/api/targets/mine'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({
-            targets: [{ target: { id: 't1', label: 'Frontend Roles' } }],
-          }),
-        });
-      if (url.includes('/add-to-target'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({
-            success: true,
-            job_posting_id: '1',
-            target_id: 't1',
-            score: 70,
-          }),
-        });
-      if (url.includes('/api/jobs/target-membership'))
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({ memberships: {} }), // starts unbound
-        });
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          query: 'q',
-          count: 1,
-          has_more: false,
-          results: [result({ id: '1' })],
-        }),
-      });
-    }) as unknown as typeof fetch;
-
-    render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
-
-    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
-    const dialog = await screen.findByRole('dialog');
-    // Unbound → no match link yet.
-    expect(
-      within(dialog).queryByRole('link', { name: /see how you match/i })
-    ).not.toBeInTheDocument();
-
-    // Bind it from the modal's picker.
-    fireEvent.click(
-      within(dialog).getByRole('button', { name: /add to target/i })
-    );
-    fireEvent.click(
-      await screen.findByRole('menuitem', { name: 'Frontend Roles' })
-    );
-
-    // Live unlock: the match link now appears, pointing at /jobs/1.
-    await waitFor(() =>
-      expect(
-        screen.getByRole('link', { name: /see how you match/i })
-      ).toHaveAttribute('href', '/jobs/1')
-    );
-  });
-
-  it('opens the modal from the keyboard (Enter on the focused card)', async () => {
-    mockSearch([result()]);
-    render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
-
-    const card = await screen.findByRole('button', { name: cardName() });
-    fireEvent.keyDown(card, { key: 'Enter' });
-    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    fireEvent.click(await findCard());
+    expect(mockEmitSearchEvent).toHaveBeenCalledWith({
+      event_type: 'card_open',
+      surface: 'authed',
+      job_posting_id: '1',
+    });
   });
 
   it('fetches target-membership for the page and badges a bound listing (#467 §11)', async () => {
@@ -326,19 +279,13 @@ describe('JobSearchExplorer', () => {
     typeAndSearch('frontend');
 
     // Page 1 + a "Load more" affordance.
-    expect(
-      await screen.findByRole('button', { name: cardName('Frontend Engineer') })
-    ).toBeInTheDocument();
+    expect(await findCard('Frontend Engineer')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /load more/i }));
 
     // Page 2 appended (page 1 rows still present), and "Load more" is gone.
+    expect(await findCard('Staff Frontend Engineer')).toBeInTheDocument();
     expect(
-      await screen.findByRole('button', {
-        name: cardName('Staff Frontend Engineer'),
-      })
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole('button', { name: cardName('Frontend Engineer') })
+      screen.getByRole('link', { name: cardName('Frontend Engineer') })
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(
@@ -384,9 +331,7 @@ describe('JobSearchExplorer', () => {
     render(<JobSearchExplorer isAuthenticated />);
 
     // No typing — the search runs off the URL alone.
-    expect(
-      await screen.findByRole('button', { name: cardName('Frontend Engineer') })
-    ).toBeInTheDocument();
+    expect(await findCard('Frontend Engineer')).toBeInTheDocument();
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/jobs/search?q=engineer')
     );
@@ -408,7 +353,7 @@ describe('JobSearchExplorer', () => {
     mockSearch([result()]);
     mockSearchParams = new URLSearchParams('q=engineer');
     render(<JobSearchExplorer isAuthenticated />);
-    await screen.findByRole('button', { name: cardName('Frontend Engineer') });
+    await findCard('Frontend Engineer');
 
     fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
       target: { value: '30' },
@@ -470,6 +415,18 @@ describe('JobSearchExplorer — logged out (public)', () => {
       .filter((u): u is string => typeof u === 'string');
   }
 
+  it('emits a card_open tick with the PUBLIC surface when logged out', async () => {
+    mockPublicPage();
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend');
+    fireEvent.click(await findCard());
+    expect(mockEmitSearchEvent).toHaveBeenCalledWith({
+      event_type: 'card_open',
+      surface: 'public',
+      job_posting_id: '1',
+    });
+  });
+
   it('uses the honest logged-out sub-copy (no "scored against your profile" steer)', () => {
     render(<JobSearchExplorer isAuthenticated={false} />);
     expect(screen.getByText(/no account needed/i)).toBeInTheDocument();
@@ -487,7 +444,7 @@ describe('JobSearchExplorer — logged out (public)', () => {
     render(<JobSearchExplorer isAuthenticated={false} />);
     typeAndSearch('frontend engineer');
 
-    await screen.findByRole('button', { name: cardName() });
+    await findCard();
 
     // Hits the public BFF route with the query...
     expect(global.fetch).toHaveBeenCalledWith(
@@ -506,42 +463,21 @@ describe('JobSearchExplorer — logged out (public)', () => {
     render(<JobSearchExplorer isAuthenticated={false} />);
     typeAndSearch('frontend');
 
-    const card = await screen.findByRole('button', { name: cardName() });
-    // The card still opens the detail (below), but carries no add/badge footer.
+    const card = await findCard();
+    // The card still links into the detail, but carries no add/badge footer.
     expect(within(card).queryByText(/add to target/i)).not.toBeInTheDocument();
     expect(within(card).queryByText(/^In /)).not.toBeInTheDocument();
   });
 
-  it('opens a detail with the source link + the soft signup allusion, not the bind/LLM actions', async () => {
+  it('links the logged-out card to the same shareable detail URL', async () => {
+    // The public detail itself (source link + the soft signup allusion, never
+    // the bind/LLM actions) renders in the @modal slot / full page — covered by
+    // ListingModal.spec + JobDetailModal.spec. Here the explorer's job ends at
+    // the navigation.
     mockPublicPage();
     render(<JobSearchExplorer isAuthenticated={false} />);
     typeAndSearch('frontend');
 
-    fireEvent.click(await screen.findByRole('button', { name: cardName() }));
-    const dialog = await screen.findByRole('dialog');
-
-    // Browsing stays free: the source link is present.
-    expect(
-      within(dialog).getByRole('link', { name: /view original posting/i })
-    ).toHaveAttribute('href', 'https://ext.example/1');
-    // The one soft conversion moment → /login.
-    expect(
-      within(dialog).getByRole('link', { name: /sign up free/i })
-    ).toHaveAttribute('href', '/login');
-    // NONE of the logged-in bind / LLM actions leak onto the public detail.
-    expect(
-      within(dialog).queryByText(/unlock llm pipelines/i)
-    ).not.toBeInTheDocument();
-    expect(
-      within(dialog).queryByRole('button', {
-        name: /create a target from this role/i,
-      })
-    ).not.toBeInTheDocument();
-    expect(
-      within(dialog).queryByRole('button', { name: /add to target/i })
-    ).not.toBeInTheDocument();
-    expect(
-      within(dialog).queryByRole('link', { name: /see how you match/i })
-    ).not.toBeInTheDocument();
+    expect(await findCard()).toHaveAttribute('href', '/search/1');
   });
 });
