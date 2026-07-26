@@ -46,12 +46,11 @@ from app.services.extract import (
     ExtractionResult,
     _extract_from_firecrawl,
     extract_job_from_html,
-    extract_salary_from_text,
+    extract_salary_from_html,
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
 from app.services.recency import display_recency_score
-from app.services.scoring import strip_html
 from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
@@ -2508,7 +2507,7 @@ def backfill_salary(
             html = row.get("description_html") or ""
             if not html:
                 continue
-            salary = extract_salary_from_text(strip_html(html))
+            salary = extract_salary_from_html(html)
             if salary:
                 updates.append({"id": row["id"], "salary_text": salary})
 

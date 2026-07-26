@@ -37,7 +37,7 @@ from app.services.embeddings.job_embeddings import (
 from app.services.embeddings.prescan_gate import cosine_gate_decision
 from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
-from app.services.extract import extract_salary_from_text
+from app.services.extract import extract_salary_from_html
 from app.services.firecrawl import fetch_firecrawl_jobs
 from app.services.fit import run_phase2_for_jobs
 from app.services.fit.phase2_runner import _prescan_gate_applies
@@ -1751,7 +1751,7 @@ async def _poll_one_source(
                 dropped_phase1 += 1
                 continue
 
-            salary = job.salary_text or extract_salary_from_text(strip_html(job.content))
+            salary = job.salary_text or extract_salary_from_html(job.content)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -2879,7 +2879,7 @@ async def _poll_one_source_for_target(
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
-            salary = job.salary_text or extract_salary_from_text(strip_html(job.content))
+            salary = job.salary_text or extract_salary_from_html(job.content)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(

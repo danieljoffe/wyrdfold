@@ -31,11 +31,10 @@ from app.models.targets import JobTarget
 from app.services.extract import (
     MANUAL_SOURCE_ID,
     MANUAL_SOURCE_ROW,
-    extract_salary_from_text,
+    extract_salary_from_html,
 )
 from app.services.jd_parser import parse_jd
 from app.services.sanitize import sanitize_html
-from app.services.scoring import strip_html
 from app.services.target_scoring import score_and_upsert, update_global_score
 
 logger = logging.getLogger(__name__)
@@ -89,7 +88,7 @@ async def materialize_and_score_job(
     """
     salary = salary_text
     if not salary and description_html:
-        salary = extract_salary_from_text(strip_html(description_html))
+        salary = extract_salary_from_html(description_html)
 
     row: dict[str, Any] = {
         "external_id": job_external_id(final_url),

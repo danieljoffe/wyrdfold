@@ -20,6 +20,7 @@ from app.services.jsonld import (
     _get_location,
     _get_str,
 )
+from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
 
@@ -65,20 +66,99 @@ class ExtractionResult(BaseModel):
     warnings: list[str] = []
 
 
-# Matches common salary range patterns like "$120,000 - $150,000/yr", "$120k-$150k"
-_SALARY_RE = re.compile(
-    r"\$\s*[\d,]+(?:\.\d+)?[kK]?"  # first amount
-    r"\s*[-–—to]+\s*"  # separator
-    r"\$?\s*[\d,]+(?:\.\d+)?[kK]?"  # second amount
-    r"(?:\s*/?\s*(?:yr|year|annually|per\s+year|hr|hour|hourly|per\s+hour))?",  # unit
+# ---- Salary extraction (v2 — #503) ------------------------------------------
+#
+# Grown from the REAL formats prod has matched (regression corpus in
+# tests/test_extract.py): "$120,000-$275,000", "$200K-$400K" (en-dash variants
+# too), "$77,600.00 to $176,000.00", "$19.00 - 21.00" (second amount bare),
+# "$17.89 - $26.35 / Hour", "/per year" units — plus the #503 additions:
+# £/€/CA$ currencies, a trailing ISO code ("$190,800 [em-dash] $267,100 USD"),
+# and guarded single-bound forms ("up to $180,000", "from £60k").
+
+# Currency symbol, optionally region-prefixed (US$/CA$/AU$/NZ$).
+_CUR = r"(?:(?:US|CA|AU|NZ)?\$|£|€)"
+# An amount: 1,234 / 1234.56 / 120k. First amount requires the symbol; the
+# second may omit it ("$19.00 - 21.00" is a real prod format). NB the k-suffix
+# allows NO preceding whitespace — a greedy `\s*` there would eat the space the
+# optional trailing ISO code needs (`$267,100 USD` silently losing its `USD`).
+_AMT = rf"{_CUR}\s*\d[\d,]*(?:\.\d+)?[kK]?"
+_AMT_BARE = rf"(?:{_CUR})?\s*\d[\d,]*(?:\.\d+)?[kK]?"
+# Range separator: dash family (spaces optional) or a spaced joining word.
+_SEP = r"(?:\s*[-–—~]\s*|\s+(?:to|through)\s+)"
+# Pay period, e.g. "/yr", " per hour", "/ Hour", "/per year".
+_UNIT = r"(?:\s*/?\s*(?:yr|year|annually|per\s+year|per\s+annum|hr|hour|hourly|per\s+hour))?"
+# Trailing ISO currency code, e.g. "$267,100 USD".
+_ISO = r"(?:\s+(?:USD|CAD|AUD|NZD|GBP|EUR))?"
+
+_SALARY_RANGE_RE = re.compile(rf"{_AMT}{_SEP}{_AMT_BARE}{_UNIT}{_ISO}", re.I)
+
+# Single-bound forms need an explicit cue word — a bare "$180,000" anywhere in
+# a JD is far too promiscuous (funding rounds, revenue, perk values).
+_SALARY_BOUND_RE = re.compile(
+    rf"(?:up\s+to|from|starting\s+(?:at|from)|minimum\s+of)\s+({_AMT}){_UNIT}{_ISO}",
     re.I,
 )
+# First numeric in a match, for the single-bound plausibility guard.
+_FIRST_NUM_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*([kK])?")
+_HOURLY_HINT_RE = re.compile(r"hr|hour", re.I)
+
+
+def _plausible_single_bound(match: re.Match[str]) -> bool:
+    """Reject perk-sized 'up to $500' hits: a single-bound salary must be
+    ≥ $1k (or k-suffixed), unless an explicit hourly unit makes small
+    amounts legitimate ('starting at $25/hour'). Ranges are NOT gated —
+    real unit-less hourly ranges exist in prod ("$49 - $57")."""
+    num = _FIRST_NUM_RE.search(match.group(1))
+    if not num:
+        return False
+    if num.group(2):  # k-suffix
+        return True
+    value = float(num.group(1).replace(",", ""))
+    if _HOURLY_HINT_RE.search(match.group(0)):
+        return value >= 10
+    return value >= 1_000
 
 
 def extract_salary_from_text(text: str) -> str | None:
-    """Best-effort salary extraction from plain text via regex."""
-    m = _SALARY_RE.search(text)
-    return m.group(0).strip() if m else None
+    """Best-effort salary extraction from plain text via regex.
+
+    Ranges win over single-bound forms ("from $150k to $190k" must yield the
+    whole range, not the "from" prefix). Trailing punctuation is trimmed —
+    prod once stored "$148,000 - $185,000," verbatim.
+    """
+    m = _SALARY_RANGE_RE.search(text)
+    if m is None:
+        m = _SALARY_BOUND_RE.search(text)
+        if m is None or not _plausible_single_bound(m):
+            return None
+    return m.group(0).strip().rstrip(",.;:")
+
+
+def extract_salary_from_html(description_html: str | None) -> str | None:
+    """Salary from a JD's HTML — the ONE entry point for every stored-HTML
+    caller (poller, manual ingest, backfill, JSON-LD descriptions).
+
+    Structural first: Greenhouse renders compensation in a dedicated
+    ``pay-range`` block (``<span>$190,800</span><span class="divider">—</span>
+    <span>$267,100 USD</span>``) — parsing it directly beats prose regex for
+    the most common board AND guarantees the real comp wins over any earlier
+    dollar figure in the body text. Falls back to the shared token stream
+    (``strip_html``, escaped-HTML-defensive) + prose regex.
+    """
+    if not description_html:
+        return None
+    if "pay-range" in description_html:
+        soup = BeautifulSoup(description_html, "html.parser")
+        el = soup.select_one(".content-pay-transparency .pay-range") or soup.select_one(
+            ".pay-range"
+        )
+        if el is not None:
+            structural = extract_salary_from_text(
+                " ".join(el.get_text(separator=" ").split())
+            )
+            if structural:
+                return structural
+    return extract_salary_from_text(strip_html(description_html))
 
 
 def _company_from_domain(url: str) -> str:
@@ -120,7 +200,8 @@ def _extract_from_jsonld(html: str) -> ExtractionResult | None:
 
     salary = _format_salary(posting)
     if not salary and description:
-        salary = extract_salary_from_text(description)
+        # JSON-LD descriptions are frequently HTML — same html-aware entry.
+        salary = extract_salary_from_html(description)
 
     return ExtractionResult(
         title=title,
