@@ -17,6 +17,48 @@ def test_strip_html_handles_empty():
     assert strip_html("") == ""
 
 
+# The verbatim shape of the prod Reddit row's pay-transparency region (2026-07-26
+# bug report): HTML-ESCAPED markup + a DOUBLE-escaped &amp;mdash; BETWEEN the two
+# amounts. Rows stored before the greenhouse ingestion unescape (services/
+# greenhouse.py) look like this.
+_ESCAPED_PAY_RANGE = (
+    "&lt;div class=&quot;title&quot;&gt;The base salary range for this position is:"
+    "&lt;/div&gt;&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$190,800&lt;/span&gt;"
+    "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+    "&lt;span&gt;$267,100 USD&lt;/span&gt;&lt;/div&gt;"
+)
+
+
+def test_strip_html_double_strips_stored_escaped_html():
+    """Stored-escaped rows must yield a CLEAN token stream — the first pass
+    unescapes the entities into tag-looking text; the bounded second pass
+    strips it. This is the shared fix behind the tag-soup snippets AND the
+    null-salary misses (markup between the pay-range amounts)."""
+    text = strip_html(_ESCAPED_PAY_RANGE)
+    assert "<" not in text and ">" not in text
+    assert "&mdash;" not in text and "&quot;" not in text
+    assert "The base salary range for this position is: $190,800" in text
+
+
+def test_strip_html_escaped_pay_range_is_salary_extractable():
+    """End-to-end regression for the Reddit null-salary bug: the poller's
+    exact pipeline (strip_html -> extract_salary_from_text) must recover the
+    range from a stored-escaped pay-transparency div."""
+    from app.services.extract import extract_salary_from_text
+
+    salary = extract_salary_from_text(strip_html(_ESCAPED_PAY_RANGE))
+    assert salary is not None
+    assert "$190,800" in salary and "$267,100" in salary
+
+
+def test_strip_html_keeps_stray_lt_in_prose():
+    """A literal '<' in prose is NOT a tag shape — the second pass must not
+    fire and eat legitimate text (comp ranges, code mentions)."""
+    assert strip_html("<p>Comp &lt; $200k, equity &gt; 0.1%</p>") == (
+        "Comp < $200k, equity > 0.1%"
+    )
+
+
 def test_strip_html_preserves_plain_text():
     assert strip_html("no tags here") == "no tags here"
 

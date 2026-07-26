@@ -27,10 +27,10 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from bs4 import BeautifulSoup
 from supabase import Client
 
 from app.models.job_search import JobSearchResult
+from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
 
@@ -259,10 +259,16 @@ def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
 def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | None:
     """Tag-strip + whitespace-collapse + truncate a JD's ``description_html`` into
     a short plaintext preview. ``None`` for empty/blank input; appends an ellipsis
-    when truncated."""
+    when truncated.
+
+    Delegates the strip to :func:`app.services.scoring.strip_html` — the ONE
+    shared implementation of the escaped-HTML-defensive double-strip (see its
+    docstring for the Greenhouse stored-escaped-rows story), so the snippet,
+    keyword scoring, and salary extraction can never disagree about the text.
+    """
     if not html:
         return None
-    text = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ").split())
+    text = strip_html(html)
     if not text:
         return None
     if len(text) <= max_len:
