@@ -27,10 +27,10 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from bs4 import BeautifulSoup
 from supabase import Client
 
 from app.models.job_search import JobSearchResult
+from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
 
@@ -256,30 +256,19 @@ def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
     return result
 
 
-# A real tag shape (`<div …>`, `</p>`, `<!--`), NOT a stray "<" in prose like
-# "comp < $200k" — decides whether the second strip pass below is needed.
-_TAGGY_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
-
-
 def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | None:
     """Tag-strip + whitespace-collapse + truncate a JD's ``description_html`` into
     a short plaintext preview. ``None`` for empty/blank input; appends an ellipsis
     when truncated.
 
-    Defensive double-strip: some boards deliver the JD HTML-**escaped**
-    (Greenhouse's Job Board API — ingestion now unescapes at the source, see
-    ``services/greenhouse.py``), so rows ingested before that fix hold
-    ``&lt;div&gt;…`` — the first ``get_text`` pass *unescapes* those entities
-    into text that still LOOKS like markup (the 2026-07-26 tag-soup-on-cards
-    prod bug). When, and only when, the first pass leaves a real tag shape
-    behind, one bounded second pass strips it; plain prose containing a stray
-    ``<`` is left untouched.
+    Delegates the strip to :func:`app.services.scoring.strip_html` — the ONE
+    shared implementation of the escaped-HTML-defensive double-strip (see its
+    docstring for the Greenhouse stored-escaped-rows story), so the snippet,
+    keyword scoring, and salary extraction can never disagree about the text.
     """
     if not html:
         return None
-    text = " ".join(BeautifulSoup(html, "html.parser").get_text(separator=" ").split())
-    if text and _TAGGY_RE.search(text):
-        text = " ".join(BeautifulSoup(text, "html.parser").get_text(separator=" ").split())
+    text = strip_html(html)
     if not text:
         return None
     if len(text) <= max_len:
