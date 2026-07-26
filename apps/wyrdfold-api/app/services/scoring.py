@@ -10,9 +10,29 @@ from app.services.jd_parser import ParsedJD, parse_jd
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# A real tag shape (`<div …>`, `</p>`, `<!--`), NOT a stray "<" in prose like
+# "comp < $200k" — decides whether strip_html's second pass is needed.
+_TAGGY_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
+
 
 def strip_html(html: str) -> str:
+    """HTML → collapsed plain text: THE token stream behind keyword scoring,
+    salary extraction (poller + backfill), and the search snippets.
+
+    Defensive double-strip: some boards deliver the JD HTML-**escaped**
+    (Greenhouse's Job Board API — ingestion now unescapes at the source, see
+    ``services/greenhouse.py``), so rows stored before that fix hold
+    ``&lt;div&gt;…`` — the first ``get_text`` pass *unescapes* those entities
+    into text that still LOOKS like markup, polluting every consumer above
+    (the 2026-07-26 prod bugs: tag soup on the search cards, and null
+    ``salary_text`` whenever markup sat between the two amounts of a
+    Greenhouse pay-transparency range). When, and only when, the first pass
+    leaves a real tag shape behind, one bounded second pass strips it; plain
+    prose containing a stray ``<`` is left untouched.
+    """
     text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+    if _TAGGY_RE.search(text):
+        text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
