@@ -313,6 +313,29 @@ def test_html_to_snippet_truncates_with_ellipsis() -> None:
     assert s.endswith("…")
 
 
+def test_html_to_snippet_double_strips_escaped_html() -> None:
+    """Rows ingested before the greenhouse unescape fix hold HTML-ESCAPED
+    markup; the first get_text pass unescapes it into tag-looking text (the
+    2026-07-26 tag-soup-on-cards prod bug). The bounded second pass must
+    strip it to clean prose."""
+    escaped = (
+        "&lt;div class=&quot;content-intro&quot;&gt;&lt;h2&gt;&lt;strong&gt;"
+        "About LeafLink&lt;/strong&gt;&lt;/h2&gt; &lt;p&gt;&lt;span style="
+        "&quot;font-weight: 400;&quot;&gt;LeafLink is the largest unified "
+        "B2B cannabis platform&lt;/span&gt;&lt;/p&gt;"
+    )
+    out = job_search._html_to_snippet(escaped)
+    assert out == "About LeafLink LeafLink is the largest unified B2B cannabis platform"
+    assert "<" not in out and ">" not in out
+
+
+def test_html_to_snippet_keeps_stray_lt_in_prose() -> None:
+    """A literal '<' in prose is NOT a tag shape — the second pass must not
+    fire and eat legitimate text."""
+    out = job_search._html_to_snippet("<p>Comp &lt; $200k, equity &gt; 0.1%</p>")
+    assert out == "Comp < $200k, equity > 0.1%"
+
+
 def test_html_to_snippet_empty_or_blank_is_none() -> None:
     assert job_search._html_to_snippet(None) is None
     assert job_search._html_to_snippet("") is None
