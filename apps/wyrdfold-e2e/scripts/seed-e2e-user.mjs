@@ -43,7 +43,7 @@ if (error) {
       );
       process.exit(1);
     }
-    userId = list?.users?.find((u) => u.email === email)?.id;
+    userId = list?.users?.find(u => u.email === email)?.id;
   } else {
     console.error(`seed-e2e-user: failed to create ${email}: ${error.message}`);
     process.exit(1);
@@ -71,7 +71,9 @@ const { error: profileError } = await admin.from('user_profiles').upsert(
   { onConflict: 'user_id' }
 );
 if (profileError) {
-  console.error(`seed-e2e-user: profile upsert failed: ${profileError.message}`);
+  console.error(
+    `seed-e2e-user: profile upsert failed: ${profileError.message}`
+  );
   process.exit(1);
 }
 console.log('seed-e2e-user: profile marked onboarded.');
@@ -92,12 +94,14 @@ if (proseSelectError) {
   process.exit(1);
 }
 if (!existingProse?.length) {
-  const { error: proseError } = await admin.from('experience_prose_docs').insert({
-    user_id: userId,
-    version: 1,
-    content:
-      'E2E seeded experience document. Senior engineer with ten years of shipped work.',
-  });
+  const { error: proseError } = await admin
+    .from('experience_prose_docs')
+    .insert({
+      user_id: userId,
+      version: 1,
+      content:
+        'E2E seeded experience document. Senior engineer with ten years of shipped work.',
+    });
   if (proseError) {
     console.error(`seed-e2e-user: prose seed failed: ${proseError.message}`);
     process.exit(1);
