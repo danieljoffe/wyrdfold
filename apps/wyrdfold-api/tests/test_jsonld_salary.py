@@ -93,6 +93,13 @@ async def test_fill_targets_new_salaryless_rows_and_respects_cap(monkeypatch) ->
     assert rows[4]["salary_text"] == "$150,000 – $210,000/yr"
     assert rows[5]["salary_text"] is None
     assert rows[0]["salary_text"] is None
+    # The fill writes the STRUCTURED parts alongside the text (query-grade
+    # columns must never diverge from the display string).
+    assert rows[3]["salary_min"] == 150000
+    assert rows[3]["salary_max"] == 210000
+    assert rows[3]["salary_currency"] == "USD"
+    assert rows[3]["salary_period"] == "yearly"
+    assert "salary_min" not in rows[5]  # non-fetched rows untouched
 
 
 @pytest.mark.asyncio

@@ -37,7 +37,7 @@ from app.services.embeddings.job_embeddings import (
 from app.services.embeddings.prescan_gate import cosine_gate_decision
 from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
-from app.services.extract import extract_salary_from_html
+from app.services.extract import extract_salary_from_html, salary_columns
 from app.services.firecrawl import fetch_firecrawl_jobs
 from app.services.fit import run_phase2_for_jobs
 from app.services.fit.phase2_runner import _prescan_gate_applies
@@ -603,6 +603,7 @@ async def _fill_jsonld_salaries(
                 salary = await fetch_salary_from_posting_page(str(row["absolute_url"]))
             if salary:
                 row["salary_text"] = salary
+                row.update(salary_columns(salary))
         except Exception:
             logger.exception("jsonld salary fill failed for %s", row.get("absolute_url"))
 
@@ -1909,6 +1910,7 @@ async def _poll_one_source(
                     "score_breakdown": {},
                     "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
+                    **salary_columns(salary),
                 }
             )
 
@@ -3164,6 +3166,7 @@ async def _poll_one_source_for_target(
                     "score_breakdown": {},
                     "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
+                    **salary_columns(salary),
                 }
             )
 
