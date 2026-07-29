@@ -42,6 +42,7 @@ const FORWARDED_PARAMS = [
   'offset',
   'location',
   'posted_within_days',
+  'salary_floor',
 ] as const;
 
 export async function GET(request: NextRequest) {
