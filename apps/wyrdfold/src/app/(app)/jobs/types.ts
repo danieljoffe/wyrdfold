@@ -56,6 +56,14 @@ export interface JobPosting {
   title: string;
   company_name: string;
   location: string | null;
+  /**
+   * Structured parts parsed from `location` at ingest (#518) — compose with
+   * `formatLocation()`. Optional: older cached payloads may omit them.
+   */
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+  location_remote?: boolean | null;
   absolute_url: string | null;
   score: number;
   score_breakdown: Record<string, number> | null;

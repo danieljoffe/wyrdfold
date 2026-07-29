@@ -20,6 +20,13 @@ class JobSearchResult(BaseModel):
     title: str
     company_name: str
     location: str | None = None
+    # Structured parts parsed from ``location`` at ingest (#518). Nullable —
+    # unparseable strings leave them None and the client falls back to the
+    # raw ``location`` for display.
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    location_remote: bool | None = None
     department: str | None = None
     salary_text: str | None = None
     # Link to the ORIGINAL posting (Greenhouse/Ashby/…). Public results point at

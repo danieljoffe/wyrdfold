@@ -62,6 +62,7 @@ from app.services.llm.provider_breaker import (
 from app.services.llm.provider_breaker import (
     trip_provider_fatal as _trip_provider_fatal,
 )
+from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -1537,7 +1538,23 @@ async def _poll_one_source(
             retry_sync=True,
         )
         existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
-        known_external_ids = {r.get("external_id") for r in existing_rows}
+        # #514: admission scoping keys on EVERY external_id this source
+        # already has, not the live-unengaged view above. Engaged
+        # (saved/applied) and archived rows are still KNOWN rows — they were
+        # admitted on a prior cycle, so they must neither re-enter Phase-1
+        # triage as candidates nor be judged by its budget-defer rule below.
+        # The RPC view keeps its narrower scope for the (company, title)
+        # dedupe and the stale-archive pass, where engaged/archived rows are
+        # deliberately out of bounds.
+        known_ids_resp = await poll_db_read(
+            supabase,
+            lambda c: c.table("jobs").select("external_id").eq("source_id", source_id),
+            label=f"poll known ids {company_name}",
+            retry_sync=True,
+        )
+        known_external_ids = {
+            r.get("external_id") for r in cast(list[dict[str, Any]], known_ids_resp.data or [])
+        }
 
         # Payer/allowance snapshot: who pays for each target's LLM work,
         # and which payers are over their monthly allowance. Built once
@@ -1747,11 +1764,20 @@ async def _poll_one_source(
             # below uses the same idx + 1 convention. Non-survivors
             # never reach this line, so their missing verdicts can't
             # fail-open anything into the upsert.
-            if not _any_target_admits(idx + 1):
+            #
+            # KNOWN rows bypass the gate (#514): they were admitted on the
+            # cycle that ingested them and are never triage candidates, so
+            # to ``_any_target_admits`` they are indistinguishable from
+            # budget-deferred candidates — judging them dropped every known
+            # row from the conflict-update whenever a cycle produced any
+            # verdicts, starving busy boards of content refreshes entirely
+            # (JD edits, the escaped-HTML heal, salary re-extraction).
+            if job.external_id not in known_external_ids and not _any_target_admits(idx + 1):
                 dropped_phase1 += 1
                 continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -1761,6 +1787,10 @@ async def _poll_one_source(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
@@ -1771,9 +1801,15 @@ async def _poll_one_source(
                 }
             )
 
-        # Optional: validate job URLs before upserting (#496)
+        # Optional: validate job URLs before upserting (#496). NEW rows only
+        # (#514): a known row's URL was validated at ingest and url_health
+        # monitors it from then on — re-validating every known row per cycle
+        # is a fleet-wide HEAD storm, and a transient upstream blip would
+        # null a working absolute_url on refresh.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
 
         new_rows: list[dict[str, Any]] = []
         if rows_to_upsert:
@@ -1809,13 +1845,25 @@ async def _poll_one_source(
                 ),
                 label=f"poll upsert {company_name}",
             )
+            # #514: a row is a REFRESH iff its external_id was known BEFORE
+            # this cycle's upsert. NOT derivable from created_at ==
+            # updated_at: nothing bumps jobs.updated_at on a conflict-update
+            # (no moddatetime trigger; the payload doesn't set it), so a
+            # refreshed row keeps created == updated forever and the old
+            # timestamp split misclassified every refresh as "new" — which
+            # would re-fire the new-job email/SMS alerts below on EVERY
+            # cycle. The Stage-2 pass preserves the persisted Phase-1
+            # verdict for refreshed rows instead of re-litigating admission
+            # with this cycle's (absent) verdict.
+            known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
-                if data.get("created_at") == data.get("updated_at"):
+                if data.get("external_id") in known_external_ids:
+                    summary["updated"] += 1
+                    known_upserted_ids.append(data["id"])
+                else:
                     summary["new"] += 1
                     new_rows.append(data)
-                else:
-                    summary["updated"] += 1
 
             # ---- Qualification firewall (#60) ----
             # Target-INDEPENDENT tagging: classify each upserted job ONCE and
@@ -1888,32 +1936,68 @@ async def _poll_one_source(
                 # verdict. Missing entries are fail-open (admit).
                 target_verdicts = phase1_verdicts.get(active_target.id, {})
 
+                # #514: persisted Phase-1 verdicts for the refreshed rows.
+                # ``promising=False`` is the exclusion floor on re-score
+                # (``bulk_score_for_target``'s contract — a refresh must not
+                # walk back a Phase-1 rejection); True/NULL rely on the
+                # keyword scorer. Chunked ≤150 ids to stay inside
+                # PostgREST's URL-safe ``in_`` bound.
+                promising_floor: dict[str, bool | None] = {}
+                for start in range(0, len(known_upserted_ids), 150):
+                    chunk = known_upserted_ids[start : start + 150]
+                    floor_resp = await poll_db_read(
+                        supabase,
+                        lambda c, _chunk=chunk, _tid=active_target.id: (
+                            c.table("scores")
+                            .select("job_posting_id, promising")
+                            .eq("target_id", _tid)
+                            .in_("job_posting_id", _chunk)
+                        ),
+                        label=f"poll stage2 floor {company_name}",
+                        retry_sync=True,
+                    )
+                    for floor_row in cast(list[dict[str, Any]], floor_resp.data or []):
+                        promising_floor[floor_row["job_posting_id"]] = floor_row.get("promising")
+
                 async def _full_score_one(
                     row_data: dict[str, Any],
                     target: JobTarget = active_target,
                     verdicts: dict[int, TitleVerdict] = target_verdicts,
+                    floor: dict[str, bool | None] = promising_floor,
                 ) -> None:
                     try:
                         ext_id = row_data.get("external_id", "")
-                        phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                        verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
-                        # Gate admission on confidence (#47) AND budget-deferral
-                        # (#285 f/u): a missing verdict fail-opens ONLY if this
-                        # target actually triaged the job; a job the budget
-                        # deferred (never triaged) → promising=None = defer
-                        # (excluded now, re-triaged after the budget resets),
-                        # never admit-blind.
-                        attempted_here = (
-                            phase1_idx is not None
-                            and phase1_idx in phase1_attempted.get(target.id, set())
-                        )
-                        promising = _phase1_promising(
-                            verdict,
-                            attempted=attempted_here,
-                            gate_active=bool(phase1_verdicts),
-                            min_confidence=settings.phase1_min_confidence,
-                        )
-                        phase1_confidence = verdict.confidence if verdict is not None else None
+                        promising: bool | None
+                        if ext_id in known_external_ids:
+                            # #514: refresh of an already-ingested row — Phase 1
+                            # does not re-litigate admission. ``promising=False``
+                            # is the persisted exclusion floor; the stored
+                            # verdict/confidence columns stay untouched (None
+                            # args = leave-unchanged upsert semantics).
+                            promising = floor.get(row_data["id"]) is not False
+                            promising_arg: bool | None = None
+                            phase1_confidence: int | None = None
+                        else:
+                            phase1_idx = phase1_idx_by_external_id.get(ext_id)
+                            verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
+                            # Gate admission on confidence (#47) AND budget-deferral
+                            # (#285 f/u): a missing verdict fail-opens ONLY if this
+                            # target actually triaged the job; a job the budget
+                            # deferred (never triaged) → promising=None = defer
+                            # (excluded now, re-triaged after the budget resets),
+                            # never admit-blind.
+                            attempted_here = (
+                                phase1_idx is not None
+                                and phase1_idx in phase1_attempted.get(target.id, set())
+                            )
+                            promising = _phase1_promising(
+                                verdict,
+                                attempted=attempted_here,
+                                gate_active=bool(phase1_verdicts),
+                                min_confidence=settings.phase1_min_confidence,
+                            )
+                            promising_arg = promising if phase1_verdicts else None
+                            phase1_confidence = verdict.confidence if verdict is not None else None
                         stage2 = await target_score_and_upsert(
                             supabase,
                             job_posting_id=row_data["id"],
@@ -1922,7 +2006,7 @@ async def _poll_one_source(
                             target=target,
                             parsed_jd=jd_cache.get(row_data["id"]),
                             excluded_by_prefilter=not promising,
-                            promising=promising if phase1_verdicts else None,
+                            promising=promising_arg,
                             phase1_confidence=phase1_confidence,
                         )
                         # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
@@ -2771,17 +2855,33 @@ async def _poll_one_source_for_target(
         jobs = await fetcher(board_token)
         summary["polled"] = True
 
+        # #514: this path had no known-row read at all, so already-ingested
+        # external_ids were re-triaged on every cycle (the exact LLM waste
+        # the shared path's candidate comment calls out) and a flipped
+        # verdict — or the fail-closed gate below — starved their content
+        # refresh. Same full-set admission scoping as ``_poll_one_source``.
+        known_ids_resp = await poll_db_read(
+            supabase,
+            lambda c: c.table("jobs").select("external_id").eq("source_id", source_id),
+            label=f"poll known ids {company_name}",
+            retry_sync=True,
+        )
+        known_external_ids = {
+            r.get("external_id") for r in cast(list[dict[str, Any]], known_ids_resp.data or [])
+        }
+
         # Phase 1 per-target triage (single target). Same semantics as
         # ``_poll_one_source`` but the candidate set is one target, so
         # ``phase1_verdicts`` collapses to a single dict. Skipped when
         # the payer is over their monthly allowance (or unattributable):
         # empty verdicts → fail-open ingest, grading defers.
         #
-        # Only FREE-GATE SURVIVORS are triaged (mirrors
-        # ``_poll_one_source``): the per-job loop below drops keyword
-        # misses and non-US locations regardless of verdict, so paying
-        # the LLM to classify them was pure waste. Verdicts stay keyed
-        # by ORIGINAL 1-based job index via the candidate mapping;
+        # Only NEW external_ids that are FREE-GATE SURVIVORS are triaged
+        # (mirrors ``_poll_one_source``): the per-job loop below drops
+        # keyword misses and non-US locations regardless of verdict, and
+        # known rows were admitted on a prior cycle (#514) — paying the
+        # LLM to classify either is pure waste. Verdicts stay keyed by
+        # ORIGINAL 1-based job index via the candidate mapping;
         # non-survivors have no entry (fail-open, then free-gate drop).
         target_verdicts: dict[int, TitleVerdict] = {}
         # Global idxs actually sent to triage (before any budget defer). Missing
@@ -2791,7 +2891,8 @@ async def _poll_one_source_for_target(
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
-            if _title_matches_target(job.title, target.search_keywords)
+            if job.external_id not in known_external_ids
+            and _title_matches_target(job.title, target.search_keywords)
             and _is_us_location(job.location_name)
         ]
         # Grade the most RECENT first (#285 f/u): budget truncation defers the
@@ -2873,13 +2974,27 @@ async def _poll_one_source_for_target(
             # job we actually triaged (LLM dropped an id). A job the budget
             # DEFERRED (never triaged) is dropped from the upsert here — deferred,
             # re-triaged next cycle, not admitted blind (#285 f/u).
-            if settings.phase1_triage_enabled:
+            #
+            # The gate judges CANDIDATES only (#514): known rows were admitted
+            # on a prior cycle, and when triage was deliberately skipped this
+            # cycle (``llm is None`` — over-budget / BYOK require-mode without
+            # a key / zero candidates) ingest fails OPEN as documented above,
+            # with grading deferred. The old form dropped EVERY job in both
+            # states — fail-closed, the opposite of the documented contract.
+            # ``llm is not None`` with FAILED calls keeps the dead-key defer:
+            # those candidates stay un-attempted and drop below.
+            if (
+                settings.phase1_triage_enabled
+                and llm is not None
+                and job.external_id not in known_external_ids
+            ):
                 gj = idx + 1
                 v = target_verdicts.get(gj)
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -2889,6 +3004,10 @@ async def _poll_one_source_for_target(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
@@ -2899,8 +3018,12 @@ async def _poll_one_source_for_target(
                 }
             )
 
+        # NEW rows only (#514) — same scoping as _poll_one_source: known
+        # rows' URLs were validated at ingest and are url_health-monitored.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
 
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
@@ -2918,12 +3041,19 @@ async def _poll_one_source_for_target(
                 ),
                 label=f"poll upsert {company_name}",
             )
+            # #514: a row is a REFRESH iff its external_id was known before
+            # this cycle's upsert — NOT created==updated (a conflict-update
+            # never bumps jobs.updated_at, see _poll_one_source). The
+            # Stage-2 pass preserves the persisted Phase-1 verdict for
+            # refreshed rows instead of re-litigating admission.
+            known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
-                if data.get("created_at") == data.get("updated_at"):
-                    summary["new"] += 1
-                else:
+                if data.get("external_id") in known_external_ids:
                     summary["updated"] += 1
+                    known_upserted_ids.append(data["id"])
+                else:
+                    summary["new"] += 1
 
             # Qualification firewall (#60): same target-INDEPENDENT tagging
             # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target
@@ -2967,6 +3097,27 @@ async def _poll_one_source_for_target(
                 rd = cast(dict[str, Any], raw_row)
                 jd_cache[rd["id"]] = parse_jd(rd.get("description_html") or "")
 
+            # #514: persisted Phase-1 verdicts for the refreshed rows —
+            # ``promising=False`` is the exclusion floor on re-score
+            # (``bulk_score_for_target``'s contract); True/NULL rely on the
+            # keyword scorer. Chunked ≤150 ids for PostgREST's URL bound.
+            promising_floor: dict[str, bool | None] = {}
+            for start in range(0, len(known_upserted_ids), 150):
+                chunk = known_upserted_ids[start : start + 150]
+                floor_resp = await poll_db_read(
+                    supabase,
+                    lambda c, _chunk=chunk: (
+                        c.table("scores")
+                        .select("job_posting_id, promising")
+                        .eq("target_id", target.id)
+                        .in_("job_posting_id", _chunk)
+                    ),
+                    label=f"poll stage2 floor {company_name}",
+                    retry_sync=True,
+                )
+                for floor_row in cast(list[dict[str, Any]], floor_resp.data or []):
+                    promising_floor[floor_row["job_posting_id"]] = floor_row.get("promising")
+
             async def _full_score_one(row_data: dict[str, Any]) -> None:
                 try:
                     # Phase 1 verdict for this (job, this-target) pair.
@@ -2975,18 +3126,30 @@ async def _poll_one_source_for_target(
                     # still want ``scores.promising=True`` persisted so
                     # Phase 2 candidate selection can rely on it.
                     ext_id = row_data.get("external_id", "")
-                    phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                    verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
-                    # Confidence gate (#47) + budget-deferral (#285 f/u): defer a
-                    # never-triaged job instead of admitting it blind.
-                    attempted_here = phase1_idx is not None and phase1_idx in phase1_attempted
-                    promising = _phase1_promising(
-                        verdict,
-                        attempted=attempted_here,
-                        gate_active=settings.phase1_triage_enabled,
-                        min_confidence=settings.phase1_min_confidence,
-                    )
-                    phase1_confidence = verdict.confidence if verdict is not None else None
+                    promising: bool | None
+                    if ext_id in known_external_ids:
+                        # #514: refresh of an already-ingested row — Phase 1
+                        # does not re-litigate admission; the persisted
+                        # verdict is the floor and its columns stay untouched.
+                        promising = promising_floor.get(row_data["id"]) is not False
+                        promising_arg: bool | None = None
+                        phase1_confidence: int | None = None
+                    else:
+                        phase1_idx = phase1_idx_by_external_id.get(ext_id)
+                        verdict = (
+                            target_verdicts.get(phase1_idx) if phase1_idx is not None else None
+                        )
+                        # Confidence gate (#47) + budget-deferral (#285 f/u): defer a
+                        # never-triaged job instead of admitting it blind.
+                        attempted_here = phase1_idx is not None and phase1_idx in phase1_attempted
+                        promising = _phase1_promising(
+                            verdict,
+                            attempted=attempted_here,
+                            gate_active=settings.phase1_triage_enabled,
+                            min_confidence=settings.phase1_min_confidence,
+                        )
+                        promising_arg = promising if target_verdicts else None
+                        phase1_confidence = verdict.confidence if verdict is not None else None
                     stage2 = await target_score_and_upsert(
                         supabase,
                         job_posting_id=row_data["id"],
@@ -2995,7 +3158,7 @@ async def _poll_one_source_for_target(
                         target=target,
                         parsed_jd=jd_cache.get(row_data["id"]),
                         excluded_by_prefilter=not promising,
-                        promising=promising if target_verdicts else None,
+                        promising=promising_arg,
                         phase1_confidence=phase1_confidence,
                     )
                     # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----

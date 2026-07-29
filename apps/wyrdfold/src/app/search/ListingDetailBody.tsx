@@ -8,6 +8,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
+import { formatLocation } from '@/lib/formatLocation';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
 // `/search` is now a top-level (auth-adaptive) route; the targets flow stays in
@@ -73,11 +74,12 @@ export default function ListingDetailBody({
   const { toast } = useToast();
   const [creating, setCreating] = useState(false);
   const bound = inTargets.length > 0;
-  const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
+  const locationDisplay = formatLocation(job);
+  const meta = [job.company_name, locationDisplay].filter(Boolean).join(' · ');
   const chips: string[] = [
     job.salary_text || 'Salary not listed',
     `Posted ${timeAgo(job.created_at)}`,
-    ...(job.location ? [job.location] : []),
+    ...(locationDisplay ? [locationDisplay] : []),
   ];
 
   // Create a target from this listing (#467 power-action) — the from-url derive
