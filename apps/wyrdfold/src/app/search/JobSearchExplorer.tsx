@@ -53,6 +53,19 @@ const RECENCY_OPTIONS: SelectOption[] = [
   { value: '90', label: 'Past 3 months' },
 ];
 
+/** Salary-floor presets (yearly USD). The value is the `salary_min` carried in
+ *  the URL and sent to the API as `salary_floor` (`''` = any salary). Rows whose
+ *  posted yearly-USD range reaches the floor pass; roles without a posted
+ *  salary are excluded while a floor is active. */
+const SALARY_OPTIONS: SelectOption[] = [
+  { value: '', label: 'Any salary' },
+  { value: '100000', label: '$100k+' },
+  { value: '150000', label: '$150k+' },
+  { value: '200000', label: '$200k+' },
+  { value: '250000', label: '$250k+' },
+  { value: '300000', label: '$300k+' },
+];
+
 /** Two-letter monogram from a company name. */
 function initials(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
@@ -385,6 +398,7 @@ export default function JobSearchExplorer({
   const urlQ = (searchParams.get('q') ?? '').trim();
   const urlLocation = searchParams.get('location') ?? '';
   const urlDays = searchParams.get('posted_within') ?? '';
+  const urlSalary = searchParams.get('salary_min') ?? '';
 
   // Text-input drafts, seeded from the URL and re-synced whenever it changes
   // underneath us (back/forward). Submitting commits them back to the URL.
@@ -410,6 +424,7 @@ export default function JobSearchExplorer({
       q: string;
       location: string;
       days: string;
+      salary: string;
       offset: number;
     }) => {
       const sp = new URLSearchParams({
@@ -419,6 +434,7 @@ export default function JobSearchExplorer({
       });
       if (opts.location.trim()) sp.set('location', opts.location.trim());
       if (opts.days) sp.set('posted_within_days', opts.days);
+      if (opts.salary) sp.set('salary_floor', opts.salary);
       const res = await fetch(`${searchEndpoint}?${sp.toString()}`);
       if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
       return (await res.json()) as JobSearchResponse;
@@ -474,7 +490,13 @@ export default function JobSearchExplorer({
     setLoading(true);
     setError(null);
     setResults(null);
-    fetchPage({ q: urlQ, location: urlLocation, days: urlDays, offset: 0 })
+    fetchPage({
+      q: urlQ,
+      location: urlLocation,
+      days: urlDays,
+      salary: urlSalary,
+      offset: 0,
+    })
       .then(data => {
         if (cancelled) return;
         setResults(data.results);
@@ -494,18 +516,19 @@ export default function JobSearchExplorer({
     return () => {
       cancelled = true;
     };
-  }, [urlQ, urlLocation, urlDays, fetchPage, fetchMembership]);
+  }, [urlQ, urlLocation, urlDays, urlSalary, fetchPage, fetchMembership]);
 
   // Commit search state to the URL (replace → the /search entry updates in place,
   // so "back" from a listing lands on this exact query+filters rather than a
   // stack of every keystroke). The effect above re-runs the search off the new
   // URL. `scroll:false` keeps the viewport put on a filter tweak.
   const commit = useCallback(
-    (next: { q: string; location: string; days: string }) => {
+    (next: { q: string; location: string; days: string; salary: string }) => {
       const params = new URLSearchParams();
       if (next.q.trim()) params.set('q', next.q.trim());
       if (next.location.trim()) params.set('location', next.location.trim());
       if (next.days) params.set('posted_within', next.days);
+      if (next.salary) params.set('salary_min', next.salary);
       const qs = params.toString();
       router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
     },
@@ -513,10 +536,18 @@ export default function JobSearchExplorer({
   );
 
   const submitSearch = () =>
-    commit({ q: draftQ, location: draftLocation, days: urlDays });
+    commit({
+      q: draftQ,
+      location: draftLocation,
+      days: urlDays,
+      salary: urlSalary,
+    });
   const changeRecency = (days: string) =>
-    commit({ q: draftQ, location: draftLocation, days });
-  const clearFilters = () => commit({ q: draftQ, location: '', days: '' });
+    commit({ q: draftQ, location: draftLocation, days, salary: urlSalary });
+  const changeSalary = (salary: string) =>
+    commit({ q: draftQ, location: draftLocation, days: urlDays, salary });
+  const clearFilters = () =>
+    commit({ q: draftQ, location: '', days: '', salary: '' });
 
   const loadMore = useCallback(async () => {
     if (!results) return;
@@ -527,6 +558,7 @@ export default function JobSearchExplorer({
         q: urlQ,
         location: urlLocation,
         days: urlDays,
+        salary: urlSalary,
         offset: results.length,
       });
       setResults(prev => [...(prev ?? []), ...data.results]);
@@ -537,9 +569,17 @@ export default function JobSearchExplorer({
     } finally {
       setLoadingMore(false);
     }
-  }, [fetchPage, fetchMembership, urlQ, urlLocation, urlDays, results]);
+  }, [
+    fetchPage,
+    fetchMembership,
+    urlQ,
+    urlLocation,
+    urlDays,
+    urlSalary,
+    results,
+  ]);
 
-  const hasActiveFilters = Boolean(urlLocation.trim() || urlDays);
+  const hasActiveFilters = Boolean(urlLocation.trim() || urlDays || urlSalary);
   const onEnter = (e: ReactKeyboardEvent) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -623,6 +663,18 @@ export default function JobSearchExplorer({
               value={urlDays}
               onChange={e => changeRecency(e.target.value)}
               options={RECENCY_OPTIONS}
+            />
+          </div>
+          {/* Salary floor — same Select control as recency; yearly-USD
+              semantics live in the API (roles without a posted salary are
+              excluded while a floor is active). */}
+          <div className='w-36'>
+            <Select
+              id='job-search-salary'
+              aria-label='Filter by minimum salary'
+              value={urlSalary}
+              onChange={e => changeSalary(e.target.value)}
+              options={SALARY_OPTIONS}
             />
           </div>
           {hasActiveFilters && (

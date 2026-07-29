@@ -16,6 +16,13 @@ export interface JobSearchResult {
   location_remote: boolean | null;
   department: string | null;
   salary_text: string | null;
+  // Structured salary parsed from salary_text at ingest (query-grade; the raw
+  // text stays the display value; the salary filter applies server-side).
+  // Optional until the FE consumes them. period: 'yearly' | 'hourly' | null.
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency?: string | null;
+  salary_period?: string | null;
   absolute_url: string | null;
   first_seen_at: string | null;
   created_at: string | null;

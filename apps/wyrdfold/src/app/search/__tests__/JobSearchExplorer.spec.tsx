@@ -372,6 +372,29 @@ describe('JobSearchExplorer', () => {
     );
   });
 
+  it('applies the salary filter to the URL and the request', async () => {
+    mockSearch([result()]);
+    mockSearchParams = new URLSearchParams('q=engineer');
+    render(<JobSearchExplorer isAuthenticated />);
+    await findCard('Frontend Engineer');
+
+    fireEvent.change(screen.getByLabelText(/filter by minimum salary/i), {
+      target: { value: '150000' },
+    });
+
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith(
+        expect.stringContaining('salary_min=150000'),
+        expect.anything()
+      )
+    );
+    await waitFor(() =>
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('salary_floor=150000')
+      )
+    );
+  });
+
   it('applies the location filter to the request', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
