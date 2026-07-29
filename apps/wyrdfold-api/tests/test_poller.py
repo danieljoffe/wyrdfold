@@ -1985,7 +1985,6 @@ async def test_url_validation_skips_known_rows(monkeypatch):
     URL validator — a known row's URL was validated at ingest and is
     url_health-monitored; re-validating per cycle is a HEAD storm and a
     transient upstream blip would null a working absolute_url."""
-    from unittest.mock import AsyncMock
 
     from app.config import settings as live_settings
     from app.services import poller as poller_mod
