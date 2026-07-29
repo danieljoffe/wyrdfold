@@ -173,6 +173,14 @@ class Settings(BaseSettings):
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 
+    # JSON-LD baseSalary fallback (#503): when a NEW row's JD text yields no
+    # salary, fetch its hosted posting page and read schema.org
+    # ``baseSalary`` (Lever/Ashby pages often carry structured pay their
+    # board APIs omit). Ships dark; the per-source cap bounds the extra
+    # fetch fan-out a cycle can add.
+    jsonld_salary_enabled: bool = False
+    jsonld_salary_max_fetches: int = 10
+
     # Periodic job URL health checks (see app/services/url_health.py).
     # Off by default. When enabled, the scheduler ticks every
     # ``url_health_tick_hours`` and HEAD-checks the oldest
