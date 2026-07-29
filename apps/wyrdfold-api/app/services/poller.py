@@ -62,6 +62,7 @@ from app.services.llm.provider_breaker import (
 from app.services.llm.provider_breaker import (
     trip_provider_fatal as _trip_provider_fatal,
 )
+from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -1776,6 +1777,7 @@ async def _poll_one_source(
                 continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -1785,6 +1787,10 @@ async def _poll_one_source(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
@@ -2988,6 +2994,7 @@ async def _poll_one_source_for_target(
                     continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -2997,6 +3004,10 @@ async def _poll_one_source_for_target(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,

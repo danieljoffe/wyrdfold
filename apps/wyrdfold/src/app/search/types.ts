@@ -8,6 +8,12 @@ export interface JobSearchResult {
   title: string;
   company_name: string;
   location: string | null;
+  // Structured parts parsed from `location` at ingest (#518) — compose with
+  // `formatLocation()`; null when the raw string was unparseable.
+  city: string | null;
+  state: string | null;
+  country: string | null;
+  location_remote: boolean | null;
   department: string | null;
   salary_text: string | null;
   absolute_url: string | null;

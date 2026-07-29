@@ -21,6 +21,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
+import { formatLocation } from '@/lib/formatLocation';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
 // `/search` now lives at the top level (auth-adaptive), so the targets flow —
@@ -271,7 +272,9 @@ function JobSearchCard({
    *  (#467 §11.1). The soft signup allusion lives only in the detail (§11.5). */
   isAuthenticated: boolean;
 }) {
-  const meta = [job.company_name, job.location].filter(Boolean).join(' · ');
+  const meta = [job.company_name, formatLocation(job)]
+    .filter(Boolean)
+    .join(' · ');
   const bound = inTargets.length > 0;
 
   return (

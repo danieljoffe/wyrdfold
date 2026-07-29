@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # a preview that links to the source) nor the legacy ``score``/``score_breakdown``
 # columns (search must carry no match score).
 _SEARCH_COLS = (
-    "id, title, company_name, location, department, "
-    "salary_text, absolute_url, first_seen_at, created_at"
+    "id, title, company_name, location, city, state, country, location_remote, "
+    "department, salary_text, absolute_url, first_seen_at, created_at"
 )
 
 # How many title-matching candidates to pull for Python re-ranking. This also
@@ -298,9 +298,7 @@ def attach_snippets(
         return
     ids = [r.id for r in results]  # ≤ page size, so no in_() chunking (#414 guard)
     try:
-        resp = (
-            supabase.table("jobs").select("id, description_html").in_("id", ids).execute()
-        )
+        resp = supabase.table("jobs").select("id, description_html").in_("id", ids).execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
     except Exception:
         logger.warning("snippet fetch failed; leaving snippets empty", exc_info=True)
