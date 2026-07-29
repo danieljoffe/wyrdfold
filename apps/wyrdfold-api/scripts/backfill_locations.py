@@ -44,35 +44,49 @@ def main() -> None:
 
     total = 0
     while True:
-        resp = (
-            supabase.table("jobs")
-            .select("id, location")
-            .not_.is_("location", "null")
-            .is_("city", "null")
-            .is_("state", "null")
-            .is_("country", "null")
-            .is_("location_remote", "null")
-            .limit(BATCH)
-            .execute()
-        )
-        rows = resp.data or []
-        if not rows:
-            break
+        try:
+            resp = (
+                supabase.table("jobs")
+                .select("id, location")
+                .not_.is_("location", "null")
+                .is_("city", "null")
+                .is_("state", "null")
+                .is_("country", "null")
+                .is_("location_remote", "null")
+                # Newest first: fresh postings are the ones users see on
+                # /search, so they get the canonical display soonest.
+                .order("created_at", desc=True)
+                .limit(BATCH)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                break
 
-        for row in rows:
-            loc = parse_location(row.get("location"))
-            supabase.table("jobs").update(
-                {
-                    "city": loc.city,
-                    "state": loc.state,
-                    "country": loc.country,
-                    # Always non-null after a parse attempt — this is the
-                    # "already processed" marker that keeps the select loop
-                    # converging even for unparseable strings.
-                    "location_remote": loc.remote,
-                }
-            ).eq("id", row["id"]).execute()
-            total += 1
+            for row in rows:
+                loc = parse_location(row.get("location"))
+                supabase.table("jobs").update(
+                    {
+                        "city": loc.city,
+                        "state": loc.state,
+                        "country": loc.country,
+                        # Always non-null after a parse attempt — this is the
+                        # "already processed" marker that keeps the select loop
+                        # converging even for unparseable strings.
+                        "location_remote": loc.remote,
+                    }
+                ).eq("id", row["id"]).execute()
+                total += 1
+        except Exception as exc:
+            # The Supabase edge terminates a single HTTP/2 connection after
+            # ~20k streams (observed: RemoteProtocolError ConnectionTerminated
+            # at last_stream_id 19999) and the sync client holds ONE
+            # connection for its lifetime. The loop is idempotent, so a fresh
+            # client resumes exactly where the dead one stopped.
+            print(f"reconnecting after {type(exc).__name__}: {exc}", flush=True)
+            supabase = create_client(url, key)
+            time.sleep(2)
+            continue
 
         print(f"backfilled {total} rows…", flush=True)
         time.sleep(PAUSE_SECONDS)
