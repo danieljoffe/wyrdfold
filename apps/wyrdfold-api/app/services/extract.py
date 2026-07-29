@@ -6,6 +6,7 @@ Three-tier extraction cascade:
   3. Firecrawl for JS-rendered pages (gated behind API key)
 """
 
+import html
 import logging
 import re
 from typing import Any
@@ -20,7 +21,7 @@ from app.services.jsonld import (
     _get_location,
     _get_str,
 )
-from app.services.scoring import strip_html
+from app.services.scoring import _TAGGY_RE, strip_html
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,40 @@ def extract_salary_from_text(text: str) -> str | None:
     return m.group(0).strip().rstrip(",.;:")
 
 
+# A leading escaped tag at ANY escape depth: "&lt;", "&amp;lt;",
+# "&amp;amp;lt;", … — each extra escape round wraps the & as "&amp;".
+_ESCAPED_DOC_PREFIX_RE = re.compile(r"^&(?:amp;)*lt;")
+
+
+def unescape_html_doc(description_html: str | None) -> str | None:
+    """Heal a stored JD whose ENTIRE payload was HTML-escaped at ingestion.
+
+    Greenhouse's Job Board API delivered ``content`` escaped (#500 — fixed at
+    ingestion in ``services/greenhouse.py``), so rows stored before that fix
+    hold ``&lt;div ...`` verbatim. The poller only re-delivers content for
+    rows that pass TODAY'S free gates on a polled, still-listed board, so the
+    stored backlog never converges on its own — this is the column-level heal
+    the backfill script applies.
+
+    Returns the unescaped document, or ``None`` when the input doesn't look
+    like a fully-escaped document (already-real markup, prose, empty) —
+    callers must treat ``None`` as "leave the row alone". Bounded: at most 3
+    unescape rounds (prod holds only single-escaped rows; deeper depths are
+    handled defensively), and the result must start with a real tag shape or
+    the heal is rejected — never corrupt a row on a false positive.
+    """
+    if not description_html or not _ESCAPED_DOC_PREFIX_RE.match(description_html):
+        return None
+    healed = description_html
+    for _ in range(3):
+        if not _ESCAPED_DOC_PREFIX_RE.match(healed):
+            break
+        healed = html.unescape(healed)
+    if healed.startswith("<") and _TAGGY_RE.match(healed):
+        return healed
+    return None
+
+
 def extract_salary_from_html(description_html: str | None) -> str | None:
     """Salary from a JD's HTML — the ONE entry point for every stored-HTML
     caller (poller, manual ingest, backfill, JSON-LD descriptions).
@@ -153,9 +188,7 @@ def extract_salary_from_html(description_html: str | None) -> str | None:
             ".pay-range"
         )
         if el is not None:
-            structural = extract_salary_from_text(
-                " ".join(el.get_text(separator=" ").split())
-            )
+            structural = extract_salary_from_text(" ".join(el.get_text(separator=" ").split()))
             if structural:
                 return structural
     return extract_salary_from_text(strip_html(description_html))

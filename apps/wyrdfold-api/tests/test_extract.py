@@ -237,10 +237,7 @@ class TestSalaryProdRegressionCorpus:
 
     def test_range_keeps_trailing_iso_code(self):
         # The Greenhouse pay-range text (Reddit): the USD suffix now survives.
-        assert (
-            extract_salary_from_text("is: $190,800 — $267,100 USD")
-            == "$190,800 — $267,100 USD"
-        )
+        assert extract_salary_from_text("is: $190,800 — $267,100 USD") == "$190,800 — $267,100 USD"
 
 
 class TestSalaryNewCapabilities:
@@ -295,9 +292,7 @@ class TestSalaryFromHtmlStructural:
         assert extract_salary_from_html(html) == "$190,800 — $267,100 USD"
 
     def test_structural_block_wins_over_earlier_prose_figure(self):
-        html = (
-            "<p>We manage $2,000 - $5,000 ad budgets daily.</p>" + self._PAY_DIV
-        )
+        html = "<p>We manage $2,000 - $5,000 ad budgets daily.</p>" + self._PAY_DIV
         # Prose regex alone would grab the ad-budget range first; the
         # structural parse must return the real compensation instead.
         assert extract_salary_from_html(html) == "$190,800 — $267,100 USD"
@@ -316,3 +311,60 @@ class TestSalaryFromHtmlStructural:
     def test_none_and_salary_free_html(self):
         assert extract_salary_from_html(None) is None
         assert extract_salary_from_html("<p>Great benefits and PTO.</p>") is None
+
+
+class TestUnescapeHtmlDoc:
+    """Column-level heal for pre-#500 escaped rows (backfill_escaped_html)."""
+
+    # Verbatim prod shape: the ENTIRE Greenhouse payload stored escaped.
+    _ESCAPED = (
+        "&lt;div class=&quot;content-intro&quot;&gt;&lt;p&gt;About the team&lt;/p&gt;"
+        "&lt;div class=&quot;content-pay-transparency&quot;&gt;&lt;div class=&quot;pay-input&quot;&gt;"
+        "&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$190,800&lt;/span&gt;"
+        "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+        "&lt;span&gt;$267,100 USD&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;"
+    )
+
+    def test_single_escaped_doc_heals_to_real_markup(self):
+        from app.services.extract import unescape_html_doc
+
+        healed = unescape_html_doc(self._ESCAPED)
+        assert healed is not None
+        assert healed.startswith('<div class="content-intro">')
+        assert '<div class="pay-range">' in healed
+
+    def test_double_escaped_doc_heals(self):
+        import html as html_mod
+
+        from app.services.extract import unescape_html_doc
+
+        double = html_mod.escape(self._ESCAPED)  # &amp;lt;div…
+        healed = unescape_html_doc(double)
+        assert healed is not None and healed.startswith('<div class="content-intro">')
+
+    def test_healed_doc_unlocks_structural_salary_parse(self):
+        # The whole point of the column heal: the escaped form defeats the
+        # structural pay-range parse; the healed form yields the EXACT
+        # canonical range (not just token-stream luck).
+        from app.services.extract import extract_salary_from_html, unescape_html_doc
+
+        healed = unescape_html_doc(self._ESCAPED)
+        assert extract_salary_from_html(healed) == "$190,800 — $267,100 USD"
+
+    def test_already_real_markup_is_left_alone(self):
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc("<div><p>Real markup.</p></div>") is None
+
+    def test_prose_with_leading_escaped_lt_is_rejected(self):
+        # "&lt; 5% raises…" unescapes to "< 5% raises…" — startswith("<") but
+        # NOT a tag shape. The healer must refuse rather than corrupt prose.
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc("&lt; 5% raises are typical here") is None
+
+    def test_none_and_empty_are_rejected(self):
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc(None) is None
+        assert unescape_html_doc("") is None
