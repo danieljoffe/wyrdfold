@@ -9,6 +9,7 @@ import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
+import { formatLocation } from '@/lib/formatLocation';
 import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';
 import LogisticsChips from './LogisticsChips';
@@ -134,7 +135,7 @@ export default function JobCard({
         </dd>
         <dt className='text-text-tertiary'>Location</dt>
         <dd className='truncate text-right text-text-secondary'>
-          {job.location ?? '—'}
+          {formatLocation(job) || '—'}
         </dd>
         <dt className='text-text-tertiary'>Salary</dt>
         <dd className='truncate text-right text-text-secondary'>

@@ -34,6 +34,7 @@ from app.services.extract import (
     extract_salary_from_html,
 )
 from app.services.jd_parser import parse_jd
+from app.services.location_parse import parse_location
 from app.services.sanitize import sanitize_html
 from app.services.target_scoring import score_and_upsert, update_global_score
 
@@ -90,12 +91,17 @@ async def materialize_and_score_job(
     if not salary and description_html:
         salary = extract_salary_from_html(description_html)
 
+    loc = parse_location(location)
     row: dict[str, Any] = {
         "external_id": job_external_id(final_url),
         "source_id": MANUAL_SOURCE_ID,
         "title": title,
         "company_name": company_name,
         "location": location,
+        "city": loc.city,
+        "state": loc.state,
+        "country": loc.country,
+        "location_remote": loc.remote,
         "department": None,
         "description_html": sanitize_html(description_html) if description_html else "",
         "absolute_url": final_url,

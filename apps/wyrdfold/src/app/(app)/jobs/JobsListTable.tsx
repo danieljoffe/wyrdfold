@@ -5,6 +5,7 @@ import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
 import Button from '@/components/kit/Button';
 import ScoreBadge from '@/components/ScoreBadge';
+import { formatLocation } from '@/lib/formatLocation';
 import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';
 import JobDetailPanel from './JobDetailPanel';
@@ -235,7 +236,7 @@ export default function JobsListTable({
                     {job.salary_text ?? '—'}
                   </td>
                   <td className='px-3 py-2 text-text-tertiary truncate max-w-[150px]'>
-                    {job.location ?? '—'}
+                    {formatLocation(job) || '—'}
                   </td>
                 </tr>
                 {expandedId === job.id && (

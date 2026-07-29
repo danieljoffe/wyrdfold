@@ -11,6 +11,7 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
+import { formatLocation } from '@/lib/formatLocation';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
@@ -251,9 +252,9 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
                 </Badge>
               )}
             </div>
-            {posting.location && (
+            {formatLocation(posting) && (
               <Text variant='caption' className='text-text-secondary'>
-                {posting.location}
+                {formatLocation(posting)}
               </Text>
             )}
             {posting.salary_text && (

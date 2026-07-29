@@ -19,6 +19,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import LinkButton from '@/components/kit/LinkButton';
 import ScoreBadge from '@/components/ScoreBadge';
 import type { JobPosting } from './jobs/types';
+import { formatLocation } from '@/lib/formatLocation';
 
 export interface DashboardInitial {
   topMatches: JobPosting[];
@@ -235,7 +236,9 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                     className='truncate text-text-secondary'
                   >
                     {posting.company_name}
-                    {posting.location ? ` · ${posting.location}` : ''}
+                    {formatLocation(posting)
+                      ? ` · ${formatLocation(posting)}`
+                      : ''}
                   </Text>
                 </div>
               </Link>
