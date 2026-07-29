@@ -2028,15 +2028,14 @@ async def test_url_validation_skips_known_rows(monkeypatch):
     seen_urls: list[str] = []
 
     class _Valid:
-        is_valid = True
-        warnings: list[str] = []
-        final_url = None
+        def __init__(self, url: str) -> None:
+            self.is_valid = True
+            self.warnings: list[str] = []
+            self.final_url = url
 
     async def fake_validate(url: str) -> object:
         seen_urls.append(url)
-        v = _Valid()
-        v.final_url = url
-        return v
+        return _Valid(url)
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
