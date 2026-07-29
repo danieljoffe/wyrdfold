@@ -16,6 +16,11 @@ import { Badge } from '@danieljoffe/shared-ui/Badge';
 import type { ButtonVariant } from '@danieljoffe/shared-ui/Button';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
+import {
+  Dropdown,
+  type DropdownItem,
+  type DropdownTriggerProps,
+} from '@danieljoffe/shared-ui/Dropdown';
 import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
@@ -100,8 +105,12 @@ export function CompanyAvatar({
  * adds THIS existing posting to the chosen one: the API scores the already-
  * ingested posting against that target and saves it to the pipeline. Distinct
  * from "Create target", which derives a whole NEW target from the listing URL.
- * Mirrors JobsLocationFilter's open / outside-click / Escape idiom for
- * consistent behaviour + a11y.
+ *
+ * Composed on shared-ui Dropdown (#485, 0.10+ composable trigger): the
+ * primitive owns open state, outside-click/Escape dismiss, focus return, and
+ * menu keyboard nav; we keep the design-system Button trigger via the
+ * render-function `trigger` and stay CONTROLLED so the menu can lazily load
+ * targets on open, stay open through the async pick, and close on success.
  */
 export function AddToTargetMenu({
   jobId,
@@ -124,47 +133,12 @@ export function AddToTargetMenu({
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
-  const wrapperRef = useRef<HTMLDivElement>(null);
   const { targets, loading, error, ensureLoaded } = source;
 
-  const toggle = () => {
-    const next = !open;
+  const handleOpenChange = (next: boolean) => {
     setOpen(next);
-    if (next) ensureLoaded(); // lazy fetch on first open — side effect stays
-    // out of the setState updater (which must be pure; ensureLoaded sets the
-    // parent's state).
+    if (next) ensureLoaded(); // lazy fetch on first open
   };
-
-  // Close on outside click / Escape — same idiom as JobsLocationFilter. The kit
-  // Button isn't a forwardRef, so restore focus to the trigger by querying it
-  // inside the wrapper rather than holding a ref to it.
-  useEffect(() => {
-    if (!open) return;
-    function onDown(e: MouseEvent) {
-      if (!wrapperRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
-        // Close the menu only — swallow the Escape so a hosting Modal (which
-        // listens for Escape on window) doesn't also close on the same
-        // keystroke. Menu closed → its listener is gone → Escape closes the
-        // modal, giving the expected nested-dismiss order (#467 §11).
-        e.stopPropagation();
-        setOpen(false);
-        (
-          wrapperRef.current?.querySelector(
-            'button[aria-haspopup="menu"]'
-          ) as HTMLElement | null
-        )?.focus();
-      }
-    }
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
 
   const pick = async (target: TargetOption) => {
     setPendingId(target.id);
@@ -188,60 +162,90 @@ export function AddToTargetMenu({
     }
   };
 
-  return (
-    <div ref={wrapperRef} className='relative'>
-      <Button
-        name='search-add-to-target'
-        variant={variant}
-        size='sm'
-        aria-haspopup='menu'
-        aria-expanded={open}
-        onClick={toggle}
-      >
-        {label}
-        <ChevronDown className='ml-1 size-3.5 opacity-70' aria-hidden />
-      </Button>
-      {open && (
-        <div
-          role='menu'
-          aria-label='Add to one of your targets'
-          className='absolute left-0 z-20 mt-1 max-h-64 w-64 max-w-[calc(100vw-2rem)] overflow-auto rounded-lg border border-border bg-surface-elevated p-1 shadow-lg'
-        >
-          {loading && (
-            <div className='flex items-center gap-2 px-2 py-1.5' role='status'>
+  // Whole-menu loading / error / empty states as disabled status items — the
+  // documented Dropdown idiom for async menus.
+  const items: DropdownItem[] = loading
+    ? [
+        {
+          label: 'Loading targets…',
+          disabled: true,
+          content: (
+            <span className='flex items-center gap-2' role='status'>
               <Spinner size='sm' aria-label='Loading targets' />
               <Text variant='meta'>Loading targets…</Text>
-            </div>
-          )}
-          {error && !loading && (
-            <Text variant='error' role='alert' className='block px-2 py-1.5'>
-              {error}
-            </Text>
-          )}
-          {targets && !loading && targets.length === 0 && (
-            <Text
-              variant='meta'
-              className='block px-2 py-1.5 text-text-secondary'
-            >
-              No targets yet — create one first.
-            </Text>
-          )}
-          {targets &&
-            !loading &&
-            targets.map(t => (
-              <button
-                key={t.id}
-                type='button'
-                role='menuitem'
-                onClick={() => pick(t)}
-                disabled={pendingId !== null}
-                className='block w-full truncate rounded-md px-2 py-1.5 text-left text-sm text-text-primary hover:bg-surface-tertiary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-60'
-              >
-                {pendingId === t.id ? 'Adding…' : t.label}
-              </button>
-            ))}
-        </div>
-      )}
+            </span>
+          ),
+        },
+      ]
+    : error
+      ? [
+          {
+            label: error,
+            disabled: true,
+            content: (
+              <Text variant='error' role='alert'>
+                {error}
+              </Text>
+            ),
+          },
+        ]
+      : !targets || targets.length === 0
+        ? [
+            {
+              label: 'No targets yet — create one first.',
+              disabled: true,
+            },
+          ]
+        : targets.map(t => ({
+            label: pendingId === t.id ? 'Adding…' : t.label,
+            onClick: () => void pick(t),
+            disabled: pendingId !== null && pendingId !== t.id,
+            loading: pendingId === t.id,
+            // The pick is async: keep the menu open while pending; success
+            // closes it explicitly via the controlled state above.
+            closeOnClick: false,
+          }));
+
+  // Escape guard: shared-ui Modal listens for Escape on window, and the
+  // Dropdown's own Escape handler (on its wrapper) doesn't stop
+  // propagation — without a guard, one keystroke closes BOTH the menu and a
+  // hosting detail modal. A NATIVE bubble-phase listener on this wrapper
+  // sits in the true DOM path (menu → dropdown wrapper → HERE → … → window)
+  // and swallows exactly the Escapes the menu CONSUMED: the primitive calls
+  // preventDefault() before closing, so ``defaultPrevented`` marks them.
+  // (Gating on our own open state instead is a race — keydown is a discrete
+  // event, so the close's setState flushes synchronously mid-dispatch and
+  // the state already reads closed by the time the event bubbles here.)
+  const escapeGuardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = escapeGuardRef.current;
+    if (!el) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && e.defaultPrevented) e.stopPropagation();
+    };
+    el.addEventListener('keydown', onKeyDown);
+    return () => el.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  return (
+    <div ref={escapeGuardRef}>
+      <Dropdown
+        open={open}
+        onOpenChange={handleOpenChange}
+        items={items}
+        panelClassName='max-h-64 w-64 max-w-[calc(100vw-2rem)] overflow-auto'
+        trigger={(triggerProps: DropdownTriggerProps) => (
+          <Button
+            name='search-add-to-target'
+            variant={variant}
+            size='sm'
+            {...triggerProps}
+          >
+            {label}
+            <ChevronDown className='ml-1 size-3.5 opacity-70' aria-hidden />
+          </Button>
+        )}
+      />
     </div>
   );
 }
