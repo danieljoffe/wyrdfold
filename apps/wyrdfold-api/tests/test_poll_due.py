@@ -218,3 +218,81 @@ async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPat
     backfill.assert_awaited_once()  # ...but the sweep still ran
     assert backfill.await_args is not None
     assert backfill.await_args.args[1] == 50  # with the configured batch
+
+
+# ---- per-cycle source cap (#514 residual) ----------------------------------
+
+
+def _three_due_sources() -> list[dict[str, Any]]:
+    """Three due sources, deliberately listed in NON-overdue order so the
+    cap's most-overdue-first sort (never-polled at the very front) is
+    observable, not an accident of input order."""
+    ten_h = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    six_h = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
+    return [
+        _src(last_polled_at=six_h, poll_interval_minutes=240, company="Newer Co"),
+        _src(last_polled_at=ten_h, poll_interval_minutes=240, company="Oldest Co"),
+        _src(last_polled_at=None, poll_interval_minutes=240, company="Never Co"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_caps_batch_most_overdue_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With more due sources than ``poll_max_sources_per_cycle``, only the cap
+    is polled this tick — and it's the MOST overdue slice (never-polled first,
+    then oldest ``last_polled_at``), so a backlog drains oldest-first instead
+    of re-attempting the whole fleet and tripping the cycle watchdog."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "poll_max_sources_per_cycle", 2)
+    supabase = _supabase_returning(_three_due_sources())
+
+    with (
+        patch("app.services.poller.get_latest_optimized", return_value=None),
+        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        result = await poll_due_sources(supabase)
+
+    assert poll_one.await_count == 2
+    polled = {call.args[0]["company_name"] for call in poll_one.await_args_list}
+    assert polled == {"Never Co", "Oldest Co"}  # the 6h-overdue one waits a tick
+    assert result.sources_polled == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_cap_zero_is_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``poll_max_sources_per_cycle=0`` keeps the legacy poll-everything-due
+    behavior."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "poll_max_sources_per_cycle", 0)
+    supabase = _supabase_returning(_three_due_sources())
+
+    with (
+        patch("app.services.poller.get_latest_optimized", return_value=None),
+        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        result = await poll_due_sources(supabase)
+
+    assert poll_one.await_count == 3
+    assert result.sources_polled == 3

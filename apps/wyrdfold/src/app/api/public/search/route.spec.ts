@@ -80,7 +80,8 @@ describe('GET /api/public/search (public BFF forwarder)', () => {
 
     const res = await GET(
       makeRequest(
-        'q=frontend&page_size=20&offset=0&location=Remote&posted_within_days=7'
+        'q=frontend&page_size=20&offset=0&location=Remote&posted_within_days=7' +
+          '&salary_floor=150000'
       )
     );
 
@@ -102,6 +103,7 @@ describe('GET /api/public/search (public BFF forwarder)', () => {
     expect(params.get('offset')).toBe('0');
     expect(params.get('location')).toBe('Remote');
     expect(params.get('posted_within_days')).toBe('7');
+    expect(params.get('salary_floor')).toBe('150000');
   });
 
   it('trims q and only forwards the known search params (drops unknown args)', async () => {

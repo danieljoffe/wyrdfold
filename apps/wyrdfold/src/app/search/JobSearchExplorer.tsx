@@ -16,6 +16,11 @@ import { Badge } from '@danieljoffe/shared-ui/Badge';
 import type { ButtonVariant } from '@danieljoffe/shared-ui/Button';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Input } from '@danieljoffe/shared-ui/Input';
+import {
+  Dropdown,
+  type DropdownItem,
+  type DropdownTriggerProps,
+} from '@danieljoffe/shared-ui/Dropdown';
 import { Select, type SelectOption } from '@danieljoffe/shared-ui/Select';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
@@ -46,6 +51,19 @@ const RECENCY_OPTIONS: SelectOption[] = [
   { value: '7', label: 'Past week' },
   { value: '30', label: 'Past month' },
   { value: '90', label: 'Past 3 months' },
+];
+
+/** Salary-floor presets (yearly USD). The value is the `salary_min` carried in
+ *  the URL and sent to the API as `salary_floor` (`''` = any salary). Rows whose
+ *  posted yearly-USD range reaches the floor pass; roles without a posted
+ *  salary are excluded while a floor is active. */
+const SALARY_OPTIONS: SelectOption[] = [
+  { value: '', label: 'Any salary' },
+  { value: '100000', label: '$100k+' },
+  { value: '150000', label: '$150k+' },
+  { value: '200000', label: '$200k+' },
+  { value: '250000', label: '$250k+' },
+  { value: '300000', label: '$300k+' },
 ];
 
 /** Two-letter monogram from a company name. */
@@ -100,8 +118,12 @@ export function CompanyAvatar({
  * adds THIS existing posting to the chosen one: the API scores the already-
  * ingested posting against that target and saves it to the pipeline. Distinct
  * from "Create target", which derives a whole NEW target from the listing URL.
- * Mirrors JobsLocationFilter's open / outside-click / Escape idiom for
- * consistent behaviour + a11y.
+ *
+ * Composed on shared-ui Dropdown (#485, 0.10+ composable trigger): the
+ * primitive owns open state, outside-click/Escape dismiss, focus return, and
+ * menu keyboard nav; we keep the design-system Button trigger via the
+ * render-function `trigger` and stay CONTROLLED so the menu can lazily load
+ * targets on open, stay open through the async pick, and close on success.
  */
 export function AddToTargetMenu({
   jobId,
@@ -124,47 +146,12 @@ export function AddToTargetMenu({
   const { toast } = useToast();
   const [open, setOpen] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
-  const wrapperRef = useRef<HTMLDivElement>(null);
   const { targets, loading, error, ensureLoaded } = source;
 
-  const toggle = () => {
-    const next = !open;
+  const handleOpenChange = (next: boolean) => {
     setOpen(next);
-    if (next) ensureLoaded(); // lazy fetch on first open — side effect stays
-    // out of the setState updater (which must be pure; ensureLoaded sets the
-    // parent's state).
+    if (next) ensureLoaded(); // lazy fetch on first open
   };
-
-  // Close on outside click / Escape — same idiom as JobsLocationFilter. The kit
-  // Button isn't a forwardRef, so restore focus to the trigger by querying it
-  // inside the wrapper rather than holding a ref to it.
-  useEffect(() => {
-    if (!open) return;
-    function onDown(e: MouseEvent) {
-      if (!wrapperRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') {
-        // Close the menu only — swallow the Escape so a hosting Modal (which
-        // listens for Escape on window) doesn't also close on the same
-        // keystroke. Menu closed → its listener is gone → Escape closes the
-        // modal, giving the expected nested-dismiss order (#467 §11).
-        e.stopPropagation();
-        setOpen(false);
-        (
-          wrapperRef.current?.querySelector(
-            'button[aria-haspopup="menu"]'
-          ) as HTMLElement | null
-        )?.focus();
-      }
-    }
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
 
   const pick = async (target: TargetOption) => {
     setPendingId(target.id);
@@ -188,60 +175,90 @@ export function AddToTargetMenu({
     }
   };
 
-  return (
-    <div ref={wrapperRef} className='relative'>
-      <Button
-        name='search-add-to-target'
-        variant={variant}
-        size='sm'
-        aria-haspopup='menu'
-        aria-expanded={open}
-        onClick={toggle}
-      >
-        {label}
-        <ChevronDown className='ml-1 size-3.5 opacity-70' aria-hidden />
-      </Button>
-      {open && (
-        <div
-          role='menu'
-          aria-label='Add to one of your targets'
-          className='absolute left-0 z-20 mt-1 max-h-64 w-64 max-w-[calc(100vw-2rem)] overflow-auto rounded-lg border border-border bg-surface-elevated p-1 shadow-lg'
-        >
-          {loading && (
-            <div className='flex items-center gap-2 px-2 py-1.5' role='status'>
+  // Whole-menu loading / error / empty states as disabled status items — the
+  // documented Dropdown idiom for async menus.
+  const items: DropdownItem[] = loading
+    ? [
+        {
+          label: 'Loading targets…',
+          disabled: true,
+          content: (
+            <span className='flex items-center gap-2' role='status'>
               <Spinner size='sm' aria-label='Loading targets' />
               <Text variant='meta'>Loading targets…</Text>
-            </div>
-          )}
-          {error && !loading && (
-            <Text variant='error' role='alert' className='block px-2 py-1.5'>
-              {error}
-            </Text>
-          )}
-          {targets && !loading && targets.length === 0 && (
-            <Text
-              variant='meta'
-              className='block px-2 py-1.5 text-text-secondary'
-            >
-              No targets yet — create one first.
-            </Text>
-          )}
-          {targets &&
-            !loading &&
-            targets.map(t => (
-              <button
-                key={t.id}
-                type='button'
-                role='menuitem'
-                onClick={() => pick(t)}
-                disabled={pendingId !== null}
-                className='block w-full truncate rounded-md px-2 py-1.5 text-left text-sm text-text-primary hover:bg-surface-tertiary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-60'
-              >
-                {pendingId === t.id ? 'Adding…' : t.label}
-              </button>
-            ))}
-        </div>
-      )}
+            </span>
+          ),
+        },
+      ]
+    : error
+      ? [
+          {
+            label: error,
+            disabled: true,
+            content: (
+              <Text variant='error' role='alert'>
+                {error}
+              </Text>
+            ),
+          },
+        ]
+      : !targets || targets.length === 0
+        ? [
+            {
+              label: 'No targets yet — create one first.',
+              disabled: true,
+            },
+          ]
+        : targets.map(t => ({
+            label: pendingId === t.id ? 'Adding…' : t.label,
+            onClick: () => void pick(t),
+            disabled: pendingId !== null && pendingId !== t.id,
+            loading: pendingId === t.id,
+            // The pick is async: keep the menu open while pending; success
+            // closes it explicitly via the controlled state above.
+            closeOnClick: false,
+          }));
+
+  // Escape guard: shared-ui Modal listens for Escape on window, and the
+  // Dropdown's own Escape handler (on its wrapper) doesn't stop
+  // propagation — without a guard, one keystroke closes BOTH the menu and a
+  // hosting detail modal. A NATIVE bubble-phase listener on this wrapper
+  // sits in the true DOM path (menu → dropdown wrapper → HERE → … → window)
+  // and swallows exactly the Escapes the menu CONSUMED: the primitive calls
+  // preventDefault() before closing, so ``defaultPrevented`` marks them.
+  // (Gating on our own open state instead is a race — keydown is a discrete
+  // event, so the close's setState flushes synchronously mid-dispatch and
+  // the state already reads closed by the time the event bubbles here.)
+  const escapeGuardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = escapeGuardRef.current;
+    if (!el) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && e.defaultPrevented) e.stopPropagation();
+    };
+    el.addEventListener('keydown', onKeyDown);
+    return () => el.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  return (
+    <div ref={escapeGuardRef}>
+      <Dropdown
+        open={open}
+        onOpenChange={handleOpenChange}
+        items={items}
+        panelClassName='max-h-64 w-64 max-w-[calc(100vw-2rem)] overflow-auto'
+        trigger={(triggerProps: DropdownTriggerProps) => (
+          <Button
+            name='search-add-to-target'
+            variant={variant}
+            size='sm'
+            {...triggerProps}
+          >
+            {label}
+            <ChevronDown className='ml-1 size-3.5 opacity-70' aria-hidden />
+          </Button>
+        )}
+      />
     </div>
   );
 }
@@ -381,6 +398,7 @@ export default function JobSearchExplorer({
   const urlQ = (searchParams.get('q') ?? '').trim();
   const urlLocation = searchParams.get('location') ?? '';
   const urlDays = searchParams.get('posted_within') ?? '';
+  const urlSalary = searchParams.get('salary_min') ?? '';
 
   // Text-input drafts, seeded from the URL and re-synced whenever it changes
   // underneath us (back/forward). Submitting commits them back to the URL.
@@ -406,6 +424,7 @@ export default function JobSearchExplorer({
       q: string;
       location: string;
       days: string;
+      salary: string;
       offset: number;
     }) => {
       const sp = new URLSearchParams({
@@ -415,6 +434,7 @@ export default function JobSearchExplorer({
       });
       if (opts.location.trim()) sp.set('location', opts.location.trim());
       if (opts.days) sp.set('posted_within_days', opts.days);
+      if (opts.salary) sp.set('salary_floor', opts.salary);
       const res = await fetch(`${searchEndpoint}?${sp.toString()}`);
       if (!res.ok) throw new Error(await extractApiError(res, 'Search failed'));
       return (await res.json()) as JobSearchResponse;
@@ -470,7 +490,13 @@ export default function JobSearchExplorer({
     setLoading(true);
     setError(null);
     setResults(null);
-    fetchPage({ q: urlQ, location: urlLocation, days: urlDays, offset: 0 })
+    fetchPage({
+      q: urlQ,
+      location: urlLocation,
+      days: urlDays,
+      salary: urlSalary,
+      offset: 0,
+    })
       .then(data => {
         if (cancelled) return;
         setResults(data.results);
@@ -490,18 +516,19 @@ export default function JobSearchExplorer({
     return () => {
       cancelled = true;
     };
-  }, [urlQ, urlLocation, urlDays, fetchPage, fetchMembership]);
+  }, [urlQ, urlLocation, urlDays, urlSalary, fetchPage, fetchMembership]);
 
   // Commit search state to the URL (replace → the /search entry updates in place,
   // so "back" from a listing lands on this exact query+filters rather than a
   // stack of every keystroke). The effect above re-runs the search off the new
   // URL. `scroll:false` keeps the viewport put on a filter tweak.
   const commit = useCallback(
-    (next: { q: string; location: string; days: string }) => {
+    (next: { q: string; location: string; days: string; salary: string }) => {
       const params = new URLSearchParams();
       if (next.q.trim()) params.set('q', next.q.trim());
       if (next.location.trim()) params.set('location', next.location.trim());
       if (next.days) params.set('posted_within', next.days);
+      if (next.salary) params.set('salary_min', next.salary);
       const qs = params.toString();
       router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
     },
@@ -509,10 +536,18 @@ export default function JobSearchExplorer({
   );
 
   const submitSearch = () =>
-    commit({ q: draftQ, location: draftLocation, days: urlDays });
+    commit({
+      q: draftQ,
+      location: draftLocation,
+      days: urlDays,
+      salary: urlSalary,
+    });
   const changeRecency = (days: string) =>
-    commit({ q: draftQ, location: draftLocation, days });
-  const clearFilters = () => commit({ q: draftQ, location: '', days: '' });
+    commit({ q: draftQ, location: draftLocation, days, salary: urlSalary });
+  const changeSalary = (salary: string) =>
+    commit({ q: draftQ, location: draftLocation, days: urlDays, salary });
+  const clearFilters = () =>
+    commit({ q: draftQ, location: '', days: '', salary: '' });
 
   const loadMore = useCallback(async () => {
     if (!results) return;
@@ -523,6 +558,7 @@ export default function JobSearchExplorer({
         q: urlQ,
         location: urlLocation,
         days: urlDays,
+        salary: urlSalary,
         offset: results.length,
       });
       setResults(prev => [...(prev ?? []), ...data.results]);
@@ -533,9 +569,17 @@ export default function JobSearchExplorer({
     } finally {
       setLoadingMore(false);
     }
-  }, [fetchPage, fetchMembership, urlQ, urlLocation, urlDays, results]);
+  }, [
+    fetchPage,
+    fetchMembership,
+    urlQ,
+    urlLocation,
+    urlDays,
+    urlSalary,
+    results,
+  ]);
 
-  const hasActiveFilters = Boolean(urlLocation.trim() || urlDays);
+  const hasActiveFilters = Boolean(urlLocation.trim() || urlDays || urlSalary);
   const onEnter = (e: ReactKeyboardEvent) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -619,6 +663,18 @@ export default function JobSearchExplorer({
               value={urlDays}
               onChange={e => changeRecency(e.target.value)}
               options={RECENCY_OPTIONS}
+            />
+          </div>
+          {/* Salary floor — same Select control as recency; yearly-USD
+              semantics live in the API (roles without a posted salary are
+              excluded while a floor is active). */}
+          <div className='w-36'>
+            <Select
+              id='job-search-salary'
+              aria-label='Filter by minimum salary'
+              value={urlSalary}
+              onChange={e => changeSalary(e.target.value)}
+              options={SALARY_OPTIONS}
             />
           </div>
           {hasActiveFilters && (

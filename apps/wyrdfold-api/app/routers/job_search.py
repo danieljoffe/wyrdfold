@@ -45,9 +45,7 @@ _CACHE_PREFIX = "jobsearch:"
 async def search_jobs_endpoint(
     request: Request,
     q: str = Query(..., min_length=1, max_length=120, description="Title / keyword query"),
-    page_size: int = Query(
-        job_search.DEFAULT_PAGE_SIZE, ge=1, le=job_search.MAX_PAGE_SIZE
-    ),
+    page_size: int = Query(job_search.DEFAULT_PAGE_SIZE, ge=1, le=job_search.MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0, le=job_search.MAX_OFFSET, description="Pagination offset"),
     location: str | None = Query(
         None, max_length=100, description="Case-insensitive location substring filter"
@@ -57,6 +55,12 @@ async def search_jobs_endpoint(
         ge=1,
         le=job_search.MAX_POSTED_WITHIN_DAYS,
         description="Only postings created within the last N days",
+    ),
+    salary_floor: int | None = Query(
+        None,
+        ge=1,
+        le=job_search.MAX_SALARY_FLOOR,
+        description="Only postings whose yearly USD salary range reaches this floor",
     ),
     supabase: Client = Depends(get_supabase),
 ) -> JobSearchResponse:
@@ -75,7 +79,9 @@ async def search_jobs_endpoint(
         offset=offset,
         location=(location or "").strip().lower(),
         posted_within_days=posted_within_days or 0,
+        salary_floor=salary_floor or 0,
     )
+
     def _instrument(resp: JobSearchResponse) -> None:
         # Fire-and-forget funnel metrics (#467 §10 PR6): O(1) in-memory
         # enqueue, flushed in bulk by a background task — never a request
@@ -107,10 +113,9 @@ async def search_jobs_endpoint(
         offset=offset,
         location=location,
         posted_within_days=posted_within_days,
+        salary_floor=salary_floor,
     )
-    response = JobSearchResponse(
-        query=q, count=len(results), has_more=has_more, results=results
-    )
+    response = JobSearchResponse(query=q, count=len(results), has_more=has_more, results=results)
     job_list_cache.set(cache_key, response)
     _instrument(response)
     return response

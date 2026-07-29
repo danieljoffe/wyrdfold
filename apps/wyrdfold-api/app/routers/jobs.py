@@ -47,6 +47,7 @@ from app.services.extract import (
     _extract_from_firecrawl,
     extract_job_from_html,
     extract_salary_from_html,
+    salary_columns,
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
@@ -110,6 +111,7 @@ _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, "
     "city, state, country, location_remote, department, "
     "absolute_url, score, score_breakdown, salary_text, "
+    "salary_min, salary_max, salary_currency, salary_period, "
     "greenhouse_updated_at, first_seen_at, created_at"
 )
 
@@ -1075,9 +1077,7 @@ def _list_jobs_for_target(
                 search=search,
                 cursor=cursor,
                 # #457: the RPC blends this target's custom weights DB-side.
-                weights_by_target=(
-                    {target_id: axis_weights} if axis_weights is not None else None
-                ),
+                weights_by_target=({target_id: axis_weights} if axis_weights is not None else None),
                 user_id=user_id,
             )
         except _RpcIneligibleError as exc:
@@ -1478,25 +1478,33 @@ def _apply_location_filter(
     ]
 
 
-def _logistics_passes(logistics: dict[str, Any] | None, f: _LogisticsFilter) -> bool:
-    """One posting's ``logistics_filters`` dict against the active filters.
+def _logistics_passes(posting: dict[str, Any], f: _LogisticsFilter) -> bool:
+    """One posting against the active logistics filters.
 
     Semantics per plan-wyrdfold-logistics-chips.md:
     - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
       unknown/``unspecified`` status is dropped; the user explicitly asked for
       remote, so surfacing unknowns would dilute the filter).
-    - ``min_salary`` — STRICT: keep only when ``salary_max`` is present and
-      ``>= min_salary`` (an undisclosed salary is dropped).
+    - ``min_salary`` — STRICT: an undisclosed salary is dropped. The bound
+      PREFERS the deterministic jobs-level columns (``salary_max``/``salary_min``
+      parsed from the posting's own salary text — present for the whole corpus,
+      yearly-USD gated) and falls back to the Phase-2 grader's
+      ``logistics_filters.salary_max`` (per-target LLM output, graded rows
+      only) when the posting carries no structured yearly-USD salary. Before
+      the columns existed this filter silently dropped every ungraded row.
     - ``country`` — LENIENT: keep when ``location_country`` matches
       (case-insensitive) OR is absent (a remote role with no country anchor
       still passes).
     """
-    log = logistics or {}
+    log = posting.get("logistics_filters") or {}
     if f.remote_only and log.get("remote_status") != "remote":
         return False
     if f.min_salary is not None:
-        salary_max = log.get("salary_max")
-        if salary_max is None or salary_max < f.min_salary:
+        if posting.get("salary_currency") == "USD" and posting.get("salary_period") == "yearly":
+            bound = posting.get("salary_max") or posting.get("salary_min")
+        else:
+            bound = log.get("salary_max")
+        if bound is None or bound < f.min_salary:
             return False
     if f.country:
         country = log.get("location_country")
@@ -1515,7 +1523,7 @@ def _apply_logistics_filter(
     it)."""
     if not f.active:
         return postings
-    return [p for p in postings if _logistics_passes(p.get("logistics_filters"), f)]
+    return [p for p in postings if _logistics_passes(p, f)]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -2510,7 +2518,7 @@ def backfill_salary(
                 continue
             salary = extract_salary_from_html(html)
             if salary:
-                updates.append({"id": row["id"], "salary_text": salary})
+                updates.append({"id": row["id"], "salary_text": salary, **salary_columns(salary)})
 
         if updates:
             supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()

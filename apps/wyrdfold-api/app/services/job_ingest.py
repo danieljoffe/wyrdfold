@@ -32,6 +32,7 @@ from app.services.extract import (
     MANUAL_SOURCE_ID,
     MANUAL_SOURCE_ROW,
     extract_salary_from_html,
+    salary_columns,
 )
 from app.services.jd_parser import parse_jd
 from app.services.location_parse import parse_location
@@ -109,6 +110,7 @@ async def materialize_and_score_job(
         "score_breakdown": {},
         "greenhouse_updated_at": datetime.now(UTC).isoformat(),
         "salary_text": salary,
+        **salary_columns(salary),
     }
 
     def _persist() -> Any:

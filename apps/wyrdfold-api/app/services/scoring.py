@@ -64,6 +64,12 @@ def _keyword_in_text(keyword: str, text: str) -> bool:
 
 # Canonical keyword → common variations found in JDs.
 _KEYWORD_ALIASES_RAW: dict[str, list[str]] = {
+    # Role-family compounds — JDs hyphenate/space these freely ("front-end
+    # architecture", "full stack engineer"); 273 live prod JDs say
+    # "front-end" and 362 say "full-stack" (sampled 2026-07-29, #503).
+    "frontend": ["front-end", "front end"],
+    "backend": ["back-end", "back end"],
+    "fullstack": ["full-stack", "full stack"],
     # Frontend frameworks
     "react": ["reactjs", "react.js"],
     "next.js": ["nextjs", "next"],
@@ -166,7 +172,15 @@ def _keyword_or_alias_in_text(keyword: str, text: str) -> bool:
             if alias != kw_lower and _keyword_in_text(alias, text):
                 return True
 
-    return False
+    # Hyphen/space drift (#503): compound keywords appear in JDs with the
+    # separators mixed freely — keyword "data driven decision making" vs JD
+    # "data-driven decision-making". Enumerating swapped variants can't
+    # cover the 2^(n-1) mixed forms, so collapse hyphens to spaces on BOTH
+    # sides and substring-match once. Single-word keywords never take this
+    # path, so the word-boundary guarantees above are untouched.
+    return ("-" in kw_lower or " " in kw_lower) and kw_lower.replace("-", " ") in text.replace(
+        "-", " "
+    )
 
 
 def _count_keyword_occurrences(keyword: str, text_lower: str) -> int:
