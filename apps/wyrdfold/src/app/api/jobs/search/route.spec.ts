@@ -40,7 +40,8 @@ describe('GET /api/jobs/search (BFF forwarding)', () => {
   it('forwards q, pagination, AND the filters to upstream /search', async () => {
     await GET(
       get(
-        'q=engineer&page_size=20&offset=20&location=Remote&posted_within_days=30'
+        'q=engineer&page_size=20&offset=20&location=Remote&posted_within_days=30' +
+          '&salary_floor=150000'
       )
     );
     expect(mockProxy).toHaveBeenCalledTimes(1);
@@ -50,6 +51,20 @@ describe('GET /api/jobs/search (BFF forwarding)', () => {
     expect(sp.get('offset')).toBe('20');
     expect(sp.get('location')).toBe('Remote');
     expect(sp.get('posted_within_days')).toBe('30');
+    expect(sp.get('salary_floor')).toBe('150000');
+  });
+
+  it('forwards EVERY shared filter param — the drift that shipped twice', async () => {
+    // Pin against the exact regression class: a filter added to the API +
+    // component that one BFF route forwards and the other silently drops.
+    const { SEARCH_FILTER_PARAMS } =
+      await import('@/lib/api/searchFilterParams');
+    const qs = SEARCH_FILTER_PARAMS.map((p, i) => `${p}=v${i}`).join('&');
+    await GET(get(`q=engineer&${qs}`));
+    const sp = forwardedParams();
+    SEARCH_FILTER_PARAMS.forEach((p, i) => {
+      expect(sp.get(p)).toBe(`v${i}`);
+    });
   });
 
   it('omits filters that are absent (no empty params leak upstream)', async () => {

@@ -1,4 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
+
+import { SEARCH_FILTER_PARAMS } from '@/lib/api/searchFilterParams';
 import * as Sentry from '@sentry/nextjs';
 
 import { bffSecretHeader } from '@/lib/api/bffSecret';
@@ -36,13 +38,13 @@ const GENERIC_ERROR = 'Something went wrong. Please try again.';
 // Forwarded verbatim to the API's `GET /public/search`. The backend re-validates
 // and hard-caps every one — this list is just the allowlist of params we relay,
 // so an anonymous caller can't smuggle extra query args to the upstream.
+// Filter params come from the shared list so the authed proxy and this route
+// can never drift (a filter missing on one side silently no-ops its UI).
 const FORWARDED_PARAMS = [
   'q',
   'page_size',
   'offset',
-  'location',
-  'posted_within_days',
-  'salary_floor',
+  ...SEARCH_FILTER_PARAMS,
 ] as const;
 
 export async function GET(request: NextRequest) {
