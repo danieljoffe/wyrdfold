@@ -47,6 +47,7 @@ from app.services.extract import (
     _extract_from_firecrawl,
     extract_job_from_html,
     extract_salary_from_html,
+    salary_columns,
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
@@ -110,6 +111,7 @@ _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, "
     "city, state, country, location_remote, department, "
     "absolute_url, score, score_breakdown, salary_text, "
+    "salary_min, salary_max, salary_currency, salary_period, "
     "greenhouse_updated_at, first_seen_at, created_at"
 )
 
@@ -1075,9 +1077,7 @@ def _list_jobs_for_target(
                 search=search,
                 cursor=cursor,
                 # #457: the RPC blends this target's custom weights DB-side.
-                weights_by_target=(
-                    {target_id: axis_weights} if axis_weights is not None else None
-                ),
+                weights_by_target=({target_id: axis_weights} if axis_weights is not None else None),
                 user_id=user_id,
             )
         except _RpcIneligibleError as exc:
@@ -2510,7 +2510,7 @@ def backfill_salary(
                 continue
             salary = extract_salary_from_html(html)
             if salary:
-                updates.append({"id": row["id"], "salary_text": salary})
+                updates.append({"id": row["id"], "salary_text": salary, **salary_columns(salary)})
 
         if updates:
             supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()

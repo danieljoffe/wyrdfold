@@ -1605,6 +1605,9 @@ async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
     jobs_table.upsert.assert_called_once()
     payload = jobs_table.upsert.call_args.args[0]
     assert [r["external_id"] for r in payload] == ["known-1"]
+    # Every upsert row carries the structured salary columns (the
+    # ``salary_columns`` spread) so text and parts can never diverge.
+    assert {"salary_min", "salary_max", "salary_currency", "salary_period"} <= set(payload[0])
 
 
 @pytest.mark.asyncio

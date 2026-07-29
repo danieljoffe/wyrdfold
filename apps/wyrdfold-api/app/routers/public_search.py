@@ -94,6 +94,12 @@ async def public_search_endpoint(
         le=job_search.MAX_POSTED_WITHIN_DAYS,
         description="Only postings created within the last N days",
     ),
+    salary_floor: int | None = Query(
+        None,
+        ge=1,
+        le=job_search.MAX_SALARY_FLOOR,
+        description="Only postings whose yearly USD salary range reaches this floor",
+    ),
     supabase: Client = Depends(get_supabase),
 ) -> JobSearchResponse:
     """Public keyword search over the live, US jobs corpus (one shallow page).
@@ -111,7 +117,9 @@ async def public_search_endpoint(
         offset=offset,
         location=(location or "").strip().lower(),
         posted_within_days=posted_within_days or 0,
+        salary_floor=salary_floor or 0,
     )
+
     def _instrument(resp: JobSearchResponse) -> None:
         # Fire-and-forget funnel metrics (#467 §10 PR6): O(1) in-memory
         # enqueue, flushed in bulk by a background task — never a request
@@ -142,10 +150,9 @@ async def public_search_endpoint(
         offset=offset,
         location=location,
         posted_within_days=posted_within_days,
+        salary_floor=salary_floor,
     )
-    response = JobSearchResponse(
-        query=q, count=len(results), has_more=has_more, results=results
-    )
+    response = JobSearchResponse(query=q, count=len(results), has_more=has_more, results=results)
     job_list_cache.set(cache_key, response)
     _instrument(response)
     return response

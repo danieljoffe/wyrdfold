@@ -39,8 +39,13 @@ logger = logging.getLogger(__name__)
 # columns (search must carry no match score).
 _SEARCH_COLS = (
     "id, title, company_name, location, city, state, country, location_remote, "
-    "department, salary_text, absolute_url, first_seen_at, created_at"
+    "department, salary_text, salary_min, salary_max, salary_currency, "
+    "salary_period, absolute_url, first_seen_at, created_at"
 )
+
+# Salary-floor ceiling — mirrors the parser's plausibility cap (no real posted
+# salary exceeds $5M/yr), so the router bound and the data agree.
+MAX_SALARY_FLOOR = 5_000_000
 
 # How many title-matching candidates to pull for Python re-ranking. This also
 # bounds how deep pagination can go (we rank the candidate window, then page
@@ -159,6 +164,7 @@ def search_jobs(
     offset: int = 0,
     location: str | None = None,
     posted_within_days: int | None = None,
+    salary_floor: int | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
     """Search the live, US jobs corpus by title. Service-role client (the corpus
     is shared, non-user data).
@@ -177,6 +183,14 @@ def search_jobs(
     escaping over a free-text value, and location text is too irregular to index
     on anyway). Both are refinements over the title match, so they operate within
     the capped candidate window — the same V1 bound as pagination.
+
+    ``salary_floor`` (USD/year) keeps rows whose posted range REACHES the floor
+    (``salary_max >= floor``, or ``salary_min >= floor`` for min-only rows) —
+    and therefore only rows carrying structured yearly-USD salary at all:
+    "pays at least X" is a claim salary-less rows can't make. Hourly and
+    unknown-period rows are excluded rather than fake-annualized. Applied
+    DB-side (a clean numeric predicate on validated ints) so sub-floor rows
+    never waste candidate-window slots.
     """
     limit = max(1, min(limit, MAX_PAGE_SIZE))
     offset = max(0, offset)
@@ -203,6 +217,13 @@ def search_jobs(
         days = max(1, min(posted_within_days, MAX_POSTED_WITHIN_DAYS))
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
         query = query.gte("created_at", cutoff)
+    if salary_floor is not None:
+        floor = max(1, min(int(salary_floor), MAX_SALARY_FLOOR))
+        query = (
+            query.eq("salary_currency", "USD")
+            .eq("salary_period", "yearly")
+            .or_(f"salary_max.gte.{floor},and(salary_max.is.null,salary_min.gte.{floor})")
+        )
 
     resp = (
         # Bias the capped candidate pull toward recent postings before re-ranking.
@@ -327,6 +348,7 @@ def search_jobs_with_snippets(
     offset: int = 0,
     location: str | None = None,
     posted_within_days: int | None = None,
+    salary_floor: int | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
     """``search_jobs`` + the page-only snippet fetch, composed so both blocking
     round-trips run in a single worker thread.
@@ -342,6 +364,7 @@ def search_jobs_with_snippets(
         offset=offset,
         location=location,
         posted_within_days=posted_within_days,
+        salary_floor=salary_floor,
     )
     attach_snippets(supabase, results)
     return results, has_more

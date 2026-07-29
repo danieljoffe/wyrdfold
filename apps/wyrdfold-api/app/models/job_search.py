@@ -29,6 +29,13 @@ class JobSearchResult(BaseModel):
     location_remote: bool | None = None
     department: str | None = None
     salary_text: str | None = None
+    # Structured salary parsed from ``salary_text`` at ingest — query-grade
+    # (range filters); the raw text stays the display value. ``salary_period``
+    # is "yearly" | "hourly" | None (unknown periods are never guessed).
+    salary_min: float | None = None
+    salary_max: float | None = None
+    salary_currency: str | None = None
+    salary_period: str | None = None
     # Link to the ORIGINAL posting (Greenhouse/Ashby/…). Public results point at
     # the source rather than republishing the full JD.
     absolute_url: str | None = None

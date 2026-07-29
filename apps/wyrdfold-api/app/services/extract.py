@@ -9,6 +9,7 @@ Three-tier extraction cascade:
 import html
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -133,6 +134,150 @@ def extract_salary_from_text(text: str) -> str | None:
         if m is None or not _plausible_single_bound(m):
             return None
     return m.group(0).strip().rstrip(",.;:")
+
+
+# ---- Structured salary parts (query-grade columns) ---------------------------
+#
+# ``salary_text`` is display-grade prose; the structured columns
+# (jobs.salary_min/salary_max/salary_currency/salary_period) power range
+# filters and sorting. Parsed DETERMINISTICALLY from the already-extracted
+# string — no LLM — and validated against every distinct salary_text prod has
+# ever stored (5,834 formats at build time). Grow the corpus tests with every
+# new miss, same discipline as the extractor regexes above.
+
+# Parse-oriented mirrors of the extractor building blocks, with capture
+# groups. The first amount always carries a symbol (both extractor regexes
+# require it); the second may be bare ("$19.00 - 21.00", "$250,000 - 300,000").
+_PARSE_RANGE_RE = re.compile(
+    r"(US\$|CA\$|AU\$|NZ\$|\$|£|€)\s*(\d[\d,]*(?:\.\d+)?)([kK])?"
+    r"(?:(?:\s*[-–—~]\s*|\s+(?:to|through)\s+)"
+    r"(US\$|CA\$|AU\$|NZ\$|\$|£|€)?\s*(\d[\d,]*(?:\.\d+)?)([kK])?)?"
+)
+_PARSE_ISO_RE = re.compile(r"\b(USD|CAD|AUD|NZD|GBP|EUR)\b")
+# \b guards matter: the separator word "through" must not read as "hr".
+_PARSE_HOURLY_RE = re.compile(r"\b(?:hr|hour|hourly)\b", re.I)
+_PARSE_YEARLY_RE = re.compile(r"\b(?:yr|year|yearly|annual|annually|annum)\b", re.I)
+_PARSE_MAX_CUE_RE = re.compile(r"^\s*(?:up\s+to|maximum(?:\s+of)?)\b", re.I)
+_SYMBOL_CURRENCY = {
+    "$": "USD",
+    "US$": "USD",
+    "CA$": "CAD",
+    "AU$": "AUD",
+    "NZ$": "NZD",
+    "£": "GBP",
+    "€": "EUR",
+}
+
+
+@dataclass(frozen=True)
+class SalaryParts:
+    min: float | None
+    max: float | None
+    currency: str | None
+    period: str | None  # "yearly" | "hourly" | None (unknown)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.min is None and self.max is None
+
+
+_EMPTY_SALARY = SalaryParts(min=None, max=None, currency=None, period=None)
+
+
+def parse_salary_text(salary_text: str | None) -> SalaryParts:
+    """``salary_text`` → structured (min, max, currency, period).
+
+    Defensive rules earned from the real corpus:
+    - One-sided k-suffix spreads to a small bare partner ("$150-200K" means
+      150k–200k, never $150–$200,000).
+    - An inverted range drops the MAX, keeps the min — prod stores truncated
+      tails ("$250,000 to $1") and separator typos ("$141,380 -$194.390");
+      a bogus tiny max would wrongly EXCLUDE the row from floor filters.
+    - A trailing ISO code overrides the symbol; bare "$" is USD (the corpus
+      is US-gated at ingestion).
+    - Period: explicit unit token wins; else k-suffix ⇒ yearly; else
+      magnitude (≥10k yearly, <500 hourly, the 500–10k gray zone stays
+      None — could be monthly/weekly, and guessing would poison filters).
+    - "up to $X" is a MAX-only bound; "from $X" / bare singles are MIN-only.
+    """
+    if not salary_text:
+        return _EMPTY_SALARY
+    text = salary_text.strip()
+    m = _PARSE_RANGE_RE.search(text)
+    if m is None:
+        return _EMPTY_SALARY
+    cur1, num1, k1, cur2, num2, k2 = m.groups()
+
+    def _value(num: str, k: str | None) -> float:
+        v = float(num.replace(",", ""))
+        if "." not in num:
+            # Malformed thousands groups are TYPOS, not small numbers:
+            # "$132,00" means 132,000 (2-digit final group), "$80,0000"
+            # means 80,000 (4-digit final group). Real comma groups are 3.
+            if re.search(r",\d{2}$", num):
+                v *= 10
+            elif re.search(r",\d{4}$", num):
+                v /= 10
+        # A k-suffix on an already-thousands amount ("$360,000k") is a typo
+        # — honoring it would file the row at $360 MILLION.
+        if k and v < 10_000:
+            v *= 1000.0
+        return v
+
+    lo_val: float = _value(num1, k1)
+    hi: float | None = _value(num2, k2) if num2 else None
+    lo: float | None = lo_val
+    if hi is not None:
+        if k2 and not k1 and lo_val < 1000 <= hi:
+            lo_val *= 1000.0
+        elif k1 and not k2 and hi < 1000 <= lo_val:
+            hi *= 1000.0
+        elif not k1 and not k2 and lo_val < 1000 and hi >= 10_000 and lo_val * 1000 <= hi:
+            # Elided-thousands shorthand: "$150-175,000" means 150k-175k.
+            # The ordering guard keeps genuine small-vs-large pairs
+            # ("$999 - $12,000") untouched.
+            lo_val *= 1000.0
+        if hi < lo_val:
+            # Truncated tails ("$250,000 to $1") and separator typos
+            # ("$194.390") — a bogus tiny max would wrongly EXCLUDE the row
+            # from floor filters, so drop the max and keep the min.
+            hi = None
+        lo = lo_val
+    elif _PARSE_MAX_CUE_RE.match(text):
+        lo, hi = None, lo_val
+    if (lo or 0) > 5_000_000 or (hi or 0) > 5_000_000:
+        # No real posted salary exceeds $5M/yr — a bound this size is
+        # corrupted input ("$142,400,000 - ..."); distrust the whole parse
+        # and let the row stay display-only.
+        return _EMPTY_SALARY
+
+    iso = _PARSE_ISO_RE.search(text)
+    currency = iso.group(1) if iso else _SYMBOL_CURRENCY.get(cur1 or cur2 or "")
+
+    if _PARSE_HOURLY_RE.search(text):
+        period: str | None = "hourly"
+    elif _PARSE_YEARLY_RE.search(text) or k1 or k2:
+        period = "yearly"
+    else:
+        largest = max(v for v in (lo, hi) if v is not None)
+        period = "yearly" if largest >= 10_000 else "hourly" if largest < 500 else None
+    return SalaryParts(min=lo, max=hi, currency=currency, period=period)
+
+
+def salary_columns(salary_text: str | None) -> dict[str, float | str | None]:
+    """The four structured jobs columns derived from ``salary_text``.
+
+    The one spread every write site uses (poller upserts, JSON-LD fill,
+    manual ingest, admin backfill), so the text and its parts can never
+    diverge in storage.
+    """
+    parts = parse_salary_text(salary_text)
+    return {
+        "salary_min": parts.min,
+        "salary_max": parts.max,
+        "salary_currency": parts.currency,
+        "salary_period": parts.period,
+    }
 
 
 # A leading escaped tag at ANY escape depth: "&lt;", "&amp;lt;",

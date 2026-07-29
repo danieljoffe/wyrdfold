@@ -54,7 +54,7 @@ def _stub_search(
     """Patch the service so the endpoint returns controlled rows, and capture the
     (q, limit, offset, filters) it forwarded."""
 
-    def fake(supabase, *, q, limit, offset, location, posted_within_days):
+    def fake(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
         if captured is not None:
             captured.update(
                 q=q,
@@ -62,15 +62,14 @@ def _stub_search(
                 offset=offset,
                 location=location,
                 posted_within_days=posted_within_days,
+                salary_floor=salary_floor,
             )
         return (results if results is not None else [_result("a")], has_more)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake)
     # No-op the snippet fetch so the cap / BFF / forwarding tests stay focused;
     # the snippet path has its own tests below.
-    monkeypatch.setattr(
-        public_search.job_search, "attach_snippets", lambda sb, res, **kw: None
-    )
+    monkeypatch.setattr(public_search.job_search, "attach_snippets", lambda sb, res, **kw: None)
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
 
 
@@ -91,6 +90,26 @@ def test_page_size_beyond_public_cap_is_rejected(monkeypatch) -> None:
         f"/public/search?q=frontend&page_size={public_search.PUBLIC_MAX_PAGE_SIZE + 1}"
     )
     assert r.status_code == 422
+
+
+def test_salary_floor_bounds_are_enforced(monkeypatch) -> None:
+    _stub_search(monkeypatch)
+    client = TestClient(app)
+    # 0 and negatives are meaningless floors; beyond the plausibility cap 422s.
+    assert client.get("/public/search?q=x&salary_floor=0").status_code == 422
+    assert client.get("/public/search?q=x&salary_floor=-5").status_code == 422
+    over = public_search.job_search.MAX_SALARY_FLOOR + 1
+    assert client.get(f"/public/search?q=x&salary_floor={over}").status_code == 422
+    # Junk types never reach the service.
+    assert client.get("/public/search?q=x&salary_floor=lots").status_code == 422
+
+
+def test_salary_floor_is_forwarded(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    _stub_search(monkeypatch, captured=captured)
+    r = TestClient(app).get("/public/search?q=frontend&salary_floor=150000")
+    assert r.status_code == 200
+    assert captured["salary_floor"] == 150000
 
 
 def test_at_the_public_cap_boundary_is_allowed(monkeypatch) -> None:
@@ -128,9 +147,7 @@ def test_returns_page_with_no_score_or_jd_body(monkeypatch) -> None:
 def test_forwards_query_and_filters_to_the_service(monkeypatch) -> None:
     captured: dict[str, Any] = {}
     _stub_search(monkeypatch, captured=captured)
-    TestClient(app).get(
-        "/public/search?q=Frontend+Developer&location=Remote&posted_within_days=7"
-    )
+    TestClient(app).get("/public/search?q=Frontend+Developer&location=Remote&posted_within_days=7")
     assert captured["q"] == "Frontend Developer"  # service does its own normalize
     assert captured["location"] == "Remote"
     assert captured["posted_within_days"] == 7
@@ -148,7 +165,7 @@ def test_populates_snippet_from_page_jd_html(monkeypatch) -> None:
     """The public endpoint runs the real ``attach_snippets`` after ``search_jobs``:
     a page-only ``description_html`` fetch, tag-stripped into a preview."""
 
-    def fake_search(supabase, *, q, limit, offset, location, posted_within_days):
+    def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
         return ([_result("a"), _result("b")], False)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake_search)
@@ -191,7 +208,5 @@ def test_direct_hit_without_bff_secret_is_forbidden(monkeypatch) -> None:
 def test_bff_forwarded_call_is_allowed(monkeypatch) -> None:
     _stub_search(monkeypatch)
     app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret="s3cret")
-    r = TestClient(app).get(
-        "/public/search?q=frontend", headers={"x-wyrdfold-bff": "s3cret"}
-    )
+    r = TestClient(app).get("/public/search?q=frontend", headers={"x-wyrdfold-bff": "s3cret"})
     assert r.status_code == 200

@@ -277,9 +277,12 @@ def test_search_endpoint_forwards_filters_to_the_service(
 
     captured: dict[str, Any] = {}
 
-    def fake_search(supabase, *, q, limit, offset, location, posted_within_days):
+    def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
         captured.update(
-            q=q, location=location, posted_within_days=posted_within_days
+            q=q,
+            location=location,
+            posted_within_days=posted_within_days,
+            salary_floor=salary_floor,
         )
         return [], False
 
@@ -288,11 +291,12 @@ def test_search_endpoint_forwards_filters_to_the_service(
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "u"
     try:
         resp = TestClient(app).get(
-            "/search?q=frontend&location=Remote&posted_within_days=30"
+            "/search?q=frontend&location=Remote&posted_within_days=30&salary_floor=150000"
         )
         assert resp.status_code == 200
         assert captured["location"] == "Remote"
         assert captured["posted_within_days"] == 30
+        assert captured["salary_floor"] == 150000
     finally:
         app.dependency_overrides.clear()
 
@@ -301,9 +305,7 @@ def test_search_endpoint_forwards_filters_to_the_service(
 
 
 def test_html_to_snippet_strips_tags_and_collapses_whitespace() -> None:
-    assert job_search._html_to_snippet("<p>Build   <b>fast</b>\n\n UIs.</p>") == (
-        "Build fast UIs."
-    )
+    assert job_search._html_to_snippet("<p>Build   <b>fast</b>\n\n UIs.</p>") == ("Build fast UIs.")
 
 
 def test_html_to_snippet_truncates_with_ellipsis() -> None:
@@ -366,8 +368,8 @@ def test_attach_snippets_is_best_effort_on_fetch_failure() -> None:
     # enhancement, so it degrades to None (WITHOUT the try/except this raises).
     results = [JobSearchResult(id="a", title="T", company_name="C")]
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.side_effect = (
-        RuntimeError("db down")
+    sb.table.return_value.select.return_value.in_.return_value.execute.side_effect = RuntimeError(
+        "db down"
     )
     job_search.attach_snippets(sb, results)  # no raise
     assert results[0].snippet is None
@@ -420,3 +422,37 @@ def test_authed_search_endpoint_now_returns_snippets(
         assert resp.json()["results"][0]["snippet"] == "Build fast UIs."
     finally:
         app.dependency_overrides.clear()
+
+
+# --- salary floor (structured columns) ---------------------------------------
+
+
+def test_salary_floor_predicate_is_db_side() -> None:
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="engineer", salary_floor=150_000)
+
+    qb = supabase.table.return_value
+    eq_calls = {c.args for c in qb.eq.call_args_list}
+    assert ("salary_currency", "USD") in eq_calls
+    assert ("salary_period", "yearly") in eq_calls
+    or_calls = [c.args[0] for c in qb.or_.call_args_list]
+    assert "salary_max.gte.150000,and(salary_max.is.null,salary_min.gte.150000)" in or_calls
+
+
+def test_salary_floor_is_clamped_to_cap() -> None:
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="engineer", salary_floor=99_999_999)
+
+    qb = supabase.table.return_value
+    or_calls = [c.args[0] for c in qb.or_.call_args_list]
+    cap = job_search.MAX_SALARY_FLOOR
+    assert f"salary_max.gte.{cap},and(salary_max.is.null,salary_min.gte.{cap})" in or_calls
+
+
+def test_no_salary_floor_adds_no_salary_predicate() -> None:
+    supabase = _mock_supabase([])
+    job_search.search_jobs(supabase, q="engineer")
+
+    qb = supabase.table.return_value
+    assert all(c.args[0] != "salary_currency" for c in qb.eq.call_args_list)
+    assert all("salary_max" not in c.args[0] for c in qb.or_.call_args_list)
