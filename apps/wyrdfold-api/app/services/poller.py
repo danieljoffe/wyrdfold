@@ -43,7 +43,7 @@ from app.services.fit import run_phase2_for_jobs
 from app.services.fit.phase2_runner import _prescan_gate_applies
 from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
-from app.services.jsonld import fetch_jsonld_jobs
+from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
 from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError
 from app.services.llm import get_client as get_llm_client
@@ -520,6 +520,45 @@ async def _validate_one_row(row: dict[str, Any]) -> dict[str, Any]:
 async def _validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Validate URLs for all rows concurrently."""
     return list(await asyncio.gather(*(_validate_one_row(r) for r in rows)))
+
+
+async def _fill_jsonld_salaries(
+    rows: list[dict[str, Any]], known_external_ids: set[str | None]
+) -> None:
+    """#503: bounded JSON-LD ``baseSalary`` fallback for NEW salary-less rows.
+
+    Board APIs often omit the structured pay their hosted posting pages carry
+    as schema.org markup (Lever/Ashby especially). For up to
+    ``jsonld_salary_max_fetches`` NEW rows per source per cycle whose JD text
+    yielded no salary, fetch the posting page and read ``baseSalary``.
+    Flag-gated (ships dark), bounded by the same cycle-wide fetch semaphore
+    as URL validation, and best-effort — failures leave the row's salary
+    null, exactly as before. Known rows are skipped: their salary re-derives
+    from JD content every cycle (#514), and re-fetching every known row's
+    page per cycle would be the same fan-out storm URL validation avoids.
+    """
+    if not settings.jsonld_salary_enabled:
+        return
+    candidates = [
+        r
+        for r in rows
+        if r.get("external_id") not in known_external_ids
+        and not r.get("salary_text")
+        and r.get("absolute_url")
+    ][: settings.jsonld_salary_max_fetches]
+    if not candidates:
+        return
+
+    async def _one(row: dict[str, Any]) -> None:
+        try:
+            async with _validate_semaphore():
+                salary = await fetch_salary_from_posting_page(str(row["absolute_url"]))
+            if salary:
+                row["salary_text"] = salary
+        except Exception:
+            logger.exception("jsonld salary fill failed for %s", row.get("absolute_url"))
+
+    await asyncio.gather(*(_one(r) for r in candidates))
 
 
 async def _batch_fetch_job_scores(supabase: Client, job_ids: list[str]) -> dict[str, int]:
@@ -1811,6 +1850,11 @@ async def _poll_one_source(
             kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
             rows_to_upsert = (await _validate_rows(fresh)) + kept
 
+        # #503: JSON-LD baseSalary fallback for new salary-less rows
+        # (flag-gated, bounded; no-op by default).
+        if rows_to_upsert:
+            await _fill_jsonld_salaries(rows_to_upsert, known_external_ids)
+
         new_rows: list[dict[str, Any]] = []
         if rows_to_upsert:
             # Dedupe rows_to_upsert by (company, title). Both within
@@ -3024,6 +3068,10 @@ async def _poll_one_source_for_target(
             fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
             kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
             rows_to_upsert = (await _validate_rows(fresh)) + kept
+
+        # #503: JSON-LD baseSalary fallback (flag-gated, bounded; no-op by default).
+        if rows_to_upsert:
+            await _fill_jsonld_salaries(rows_to_upsert, known_external_ids)
 
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
