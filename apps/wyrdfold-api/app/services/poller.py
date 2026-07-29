@@ -1795,9 +1795,15 @@ async def _poll_one_source(
                 }
             )
 
-        # Optional: validate job URLs before upserting (#496)
+        # Optional: validate job URLs before upserting (#496). NEW rows only
+        # (#514): a known row's URL was validated at ingest and url_health
+        # monitors it from then on — re-validating every known row per cycle
+        # is a fleet-wide HEAD storm, and a transient upstream blip would
+        # null a working absolute_url on refresh.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
 
         new_rows: list[dict[str, Any]] = []
         if rows_to_upsert:
@@ -1833,25 +1839,25 @@ async def _poll_one_source(
                 ),
                 label=f"poll upsert {company_name}",
             )
-            # #514: ids the conflict-update REFRESHED (vs fresh inserts) —
-            # a row is a refresh iff its external_id was known BEFORE this
-            # cycle's upsert. NOT derivable from created_at == updated_at:
-            # nothing bumps jobs.updated_at on a conflict-update (no
-            # moddatetime trigger; the payload doesn't set it), so a
-            # refreshed row keeps created == updated forever and would be
-            # misclassified as new. The Stage-2 pass below preserves the
-            # persisted Phase-1 verdict for these rows instead of
-            # re-litigating admission with this cycle's (absent) verdict.
+            # #514: a row is a REFRESH iff its external_id was known BEFORE
+            # this cycle's upsert. NOT derivable from created_at ==
+            # updated_at: nothing bumps jobs.updated_at on a conflict-update
+            # (no moddatetime trigger; the payload doesn't set it), so a
+            # refreshed row keeps created == updated forever and the old
+            # timestamp split misclassified every refresh as "new" — which
+            # would re-fire the new-job email/SMS alerts below on EVERY
+            # cycle. The Stage-2 pass preserves the persisted Phase-1
+            # verdict for refreshed rows instead of re-litigating admission
+            # with this cycle's (absent) verdict.
             known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
                 if data.get("external_id") in known_external_ids:
+                    summary["updated"] += 1
                     known_upserted_ids.append(data["id"])
-                if data.get("created_at") == data.get("updated_at"):
+                else:
                     summary["new"] += 1
                     new_rows.append(data)
-                else:
-                    summary["updated"] += 1
 
             # ---- Qualification firewall (#60) ----
             # Target-INDEPENDENT tagging: classify each upserted job ONCE and
@@ -3001,8 +3007,12 @@ async def _poll_one_source_for_target(
                 }
             )
 
+        # NEW rows only (#514) — same scoping as _poll_one_source: known
+        # rows' URLs were validated at ingest and are url_health-monitored.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
 
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
@@ -3020,20 +3030,19 @@ async def _poll_one_source_for_target(
                 ),
                 label=f"poll upsert {company_name}",
             )
-            # #514: ids the conflict-update REFRESHED (vs fresh inserts) —
-            # keyed on the pre-upsert known set, NOT created==updated (a
-            # conflict-update never bumps jobs.updated_at, see
-            # _poll_one_source). Their Stage-2 pass preserves the persisted
-            # Phase-1 verdict instead of re-litigating admission.
+            # #514: a row is a REFRESH iff its external_id was known before
+            # this cycle's upsert — NOT created==updated (a conflict-update
+            # never bumps jobs.updated_at, see _poll_one_source). The
+            # Stage-2 pass preserves the persisted Phase-1 verdict for
+            # refreshed rows instead of re-litigating admission.
             known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
                 if data.get("external_id") in known_external_ids:
-                    known_upserted_ids.append(data["id"])
-                if data.get("created_at") == data.get("updated_at"):
-                    summary["new"] += 1
-                else:
                     summary["updated"] += 1
+                    known_upserted_ids.append(data["id"])
+                else:
+                    summary["new"] += 1
 
             # Qualification firewall (#60): same target-INDEPENDENT tagging
             # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target

@@ -1884,3 +1884,169 @@ async def test_targeted_poll_known_job_bypasses_triage_and_refreshes(monkeypatch
     jobs_table.upsert.assert_called_once()
     payload = jobs_table.upsert.call_args.args[0]
     assert [r["external_id"] for r in payload] == ["k-known"]
+
+
+@pytest.mark.asyncio
+async def test_refreshed_known_row_does_not_realert(monkeypatch):
+    """#514 guard: refreshed known rows must never re-enter the new-job
+    alert path. ``jobs.updated_at`` is not bumped by a conflict-update, so
+    the old created==updated split classified EVERY refresh as new — with
+    known rows now flowing again, that would have re-fired email/SMS
+    alerts for the same job on every poll cycle. New-ness keys on the
+    pre-upsert external_id set instead."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    existing = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        }
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+    # The refreshed row comes back with created == updated (the real
+    # conflict-update shape); the fresh row is genuinely new.
+    jobs_table.upsert.return_value.execute.return_value.data = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "description_html": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "id": "job-new",
+            "external_id": "new-1",
+            "title": "Brand New Role II",
+            "description_html": "",
+            "created_at": "2026-01-02T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+        },
+    ]
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-1",
+                title="Brand New Role",
+                location_name="Remote",
+                department=None,
+                content="",
+                updated_at="2026-01-02",
+                absolute_url="https://example.com/j/1",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                department=None,
+                content="",
+                updated_at="2026-01-02",
+                absolute_url="https://example.com/j/2",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    fake_email = AsyncMock()
+    fake_sms = AsyncMock()
+    fake_load = AsyncMock(side_effect=lambda _sb, rows: rows)
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_load_alert_rows", fake_load)
+    monkeypatch.setattr(poller_mod.notify, "send_alerts_for_new_jobs", fake_email)
+    monkeypatch.setattr(poller_mod.notify, "send_sms_alerts_for_new_jobs", fake_sms)
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
+
+    assert summary["error"] is None
+    assert summary["new"] == 1
+    assert summary["updated"] == 1
+    # Only the genuinely new row reaches the alert path.
+    alerted = [r["external_id"] for r in fake_email.await_args.args[1]]
+    assert alerted == ["new-1"]
+    assert fake_sms.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_url_validation_skips_known_rows(monkeypatch):
+    """#514 guard: with ``validate_poll_urls`` on, only NEW rows hit the
+    URL validator — a known row's URL was validated at ingest and is
+    url_health-monitored; re-validating per cycle is a HEAD storm and a
+    transient upstream blip would null a working absolute_url."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", True)
+
+    existing = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        }
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-1",
+                title="Brand New Role",
+                location_name="Remote",
+                department=None,
+                content="",
+                updated_at="2026-01-02",
+                absolute_url="https://example.com/j/known",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                department=None,
+                content="",
+                updated_at="2026-01-02",
+                absolute_url="https://example.com/j/new",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    seen_urls: list[str] = []
+
+    class _Valid:
+        is_valid = True
+        warnings: list[str] = []
+        final_url = None
+
+    async def fake_validate(url: str) -> object:
+        seen_urls.append(url)
+        v = _Valid()
+        v.final_url = url
+        return v
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "validate_job_url", fake_validate)
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
+
+    assert summary["error"] is None
+    # Only the NEW row's URL was validated; both rows still upserted.
+    assert seen_urls == ["https://example.com/j/new"]
+    payload = jobs_table.upsert.call_args.args[0]
+    assert sorted(r["external_id"] for r in payload) == ["known-1", "new-1"]
