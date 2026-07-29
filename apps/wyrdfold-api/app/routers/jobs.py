@@ -107,7 +107,8 @@ router = APIRouter(
 )
 
 _JP_SELECT_COLS = (
-    "id, external_id, source_id, title, company_name, location, department, "
+    "id, external_id, source_id, title, company_name, location, "
+    "city, state, country, location_remote, department, "
     "absolute_url, score, score_breakdown, salary_text, "
     "greenhouse_updated_at, first_seen_at, created_at"
 )
