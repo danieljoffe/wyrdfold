@@ -161,6 +161,11 @@ _COUNTRIES: dict[str, str] = {
     "mx": "Mexico",
     "philippines": "Philippines",
     "ph": "Philippines",
+    "ukraine": "Ukraine",
+    "hungary": "Hungary",
+    "malaysia": "Malaysia",
+    "colombia": "Colombia",
+    "costa rica": "Costa Rica",
     # Canadian provinces collapse to the country (no US-state-style
     # abbreviation convention in the display format).
     "ontario": "Canada",
@@ -219,6 +224,17 @@ _KNOWN_METROS: dict[str, tuple[str, str | None, str]] = {
     "tel aviv": ("Tel Aviv", None, "Israel"),
     "tokyo": ("Tokyo", None, "Japan"),
     "manila": ("Manila", None, "Philippines"),
+    "detroit": ("Detroit", "MI", "US"),
+    "san carlos": ("San Carlos", "CA", "US"),
+    "kolkata": ("Kolkata", None, "India"),
+    "chennai": ("Chennai", None, "India"),
+    "gurgaon": ("Gurgaon", None, "India"),
+    "quezon city": ("Quezon City", None, "Philippines"),
+    "kyiv": ("Kyiv", None, "Ukraine"),
+    "budapest": ("Budapest", None, "Hungary"),
+    "kuala lumpur": ("Kuala Lumpur", None, "Malaysia"),
+    "belfast": ("Belfast", None, "UK"),
+    "bogota": ("Bogota", None, "Colombia"),
 }
 
 # City aliases applied even when the city arrives WITH a state ("New York
@@ -334,6 +350,43 @@ def _parse_segment(segment: str) -> LocationParts:
     return LocationParts(parts.city, parts.state, parts.country, remote)
 
 
+def _parse_commaless_suffix(cleaned: str) -> LocationParts | None:
+    """Parse a comma-free multi-word string anchored by a COUNTRY suffix.
+
+    "New York New York United States" → (New York, NY, US);
+    "Heredia Costa Rica" → (Heredia, None, Costa Rica). Returns None when
+    no known country terminates the string — junk like campus names stays
+    unparsed. Longest country form wins ("United States of America" before
+    "United States"); a recognized state name may sit between city and
+    country.
+    """
+    lower = cleaned.lower()
+    country_hit: tuple[str, str] | None = None  # (canon form, display)
+    for form, display in _COUNTRIES.items():
+        if " " not in form and len(form) <= 3:
+            continue  # bare ISO codes need comma context — too collision-prone
+        if (lower == form or lower.endswith(" " + form)) and (
+            country_hit is None or len(form) > len(country_hit[0])
+        ):
+            country_hit = (form, display)
+    if country_hit is None:
+        return None
+    rest = cleaned[: len(cleaned) - len(country_hit[0])].strip()
+    if not rest:
+        return LocationParts(None, None, country_hit[1], False)
+    state: str | None = None
+    rest_l = rest.lower()
+    for name, abbrev in _US_STATES.items():
+        if rest_l == name or rest_l.endswith(" " + name):
+            state = abbrev
+            rest = rest[: len(rest) - len(name)].strip()
+            break
+    city = _title_case(rest) if rest else None
+    if city:
+        city = _CITY_ALIASES.get(city.lower(), city)
+    return LocationParts(city, state, country_hit[1], False)
+
+
 def _parse_tokens(segment: str) -> LocationParts:
     """Comma-token classification for one dash-free, remote-free segment."""
     city: str | None = None
@@ -362,8 +415,14 @@ def _parse_tokens(segment: str) -> LocationParts:
     # be a city — "Hybrid", "Asia", "Washington University Medical Campus",
     # "2 Locations" would all masquerade as cities. Comma-anchored strings
     # ("Hawthorne, CA") keep free-city acceptance below because the other
-    # token corroborates a real place.
+    # token corroborates a real place. One comma-less form IS parseable:
+    # a recognized country suffix (optionally preceded by a state suffix)
+    # anchors the remainder as the city — "New York New York United States",
+    # "Heredia Costa Rica" (both real prod strings).
     if len(tokens) < 2:
+        suffix = _parse_commaless_suffix(cleaned)
+        if suffix is not None:
+            return suffix
         return _EMPTY
     for token in tokens:
         # Glued "ST Country" token ("CA United States" — missing comma).
