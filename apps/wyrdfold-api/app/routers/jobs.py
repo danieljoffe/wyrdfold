@@ -1478,25 +1478,33 @@ def _apply_location_filter(
     ]
 
 
-def _logistics_passes(logistics: dict[str, Any] | None, f: _LogisticsFilter) -> bool:
-    """One posting's ``logistics_filters`` dict against the active filters.
+def _logistics_passes(posting: dict[str, Any], f: _LogisticsFilter) -> bool:
+    """One posting against the active logistics filters.
 
     Semantics per plan-wyrdfold-logistics-chips.md:
     - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
       unknown/``unspecified`` status is dropped; the user explicitly asked for
       remote, so surfacing unknowns would dilute the filter).
-    - ``min_salary`` — STRICT: keep only when ``salary_max`` is present and
-      ``>= min_salary`` (an undisclosed salary is dropped).
+    - ``min_salary`` — STRICT: an undisclosed salary is dropped. The bound
+      PREFERS the deterministic jobs-level columns (``salary_max``/``salary_min``
+      parsed from the posting's own salary text — present for the whole corpus,
+      yearly-USD gated) and falls back to the Phase-2 grader's
+      ``logistics_filters.salary_max`` (per-target LLM output, graded rows
+      only) when the posting carries no structured yearly-USD salary. Before
+      the columns existed this filter silently dropped every ungraded row.
     - ``country`` — LENIENT: keep when ``location_country`` matches
       (case-insensitive) OR is absent (a remote role with no country anchor
       still passes).
     """
-    log = logistics or {}
+    log = posting.get("logistics_filters") or {}
     if f.remote_only and log.get("remote_status") != "remote":
         return False
     if f.min_salary is not None:
-        salary_max = log.get("salary_max")
-        if salary_max is None or salary_max < f.min_salary:
+        if posting.get("salary_currency") == "USD" and posting.get("salary_period") == "yearly":
+            bound = posting.get("salary_max") or posting.get("salary_min")
+        else:
+            bound = log.get("salary_max")
+        if bound is None or bound < f.min_salary:
             return False
     if f.country:
         country = log.get("location_country")
@@ -1515,7 +1523,7 @@ def _apply_logistics_filter(
     it)."""
     if not f.active:
         return postings
-    return [p for p in postings if _logistics_passes(p.get("logistics_filters"), f)]
+    return [p for p in postings if _logistics_passes(p, f)]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
