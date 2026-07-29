@@ -136,3 +136,38 @@ def test_campus_junk_yields_no_parts() -> None:
 def test_remote_hybrid_wording_is_not_remote() -> None:
     got = parse_location("Hybrid")
     assert got.remote is False
+
+
+# -- corpus growth: post-backfill prod gap sample (2026-07-29) ---------------
+# fmt: off
+CORPUS_2 = [
+    ("Detroit",                                  ("Detroit", "MI", "US", False)),
+    ("Kolkata, in",                              ("Kolkata", None, "India", False)),
+    ("Chennai",                                  ("Chennai", None, "India", False)),
+    ("Gurgaon",                                  ("Gurgaon", None, "India", False)),
+    ("Quezon City",                              ("Quezon City", None, "Philippines", False)),
+    ("Kyiv",                                     ("Kyiv", None, "Ukraine", False)),
+    ("Budapest",                                 ("Budapest", None, "Hungary", False)),
+    ("Kuala Lumpur",                             ("Kuala Lumpur", None, "Malaysia", False)),
+    ("Belfast",                                  ("Belfast", None, "UK", False)),
+    ("Bogota",                                   ("Bogota", None, "Colombia", False)),
+    ("San Carlos  - Hybrid",                     ("San Carlos", "CA", "US", False)),
+    # Comma-less suffix forms (real prod strings).
+    ("New York New York United States",          ("New York", "NY", "US", False)),
+    ("Heredia  Costa Rica",                      ("Heredia", None, "Costa Rica", False)),
+    # Suffix rule must NOT swallow junk: no country suffix → unparsed.
+    ("Washington University Medical Campus",     (None, None, None, False)),
+    ("New York Office",                          (None, None, None, False)),
+    ("Oklahoma County",                          (None, None, None, False)),
+    ("Home based - Worldwide",                   (None, None, None, False)),
+    ("Distributed",                              (None, None, None, False)),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize(("raw", "expected"), CORPUS_2, ids=[c[0] for c in CORPUS_2])
+def test_prod_corpus_growth(
+    raw: str, expected: tuple[str | None, str | None, str | None, bool]
+) -> None:
+    got = parse_location(raw)
+    assert (got.city, got.state, got.country, got.remote) == expected

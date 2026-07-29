@@ -211,10 +211,21 @@ def search_jobs(
     rows = cast(list[dict[str, Any]], resp.data or [])
 
     # Location refine (Python, post-fetch): case-insensitive substring over the
-    # candidate window. A blank/whitespace value is a no-op.
+    # candidate window. A blank/whitespace value is a no-op. Matches the raw
+    # string AND the parsed parts (#518) so canonical forms hit regardless of
+    # how the board spelled it — "california" finds rows whose raw says only
+    # "CA" (state=CA expands nothing, but city/state/country hold canonical
+    # spellings like "San Francisco"/"CA"/"US" that the raw may lack).
     if location and location.strip():
         needle = location.strip().lower()
-        rows = [r for r in rows if needle in str(r.get("location") or "").lower()]
+        rows = [
+            r
+            for r in rows
+            if any(
+                needle in str(r.get(field) or "").lower()
+                for field in ("location", "city", "state", "country")
+            )
+        ]
 
     query_groups = _groups(tokens)
     rows.sort(key=lambda r: _rank_key(query_groups, r), reverse=True)
