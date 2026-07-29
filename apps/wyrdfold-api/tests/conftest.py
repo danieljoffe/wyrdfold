@@ -26,6 +26,40 @@ import pytest
 
 from app.cache import job_list_cache
 
+# ---- #515: local test env == CI clean room ---------------------------------
+# WYRDFOLD_API_TESTING=1 (above) suppresses pydantic's env_file source (#28),
+# but real environment VARIABLES outrank the file — and nx loads the
+# workspace/app `.env` values into the process env before running the test
+# target. Ten tests failed locally-but-not-in-CI through that hole (SaaS mode
+# switched on, prescan flags flipped, BYOK require-mode… one billing test
+# reached the REAL Stripe API from a laptop). Scrub every env var that maps
+# to a Settings field — except the ones this conftest deliberately sets —
+# then rebuild the singleton IN PLACE so every `from app.config import
+# settings` importer sees pure defaults, exactly like CI.
+_CONFTEST_OWNED_ENV = {
+    "SUPABASE_URL",
+    "WYRDFOLD_API_KEY",
+    "ALLOWED_HOSTS",
+    "RATE_LIMIT_ENABLED",
+    "ACTIVITY_TRACKING_ENABLED",
+    "WYRDFOLD_API_TESTING",
+}
+
+
+def _scrub_settings_env() -> None:
+    from app.config import Settings, settings
+
+    for field_name in Settings.model_fields:
+        env_name = field_name.upper()
+        if env_name not in _CONFTEST_OWNED_ENV:
+            os.environ.pop(env_name, None)
+    clean = Settings()
+    for field_name in Settings.model_fields:
+        object.__setattr__(settings, field_name, getattr(clean, field_name))
+
+
+_scrub_settings_env()
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
