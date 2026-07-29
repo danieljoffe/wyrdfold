@@ -2048,3 +2048,200 @@ async def test_url_validation_skips_known_rows(monkeypatch):
     assert seen_urls == ["https://example.com/j/new"]
     payload = jobs_table.upsert.call_args.args[0]
     assert sorted(r["external_id"] for r in payload) == ["known-1", "new-1"]
+
+
+# ---- Phase 1 negative-verdict cache (#514 residual) -------------------------
+
+
+def _rejecting_triage():
+    """Triage stub that rejects every submitted title, with a REAL (non-None)
+    result object so the titles count as attempted — the cache must only ever
+    hold verdicts the LLM actually returned."""
+    from unittest.mock import AsyncMock
+
+    from app.services.relevance.title_triage import TitleVerdict
+
+    async def _reject(_llm, *, target, titles):
+        verdicts = {i + 1: TitleVerdict(id=i + 1, promising=False) for i in range(len(titles))}
+        return verdicts, MagicMock()
+
+    return AsyncMock(side_effect=_reject)
+
+
+def _wire_rejection_cache_poll(monkeypatch, *, ttl_hours: float):
+    """Shared setup for the scheduled-path cache tests: one NEW job that
+    passes the free gates, an LLM that rejects it. Returns
+    ``(supabase, fake_triage, target, run)`` where ``run()`` awaits one poll
+    cycle."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", ttl_hours)
+
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+    fake_triage = _rejecting_triage()
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    async def one_new_job(_token: str) -> list[StandardJob]:
+        return [_job("new-1", "Brand New Role", "Remote")]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+
+    async def run() -> dict:
+        return await poller_mod._poll_one_source(
+            dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+        )
+
+    return supabase, fake_triage, target, run
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_skips_llm_on_next_cycle(monkeypatch):
+    """A title the LLM rejected must NOT be re-sent on the next cycle while
+    the TTL holds: the cache re-injects a synthetic reject, so the job is
+    still dropped from the upsert (rejected, not budget-deferred) but the
+    verdict is free the second time."""
+    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    first = await run()
+    assert first["error"] is None
+    assert fake_triage.await_count == 1
+    assert fake_triage.await_args.kwargs["titles"] == ["Brand New Role"]
+    assert first["new"] == 0  # rejected → never ingested
+
+    second = await run()
+    assert second["error"] is None
+    assert fake_triage.await_count == 1  # cache hit — LLM not consulted again
+    assert second["new"] == 0  # still rejected, still not ingested
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_disabled_at_zero_ttl(monkeypatch):
+    """``phase1_rejection_ttl_hours=0`` restores the legacy behavior: every
+    cycle re-pays the verdict."""
+    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
+
+    await run()
+    await run()
+    assert fake_triage.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_keyed_on_profile_version(monkeypatch):
+    """A profile edit bumps ``profile_version``; cached rejections under the
+    old profile must not gag the new one — the title is re-judged."""
+    from app.services import poller as poller_mod
+
+    _supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    await run()
+    assert fake_triage.await_count == 1
+
+    edited = target.model_copy(update={"profile_version": target.profile_version + 1})
+    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [edited])
+    await run()
+    assert fake_triage.await_count == 2  # new profile → fresh verdict
+
+
+@pytest.mark.asyncio
+async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
+    """Same cache on the activation path (``_poll_one_source_for_target``):
+    the second pass over an unchanged board sends nothing to the LLM."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    supabase, _jobs_table, _user_targets = _make_targeted_poll_supabase()
+    fake_triage = _rejecting_triage()
+    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [_job("k3", "Staff Frontend Engineer", "Remote")]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    first = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+    assert first["error"] is None
+    assert fake_triage.await_count == 1
+
+    second = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+    assert second["error"] is None
+    assert fake_triage.await_count == 1  # cached rejection — no second call
+
+
+def test_phase1_rejection_helpers_roundtrip(monkeypatch):
+    """Unit contract of the cache helpers: keyed per (target, profile_version,
+    normalized title); an expired entry stops matching; TTL=0 records nothing."""
+    import time as time_mod
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    poller_mod._phase1_record_rejection(target, "Brand  New Role")
+    # Whitespace/case-normalized title matches; other titles don't.
+    assert poller_mod._phase1_cached_rejection(target, "brand new role") is True
+    assert poller_mod._phase1_cached_rejection(target, "Other Role") is False
+    # Same title under a bumped profile_version is a different key.
+    edited = target.model_copy(update={"profile_version": target.profile_version + 1})
+    assert poller_mod._phase1_cached_rejection(edited, "brand new role") is False
+
+    # Force-expire the stored entry: it must stop matching.
+    key = poller_mod._phase1_rejection_key(target, "brand new role")
+    poller_mod._PHASE1_REJECTIONS[key] = time_mod.monotonic() - 1.0
+    assert poller_mod._phase1_cached_rejection(target, "brand new role") is False
+
+    # TTL=0: nothing is recorded, nothing matches.
+    poller_mod._PHASE1_REJECTIONS.clear()
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 0.0)
+    poller_mod._phase1_record_rejection(target, "brand new role")
+    assert poller_mod._PHASE1_REJECTIONS == {}
+
+
+def test_phase1_rejection_cache_size_bound(monkeypatch):
+    """At the hard cap the cache prunes expired entries first, and clears
+    outright when still full — it can grow stale-heavy but never unbounded."""
+    import time as time_mod
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    monkeypatch.setattr(poller_mod, "_PHASE1_REJECTIONS_CAP", 2)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    # Full of EXPIRED entries → pruned, then the new entry lands.
+    poller_mod._PHASE1_REJECTIONS.update(
+        {("t", 1, "a"): time_mod.monotonic() - 1, ("t", 1, "b"): time_mod.monotonic() - 1}
+    )
+    poller_mod._phase1_record_rejection(target, "fresh title")
+    assert list(poller_mod._PHASE1_REJECTIONS) == [
+        poller_mod._phase1_rejection_key(target, "fresh title")
+    ]
+
+    # Full of LIVE entries → blunt clear, then the new entry lands alone.
+    poller_mod._PHASE1_REJECTIONS.update(
+        {("t", 1, "a"): time_mod.monotonic() + 999, ("t", 1, "b"): time_mod.monotonic() + 999}
+    )
+    poller_mod._phase1_record_rejection(target, "another title")
+    assert list(poller_mod._PHASE1_REJECTIONS) == [
+        poller_mod._phase1_rejection_key(target, "another title")
+    ]

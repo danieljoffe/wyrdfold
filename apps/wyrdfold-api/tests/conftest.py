@@ -65,15 +65,21 @@ _scrub_settings_env()
 def _clear_caches():
     """Prevent cross-test cache pollution from in-memory state."""
     from app.services.analysis import run_registry
+    from app.services.poller import _PHASE1_REJECTIONS
 
     job_list_cache.invalidate()
     # The in-flight analysis registry (#459) is a module-level dict; a leaked
     # "running" entry would make the next test's kick dedup to 202 without
     # spawning (LLM never called).
     run_registry.clear_all()
+    # Phase-1 negative-verdict cache (#514) is a module-level TTL dict; a
+    # rejection leaked from one poller test would silently skip the LLM in
+    # the next one.
+    _PHASE1_REJECTIONS.clear()
     yield
     job_list_cache.invalidate()
     run_registry.clear_all()
+    _PHASE1_REJECTIONS.clear()
 
 
 @pytest.fixture(autouse=True)

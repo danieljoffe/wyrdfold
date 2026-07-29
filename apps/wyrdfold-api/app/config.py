@@ -598,6 +598,31 @@ class Settings(BaseSettings):
     # tick interval so an aborted cycle doesn't overlap the next. 0 disables
     # (wait forever — the pre-watchdog behavior).
     poll_cycle_timeout_seconds: int = Field(default=1200, ge=0)
+    # Max sources polled per cycle (#514 residual). An unbounded due batch
+    # interacts badly with the watchdog above: a backlog cycle (restart,
+    # cron gap) tries every due source at once, blows past
+    # ``poll_cycle_timeout_seconds``, the abort kills the unfinished tail
+    # un-stamped, and the next cycle repeats the exact same oversized batch —
+    # the fleet starves in a loop instead of draining. Measured 2026-07-29:
+    # 1,110 of 3,231 enabled sources >2x overdue, 1,077 unpolled for 24h+.
+    # Capping the batch to what a cycle can actually finish (and taking the
+    # most-overdue first) drains the backlog cap-sized-chunk by chunk.
+    # ~250 sources comfortably fits the 20-min watchdog at concurrency 5.
+    # 0 = legacy unbounded.
+    poll_max_sources_per_cycle: int = Field(default=250, ge=0)
+    # In-process TTL cache for Phase-1 REJECTED titles (#514 residual). A
+    # rejected candidate never ingests, so the same title re-enters triage
+    # every poll cycle and re-pays the LLM verdict at the source's cadence
+    # (~4h) until the posting closes. Measured 2026-07-29:
+    # relevance.title_triage = 17,843 calls / $8.34 over 7 days — the
+    # dominant LLM line item, mostly repeat verdicts on unchanged titles.
+    # A rejection is remembered per (target, profile_version, title) for
+    # this many hours; profile edits bump profile_version, which re-judges
+    # everything under the new profile immediately. In-memory only: a
+    # restart clears it (worst case = one extra verdict per title), and the
+    # poller holds a fleet-wide advisory lock so exactly one process polls.
+    # 0 disables.
+    phase1_rejection_ttl_hours: float = Field(default=24.0, ge=0.0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,
