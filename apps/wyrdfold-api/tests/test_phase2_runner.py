@@ -900,3 +900,56 @@ async def test_us_gate_skips_confirmed_non_us_jobs(
     assert set(graded) == {"j-us", "j-untagged"}  # confirmed non-US dropped
     assert "j-nonus" not in graded
     assert n == 2
+
+
+# ---- family gate (#277/#278 write side) ------------------------------------
+
+
+async def test_family_gate_never_grades_hard_offfamily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A customer_experience listing must never burn a grade against an
+    engineering-family target (2026-07-30 prod audit: 55% of promising rows
+    were hard off-family, each graded one pure waste). Untagged jobs keep the
+    benefit of the doubt — the tagger is async and may not have landed."""
+    ids = ["j-eng", "j-cx", "j-untagged"]
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+
+    target = _target(1).model_copy(update={"role_family": "engineering"})
+    jobs = [
+        {"id": "j-eng", "title": "x", "description_html": "", "role_family": "engineering"},
+        {"id": "j-cx", "title": "x", "description_html": "", "role_family": "customer_experience"},
+        {"id": "j-untagged", "title": "x", "description_html": "", "role_family": None},
+    ]
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=target,
+        payload=_payload(),
+        jobs=jobs,
+    )
+    assert set(graded) == {"j-eng", "j-untagged"}  # keep-null admits untagged
+    assert "j-cx" not in graded
+    assert n == 2
+
+
+async def test_family_gate_unclassified_target_is_ungated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A target with role_family NULL accepts any job family (#277 keep-null,
+    target side) — the gate must be a no-op, exactly like the read gates."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    jobs = [
+        {"id": "j-cx", "title": "x", "description_html": "", "role_family": "customer_experience"},
+    ]
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-cx"])),
+        MagicMock(),
+        target=_target(1),  # role_family defaults to None
+        payload=_payload(),
+        jobs=jobs,
+    )
+    assert graded == ["j-cx"]
+    assert n == 1

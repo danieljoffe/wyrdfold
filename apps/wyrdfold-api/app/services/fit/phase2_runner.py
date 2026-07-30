@@ -47,6 +47,7 @@ from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
 from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
 from app.services.llm.client import LLMClient
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
@@ -183,12 +184,13 @@ async def run_phase2_for_jobs(
 
     # US-only corpus (#60): never (re-)grade a CONFIRMED non-US job — the write
     # side of the display read gate (``jobs.py`` ``_gate_live_us``: is_us IS NOT
-    # FALSE). The L2 tagger sets ``is_us`` only AFTER a job's first grade, so
-    # first grades still happen (is_us NULL passes); once a job is confirmed
-    # non-US it's never re-graded. Without this a re-polled non-US job burns a
-    # fresh LLM grade every cycle — ``archived_at`` does NOT gate grading (134
-    # non-US jobs were graded *after* being archived in one 7-day window). Keep
-    # true + null (``is not False``); drop only confirmed-false.
+    # FALSE). The poller's post-tagger ``_refresh_job_tags`` patches this
+    # cycle's verdicts into the job dicts, so a first-cycle confirmed-non-US
+    # job is skipped here too; a still-untagged job (is_us NULL) passes.
+    # Without this a re-polled non-US job burns a fresh LLM grade every cycle —
+    # ``archived_at`` does NOT gate grading (134 non-US jobs were graded
+    # *after* being archived in one 7-day window). Keep true + null (``is not
+    # False``); drop only confirmed-false.
     us_jobs = [j for j in jobs if j.get("is_us") is not False]
     non_us_skipped = len(jobs) - len(us_jobs)
     if non_us_skipped:
@@ -200,6 +202,31 @@ async def run_phase2_for_jobs(
     jobs = us_jobs
     if not jobs:
         return 0
+
+    # Family gate (#277/#278, write side): never spend a grade on a pair the
+    # read gates (`get_target_jobs` / `_gate_off_family` / the membership
+    # badge) will hide from every surface anyway. Same shared predicate,
+    # keep-null both ways: an untagged job (role_family NULL — the tagger is
+    # async and may not have landed) and an unclassified target both admit.
+    # Before this gate, hard off-family pairs burned full grades — the
+    # 2026-07-30 prod audit found 55% of all promising rows were off-family,
+    # each graded one pure waste (e.g. a customer_experience listing graded
+    # against a frontend-engineer target, scored 0).
+    if target.role_family:
+        in_family = [
+            j for j in jobs if passes_family_gate(target.role_family, j.get("role_family"))
+        ]
+        family_skipped = len(jobs) - len(in_family)
+        if family_skipped:
+            logger.info(
+                "Phase 2 family gate: skipped %d off-family job(s) for target %s (family=%s)",
+                family_skipped,
+                target.id,
+                target.role_family,
+            )
+        jobs = in_family
+        if not jobs:
+            return 0
 
     job_by_id = {j["id"]: j for j in jobs if j.get("id")}
     job_ids = list(job_by_id)

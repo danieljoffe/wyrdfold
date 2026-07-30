@@ -598,3 +598,118 @@ class TestProviderFastFail:
     def test_breaker_auto_clears_after_cooldown(self) -> None:
         provider_breaker._provider_fatal_until = time.monotonic() - 1.0  # in the past
         assert not poller_mod._provider_fatal_active()
+
+
+# ---- family reconcile + tag refresh (the _qualify_jobs closers) ------------
+
+
+class _TableChain:
+    """Self-returning query stub; records ``update(...).in_(...)`` calls."""
+
+    def __init__(self, table: str, data: list[dict[str, Any]], writes: list[Any]) -> None:
+        self._table = table
+        self._data = data
+        self._writes = writes
+        self._update_payload: dict[str, Any] | None = None
+
+    def select(self, *_a: Any, **_kw: Any) -> _TableChain:
+        return self
+
+    def eq(self, *_a: Any, **_kw: Any) -> _TableChain:
+        return self
+
+    def update(self, payload: dict[str, Any]) -> _TableChain:
+        self._update_payload = payload
+        return self
+
+    def in_(self, col: str, vals: list[str]) -> _TableChain:
+        if self._update_payload is not None:
+            self._writes.append((self._table, self._update_payload, col, list(vals)))
+        return self
+
+    def execute(self) -> Any:
+        return MagicMock(data=self._data)
+
+
+def _closer_sb(
+    *,
+    targets: list[dict[str, Any]] | None = None,
+    scores: list[dict[str, Any]] | None = None,
+    jobs: list[dict[str, Any]] | None = None,
+) -> tuple[MagicMock, list[Any]]:
+    writes: list[Any] = []
+    data = {"targets": targets or [], "scores": scores or [], "jobs": jobs or []}
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: _TableChain(name, data.get(name, []), writes)
+    return sb, writes
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retracts_offfamily_promising() -> None:
+    """The prod 2026-07-30 class: a promising verdict written pre-tag must be
+    retracted once the landed family hard-contradicts it. Keep-null on either
+    side survives (#277), and ``excluded`` is never touched."""
+    sb, writes = _closer_sb(
+        targets=[{"id": "t-eng", "role_family": "engineering"}],
+        scores=[
+            {"id": "s-cx", "target_id": "t-eng", "job_role_family": "customer_experience"},
+            {"id": "s-eng", "target_id": "t-eng", "job_role_family": "engineering"},
+            {"id": "s-null", "target_id": "t-eng", "job_role_family": None},
+        ],
+    )
+    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+
+    assert writes == [("scores", {"promising": False}, "id", ["s-cx"])]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_noop_when_no_target_is_classified() -> None:
+    sb, writes = _closer_sb(
+        targets=[{"id": "t-any", "role_family": None}],
+        scores=[{"id": "s-1", "target_id": "t-any", "job_role_family": "sales"}],
+    )
+    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_job_tags_patches_stale_row_dicts() -> None:
+    """The dicts the cycle threads into Phase 2 are upsert-time snapshots —
+    the refresh must overwrite their tag columns with the post-tagger DB
+    state so the Phase-2 family/US gates see this cycle's verdicts."""
+    sb, _writes = _closer_sb(
+        jobs=[{"id": "job-1", "role_family": "customer_experience", "is_us": True}]
+    )
+    rows: list[dict[str, Any]] = [{"id": "job-1", "title": "Support Specialist"}]
+    await poller_mod._refresh_job_tags(sb, rows)
+
+    assert rows[0]["role_family"] == "customer_experience"
+    assert rows[0]["is_us"] is True
+
+
+@pytest.mark.asyncio
+async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closers are DB-only and must run on EVERY exit path — including
+    the earliest one (no LLM client), where prior-cycle tags may still
+    contradict persisted promising rows."""
+    calls: list[str] = []
+
+    def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("no client")
+
+    async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
+        calls.append(f"refresh:{len(rows)}")
+
+    async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
+        calls.append(f"reconcile:{','.join(job_ids)}")
+
+    monkeypatch.setattr(poller_mod, "get_llm_client", _raise)
+    monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
+    monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+
+    await poller_mod._qualify_jobs(MagicMock(), [_row(id="job-9")])
+
+    assert calls == ["refresh:1", "reconcile:job-9"]
