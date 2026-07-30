@@ -1171,8 +1171,12 @@ async def _reconcile_offfamily_promising(supabase: Client, job_ids: list[str]) -
             return  # no classified targets — nothing can mismatch
 
         to_retract: list[str] = []
-        for start in range(0, len(job_ids), _IN_CHUNK):
-            chunk = job_ids[start : start + _IN_CHUNK]
+        # Third-size chunks: this read returns up to one row per (job, target)
+        # pair, and a full 150-job chunk on a many-target install could cross
+        # PostgREST's 1000-row response cap (silent truncation).
+        scan_chunk = _IN_CHUNK // 3
+        for start in range(0, len(job_ids), scan_chunk):
+            chunk = job_ids[start : start + scan_chunk]
             sresp = await poll_db_read(
                 supabase,
                 lambda c, _chunk=chunk: (

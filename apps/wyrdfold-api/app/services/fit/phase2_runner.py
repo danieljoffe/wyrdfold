@@ -184,12 +184,13 @@ async def run_phase2_for_jobs(
 
     # US-only corpus (#60): never (re-)grade a CONFIRMED non-US job — the write
     # side of the display read gate (``jobs.py`` ``_gate_live_us``: is_us IS NOT
-    # FALSE). The L2 tagger sets ``is_us`` only AFTER a job's first grade, so
-    # first grades still happen (is_us NULL passes); once a job is confirmed
-    # non-US it's never re-graded. Without this a re-polled non-US job burns a
-    # fresh LLM grade every cycle — ``archived_at`` does NOT gate grading (134
-    # non-US jobs were graded *after* being archived in one 7-day window). Keep
-    # true + null (``is not False``); drop only confirmed-false.
+    # FALSE). The poller's post-tagger ``_refresh_job_tags`` patches this
+    # cycle's verdicts into the job dicts, so a first-cycle confirmed-non-US
+    # job is skipped here too; a still-untagged job (is_us NULL) passes.
+    # Without this a re-polled non-US job burns a fresh LLM grade every cycle —
+    # ``archived_at`` does NOT gate grading (134 non-US jobs were graded
+    # *after* being archived in one 7-day window). Keep true + null (``is not
+    # False``); drop only confirmed-false.
     us_jobs = [j for j in jobs if j.get("is_us") is not False]
     non_us_skipped = len(jobs) - len(us_jobs)
     if non_us_skipped:
