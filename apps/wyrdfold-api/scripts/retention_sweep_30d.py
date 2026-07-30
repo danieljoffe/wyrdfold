@@ -52,6 +52,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from postgrest.exceptions import APIError
 from supabase import Client
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -65,7 +66,27 @@ logger = logging.getLogger("retention_sweep_30d")
 PAGE_SIZE = 1000
 # in_() URL-encodes ~36 bytes per UUID; keep chunks small (#57 lesson).
 IN_CHUNK = 100
+# job_embeddings deletes touch the 800MB HNSW-indexed table — after the bulk
+# tombstone/score writes ahead of them, 100-job chunks crossed the 8s
+# statement timeout (57014, prod 2026-07-30). Quarter-size + retry instead.
+EMB_CHUNK = 25
 WRITE_SLEEP_S = 0.15
+
+
+async def _write_with_retry(fn: Any, *, what: str, attempts: int = 4) -> Any:
+    """Run a blocking PostgREST write, backing off on 57014 statement
+    timeouts (the small-instance breaker lesson) instead of aborting the
+    whole resumable sweep."""
+    for attempt in range(attempts):
+        try:
+            return await asyncio.to_thread(fn)
+        except APIError as e:
+            if getattr(e, "code", None) != "57014" or attempt == attempts - 1:
+                raise
+            wait = 2 * (2**attempt)
+            logger.info("  %s hit 57014 — backing off %ds", what, wait)
+            await asyncio.sleep(wait)
+    return None  # unreachable
 
 # Tables whose mere reference to a job marks it a user artifact (protected
 # from tombstoning; engagement via user_jobs is checked separately).
@@ -157,8 +178,9 @@ async def _phase_a_archive(
     now = _now_iso()
     for i in range(0, len(to_archive), IN_CHUNK):
         chunk = to_archive[i : i + IN_CHUNK]
-        await asyncio.to_thread(
-            supabase.table("jobs").update({"archived_at": now}).in_("id", chunk).execute
+        await _write_with_retry(
+            supabase.table("jobs").update({"archived_at": now}).in_("id", chunk).execute,
+            what="archive",
         )
         await asyncio.sleep(WRITE_SLEEP_S)
     logger.info("  archived %d row(s)", len(to_archive))
@@ -204,11 +226,12 @@ async def _phase_b_tombstone(
     done = 0
     for i in range(0, len(to_tombstone), IN_CHUNK):
         chunk = to_tombstone[i : i + IN_CHUNK]
-        await asyncio.to_thread(
+        await _write_with_retry(
             supabase.table("jobs")
             .update({"purged_at": now, "description_html": None})
             .in_("id", chunk)
-            .execute
+            .execute,
+            what="tombstone",
         )
         done += len(chunk)
         if done % 2000 < IN_CHUNK:
@@ -275,8 +298,9 @@ async def _phase_c_cascade(
         done = 0
         for i in range(0, len(ungraded_score_ids), IN_CHUNK):
             chunk = ungraded_score_ids[i : i + IN_CHUNK]
-            await asyncio.to_thread(
-                supabase.table("scores").delete().in_("id", chunk).execute
+            await _write_with_retry(
+                supabase.table("scores").delete().in_("id", chunk).execute,
+                what="scores delete",
             )
             done += len(chunk)
             if done % 5000 < IN_CHUNK:
@@ -294,14 +318,15 @@ async def _phase_c_cascade(
             logger.info("  %s: skipped (opt-in via --include-shadow)", table)
             continue
         done = 0
-        for i in range(0, len(tomb_ids), IN_CHUNK):
-            chunk = tomb_ids[i : i + IN_CHUNK]
+        for i in range(0, len(tomb_ids), EMB_CHUNK):
+            chunk = tomb_ids[i : i + EMB_CHUNK]
             if execute:
-                resp = await asyncio.to_thread(
+                resp = await _write_with_retry(
                     supabase.table(table)
                     .delete(count="exact")
                     .in_("job_posting_id", chunk)
-                    .execute
+                    .execute,
+                    what=f"{table} delete",
                 )
                 await asyncio.sleep(WRITE_SLEEP_S)
             else:
@@ -312,6 +337,8 @@ async def _phase_c_cascade(
                     .execute
                 )
             done += resp.count or 0
+            if done and done % 5000 < EMB_CHUNK * 2:
+                logger.info("  %s progress: %d", table, done)
         counts[key] = done
         logger.info(
             "  %s %s: %d", table, "deleted" if execute else "would delete", done
