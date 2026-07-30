@@ -25,8 +25,9 @@ Usage::
     uv run python scripts/backfill_target_families.py            # dry-run
     uv run python scripts/backfill_target_families.py --execute
 
-Env required: ``SUPABASE_URL`` + ``SUPABASE_SERVICE_ROLE_KEY`` +
-``LLM_PROVIDER=anthropic`` + ``ANTHROPIC_API_KEY``.
+Env required: ``SUPABASE_URL`` + ``SUPABASE_SERVICE_ROLE_KEY`` + a REAL
+``LLM_PROVIDER`` (anthropic or openrouter — prod runs openrouter) with its
+key; the mock provider is refused on ``--execute``.
 Cost: one small derive call per unclassified target (a handful exist).
 """
 
@@ -63,11 +64,11 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    if settings.llm_provider != "anthropic" and args.execute:
+    if settings.llm_provider == "mock" and args.execute:
         raise SystemExit(
-            "ERROR: LLM_PROVIDER must be 'anthropic' for a real backfill "
-            f"(currently {settings.llm_provider!r}) — mock verdicts must not "
-            "reach the DB. Use the default dry-run for a count-only pass."
+            "ERROR: LLM_PROVIDER is 'mock' — mock verdicts must not reach the "
+            "DB. Run with a real provider (prod uses openrouter), or use the "
+            "default dry-run for a count-only pass."
         )
 
     init_supabase()
