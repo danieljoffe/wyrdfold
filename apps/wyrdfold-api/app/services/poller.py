@@ -71,6 +71,7 @@ from app.services.qualification import (
     qualification_hash,
     tag_job,
 )
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.title_triage import (
     PHASE1_PURPOSE,
@@ -1022,15 +1023,40 @@ async def _qualify_jobs(
     to one chunk instead of the whole backlog. Untagged rows simply stay
     NULL (fail-soft, exactly like a tagger outage) and re-attempt next cycle
     once the UTC day rolls over and the meter resets.
+
+    Whatever happens above — full tag pass, budget defer, provider trip, even
+    an unavailable LLM client — the ``finally`` step ALWAYS runs the two
+    DB-only closers: ``_refresh_job_tags`` (patch fresh tag columns back into
+    the caller's row dicts, which are upsert-time snapshots that predate this
+    cycle's tag writes) and ``_reconcile_offfamily_promising`` (retract
+    ``promising`` verdicts the now-known family hard-contradicts — Phase 1
+    triages titles pre-ingest, before any tag exists, and #517 deliberately
+    never demotes on re-poll, so a late-landing tag is the ONLY chance to
+    correct an off-family admit; prod 2026-07-30: 55% of promising rows).
+    Neither needs the LLM, and both are cheap id-scoped reads/writes.
     """
     if not rows:
         return
     try:
-        llm = get_llm_client(supabase, None)
-    except Exception:
-        logger.exception("Qualification tagger: LLM client unavailable; skipping")
-        return
+        try:
+            llm = get_llm_client(supabase, None)
+        except Exception:
+            logger.exception("Qualification tagger: LLM client unavailable; skipping")
+            return
+        await _qualify_rows_with_budget(supabase, llm, rows)
+    finally:
+        await _refresh_job_tags(supabase, rows)
+        await _reconcile_offfamily_promising(
+            supabase, [cast(str, r["id"]) for r in rows if r.get("id")]
+        )
 
+
+async def _qualify_rows_with_budget(
+    supabase: Client,
+    llm: LLMClient,
+    rows: list[dict[str, Any]],
+) -> None:
+    """The budget-gated tagger fan-out (see ``_qualify_jobs`` docstring)."""
     for start in range(0, len(rows), QUALIFICATION_BUDGET_RECHECK_EVERY):
         # Provider fast-fail (audit PERF-M): if a prior chunk already hit a
         # 402/429, the provider is rejecting every call — defer the rest of the
@@ -1075,6 +1101,111 @@ async def _qualify_jobs(
             *(_qualify_one_job(llm, supabase, row) for row in chunk),
             return_exceptions=True,
         )
+
+
+# in_() id-chunk bound for the tag-refresh / reconcile reads (#57 lesson:
+# ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
+_IN_CHUNK = 150
+
+
+async def _refresh_job_tags(supabase: Client, rows: list[dict[str, Any]]) -> None:
+    """Patch fresh tag columns back into ``rows`` (in place, best-effort).
+
+    The dicts the poll cycle threads into Phase 2 (``upsert_resp.data``) are
+    snapshots from BEFORE the tagger's UPDATE, so on a job's first cycle
+    ``role_family``/``is_us`` read as NULL downstream even though the row is
+    tagged — the Phase-2 family and US gates then fail open on exactly the
+    cycle that grades most jobs. One chunked read closes that window; a read
+    failure leaves the snapshots as they were (the pre-existing behavior).
+    """
+    ids = [cast(str, r["id"]) for r in rows if r.get("id")]
+    if not ids:
+        return
+    by_id = {cast(str, r["id"]): r for r in rows if r.get("id")}
+    try:
+        for start in range(0, len(ids), _IN_CHUNK):
+            chunk = ids[start : start + _IN_CHUNK]
+            resp = await poll_db_read(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("jobs").select("id, role_family, is_us").in_("id", _chunk)
+                ),
+                label="qualify tag refresh",
+            )
+            for raw in cast(list[dict[str, Any]], resp.data or []):
+                row = by_id.get(cast(str, raw.get("id")))
+                if row is not None:
+                    row["role_family"] = raw.get("role_family")
+                    row["is_us"] = raw.get("is_us")
+    except Exception:
+        logger.exception("Qualification tag refresh failed (best-effort; dicts stay stale)")
+
+
+async def _reconcile_offfamily_promising(supabase: Client, job_ids: list[str]) -> None:
+    """Retract ``promising`` verdicts that the (now-landed) family tag
+    hard-contradicts (best-effort).
+
+    Phase 1 triages titles PRE-ingest — no jobs row, no tag — and #517's
+    floor deliberately never demotes a persisted verdict on re-poll, so an
+    off-family admit would otherwise stand forever (the 2026-07-30 audit:
+    55% of all promising rows were hard off-family; the one-off
+    ``backfill_offfamily_promising.py`` cleaned the stock, this closes the
+    flow). Mismatch test = the shared ``passes_family_gate`` over the
+    trigger-synced ``scores.job_role_family`` denorm vs the target's family;
+    keep-null on either side, exactly like every read gate. ``excluded`` is
+    never touched (user-preference semantics).
+    """
+    if not job_ids:
+        return
+    try:
+        tresp = await poll_db_read(
+            supabase,
+            lambda c: c.table("targets").select("id, role_family"),
+            label="reconcile target families",
+        )
+        target_family = {
+            cast(str, r["id"]): cast("str | None", r.get("role_family"))
+            for r in cast(list[dict[str, Any]], tresp.data or [])
+        }
+        if not any(target_family.values()):
+            return  # no classified targets — nothing can mismatch
+
+        to_retract: list[str] = []
+        for start in range(0, len(job_ids), _IN_CHUNK):
+            chunk = job_ids[start : start + _IN_CHUNK]
+            sresp = await poll_db_read(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("scores")
+                    .select("id, target_id, job_role_family")
+                    .eq("promising", True)
+                    .in_("job_posting_id", _chunk)
+                ),
+                label="reconcile promising read",
+            )
+            for s in cast(list[dict[str, Any]], sresp.data or []):
+                tfam = target_family.get(cast(str, s.get("target_id")))
+                if not passes_family_gate(tfam, cast("str | None", s.get("job_role_family"))):
+                    to_retract.append(cast(str, s["id"]))
+
+        for start in range(0, len(to_retract), _IN_CHUNK):
+            chunk = to_retract[start : start + _IN_CHUNK]
+            await poll_db_write(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("scores").update({"promising": False}).in_("id", _chunk)
+                ),
+                label="reconcile promising retract",
+            )
+        if to_retract:
+            logger.info(
+                "Family reconcile: retracted %d off-family promising verdict(s) "
+                "across %d job(s)",
+                len(to_retract),
+                len(job_ids),
+            )
+    except Exception:
+        logger.exception("Family reconcile failed (best-effort; next cycle retries)")
 
 
 async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
@@ -1383,7 +1514,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
                     c.table("scores")
                     .select(
                         "recency_score, jobs!inner(id, title, description_html, "
-                        "first_seen_at, archived_at, purged_at, is_us)"
+                        "first_seen_at, archived_at, purged_at, is_us, role_family)"
                     )
                     .eq("target_id", tid)
                     .eq("promising", True)
