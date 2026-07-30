@@ -76,6 +76,7 @@ def _promising_rows(supabase: Client) -> list[dict[str, Any]]:
             supabase.table("scores")
             .select("id, target_id, job_role_family")
             .eq("promising", True)
+            .order("id")
             .range(offset, offset + PAGE_SIZE - 1)
             .execute()
         )
