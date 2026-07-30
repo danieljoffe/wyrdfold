@@ -37,10 +37,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from collections import Counter
+from pathlib import Path
 from typing import Any, cast
 
 from supabase import Client
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.services.qualification.family_gate import passes_family_gate
 from app.supabase_pool import get_supabase_pool, init_supabase
