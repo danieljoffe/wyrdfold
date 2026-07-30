@@ -26,6 +26,7 @@ echo "==> Building $IMAGE (context: $ROOT)"
 docker build -f apps/wyrdfold-api/Dockerfile -t "$IMAGE" .
 
 SRK="$(supabase status -o env 2>/dev/null | grep '^SERVICE_ROLE_KEY=' | cut -d'"' -f2 || true)"
+ANON="$(supabase status -o env 2>/dev/null | grep '^ANON_KEY=' | cut -d'"' -f2 || true)"
 if [ -z "$SRK" ]; then
   echo "==> Build OK. Local Supabase stack not detected (run 'supabase start')."
   echo "    Skipping boot check — the image built cleanly."
@@ -39,6 +40,7 @@ docker run -d --name "$CONTAINER" -p "${HOST_PORT}:8001" \
   -e WYRDFOLD_API_KEY="smoketest" \
   -e SUPABASE_URL="http://host.docker.internal:54321" \
   -e SUPABASE_SERVICE_ROLE_KEY="$SRK" \
+  -e SUPABASE_ANON_KEY="$ANON" \
   "$IMAGE" >/dev/null
 
 # Poll /health for up to ~20s.
