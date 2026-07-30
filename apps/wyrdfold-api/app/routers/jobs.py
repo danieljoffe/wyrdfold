@@ -51,6 +51,7 @@ from app.services.extract import (
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
 from app.services.tailor import persistence
 from app.services.target_scoring import (
@@ -681,11 +682,10 @@ def _gate_off_family(
     Python and the check is RELATIONAL (job's family vs the family of the target
     its score belongs to), so it can't be a column filter like ``_gate_live_us``.
 
-    Strict, keep-null (mirrors #277): keep a match only when the job's family
-    EQUALS the target's, the job is untagged (``role_family`` NULL — benefit of
-    the doubt, like ``is_us IS NOT FALSE``), or the target is unclassified
-    (family NULL → ungated). ``by_id`` maps job_posting_id -> the winning
-    ``scores`` row (carrying ``target_id``).
+    Semantics live in ``services.qualification.family_gate`` (strict,
+    keep-null — the #277 rule, shared with the target-membership badge).
+    ``by_id`` maps job_posting_id -> the winning ``scores`` row (carrying
+    ``target_id``).
 
     Cheap: one ``targets`` read + chunked ``jobs.role_family`` reads, then an
     in-memory filter — no per-row round-trips. #60 / #278.
@@ -727,7 +727,7 @@ def _gate_off_family(
         tid = s.get("target_id")
         tfam = target_family.get(tid) if tid is not None else None
         jfam = job_family.get(pid)
-        if tfam is None or jfam is None or jfam == tfam:
+        if passes_family_gate(tfam, jfam):
             gated[pid] = s
     return gated
 
