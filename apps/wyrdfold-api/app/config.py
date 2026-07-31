@@ -474,19 +474,17 @@ class Settings(BaseSettings):
     # the write is best-effort (an embedding error never breaks polling) and
     # content-hash cached (an unchanged re-poll re-embeds nothing). Requires
     # ``EMBEDDINGS_PROVIDER=voyage`` + ``VOYAGE_API_KEY`` to embed for real;
-    # with the mock provider it writes deterministic fake vectors. Flip
-    # per-deploy once the backfill has populated the table in DEV.
+    # with the mock provider it writes deterministic fake vectors. Since the
+    # Disk IO slim-down (2026-07-30) this gates the LAZY path only: vectors
+    # materialize at grade time (``ensure_job_vectors`` in the Phase-2
+    # runner) for exactly the candidate set — there is no embed-on-ingest.
     prescan_embed_enabled: bool = False
 
-    # Per-cycle cap for the vector-less-job sweep (#21). The on-ingest embed
-    # hook is fail-soft per row, so a job whose embed silently failed — or one
-    # ingested before the pipeline armed / while its source was delisting —
-    # never gets a vector, and the cosine gate (#90) fails OPEN on it, burning
-    # a blind Sonnet grade. Each scheduled cycle, embed up to this many of the
-    # NEWEST jobs with no ``job_embeddings`` row (archived included — they stay
-    # gradeable via click-through, and calibration reads their vectors).
-    # ~$0.00005/job, so the default costs ≈ $0.01/cycle worst case. 0 disables.
-    # Only runs when ``prescan_embed_enabled``.
+    # DEPRECATED (Disk IO slim-down, 2026-07-30): the vector-less-job sweep
+    # (#21) is gone — lazy grade-time embedding makes that stranding class
+    # structurally impossible (a job embeds exactly when first needed). The
+    # field survives so a stale env var doesn't break settings parsing;
+    # nothing reads it.
     prescan_embed_backfill_batch: int = Field(default=200, ge=0, le=2000)
 
     # Pre-scan SHADOW MODE (#60/#68, Phase 3). When True the poller, AFTER the
@@ -701,6 +699,9 @@ class Settings(BaseSettings):
     # fan-out just piles contention on a small instance and STARVES foreground
     # reads (the /jobs statement-timeouts, 2026-07-23) without real throughput.
     # A few in flight keeps ingestion moving while leaving IO for user reads.
+    # DEPRECATED (2026-07-30): the on-ingest embed fan-out this bounded is
+    # gone (lazy grade-time embedding batches internally); kept for env-var
+    # compatibility, nothing reads it.
     embedding_write_concurrency: int = Field(default=3, ge=1, le=32)
 
     # In-process scheduled source discovery. Off by default (same posture as

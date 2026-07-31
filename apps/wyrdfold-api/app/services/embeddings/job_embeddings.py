@@ -19,6 +19,7 @@ break polling — the job simply stays un-embedded and a later cycle retries.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import logging
@@ -47,6 +48,16 @@ JOB_EMBED_PURPOSE = "prescan.job_embed"
 # anti-join keep the spaces separate, and thresholds must be re-derived in
 # 3.5 space (see #21).
 DEFAULT_MODEL: EmbeddingModelId = "voyage-3.5"
+
+# Matryoshka output size (Disk IO slim-down, 2026-07-30): voyage-3.5 supports
+# shortened outputs; 512-d keeps the coarse-relevance signal while halving
+# storage vs the 1024-d default (halfvec(512) = ~1KB/vector). A different
+# dimension is a DIFFERENT vector space: job and target vectors must both be
+# produced at this size, and cosine across sizes is meaningless — the read
+# path guards on length mismatch (fail-open) rather than comparing garbage.
+# Changing this value invalidates every stored vector AND any calibrated
+# per-target cosine threshold; treat it like a model change (#21).
+EMBED_DIMENSIONS = 512
 
 # The validated body window (#60): title + the first 4000 chars of the cleaned
 # description. Voyage-3 reads far more, but 4000 chars captured the relevance
@@ -129,6 +140,7 @@ async def upsert_job_embedding(
             inputs=[text],
             purpose=JOB_EMBED_PURPOSE,
             input_type="document",
+            output_dimension=EMBED_DIMENSIONS,
         )
         if not result.embeddings:
             # Defensive: a non-empty input should always yield one vector.
@@ -175,6 +187,83 @@ _BATCH_WRITE_CHUNK = 8
 # exactly the hammer-loop the incident memory says to break: abort on the
 # signal, let the next cycle retry when the disk has recovered.
 _WRITE_BREAKER_LIMIT = 2
+
+
+def _parse_vector(raw: Any) -> list[float] | None:
+    """pgvector/halfvec text form ("[0.1,0.2,...]") -> floats, else None."""
+    if isinstance(raw, list):
+        try:
+            return [float(x) for x in raw]
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw, str):
+        try:
+            parsed = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return None
+        if isinstance(parsed, (list, tuple)):
+            try:
+                return [float(x) for x in parsed]
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+# ensure_job_vectors fetch chunk — PK reads, well under PostgREST URL bounds.
+_ENSURE_FETCH_CHUNK = 100
+
+
+async def ensure_job_vectors(
+    supabase: Client,
+    embeddings_client: EmbeddingsClient,
+    jobs: list[dict[str, Any]],
+    *,
+    model: EmbeddingModelId = DEFAULT_MODEL,
+) -> dict[str, list[float]]:
+    """Materialize vectors ON DEMAND for exactly the jobs about to be read.
+
+    The lazy replacement for embed-on-ingest + the blanket backfill drain
+    (Disk IO slim-down, 2026-07-30): most stored vectors were never read —
+    the only serving consumer is Phase-2 ordering/gating over a target's
+    CANDIDATES — so we now embed at the moment of need instead of for every
+    admitted job. ``jobs`` are dicts carrying ``id``, ``title``,
+    ``description_html``. Returns ``{job_id: vector}`` for every id that has
+    (or just got) a vector; ids that fail stay absent and the callers'
+    existing fail-open handling applies. Stranding is structurally
+    impossible (#21's concern): a job is embedded exactly when first needed,
+    and the content-hash makes retries free. Best-effort; never raises.
+    """
+    out: dict[str, list[float]] = {}
+    wanted = [j for j in jobs if j.get("id")]
+    if not wanted:
+        return out
+    def _read_chunk(ids_chunk: list[str]) -> Any:
+        return (
+            supabase.table(TABLE)
+            .select("job_posting_id, embedding")
+            .eq("model", model)
+            .in_("job_posting_id", ids_chunk)
+            .execute()
+        )
+
+    async def _collect(ids_to_fetch: list[str]) -> None:
+        for i in range(0, len(ids_to_fetch), _ENSURE_FETCH_CHUNK):
+            resp = await asyncio.to_thread(_read_chunk, ids_to_fetch[i : i + _ENSURE_FETCH_CHUNK])
+            for row in cast(list[dict[str, Any]], resp.data or []):
+                vec = _parse_vector(row.get("embedding"))
+                if vec is not None:
+                    out[cast(str, row["job_posting_id"])] = vec
+
+    try:
+        await _collect([cast(str, j["id"]) for j in wanted])
+
+        missing = [j for j in wanted if cast(str, j["id"]) not in out]
+        if missing:
+            await embed_jobs_batch(supabase, embeddings_client, missing, model=model)
+            await _collect([cast(str, j["id"]) for j in missing])
+    except Exception:
+        logger.exception("ensure_job_vectors failed (best-effort; callers fail open)")
+    return out
 
 
 async def embed_jobs_batch(
@@ -225,6 +314,7 @@ async def embed_jobs_batch(
                 inputs=[t for _, t in texts],
                 purpose=JOB_EMBED_PURPOSE,
                 input_type="document",
+                output_dimension=EMBED_DIMENSIONS,
             )
             cost_log.record_embedding(
                 supabase,

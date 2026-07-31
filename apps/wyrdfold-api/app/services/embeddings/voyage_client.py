@@ -57,11 +57,16 @@ class VoyageEmbeddingsClient:
         model: EmbeddingModelId,
         inputs: list[str],
         input_type: Literal["document", "query"],
+        output_dimension: int | None,
     ) -> tuple[list[list[float]], int]:
+        kwargs: dict[str, Any] = {}
+        if output_dimension is not None:
+            kwargs["output_dimension"] = output_dimension
         response: Any = await self._client.embed(
             texts=inputs,
             model=model,
             input_type=input_type,
+            **kwargs,
         )
         return list(response.embeddings), int(response.total_tokens)
 
@@ -72,6 +77,7 @@ class VoyageEmbeddingsClient:
         inputs: list[str],
         purpose: str,
         input_type: Literal["document", "query"] = "document",
+        output_dimension: int | None = None,
     ) -> EmbeddingResult:
         if not inputs:
             # Don't call the API for an empty batch — save a roundtrip.
@@ -87,7 +93,7 @@ class VoyageEmbeddingsClient:
 
         if len(inputs) <= MAX_INPUTS_PER_CALL:
             embeddings, total_tokens = await self._embed_one_batch(
-                model=model, inputs=inputs, input_type=input_type
+                model=model, inputs=inputs, input_type=input_type, output_dimension=output_dimension
             )
         else:
             sub_batches = [
@@ -96,7 +102,12 @@ class VoyageEmbeddingsClient:
             ]
             results = await asyncio.gather(
                 *(
-                    self._embed_one_batch(model=model, inputs=sub, input_type=input_type)
+                    self._embed_one_batch(
+                        model=model,
+                        inputs=sub,
+                        input_type=input_type,
+                        output_dimension=output_dimension,
+                    )
                     for sub in sub_batches
                 )
             )
