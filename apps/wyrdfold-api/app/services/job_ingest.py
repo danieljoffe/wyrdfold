@@ -37,7 +37,7 @@ from app.services.extract import (
 from app.services.jd_parser import parse_jd
 from app.services.location_parse import parse_location
 from app.services.sanitize import sanitize_html
-from app.services.target_scoring import score_and_upsert, update_global_score
+from app.services.target_scoring import score_and_upsert
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +151,6 @@ async def materialize_and_score_job(
             logger.error(
                 "Target scoring failed for job %s target %s", posting_id, t.id, exc_info=result
             )
-    try:
-        await asyncio.to_thread(update_global_score, supabase, posting_id)
-    except Exception:
-        logger.exception("Global score update failed for job %s", posting_id)
-
     # Force-include: a deliberately-added posting must be visible even when the
     # negative-keyword pass flagged ``excluded`` (e.g. a JD mentioning "mentor
     # junior engineers"). Scoped to the targets scored here so it never flips

@@ -28,8 +28,6 @@ from app.services.target_scoring import (
     score_and_upsert,
 )
 
-_BATCH_UPDATE_PATH = "app.services.target_scoring.batch_update_global_scores"
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -202,7 +200,6 @@ def test_bulk_score_for_target_scores_stage1_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """bulk_score_for_target only scores jobs with existing target score rows."""
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
 
     # Stage 1 score rows (existing matches for this target)
     jts_rows = [
@@ -259,7 +256,6 @@ def test_bulk_score_for_target_preserves_phase1_promising_verdict(
     floor on each rescore. promising=False -> excluded stays True even if
     the keyword scorer would admit; promising=True/None -> scorer decides.
     """
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
 
     # The stale-row page carries the ``promising`` verdict inline (selected
     # in the same paging query), so the Phase 1 floor is preserved without a
@@ -334,7 +330,6 @@ def test_bulk_score_for_target_streams_multiple_pages_without_holding_all_ids(
     """
     import app.services.target_scoring as ts
 
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
     # Shrink the page so a small catalog spans multiple pages cheaply.
     page = 2
     monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", page)
@@ -406,7 +401,6 @@ def test_bulk_score_for_target_terminates_when_page_has_no_backing_jobs(
     """
     import app.services.target_scoring as ts
 
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, MagicMock())
     monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", 2)
 
     range_calls = {"n": 0}
@@ -751,130 +745,6 @@ def _score_row(
         "scoring_status": scoring_status,
         "excluded": excluded,
     }
-
-
-def test_aggregate_ignores_keyword_placeholder_when_a_grade_exists() -> None:
-    """The #194 regression: a keyword placeholder must not drag a real grade.
-
-    Old behaviour averaged the two mixed scales — avg(80, 10) = 45. The graded
-    row must now stand alone at 80.
-    """
-    from app.services.target_scoring import _aggregate_global_score
-
-    rows = [
-        _score_row(80, scoring_status="complete"),
-        _score_row(10, scoring_status="stage2"),  # keyword placeholder
-    ]
-    assert _aggregate_global_score(rows) == 80
-
-
-def test_aggregate_keyword_placeholder_cannot_inflate_a_grade() -> None:
-    """The inverse: a high keyword placeholder can't lift a low real grade."""
-    from app.services.target_scoring import _aggregate_global_score
-
-    rows = [
-        _score_row(20, scoring_status="complete"),
-        _score_row(95, scoring_status="stage1"),  # keyword placeholder
-    ]
-    assert _aggregate_global_score(rows) == 20  # not avg(20, 95) == 58
-
-
-def test_aggregate_averages_only_graded_rows_when_several_exist() -> None:
-    from app.services.target_scoring import _aggregate_global_score
-
-    rows = [
-        _score_row(80, scoring_status="complete"),
-        _score_row(60, scoring_status="complete"),
-        _score_row(30, scoring_status="stage2"),  # ignored
-    ]
-    assert _aggregate_global_score(rows) == 70  # avg(80, 60), placeholder dropped
-
-
-def test_aggregate_falls_back_to_keyword_rows_when_nothing_graded() -> None:
-    """A not-yet-graded job still gets its keyword placeholder aggregate."""
-    from app.services.target_scoring import _aggregate_global_score
-
-    rows = [
-        _score_row(10, scoring_status="stage1"),
-        _score_row(20, scoring_status="stage2"),
-    ]
-    assert _aggregate_global_score(rows) == 15
-
-
-def test_aggregate_missing_status_is_treated_as_keyword() -> None:
-    """A row without scoring_status is a placeholder (mirrors _is_pending)."""
-    from app.services.target_scoring import _aggregate_global_score
-
-    graded_plus_unknown = [
-        _score_row(90, scoring_status="complete"),
-        {"job_posting_id": "job-1", "score": 25, "excluded": False},  # no status
-    ]
-    assert _aggregate_global_score(graded_plus_unknown) == 90
-
-    only_unknown = [{"job_posting_id": "job-1", "score": 25, "excluded": False}]
-    assert _aggregate_global_score(only_unknown) == 25
-
-
-def test_aggregate_drops_excluded_rows_before_the_graded_split() -> None:
-    from app.services.target_scoring import _aggregate_global_score
-
-    # The only graded row is excluded → fall back to the live keyword row.
-    rows = [
-        _score_row(80, scoring_status="complete", excluded=True),
-        _score_row(12, scoring_status="stage2", excluded=False),
-    ]
-    assert _aggregate_global_score(rows) == 12
-
-    # An excluded keyword row can't drag a live grade either.
-    rows2 = [
-        _score_row(70, scoring_status="complete", excluded=False),
-        _score_row(5, scoring_status="stage1", excluded=True),
-    ]
-    assert _aggregate_global_score(rows2) == 70
-
-
-def test_aggregate_empty_or_all_excluded_is_zero() -> None:
-    from app.services.target_scoring import _aggregate_global_score
-
-    assert _aggregate_global_score([]) == 0
-    assert _aggregate_global_score([_score_row(90, excluded=True)]) == 0
-
-
-def test_update_global_score_writes_graded_first_value() -> None:
-    """End-to-end through the DB path: the write uses the graded-first rule."""
-    from app.services.target_scoring import update_global_score
-
-    supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
-        _score_row(85, scoring_status="complete"),
-        _score_row(15, scoring_status="stage2"),
-    ]
-    update_global_score(supabase, "job-1")
-
-    update_call = supabase.table.return_value.update
-    update_call.assert_called_once_with({"score": 85})
-
-
-def test_batch_update_global_scores_aggregates_each_job_graded_first() -> None:
-    """The batch path groups by job and applies the same graded-first rule."""
-    from app.services.target_scoring import batch_update_global_scores
-
-    supabase = MagicMock()
-    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        # job-1: graded 90 + keyword 10 -> 90
-        _score_row(90, scoring_status="complete", job_posting_id="job-1"),
-        _score_row(10, scoring_status="stage2", job_posting_id="job-1"),
-        # job-2: keyword only -> avg(20, 40) = 30
-        _score_row(20, scoring_status="stage1", job_posting_id="job-2"),
-        _score_row(40, scoring_status="stage2", job_posting_id="job-2"),
-    ]
-    batch_update_global_scores(supabase, ["job-1", "job-2"])
-
-    supabase.rpc.assert_called_once()
-    name, payload = supabase.rpc.call_args.args
-    assert name == "bulk_update_scores"
-    by_id = {u["id"]: u["score"] for u in payload["p_updates"]}
-    assert by_id == {"job-1": 90, "job-2": 30}
 
 
 # ---------------------------------------------------------------------------
@@ -1312,111 +1182,6 @@ _BATCH_ROWS_BY_JOB: dict[str, list[dict[str, Any]]] = {
 }
 
 
-@pytest.mark.asyncio
-async def test_batch_update_global_scores_poll_flag_off_uses_sync_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import app.services.target_scoring as ts
-    from app.services.target_scoring import batch_update_global_scores_poll
-
-    lookups = _seam_flag_off(monkeypatch)
-    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)  # 2 unique ids -> 2 chunk reads
-    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
-
-    # Duplicate id proves the dedupe: 3 ids in, only 2 chunk reads out.
-    await batch_update_global_scores_poll(
-        sync_client,  # type: ignore[arg-type]
-        ["job-1", "job-2", "job-1"],
-    )
-
-    assert sync_client.executed == 3  # 2 chunked reads + 1 bulk-update rpc
-    assert lookups == []
-    name, params = sync_client.op("rpc")[1:]
-    assert name == "bulk_update_scores"
-    by_id = {u["id"]: u["score"] for u in params["p_updates"]}
-    assert by_id == {"job-1": 90, "job-2": 30}
-
-
-@pytest.mark.asyncio
-async def test_batch_update_global_scores_poll_flag_on_uses_async_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import app.services.target_scoring as ts
-    from app.services.target_scoring import batch_update_global_scores_poll
-
-    async_client = _AsyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
-    _seam_flag_on(monkeypatch, async_client)
-    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)
-    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
-
-    await batch_update_global_scores_poll(
-        sync_client,  # type: ignore[arg-type]
-        ["job-1", "job-2"],
-    )
-
-    # Reads AND the rpc write all land on the async client; sync untouched.
-    assert async_client.executed == 3
-    assert sync_client.executed == 0
-    name, params = async_client.op("rpc")[1:]
-    assert name == "bulk_update_scores"
-    assert all(set(u) == {"id", "score"} for u in params["p_updates"])
-    by_id = {u["id"]: u["score"] for u in params["p_updates"]}
-    assert by_id == {"job-1": 90, "job-2": 30}
-
-
-@pytest.mark.asyncio
-async def test_batch_update_global_scores_poll_matches_sync_rpc_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DRIFT GUARD (#57): the poll variant's ``bulk_update_scores`` payload
-    equals what the sync original computes for the same score rows. The
-    shared :func:`_global_score_updates` makes this structural; the assert
-    pins the whole read->aggregate->rpc shape anyway."""
-    import app.services.target_scoring as ts
-    from app.services.target_scoring import (
-        batch_update_global_scores,
-        batch_update_global_scores_poll,
-    )
-
-    _seam_flag_off(monkeypatch)
-    monkeypatch.setattr(ts, "_BATCH_CHUNK_SIZE", 1)  # exercise multi-chunk reads
-    ids = ["job-1", "job-2"]
-
-    poll_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
-    await batch_update_global_scores_poll(poll_client, ids)  # type: ignore[arg-type]
-
-    sync_client = _SyncSeamClient(rows_by_job=_BATCH_ROWS_BY_JOB)
-    batch_update_global_scores(sync_client, ids)  # type: ignore[arg-type]
-
-    poll_name, poll_params = poll_client.op("rpc")[1:]
-    sync_name, sync_params = sync_client.op("rpc")[1:]
-    assert poll_name == sync_name == "bulk_update_scores"
-    assert sorted(poll_params["p_updates"], key=lambda u: str(u["id"])) == sorted(
-        sync_params["p_updates"], key=lambda u: str(u["id"])
-    )
-    # Same read shape too: identical select/in_ chunk sequences.
-    poll_reads = [o for o in poll_client.ops if o[0] in ("select", "in_")]
-    sync_reads = [o for o in sync_client.ops if o[0] in ("select", "in_")]
-    assert poll_reads == sync_reads
-
-
-@pytest.mark.asyncio
-async def test_batch_update_global_scores_poll_empty_ids_no_db_traffic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same guard clause as the sync original: no ids -> zero queries."""
-    from app.services.target_scoring import batch_update_global_scores_poll
-
-    lookups = _seam_flag_off(monkeypatch)
-    sync_client = _SyncSeamClient()
-
-    await batch_update_global_scores_poll(sync_client, [])  # type: ignore[arg-type]
-
-    assert sync_client.executed == 0
-    assert sync_client.ops == []
-    assert lookups == []
-
-
 # ---------------------------------------------------------------------------
 # bulk_title_score_for_target (retro-score at activation — audit P3/M7)
 # ---------------------------------------------------------------------------
@@ -1487,16 +1252,15 @@ def _retro_jobs() -> list[dict[str, str]]:
     ]
 
 
-def test_bulk_title_score_batches_upserts_and_recomputes_globals(
+def test_bulk_title_score_batches_upserts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One bulk upsert + one global-score recompute PER PAGE (not per row),
-    only for pages that produced matches; the correctness fix for the retro
-    N+1 that never recomputed jobs.score."""
+    """One bulk upsert PER PAGE (not per row), only for pages that produced
+    matches — the correctness fix for the retro N+1. (The per-page global
+    jobs.score recompute that used to follow was retired with the column,
+    R2 schema audit Group A.)"""
     import app.services.target_scoring as ts
 
-    batch_update = MagicMock()
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
     monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)  # force multi-page
 
     supabase = _RetroSupabase(_retro_jobs())
@@ -1519,19 +1283,11 @@ def test_bulk_title_score_batches_upserts_and_recomputes_globals(
     assert by_id["j05"]["excluded"] is True
     assert by_id["j01"]["excluded"] is False
     assert by_id["j06"]["excluded"] is False
-    # Global score recomputed once per page-with-matches, with that page's ids.
-    assert batch_update.call_count == 2
-    assert [sorted(call.args[1]) for call in batch_update.call_args_list] == [
-        ["j01"],
-        ["j05", "j06"],
-    ]
 
 
 def test_bulk_title_score_empty_catalog_writes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    batch_update = MagicMock()
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
     supabase = _RetroSupabase([])
     target = _target(core={"React": 3})
 
@@ -1539,7 +1295,6 @@ def test_bulk_title_score_empty_catalog_writes_nothing(
 
     assert written == 0
     assert supabase.upsert_calls == []
-    batch_update.assert_not_called()
 
 
 def test_bulk_title_score_no_matches_writes_nothing(
@@ -1547,8 +1302,6 @@ def test_bulk_title_score_no_matches_writes_nothing(
 ) -> None:
     """Jobs exist but none match the target -> no upsert, no global recompute
     (and the keyset loop still terminates)."""
-    batch_update = MagicMock()
-    monkeypatch.setattr(_BATCH_UPDATE_PATH, batch_update)
     supabase = _RetroSupabase([{"id": "j01", "title": "Plumber"}, {"id": "j02", "title": "Chef"}])
     target = _target(core={"React": 3})
 
@@ -1556,4 +1309,3 @@ def test_bulk_title_score_no_matches_writes_nothing(
 
     assert written == 0
     assert supabase.upsert_calls == []
-    batch_update.assert_not_called()

@@ -138,7 +138,6 @@ class TestManualJobEndpoint:
         monkeypatch.setattr(jobs_router, "get_active_for_user", lambda *_a, **_kw: [target])
         # Scoring + global-score moved into the shared job_ingest service; the
         # router now delegates. Patch there.
-        monkeypatch.setattr(job_ingest, "update_global_score", lambda *_a, **_kw: None)
 
         captured: dict[str, object] = {}
 

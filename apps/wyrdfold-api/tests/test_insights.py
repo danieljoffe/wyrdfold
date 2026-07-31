@@ -1280,55 +1280,55 @@ class TestComputeSkillsCost:
         assert "Docker" in missing_skills
 
     def test_top_missing_ranked_by_score_weighted_priority(self):
-        """A skill missing from one 90-score job outranks a skill missing
-        from two 30-score jobs, since 90 > 30+30."""
+        """A skill missing from one HIGH-scoring analysis outranks a skill
+        missing from two LOW-scoring ones. Since R2 the weight is derived
+        from the analysis's own scorecard (scorecard_to_numeric) — the
+        legacy ``jobs.llm_score`` copy is gone — so the fixtures shape the
+        scorecards: strong fits (~88 numeric) vs weak fits (~1 each)."""
+        strong = {
+            # 6 high-confidence matches → skills 30; strong seniority+domain
+            # → 88 after the 1-missing penalty (scorecard_to_numeric).
+            "skills_matched": [
+                {"name": f"S{i}", "matched": True, "confidence": "high"} for i in range(6)
+            ],
+            "skills_missing": ["Kubernetes"],
+            "nice_to_haves": [],
+            "seniority_fit": "strong",
+            "seniority_rationale": "strong",
+            "domain_fit": "strong",
+            "domain_rationale": "strong",
+        }
+        weak = {
+            # one low-confidence match, weak fits → numeric ~0 after penalty.
+            "skills_matched": [{"name": "W", "matched": True, "confidence": "low"}],
+            "skills_missing": ["Rust"],
+            "nice_to_haves": [],
+            "seniority_fit": "weak",
+            "seniority_rationale": "weak",
+            "domain_fit": "weak",
+            "domain_rationale": "weak",
+        }
         analyses = [
-            {
-                "job_posting_id": "high-1",
-                "scorecard": {
-                    "skills_matched": [],
-                    "skills_missing": ["Kubernetes"],
-                },
-                "created_at": _ts(_NOW),
-            },
-            {
-                "job_posting_id": "low-1",
-                "scorecard": {
-                    "skills_matched": [],
-                    "skills_missing": ["Rust"],
-                },
-                "created_at": _ts(_NOW),
-            },
-            {
-                "job_posting_id": "low-2",
-                "scorecard": {
-                    "skills_matched": [],
-                    "skills_missing": ["Rust"],
-                },
-                "created_at": _ts(_NOW),
-            },
+            {"job_posting_id": "high-1", "scorecard": strong, "created_at": _ts(_NOW)},
+            {"job_posting_id": "low-1", "scorecard": dict(weak), "created_at": _ts(_NOW)},
+            {"job_posting_id": "low-2", "scorecard": dict(weak), "created_at": _ts(_NOW)},
         ]
-        postings = [
-            {"id": "high-1", "llm_score": 90.0, "created_at": _ts(_NOW)},
-            {"id": "low-1", "llm_score": 30.0, "created_at": _ts(_NOW)},
-            {"id": "low-2", "llm_score": 30.0, "created_at": _ts(_NOW)},
-        ]
-        sb = _mock_supabase({"analyses": analyses, "jobs": postings})
+        sb = _mock_supabase({"analyses": analyses})
         result = compute_skills_cost(sb, since=None)
 
         skills = [m.skill for m in result.top_missing]
-        assert skills[0] == "Kubernetes"  # priority 90 beats 60
-        assert skills[1] == "Rust"
+        assert skills[0] == "Kubernetes"  # one ~88-weight miss beats two ~0s
+        assert "Rust" in skills
 
         kubernetes = next(m for m in result.top_missing if m.skill == "Kubernetes")
         assert kubernetes.missing_count == 1
-        assert kubernetes.avg_job_score == 90.0
-        assert kubernetes.priority_score == 90.0
+        assert kubernetes.avg_job_score == 88.0  # scorecard_to_numeric(strong)
+        assert kubernetes.priority_score == 88.0
 
         rust = next(m for m in result.top_missing if m.skill == "Rust")
         assert rust.missing_count == 2
-        assert rust.avg_job_score == 30.0
-        assert rust.priority_score == 60.0
+        assert rust.avg_job_score == 0.0  # two weak fits, numeric 0 each
+        assert rust.priority_score == 0.0
 
     def test_top_missing_falls_back_to_count_when_no_scores(self):
         """If no posting has llm_score, ranking should still produce a
@@ -1574,8 +1574,9 @@ class TestComputeChunksLargeIdLists:
     def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
         """#60-perf: skills-cost no longer resolves posting membership via
         ``scores`` (tens of thousands of rows) + fetches every target posting.
-        It scopes analyses by ``target_id`` directly and fetches ``jobs.llm_score``
-        for ONLY the handful of analysis-bearing postings."""
+        It scopes analyses by ``target_id`` directly; since R2 the priority
+        weight comes from each analysis's own scorecard, so there is NO jobs
+        fetch at all."""
         analyses = [
             {
                 "job_posting_id": "p1",
@@ -1593,10 +1594,9 @@ class TestComputeChunksLargeIdLists:
                 "scorecard": {"skills_missing": ["Go"]},
             },
         ]
-        postings = [{"id": "p1", "llm_score": 80.0}, {"id": "p2", "llm_score": 60.0}]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
-            {"analyses": analyses, "jobs": postings, "documents": [], "llm_costs": []},
+            {"analyses": analyses, "documents": [], "llm_costs": []},
             in_batches,
         )
 
@@ -1604,10 +1604,9 @@ class TestComputeChunksLargeIdLists:
 
         # No membership pull: skills-cost must not touch the ``scores`` table.
         assert "scores" not in in_batches
-        # ``jobs`` fetched for ONLY the two analysis-bearing postings, not a
-        # target-wide membership set.
-        job_ids = sorted(i for batch in in_batches.get("jobs", []) for i in batch)
-        assert job_ids == ["p1", "p2"]
+        # And since R2, no ``jobs`` read either — the weight is in-hand from
+        # the analyses' scorecards.
+        assert "jobs" not in in_batches
         # Skills flow through from the scorecards.
         skills = {s.skill for s in result.top_skills}
         assert {"React", "Rust", "Go"} <= skills

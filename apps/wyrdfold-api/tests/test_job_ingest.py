@@ -54,12 +54,11 @@ def _rpc_calls(supabase: MagicMock) -> list[str]:
 def invalidations(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     """Neutralize the scoring collaborators + record cache invalidations.
 
-    Individual tests re-patch ``score_and_upsert`` / ``update_global_score`` when
-    they want to assert on those calls.
+    Individual tests re-patch ``score_and_upsert`` when they want to assert
+    on those calls.
     """
     monkeypatch.setattr(job_ingest, "parse_jd", lambda _desc: {})
     monkeypatch.setattr(job_ingest, "sanitize_html", lambda s: s)
-    monkeypatch.setattr(job_ingest, "update_global_score", lambda *_a, **_kw: None)
     hits: list[int] = []
     # Same singleton job_ingest imported — patching here neutralizes it there.
     monkeypatch.setattr(job_list_cache, "invalidate", lambda: hits.append(1))
@@ -127,14 +126,10 @@ async def test_scores_each_target_and_force_includes(
     monkeypatch.setattr(
         job_ingest, "score_and_upsert", lambda _c, **kw: scored.append(kw["target"].id)
     )
-    gs = MagicMock()
-    monkeypatch.setattr(job_ingest, "update_global_score", gs)
-
     posting_id = await _materialize(supabase, targets=[_target("tgt-1"), _target("tgt-2")])
 
     assert posting_id == "job-1"
     assert sorted(scored) == ["tgt-1", "tgt-2"]  # every target scored
-    gs.assert_called_once()  # global score recomputed once
     # Force-include RPC carried the posting + BOTH target ids.
     rpc = next(c for c in supabase.rpc.call_args_list if c.args[0] == "user_set_scores_included")
     assert rpc.args[1]["p_job_posting_id"] == "job-1"
@@ -147,7 +142,7 @@ async def test_per_target_score_failure_is_isolated(
     monkeypatch: pytest.MonkeyPatch, invalidations: list[int]
 ) -> None:
     """One target's scoring blowing up must not lose the others, fail the
-    materialize, or skip the global-score / force-include steps."""
+    materialize, or skip the force-include step."""
     supabase = _supabase()
     scored: list[str] = []
 
@@ -158,36 +153,12 @@ async def test_per_target_score_failure_is_isolated(
         scored.append(target.id)  # type: ignore[attr-defined]
 
     monkeypatch.setattr(job_ingest, "score_and_upsert", flaky)
-    gs = MagicMock()
-    monkeypatch.setattr(job_ingest, "update_global_score", gs)
 
     posting_id = await _materialize(supabase, targets=[_target("tgt-bad"), _target("tgt-ok")])
 
     assert posting_id == "job-1"  # materialize did NOT fail
     assert scored == ["tgt-ok"]  # the healthy target still scored
-    gs.assert_called_once()  # global score still recomputed
     assert "user_set_scores_included" in _rpc_calls(supabase)  # force-include still ran
-
-
-@pytest.mark.asyncio
-async def test_global_score_failure_is_swallowed(
-    monkeypatch: pytest.MonkeyPatch, invalidations: list[int]
-) -> None:
-    """A global-score recompute failure is best-effort — it must not propagate,
-    and force-include (the visibility guarantee) must still run afterward."""
-    supabase = _supabase()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", lambda _c, **kw: None)
-
-    def boom(*_a: object, **_kw: object) -> None:
-        raise RuntimeError("global score down")
-
-    monkeypatch.setattr(job_ingest, "update_global_score", boom)
-
-    posting_id = await _materialize(supabase)
-
-    assert posting_id == "job-1"  # did not propagate
-    assert "user_set_scores_included" in _rpc_calls(supabase)  # force-include still ran
-    assert invalidations == [1]
 
 
 @pytest.mark.asyncio

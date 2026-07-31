@@ -19,7 +19,7 @@ Lifecycle:
   5. ``archive_dead_jobs`` flips jobs whose failure_count >=
      ``URL_HEALTH_FAILURE_THRESHOLD`` to ``status = 'archived'`` and NULLs
      heavy fields (``description_html`` on jobs; ``axis_scores``,
-     ``fit_reasoning``, ``score_breakdown``, ``matched_keywords`` on
+     ``fit_reasoning``, ``score_breakdown`` on
      scores) to reclaim DB space.
 
 We track existence by keeping the row + identity (id, external_id, title,
@@ -216,7 +216,7 @@ async def _archive_with_data_drop(supabase: AsyncClient, job_ids: list[str]) -> 
 
     Dropped (to reclaim space):
       jobs.description_html
-      scores.axis_scores, fit_reasoning, score_breakdown, matched_keywords
+      scores.axis_scores, fit_reasoning, score_breakdown
 
     Returns the number of jobs archived.
     """
@@ -245,7 +245,6 @@ async def _archive_with_data_drop(supabase: AsyncClient, job_ids: list[str]) -> 
                 "axis_scores": None,
                 "fit_reasoning": None,
                 "score_breakdown": None,
-                "matched_keywords": None,
             }
         )
         .in_("job_posting_id", job_ids)

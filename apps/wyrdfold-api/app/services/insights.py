@@ -18,6 +18,7 @@ from typing import Any, cast
 
 from supabase import Client
 
+from app.models.analysis import Scorecard
 from app.models.insights import (
     CostBucket,
     FunnelStage,
@@ -33,6 +34,7 @@ from app.models.insights import (
     TargetInsights,
     WeeklyCount,
 )
+from app.services.analysis.scoring import scorecard_to_numeric
 from app.services.supabase_retry import execute_with_retry_sync
 
 logger = logging.getLogger(__name__)
@@ -991,21 +993,23 @@ def compute_skills_cost(
     else:
         analyses = _rows(_analyses_base(), label="insights/skills_cost_analyses")
 
-    # ``jobs.llm_score`` weights the missing-skill priority. Only postings that
-    # have an analysis contribute skills, so fetch scores for JUST those (a
-    # handful) — not every posting in the target.
-    analysis_posting_ids = {str(a["job_posting_id"]) for a in analyses if a.get("job_posting_id")}
+    # The analysis's own scorecard weights the missing-skill priority —
+    # derived in-hand from rows we already fetched. (Until R2 this read the
+    # legacy ``jobs.llm_score`` copy, which was stale-or-NULL on all but a
+    # few hundred rows; the scorecard is the same signal at the source.)
     posting_scores: dict[str, float] = {}
-    if analysis_posting_ids:
-        score_rows = _fetch_in_chunks(
-            lambda batch: supabase.table("jobs").select("id, llm_score").in_("id", batch),
-            list(analysis_posting_ids),
-            label="insights/skills_cost_postings",
-        )
-        for p in score_rows:
-            score = p.get("llm_score")
-            if score is not None:
-                posting_scores[str(p["id"])] = float(score)
+    for a in analyses:
+        pid = a.get("job_posting_id")
+        card = a.get("scorecard")
+        if pid and isinstance(card, dict):
+            try:
+                posting_scores[str(pid)] = float(
+                    scorecard_to_numeric(Scorecard.model_validate(card))
+                )
+            except Exception:
+                # Malformed legacy scorecard — log once at debug and skip
+                # its weight; the skill still counts, just unweighted.
+                logger.debug("insights: unparseable scorecard for posting %s", pid)
 
     # Per-purpose LLM spend — aggregated server-side via the
     # cost_by_purpose_since RPC (#105), client-side fallback inside the helper.

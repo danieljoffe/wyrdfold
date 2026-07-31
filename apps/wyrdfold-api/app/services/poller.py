@@ -15,24 +15,13 @@ from app.models.experience import OptimizedDoc
 from app.models.schemas import PollResult
 from app.models.targets import JobTarget
 from app.services import notify
-from app.services.analysis.analyze import analyze_job
-from app.services.analysis.persistence import (
-    get_cached as get_cached_analysis,
-)
-from app.services.analysis.persistence import (
-    persist as persist_analysis,
-)
-from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
-from app.services.embeddings.prescan_gate import cosine_gate_decision
-from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
 from app.services.extract import extract_salary_from_html, salary_columns
 from app.services.firecrawl import fetch_firecrawl_jobs
 from app.services.fit import run_phase2_for_jobs
-from app.services.fit.phase2_runner import _prescan_gate_applies
 from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
@@ -73,15 +62,9 @@ from app.services.relevance.title_triage import (
     triage_titles,
 )
 from app.services.sanitize import sanitize_html
-from app.services.scoring import score_title_against_profile, strip_html
+from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
-from app.services.target_scoring import (
-    batch_update_global_scores_poll as batch_update_global_scores,
-)
-from app.services.target_scoring import (
-    mark_complete_poll as mark_target_scores_complete,
-)
 from app.services.target_scoring import (
     score_and_upsert_poll as target_score_and_upsert,
 )
@@ -165,10 +148,6 @@ def _validate_semaphore() -> asyncio.Semaphore:
 # modules outside the poll herd (targets CRUD, budget meters, analysis
 # persistence) — a few calls per cycle, migrating with the request-handler
 # slice, not per-row fan-outs.
-
-# Minimum keyword score to trigger LLM analysis during polling.
-# Below this threshold, only keyword scoring is used.
-LLM_SCORE_THRESHOLD = 40
 
 # How many qualification-tagger jobs to fan out between global-budget
 # re-reads (#60 overspend fix). The tagger bills the instance key, so it is
@@ -545,15 +524,14 @@ async def _validate_one_row(row: dict[str, Any]) -> dict[str, Any]:
         # PERF-H3: bound the URL-validation fan-out cycle-wide.
         async with _validate_semaphore():
             result = await validate_job_url(url)
+        # The validation's OBSERVABLE effects live on absolute_url (null a
+        # rejected link, normalize redirects). The old per-row ledger columns
+        # (url_validation_status/warnings) were write-only for their whole
+        # life — 0 rejected / 35k 'valid' ever — and were dropped in R2.
         if not result.is_valid:
-            row["url_validation_status"] = "rejected"
-            row["url_validation_warnings"] = [result.rejection_reason]
             row["absolute_url"] = None
-        else:
-            row["url_validation_status"] = "valid"
-            row["url_validation_warnings"] = result.warnings
-            if result.final_url != url:
-                row["absolute_url"] = result.final_url
+        elif result.final_url != url:
+            row["absolute_url"] = result.final_url
     except Exception:
         logger.exception("URL validation failed for %s", url)
     return row
@@ -604,35 +582,6 @@ async def _fill_jsonld_salaries(
     await asyncio.gather(*(_one(r) for r in candidates))
 
 
-async def _batch_fetch_job_scores(supabase: Client, job_ids: list[str]) -> dict[str, int]:
-    """Return ``{job_id: score}`` for the given ids in a single round-trip.
-
-    Callers in the poller fan out Stage 3 over N rows; without this batch
-    helper each call did its own ``.eq("id", jid).single()`` lookup — N
-    sequential queries to read scores that Stage 2 just wrote. One RPC
-    call replaces all of them.
-
-    ``job_ids`` scales with a source's job feed (every upsertable row), so
-    they ride in the ``get_job_scores_by_ids`` RPC's ``p_ids`` jsonb body —
-    no id list in the request URL, no URL-length limit, one round-trip
-    (#93). The result dict is keyed by id, identical to the old ``.in_()``
-    read.
-    """
-    if not job_ids:
-        return {}
-    resp = await poll_db_read(
-        supabase,
-        lambda c: c.rpc("get_job_scores_by_ids", {"p_ids": job_ids}),
-        label="poll job-scores read",
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    out: dict[str, int] = {}
-    for r in rows:
-        if r.get("id") is not None:
-            out[cast(str, r["id"])] = int(r.get("score") or 0)
-    return out
-
-
 async def _load_alert_rows(
     supabase: Client, new_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -670,170 +619,6 @@ async def _load_alert_rows(
     except Exception:
         logger.exception("Alert-row refresh failed — dispatching stale rows")
     return new_rows
-
-
-async def _run_llm_scoring_for_row(
-    supabase: Client,
-    row_data: dict[str, Any],
-    optimized_doc: OptimizedDoc,
-    llm: LLMClient,
-    target: JobTarget,
-    *,
-    current_score: int | None = None,
-    payer_user_id: str | None = None,
-) -> None:
-    """Stage 3: Run LLM analysis and mark target scores as complete.
-
-    The caller may pass ``current_score`` to skip the per-job score
-    lookup — strongly preferred when invoking in a fan-out loop, since
-    Stage 2 already wrote the score and pre-fetching the batch via
-    ``_batch_fetch_job_scores`` collapses N round-trips into 1. When
-    omitted, falls back to a per-row ``.eq().single()`` lookup for
-    callers that don't have a batch context.
-
-    Blends keyword and LLM scores, updates global score, and marks all
-    target scores for this job as 'complete'.
-
-    Cache key is (job_posting_id, target.id, optimized_doc.id) — the
-    same row is reused by the user-facing analysis flow when viewing
-    the job under this target.
-
-    Silently falls back to keyword-only score on any error.
-    """
-    job_id = row_data.get("id")
-    if not job_id:
-        return
-
-    if current_score is None:
-        # Single-row fallback for callers without a pre-fetched batch.
-        try:
-            score_resp = await poll_db_read(
-                supabase,
-                lambda c: c.table("jobs").select("score").eq("id", job_id).single(),
-                label="poll job-score fallback read",
-            )
-            current_score = int(cast(dict[str, Any], score_resp.data).get("score", 0))
-        except Exception:
-            # Score row missing or unparseable — treat as 0 so the LLM-threshold
-            # gate applies as if this is a fresh job. Logged so silent zeroing is
-            # observable when investigating low-confidence matches.
-            logger.warning(
-                "Could not read current score for job %s — defaulting to 0",
-                job_id,
-                exc_info=True,
-            )
-            current_score = 0
-
-    if current_score < LLM_SCORE_THRESHOLD:
-        # Below threshold — skip LLM but still mark as complete
-        try:
-            await mark_target_scores_complete(supabase, job_id)
-        except Exception:
-            logger.exception("Failed to mark scores complete for job %s", job_id)
-        return
-
-    # Check LLM cache — skip re-analysis if this job+target+optimized was already
-    # done. Scope to the doc's OWNING user (``optimized_doc.user_id``) — the same
-    # tenant the user-facing ``POST /analysis`` reads under (its
-    # ``get_latest(user_id=sub)`` returns this very doc). Reading/persisting under
-    # ``user_id=None`` (the old value) stranded cron-computed analyses in a
-    # separate namespace the user view could never hit, so every first visit
-    # re-fired a full-price LLM call the cron had already paid for.
-    try:
-        cached = await asyncio.to_thread(
-            get_cached_analysis,
-            supabase,
-            job_id,
-            target_id=target.id,
-            optimized_doc_id=optimized_doc.id,
-            user_id=optimized_doc.user_id,
-        )
-        if cached is not None:
-            llm_score = scorecard_to_numeric(cached.scorecard)
-            blended = blend_scores(current_score, llm_score)
-            await poll_db_write(
-                supabase,
-                lambda c: (
-                    c.table("jobs")
-                    .update(
-                        {
-                            "score": blended,
-                            "llm_score": llm_score,
-                            "llm_analysis_id": cached.id,
-                        }
-                    )
-                    .eq("id", job_id)
-                ),
-                label="poll llm-score cached update",
-            )
-            await mark_target_scores_complete(supabase, job_id)
-            return
-    except Exception:
-        logger.debug("LLM cache check failed for job %s, proceeding with analysis", job_id)
-
-    try:
-        description_text = strip_html(row_data.get("description_html", ""))
-
-        analysis, llm_result = await analyze_job(
-            llm,
-            optimized=optimized_doc.payload,
-            job_description=description_text,
-            purpose="poll_scoring",
-        )
-
-        # Persist analysis and log cost. Owned by ``optimized_doc.user_id`` so
-        # the user-facing ``POST /analysis`` flow reuses this exact row (shared
-        # cache key (job, target, optimized_doc_id, user_id)) instead of
-        # re-running the LLM on first view.
-        record = await asyncio.to_thread(
-            persist_analysis,
-            supabase,
-            job_posting_id=job_id,
-            target_id=target.id,
-            user_id=optimized_doc.user_id,
-            optimized_doc_id=optimized_doc.id,
-            analysis=analysis,
-            llm_result=llm_result,
-        )
-        # Cron path: enqueue instead of inline INSERT. The background
-        # buffer batches per-row writes into a single bulk INSERT every
-        # few seconds, so a fan-out of N concurrent LLM calls produces
-        # ~1 cost-log INSERT instead of N. Charged to the payer (the
-        # user whose optimized doc this run scores against).
-        enqueue_llm_cost(payer_user_id, "poll_scoring", llm_result)
-
-        llm_score = scorecard_to_numeric(analysis.scorecard)
-        blended = blend_scores(current_score, llm_score)
-
-        # Update the jobs row with LLM score data
-        await poll_db_write(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .update(
-                    {
-                        "score": blended,
-                        "llm_score": llm_score,
-                        "llm_analysis_id": record.id,
-                    }
-                )
-                .eq("id", job_id)
-            ),
-            label="poll llm-score update",
-        )
-
-        # Mark all target scores as complete
-        await mark_target_scores_complete(supabase, job_id)
-
-    except Exception:
-        logger.exception(
-            "LLM scoring failed for job %s ('%s')",
-            row_data.get("id"),
-            row_data.get("title", "?"),
-        )
-        # Still mark as complete on error — don't leave jobs stuck in stage2
-        with contextlib.suppress(Exception):
-            await mark_target_scores_complete(supabase, job_id)
 
 
 async def _resolve_user_targets_for_stage3(
@@ -1433,7 +1218,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
             target.id,
         )
         try:
-            graded = await run_phase2_for_jobs(
+            await run_phase2_for_jobs(
                 supabase,
                 llm,
                 target=target,
@@ -1444,92 +1229,6 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
         except Exception:
             logger.exception("Grade backfill failed for target %s", target.id)
             continue
-        if graded:
-            # Phase 2 rewrote ``scores.score``; re-aggregate the global
-            # ``jobs.score`` for the touched rows (mirrors the cycle path).
-            try:
-                await batch_update_global_scores(supabase, [cast(str, j["id"]) for j in stale_jobs])
-            except Exception:
-                logger.exception("Grade backfill: global score update failed")
-
-
-async def _shadow_observe(
-    supabase: Client,
-    *,
-    job_id: str,
-    target: JobTarget,
-    keyword_admit: bool | None,
-    keyword_score: int | None,
-) -> None:
-    """Log the pre-scan disagreement matrix for one (job, target) (#60/#68 P3).
-
-    SHADOW MODE — OBSERVATION ONLY. The keyword decision passed in
-    (``keyword_admit`` / ``keyword_score``) is what actually drove admission;
-    here we ALSO compute the would-be cosine gate decision and append one
-    ``prescan_shadow`` row recording both, so the keyword↔cosine disagreement can
-    be sized BEFORE any gate flip. This changes NO admission behavior.
-
-    Best-effort and fully fail-soft: the cosine computation returns ``(None,
-    None)`` when the Phase-1/2 vectors aren't populated, and both it and the row
-    write swallow their own errors — a shadow failure can never break polling.
-    Only ever reached behind ``settings.prescan_shadow_enabled`` (the caller
-    gates on the flag; flag off ⇒ this is never invoked, no cosine work, no row).
-
-    Once the gate is LIVE for a target (``_prescan_gate_applies``), the
-    disagreement matrix is moot for it — cosine already drives admission — so
-    the shadow is skipped. This isn't just tidiness: each shadow observation
-    costs two full-vector reads (~8-16KB each) plus a row write, per
-    (job, target), per cycle — a steady IO stream the 2026-07-10 disk-budget
-    incident taught us to account for.
-    """
-    if _prescan_gate_applies(target.id):
-        return
-    try:
-        cosine, cosine_admit = await cosine_gate_decision(supabase, job_id=job_id, target=target)
-        threshold = await _shadow_threshold(supabase, target_id=target.id)
-        await record_shadow_observation(
-            supabase,
-            job_id=job_id,
-            target_id=target.id,
-            keyword_admit=keyword_admit,
-            keyword_score=keyword_score,
-            cosine=cosine,
-            cosine_admit=cosine_admit,
-            threshold=threshold,
-        )
-    except Exception:
-        logger.exception(
-            "Pre-scan shadow observation failed for job %s / target %s",
-            job_id,
-            target.id,
-        )
-
-
-async def _shadow_threshold(supabase: Client, *, target_id: str) -> float | None:
-    """Best-effort read of a target's ``prescan_cosine_threshold`` for the shadow
-    row's ``threshold`` column. Returns ``None`` on any miss/error so the shadow
-    log is never blocked by it.
-
-    Read separately from ``cosine_gate_decision`` (which fetches the threshold
-    internally but only returns the cosine + verdict): the matrix wants the raw
-    threshold logged even when cosine is NULL.
-    """
-    try:
-        resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("targets").select("prescan_cosine_threshold").eq("id", target_id).limit(1)
-            ),
-            label="poll shadow-threshold read",
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
-            return None
-        raw = rows[0].get("prescan_cosine_threshold")
-        return float(raw) if raw is not None else None
-    except Exception:
-        logger.exception("Pre-scan shadow threshold read failed for target %s", target_id)
-        return None
 
 
 def _resolve_payer_client(
@@ -1931,8 +1630,6 @@ async def _poll_one_source(
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "score": 0,  # Placeholder — updated by target scoring pipeline
-                    "score_breakdown": {},
                     "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
                     **salary_columns(salary),
@@ -2047,14 +1744,6 @@ async def _poll_one_source(
                     *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
 
-            # Update global scores after stage 1 (batched)
-            stage1_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if stage1_ids:
-                try:
-                    await batch_update_global_scores(supabase, stage1_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 1")
-
             # ---- Stage 2: Full JD scoring per target (async) ----
             # Pre-parse each JD once, reuse across all targets
             jd_cache: dict[str, Any] = {}
@@ -2132,7 +1821,7 @@ async def _poll_one_source(
                             )
                             promising_arg = promising if phase1_verdicts else None
                             phase1_confidence = verdict.confidence if verdict is not None else None
-                        stage2 = await target_score_and_upsert(
+                        await target_score_and_upsert(
                             supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
@@ -2143,35 +1832,12 @@ async def _poll_one_source(
                             promising=promising_arg,
                             phase1_confidence=phase1_confidence,
                         )
-                        # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
-                        # OBSERVATION ONLY: the keyword decision above already
-                        # drove admission; here we also log the would-be cosine
-                        # gate verdict alongside it (the disagreement matrix).
-                        # Best-effort + flag-gated — nothing happens (no cosine
-                        # work, no row) unless ``prescan_shadow_enabled`` is set,
-                        # and a shadow failure can never break scoring.
-                        if settings.prescan_shadow_enabled:
-                            await _shadow_observe(
-                                supabase,
-                                job_id=row_data["id"],
-                                target=target,
-                                keyword_admit=promising,
-                                keyword_score=stage2.score,
-                            )
                     except Exception:
                         logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
                 await asyncio.gather(
                     *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
-
-            # Update global scores after stage 2 (batched)
-            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if stage2_ids:
-                try:
-                    await batch_update_global_scores(supabase, stage2_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 2")
 
             # ---- Stage 3: LLM scoring for qualified jobs (concurrent) ----
             # Each user with an active target gets one LLM analysis per
@@ -2239,62 +1905,10 @@ async def _poll_one_source(
                             uid,
                             p2_target.id,
                         )
-                if stage2_ids:
-                    try:
-                        await batch_update_global_scores(supabase, stage2_ids)
-                    except Exception:
-                        logger.exception("Global score update failed after Phase 2")
-            elif primary_by_user:
-                llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-
-                # Pre-fetch scores once: Stage 2 just wrote them, and
-                # _run_llm_scoring_for_row would otherwise issue one
-                # .eq().single() per row in the fan-out below.
-                stage3_ids = [
-                    cast(str, cast(dict[str, Any], r).get("id"))
-                    for r in upsert_resp.data or []
-                    if cast(dict[str, Any], r).get("id")
-                ]
-                score_map = await _batch_fetch_job_scores(supabase, stage3_ids)
-
-                async def _llm_one(
-                    row_data: dict[str, Any],
-                    target: JobTarget,
-                    doc: OptimizedDoc,
-                    payer: str,
-                ) -> None:
-                    # BYOK (#5 P3): each row grades on its payer's own key
-                    # (memoized, so a payer's rows reuse one client). No
-                    # key in hosted require-mode → skip this row's grading.
-                    client = _resolve_payer_client(payer_clients, supabase, payer)
-                    if client is None:
-                        return
-                    async with llm_sem:
-                        await _run_llm_scoring_for_row(
-                            supabase,
-                            row_data,
-                            doc,
-                            client,
-                            target,
-                            current_score=score_map.get(cast(str, row_data.get("id", "")), 0),
-                            payer_user_id=payer,
-                        )
-
-                await asyncio.gather(
-                    *(
-                        _llm_one(
-                            cast(dict[str, Any], r),
-                            primary_by_user[uid],
-                            user_optimized[uid],
-                            uid,
-                        )
-                        for r in upsert_resp.data or []
-                        for uid in primary_by_user
-                        # Over-allowance payers defer — same semantics as
-                        # the Phase 2 branch above.
-                        if not gate.user_blocked(uid)
-                    )
-                )
+            # Ids of every row touched this cycle — feeds the recency
+            # refresh (the legacy global-score recompute that shared this
+            # list was retired in R2, schema audit Group A).
+            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
 
             # ---- Recency decay refresh (#5) ----
             # Re-derive ``scores.recency_score`` for every row touched
@@ -3176,8 +2790,6 @@ async def _poll_one_source_for_target(
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "score": 0,  # Updated by target scoring pipeline
-                    "score_breakdown": {},
                     "greenhouse_updated_at": normalize_posted_at(job.updated_at),
                     "salary_text": salary,
                     **salary_columns(salary),
@@ -3312,7 +2924,7 @@ async def _poll_one_source_for_target(
                         )
                         promising_arg = promising if target_verdicts else None
                         phase1_confidence = verdict.confidence if verdict is not None else None
-                    stage2 = await target_score_and_upsert(
+                    await target_score_and_upsert(
                         supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
@@ -3323,33 +2935,12 @@ async def _poll_one_source_for_target(
                         promising=promising_arg,
                         phase1_confidence=phase1_confidence,
                     )
-                    # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
-                    # OBSERVATION ONLY: log the would-be cosine gate verdict
-                    # alongside the live keyword decision above. Best-effort +
-                    # flag-gated (no cosine work / no row unless
-                    # ``prescan_shadow_enabled``); never breaks scoring.
-                    if settings.prescan_shadow_enabled:
-                        await _shadow_observe(
-                            supabase,
-                            job_id=row_data["id"],
-                            target=target,
-                            keyword_admit=promising,
-                            keyword_score=stage2.score,
-                        )
                 except Exception:
                     logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
             await asyncio.gather(
                 *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
             )
-
-            # Update global scores after stage 2 (batched)
-            s2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if s2_ids:
-                try:
-                    await batch_update_global_scores(supabase, s2_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 2")
 
             # Stage 3: LLM scoring for qualified jobs (concurrent).
             # JobTarget is a global row with no user_id — resolve owning
@@ -3402,57 +2993,6 @@ async def _poll_one_source_for_target(
                                 uid,
                                 target.id,
                             )
-                    if s2_ids:
-                        try:
-                            await batch_update_global_scores(supabase, s2_ids)
-                        except Exception:
-                            logger.exception("Global score update failed after Phase 2")
-            elif primary_by_user:
-                # BYOK (#5 P3): grade on the payer's own key; no key in
-                # hosted require-mode defers.
-                llm = _resolve_payer_client(payer_clients, supabase, payer_user_id)
-                if llm is None:
-                    logger.info(
-                        "Stage 3 deferred for target %s (payer %s has no BYOK key)",
-                        target.id,
-                        payer_user_id,
-                    )
-                else:
-                    # Bind a non-optional alias: mypy doesn't carry the
-                    # ``llm is not None`` narrowing into the nested closure.
-                    grading_client: LLMClient = llm
-                    llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-
-                    # Pre-fetch scores once (Stage 2 just wrote them).
-                    stage3_ids_t = [
-                        cast(str, cast(dict[str, Any], r).get("id"))
-                        for r in upsert_resp.data or []
-                        if cast(dict[str, Any], r).get("id")
-                    ]
-                    score_map_t = await _batch_fetch_job_scores(supabase, stage3_ids_t)
-
-                    async def _llm_one_t(
-                        row_data: dict[str, Any],
-                        doc: OptimizedDoc,
-                    ) -> None:
-                        async with llm_sem:
-                            await _run_llm_scoring_for_row(
-                                supabase,
-                                row_data,
-                                doc,
-                                grading_client,
-                                target,
-                                current_score=score_map_t.get(cast(str, row_data.get("id", "")), 0),
-                                payer_user_id=payer_user_id,
-                            )
-
-                    await asyncio.gather(
-                        *(
-                            _llm_one_t(cast(dict[str, Any], r), user_optimized[uid])
-                            for r in upsert_resp.data or []
-                            for uid in primary_by_user
-                        )
-                    )
 
     except Exception:
         logger.exception("Poll failed for %s (target %s)", company_name, target.label)

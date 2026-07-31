@@ -58,7 +58,6 @@ def test_score_write_rpcs_locked_to_service_role(
                         "scoring_status": "stage2",
                         "scored_profile_version": 1,
                         "recency_score": 0,
-                        "matched_keywords": [],
                         "updated_at": "2026-07-18T00:00:00+00:00",
                         "score_breakdown": {},
                     }
