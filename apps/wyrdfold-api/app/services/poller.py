@@ -1840,16 +1840,19 @@ async def _poll_one_source(
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
-                    # Payer over monthly allowance (or unattributable) —
-                    # spend nothing. Empty verdicts → fail-open admit, so
-                    # jobs still ingest (promising, score=NULL) and get
-                    # graded once the payer's window frees up. Same defer
-                    # semantics as the Phase 2 daily cap.
+                    # Sponsored target whose payer is blocked (over
+                    # allowance / idle / disabled) — spend nothing. Empty
+                    # verdicts → fail-open admit, so jobs still ingest
+                    # (promising, score=NULL) and get graded once the
+                    # payer's window frees up. Same defer semantics as the
+                    # Phase 2 daily cap. Catalog targets (no active user
+                    # link) are never blocked here — their triage bills
+                    # the instance key via ``_resolve_payer_client(None)``.
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s over "
-                        "monthly allowance or unknown)",
+                        "Phase 1 deferred for target %s (payer %s blocked: "
+                        "over allowance / idle / disabled)",
                         active_target.id,
                         gate.payer_for(active_target.id),
                     )
@@ -3144,9 +3147,10 @@ async def _poll_one_source_for_target(
 
         # Phase 1 per-target triage (single target). Same semantics as
         # ``_poll_one_source`` but the candidate set is one target, so
-        # ``phase1_verdicts`` collapses to a single dict. Skipped when
-        # the payer is over their monthly allowance (or unattributable):
-        # empty verdicts → fail-open ingest, grading defers.
+        # ``phase1_verdicts`` collapses to a single dict. Skipped when a
+        # SPONSORED payer is blocked (over allowance / idle / disabled):
+        # empty verdicts → fail-open ingest, grading defers. A catalog
+        # target (no active user link) triages on the instance key.
         #
         # Only NEW external_ids that are FREE-GATE SURVIVORS are triaged
         # (mirrors ``_poll_one_source``): the per-job loop below drops
@@ -3669,7 +3673,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
     if over:
         logger.info(
             "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s over monthly allowance or unknown)",
+            "(payer %s blocked: over allowance / idle / disabled)",
             target.id,
             payer,
         )
