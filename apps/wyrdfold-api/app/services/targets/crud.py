@@ -256,6 +256,9 @@ def get_active(supabase: Client) -> list[JobTarget]:
     tables, deduped in Python.
     """
     floor_resp = supabase.table(TARGETS_TABLE).select("*").eq("app_active", True).execute()
+    # NOTE: both arms ride PostgREST's default 1000-row page. Fine at current
+    # scale (tens of rows); at 1000+ active memberships the derived set would
+    # silently truncate — page the membership read before that ever happens.
     member_ids_resp = (
         supabase.table(USER_TARGETS_TABLE)
         .select("target_id")
