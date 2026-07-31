@@ -26,14 +26,6 @@ from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
-from app.services.embeddings import get_default_client as get_embeddings_client
-from app.services.embeddings.job_embeddings import (
-    DEFAULT_MODEL as EMBED_DEFAULT_MODEL,
-)
-from app.services.embeddings.job_embeddings import (
-    embed_jobs_batch,
-    upsert_job_embedding,
-)
 from app.services.embeddings.prescan_gate import cosine_gate_decision
 from app.services.embeddings.prescan_shadow import record_shadow_observation
 from app.services.experience.optimized import get_latest as get_latest_optimized
@@ -1304,48 +1296,6 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
         await _qualify_jobs(supabase, live)
 
 
-async def _embed_jobs(
-    supabase: Client,
-    rows: list[dict[str, Any]],
-) -> None:
-    """Embed ``rows`` for the #60 pre-scan (best-effort, target-INDEPENDENT).
-
-    PURELY populates ``job_embeddings`` — no gating, no behavior change.
-    ``upsert_job_embedding`` is itself content-hash cached (an unchanged
-    re-poll re-embeds nothing) and fail-soft (it never raises). The fan-out
-    is bounded by a dedicated semaphore sized like the DB-write cap so a
-    large poll's embeds can't thundering-herd the pool; we don't reuse the
-    shared DB-write semaphore because that would also serialize the slow
-    Voyage network call. Resolving the client and the whole step are wrapped
-    so any failure can never break the poll.
-    """
-    try:
-        embeddings_client = get_embeddings_client()
-    except Exception:
-        logger.exception("Pre-scan embed: embeddings client unavailable; skipping")
-        return
-
-    # Dedicated, SMALL cap (not DB_WRITE_CONCURRENCY): concurrent HNSW inserts
-    # contend + starve foreground reads on a small instance (2026-07-23). A few
-    # in flight keeps ingestion moving without saturating IO.
-    sem = asyncio.Semaphore(settings.embedding_write_concurrency)
-
-    async def _one(row: dict[str, Any]) -> None:
-        async with sem:
-            await upsert_job_embedding(
-                supabase,
-                embeddings_client,
-                job_id=row["id"],
-                title=row.get("title"),
-                description_html=row.get("description_html"),
-            )
-
-    await asyncio.gather(
-        *(_one(row) for row in rows),
-        return_exceptions=True,
-    )
-
-
 async def _drop_purged_rows(
     supabase: Client, source_id: str, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1391,70 +1341,6 @@ async def _drop_purged_rows(
     except Exception:
         logger.exception("Purge guard failed for source %s; upserting all", source_id)
         return rows
-
-
-async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
-    """Embed a bounded batch of jobs with NO ``job_embeddings`` row (#21 sweep).
-
-    The on-ingest hook (``_embed_jobs`` above) only sees jobs upserted THIS
-    cycle, and it's fail-soft per row — so a job whose embed silently failed
-    (provider hiccup, cancelled cycle) is only retried if its source re-lists
-    it, and a job ingested before the embed pipeline armed is never visited at
-    all. On prod that left ~5.6k jobs (1.3k of them Phase-2 candidates)
-    permanently vector-less, where the cosine gate fails OPEN and burns a blind
-    Sonnet grade (#90). Same stranding the qualification sweep
-    (``_backfill_qualify_stale``) fixes for the tagger — this is its embedding
-    twin, minus the liveness check: a Voyage embed costs ~$0.00005, far less
-    than the HTTP probe that would guard it, and ARCHIVED jobs stay included
-    because they remain gradeable (click-through re-grades ignore
-    ``archived_at``) and threshold calibration reads their vectors.
-
-    Selection is the PostgREST anti-join (``job_embeddings=is.null`` on the
-    embedded resource), NEWEST first: the drip this drains is dominated by
-    recently-ingested jobs whose first embed failed — exactly the rows about
-    to face the gate. A row that persistently can't embed (e.g. no title and
-    no description → ``skipped_empty`` writes nothing) is re-selected and
-    re-skipped each cycle, wasting one slot — bounded and harmless. Batch cost
-    is ``limit`` embeds ≈ $0.01 at the default, so no budget gate.
-    """
-    if limit <= 0:
-        return
-    try:
-        # Model-aware anti-join: a job counts as vector-less iff it has no
-        # ``job_embeddings`` row for the CURRENT model — a stale row from a
-        # retired model (voyage-3) must not mask the missing current-space
-        # vector, or a model migration would strand the whole old corpus.
-        resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .select("id, title, description_html, job_embeddings(job_posting_id)")
-                .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
-                .is_("job_embeddings", "null")
-                # Tombstoned rows have their payload stripped — embedding them
-                # would return skipped_empty forever, wasting sweep slots.
-                .is_("purged_at", "null")
-                .order("created_at", desc=True)
-                .limit(limit)
-            ),
-            label="poll embed-backfill select",
-        )
-    except Exception:
-        logger.exception("Embed backfill: select failed; skipping this cycle")
-        return
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        return
-    logger.info("Embed backfill: embedding %d vector-less job(s)", len(rows))
-    # Batched path: the anti-join above guarantees these rows have no
-    # current-model vector, so we can skip the per-job hash probes and use
-    # ~15 IO operations per 200 jobs instead of ~800 (2026-07-10 incident).
-    try:
-        embeddings_client = get_embeddings_client()
-    except Exception:
-        logger.exception("Embed backfill: embeddings client unavailable; skipping")
-        return
-    await embed_jobs_batch(supabase, embeddings_client, rows)
 
 
 async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
@@ -1840,16 +1726,19 @@ async def _poll_one_source(
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
-                    # Payer over monthly allowance (or unattributable) —
-                    # spend nothing. Empty verdicts → fail-open admit, so
-                    # jobs still ingest (promising, score=NULL) and get
-                    # graded once the payer's window frees up. Same defer
-                    # semantics as the Phase 2 daily cap.
+                    # Sponsored target whose payer is blocked (over
+                    # allowance / idle / disabled) — spend nothing. Empty
+                    # verdicts → fail-open admit, so jobs still ingest
+                    # (promising, score=NULL) and get graded once the
+                    # payer's window frees up. Same defer semantics as the
+                    # Phase 2 daily cap. Catalog targets (no active user
+                    # link) are never blocked here — their triage bills
+                    # the instance key via ``_resolve_payer_client(None)``.
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s over "
-                        "monthly allowance or unknown)",
+                        "Phase 1 deferred for target %s (payer %s blocked: "
+                        "over allowance / idle / disabled)",
                         active_target.id,
                         gate.payer_for(active_target.id),
                     )
@@ -2132,19 +2021,10 @@ async def _poll_one_source(
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
 
-            # ---- Pre-scan job embeddings (#60, Phase 1) ----
-            # Target-INDEPENDENT: embed each upserted job ONCE and cache the
-            # vector for a future semantic pre-filter. PURELY populates
-            # ``job_embeddings`` — no gating, no behavior change. Best-effort
-            # and flag-gated: nothing runs (and no embedding spend) unless
-            # ``prescan_embed_enabled`` is set; an embedding outage is swallowed
-            # so it can never break polling, and the content-hash skips
-            # re-embedding unchanged rows.
-            if settings.prescan_embed_enabled and upsert_resp.data:
-                await _embed_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                )
+            # Job embeddings are LAZY now (Disk IO slim-down, 2026-07-30):
+            # no embed-on-ingest — ``ensure_job_vectors`` in the Phase-2
+            # runner materializes vectors for exactly the candidate set
+            # about to be read ("only a few will ever be read").
 
             # ---- Stage 1: Title scoring per target ----
             for active_target in active_targets:
@@ -3019,13 +2899,10 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
         await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
 
-    # Same stranding fix for the embedding spine (#21): jobs whose on-ingest
-    # embed silently failed (or that predate the embed pipeline) never get a
-    # vector, so the cosine gate fails open and burns blind grades. Drain a
-    # bounded, newest-first slice of the vector-less backlog every cycle.
-    # Cheap (~$0.00005/job), so no budget gate; 0 disables.
-    if settings.prescan_embed_enabled and settings.prescan_embed_backfill_batch > 0:
-        await _backfill_embed_missing(supabase, settings.prescan_embed_backfill_batch)
+    # The embedding drain is GONE (Disk IO slim-down, 2026-07-30): vectors
+    # materialize lazily at grade time (``ensure_job_vectors``), so #21-class
+    # stranding is structurally impossible — a job is embedded exactly when
+    # first needed and the content-hash makes retries free.
 
     # Grade a slice of the stale promising backlog (the qualify sweep's
     # grading twin) — also before the ``not due`` early-exit, so quiet
@@ -3144,9 +3021,10 @@ async def _poll_one_source_for_target(
 
         # Phase 1 per-target triage (single target). Same semantics as
         # ``_poll_one_source`` but the candidate set is one target, so
-        # ``phase1_verdicts`` collapses to a single dict. Skipped when
-        # the payer is over their monthly allowance (or unattributable):
-        # empty verdicts → fail-open ingest, grading defers.
+        # ``phase1_verdicts`` collapses to a single dict. Skipped when a
+        # SPONSORED payer is blocked (over allowance / idle / disabled):
+        # empty verdicts → fail-open ingest, grading defers. A catalog
+        # target (no active user link) triages on the instance key.
         #
         # Only NEW external_ids that are FREE-GATE SURVIVORS are triaged
         # (mirrors ``_poll_one_source``): the per-job loop below drops
@@ -3355,16 +3233,8 @@ async def _poll_one_source_for_target(
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
 
-            # Pre-scan job embeddings (#60, Phase 1): same target-INDEPENDENT
-            # populate as ``_poll_one_source`` — flag-gated, best-effort. This
-            # path runs per-target, but the embed is content-hash cached, so a
-            # job already embedded for another target is a cheap cache-hit
-            # (one SELECT, no embed, no write).
-            if settings.prescan_embed_enabled and upsert_resp.data:
-                await _embed_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                )
+            # Job embeddings are LAZY (see _poll_one_source): the Phase-2
+            # runner's ensure_job_vectors materializes exactly the read set.
 
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
@@ -3669,7 +3539,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
     if over:
         logger.info(
             "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s over monthly allowance or unknown)",
+            "(payer %s blocked: over allowance / idle / disabled)",
             target.id,
             payer,
         )
