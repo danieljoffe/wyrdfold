@@ -40,11 +40,7 @@ from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
 from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import ensure_job_vectors
-from app.services.embeddings.prescan_gate import (
-    cosine_gate_batch,
-    cosine_scores_batch,
-    in_prescan_holdout,
-)
+from app.services.embeddings.prescan_gate import cosine_scores_batch
 from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
 from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
@@ -136,24 +132,6 @@ def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[s
         batches.append(items[i : i + rest])
         i += rest
     return batches
-
-
-def _prescan_gate_applies(target_id: str) -> bool:
-    """Whether the pre-scan cosine gate acts on this target (#90 staged rollout).
-
-    The global ``prescan_gate_enabled`` must be on AND the target must be in the
-    ``prescan_gate_target_ids`` allowlist. An EMPTY allowlist means **no
-    targets** — NOT "all targets" — so the gate can never be silently applied to
-    an unvalidated target. This matters because cosine gating is only safe
-    per-target, calibrated against live Phase-2 scores: it's a coarse off-domain
-    filter (0% recall loss on CX, an off-cluster exec target) that FAILS on an
-    in-domain one (Frontend drops ~60% of good matches at its calibrated
-    threshold, #90). Enabling the gate with an empty allowlist is therefore a
-    no-op, never a gate-everything that would silently drop good matches.
-    """
-    if not settings.prescan_gate_enabled:
-        return False
-    return str(target_id) in settings.prescan_gate_target_ids_set
 
 
 async def run_phase2_for_jobs(
@@ -289,66 +267,15 @@ async def run_phase2_for_jobs(
             [job_by_id[jid] for jid in candidates],
         )
 
-    # Pre-scan cosine gate (#90 flip): admit to the LLM grade only where
-    # cosine(job, target) >= the calibrated threshold, replacing the permissive
-    # keyword admission (shadow data: keyword admits ~100%, cosine ~5%).
-    # DATA absence fails open — a None verdict (target uncalibrated / job
-    # unvectored) is admitted, so an unpopulated spine never drops jobs.
-    # INFRA errors fail CLOSED — a failed vector read DEFERS the whole batch
-    # to the next cycle instead of grading it ungated ("defer, never
-    # admit-blind", the same contract as the Phase-1 budget gate). The
-    # 2026-07-12 gated-cycle audit is why: the old error→admit-all path
-    # converted IO timeouts into ~20% of a 48h sample being graded ungated.
-    # A deterministic exploration holdout keeps a small slice of would-drop
-    # jobs FOR grading, so the gate's false-negative rate stays measurable.
-    # Flag-off by default; enabled per-target (``prescan_gate_target_ids``)
-    # after calibration (#89) so a zero-loss target flips before a lossier
-    # one (#90 rollout).
-    cosines: dict[str, float]
-    if _prescan_gate_applies(target.id):
-        try:
-            gate = await cosine_gate_batch(supabase, target, candidates)
-        except Exception:
-            logger.warning(
-                "Phase 2 pre-scan gate: vector read failed for target %s — "
-                "deferring %d candidate(s) to the next cycle (fail-closed; "
-                "an IO error must not buy ungated grades)",
-                target.id,
-                len(candidates),
-                exc_info=True,
-            )
-            return 0
-        holdout = settings.prescan_gate_holdout_fraction
-        kept = []
-        dropped = held = 0
-        for jid in candidates:
-            if gate.admit(jid) is False:
-                if in_prescan_holdout(jid, target.id, holdout):
-                    held += 1
-                    kept.append(jid)  # exploration holdout — grade to measure FN
-                else:
-                    dropped += 1
-                continue
-            kept.append(jid)  # True (>= threshold) or None (data absence) → admit
-        if dropped or held:
-            logger.info(
-                "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d for target %s",
-                dropped,
-                held,
-                len(kept),
-                len(candidates),
-                target.id,
-            )
-        candidates = kept
-        if not candidates:
-            return 0
-        # Reuse the gate's cosines for ordering — no second vector fetch.
-        cosines = gate.cosines
-    else:
-        # Gate not enforced for this target: cosines are fetched for ORDERING
-        # only, best-effort ({} on error) — a read failure here degrades
-        # priority order but cannot change what gets admitted or spent.
-        cosines = await cosine_scores_batch(supabase, target, candidates)
+    # Cosine(job, target) for ORDERING only — best-effort ({} on error): a
+    # read failure degrades priority order but cannot change what gets
+    # admitted or spent. (The #90 pre-scan admission GATE that used to fork
+    # here was retired in R2: its shadow-vs-outcome join showed the armed
+    # threshold dropped 61.5% of promising matches; the full analysis + the
+    # threshold trade-off curve are preserved in docs/decisions.md
+    # 2026-07-30 "retired by its own shadow data". The cosine ORDERING below
+    # survives on its own evidence.)
+    cosines: dict[str, float] = await cosine_scores_batch(supabase, target, candidates)
 
     # Order candidates so the Phase 2 daily cap goes to the highest-FIT-
     # PROBABILITY jobs first. cosine(job, target) is the strongest cheap

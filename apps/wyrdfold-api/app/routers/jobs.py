@@ -57,7 +57,6 @@ from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
     score_and_upsert,
-    update_global_score,
 )
 from app.services.targets.crud import get as get_target
 from app.services.targets.crud import get_active as get_active_target
@@ -111,7 +110,7 @@ router = APIRouter(
 _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, "
     "city, state, country, location_remote, department, "
-    "absolute_url, score, score_breakdown, salary_text, "
+    "absolute_url, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "
     # Firewall tag columns (#524 tagger): serving them is what makes the
     # per-target preference filters real — they were written-but-never-
@@ -2431,12 +2430,7 @@ def add_job_to_target(
     # fail the whole action — the score (the core effect) is already written, so
     # a 500 here would read as "nothing happened" when the job IS scored and
     # will show under the target. Each step is independent and logged.
-    #  1. Recompute the posting's global aggregate (shared column → service-role).
-    try:
-        update_global_score(service_supabase, job_id)
-    except Exception:
-        logger.exception("add-to-target global-score update failed for job %s", job_id)
-    #  2. Force-include under THIS one target so a negative-keyword ``excluded``
+    #  1. Force-include under THIS one target so a negative-keyword ``excluded``
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
     try:

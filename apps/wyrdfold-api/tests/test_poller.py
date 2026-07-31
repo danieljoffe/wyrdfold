@@ -864,28 +864,6 @@ async def test_load_alert_rows_no_ids_short_circuits():
 
 
 @pytest.mark.asyncio
-async def test_batch_fetch_job_scores_uses_rpc_body() -> None:
-    """A large score lookup is ONE ``get_job_scores_by_ids`` RPC with the
-    full id list in the jsonb body (no URL ``.in_()`` chunking), folded into
-    the same ``{id: score}`` dict the chunked read produced."""
-    from app.services.poller import _batch_fetch_job_scores
-
-    job_ids = [f"job-{i}" for i in range(450)]
-    rpc_rows = [{"id": jid, "score": idx} for idx, jid in enumerate(job_ids)]
-
-    supabase = MagicMock()
-    supabase.rpc.return_value.execute.return_value.data = rpc_rows
-
-    scores = await _batch_fetch_job_scores(supabase, job_ids)
-
-    supabase.rpc.assert_called_once_with("get_job_scores_by_ids", {"p_ids": job_ids})
-    # Every id keyed once, identical to the old single-query result.
-    assert len(scores) == 450
-    assert scores["job-0"] == 0
-    assert scores["job-449"] == 449
-
-
-@pytest.mark.asyncio
 async def test_load_alert_rows_uses_rpc_body() -> None:
     """A large alert refresh is ONE ``get_jobs_by_ids`` RPC with the full id
     list in the jsonb body (no URL ``.in_()`` chunking); the returned rows
@@ -1164,9 +1142,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     # the poller awaits them directly, so their stand-ins must be awaitable.
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
     monkeypatch.setattr(poller_mod, "run_phase2_for_jobs", fake_phase2)
-    monkeypatch.setattr(poller_mod, "_run_llm_scoring_for_row", fake_legacy)
 
     return supabase, fake_phase2, fake_legacy, target
 
@@ -1193,24 +1169,6 @@ async def test_targeted_stage3_uses_phase2_when_flag_on(monkeypatch):
     assert kwargs["user_id"] == "payer-1"
     assert [j["id"] for j in kwargs["jobs"]] == ["j1"]
     fake_legacy.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_targeted_stage3_legacy_fallback_when_flag_off(monkeypatch):
-    """Flag off → the legacy Stage 3 path runs unchanged."""
-    from app.services import poller as poller_mod
-
-    supabase, fake_phase2, fake_legacy, target = _wire_targeted_stage3(
-        monkeypatch, phase2_enabled=False
-    )
-
-    summary = await poller_mod._poll_one_source_for_target(
-        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
-    )
-
-    assert summary["error"] is None
-    assert fake_legacy.await_count == 1
-    fake_phase2.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1467,7 +1425,6 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
     monkeypatch.setattr(live_settings, "validate_poll_urls", False)
     monkeypatch.setattr(live_settings, "qualification_enabled", False)
     monkeypatch.setattr(live_settings, "prescan_embed_enabled", False)
-    monkeypatch.setattr(live_settings, "prescan_shadow_enabled", False)
     monkeypatch.setattr(live_settings, "recency_decay_enabled", False)
     monkeypatch.setattr(db_write.settings, "poller_async_db", True)
 
@@ -1521,9 +1478,6 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
         if any(o[0] == "upsert" for o in ops[1:])
     ]
     assert len(score_upserts) == 4
-
-    # Global-score aggregation RPC ran on the async client too.
-    assert async_client.chains("rpc", "bulk_update_scores")
 
     # Mark-polled update landed on sources via the async client.
     source_updates = [
@@ -1788,7 +1742,6 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", fake_stage2)
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
 
     open_gate = MagicMock()
     open_gate.target_blocked.return_value = False
@@ -1971,7 +1924,6 @@ async def test_refreshed_known_row_does_not_realert(monkeypatch):
     monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
     monkeypatch.setattr(poller_mod, "_load_alert_rows", fake_load)
     monkeypatch.setattr(poller_mod.notify, "send_alerts_for_new_jobs", fake_email)
     monkeypatch.setattr(poller_mod.notify, "send_sms_alerts_for_new_jobs", fake_sms)

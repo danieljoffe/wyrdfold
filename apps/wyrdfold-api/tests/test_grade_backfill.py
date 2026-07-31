@@ -82,16 +82,12 @@ def _wire(
             raise graded
         return graded
 
-    async def fake_agg(_sb: Any, ids: list[str]) -> None:
-        rec["agg_calls"].append(ids)
-
     monkeypatch.setattr(poller_mod, "_cycle_budget_gate", fake_gate)
     monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
     monkeypatch.setattr(poller_mod, "_resolve_user_targets_for_stage3", fake_stage3)
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", lambda _c, _sb, _uid: llm)
     monkeypatch.setattr(poller_mod, "poll_db_read", fake_read)
     monkeypatch.setattr(poller_mod, "run_phase2_for_jobs", fake_phase2)
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", fake_agg)
     return rec
 
 
@@ -162,7 +158,6 @@ async def test_grades_live_stale_rows_and_reaggregates(
     assert [j["id"] for j in call["jobs"]] == ["j-0", "j-1", "j-2"]
     assert call["user_id"] == "u1"
     # Graded rows re-aggregate jobs.score (mirrors the cycle path).
-    assert rec["agg_calls"] == [["j-0", "j-1", "j-2"]]
 
 
 @pytest.mark.asyncio
@@ -195,14 +190,12 @@ async def test_phase2_failure_fails_soft_and_skips_reaggregate(
 ) -> None:
     rec = _wire(monkeypatch, gate=_OpenGate(), stale_rows=_rows(2), graded=RuntimeError("llm down"))
     await poller_mod._backfill_grade_stale(MagicMock(), 25)  # must not raise
-    assert rec["agg_calls"] == []
 
 
 @pytest.mark.asyncio
 async def test_zero_graded_skips_reaggregate(monkeypatch: pytest.MonkeyPatch) -> None:
     rec = _wire(monkeypatch, gate=_OpenGate(), stale_rows=_rows(2), graded=0)
     await poller_mod._backfill_grade_stale(MagicMock(), 25)
-    assert rec["agg_calls"] == []
 
 
 @pytest.mark.asyncio
@@ -210,7 +203,6 @@ async def test_empty_backlog_is_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
     rec = _wire(monkeypatch, gate=_OpenGate(), stale_rows=[])
     await poller_mod._backfill_grade_stale(MagicMock(), 25)
     assert rec["phase2_calls"] == []
-    assert rec["agg_calls"] == []
 
 
 @pytest.mark.asyncio
