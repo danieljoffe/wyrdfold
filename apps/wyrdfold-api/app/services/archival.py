@@ -106,8 +106,8 @@ async def _archive_stale(supabase: Client, *, batch: int) -> int:
         supabase.table("jobs")
         .select("id")
         .is_("archived_at", "null")
-        .lt("created_at", cutoff)
-        .order("created_at", desc=False)
+        .lt("cataloged_at", cutoff)
+        .order("cataloged_at", desc=False)
         .limit(batch)
         .execute
     )

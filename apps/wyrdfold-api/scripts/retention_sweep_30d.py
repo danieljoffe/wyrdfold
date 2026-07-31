@@ -144,11 +144,11 @@ async def _phase_a_archive(
         supabase,
         build=lambda off: (
             supabase.table("jobs")
-            .select("id, title, company_name, created_at")
+            .select("id, title, company_name, cataloged_at")
             .is_("archived_at", "null")
             .is_("purged_at", "null")
-            .lt("created_at", cutoff)
-            .order("created_at", desc=False)
+            .lt("cataloged_at", cutoff)
+            .order("cataloged_at", desc=False)
             .range(off, off + PAGE_SIZE - 1)
         ),
     )
@@ -160,7 +160,7 @@ async def _phase_a_archive(
         marker = " [ENGAGED]" if r["id"] in engaged else ""
         logger.info(
             "  %s  %s — %s (%s)%s",
-            cast(str, r["created_at"])[:10],
+            cast(str, r["cataloged_at"])[:10],
             r.get("title"),
             r.get("company_name"),
             cast(str, r["id"])[:8],
@@ -201,8 +201,8 @@ async def _phase_b_tombstone(
             .select("id")
             .not_.is_("archived_at", "null")
             .is_("purged_at", "null")
-            .lt("created_at", cutoff)
-            .order("created_at", desc=False)
+            .lt("cataloged_at", cutoff)
+            .order("cataloged_at", desc=False)
             .range(off, off + PAGE_SIZE - 1)
         ),
     )
@@ -258,7 +258,7 @@ async def _phase_c_cascade(
             supabase.table("jobs")
             .select("id")
             .not_.is_("purged_at", "null")
-            .order("created_at", desc=False)
+            .order("cataloged_at", desc=False)
             .range(off, off + PAGE_SIZE - 1)
         ),
     )
@@ -358,7 +358,7 @@ async def _verify(supabase: Client, *, cutoff: str) -> None:
         .select("id", count="exact", head=True)
         .is_("archived_at", "null")
         .is_("purged_at", "null")
-        .lt("created_at", cutoff)
+        .lt("cataloged_at", cutoff)
     )
     logger.info(
         "  %s live rows older than cutoff remain: %d",
