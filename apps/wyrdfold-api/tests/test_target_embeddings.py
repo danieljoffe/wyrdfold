@@ -39,7 +39,7 @@ def _target(
         description=description,
         scoring_profile=ScoringProfile(),
         search_keywords=keywords if keywords is not None else ["React", "TypeScript"],
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

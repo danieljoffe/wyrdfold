@@ -37,7 +37,7 @@ def _target() -> JobTarget:
             categories={"core_skills": CategoryProfile(keywords={"x": 1}, weight=2.0)},
             seniority=SeniorityProfile(signals=["staff"]),
         ),
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )

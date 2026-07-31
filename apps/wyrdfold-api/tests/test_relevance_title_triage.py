@@ -52,7 +52,7 @@ def _target(
             seniority=SeniorityProfile(signals=["staff"]),
         ),
         search_keywords=["frontend engineer"],
-        is_active=True,
+        app_active=True,
         example_promising_titles=promising or [],
         example_unpromising_titles=unpromising or [],
         created_at=datetime.now(UTC),

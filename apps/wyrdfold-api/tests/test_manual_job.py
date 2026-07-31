@@ -131,7 +131,7 @@ class TestManualJobEndpoint:
             id="tgt-1",
             label="X",
             scoring_profile=ScoringProfile(),
-            is_active=True,
+            app_active=True,
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )

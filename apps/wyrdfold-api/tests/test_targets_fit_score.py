@@ -35,7 +35,7 @@ def _target() -> JobTarget:
         search_keywords=["frontend"],
         activation_status="idle",
         profile_version=1,
-        is_active=False,
+        app_active=False,
         created_at=now,
         updated_at=now,
     )

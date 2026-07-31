@@ -39,7 +39,7 @@ def _job_target() -> JobTarget:
         id="target-1",
         label="Director of CX Operations",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -75,7 +75,7 @@ def _summary_item() -> UserTargetWithSummary:
     return UserTargetWithSummary(
         user_target=_user_target(),
         target=JobTargetSummary(
-            id="target-1", label="X", is_active=True, created_at=now, updated_at=now
+            id="target-1", label="X", app_active=True, created_at=now, updated_at=now
         ),
     )
 

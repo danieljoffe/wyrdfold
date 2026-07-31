@@ -46,7 +46,7 @@ def _job_target() -> JobTarget:
         id="target-1",
         label="Software Engineer",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

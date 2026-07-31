@@ -34,7 +34,9 @@ export interface JobTarget {
   search_keywords: string[];
   activation_status: string;
   profile_version: number;
-  is_active: boolean;
+  /** Instance-sponsorship floor (app-owned catalog / operator). Never
+   * user-written; pipeline-active = app_active OR an active membership. */
+  app_active: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -112,7 +114,7 @@ export interface JobTargetSummary {
   normalized_label: string | null;
   activation_status: string;
   profile_version: number;
-  is_active: boolean;
+  app_active: boolean;
   seniority_hint: string | null;
   keyword_count: number;
   category_count: number;
@@ -153,7 +155,7 @@ export function toSummary(target: JobTarget): JobTargetSummary {
     normalized_label: target.normalized_label,
     activation_status: target.activation_status,
     profile_version: target.profile_version,
-    is_active: target.is_active,
+    app_active: target.app_active,
     seniority_hint: null,
     keyword_count: keywordCount,
     category_count: Object.keys(categories).length,

@@ -268,7 +268,7 @@ def compute_target_funnel(supabase: Client, target_id: str) -> TargetFunnelRespo
         target_id=target.id,
         label=target.label,
         normalized_label=target.normalized_label,
-        is_active=target.is_active,
+        app_active=target.app_active,
         activation_status=target.activation_status,
         profile_version=target.profile_version,
         seniority_hint=target.seniority_hint,

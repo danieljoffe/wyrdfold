@@ -33,7 +33,7 @@ def _target(target_id: str = "tgt-1") -> JobTarget:
         label="Staff Frontend Engineer",
         scoring_profile=ScoringProfile(),
         search_keywords=["React", "TypeScript"],
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

@@ -31,7 +31,7 @@ def _target(tid: str, label: str, description: str | None = None) -> JobTarget:
         label=label,
         description=description,
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

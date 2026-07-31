@@ -44,7 +44,7 @@ def _target(profile_version: int = 1) -> JobTarget:
             seniority=SeniorityProfile(signals=["staff"]),
         ),
         profile_version=profile_version,
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )

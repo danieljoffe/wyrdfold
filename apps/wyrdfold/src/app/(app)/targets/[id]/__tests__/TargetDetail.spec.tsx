@@ -55,6 +55,21 @@ jest.mock('../LearningLogPanel', () => ({
 
 const ORIGINAL_FETCH = global.fetch;
 
+const USER_TARGET = {
+  id: 'ut-1',
+  user_id: 'u-1',
+  target_id: 't-1',
+  // The header badge reads the caller's OWN membership state (P0
+  // re-semantics) — not the shared catalog flag.
+  is_active: true,
+  fit_score: null,
+  fit_score_reasoning: null,
+  axis_weights: null,
+  axis_weights_previous: null,
+  created_at: '2026-01-01',
+  updated_at: '2026-01-01',
+};
+
 const TARGET: JobTarget = {
   id: 't-1',
   label: 'Senior Frontend Engineer',
@@ -69,7 +84,7 @@ const TARGET: JobTarget = {
   search_keywords: [],
   activation_status: 'ready',
   profile_version: 1,
-  is_active: true,
+  app_active: true,
   created_at: '2026-01-01',
   updated_at: '2026-01-01',
 };
@@ -102,6 +117,12 @@ describe('TargetDetail', () => {
         return Promise.resolve({
           ok: true,
           json: async () => ({ reference_jds: [] }),
+        });
+      }
+      if (input.endsWith('/user-target')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ user_target: USER_TARGET, target: TARGET }),
         });
       }
       return Promise.resolve({ ok: true, json: async () => TARGET });

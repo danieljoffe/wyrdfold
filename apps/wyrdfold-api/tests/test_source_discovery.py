@@ -47,7 +47,7 @@ def _make_target(keywords: list[str] | None = None) -> JobTarget:
             negative=NegativeProfile(keywords=[], weight=-10.0),
         ),
         search_keywords=keywords if keywords is not None else ["director of cx"],
-        is_active=True,
+        app_active=True,
         activation_status="ready",
         profile_version=1,
         created_at=now,

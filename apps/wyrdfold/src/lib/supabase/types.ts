@@ -1016,7 +1016,7 @@ export type Database = {
           example_promising_titles: string[];
           example_unpromising_titles: string[];
           id: string;
-          is_active: boolean;
+          app_active: boolean;
           label: string;
           normalized_label: string | null;
           profile_version: number;
@@ -1033,7 +1033,7 @@ export type Database = {
           example_promising_titles?: string[];
           example_unpromising_titles?: string[];
           id?: string;
-          is_active?: boolean;
+          app_active?: boolean;
           label: string;
           normalized_label?: string | null;
           profile_version?: number;
@@ -1050,7 +1050,7 @@ export type Database = {
           example_promising_titles?: string[];
           example_unpromising_titles?: string[];
           id?: string;
-          is_active?: boolean;
+          app_active?: boolean;
           label?: string;
           normalized_label?: string | null;
           profile_version?: number;
@@ -1325,7 +1325,7 @@ export type Database = {
           example_promising_titles: string[];
           example_unpromising_titles: string[];
           id: string;
-          is_active: boolean;
+          app_active: boolean;
           label: string;
           normalized_label: string | null;
           profile_version: number;

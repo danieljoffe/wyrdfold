@@ -90,12 +90,15 @@ class JobTarget(BaseModel):
         default="idle",
         description=(
             "Background pipeline state: idle | deriving | polling | ready "
-            "| error. Distinct from is_active, the user-facing toggle for "
-            "whether jobs should be queried for this target."
+            "| error. Distinct from app_active (the instance-sponsorship "
+            "floor) and from user_targets.is_active (the per-user toggle)."
         ),
     )
     profile_version: int = 1
-    is_active: bool
+    # Standing instance-sponsorship floor (app-owned catalog / operator).
+    # NEVER written by user actions; pipeline-active is derived as
+    # app_active OR EXISTS(active membership) — see crud.get_active.
+    app_active: bool
     # Few-shot title pools for the upcoming Phase 1 LLM triage. Seeded
     # at target creation from the same LLM call that derives the
     # scoring profile; later (Phase 1 PR) augmented from user 👍/👎
@@ -405,7 +408,7 @@ class JobTargetSummary(BaseModel):
     normalized_label: str | None = None
     activation_status: str = "idle"
     profile_version: int = 1
-    is_active: bool
+    app_active: bool
     seniority_hint: SeniorityHint | None = None
     keyword_count: int = 0
     category_count: int = 0
@@ -461,7 +464,7 @@ class TargetUpdate(BaseModel):
     scoring_profile: ScoringProfile | None = None
     search_keywords: list[str] | None = None
     activation_status: str | None = None
-    is_active: bool | None = None
+    app_active: bool | None = None
     profile_version: int | None = None
     example_promising_titles: list[str] | None = None
     example_unpromising_titles: list[str] | None = None

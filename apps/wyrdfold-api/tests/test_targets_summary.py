@@ -18,7 +18,7 @@ def _row(scoring_profile: object) -> dict[str, object]:
         "scoring_profile": scoring_profile,
         "activation_status": "ready",
         "profile_version": 2,
-        "is_active": True,
+        "app_active": True,
         "seniority_hint": "senior",
         "created_at": "2026-04-24T00:00:00Z",
         "updated_at": "2026-04-30T00:00:00Z",

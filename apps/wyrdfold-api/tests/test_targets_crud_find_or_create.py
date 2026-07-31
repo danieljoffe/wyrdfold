@@ -16,7 +16,7 @@ def _target_row(label: str, *, target_id: str = "tgt-1") -> dict[str, Any]:
         "label": label,
         "normalized_label": label.lower().strip(),
         "scoring_profile": {},
-        "is_active": False,
+        "app_active": False,
         "created_at": "2026-07-18T00:00:00+00:00",
         "updated_at": "2026-07-18T00:00:00+00:00",
     }
