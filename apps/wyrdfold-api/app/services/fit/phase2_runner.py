@@ -38,6 +38,8 @@ from supabase import Client
 from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
+from app.services.embeddings import get_default_client as get_embeddings_client
+from app.services.embeddings.job_embeddings import ensure_job_vectors
 from app.services.embeddings.prescan_gate import (
     cosine_gate_batch,
     cosine_scores_batch,
@@ -273,6 +275,19 @@ async def run_phase2_for_jobs(
         candidates = kept
         if not candidates:
             return 0
+
+    # Lazy vector materialization (Disk IO slim-down, 2026-07-30): embeddings
+    # are no longer written at ingest — this grade-time candidate set is the
+    # ONLY serving reader of job vectors, so they're ensured exactly here,
+    # for exactly these jobs ("only a few will ever be read"). Best-effort by
+    # construction: any id that fails to materialize is simply absent and the
+    # cosine paths below fail open for it, same as any missing vector.
+    if settings.prescan_embed_enabled and candidates:
+        await ensure_job_vectors(
+            supabase,
+            get_embeddings_client(),
+            [job_by_id[jid] for jid in candidates],
+        )
 
     # Pre-scan cosine gate (#90 flip): admit to the LLM grade only where
     # cosine(job, target) >= the calibrated threshold, replacing the permissive

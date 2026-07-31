@@ -934,6 +934,79 @@ async def test_family_gate_never_grades_hard_offfamily(
     assert n == 2
 
 
+async def test_lazy_vectors_ensured_for_exactly_the_candidate_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disk IO slim-down contract: embeddings materialize at grade time for
+    exactly the candidates about to be read — there is no embed-on-ingest,
+    so this call is the only thing standing between a fresh job and a
+    fail-open cosine. Also pins that the flag gates it."""
+    from app.config import settings as live_settings
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    ensured: list[list[str]] = []
+
+    async def fake_ensure(_sb: Any, _client: Any, jobs: list[dict[str, Any]], **_k: Any) -> dict:
+        ensured.append([j["id"] for j in jobs])
+        return {}
+
+    monkeypatch.setattr(f"{_RUNNER}.ensure_job_vectors", fake_ensure)
+    monkeypatch.setattr(f"{_RUNNER}.get_embeddings_client", lambda: MagicMock())
+    monkeypatch.setattr(live_settings, "prescan_embed_enabled", True)
+
+    jobs = [
+        {"id": "j-cand", "title": "x", "description_html": ""},
+        {"id": "j-not-promising", "title": "x", "description_html": ""},
+    ]
+    rows = [
+        {
+            "job_posting_id": "j-cand",
+            "promising": True,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        },
+        {
+            "job_posting_id": "j-not-promising",
+            "promising": False,
+            "scoring_status": "stage2",
+            "scored_profile_version": 1,
+        },
+    ]
+    await run_phase2_for_jobs(
+        _supabase(rows), MagicMock(), target=_target(1), payload=_payload(), jobs=jobs
+    )
+
+    assert ensured == [["j-cand"]]  # candidates only — never the whole page
+    assert graded == ["j-cand"]
+
+
+async def test_lazy_vectors_skipped_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings as live_settings
+
+    _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    called: list[Any] = []
+
+    async def fake_ensure(*a: Any, **k: Any) -> dict:
+        called.append(a)
+        return {}
+
+    monkeypatch.setattr(f"{_RUNNER}.ensure_job_vectors", fake_ensure)
+    monkeypatch.setattr(live_settings, "prescan_embed_enabled", False)
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+    )
+    assert called == []
+
+
 async def test_family_gate_unclassified_target_is_ungated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

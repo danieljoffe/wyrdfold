@@ -19,6 +19,7 @@ class EmbeddingsClient(Protocol):
         inputs: list[str],
         purpose: str,
         input_type: Literal["document", "query"] = "document",
+        output_dimension: int | None = None,
     ) -> EmbeddingResult:
         """Embed a batch of strings.
 
@@ -34,5 +35,9 @@ class EmbeddingsClient(Protocol):
                 existing caller (the chunk write path) is unaffected; the query
                 side is only used by retrieval callers (e.g. the pre-scan target
                 vector).
+            output_dimension: Matryoshka output size (voyage-3.5 family:
+                256/512/1024/2048). ``None`` = the model's default. Vectors of
+                different dimensions are DIFFERENT spaces — never cosine across
+                them (the pre-scan pins 512, see ``job_embeddings.EMBED_DIMENSIONS``).
         """
         ...
