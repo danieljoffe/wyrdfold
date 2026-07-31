@@ -165,7 +165,7 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
                 location_name=location_str,
                 department=department.get("label") if department else None,
                 content=_build_content(detail),
-                updated_at=detail.get("releasedDate", item.get("releasedDate", "")),
+                posted_at=detail.get("releasedDate", item.get("releasedDate", "")),
                 absolute_url=absolute_url,
             )
         )

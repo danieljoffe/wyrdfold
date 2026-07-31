@@ -214,7 +214,7 @@ async def test_merge_check_results_noop_when_no_matches() -> None:
 @pytest.mark.asyncio
 async def test_archive_with_data_drop_nulls_heavy_fields() -> None:
     """Archive nulls description_html on jobs and axis_scores/fit_reasoning/
-    score_breakdown/matched_keywords on scores. Keeps identity intact."""
+    score_breakdown on scores. Keeps identity intact."""
     sink: list[dict[str, Any]] = []
     sb = _mock_supabase(sink)
     n = await _archive_with_data_drop(sb, ["j1", "j2"])
@@ -232,7 +232,6 @@ async def test_archive_with_data_drop_nulls_heavy_fields() -> None:
         "axis_scores": None,
         "fit_reasoning": None,
         "score_breakdown": None,
-        "matched_keywords": None,
     }
 
 

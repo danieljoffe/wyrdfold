@@ -58,9 +58,20 @@ def _balanced_body(text: str, open_paren_idx: int) -> str:
     return text[open_paren_idx + 1 :]
 
 
+_ALTER_RENAME_TABLE = re.compile(
+    r'alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?"?(?:public"?\.)?"?(\w+)"?\s+'
+    r'rename\s+to\s+"?(\w+)"?',
+    re.IGNORECASE,
+)
+
+
 def _tables_with_user_id_column() -> set[str]:
     found: set[str] = set()
-    for sql_file in _migrations_dir().glob("*.sql"):
+    renames: list[tuple[str, str]] = []
+    # Migrations apply in filename order; process them the same way so a
+    # RENAME TO lands after the CREATE it renames (source_ownerships →
+    # source_registrations, R2 2026-07-31).
+    for sql_file in sorted(_migrations_dir().glob("*.sql")):
         text = sql_file.read_text(encoding="utf-8")
         for match in _CREATE_TABLE.finditer(text):
             body = _balanced_body(text, match.end() - 1)
@@ -68,6 +79,12 @@ def _tables_with_user_id_column() -> set[str]:
                 found.add(match.group(1))
         for match in _ALTER_ADD_USER_ID.finditer(text):
             found.add(match.group(1))
+        for match in _ALTER_RENAME_TABLE.finditer(text):
+            renames.append((match.group(1), match.group(2)))
+    for old, new in renames:
+        if old in found:
+            found.discard(old)
+            found.add(new)
     return found
 
 

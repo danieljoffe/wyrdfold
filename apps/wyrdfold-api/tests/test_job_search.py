@@ -41,7 +41,7 @@ def _row(rid: str, title: str, created_at: str) -> dict[str, Any]:
         "department": None,
         "salary_text": None,
         "absolute_url": f"https://example.com/{rid}",
-        "first_seen_at": ts,
+        "cataloged_at": ts,
         "created_at": ts,
     }
 
@@ -237,15 +237,19 @@ def test_blank_location_is_a_noop() -> None:
     assert len(results) == 3  # whitespace-only filter keeps every candidate
 
 
-def test_recency_filter_applies_a_created_at_lower_bound() -> None:
+def test_recency_filter_applies_a_posted_at_lower_bound() -> None:
     from datetime import UTC, datetime
 
     supabase = _mock_supabase([])
     job_search.search_jobs(supabase, q="frontend", posted_within_days=7)
     qb = supabase.table.return_value
-    assert qb.gte.called
-    col, cutoff = qb.gte.call_args[0]
-    assert col == "created_at"
+    # R2: the bound rides a PostgREST or_ — provider posted date when known,
+    # cataloged time as the fallback — in ONE round-trip.
+    assert qb.or_.called
+    or_arg = qb.or_.call_args[0][0]
+    assert "source_posted_at.gte." in or_arg
+    assert "and(source_posted_at.is.null,cataloged_at.gte." in or_arg
+    cutoff = or_arg.split("source_posted_at.gte.", 1)[1].split(",", 1)[0]
     delta_days = (datetime.now(UTC) - datetime.fromisoformat(cutoff)).days
     assert 6 <= delta_days <= 8  # ~7 days back
 
@@ -255,15 +259,18 @@ def test_recency_days_are_clamped_to_the_ceiling() -> None:
 
     supabase = _mock_supabase([])
     job_search.search_jobs(supabase, q="frontend", posted_within_days=99999)
-    _, cutoff = supabase.table.return_value.gte.call_args[0]
+    or_arg = supabase.table.return_value.or_.call_args[0][0]
+    cutoff = or_arg.split("source_posted_at.gte.", 1)[1].split(",", 1)[0]
     delta_days = (datetime.now(UTC) - datetime.fromisoformat(cutoff)).days
     assert delta_days <= job_search.MAX_POSTED_WITHIN_DAYS + 1
 
 
-def test_no_recency_filter_skips_the_created_at_bound() -> None:
+def test_no_recency_filter_skips_the_posted_bound() -> None:
     supabase = _mock_supabase([])
     job_search.search_jobs(supabase, q="frontend")
-    assert not supabase.table.return_value.gte.called
+    # The title ilike matcher also rides or_ — assert no POSTED bound rode one.
+    or_args = [c.args[0] for c in supabase.table.return_value.or_.call_args_list]
+    assert not any("source_posted_at.gte." in a for a in or_args)
 
 
 def test_search_endpoint_forwards_filters_to_the_service(

@@ -128,3 +128,20 @@ def test_get_active_dedupes_floor_and_membership_arms(
 
     ids = [t.id for t in crud.get_active(service_client)]
     assert ids.count(catalog_target) == 1
+
+
+def test_get_active_target_ids_excludes_paused_links(
+    service_client: Client, catalog_target: str, auth_user: str
+) -> None:
+    """/jobs list scope: an INACTIVE link is invisible to
+    get_active_target_ids (jobs leave the list on pause) while
+    get_user_target_ids still sees it (authz/dedup keep working)."""
+    crud.link_user_to_target(
+        service_client, user_id=auth_user, target_id=catalog_target, is_active=False
+    )
+
+    assert catalog_target not in crud.get_active_target_ids(service_client, auth_user)
+    assert catalog_target in crud.get_user_target_ids(service_client, auth_user)
+
+    crud.set_user_target_active(service_client, user_id=auth_user, target_id=catalog_target)
+    assert catalog_target in crud.get_active_target_ids(service_client, auth_user)

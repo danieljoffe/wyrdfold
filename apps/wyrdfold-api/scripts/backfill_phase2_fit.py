@@ -80,13 +80,13 @@ def _promising_job_ids(supabase: Any, target_id: str) -> list[str]:
 
 
 def _fetch_jobs(supabase: Any, job_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch the job rows Phase 2 needs (id, title, JD, first_seen_at)."""
+    """Fetch the job rows Phase 2 needs (id, title, JD, posted date)."""
     jobs: list[dict[str, Any]] = []
     for i in range(0, len(job_ids), _PAGE):
         chunk = job_ids[i : i + _PAGE]
         resp = (
             supabase.table("jobs")
-            .select("id, title, description_html, first_seen_at")
+            .select("id, title, description_html, source_posted_at, cataloged_at")
             .in_("id", chunk)
             .execute()
         )

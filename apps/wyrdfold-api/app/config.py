@@ -211,32 +211,6 @@ class Settings(BaseSettings):
     # 40 = the "solid match" band (aligns with the #89 pre-scan cutoff).
     default_list_min_score: int = Field(default=40, ge=0, le=100)
 
-    # Pre-scan cosine gate — the #90 flip. When True, Phase-2 grading candidacy
-    # is gated on cosine(job, target) >= target.prescan_cosine_threshold,
-    # replacing the permissive keyword admission the shadow data showed admits
-    # ~100% (#60/#90). FAIL-OPEN by construction: a target with no calibrated
-    # threshold / embedding, or a job with no vector, is admitted — an
-    # unpopulated spine never silently drops jobs. Default off; flip per target
-    # once its threshold is calibrated (#89).
-    prescan_gate_enabled: bool = False
-    # Per-target SCOPE for the gate above — a staged rollout (#90). Comma-separated
-    # target UUIDs the gate applies to. EMPTY = NO targets (a safe no-op) — the gate
-    # requires EXPLICIT per-target opt-in, so it can never be silently applied to an
-    # unvalidated target. Cosine gating is only safe per-target, calibrated on live
-    # Phase-2 scores: it's a coarse off-domain filter (0% recall loss on CX, an
-    # off-cluster exec target) that FAILS in-domain (Frontend loses ~60% of good
-    # matches at its threshold — the fixture-based "2.8%" was measured on the
-    # keyword proxy, not real scores). No effect when ``prescan_gate_enabled`` is
-    # off. Parsed by ``prescan_gate_target_ids_set``.
-    prescan_gate_target_ids: str = ""
-    # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
-    # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
-    # false-negative rate (dropped-but-actually-high-fit) is measurable against
-    # the shadow log (prescan_shadow.cosine_admit=false joined to a resulting
-    # complete grade). 0 disables the holdout. Kept small — it spends grades on
-    # would-drop jobs, but the gate frees ample daily-cap headroom.
-    prescan_gate_holdout_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
-
     # Poller async DB migration (#57). When True, hot poll-cycle DB writes run
     # on the native async service-role client (HTTP/2, its own bounded pool)
     # instead of the sync client in an ``asyncio.to_thread`` — so the poll's
@@ -487,20 +461,6 @@ class Settings(BaseSettings):
     # nothing reads it.
     prescan_embed_backfill_batch: int = Field(default=200, ge=0, le=2000)
 
-    # Pre-scan SHADOW MODE (#60/#68, Phase 3). When True the poller, AFTER the
-    # live keyword admit decision for each (job, target), ALSO computes the
-    # would-be cosine gate decision (cosine(job_vec, target_vec) >=
-    # target.prescan_cosine_threshold) and appends one ``prescan_shadow`` row
-    # recording BOTH decisions — the disagreement matrix. OBSERVATION ONLY: the
-    # keyword decision still drives what gets graded; this changes no admission
-    # behavior. The actual gate FLIP (cosine driving admission) is a LATER phase
-    # informed by this shadow data and is deliberately not built. Ships FALSE so
-    # merging is inert — flag off ⇒ no shadow rows and no cosine computation; the
-    # write is best-effort (a failure never breaks polling). Even with the flag
-    # on it stays cheap: cosine reuses the cached Phase-1/2 vectors (NO embedding
-    # spend) and yields NULL when those vectors aren't populated yet.
-    prescan_shadow_enabled: bool = False
-
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
     # model to emit a `logistics` JSON object (remote_status, salary
@@ -749,13 +709,6 @@ class Settings(BaseSettings):
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
-
-    @property
-    def prescan_gate_target_ids_set(self) -> frozenset[str]:
-        """Parsed ``prescan_gate_target_ids`` — the target IDs the pre-scan gate
-        is scoped to. Empty means NO targets (a safe no-op requiring explicit
-        opt-in), NOT "all targets" (see ``_prescan_gate_applies``)."""
-        return frozenset(t.strip() for t in self.prescan_gate_target_ids.split(",") if t.strip())
 
     # Per-user LLM budget (defense-in-depth). Rolling window over llm_costs.
     # Set to 0 to disable a window. API-key callers (cron) bypass the HTTP

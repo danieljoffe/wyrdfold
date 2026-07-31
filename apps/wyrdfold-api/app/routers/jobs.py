@@ -57,14 +57,13 @@ from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
     score_and_upsert,
-    update_global_score,
 )
 from app.services.targets.crud import get as get_target
 from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.crud import (
     get_active_for_user,
+    get_active_target_ids,
     get_user_target,
-    get_user_target_ids,
     list_user_targets,
     preferences_from_user_target,
 )
@@ -111,9 +110,13 @@ router = APIRouter(
 _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, "
     "city, state, country, location_remote, department, "
-    "absolute_url, score, score_breakdown, salary_text, "
+    "absolute_url, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "
-    "greenhouse_updated_at, first_seen_at, created_at"
+    # Firewall tag columns (#524 tagger): serving them is what makes the
+    # per-target preference filters real — they were written-but-never-
+    # selected for a year ("starved tags", schema audit Group B addendum).
+    "employment_type, seniority, metro, is_remote, "
+    "source_posted_at, cataloged_at"
 )
 
 # Detail-view projection — adds ``description_html`` (and anything else
@@ -463,10 +466,11 @@ def _list_jobs_for_target_rpc(
     return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
-def _first_seen_lookup(
+def _posted_at_lookup(
     supabase: Client, job_ids: list[str], *, force: bool = False
 ) -> dict[str, Any]:
-    """``job_posting_id`` → ``first_seen_at``, for recency-aware ordering.
+    """``job_posting_id`` → posted date (``source_posted_at`` falling back to
+    ``cataloged_at``), for recency-aware ordering.
 
     Two callers need it: the recency-decay display value (when decay is on), and
     the Pending-tier recency sort (``force=True``, used on the score sort so fresh
@@ -479,9 +483,14 @@ def _first_seen_lookup(
         return lookup
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        resp = supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
+        resp = (
+            supabase.table("jobs")
+            .select("id, source_posted_at, cataloged_at")
+            .in_("id", chunk)
+            .execute()
+        )
         for r in cast(list[dict[str, Any]], resp.data or []):
-            lookup[r["id"]] = r.get("first_seen_at")
+            lookup[r["id"]] = r.get("source_posted_at") or r.get("cataloged_at")
     return lookup
 
 
@@ -489,7 +498,7 @@ def _display_sort_value(
     ts: dict[str, Any],
     *,
     weights: AxisWeights | None,
-    first_seen_at: Any,
+    posted_at: Any,
     now: datetime,
 ) -> int:
     """The score a row will actually DISPLAY: the axis-weighted blend, then
@@ -503,7 +512,7 @@ def _display_sort_value(
     )
     if not settings.recency_decay_enabled:
         return weighted
-    return display_recency_score(weighted, first_seen_at, now)
+    return display_recency_score(weighted, posted_at, now)
 
 
 # ---------------------------------------------------------------------------
@@ -569,11 +578,11 @@ _SCORE_ROW_COLS = (
 
 
 # The liveness inner-join doubles as a column ride-along: role_family feeds
-# the off-family gate and first_seen_at the Pending-tier recency sort —
+# the off-family gate and the posted date the Pending-tier recency sort —
 # columns these paths used to re-fetch in up to ~20 sequential chunked reads
 # per request (the 4-8s /jobs + dashboard latencies, 2026-07-16). One join,
 # zero extra round-trips.
-_JOBS_EMBED = ", jobs!inner(id, role_family, first_seen_at)"
+_JOBS_EMBED = ", jobs!inner(id, role_family, source_posted_at, cataloged_at)"
 
 
 def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
@@ -630,7 +639,7 @@ def _rank_graded_first(
 ) -> list[dict[str, Any]]:
     """Order ``rows`` for the score sort so graded rows always precede Pending
     ones. Graded rows sort by ``value`` (the display fit score); Pending rows
-    sort by ``pending_value`` when supplied — recency (first_seen_at), so fresh
+    sort by ``pending_value`` when supplied — recency (posted date), so fresh
     ungraded postings surface at the top of the Pending tier instead of being
     ranked by the hidden keyword placeholder ``value`` returns for them. Falls
     back to ``value`` for Pending when ``pending_value`` is None (#47 f/u).
@@ -778,28 +787,28 @@ def _assemble_jobs_page(
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
-    # Force the first-seen fetch on the score sort even with decay off — the
+    # Force the posted-date fetch on the score sort even with decay off — the
     # Pending-tier recency sort keys on it (#47 f/u). The live-path scores
-    # fetch embeds jobs(first_seen_at), so this is normally a pure harvest;
-    # only embed-less rows (archived view) still pay the chunked reads.
+    # fetch embeds jobs(source_posted_at, cataloged_at), so this is normally a
+    # pure harvest; only embed-less rows (archived view) still pay the reads.
     fs_lookup: dict[str, Any] = {}
     fs_missing: list[str] = []
     for pid, s in by_id.items():
         embedded = s.get("jobs")
-        if isinstance(embedded, dict) and "first_seen_at" in embedded:
-            fs_lookup[pid] = embedded.get("first_seen_at")
+        if isinstance(embedded, dict) and "cataloged_at" in embedded:
+            fs_lookup[pid] = embedded.get("source_posted_at") or embedded.get("cataloged_at")
         else:
             fs_missing.append(pid)
     if fs_missing:
         fs_lookup.update(
-            _first_seen_lookup(supabase, fs_missing, force=(sort == "score" or sort_col == "score"))
+            _posted_at_lookup(supabase, fs_missing, force=(sort == "score" or sort_col == "score"))
         )
 
     def _display(row: dict[str, Any]) -> int:
         return _display_sort_value(
             row,
             weights=weights_for_row(row),
-            first_seen_at=fs_lookup.get(row["job_posting_id"]),
+            posted_at=fs_lookup.get(row["job_posting_id"]),
             now=now,
         )
 
@@ -819,7 +828,7 @@ def _assemble_jobs_page(
             value=lambda r: (_display(r), r["job_posting_id"]),
             ascending=ascending,
             # Pending rows have no real fit score; order them by recency
-            # (first_seen_at) so fresh ungraded jobs surface, not by the hidden
+            # (posted date) so fresh ungraded jobs surface, not by the hidden
             # keyword placeholder _display returns for them (#47 f/u).
             pending_value=lambda r: (
                 fs_lookup.get(r["job_posting_id"]) or "",
@@ -876,12 +885,15 @@ def _assemble_jobs_page(
                 # Same DISPLAY value the scores-layer sort uses (#47).
                 ts = by_id.get(p["id"])
                 return _display(ts) if ts else 0
-            val = p.get(sort)
+            # 'created_at' is the stable WIRE token; the row key is the
+            # renamed cataloged_at (R2 two-timestamp model).
+            row_key = "cataloged_at" if sort == "created_at" else sort
+            val = p.get(row_key)
             return "" if val is None else val
 
         if sort == "score":
             # Pending below graded (#47); graded by display value, Pending by
-            # recency (first_seen_at) so fresh ungraded jobs surface (#47 f/u).
+            # recency (posted date) so fresh ungraded jobs surface (#47 f/u).
             postings = _rank_graded_first(
                 postings,
                 value=_sort_key,
@@ -1531,12 +1543,14 @@ def _apply_logistics_filter(
 #
 # Score cutoff is pushed into ``min_score`` (server-side, exact, keeps
 # pagination correct). The remaining filters (employment_type / seniority /
-# location-via-metro-or-text) are POST-FETCH, mirroring how the location chip
-# already works — they read the job's firewall tag columns when present and are
-# LENIENT on absence: the tag columns (employment_type / seniority / metro /
-# is_remote) are added by a separate firewall PR and are not backfilled, so a
-# missing-or-NULL tag means "unknown" and the job is KEPT. This makes the
-# filters inert until the firewall lands without coupling this PR to it.
+# location-via-metro-or-text) are POST-FETCH and read the job's firewall tag
+# columns. The tags are SERVED as of the R2 release (added to
+# ``_JP_SELECT_COLS`` here; to the list RPCs in the R2 migration) — before
+# that they were written by the tagger but never selected, so these filters
+# silently passed everything ("starved tags", schema audit 2026-07-30).
+# Still LENIENT on absence: the tagger doesn't backfill, so a missing/NULL
+# tag means "unknown" and the job is KEPT — only a KNOWN tag outside the
+# preference drops it.
 
 
 def _job_tag(posting: dict[str, Any], column: str) -> str | None:
@@ -1705,7 +1719,7 @@ def _apply_display_recency(postings: list[dict[str, Any]]) -> None:
     The score overlay sets ``score`` to the fit/axis-weighted blend and
     preserves the undecayed fit in ``raw_score``. Users also expect a stale
     posting to visibly fade, so we multiply the displayed score by the age
-    decay derived from ``first_seen_at`` *now* — not the stored
+    decay derived from the posted date *now* — not the stored
     ``recency_score`` (which the poller only refreshes for jobs it re-touches,
     so it freezes for postings that age off the boards). ``raw_score`` is left
     intact — set by the overlay, and defaulted here for any row the overlay
@@ -1726,7 +1740,9 @@ def _apply_display_recency(postings: list[dict[str, Any]]) -> None:
             continue
         score_int = int(score)
         p.setdefault("raw_score", score_int)
-        p["score"] = display_recency_score(score_int, p.get("first_seen_at"), now)
+        p["score"] = display_recency_score(
+            score_int, p.get("source_posted_at") or p.get("cataloged_at"), now
+        )
 
 
 @router.get("")
@@ -1793,12 +1809,14 @@ def list_jobs(
     if cached is not None:
         return cached
 
-    # JWT callers see only postings whose target_id is in their user_targets.
-    # The api-key path (cron/poller) bypasses scoping — it operates on the
+    # JWT callers see only postings from their ACTIVE memberships — pausing
+    # a target removes its jobs from the list (Group D decision, 2026-07-30;
+    # the link itself and all authz/dedup surfaces stay any-status). The
+    # api-key path (cron/poller) bypasses scoping — it operates on the
     # whole table by design (e.g. backfill, rescore-all, cost rollup).
     user_target_ids: set[str] | None = None
     if user_id is not None:
-        user_target_ids = get_user_target_ids(supabase, user_id)
+        user_target_ids = get_active_target_ids(supabase, user_id)
         if not user_target_ids:
             empty: dict[str, Any] = {
                 "postings": [],
@@ -2126,7 +2144,8 @@ def pipeline_counts(
         return cached
 
     counts: dict[str, int] = dict.fromkeys(_JOB_STATUSES, 0)
-    target_ids = get_user_target_ids(supabase, user_id)
+    # ACTIVE memberships only — the tab counts must match the list scope.
+    target_ids = get_active_target_ids(supabase, user_id)
     if target_ids:
         min_score = _default_min_score_for_user(supabase, user_id)
         grouped = _pipeline_counts_grouped(
@@ -2422,12 +2441,7 @@ def add_job_to_target(
     # fail the whole action — the score (the core effect) is already written, so
     # a 500 here would read as "nothing happened" when the job IS scored and
     # will show under the target. Each step is independent and logged.
-    #  1. Recompute the posting's global aggregate (shared column → service-role).
-    try:
-        update_global_score(service_supabase, job_id)
-    except Exception:
-        logger.exception("add-to-target global-score update failed for job %s", job_id)
-    #  2. Force-include under THIS one target so a negative-keyword ``excluded``
+    #  1. Force-include under THIS one target so a negative-keyword ``excluded``
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
     try:

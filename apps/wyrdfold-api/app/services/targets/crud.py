@@ -437,8 +437,33 @@ def get_active_for_user(supabase: Client, user_id: str) -> list[JobTarget]:
 
 
 def get_user_target_ids(supabase: Client, user_id: str) -> set[str]:
-    """Return the set of target IDs a user is linked to (any status)."""
+    """Return the set of target IDs a user is linked to (any status).
+
+    ANY-status is correct for membership/authz/dedup questions ("does the
+    caller follow this target?", "don't re-offer it in suggestions"). The
+    /jobs list + its pipeline counts use :func:`get_active_target_ids`
+    instead — pausing a target removes its jobs from the list (schema-audit
+    Group D decision, docs/decisions.md 2026-07-30).
+    """
     resp = supabase.table(USER_TARGETS_TABLE).select("target_id").eq("user_id", user_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+def get_active_target_ids(supabase: Client, user_id: str) -> set[str]:
+    """Return the target IDs of the user's ACTIVE memberships only.
+
+    The /jobs serving scope: a paused (inactive) membership keeps the link —
+    and every any-status surface above — but its jobs leave the list and the
+    status-tab counts until the user reactivates.
+    """
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 

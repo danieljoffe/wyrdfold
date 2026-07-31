@@ -346,7 +346,7 @@ function JobSearchCard({
           {job.salary_text || 'Salary not listed'}
         </Text>
         <Text variant='meta' className='shrink-0 text-text-tertiary'>
-          {timeAgo(job.created_at)}
+          {timeAgo(job.source_posted_at ?? job.cataloged_at)}
         </Text>
       </div>
       {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Bound → the "✓ In

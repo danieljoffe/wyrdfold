@@ -64,16 +64,17 @@ def seeded_for_blend(
             {"user_id": uid_b, "target_id": target_b, "is_active": True},
         ]
     ).execute()
-    # jobs.llm_analysis_id FKs to analyses.id, so seed a real analysis to stamp
-    # (prod always persists the analysis before this blend write runs).
+    # A real analysis row keeps the RPC call shape prod-faithful (the RPC
+    # still takes p_analysis_id for caller compatibility; since R2 it no
+    # longer stamps jobs — the pointer is derivable from analyses itself).
     analysis_id = (
         service_client.table("analyses")
         .insert(
             {
                 "job_posting_id": job_id,
                 "target_id": target_a,
-                # analyses.user_id is NOT NULL (Phase 0); this seed exists only to
-                # satisfy jobs.llm_analysis_id, so the system principal owns it.
+                # analyses.user_id is NOT NULL (Phase 0); the system principal
+                # owns this seed.
                 "user_id": SYSTEM_USER_ID,
                 "scorecard": {},
                 "recommendation": "seed",
@@ -87,8 +88,6 @@ def seeded_for_blend(
         yield uid_a, uid_b, job_id, target_a, target_b, analysis_id
     finally:
         service_client.table("user_targets").delete().in_("user_id", [uid_a, uid_b]).execute()
-        # Clear the jobs->analyses ref before deleting analyses (circular FK).
-        service_client.table("jobs").update({"llm_analysis_id": None}).eq("id", job_id).execute()
         service_client.table("analyses").delete().eq("job_posting_id", job_id).execute()
         service_client.table("sources").delete().eq("id", source_id).execute()
         service_client.table("targets").delete().in_("id", [target_a, target_b]).execute()
@@ -113,7 +112,6 @@ def _row(job_id: str, target_id: str, score: int) -> dict:
         "target_id": target_id,
         "score": score,
         "score_breakdown": {},
-        "matched_keywords": [],
         "excluded": False,
         "scoring_status": "stage2",
         "scored_profile_version": 1,
@@ -203,7 +201,7 @@ def test_anon_cannot_call_score_write_rpcs(
     `REVOKE ... FROM PUBLIC` didn't remove the explicit per-role grant). Their
     in-body guard exempts ``auth.uid() IS NULL`` — which an anon caller is — so
     an unauthenticated anon-key holder could write the shared `scores` catalog
-    and stamp `jobs.llm_analysis_id`. Anon must now be denied EXECUTE entirely:
+    (the R2-era body no longer stamps jobs). Anon must now be denied EXECUTE entirely:
     PostgREST stops exposing the RPC to the `anon` role, so each call errors and
     the seeded score (50) is untouched.
     """

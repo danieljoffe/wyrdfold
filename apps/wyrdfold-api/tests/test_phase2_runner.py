@@ -22,7 +22,6 @@ from app.models.targets import (
     ScoringProfile,
     SeniorityProfile,
 )
-from app.services.embeddings.prescan_gate import GateBatch
 from app.services.fit.job_fit import AxisScores, JobFitResult
 from app.services.fit.phase2_runner import (
     PHASE2_BATCH_SIZE,
@@ -208,25 +207,25 @@ async def test_daily_cap_trims_to_quota_newest_first(
             "id": "j0",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-01-01T00:00:00+00:00",
+            "cataloged_at": "2026-01-01T00:00:00+00:00",
         },
         {
             "id": "j1",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-02-01T00:00:00+00:00",
+            "cataloged_at": "2026-02-01T00:00:00+00:00",
         },
         {
             "id": "j2",
             "title": "c",
             "description_html": "",
-            "first_seen_at": "2026-03-01T00:00:00+00:00",
+            "cataloged_at": "2026-03-01T00:00:00+00:00",
         },
         {
             "id": "j3",
             "title": "d",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },
     ]
 
@@ -325,7 +324,7 @@ async def test_orders_candidates_by_confidence_desc(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-low-1", "j-high", "j-mid", "j-low-2")
     ]
@@ -366,13 +365,13 @@ async def test_null_confidence_sorts_below_any_real_value(
             "id": "j-legacy",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-04-02T00:00:00+00:00",
+            "cataloged_at": "2026-04-02T00:00:00+00:00",
         },  # NEWER
         {
             "id": "j-confident",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },  # OLDER but has confidence
     ]
     n = await run_phase2_for_jobs(
@@ -411,13 +410,13 @@ async def test_confidence_ties_break_by_first_seen_at_desc(
             "id": "j-old",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-01-01T00:00:00+00:00",
+            "cataloged_at": "2026-01-01T00:00:00+00:00",
         },
         {
             "id": "j-new",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },
     ]
     n = await run_phase2_for_jobs(
@@ -471,7 +470,7 @@ async def test_orders_candidates_by_cosine_desc_over_confidence(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-hicos", "j-midcos", "j-locos")
     ]
@@ -518,7 +517,7 @@ async def test_missing_cosine_sorts_below_a_scored_one(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-scored", "j-unscored")
     ]
@@ -626,250 +625,6 @@ def _prom_jobs(ids: list[str]) -> list[dict[str, Any]]:
     return [{"id": j, "title": "x", "description_html": ""} for j in ids]
 
 
-@pytest.mark.asyncio
-async def test_prescan_gate_drops_below_threshold_keeps_admit_and_failopen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    # Explicit per-target opt-in (#90): the gate no longer acts on an empty scope.
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
-
-    async def fake_gate(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> GateBatch:
-        # j-admit above threshold, j-drop below, j-noop has no vector (absent
-        # from cosines → data-absence None → admit).
-        return GateBatch(cosines={"j-admit": 0.9, "j-drop": 0.1}, threshold=0.5)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", fake_gate)
-
-    ids = ["j-admit", "j-drop", "j-noop"]
-    n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(ids)),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(ids),
-    )
-    # True admitted, None fail-open admitted, False dropped.
-    assert set(graded) == {"j-admit", "j-noop"}
-    assert "j-drop" not in graded
-    assert n == 2
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_holdout_keeps_a_dropped_job_for_measurement(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 1.0)
-
-    async def all_below(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> GateBatch:
-        return GateBatch(cosines=dict.fromkeys(ids, 0.1), threshold=0.5)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", all_below)
-
-    n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(["j1"]),
-    )
-    # holdout=1.0 → the would-drop job is graded anyway (to measure FN rate).
-    assert graded == ["j1"]
-    assert n == 1
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_off_is_not_consulted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", False)
-
-    called: list[int] = []
-
-    async def spy(*_a: Any, **_k: Any) -> GateBatch:
-        called.append(1)
-        return GateBatch(cosines={}, threshold=None)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", spy)
-
-    await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(["j1"]),
-    )
-    assert graded == ["j1"]  # ungated
-    assert called == []  # gate never consulted when the flag is off
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_acts_when_target_in_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#90 staged rollout: with the target in the allowlist the gate acts —
-    drops below-threshold, same as the global posture."""
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
-
-    async def fake_gate(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> GateBatch:
-        return GateBatch(cosines={"j-admit": 0.9, "j-drop": 0.1}, threshold=0.5)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", fake_gate)
-
-    ids = ["j-admit", "j-drop"]
-    await run_phase2_for_jobs(
-        _supabase(_prom_rows(ids)),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(ids),
-    )
-    assert set(graded) == {"j-admit"}
-    assert "j-drop" not in graded
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_skipped_when_target_not_in_scope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The rollout guard: gate ENABLED but this target isn't in the allowlist →
-    the gate is never consulted and nothing is dropped (keyword admission)."""
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "some-other-target")
-
-    called: list[int] = []
-
-    async def spy(*_a: Any, **_k: Any) -> GateBatch:
-        called.append(1)
-        return GateBatch(cosines={}, threshold=None)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", spy)
-
-    await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(["j1"]),
-    )
-    assert graded == ["j1"]  # out-of-scope target → ungated
-    assert called == []  # gate never consulted
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_empty_scope_is_a_noop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Empty allowlist = NO targets (a safe no-op), NOT all (#90). Cosine gating
-    is only safe per-target, so the gate needs explicit opt-in — an empty scope
-    never drops anything, even with the gate globally enabled. (Guards the
-    landmine: an accidentally-empty scope silently gating unvalidated targets.)"""
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "")
-
-    called: list[int] = []
-
-    async def spy(*_a: Any, **_k: Any) -> GateBatch:
-        called.append(1)
-        return GateBatch(cosines={}, threshold=None)
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", spy)
-
-    await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1"])),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(["j1"]),
-    )
-    assert graded == ["j1"]  # empty scope → ungated, graded normally
-    assert called == []  # gate never consulted
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_infra_error_defers_batch_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An IO error during the gate's vector read DEFERS the batch — zero
-    grades, zero spend — instead of admitting everything ungated (the
-    2026-07-12 audit found the old error→admit-all path buying ~20% of a 48h
-    sample as ungated Sonnet grades). Candidates stay ``promising`` and are
-    retried next cycle, so nothing is lost, only delayed."""
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 100)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
-
-    async def boom(*_a: Any, **_k: Any) -> GateBatch:
-        raise TimeoutError("statement timeout")
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", boom)
-
-    n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(["j1", "j2"])),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(["j1", "j2"]),
-    )
-    assert n == 0
-    assert graded == []  # nothing graded ungated
-
-
-@pytest.mark.asyncio
-async def test_prescan_gate_single_fetch_feeds_ordering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """On the enforced path the gate's cosines drive the priority order too —
-    the separate ordering fetch (``cosine_scores_batch``) must NOT run, and
-    the daily quota goes to the highest-cosine admit first."""
-    graded = _patch_grader(monkeypatch)
-    _patch_quota(monkeypatch, 1)  # room for exactly one grade
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_enabled", True)
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_target_ids", "t-1")
-    monkeypatch.setattr(f"{_RUNNER}.settings.prescan_gate_holdout_fraction", 0.0)
-
-    async def fake_gate(_sb: Any, _t: Any, ids: list[str], **_k: Any) -> GateBatch:
-        return GateBatch(cosines={"j-low": 0.6, "j-high": 0.9}, threshold=0.5)
-
-    ordering_calls: list[int] = []
-
-    async def ordering_spy(*_a: Any, **_k: Any) -> dict[str, float]:
-        ordering_calls.append(1)
-        return {}
-
-    monkeypatch.setattr(f"{_RUNNER}.cosine_gate_batch", fake_gate)
-    monkeypatch.setattr(f"{_RUNNER}.cosine_scores_batch", ordering_spy)
-
-    ids = ["j-low", "j-high"]
-    n = await run_phase2_for_jobs(
-        _supabase(_prom_rows(ids)),
-        MagicMock(),
-        target=_target(1),
-        payload=_payload(),
-        jobs=_prom_jobs(ids),
-    )
-    assert n == 1
-    assert graded == ["j-high"]  # highest cosine won the quota slot
-    assert ordering_calls == []  # no second vector fetch on the enforced path
 
 
 @pytest.mark.asyncio

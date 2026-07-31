@@ -227,8 +227,10 @@ def _job(jid, source_id, title, company, family, *, is_us, fs, created, archived
         "company_name": company,
         "role_family": family,
         "is_us": is_us,
-        "first_seen_at": _iso(fs),
-        "created_at": _iso(created),
+        # fs = the posting's age driver (provider posted date since R2);
+        # created = when we cataloged it.
+        "source_posted_at": _iso(fs),
+        "cataloged_at": _iso(created),
     }
     if archived is not None:
         row["archived_at"] = _iso(archived)

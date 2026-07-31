@@ -97,8 +97,6 @@ def _wire(
         captured["score_kwargs"] = kwargs
         return _fake_score()
 
-    def fake_update_global(sb, jid):
-        captured["global_client"] = sb
 
     def fake_upsert_user_job(sb, **kwargs):
         captured["userjob_client"] = sb
@@ -110,7 +108,6 @@ def _wire(
     monkeypatch.setattr("app.routers.jobs.get_user_target", fake_get_user_target)
     monkeypatch.setattr("app.routers.jobs.get_target", fake_get_target)
     monkeypatch.setattr("app.routers.jobs.score_and_upsert", fake_score_and_upsert)
-    monkeypatch.setattr("app.routers.jobs.update_global_score", fake_update_global)
     monkeypatch.setattr("app.routers.jobs.materialize_and_score_job", _boom)
     monkeypatch.setattr("app.routers.jobs.persistence.upsert_user_job", fake_upsert_user_job)
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
@@ -153,7 +150,6 @@ def test_add_to_target_writes_via_service_role_ownership_checked_on_caller(
     assert captured["score_kwargs"]["job_posting_id"] == _JOB_ID
     assert captured["userjob_client"] is service_sb
     assert captured["userjob_kwargs"]["status"] == "saved"
-    assert captured["global_client"] is service_sb
     # Force-include goes through the RPC on the service-role client, scoped to
     # this one target; the caller client is NEVER used for a score write.
     service_sb.rpc.assert_called_once_with(
@@ -210,39 +206,6 @@ def test_add_to_target_404s_for_dead_or_unknown_job(
     assert r.status_code == 404
     assert r.json()["detail"] == "Job not found"
     assert "ownership_client" not in captured  # short-circuits before ownership
-
-
-def test_add_to_target_survives_secondary_bookkeeping_failure(
-    overrides: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The score row is the core effect; a transient failure in a secondary
-    step (global-score recompute here) must NOT fail the request — the job is
-    already scored against the target, so a 500 would be a lie."""
-    user_sb = MagicMock(name="user_client")
-    service_sb = MagicMock(name="service_client")
-    captured: dict[str, object] = {}
-    _wire(
-        monkeypatch,
-        user_sb=user_sb,
-        service_sb=service_sb,
-        job={"id": _JOB_ID, "title": "Frontend Engineer", "description_html": "x"},
-        follows_target=True,
-        target=_fake_target(),
-        captured=captured,
-    )
-
-    def _boom_global(_sb: object, _jid: object) -> None:
-        raise RuntimeError("transient db error after the score committed")
-
-    # Re-patch AFTER _wire so this wins over the capturing stub.
-    monkeypatch.setattr("app.routers.jobs.update_global_score", _boom_global)
-
-    r = TestClient(app).post(f"/jobs/{_JOB_ID}/add-to-target", json={"target_id": _TARGET_ID})
-
-    assert r.status_code == 200
-    assert r.json()["success"] is True
-    # The core score write still happened (on the service-role client).
-    assert captured["score_client"] is service_sb
 
 
 def _query_stub(rows: list[dict[str, Any]]) -> tuple[MagicMock, MagicMock]:

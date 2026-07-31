@@ -26,7 +26,7 @@ from supabase import Client
 
 from app.models.schemas import JobTargetScore, ScoreBreakdown, ScoreResult, ScoringStatus
 from app.models.targets import JobTarget
-from app.services.db_write import poll_db_read, poll_db_write
+from app.services.db_write import poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
 from app.services.scoring import score_job_with_profile, score_title_against_profile
 from app.services.supabase_retry import execute_with_retry_sync
@@ -78,7 +78,8 @@ def _score_row_payload(
         "target_id": target_id,
         "score": score,
         "score_breakdown": breakdown.model_dump(),
-        "matched_keywords": matched_keywords,
+        # matched_keywords is no longer persisted (write-only column dropped
+        # in R2 — the breakdown JSONB already embeds match components).
         "excluded": excluded,
         "scoring_status": scoring_status,
         "scored_profile_version": scored_profile_version,
@@ -490,7 +491,7 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         # (500) ids builds a ~19 KB URL that 414s past PostgREST's URL-safe
         # bound — and here the 414 is swallowed, so a feedback thumbs-down or a
         # manual /rescore on a heavy target would silently fail to re-score.
-        # Reuse the same _BATCH_CHUNK_SIZE the aggregate loops below use.
+        # Chunked .in_() reads — same bound the deleted aggregate loops used.
         jobs: list[dict[str, Any]] = []
         for i in range(0, len(batch_ids), _BATCH_CHUNK_SIZE):
             resp = (
@@ -551,11 +552,10 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         ).execute()
         total_scored += len(rows_to_upsert)
 
-        scored_ids = [r["job_posting_id"] for r in rows_to_upsert]
-        batch_update_global_scores(supabase, scored_ids)
-
     return total_scored
 
+
+_BATCH_CHUNK_SIZE = 100  # chunk bound for .in_() reads (414-guard)
 
 # Page size for the retro-score title sweep over the whole ``jobs`` table —
 # same 500 as the re-score pager; a narrow ``id, title`` select, keyset-paged.
@@ -569,10 +569,8 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
     Used at target activation so postings that pre-date the target still
     appear under it. Replaces the per-row-upsert N+1 the activation path used
     to run: matched rows are accumulated per page and written with a SINGLE
-    ``.upsert(...)``, then one :func:`batch_update_global_scores` recomputes
-    ``jobs.score`` for the page — the old retro path never recomputed the
-    global score, so jobs it newly matched kept a stale ``jobs.score`` until
-    the next poll happened to touch them (a secondary correctness gap).
+    upsert per page. (The legacy global ``jobs.score`` recompute that used to
+    follow was retired with the column — R2, schema audit Group A.)
 
     Keyset-paginated by ``id ASC``, not OFFSET: the old ``.range(offset, …)``
     had no ``ORDER BY``, so a concurrent poller insert could shift the window
@@ -616,7 +614,6 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
                 rows_to_upsert, on_conflict="job_posting_id,target_id"
             ).execute()
             written += len(rows_to_upsert)
-            batch_update_global_scores(supabase, [r["job_posting_id"] for r in rows_to_upsert])
 
         if len(rows) < _RETRO_TITLE_BATCH_SIZE:
             break
@@ -664,149 +661,6 @@ def get_target_scores(
 # A row is a real (LLM) fit grade only once its scoring_status is "complete";
 # stage1/stage2 rows carry a cheap keyword *placeholder* on a different scale.
 # Mirrors the read-side split in routers/jobs.py (`_is_pending`).
-_GRADED_STATUS = "complete"
-
-
-def _aggregate_global_score(rows: list[dict[str, Any]]) -> int:
-    """Aggregate a job's target-score rows into a single ``jobs.score``.
-
-    ``scores.score`` holds a cheap keyword *placeholder* (0–30 band) while a
-    row is ``stage1``/``stage2`` and the real LLM fit score (0–100 rubric) once
-    it's ``complete``. The two scales are not comparable, so averaging them
-    corrupts the global ranking whenever a job carries both (#194/#47). Instead:
-
-    - drop ``excluded`` rows,
-    - average the **graded** (``complete``) rows when any exist,
-    - fall back to the keyword placeholders only until the job is graded.
-
-    This mirrors exactly what the ``/jobs`` list-view split does at read time
-    (``_is_pending``). Returns 0 when there are no usable rows.
-    """
-    usable = [r for r in rows if not r.get("excluded", False)]
-    if not usable:
-        return 0
-    graded = [int(r["score"]) for r in usable if r.get("scoring_status") == _GRADED_STATUS]
-    scores = graded or [int(r["score"]) for r in usable]
-    return round(sum(scores) / len(scores))
-
-
-def update_global_score(supabase: Client, job_posting_id: str) -> None:
-    """Recompute jobs.score from this job's active-target scores.
-
-    Called after any stage updates a target score. Graded (LLM ``complete``)
-    rows define the global score when any exist; keyword placeholders are used
-    only until the job is graded — see :func:`_aggregate_global_score` (#194).
-    """
-    resp = (
-        supabase.table(TABLE)
-        .select("score, excluded, scoring_status")
-        .eq("job_posting_id", job_posting_id)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        return
-
-    avg_score = _aggregate_global_score(rows)
-    supabase.table("jobs").update({"score": avg_score}).eq("id", job_posting_id).execute()
-
-
-_BATCH_CHUNK_SIZE = 100
-
-# Columns the batch global-score recompute reads per target-score row.
-_BATCH_SCORE_COLUMNS = "job_posting_id, score, excluded, scoring_status"
-
-
-def _global_score_updates(
-    unique_ids: list[str], all_score_rows: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Group fetched score rows by job and aggregate each into a
-    ``bulk_update_scores`` update entry (graded-first — #194). Pure; shared
-    by :func:`batch_update_global_scores` and its poll twin so the two
-    aggregation paths can't drift (#57)."""
-    # Group rows by job_posting_id, then aggregate each (graded-first).
-    from collections import defaultdict
-
-    rows_by_job: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in all_score_rows:
-        rows_by_job[row["job_posting_id"]].append(row)
-
-    return [
-        {"id": job_id, "score": _aggregate_global_score(rows_by_job.get(job_id, []))}
-        for job_id in unique_ids
-    ]
-
-
-def batch_update_global_scores(supabase: Client, job_posting_ids: list[str]) -> None:
-    """Recompute jobs.score for many jobs in fewer DB round-trips.
-
-    Fetches all target scores for the given IDs in one query (chunked to
-    avoid URL length limits), aggregates each job in Python via
-    :func:`_aggregate_global_score` (graded rows win over keyword
-    placeholders — #194), then writes every new score in a single
-    `bulk_update_scores` RPC instead of one UPDATE per job.
-    """
-    if not job_posting_ids:
-        return
-
-    # Deduplicate
-    unique_ids = list(set(job_posting_ids))
-
-    # Fetch all target scores in chunks
-    all_score_rows: list[dict[str, Any]] = []
-    for i in range(0, len(unique_ids), _BATCH_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _BATCH_CHUNK_SIZE]
-        resp = (
-            supabase.table(TABLE)
-            .select(_BATCH_SCORE_COLUMNS)
-            .in_("job_posting_id", chunk)
-            .execute()
-        )
-        all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
-
-    updates = _global_score_updates(unique_ids, all_score_rows)
-    if updates:
-        supabase.rpc("bulk_update_scores", {"p_updates": updates}).execute()
-
-
-async def batch_update_global_scores_poll(supabase: Client, job_posting_ids: list[str]) -> None:
-    """The poller's seam twin of :func:`batch_update_global_scores` (#57
-    slice 2): the same chunked reads + graded-first aggregation
-    (:func:`_global_score_updates`), routed through
-    :func:`app.services.db_write.poll_db_read` / ``poll_db_write`` — see
-    their docstrings for backend selection. Slice 4 (#57) collapses the pair
-    once the sync callers migrate.
-    """
-    if not job_posting_ids:
-        return
-
-    # Deduplicate
-    unique_ids = list(set(job_posting_ids))
-
-    # Fetch all target scores in chunks
-    all_score_rows: list[dict[str, Any]] = []
-    for i in range(0, len(unique_ids), _BATCH_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _BATCH_CHUNK_SIZE]
-        resp = await poll_db_read(
-            supabase,
-            lambda c, ids=chunk: (
-                c.table(TABLE).select(_BATCH_SCORE_COLUMNS).in_("job_posting_id", ids)
-            ),
-            label="global-score batch read",
-        )
-        all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
-
-    # Aggregation is pure-Python over every fetched score row — off-loop for
-    # the same reason as the scoring compute in the ``*_poll`` twins.
-    updates = await asyncio.to_thread(_global_score_updates, unique_ids, all_score_rows)
-    if updates:
-        await poll_db_write(
-            supabase,
-            lambda c: c.rpc("bulk_update_scores", {"p_updates": updates}),
-            label="global-score bulk update",
-        )
-
-
 def mark_complete(supabase: Client, job_posting_id: str) -> None:
     """Mark all target scores for a job as scoring_status='complete'.
 
