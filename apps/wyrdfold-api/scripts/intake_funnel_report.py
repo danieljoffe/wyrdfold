@@ -107,13 +107,13 @@ async def main() -> None:
         supabase,
         build=lambda off: (
             supabase.table("jobs")
-            .select("created_at")
-            .gte("created_at", since)
-            .order("created_at", desc=False)
+            .select("cataloged_at")
+            .gte("cataloged_at", since)
+            .order("cataloged_at", desc=False)
             .range(off, off + PAGE_SIZE - 1)
         ),
     )
-    by_day = Counter(_day(cast(str, r["created_at"])) for r in ingested)
+    by_day = Counter(_day(cast(str, r["cataloged_at"])) for r in ingested)
     last7 = sum(n for d, n in by_day.items() if _age_days(d + "T00:00:00+00:00", now) < 7)
     last30 = sum(n for d, n in by_day.items() if _age_days(d + "T00:00:00+00:00", now) < 30)
     logger.info("== 1. INTAKE (last %dd) ==", args.days)
@@ -126,15 +126,15 @@ async def main() -> None:
         supabase,
         build=lambda off: (
             supabase.table("jobs")
-            .select("created_at")
+            .select("cataloged_at")
             .is_("archived_at", "null")
             .is_("purged_at", "null")
             .not_.is_("is_us", "false")
-            .order("created_at", desc=False)
+            .order("cataloged_at", desc=False)
             .range(off, off + PAGE_SIZE - 1)
         ),
     )
-    ages = sorted(_age_days(cast(str, r["created_at"]), now) for r in live)
+    ages = sorted(_age_days(cast(str, r["cataloged_at"]), now) for r in live)
     buckets = Counter()
     for a in ages:
         edge = next((e for e in (7, 14, 21, 30) if a <= e), 31)

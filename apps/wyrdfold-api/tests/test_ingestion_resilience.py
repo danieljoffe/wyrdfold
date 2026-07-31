@@ -228,7 +228,7 @@ def _health_supabase(
       none held so the leaked-lock check is a clean no-op in older tests
     """
     jobs_leaf = MagicMock()
-    jobs_rows = [{"created_at": newest_created_at}] if newest_created_at else []
+    jobs_rows = [{"cataloged_at": newest_created_at}] if newest_created_at else []
     jobs_leaf.execute.return_value = _Resp(data=jobs_rows)
     jobs_table = MagicMock()
     jobs_table.select.return_value.order.return_value.limit.return_value = jobs_leaf

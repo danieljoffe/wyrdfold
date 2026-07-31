@@ -93,17 +93,17 @@ class IngestionHealthReport:
 
 
 async def _newest_job_created_at(supabase: Client) -> datetime | None:
-    """``max(jobs.created_at)`` via a 1-row keyset read on the existing
-    ``created_at DESC`` index — cheaper than an aggregate scan."""
+    """``max(jobs.cataloged_at)`` via a 1-row keyset read on the existing
+    ``idx_jobs_cataloged_at`` index — cheaper than an aggregate scan."""
     resp = await poll_db_read(
         supabase,
-        lambda c: c.table("jobs").select("created_at").order("created_at", desc=True).limit(1),
+        lambda c: c.table("jobs").select("cataloged_at").order("cataloged_at", desc=True).limit(1),
         label="health newest-job read",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
-    raw = rows[0].get("created_at")
+    raw = rows[0].get("cataloged_at")
     if not raw:
         return None
     # PostgREST returns ISO-8601; normalise the trailing Z for fromisoformat.
