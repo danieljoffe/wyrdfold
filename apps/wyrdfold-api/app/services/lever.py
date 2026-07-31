@@ -36,7 +36,7 @@ async def fetch_lever_jobs(company: str) -> list[StandardJob]:
                 location_name=categories.get("location"),
                 department=categories.get("team"),
                 content=item.get("description", ""),
-                updated_at=str(item.get("createdAt", "")),
+                posted_at=str(item.get("createdAt", "")),
                 absolute_url=item.get("hostedUrl", ""),
             )
         )

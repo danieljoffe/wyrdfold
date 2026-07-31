@@ -536,7 +536,7 @@ def test_two_query_pending_sorts_by_recency_not_keyword_score(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end through the score-sorted two-query path: within the Pending
-    tier, fresh ungraded jobs outrank stale ones by first_seen_at — NOT by the
+    tier, fresh ungraded jobs outrank stale ones by posted date — NOT by the
     hidden keyword placeholder. Decay is OFF, so this also exercises the forced
     first-seen fetch (the case the ``force`` flag exists for)."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
@@ -573,10 +573,10 @@ def test_two_query_pending_sorts_by_recency_not_keyword_score(
         },
     ]
     jobs_rows = [
-        {"id": "g-hi", "title": "graded hi", "first_seen_at": "2026-07-05"},
-        {"id": "g-lo", "title": "graded lo", "first_seen_at": "2026-07-04"},
-        {"id": "p-old-hi", "title": "pending old high-keyword", "first_seen_at": "2026-07-01"},
-        {"id": "p-new-lo", "title": "pending new low-keyword", "first_seen_at": "2026-07-09"},
+        {"id": "g-hi", "title": "graded hi", "cataloged_at": "2026-07-05"},
+        {"id": "g-lo", "title": "graded lo", "cataloged_at": "2026-07-04"},
+        {"id": "p-old-hi", "title": "pending old high-keyword", "cataloged_at": "2026-07-01"},
+        {"id": "p-new-lo", "title": "pending new low-keyword", "cataloged_at": "2026-07-09"},
     ]
     sb = _supabase_with({"scores": _Resp(ts_rows, count=4), "jobs": _Resp(jobs_rows)})
 

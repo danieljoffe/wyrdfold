@@ -150,7 +150,7 @@ async def run_phase2_for_jobs(
     """Grade the promising, not-yet-current jobs in ``jobs`` for ``target``.
 
     ``jobs`` are job dicts carrying at least ``id`` and ``title`` (and
-    ``description_html`` for the JD context; ``first_seen_at`` is used for
+    ``description_html`` for the JD context; the posted date is used for
     ordering when present). Returns the number of jobs actually graded.
 
     Order of operations: gate + re-grade filter → order newest-first →
@@ -285,15 +285,19 @@ async def run_phase2_for_jobs(
     # fit < 20). So order by (#9):
     #   1) cosine DESC — the fit-predictive signal (missing → -1: sorts last,
     #      for an un-embedded job or an un-calibrated target).
-    #   2) phase1_confidence DESC, then 3) first_seen_at DESC — tie-breakers.
-    # ``first_seen_at`` is an ISO-8601 string, sortable lexically; missing
+    #   2) phase1_confidence DESC, then 3) posted date DESC — tie-breakers.
+    # The posted date is an ISO-8601 string, sortable lexically; missing
     # values sort last.
 
     def _priority(jid: str) -> tuple[float, int, str]:
         cos = cosines.get(jid, -1.0)
         conf = state[jid][3]  # phase1_confidence
         c = int(conf) if conf is not None else -1
-        seen = job_by_id[jid].get("first_seen_at") or ""
+        seen = (
+            job_by_id[jid].get("source_posted_at")
+            or job_by_id[jid].get("cataloged_at")
+            or ""
+        )
         return (cos, c, seen)
 
     candidates.sort(key=_priority, reverse=True)

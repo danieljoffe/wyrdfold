@@ -14,7 +14,7 @@ import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';
 import LogisticsChips from './LogisticsChips';
 import StatusIndicator from './StatusIndicator';
-import { MANUAL_SOURCE_ID, type JobPosting } from './types';
+import { MANUAL_SOURCE_ID, type JobPosting, postedAt } from './types';
 
 interface JobCardProps {
   job: JobPosting;
@@ -143,7 +143,7 @@ export default function JobCard({
         </dd>
         <dt className='text-text-tertiary'>Posted</dt>
         <dd className='text-right text-text-secondary'>
-          {timeAgo(job.created_at)}
+          {timeAgo(postedAt(job))}
         </dd>
       </dl>
 

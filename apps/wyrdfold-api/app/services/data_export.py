@@ -64,7 +64,7 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "user_jobs",
     "status_log",
     "user_targets",
-    "source_ownerships",  # deleted on erasure (the user's from-url board registrations)
+    "source_registrations",  # deleted on erasure (the user's from-url board registrations)
     "user_api_keys",
     "contribution_votes",  # deleted on erasure
     "reference_jds",  # anonymized on erasure (the user's shared contributions)

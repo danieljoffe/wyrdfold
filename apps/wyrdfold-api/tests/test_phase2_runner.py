@@ -207,25 +207,25 @@ async def test_daily_cap_trims_to_quota_newest_first(
             "id": "j0",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-01-01T00:00:00+00:00",
+            "cataloged_at": "2026-01-01T00:00:00+00:00",
         },
         {
             "id": "j1",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-02-01T00:00:00+00:00",
+            "cataloged_at": "2026-02-01T00:00:00+00:00",
         },
         {
             "id": "j2",
             "title": "c",
             "description_html": "",
-            "first_seen_at": "2026-03-01T00:00:00+00:00",
+            "cataloged_at": "2026-03-01T00:00:00+00:00",
         },
         {
             "id": "j3",
             "title": "d",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },
     ]
 
@@ -324,7 +324,7 @@ async def test_orders_candidates_by_confidence_desc(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-low-1", "j-high", "j-mid", "j-low-2")
     ]
@@ -365,13 +365,13 @@ async def test_null_confidence_sorts_below_any_real_value(
             "id": "j-legacy",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-04-02T00:00:00+00:00",
+            "cataloged_at": "2026-04-02T00:00:00+00:00",
         },  # NEWER
         {
             "id": "j-confident",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },  # OLDER but has confidence
     ]
     n = await run_phase2_for_jobs(
@@ -410,13 +410,13 @@ async def test_confidence_ties_break_by_first_seen_at_desc(
             "id": "j-old",
             "title": "a",
             "description_html": "",
-            "first_seen_at": "2026-01-01T00:00:00+00:00",
+            "cataloged_at": "2026-01-01T00:00:00+00:00",
         },
         {
             "id": "j-new",
             "title": "b",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         },
     ]
     n = await run_phase2_for_jobs(
@@ -470,7 +470,7 @@ async def test_orders_candidates_by_cosine_desc_over_confidence(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-hicos", "j-midcos", "j-locos")
     ]
@@ -517,7 +517,7 @@ async def test_missing_cosine_sorts_below_a_scored_one(
             "id": jid,
             "title": "x",
             "description_html": "",
-            "first_seen_at": "2026-04-01T00:00:00+00:00",
+            "cataloged_at": "2026-04-01T00:00:00+00:00",
         }
         for jid in ("j-scored", "j-unscored")
     ]

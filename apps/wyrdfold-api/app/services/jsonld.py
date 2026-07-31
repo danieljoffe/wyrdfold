@@ -218,7 +218,7 @@ async def fetch_jsonld_jobs(careers_url: str) -> list[StandardJob]:
                 location_name=_get_location(posting),
                 department=dept or None,
                 content=clean_desc,
-                updated_at=_get_str(posting, "datePosted"),
+                posted_at=_get_str(posting, "datePosted"),
                 absolute_url=url,
                 salary_text=_format_salary(posting),
             )

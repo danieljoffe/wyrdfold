@@ -42,7 +42,7 @@ def _register(
 
 
 def _cleanup(service_client: Client, tokens: list[str]) -> None:
-    # ON DELETE CASCADE from sources → source_ownerships clears ownership too.
+    # ON DELETE CASCADE from sources → source_registrations clears the registration too.
     with contextlib.suppress(Exception):
         service_client.table("sources").delete().in_("board_token", tokens).execute()
 
@@ -69,7 +69,7 @@ def test_register_creates_enabled_source_and_ownership(service_client: Client) -
         assert src["provider"] == "ashby"
 
         own = (
-            service_client.table("source_ownerships")
+            service_client.table("source_registrations")
             .select("user_id")
             .eq("user_id", uid)
             .execute()
@@ -88,7 +88,7 @@ def test_reregister_same_user_is_idempotent(service_client: Client) -> None:
         assert _register(service_client, user_id=uid, board_token=tok) == "registered"
         assert _register(service_client, user_id=uid, board_token=tok) == "already_owned"
         own = (
-            service_client.table("source_ownerships")
+            service_client.table("source_registrations")
             .select("user_id")
             .eq("user_id", uid)
             .execute()
@@ -141,7 +141,7 @@ def test_rls_user_sees_only_own_ownerships(
     try:
         _register(service_client, user_id=uid_a, board_token=tok)
         client_b = user_client_factory(uid_b)  # type: ignore[operator]
-        visible = client_b.table("source_ownerships").select("user_id").execute().data
+        visible = client_b.table("source_registrations").select("user_id").execute().data
         # The RLS SELECT policy scopes to auth.uid() — B never sees A's row.
         assert not any(r["user_id"] == uid_a for r in visible)
     finally:
@@ -168,11 +168,11 @@ def test_rls_denies_direct_ownership_insert(
     client = user_client_factory(uid)  # type: ignore[operator]
     try:
         with pytest.raises(Exception):
-            client.table("source_ownerships").insert(
+            client.table("source_registrations").insert(
                 {"user_id": uid, "source_id": src["id"]}
             ).execute()
         rows = (
-            service_client.table("source_ownerships")
+            service_client.table("source_registrations")
             .select("user_id")
             .eq("user_id", uid)
             .execute()

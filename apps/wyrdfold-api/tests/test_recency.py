@@ -126,8 +126,8 @@ async def test_refresh_applies_decay_per_row_when_enabled(
     fresh = datetime.now(UTC).isoformat()
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
     jobs = [
-        {"id": "j-fresh", "first_seen_at": fresh},
-        {"id": "j-old", "first_seen_at": old},
+        {"id": "j-fresh", "cataloged_at": fresh},
+        {"id": "j-old", "cataloged_at": old},
     ]
     # Two targets for the old job → two rows, different scores, same age.
     scores = [
@@ -156,7 +156,7 @@ async def test_refresh_mirrors_score_when_disabled(
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
-    jobs = [{"id": "j-old", "first_seen_at": old}]
+    jobs = [{"id": "j-old", "cataloged_at": old}]
     scores = [{"id": "s1", "job_posting_id": "j-old", "score": 90}]
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _refresh_supabase(jobs, scores, rpc_calls)
@@ -260,8 +260,8 @@ async def test_refresh_poll_flag_on_reads_and_writes_on_async_client(
     fresh = datetime.now(UTC).isoformat()
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
     jobs = [
-        {"id": "j-fresh", "first_seen_at": fresh},
-        {"id": "j-old", "first_seen_at": old},
+        {"id": "j-fresh", "cataloged_at": fresh},
+        {"id": "j-old", "cataloged_at": old},
     ]
     scores = [
         {"id": "s1", "job_posting_id": "j-fresh", "score": 80},
@@ -298,8 +298,8 @@ async def test_refresh_poll_flag_on_failed_chunk_counts_zero_others_written(
     monkeypatch.setattr(recency_mod, "_RECENCY_CHUNK_SIZE", 2)
     now_iso = datetime.now(UTC).isoformat()
     jobs = [
-        {"id": "j1", "first_seen_at": now_iso},
-        {"id": "j2", "first_seen_at": now_iso},
+        {"id": "j1", "cataloged_at": now_iso},
+        {"id": "j2", "cataloged_at": now_iso},
     ]
     # 3 updates with chunk size 2 → chunks [s1, s2] and [s3].
     scores = [
@@ -395,7 +395,7 @@ def test_target_two_query_orders_by_recency_when_enabled(
     decay is on — the visible (raw) score still rides along."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     # The sort now keys on the score each row DISPLAYS — read-time decay from
-    # ``first_seen_at`` (#47), not the stored ``recency_score``: fresh-70 (no
+    # the posted date (#47), not the stored ``recency_score``: fresh-70 (no
     # decay) outranks stale-95 (decays to ~66 at 27 days).
     fresh = datetime.now(UTC).isoformat()
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
@@ -416,8 +416,8 @@ def test_target_two_query_orders_by_recency_when_enabled(
         },
     ]
     postings_storage_order = [
-        {"id": "j-stale", "title": "stale high-fit", "first_seen_at": old},
-        {"id": "j-fresh", "title": "fresh", "first_seen_at": fresh},
+        {"id": "j-stale", "title": "stale high-fit", "cataloged_at": old},
+        {"id": "j-fresh", "title": "fresh", "cataloged_at": fresh},
     ]
     sb = _list_supabase(
         {
@@ -476,8 +476,8 @@ def test_across_targets_orders_by_recency_when_enabled(
         },
     ]
     postings = [
-        {"id": "j-stale", "title": "stale", "location": "Remote · US", "first_seen_at": old},
-        {"id": "j-fresh", "title": "fresh", "location": "Remote · US", "first_seen_at": fresh},
+        {"id": "j-stale", "title": "stale", "location": "Remote · US", "cataloged_at": old},
+        {"id": "j-fresh", "title": "fresh", "location": "Remote · US", "cataloged_at": fresh},
     ]
     sb = _list_supabase({"scores": _ListResp(score_rows), "jobs": _ListResp(postings)})
 
@@ -591,7 +591,7 @@ def test_apply_display_recency_decays_score_and_records_raw(
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 100, "first_seen_at": old}]
+    postings = [{"id": "j1", "score": 100, "cataloged_at": old}]
 
     _apply_display_recency(postings)
 
@@ -604,7 +604,7 @@ def test_apply_display_recency_noop_when_disabled(
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 100, "first_seen_at": old}]
+    postings = [{"id": "j1", "score": 100, "cataloged_at": old}]
 
     _apply_display_recency(postings)
 
@@ -620,7 +620,7 @@ def test_apply_display_recency_preserves_overlay_raw_score(
     the already-set ``raw_score`` untouched."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 80, "raw_score": 95, "first_seen_at": old}]
+    postings = [{"id": "j1", "score": 80, "raw_score": 95, "cataloged_at": old}]
 
     _apply_display_recency(postings)
 
@@ -632,7 +632,7 @@ def test_apply_display_recency_skips_rows_without_score(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
-    postings = [{"id": "j1", "first_seen_at": "2026-01-01T00:00:00+00:00"}]
+    postings = [{"id": "j1", "cataloged_at": "2026-01-01T00:00:00+00:00"}]
 
     _apply_display_recency(postings)
 
@@ -710,8 +710,8 @@ async def test_refresh_all_sweeps_live_scores_and_skips_archived(
     fresh = datetime.now(UTC).isoformat()
     # Only live (non-archived) jobs come back from the jobs walk.
     jobs = [
-        {"id": "j-old", "first_seen_at": old},
-        {"id": "j-fresh", "first_seen_at": fresh},
+        {"id": "j-old", "cataloged_at": old},
+        {"id": "j-fresh", "cataloged_at": fresh},
     ]
     scores = [
         {"id": "s1", "job_posting_id": "j-old", "score": 90},
@@ -738,7 +738,7 @@ async def test_refresh_all_mirrors_score_when_disabled(
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
-    jobs = [{"id": "j-old", "first_seen_at": old}]
+    jobs = [{"id": "j-old", "cataloged_at": old}]
     scores = [{"id": "s1", "job_posting_id": "j-old", "score": 90}]
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase(jobs, scores, rpc_calls)

@@ -200,7 +200,7 @@ def _us_job(title: str) -> StandardJob:
         location_name="New York, NY",
         department=None,
         content="",
-        updated_at="2026-01-01",
+        posted_at="2026-01-01",
         absolute_url="https://example.com/j/1",
     )
 
@@ -554,7 +554,7 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
                 location_name="London, United Kingdom",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
@@ -605,7 +605,7 @@ async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
                 location_name="London, United Kingdom",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
@@ -654,7 +654,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
@@ -663,7 +663,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/2",
             ),
         ]
@@ -721,7 +721,7 @@ async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> tup
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/2",
             )
         ]
@@ -894,7 +894,7 @@ def _job(external_id: str, title: str, location: str) -> StandardJob:
         location_name=location,
         department=None,
         content="",
-        updated_at="2026-01-01",
+        posted_at="2026-01-01",
         absolute_url=f"https://example.com/j/{external_id}",
     )
 
@@ -1245,7 +1245,7 @@ async def test_last_candidate_at_stamped_when_candidates_upserted(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
@@ -1290,7 +1290,7 @@ async def test_no_candidates_leaves_last_candidate_at_unstamped(monkeypatch):
                 location_name="London, United Kingdom",  # dropped at the US gate
                 department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
@@ -1527,7 +1527,7 @@ async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="<p>edited JD with a shiny new $100k salary</p>",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
@@ -1536,7 +1536,7 @@ async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/2",
             ),
         ]
@@ -1599,7 +1599,7 @@ async def test_engaged_job_refreshes_despite_missing_from_unengaged_view(monkeyp
                 location_name="Remote",
                 department=None,
                 content="<p>fresh content for the row the user saved</p>",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
@@ -1608,7 +1608,7 @@ async def test_engaged_job_refreshes_despite_missing_from_unengaged_view(monkeyp
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/2",
             ),
         ]
@@ -1709,7 +1709,7 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
@@ -1718,7 +1718,7 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/2",
             ),
             StandardJob(
@@ -1727,7 +1727,7 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/3",
             ),
         ]
@@ -1901,7 +1901,7 @@ async def test_refreshed_known_row_does_not_realert(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
@@ -1910,7 +1910,7 @@ async def test_refreshed_known_row_does_not_realert(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/2",
             ),
         ]
@@ -1970,7 +1970,7 @@ async def test_url_validation_skips_known_rows(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/known",
             ),
             StandardJob(
@@ -1979,7 +1979,7 @@ async def test_url_validation_skips_known_rows(monkeypatch):
                 location_name="Remote",
                 department=None,
                 content="",
-                updated_at="2026-01-02",
+                posted_at="2026-01-02",
                 absolute_url="https://example.com/j/new",
             ),
         ]

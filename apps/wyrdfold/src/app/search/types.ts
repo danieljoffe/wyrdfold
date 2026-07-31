@@ -24,8 +24,10 @@ export interface JobSearchResult {
   salary_currency?: string | null;
   salary_period?: string | null;
   absolute_url: string | null;
-  first_seen_at: string | null;
-  created_at: string | null;
+  /** Provider's posted date (null = source gave none). R2 rename. */
+  source_posted_at: string | null;
+  /** When we cataloged the listing. R2 rename of created_at/first_seen_at. */
+  cataloged_at: string | null;
   // Short plaintext preview (tag-stripped, truncated server-side) — the triage
   // payload for the card grid (#467 §11). Null when the JD has no usable text.
   snippet: string | null;

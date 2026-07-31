@@ -1029,7 +1029,7 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
                 )
                 .is_("role_family", "null")
                 .is_("archived_at", "null")
-                .order("created_at", desc=False)
+                .order("cataloged_at", desc=False)
                 .limit(limit)
             ),
             label="poll qualify-backfill select",
@@ -1190,7 +1190,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
                     c.table("scores")
                     .select(
                         "recency_score, jobs!inner(id, title, description_html, "
-                        "first_seen_at, archived_at, purged_at, is_us, role_family)"
+                        "cataloged_at, archived_at, purged_at, is_us, role_family)"
                     )
                     .eq("target_id", tid)
                     .eq("promising", True)
@@ -1421,7 +1421,7 @@ async def _poll_one_source(
         # the newest. Global idx travels with each row, so verdict mapping is
         # unaffected. Undated rows sort last.
         triage_candidates.sort(
-            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+            key=lambda c: normalize_posted_at(c[1].posted_at) or "", reverse=True
         )
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             for active_target in active_targets:
@@ -1630,7 +1630,7 @@ async def _poll_one_source(
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
+                    "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
                 }
@@ -2663,7 +2663,7 @@ async def _poll_one_source_for_target(
         # Grade the most RECENT first (#285 f/u): budget truncation defers the
         # oldest tail, not the newest. Undated rows sort last.
         triage_candidates.sort(
-            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+            key=lambda c: normalize_posted_at(c[1].posted_at) or "", reverse=True
         )
         # BYOK (#5 P3): triage on the payer's own key. ``None`` means
         # triage is off / over-budget / no BYOK key in require-mode — all
@@ -2790,7 +2790,7 @@ async def _poll_one_source_for_target(
                     "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
+                    "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
                 }

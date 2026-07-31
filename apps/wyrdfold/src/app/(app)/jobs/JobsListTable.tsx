@@ -17,6 +17,7 @@ import {
   MANUAL_SOURCE_ID,
   type JobPosting,
   type JobsSortColumn,
+  postedAt,
 } from './types';
 
 interface JobsListTableProps {
@@ -230,7 +231,7 @@ export default function JobsListTable({
                   </td>
                   <td className='px-3 py-2'>{job.company_name}</td>
                   <td className='px-3 py-2 text-text-tertiary'>
-                    {timeAgo(job.created_at)}
+                    {timeAgo(postedAt(job))}
                   </td>
                   <td className='px-3 py-2 text-text-tertiary'>
                     {job.salary_text ?? '—'}
