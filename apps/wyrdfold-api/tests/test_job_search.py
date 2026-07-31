@@ -38,7 +38,6 @@ def _row(rid: str, title: str, created_at: str) -> dict[str, Any]:
         "title": title,
         "company_name": f"Co-{rid}",
         "location": "Remote",
-        "department": None,
         "salary_text": None,
         "absolute_url": f"https://example.com/{rid}",
         "cataloged_at": ts,

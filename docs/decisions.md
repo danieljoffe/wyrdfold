@@ -3,6 +3,23 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-07-31 — The URL-health net ran daily and could never catch anything
+
+The dead-link archival cascade (HEAD checks → 3 consecutive failures →
+archive) was correctly built, scheduler-armed, and ticking every day — and had
+archived exactly **0 jobs ever**. Cause: `due_url_health_jobs` ordered
+`last_url_check_at ASC NULLS FIRST`, so a row that just took strike 1 went to
+the back of the entire never-checked backlog; at batch 50/day the second
+strike arrived ~82 days later while 30-day retention archived everything
+first. Silence looked identical to health. **Decision ("fix the net"):**
+strike-carrying rows are served FIRST (a dying URL confirms on consecutive
+ticks → archives in ~3 days), then never-checked, then stalest; batch default
+50 → 250. Lesson: a safety net needs a liveness proof — if it has never
+fired, verify it _can_; ordering choices compose into starvation at scale.
+(Same audit batch: `jobs.department` + `jobs.us_confidence` dropped —
+verified reader-free.) Full analysis:
+`.claude/docs/audit-wyrdfold-schema-debt-2026-07-30.md`.
+
 ## 2026-07-30 — The prescan gate is retired by its own shadow data; embeddings survive on ordering
 
 The #60/#89/#90 cosine pre-gate (cut Phase-2 LLM grading spend by admitting

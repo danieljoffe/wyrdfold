@@ -608,7 +608,6 @@ export type Database = {
           city: string | null;
           company_name: string;
           country: string | null;
-          department: string | null;
           description_html: string | null;
           employment_type: string | null;
           external_id: string;
@@ -637,7 +636,6 @@ export type Database = {
           updated_at: string | null;
           url_check_failure_count: number;
           url_check_status: number | null;
-          us_confidence: number | null;
         };
         Insert: {
           absolute_url?: string | null;
@@ -646,7 +644,6 @@ export type Database = {
           city?: string | null;
           company_name: string;
           country?: string | null;
-          department?: string | null;
           description_html?: string | null;
           employment_type?: string | null;
           external_id: string;
@@ -675,7 +672,6 @@ export type Database = {
           updated_at?: string | null;
           url_check_failure_count?: number;
           url_check_status?: number | null;
-          us_confidence?: number | null;
         };
         Update: {
           absolute_url?: string | null;
@@ -684,7 +680,6 @@ export type Database = {
           city?: string | null;
           company_name?: string;
           country?: string | null;
-          department?: string | null;
           description_html?: string | null;
           employment_type?: string | null;
           external_id?: string;
@@ -713,7 +708,6 @@ export type Database = {
           updated_at?: string | null;
           url_check_failure_count?: number;
           url_check_status?: number | null;
-          us_confidence?: number | null;
         };
         Relationships: [
           {
@@ -1837,7 +1831,6 @@ export type Database = {
           city: string;
           company_name: string;
           country: string;
-          department: string;
           employment_type: string;
           external_id: string;
           id: string;
@@ -1873,7 +1866,6 @@ export type Database = {
           city: string | null;
           company_name: string;
           country: string | null;
-          department: string | null;
           description_html: string | null;
           employment_type: string | null;
           external_id: string;
@@ -1902,7 +1894,6 @@ export type Database = {
           updated_at: string | null;
           url_check_failure_count: number;
           url_check_status: number | null;
-          us_confidence: number | null;
         }[];
         SetofOptions: {
           from: '*';
@@ -1931,7 +1922,6 @@ export type Database = {
           city: string;
           company_name: string;
           country: string;
-          department: string;
           employment_type: string;
           external_id: string;
           id: string;

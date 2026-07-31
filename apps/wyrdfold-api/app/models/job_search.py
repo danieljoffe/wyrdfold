@@ -27,7 +27,6 @@ class JobSearchResult(BaseModel):
     state: str | None = None
     country: str | None = None
     location_remote: bool | None = None
-    department: str | None = None
     salary_text: str | None = None
     # Structured salary parsed from ``salary_text`` at ingest — query-grade
     # (range filters); the raw text stays the display value. ``salary_period``

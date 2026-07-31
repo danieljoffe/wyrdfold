@@ -206,17 +206,11 @@ async def fetch_jsonld_jobs(careers_url: str) -> list[StandardJob]:
         id_source = url or f"{title}|{_get_location(posting) or ''}"
         external_id = hashlib.sha256(id_source.encode()).hexdigest()[:16]
 
-        org = posting.get("hiringOrganization")
-        dept = ""
-        if isinstance(org, dict):
-            dept = _get_str(org, "department")
-
         jobs.append(
             StandardJob(
                 external_id=external_id,
                 title=title,
                 location_name=_get_location(posting),
-                department=dept or None,
                 content=clean_desc,
                 posted_at=_get_str(posting, "datePosted"),
                 absolute_url=url,

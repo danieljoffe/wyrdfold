@@ -102,7 +102,6 @@ async def materialize_and_score_job(
         "state": loc.state,
         "country": loc.country,
         "location_remote": loc.remote,
-        "department": None,
         "description_html": sanitize_html(description_html) if description_html else "",
         "absolute_url": final_url,
         "score": 0,

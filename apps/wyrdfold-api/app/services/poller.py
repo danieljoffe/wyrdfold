@@ -742,7 +742,6 @@ async def _qualify_one_job(
 
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
-        "us_confidence": tags.us_confidence,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
         "employment_type": tags.employment_type,
@@ -1627,7 +1626,6 @@ async def _poll_one_source(
                     "state": loc.state,
                     "country": loc.country,
                     "location_remote": loc.remote,
-                    "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
                     "source_posted_at": normalize_posted_at(job.posted_at),
@@ -2787,7 +2785,6 @@ async def _poll_one_source_for_target(
                     "state": loc.state,
                     "country": loc.country,
                     "location_remote": loc.remote,
-                    "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
                     "source_posted_at": normalize_posted_at(job.posted_at),

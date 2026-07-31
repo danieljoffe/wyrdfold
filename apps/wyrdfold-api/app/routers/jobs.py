@@ -109,7 +109,7 @@ router = APIRouter(
 
 _JP_SELECT_COLS = (
     "id, external_id, source_id, title, company_name, location, "
-    "city, state, country, location_remote, department, "
+    "city, state, country, location_remote, "
     "absolute_url, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "
     # Firewall tag columns (#524 tagger): serving them is what makes the
