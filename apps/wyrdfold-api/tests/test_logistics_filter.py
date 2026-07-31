@@ -153,3 +153,56 @@ def test_min_salary_falls_back_to_logistics_for_non_yearly_usd() -> None:
     assert _logistics_passes(hourly_low, f) is False
     # No structured columns at all → pure fallback (the pre-columns behavior).
     assert _logistics_passes(_p({"salary_max": 200_000}), f) is True
+
+
+class TestIncludeUnknownSalaryPref:
+    """pref_include_unknown_salary wired (2026-07-31): relaxes ONLY the
+    strict unknown-salary drop under a min_salary floor. A KNOWN salary below
+    the floor drops regardless; api-key/global paths (no pref context) keep
+    the strict pre-wiring default."""
+
+    def _floor(self) -> _LogisticsFilter:
+        from app.routers.jobs import _LogisticsFilter
+
+        return _LogisticsFilter(min_salary=150_000)
+
+    def test_unknown_salary_kept_when_pref_true(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {"logistics_filters": None}  # no salary anywhere
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=True) is True
+
+    def test_unknown_salary_dropped_when_pref_false(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {"logistics_filters": None}
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=False) is False
+
+    def test_known_below_floor_drops_regardless_of_pref(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {
+            "salary_currency": "USD",
+            "salary_period": "yearly",
+            "salary_max": 100_000,
+            "logistics_filters": None,
+        }
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=True) is False
+
+    def test_default_stays_strict(self) -> None:
+        """Callers without pref context (api-key/global) keep the old drop."""
+        from app.routers.jobs import _logistics_passes
+
+        assert _logistics_passes({"logistics_filters": None}, self._floor()) is False
+
+    def test_apply_filter_resolves_per_row(self) -> None:
+        from app.routers.jobs import _apply_logistics_filter
+
+        rows = [
+            {"id": "keep-me", "logistics_filters": None},
+            {"id": "drop-me", "logistics_filters": None},
+        ]
+        out = _apply_logistics_filter(
+            rows, self._floor(), include_unknown_salary_for=lambda p: p["id"] == "keep-me"
+        )
+        assert [p["id"] for p in out] == ["keep-me"]

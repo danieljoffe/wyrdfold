@@ -742,7 +742,6 @@ async def _qualify_one_job(
 
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
-        "us_confidence": tags.us_confidence,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
         "employment_type": tags.employment_type,
@@ -770,6 +769,12 @@ async def _qualify_one_job(
         and tags.us_confidence >= settings.qualification_non_us_archive_min_confidence
         and not positively_us_location(row.get("location"))
     ):
+        payload["archived_at"] = datetime.now(UTC).isoformat()
+    # Non-postings (#60 wire-up): an explicit ``is_genuine_role=false``
+    # verdict ("join our talent community", evergreen collectors) archives in
+    # the same write — these aren't jobs, so they leave every serving surface
+    # via the standard liveness gate. Lenient: ``None`` never archives.
+    if settings.qualification_archive_non_genuine and tags.is_genuine_role is False:
         payload["archived_at"] = datetime.now(UTC).isoformat()
     try:
         await poll_db_write(
@@ -1627,7 +1632,6 @@ async def _poll_one_source(
                     "state": loc.state,
                     "country": loc.country,
                     "location_remote": loc.remote,
-                    "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
                     "source_posted_at": normalize_posted_at(job.posted_at),
@@ -2787,7 +2791,6 @@ async def _poll_one_source_for_target(
                     "state": loc.state,
                     "country": loc.country,
                     "location_remote": loc.remote,
-                    "department": job.department,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
                     "source_posted_at": normalize_posted_at(job.posted_at),

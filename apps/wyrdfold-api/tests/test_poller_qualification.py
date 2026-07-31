@@ -128,7 +128,6 @@ class TestQualifyOneJob:
         assert payload["metro"] == "San Francisco"
         assert payload["is_remote"] is False
         assert payload["is_genuine_role"] is True
-        assert payload["us_confidence"] == 98
         assert payload["qualified_at"] is not None
         # The persisted hash matches the row's content hash.
         assert payload["qualified_hash"] == qualification_hash(
@@ -218,6 +217,20 @@ def _unique_rows(n: int) -> list[dict[str, Any]]:
     """``n`` rows with distinct ids/content so each would (absent the gate)
     miss the content-hash cache and trigger one ``tag_job`` call."""
     return [_row(id=f"job-{i}", title=f"Engineer {i}") for i in range(n)]
+
+
+def _tags(*, is_genuine_role: bool | None = True) -> QualificationTags:
+    """A plain US verdict with an overridable ``is_genuine_role``."""
+    return QualificationTags(
+        is_us=True,
+        us_confidence=90,
+        role_family="engineering",
+        seniority="senior_ic",
+        employment_type="full_time",
+        metro=None,
+        is_remote=False,
+        is_genuine_role=is_genuine_role,
+    )
 
 
 def _non_us_tags(confidence: int | None) -> QualificationTags:
@@ -314,7 +327,6 @@ class TestNonUsArchive:
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
-        assert payload["us_confidence"] is None
         assert "archived_at" not in payload  # None confidence → not archived, no crash
 
     @pytest.mark.asyncio
@@ -713,3 +725,54 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     await poller_mod._qualify_jobs(MagicMock(), [_row(id="job-9")])
 
     assert calls == ["refresh:1", "reconcile:job-9"]
+
+
+class TestNonGenuineArchive:
+    """Schema-audit wire-up (2026-07-31): an explicit ``is_genuine_role=false``
+    verdict (talent-pool / "general application" / evergreen collectors)
+    archives the row in the same tag write — non-postings leave every serving
+    surface via the standard liveness gate. Lenient: ``None`` never archives;
+    flag-gated (default ON) for emergencies."""
+
+    @pytest.mark.asyncio
+    async def test_non_genuine_is_archived_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tags = _tags(is_genuine_role=False)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        payload = rec["writes"][0]
+        assert payload["is_genuine_role"] is False
+        assert payload["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_malformed_none_verdict_never_archives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lenient contract: an absent/malformed verdict (None) must keep the
+        row — only an explicit False is evidence of a non-posting."""
+        tags = _tags(is_genuine_role=None)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        assert "archived_at" not in rec["writes"][0]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_tags_but_does_not_archive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "qualification_archive_non_genuine", False)
+        tags = _tags(is_genuine_role=False)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        payload = rec["writes"][0]
+        assert payload["is_genuine_role"] is False
+        assert "archived_at" not in payload

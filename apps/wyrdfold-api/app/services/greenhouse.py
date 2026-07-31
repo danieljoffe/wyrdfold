@@ -27,13 +27,11 @@ async def fetch_board_jobs(board_token: str) -> list[StandardJob]:
     jobs: list[StandardJob] = []
     for item in data.get("jobs", []):
         location = item.get("location", {})
-        departments = item.get("departments", [])
         jobs.append(
             StandardJob(
                 external_id=str(item["id"]),
                 title=item.get("title", ""),
                 location_name=location.get("name") if location else None,
-                department=departments[0]["name"] if departments else None,
                 # The Job Board API delivers `content` HTML-ESCAPED
                 # (&lt;div&gt;…), unlike every other board source we ingest.
                 # Unescape here so `description_html` stores REAL markup —

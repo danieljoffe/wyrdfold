@@ -18,14 +18,12 @@ _SUCCESS_RESPONSE = {
                 {
                     "title": "Senior Frontend Engineer",
                     "location": "San Francisco, CA",
-                    "department": "Engineering",
                     "url": "https://example.com/jobs/sfe",
                     "description": "Build amazing UIs",
                 },
                 {
                     "title": "Product Designer",
                     "location": "Remote",
-                    "department": "Design",
                     "url": "https://example.com/jobs/pd",
                     "description": "Design product experiences",
                 },
@@ -99,7 +97,6 @@ async def test_fetch_success(mock_http_client, monkeypatch):
     job = result[0]
     assert job.title == "Senior Frontend Engineer"
     assert job.location_name == "San Francisco, CA"
-    assert job.department == "Engineering"
     assert job.absolute_url == "https://example.com/jobs/sfe"
     assert job.content == "Build amazing UIs"
     assert len(job.external_id) == 16
@@ -127,7 +124,6 @@ async def test_fetch_skips_jobs_without_title(mock_http_client, monkeypatch):
     assert len(result) == 1
     assert result[0].title == "Backend Engineer"
     assert result[0].location_name is None
-    assert result[0].department is None
 
 
 @pytest.mark.asyncio

@@ -7,9 +7,10 @@ redirect to a "no longer available" landing page).
 
 Lifecycle:
   1. The scheduler ticks every ``URL_HEALTH_TICK_HOURS`` (default 24).
-  2. ``check_due`` picks the oldest ``URL_HEALTH_BATCH_SIZE`` live jobs
-     whose ``last_url_check_at`` is older than the tick threshold (or
-     NULL — never checked).
+  2. ``check_due`` picks up to ``URL_HEALTH_BATCH_SIZE`` due live jobs —
+     rows already carrying failure strikes FIRST (so a dying URL confirms on
+     consecutive ticks and archives in ~threshold days), then never-checked,
+     then stalest (2026-07-31 cadence fix; the RPC owns the ordering).
   3. ``_head_request`` HEADs each URL in parallel under a small concurrency
      cap. HEAD is enough for status; we don't read bodies. Redirects are
      followed (final status is what we want).
