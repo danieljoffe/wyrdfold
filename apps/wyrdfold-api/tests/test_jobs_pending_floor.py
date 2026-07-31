@@ -484,8 +484,11 @@ def test_live_view_applies_jobs_inner_join() -> None:
         cursor={},
     )
     # The embed also rides the gate + recency columns (perf: kills the
-    # per-request chunked role_family/first_seen reads).
-    assert any("jobs!inner(id, role_family, first_seen_at)" in s for s in rec.selects)
+    # per-request chunked role_family/posted-date reads).
+    assert any(
+            "jobs!inner(id, role_family, source_posted_at, cataloged_at)" in s
+            for s in rec.selects
+        )
     assert ("jobs.archived_at", "null") in rec.is_calls
     assert ("jobs.purged_at", "null") in rec.is_calls
     assert ("not.jobs.is_us", "false") in rec.is_calls
@@ -625,7 +628,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
                         "jobs": {
                             "id": "j1",
                             "role_family": "engineering",
-                            "first_seen_at": "2026-07-10T00:00:00Z",
+                            "cataloged_at": "2026-07-10T00:00:00Z",
                         },
                     },
                     {
@@ -638,7 +641,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
                         "jobs": {
                             "id": "j2",
                             "role_family": "engineering",
-                            "first_seen_at": "2026-07-11T00:00:00Z",
+                            "cataloged_at": "2026-07-11T00:00:00Z",
                         },
                     },
                 ]
@@ -681,4 +684,4 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
     # chunk reads.
     assert len(jobs_selects) == 1
     assert "role_family" not in jobs_selects[0].replace("jobs!inner", "")
-    assert all("first_seen_at" not in s or "title" in s for s in jobs_selects)
+    assert all("cataloged_at" not in s or "title" in s for s in jobs_selects)

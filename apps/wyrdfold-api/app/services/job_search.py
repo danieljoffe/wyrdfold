@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 _SEARCH_COLS = (
     "id, title, company_name, location, city, state, country, location_remote, "
     "department, salary_text, salary_min, salary_max, salary_currency, "
-    "salary_period, absolute_url, first_seen_at, created_at"
+    "salary_period, absolute_url, source_posted_at, cataloged_at"
 )
 
 # Salary-floor ceiling — mirrors the parser's plausibility cap (no real posted
@@ -152,7 +152,7 @@ def _rank_key(query_groups: set[str], row: dict[str, Any]) -> tuple[int, str]:
     title_groups = _groups(_tokenize(str(row.get("title") or "")))
     overlap = len(query_groups & title_groups)
     # created_at is ISO8601 → lexical sort == chronological; missing sorts last.
-    recency = str(row.get("created_at") or row.get("first_seen_at") or "")
+    recency = str(row.get("source_posted_at") or row.get("cataloged_at") or "")
     return (overlap, recency)
 
 
@@ -216,7 +216,11 @@ def search_jobs(
     if posted_within_days is not None:
         days = max(1, min(posted_within_days, MAX_POSTED_WITHIN_DAYS))
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-        query = query.gte("created_at", cutoff)
+        # "Posted within N days": provider date when known, cataloged time
+        # otherwise (PostgREST or_ keeps it one round-trip).
+        query = query.or_(
+            f"source_posted_at.gte.{cutoff},and(source_posted_at.is.null,cataloged_at.gte.{cutoff})"
+        )
     if salary_floor is not None:
         floor = max(1, min(int(salary_floor), MAX_SALARY_FLOOR))
         query = (
@@ -227,7 +231,7 @@ def search_jobs(
 
     resp = (
         # Bias the capped candidate pull toward recent postings before re-ranking.
-        query.order("created_at", desc=True).limit(_CANDIDATE_CAP).execute()
+        query.order("cataloged_at", desc=True).limit(_CANDIDATE_CAP).execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
 

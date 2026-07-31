@@ -1,9 +1,9 @@
 """Normalize ATS posting dates into a Postgres ``timestamptz``-safe value.
 
 Every fetcher (Workday, SmartRecruiters, Greenhouse, Lever, Ashby,
-JSON-LD, Firecrawl) populates ``StandardJob.updated_at`` from whatever
-its source happens to expose, and the poller writes that straight into
-the ``greenhouse_updated_at`` column (``timestamp with time zone``).
+JSON-LD, Firecrawl) populates the posted-date field from whatever
+its source happens to expose (``StandardJob.posted_at``), and the poller writes that straight into
+the ``jobs.source_posted_at`` column (``timestamp with time zone``).
 
 The problem (live Railway prod failures): the raw values are *not*
 always ISO-8601. Real shapes seen failing the upsert with PostgREST

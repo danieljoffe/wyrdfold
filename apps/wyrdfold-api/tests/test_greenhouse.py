@@ -62,7 +62,7 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
     assert job.location_name == "Remote"
     assert job.department == "Engineering"
     assert job.content == "<p>desc</p>"
-    assert job.updated_at == "2024-01-01T00:00:00Z"
+    assert job.posted_at == "2024-01-01T00:00:00Z"
     assert job.absolute_url == "https://example.com/jobs/123"
 
 

@@ -83,9 +83,12 @@ export interface JobPosting {
   logistics_filters?: LogisticsFilters | null;
   status: string;
   salary_text: string | null;
-  greenhouse_updated_at: string | null;
-  first_seen_at: string;
-  created_at: string;
+  /** Provider's posted/created date (normalized), null when the source gave
+   * none — e.g. manual adds. Renamed from greenhouse_updated_at (R2). */
+  source_posted_at: string | null;
+  /** When the listing entered OUR catalog. Renamed from created_at; also
+   * absorbed the byte-identical first_seen_at (R2). */
+  cataloged_at: string;
   /** Present only on the detail GET ``/jobs/{id}`` — list responses
    *  deliberately omit it to keep the payload small. */
   description_html?: string | null;
@@ -114,6 +117,8 @@ export interface JobsFilterState {
   country: string; // '' | ISO country code
 }
 
+/** Wire sort tokens. 'created_at' is kept for URL/param stability and sorts
+ * the renamed cataloged_at column server-side (R2). */
 export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';
 
 interface SkillMatch {
@@ -278,4 +283,13 @@ export interface ResumeVersion {
 export interface ResumeVersionsResponse {
   versions: ResumeVersion[];
   cap: number;
+}
+
+/** The date a card shows as "Posted": the provider's own date when known,
+ * else when we cataloged the listing (R2 two-timestamp model). */
+export function postedAt(job: {
+  source_posted_at: string | null;
+  cataloged_at: string;
+}): string {
+  return job.source_posted_at ?? job.cataloged_at;
 }

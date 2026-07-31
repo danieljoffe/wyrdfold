@@ -21,7 +21,6 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from typing import Any, cast
 
 from supabase import Client
@@ -108,7 +107,9 @@ async def materialize_and_score_job(
         "absolute_url": final_url,
         "score": 0,
         "score_breakdown": {},
-        "greenhouse_updated_at": datetime.now(UTC).isoformat(),
+        # No provider date for a manual add — NULL, so "Posted" falls back to
+        # cataloged_at instead of masquerading as posted-today (R2).
+        "source_posted_at": None,
         "salary_text": salary,
         **salary_columns(salary),
     }

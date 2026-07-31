@@ -41,7 +41,7 @@ async def fetch_board_jobs(board_token: str) -> list[StandardJob]:
                 # unescapes the entities into literal tag soup on the search
                 # cards (prod bug, 2026-07-26).
                 content=html.unescape(item.get("content", "")),
-                updated_at=item.get("updated_at", ""),
+                posted_at=item.get("updated_at", ""),
                 absolute_url=item.get("absolute_url", ""),
             )
         )

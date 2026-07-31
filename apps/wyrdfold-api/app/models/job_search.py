@@ -39,8 +39,8 @@ class JobSearchResult(BaseModel):
     # Link to the ORIGINAL posting (Greenhouse/Ashby/…). Public results point at
     # the source rather than republishing the full JD.
     absolute_url: str | None = None
-    first_seen_at: datetime | None = None
-    created_at: datetime | None = None
+    source_posted_at: datetime | None = None
+    cataloged_at: datetime | None = None
     # A short PLAINTEXT preview (NOT the full JD body) — populated only for the
     # PUBLIC surface, where a snippet helps a logged-out visitor judge the role.
     # Left ``None`` on the authed surface, which spares its hot path the extra

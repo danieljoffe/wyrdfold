@@ -7,11 +7,6 @@ export type Json =
   | Json[];
 
 export type Database = {
-  // Allows to automatically instantiate createClient with right options
-  // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
-  __InternalSupabase: {
-    PostgrestVersion: '14.5';
-  };
   graphql_public: {
     Tables: {
       [_ in never]: never;
@@ -51,7 +46,7 @@ export type Database = {
           recommendation: string;
           scorecard: Json;
           target_id: string;
-          user_id: string | null;
+          user_id: string;
         };
         Insert: {
           cost_usd?: number;
@@ -64,7 +59,7 @@ export type Database = {
           recommendation: string;
           scorecard: Json;
           target_id: string;
-          user_id?: string | null;
+          user_id: string;
         };
         Update: {
           cost_usd?: number;
@@ -77,7 +72,7 @@ export type Database = {
           recommendation?: string;
           scorecard?: Json;
           target_id?: string;
-          user_id?: string | null;
+          user_id?: string;
         };
         Relationships: [
           {
@@ -91,10 +86,35 @@ export type Database = {
             foreignKeyName: 'job_analyses_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'job_analyses_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
         ];
+      };
+      app_settings: {
+        Row: {
+          key: string;
+          updated_at: string;
+          value: string;
+        };
+        Insert: {
+          key: string;
+          updated_at?: string;
+          value: string;
+        };
+        Update: {
+          key?: string;
+          updated_at?: string;
+          value?: string;
+        };
+        Relationships: [];
       };
       batch_runs: {
         Row: {
@@ -106,7 +126,7 @@ export type Database = {
           status: string;
           total: number;
           updated_at: string;
-          user_id: string | null;
+          user_id: string;
         };
         Insert: {
           completed?: number;
@@ -117,7 +137,7 @@ export type Database = {
           status?: string;
           total: number;
           updated_at?: string;
-          user_id?: string | null;
+          user_id: string;
         };
         Update: {
           completed?: number;
@@ -128,9 +148,62 @@ export type Database = {
           status?: string;
           total?: number;
           updated_at?: string;
-          user_id?: string | null;
+          user_id?: string;
         };
         Relationships: [];
+      };
+      blocked_email_domains: {
+        Row: {
+          added_at: string;
+          domain: string;
+          reason: string;
+        };
+        Insert: {
+          added_at?: string;
+          domain: string;
+          reason?: string;
+        };
+        Update: {
+          added_at?: string;
+          domain?: string;
+          reason?: string;
+        };
+        Relationships: [];
+      };
+      contribution_votes: {
+        Row: {
+          created_at: string;
+          id: string;
+          reference_jd_id: string;
+          updated_at: string;
+          user_id: string;
+          value: number;
+        };
+        Insert: {
+          created_at?: string;
+          id?: string;
+          reference_jd_id: string;
+          updated_at?: string;
+          user_id: string;
+          value: number;
+        };
+        Update: {
+          created_at?: string;
+          id?: string;
+          reference_jd_id?: string;
+          updated_at?: string;
+          user_id?: string;
+          value?: number;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'contribution_votes_reference_jd_id_fkey';
+            columns: ['reference_jd_id'];
+            isOneToOne: false;
+            referencedRelation: 'reference_jds';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       document_versions: {
         Row: {
@@ -189,7 +262,7 @@ export type Database = {
           storage_path: string | null;
           style_settings: Json | null;
           updated_at: string | null;
-          user_id: string | null;
+          user_id: string;
           warnings: Json;
         };
         Insert: {
@@ -213,7 +286,7 @@ export type Database = {
           storage_path?: string | null;
           style_settings?: Json | null;
           updated_at?: string | null;
-          user_id?: string | null;
+          user_id: string;
           warnings?: Json;
         };
         Update: {
@@ -237,7 +310,7 @@ export type Database = {
           storage_path?: string | null;
           style_settings?: Json | null;
           updated_at?: string | null;
-          user_id?: string | null;
+          user_id?: string;
           warnings?: Json;
         };
         Relationships: [
@@ -309,7 +382,7 @@ export type Database = {
           role: string;
           skipped: boolean;
           turn_index: number;
-          user_id: string | null;
+          user_id: string;
         };
         Insert: {
           content: string;
@@ -321,7 +394,7 @@ export type Database = {
           role: string;
           skipped?: boolean;
           turn_index: number;
-          user_id?: string | null;
+          user_id: string;
         };
         Update: {
           content?: string;
@@ -333,7 +406,7 @@ export type Database = {
           role?: string;
           skipped?: boolean;
           turn_index?: number;
-          user_id?: string | null;
+          user_id?: string;
         };
         Relationships: [
           {
@@ -353,7 +426,7 @@ export type Database = {
           payload: Json;
           prose_doc_id: string | null;
           source: string;
-          user_id: string | null;
+          user_id: string;
           version: number;
         };
         Insert: {
@@ -363,7 +436,7 @@ export type Database = {
           payload: Json;
           prose_doc_id?: string | null;
           source?: string;
-          user_id?: string | null;
+          user_id: string;
           version: number;
         };
         Update: {
@@ -373,7 +446,7 @@ export type Database = {
           payload?: Json;
           prose_doc_id?: string | null;
           source?: string;
-          user_id?: string | null;
+          user_id?: string;
           version?: number;
         };
         Relationships: [
@@ -392,21 +465,21 @@ export type Database = {
           id: string;
           payload: Json;
           updated_at: string;
-          user_id: string | null;
+          user_id: string;
         };
         Insert: {
           created_at?: string;
           id?: string;
           payload?: Json;
           updated_at?: string;
-          user_id?: string | null;
+          user_id: string;
         };
         Update: {
           created_at?: string;
           id?: string;
           payload?: Json;
           updated_at?: string;
-          user_id?: string | null;
+          user_id?: string;
         };
         Relationships: [];
       };
@@ -415,24 +488,56 @@ export type Database = {
           content: string;
           created_at: string;
           id: string;
-          user_id: string | null;
+          user_id: string;
           version: number;
         };
         Insert: {
           content: string;
           created_at?: string;
           id?: string;
-          user_id?: string | null;
+          user_id: string;
           version: number;
         };
         Update: {
           content?: string;
           created_at?: string;
           id?: string;
-          user_id?: string | null;
+          user_id?: string;
           version?: number;
         };
         Relationships: [];
+      };
+      job_embeddings: {
+        Row: {
+          content_hash: string;
+          created_at: string;
+          embedding: unknown;
+          job_posting_id: string;
+          model: string;
+        };
+        Insert: {
+          content_hash: string;
+          created_at?: string;
+          embedding: unknown;
+          job_posting_id: string;
+          model: string;
+        };
+        Update: {
+          content_hash?: string;
+          created_at?: string;
+          embedding?: unknown;
+          job_posting_id?: string;
+          model?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'job_embeddings_job_posting_id_fkey';
+            columns: ['job_posting_id'];
+            isOneToOne: false;
+            referencedRelation: 'jobs';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       job_feedback: {
         Row: {
@@ -483,6 +588,13 @@ export type Database = {
             foreignKeyName: 'job_feedback_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'job_feedback_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
@@ -491,105 +603,124 @@ export type Database = {
       jobs: {
         Row: {
           absolute_url: string | null;
+          archived_at: string | null;
+          cataloged_at: string | null;
+          city: string | null;
           company_name: string;
-          created_at: string | null;
+          country: string | null;
           department: string | null;
           description_html: string | null;
+          employment_type: string | null;
           external_id: string;
-          first_seen_at: string | null;
-          greenhouse_updated_at: string | null;
           id: string;
+          is_genuine_role: boolean | null;
+          is_remote: boolean | null;
+          is_us: boolean | null;
           last_url_check_at: string | null;
-          llm_analysis_id: string | null;
-          llm_score: number | null;
           location: string | null;
+          location_remote: boolean | null;
+          metro: string | null;
+          purged_at: string | null;
+          qualified_at: string | null;
+          qualified_hash: string | null;
+          role_family: string | null;
+          salary_currency: string | null;
+          salary_max: number | null;
+          salary_min: number | null;
+          salary_period: string | null;
           salary_text: string | null;
-          score: number;
-          score_breakdown: Json | null;
+          seniority: string | null;
           source_id: string;
-          status: string;
-          target_id: string | null;
+          source_posted_at: string | null;
+          state: string | null;
           title: string;
           updated_at: string | null;
           url_check_failure_count: number;
           url_check_status: number | null;
-          url_validation_status: string | null;
-          url_validation_warnings: Json | null;
+          us_confidence: number | null;
         };
         Insert: {
           absolute_url?: string | null;
+          archived_at?: string | null;
+          cataloged_at?: string | null;
+          city?: string | null;
           company_name: string;
-          created_at?: string | null;
+          country?: string | null;
           department?: string | null;
           description_html?: string | null;
+          employment_type?: string | null;
           external_id: string;
-          first_seen_at?: string | null;
-          greenhouse_updated_at?: string | null;
           id?: string;
+          is_genuine_role?: boolean | null;
+          is_remote?: boolean | null;
+          is_us?: boolean | null;
           last_url_check_at?: string | null;
-          llm_analysis_id?: string | null;
-          llm_score?: number | null;
           location?: string | null;
+          location_remote?: boolean | null;
+          metro?: string | null;
+          purged_at?: string | null;
+          qualified_at?: string | null;
+          qualified_hash?: string | null;
+          role_family?: string | null;
+          salary_currency?: string | null;
+          salary_max?: number | null;
+          salary_min?: number | null;
+          salary_period?: string | null;
           salary_text?: string | null;
-          score?: number;
-          score_breakdown?: Json | null;
+          seniority?: string | null;
           source_id: string;
-          status?: string;
-          target_id?: string | null;
+          source_posted_at?: string | null;
+          state?: string | null;
           title: string;
           updated_at?: string | null;
           url_check_failure_count?: number;
           url_check_status?: number | null;
-          url_validation_status?: string | null;
-          url_validation_warnings?: Json | null;
+          us_confidence?: number | null;
         };
         Update: {
           absolute_url?: string | null;
+          archived_at?: string | null;
+          cataloged_at?: string | null;
+          city?: string | null;
           company_name?: string;
-          created_at?: string | null;
+          country?: string | null;
           department?: string | null;
           description_html?: string | null;
+          employment_type?: string | null;
           external_id?: string;
-          first_seen_at?: string | null;
-          greenhouse_updated_at?: string | null;
           id?: string;
+          is_genuine_role?: boolean | null;
+          is_remote?: boolean | null;
+          is_us?: boolean | null;
           last_url_check_at?: string | null;
-          llm_analysis_id?: string | null;
-          llm_score?: number | null;
           location?: string | null;
+          location_remote?: boolean | null;
+          metro?: string | null;
+          purged_at?: string | null;
+          qualified_at?: string | null;
+          qualified_hash?: string | null;
+          role_family?: string | null;
+          salary_currency?: string | null;
+          salary_max?: number | null;
+          salary_min?: number | null;
+          salary_period?: string | null;
           salary_text?: string | null;
-          score?: number;
-          score_breakdown?: Json | null;
+          seniority?: string | null;
           source_id?: string;
-          status?: string;
-          target_id?: string | null;
+          source_posted_at?: string | null;
+          state?: string | null;
           title?: string;
           updated_at?: string | null;
           url_check_failure_count?: number;
           url_check_status?: number | null;
-          url_validation_status?: string | null;
-          url_validation_warnings?: Json | null;
+          us_confidence?: number | null;
         };
         Relationships: [
-          {
-            foreignKeyName: 'job_postings_llm_analysis_id_fkey';
-            columns: ['llm_analysis_id'];
-            isOneToOne: false;
-            referencedRelation: 'analyses';
-            referencedColumns: ['id'];
-          },
           {
             foreignKeyName: 'job_postings_source_id_fkey';
             columns: ['source_id'];
             isOneToOne: false;
             referencedRelation: 'sources';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'job_postings_target_id_fkey';
-            columns: ['target_id'];
-            isOneToOne: false;
-            referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
         ];
@@ -607,7 +738,7 @@ export type Database = {
           model: string;
           output_tokens: number;
           purpose: string;
-          user_id: string | null;
+          user_id: string;
         };
         Insert: {
           cache_creation_input_tokens?: number;
@@ -621,7 +752,7 @@ export type Database = {
           model: string;
           output_tokens?: number;
           purpose: string;
-          user_id?: string | null;
+          user_id: string;
         };
         Update: {
           cache_creation_input_tokens?: number;
@@ -635,7 +766,7 @@ export type Database = {
           model?: string;
           output_tokens?: number;
           purpose?: string;
-          user_id?: string | null;
+          user_id?: string;
         };
         Relationships: [];
       };
@@ -684,6 +815,64 @@ export type Database = {
           },
         ];
       };
+      prescan_shadow: {
+        Row: {
+          cosine: number | null;
+          cosine_admit: boolean | null;
+          id: string;
+          job_posting_id: string;
+          keyword_admit: boolean | null;
+          keyword_score: number | null;
+          observed_at: string;
+          target_id: string;
+          threshold: number | null;
+        };
+        Insert: {
+          cosine?: number | null;
+          cosine_admit?: boolean | null;
+          id?: string;
+          job_posting_id: string;
+          keyword_admit?: boolean | null;
+          keyword_score?: number | null;
+          observed_at?: string;
+          target_id: string;
+          threshold?: number | null;
+        };
+        Update: {
+          cosine?: number | null;
+          cosine_admit?: boolean | null;
+          id?: string;
+          job_posting_id?: string;
+          keyword_admit?: boolean | null;
+          keyword_score?: number | null;
+          observed_at?: string;
+          target_id?: string;
+          threshold?: number | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'prescan_shadow_job_posting_id_fkey';
+            columns: ['job_posting_id'];
+            isOneToOne: false;
+            referencedRelation: 'jobs';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'prescan_shadow_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'prescan_shadow_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
+            referencedRelation: 'targets';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       reference_jds: {
         Row: {
           created_at: string | null;
@@ -691,7 +880,9 @@ export type Database = {
           id: string;
           jd_text: string;
           jd_url: string | null;
+          suppressed: boolean;
           target_id: string;
+          user_id: string | null;
         };
         Insert: {
           created_at?: string | null;
@@ -699,7 +890,9 @@ export type Database = {
           id?: string;
           jd_text: string;
           jd_url?: string | null;
+          suppressed?: boolean;
           target_id: string;
+          user_id?: string | null;
         };
         Update: {
           created_at?: string | null;
@@ -707,9 +900,18 @@ export type Database = {
           id?: string;
           jd_text?: string;
           jd_url?: string | null;
+          suppressed?: boolean;
           target_id?: string;
+          user_id?: string | null;
         };
         Relationships: [
+          {
+            foreignKeyName: 'target_reference_jds_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
           {
             foreignKeyName: 'target_reference_jds_target_id_fkey';
             columns: ['target_id'];
@@ -719,6 +921,24 @@ export type Database = {
           },
         ];
       };
+      scheduler_runs: {
+        Row: {
+          job_id: string;
+          last_run_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          job_id: string;
+          last_run_at: string;
+          updated_at?: string;
+        };
+        Update: {
+          job_id?: string;
+          last_run_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
       scores: {
         Row: {
           axis_scores: Json | null;
@@ -726,9 +946,12 @@ export type Database = {
           excluded: boolean;
           fit_reasoning: string | null;
           id: string;
+          is_graded: boolean | null;
+          job_first_seen_at: string | null;
+          job_is_live: boolean | null;
           job_posting_id: string;
+          job_role_family: string | null;
           logistics_filters: Json | null;
-          matched_keywords: string[] | null;
           phase1_confidence: number | null;
           promising: boolean | null;
           recency_score: number | null;
@@ -745,9 +968,12 @@ export type Database = {
           excluded?: boolean;
           fit_reasoning?: string | null;
           id?: string;
+          is_graded?: boolean | null;
+          job_first_seen_at?: string | null;
+          job_is_live?: boolean | null;
           job_posting_id: string;
+          job_role_family?: string | null;
           logistics_filters?: Json | null;
-          matched_keywords?: string[] | null;
           phase1_confidence?: number | null;
           promising?: boolean | null;
           recency_score?: number | null;
@@ -764,9 +990,12 @@ export type Database = {
           excluded?: boolean;
           fit_reasoning?: string | null;
           id?: string;
+          is_graded?: boolean | null;
+          job_first_seen_at?: string | null;
+          job_is_live?: boolean | null;
           job_posting_id?: string;
+          job_role_family?: string | null;
           logistics_filters?: Json | null;
-          matched_keywords?: string[] | null;
           phase1_confidence?: number | null;
           promising?: boolean | null;
           recency_score?: number | null;
@@ -789,10 +1018,59 @@ export type Database = {
             foreignKeyName: 'job_target_scores_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'job_target_scores_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
         ];
+      };
+      search_events: {
+        Row: {
+          event_type: string;
+          has_more: boolean | null;
+          id: number;
+          job_posting_id: string | null;
+          location: string | null;
+          occurred_at: string;
+          page_offset: number | null;
+          posted_within_days: number | null;
+          query: string | null;
+          result_count: number | null;
+          surface: string;
+        };
+        Insert: {
+          event_type: string;
+          has_more?: boolean | null;
+          id?: never;
+          job_posting_id?: string | null;
+          location?: string | null;
+          occurred_at?: string;
+          page_offset?: number | null;
+          posted_within_days?: number | null;
+          query?: string | null;
+          result_count?: number | null;
+          surface: string;
+        };
+        Update: {
+          event_type?: string;
+          has_more?: boolean | null;
+          id?: never;
+          job_posting_id?: string | null;
+          location?: string | null;
+          occurred_at?: string;
+          page_offset?: number | null;
+          posted_within_days?: number | null;
+          query?: string | null;
+          result_count?: number | null;
+          surface?: string;
+        };
+        Relationships: [];
       };
       source_discoveries: {
         Row: {
@@ -839,7 +1117,40 @@ export type Database = {
             foreignKeyName: 'source_discoveries_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'source_discoveries_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      source_registrations: {
+        Row: {
+          created_at: string;
+          source_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          source_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          source_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'source_ownerships_source_id_fkey';
+            columns: ['source_id'];
+            isOneToOne: false;
+            referencedRelation: 'sources';
             referencedColumns: ['id'];
           },
         ];
@@ -850,10 +1161,13 @@ export type Database = {
           company_name: string;
           consecutive_failures: number;
           created_at: string | null;
+          disabled_at: string | null;
           enabled: boolean | null;
           id: string;
           job_count: number | null;
           last_candidate_at: string | null;
+          last_error: string | null;
+          last_error_at: string | null;
           last_polled_at: string | null;
           poll_interval_minutes: number;
           provider: string;
@@ -863,10 +1177,13 @@ export type Database = {
           company_name: string;
           consecutive_failures?: number;
           created_at?: string | null;
+          disabled_at?: string | null;
           enabled?: boolean | null;
           id?: string;
           job_count?: number | null;
           last_candidate_at?: string | null;
+          last_error?: string | null;
+          last_error_at?: string | null;
           last_polled_at?: string | null;
           poll_interval_minutes?: number;
           provider?: string;
@@ -876,10 +1193,13 @@ export type Database = {
           company_name?: string;
           consecutive_failures?: number;
           created_at?: string | null;
+          disabled_at?: string | null;
           enabled?: boolean | null;
           id?: string;
           job_count?: number | null;
           last_candidate_at?: string | null;
+          last_error?: string | null;
+          last_error_at?: string | null;
           last_polled_at?: string | null;
           poll_interval_minutes?: number;
           provider?: string;
@@ -894,6 +1214,7 @@ export type Database = {
           note: string | null;
           old_status: string | null;
           posting_id: string;
+          user_id: string;
         };
         Insert: {
           created_at?: string | null;
@@ -902,6 +1223,7 @@ export type Database = {
           note?: string | null;
           old_status?: string | null;
           posting_id: string;
+          user_id: string;
         };
         Update: {
           created_at?: string | null;
@@ -910,6 +1232,7 @@ export type Database = {
           note?: string | null;
           old_status?: string | null;
           posting_id?: string;
+          user_id?: string;
         };
         Relationships: [
           {
@@ -958,8 +1281,11 @@ export type Database = {
           created_at: string;
           diff: Json;
           id: string;
+          kind: string;
+          merge_payload: Json | null;
           next_profile: Json;
           prev_profile: Json;
+          projection: Json | null;
           rationale: string | null;
           signals_consumed: number;
           status: string;
@@ -973,8 +1299,11 @@ export type Database = {
           created_at?: string;
           diff: Json;
           id?: string;
+          kind?: string;
+          merge_payload?: Json | null;
           next_profile: Json;
           prev_profile: Json;
+          projection?: Json | null;
           rationale?: string | null;
           signals_consumed?: number;
           status: string;
@@ -988,8 +1317,11 @@ export type Database = {
           created_at?: string;
           diff?: Json;
           id?: string;
+          kind?: string;
+          merge_payload?: Json | null;
           next_profile?: Json;
           prev_profile?: Json;
+          projection?: Json | null;
           rationale?: string | null;
           signals_consumed?: number;
           status?: string;
@@ -1002,6 +1334,13 @@ export type Database = {
             foreignKeyName: 'target_learning_log_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'target_learning_log_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
@@ -1010,16 +1349,19 @@ export type Database = {
       targets: {
         Row: {
           activation_status: string;
+          app_active: boolean;
           created_at: string | null;
           description: string | null;
           domain_hints: string[] | null;
+          embedding: unknown;
+          embedding_text_hash: string | null;
           example_promising_titles: string[];
           example_unpromising_titles: string[];
           id: string;
-          app_active: boolean;
           label: string;
           normalized_label: string | null;
           profile_version: number;
+          role_family: string | null;
           scoring_profile: Json;
           search_keywords: Json | null;
           seniority_hint: string | null;
@@ -1027,16 +1369,19 @@ export type Database = {
         };
         Insert: {
           activation_status?: string;
+          app_active?: boolean;
           created_at?: string | null;
           description?: string | null;
           domain_hints?: string[] | null;
+          embedding?: unknown;
+          embedding_text_hash?: string | null;
           example_promising_titles?: string[];
           example_unpromising_titles?: string[];
           id?: string;
-          app_active?: boolean;
           label: string;
           normalized_label?: string | null;
           profile_version?: number;
+          role_family?: string | null;
           scoring_profile?: Json;
           search_keywords?: Json | null;
           seniority_hint?: string | null;
@@ -1044,16 +1389,19 @@ export type Database = {
         };
         Update: {
           activation_status?: string;
+          app_active?: boolean;
           created_at?: string | null;
           description?: string | null;
           domain_hints?: string[] | null;
+          embedding?: unknown;
+          embedding_text_hash?: string | null;
           example_promising_titles?: string[];
           example_unpromising_titles?: string[];
           id?: string;
-          app_active?: boolean;
           label?: string;
           normalized_label?: string | null;
           profile_version?: number;
+          role_family?: string | null;
           scoring_profile?: Json;
           search_keywords?: Json | null;
           seniority_hint?: string | null;
@@ -1072,7 +1420,7 @@ export type Database = {
           page_count: number | null;
           prose_doc_id: string | null;
           storage_path: string;
-          user_id: string | null;
+          user_id: string;
           warnings: Json;
         };
         Insert: {
@@ -1085,7 +1433,7 @@ export type Database = {
           page_count?: number | null;
           prose_doc_id?: string | null;
           storage_path: string;
-          user_id?: string | null;
+          user_id: string;
           warnings?: Json;
         };
         Update: {
@@ -1098,7 +1446,7 @@ export type Database = {
           page_count?: number | null;
           prose_doc_id?: string | null;
           storage_path?: string;
-          user_id?: string | null;
+          user_id?: string;
           warnings?: Json;
         };
         Relationships: [
@@ -1107,6 +1455,71 @@ export type Database = {
             columns: ['prose_doc_id'];
             isOneToOne: false;
             referencedRelation: 'experience_prose_docs';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      user_api_keys: {
+        Row: {
+          ciphertext: string;
+          created_at: string;
+          id: string;
+          last4: string | null;
+          provider: string;
+          rotated_at: string | null;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          ciphertext: string;
+          created_at?: string;
+          id?: string;
+          last4?: string | null;
+          provider: string;
+          rotated_at?: string | null;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          ciphertext?: string;
+          created_at?: string;
+          id?: string;
+          last4?: string | null;
+          provider?: string;
+          rotated_at?: string | null;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
+      user_jobs: {
+        Row: {
+          created_at: string;
+          job_posting_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          job_posting_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          job_posting_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'user_jobs_job_posting_id_fkey';
+            columns: ['job_posting_id'];
+            isOneToOne: false;
+            referencedRelation: 'jobs';
             referencedColumns: ['id'];
           },
         ];
@@ -1130,13 +1543,15 @@ export type Database = {
           onboarding_current_step: string | null;
           onboarding_path: string | null;
           phone_number: string | null;
+          plan: string;
           resume_style_settings: Json | null;
           sms_daily_limit: number;
           sms_notifications_enabled: boolean;
           sms_score_threshold: number;
+          stripe_customer_id: string | null;
           unsubscribed_at: string | null;
           updated_at: string;
-          user_id: string | null;
+          user_id: string;
           website_url: string | null;
         };
         Insert: {
@@ -1157,13 +1572,15 @@ export type Database = {
           onboarding_current_step?: string | null;
           onboarding_path?: string | null;
           phone_number?: string | null;
+          plan?: string;
           resume_style_settings?: Json | null;
           sms_daily_limit?: number;
           sms_notifications_enabled?: boolean;
           sms_score_threshold?: number;
+          stripe_customer_id?: string | null;
           unsubscribed_at?: string | null;
           updated_at?: string;
-          user_id?: string | null;
+          user_id: string;
           website_url?: string | null;
         };
         Update: {
@@ -1184,13 +1601,15 @@ export type Database = {
           onboarding_current_step?: string | null;
           onboarding_path?: string | null;
           phone_number?: string | null;
+          plan?: string;
           resume_style_settings?: Json | null;
           sms_daily_limit?: number;
           sms_notifications_enabled?: boolean;
           sms_score_threshold?: number;
+          stripe_customer_id?: string | null;
           unsubscribed_at?: string | null;
           updated_at?: string;
-          user_id?: string | null;
+          user_id?: string;
           website_url?: string | null;
         };
         Relationships: [];
@@ -1202,9 +1621,19 @@ export type Database = {
           axis_weights_previous: Json | null;
           created_at: string;
           fit_score: number | null;
+          fit_score_prose_doc_id: string | null;
           fit_score_reasoning: string | null;
           id: string;
           is_active: boolean;
+          job_score_threshold: number | null;
+          pref_employment_types: string[] | null;
+          pref_include_unknown_salary: boolean | null;
+          pref_locations: string[] | null;
+          pref_remote_ok: boolean | null;
+          pref_score_cutoff: number | null;
+          pref_seniority_max: string | null;
+          pref_seniority_min: string | null;
+          sms_score_threshold: number | null;
           target_id: string;
           updated_at: string;
           user_id: string;
@@ -1215,9 +1644,19 @@ export type Database = {
           axis_weights_previous?: Json | null;
           created_at?: string;
           fit_score?: number | null;
+          fit_score_prose_doc_id?: string | null;
           fit_score_reasoning?: string | null;
           id?: string;
           is_active?: boolean;
+          job_score_threshold?: number | null;
+          pref_employment_types?: string[] | null;
+          pref_include_unknown_salary?: boolean | null;
+          pref_locations?: string[] | null;
+          pref_remote_ok?: boolean | null;
+          pref_score_cutoff?: number | null;
+          pref_seniority_max?: string | null;
+          pref_seniority_min?: string | null;
+          sms_score_threshold?: number | null;
           target_id: string;
           updated_at?: string;
           user_id: string;
@@ -1228,9 +1667,19 @@ export type Database = {
           axis_weights_previous?: Json | null;
           created_at?: string;
           fit_score?: number | null;
+          fit_score_prose_doc_id?: string | null;
           fit_score_reasoning?: string | null;
           id?: string;
           is_active?: boolean;
+          job_score_threshold?: number | null;
+          pref_employment_types?: string[] | null;
+          pref_include_unknown_salary?: boolean | null;
+          pref_locations?: string[] | null;
+          pref_remote_ok?: boolean | null;
+          pref_score_cutoff?: number | null;
+          pref_seniority_max?: string | null;
+          pref_seniority_min?: string | null;
+          sms_score_threshold?: number | null;
           target_id?: string;
           updated_at?: string;
           user_id?: string;
@@ -1240,10 +1689,38 @@ export type Database = {
             foreignKeyName: 'user_targets_target_id_fkey';
             columns: ['target_id'];
             isOneToOne: false;
+            referencedRelation: 'target_funnel';
+            referencedColumns: ['target_id'];
+          },
+          {
+            foreignKeyName: 'user_targets_target_id_fkey';
+            columns: ['target_id'];
+            isOneToOne: false;
             referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
         ];
+      };
+      waitlist_signups: {
+        Row: {
+          created_at: string;
+          email: string;
+          id: string;
+          invited_at: string | null;
+        };
+        Insert: {
+          created_at?: string;
+          email: string;
+          id?: string;
+          invited_at?: string | null;
+        };
+        Update: {
+          created_at?: string;
+          email?: string;
+          id?: string;
+          invited_at?: string | null;
+        };
+        Relationships: [];
       };
       wyrdfold_beta_invites: {
         Row: {
@@ -1265,46 +1742,250 @@ export type Database = {
       };
     };
     Views: {
-      [_ in never]: never;
+      target_funnel: {
+        Row: {
+          app_active: boolean | null;
+          domain: string | null;
+          ge30: number | null;
+          ge50: number | null;
+          ge75: number | null;
+          graded: number | null;
+          max_score: number | null;
+          phase2: number | null;
+          pipeline_active: boolean | null;
+          promising: number | null;
+          target_id: string | null;
+        };
+        Relationships: [];
+      };
     };
     Functions: {
+      advisory_lock_info: {
+        Args: never;
+        Returns: {
+          application_name: string;
+          backend_start: string;
+          granted: boolean;
+          lock_key: number;
+          pid: number;
+        }[];
+      };
+      apply_target_profile_merge: {
+        Args: {
+          p_example_promising?: string[];
+          p_example_unpromising?: string[];
+          p_expected_version: number;
+          p_next_profile: Json;
+          p_search_keywords?: Json;
+          p_target_id: string;
+          p_user_id: string;
+        };
+        Returns: {
+          new_version: number;
+          outcome: string;
+        }[];
+      };
+      apply_target_profile_patch: {
+        Args: {
+          p_expected_version: number;
+          p_next_profile: Json;
+          p_target_id: string;
+          p_user_id: string;
+        };
+        Returns: {
+          new_version: number;
+          outcome: string;
+        }[];
+      };
+      archive_jobs_by_ids: { Args: { p_ids: Json }; Returns: number };
       bulk_update_recency_scores: {
         Args: { p_updates: Json };
         Returns: number;
       };
       bulk_update_salaries: { Args: { p_updates: Json }; Returns: number };
-      bulk_update_scores: { Args: { p_updates: Json }; Returns: number };
-      get_target_jobs: {
+      bulk_update_url_health: { Args: { p_updates: Json }; Returns: number };
+      cost_by_purpose_since: {
+        Args: { p_since: string; p_user_id: string };
+        Returns: Json;
+      };
+      due_url_health_jobs: {
+        Args: { p_batch_size: number; p_cutoff: string };
+        Returns: {
+          absolute_url: string;
+          id: string;
+          url_check_failure_count: number;
+        }[];
+      };
+      get_cross_target_jobs: {
         Args: {
           p_ascending?: boolean;
           p_company?: string;
           p_limit?: number;
           p_min_score?: number;
           p_offset?: number;
+          p_recency_decay?: boolean;
           p_search?: string;
           p_sort?: string;
           p_status?: string;
-          p_target_id: string;
+          p_target_ids: string[];
+          p_user_id?: string;
+          p_weights?: Json;
         };
         Returns: {
           absolute_url: string;
+          cataloged_at: string;
+          city: string;
           company_name: string;
-          created_at: string;
+          country: string;
           department: string;
+          employment_type: string;
           external_id: string;
-          first_seen_at: string;
-          greenhouse_updated_at: string;
           id: string;
+          is_remote: boolean;
           location: string;
+          location_remote: boolean;
+          logistics_filters: Json;
+          metro: string;
+          pending: boolean;
+          raw_score: number;
+          salary_currency: string;
+          salary_max: number;
+          salary_min: number;
+          salary_period: string;
           salary_text: string;
           score: number;
           score_breakdown: Json;
           scoring_status: string;
+          seniority: string;
           source_id: string;
+          source_posted_at: string;
+          state: string;
           status: string;
           title: string;
-          total_count: number;
         }[];
+      };
+      get_jobs_by_ids: {
+        Args: { p_ids: Json };
+        Returns: {
+          absolute_url: string | null;
+          archived_at: string | null;
+          cataloged_at: string | null;
+          city: string | null;
+          company_name: string;
+          country: string | null;
+          department: string | null;
+          description_html: string | null;
+          employment_type: string | null;
+          external_id: string;
+          id: string;
+          is_genuine_role: boolean | null;
+          is_remote: boolean | null;
+          is_us: boolean | null;
+          last_url_check_at: string | null;
+          location: string | null;
+          location_remote: boolean | null;
+          metro: string | null;
+          purged_at: string | null;
+          qualified_at: string | null;
+          qualified_hash: string | null;
+          role_family: string | null;
+          salary_currency: string | null;
+          salary_max: number | null;
+          salary_min: number | null;
+          salary_period: string | null;
+          salary_text: string | null;
+          seniority: string | null;
+          source_id: string;
+          source_posted_at: string | null;
+          state: string | null;
+          title: string;
+          updated_at: string | null;
+          url_check_failure_count: number;
+          url_check_status: number | null;
+          us_confidence: number | null;
+        }[];
+        SetofOptions: {
+          from: '*';
+          to: 'jobs';
+          isOneToOne: false;
+          isSetofReturn: true;
+        };
+      };
+      get_target_jobs: {
+        Args: {
+          p_after_id?: string;
+          p_after_value?: string;
+          p_ascending?: boolean;
+          p_company?: string;
+          p_limit?: number;
+          p_min_score?: number;
+          p_search?: string;
+          p_sort?: string;
+          p_status?: string;
+          p_target_id: string;
+          p_user_id?: string;
+        };
+        Returns: {
+          absolute_url: string;
+          cataloged_at: string;
+          city: string;
+          company_name: string;
+          country: string;
+          department: string;
+          employment_type: string;
+          external_id: string;
+          id: string;
+          is_remote: boolean;
+          location: string;
+          location_remote: boolean;
+          logistics_filters: Json;
+          metro: string;
+          salary_currency: string;
+          salary_max: number;
+          salary_min: number;
+          salary_period: string;
+          salary_text: string;
+          score: number;
+          score_breakdown: Json;
+          scoring_status: string;
+          seniority: string;
+          source_id: string;
+          source_posted_at: string;
+          state: string;
+          status: string;
+          title: string;
+        }[];
+      };
+      get_target_scores_by_ids: {
+        Args: { p_ids: Json; p_target_id: string };
+        Returns: {
+          axis_scores: Json | null;
+          created_at: string;
+          excluded: boolean;
+          fit_reasoning: string | null;
+          id: string;
+          is_graded: boolean | null;
+          job_first_seen_at: string | null;
+          job_is_live: boolean | null;
+          job_posting_id: string;
+          job_role_family: string | null;
+          logistics_filters: Json | null;
+          phase1_confidence: number | null;
+          promising: boolean | null;
+          recency_score: number | null;
+          score: number;
+          score_breakdown: Json | null;
+          scored_profile_version: number;
+          scoring_status: string;
+          target_id: string;
+          updated_at: string;
+        }[];
+        SetofOptions: {
+          from: '*';
+          to: 'scores';
+          isOneToOne: false;
+          isSetofReturn: true;
+        };
       };
       hook_restrict_wyrdfold_beta: { Args: { event: Json }; Returns: Json };
       insert_source_if_not_exists: {
@@ -1315,20 +1996,39 @@ export type Database = {
         };
         Returns: boolean;
       };
+      insights_pipeline_status_counts: {
+        Args: {
+          p_since: string;
+          p_target_ids: string[];
+          p_until: string;
+          p_user_id?: string;
+        };
+        Returns: {
+          count: number;
+          status: string;
+        }[];
+      };
+      insights_targets_groupby: {
+        Args: { p_since: string; p_target_ids: string[]; p_user_id?: string };
+        Returns: Json;
+      };
       match_target_by_label: {
         Args: { query_label: string; threshold?: number };
         Returns: {
           activation_status: string;
+          app_active: boolean;
           created_at: string | null;
           description: string | null;
           domain_hints: string[] | null;
+          embedding: unknown;
+          embedding_text_hash: string | null;
           example_promising_titles: string[];
           example_unpromising_titles: string[];
           id: string;
-          app_active: boolean;
           label: string;
           normalized_label: string | null;
           profile_version: number;
+          role_family: string | null;
           scoring_profile: Json;
           search_keywords: Json | null;
           seniority_hint: string | null;
@@ -1341,12 +2041,108 @@ export type Database = {
           isSetofReturn: true;
         };
       };
+      pipeline_counts: {
+        Args: {
+          p_min_score: number;
+          p_target_ids: string[];
+          p_user_id?: string;
+        };
+        Returns: {
+          count: number;
+          status: string;
+        }[];
+      };
+      recompute_contribution_suppression: {
+        Args: { p_quorum: number; p_reference_jd_id: string };
+        Returns: {
+          changed: boolean;
+          suppressed: boolean;
+        }[];
+      };
+      register_source_from_url: {
+        Args: {
+          p_board_token: string;
+          p_cap: number;
+          p_company_name: string;
+          p_provider: string;
+          p_user_id: string;
+        };
+        Returns: string;
+      };
+      release_poll_advisory_lock: { Args: { p_key: number }; Returns: boolean };
+      source_live_unengaged_jobs: {
+        Args: { p_source_id: string };
+        Returns: {
+          company_name: string;
+          external_id: string;
+          id: string;
+          title: string;
+        }[];
+      };
       spend_by_purpose_since: {
         Args: { p_since: string; p_user_id: string };
         Returns: Json;
       };
+      total_billable_spend_since: {
+        Args: {
+          p_excluded_purposes: string[];
+          p_since: string;
+          p_user_id: string;
+        };
+        Returns: number;
+      };
+      total_spend_all_since: { Args: { p_since: string }; Returns: number };
       total_spend_since: {
         Args: { p_since: string; p_user_id: string };
+        Returns: number;
+      };
+      try_poll_advisory_lock: { Args: { p_key: number }; Returns: boolean };
+      user_apply_score_blend: {
+        Args: {
+          p_analysis_id: string;
+          p_job_posting_id: string;
+          p_score: number;
+          p_target_id: string;
+        };
+        Returns: undefined;
+      };
+      user_set_scores_included: {
+        Args: { p_job_posting_id: string; p_target_ids: string[] };
+        Returns: undefined;
+      };
+      user_upsert_score: {
+        Args: { p_row: Json };
+        Returns: {
+          axis_scores: Json | null;
+          created_at: string;
+          excluded: boolean;
+          fit_reasoning: string | null;
+          id: string;
+          is_graded: boolean | null;
+          job_first_seen_at: string | null;
+          job_is_live: boolean | null;
+          job_posting_id: string;
+          job_role_family: string | null;
+          logistics_filters: Json | null;
+          phase1_confidence: number | null;
+          promising: boolean | null;
+          recency_score: number | null;
+          score: number;
+          score_breakdown: Json | null;
+          scored_profile_version: number;
+          scoring_status: string;
+          target_id: string;
+          updated_at: string;
+        }[];
+        SetofOptions: {
+          from: '*';
+          to: 'scores';
+          isOneToOne: false;
+          isSetofReturn: true;
+        };
+      };
+      wyrdfold_display_score: {
+        Args: { p_axis_scores: Json; p_raw_score: number; p_weights: Json };
         Returns: number;
       };
     };

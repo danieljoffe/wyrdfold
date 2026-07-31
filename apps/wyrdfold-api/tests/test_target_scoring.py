@@ -639,7 +639,7 @@ def test_list_jobs_with_target_overlays_target_score(
                 "score": 50,
                 "score_breakdown": None,
                 "status": "new",
-                "first_seen_at": None,
+                "cataloged_at": None,
                 "created_at": "2026-04-26T00:00:00Z",
             }
         ]

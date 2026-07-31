@@ -78,7 +78,7 @@ export default function ListingDetailBody({
   const meta = [job.company_name, locationDisplay].filter(Boolean).join(' · ');
   const chips: string[] = [
     job.salary_text || 'Salary not listed',
-    `Posted ${timeAgo(job.created_at)}`,
+    `Posted ${timeAgo(job.source_posted_at ?? job.cataloged_at)}`,
     ...(locationDisplay ? [locationDisplay] : []),
   ];
 

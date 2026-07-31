@@ -36,7 +36,7 @@ async def fetch_ashby_jobs(slug: str) -> list[StandardJob]:
                 location_name=item.get("location"),
                 department=item.get("department"),
                 content=item.get("descriptionHtml", ""),
-                updated_at=item.get("publishedAt", ""),
+                posted_at=item.get("publishedAt", ""),
                 absolute_url=item.get("jobUrl", ""),
             )
         )

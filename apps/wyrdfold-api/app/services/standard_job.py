@@ -10,6 +10,8 @@ class StandardJob:
     location_name: str | None
     department: str | None
     content: str
-    updated_at: str
+    # The provider's best posted/created/updated date (raw string; the
+    # poller normalizes via normalize_posted_at into jobs.source_posted_at).
+    posted_at: str
     absolute_url: str
     salary_text: str | None = None
