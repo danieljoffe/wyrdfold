@@ -82,11 +82,11 @@ _USER = "u1"
 class TestComputePipeline:
     def test_basic_funnel_counts(self):
         postings = [
-            {"id": "1", "status": "new", "created_at": _ts(_NOW)},
-            {"id": "2", "status": "new", "created_at": _ts(_NOW)},
-            {"id": "3", "status": "applied", "created_at": _ts(_NOW)},
-            {"id": "4", "status": "interviewing", "created_at": _ts(_NOW)},
-            {"id": "5", "status": "offer", "created_at": _ts(_NOW)},
+            {"id": "1", "status": "new", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "new", "cataloged_at": _ts(_NOW)},
+            {"id": "3", "status": "applied", "cataloged_at": _ts(_NOW)},
+            {"id": "4", "status": "interviewing", "cataloged_at": _ts(_NOW)},
+            {"id": "5", "status": "offer", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
         result = compute_pipeline(sb, since=None, user_id=_USER)
@@ -103,10 +103,10 @@ class TestComputePipeline:
 
     def test_response_rate(self):
         postings = [
-            {"id": "1", "status": "applied", "created_at": _ts(_NOW)},
-            {"id": "2", "status": "applied", "created_at": _ts(_NOW)},
-            {"id": "3", "status": "interviewing", "created_at": _ts(_NOW)},
-            {"id": "4", "status": "offer", "created_at": _ts(_NOW)},
+            {"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "applied", "cataloged_at": _ts(_NOW)},
+            {"id": "3", "status": "interviewing", "cataloged_at": _ts(_NOW)},
+            {"id": "4", "status": "offer", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
         result = compute_pipeline(sb, since=None, user_id=_USER)
@@ -129,7 +129,7 @@ class TestComputePipeline:
                 "created_at": _ts(_NOW - timedelta(days=4)),
             },
         ]
-        postings = [{"id": "1", "status": "interviewing", "created_at": _ts(_NOW)}]
+        postings = [{"id": "1", "status": "interviewing", "cataloged_at": _ts(_NOW)}]
         sb = _mock_supabase({"jobs": postings, "status_log": logs})
         result = compute_pipeline(sb, since=None)
 
@@ -199,8 +199,8 @@ class TestComputePipeline:
         # same row set. We're asserting that a prior_window triggers the
         # second aggregation pass — not the math, which is covered above.
         postings = [
-            {"id": "1", "status": "applied", "created_at": _ts(_NOW)},
-            {"id": "2", "status": "interviewing", "created_at": _ts(_NOW)},
+            {"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "interviewing", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
         prior_until = _NOW - timedelta(days=30)
@@ -295,7 +295,7 @@ def _rpc_status_counts(seed: dict[str, list[dict]], params: dict) -> list[dict]:
         job = jobs_by_id.get(s["job_posting_id"])
         if job is None:
             continue
-        created = job.get("created_at")
+        created = job.get("cataloged_at")
         if since is not None and not (created is not None and created >= since):
             continue
         if until is not None and not (created is not None and created < until):
@@ -354,7 +354,7 @@ def _reference_status_counts(
         job = jobs_by_id.get(pid)
         if job is None:
             continue
-        created = job.get("created_at")
+        created = job.get("cataloged_at")
         if since_iso is not None and not (created is not None and created >= since_iso):
             continue
         if until_iso is not None and not (created is not None and created < until_iso):
@@ -372,14 +372,14 @@ class TestPipelineGroupByRpcByteIdentical:
         recent = _ts(_NOW)
         old = _ts(_NOW - timedelta(days=120))
         jobs = [
-            {"id": "p1", "created_at": recent},  # new (no user_jobs)
-            {"id": "p2", "created_at": recent},  # saved
-            {"id": "p3", "created_at": recent},  # applied
-            {"id": "p4", "created_at": recent},  # interviewing
-            {"id": "p5", "created_at": recent},  # offer
-            {"id": "p6", "created_at": recent},  # scored vs both targets → once
-            {"id": "p7", "created_at": old},  # outside the 30d window
-            {"id": "p8", "created_at": recent},  # only an excluded score → drop
+            {"id": "p1", "cataloged_at": recent},  # new (no user_jobs)
+            {"id": "p2", "cataloged_at": recent},  # saved
+            {"id": "p3", "cataloged_at": recent},  # applied
+            {"id": "p4", "cataloged_at": recent},  # interviewing
+            {"id": "p5", "cataloged_at": recent},  # offer
+            {"id": "p6", "cataloged_at": recent},  # scored vs both targets → once
+            {"id": "p7", "cataloged_at": old},  # outside the 30d window
+            {"id": "p8", "cataloged_at": recent},  # only an excluded score → drop
         ]
         scores = [
             {"job_posting_id": "p1", "target_id": "t1", "excluded": False},
@@ -465,7 +465,7 @@ class TestPipelineGroupByRpcByteIdentical:
             if s["target_id"] in targets and not s["excluded"]
         }
         jobs_by_id = {j["id"]: j for j in seed["jobs"]}
-        win_pids = {pid for pid in member if jobs_by_id[pid]["created_at"] >= since.isoformat()}
+        win_pids = {pid for pid in member if jobs_by_id[pid]["cataloged_at"] >= since.isoformat()}
         ref_logs = _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
         ref_current = _kpis_from(ref_counts, ref_logs)
 
@@ -558,88 +558,31 @@ class TestPipelineGroupByRpcByteIdentical:
 
 
 class TestComputeTargets:
-    def test_basic_target_comparison(self):
-        targets = [
-            {"id": "t1", "label": "Frontend"},
-            {"id": "t2", "label": "Backend"},
-        ]
+    # --- Post-R2 degraded contract (2026-07-31) -------------------------
+    # The global/admin path (target_ids=None) used to read the inline
+    # ``jobs.target_id`` / ``jobs.score`` columns; both were DROPPED in R2
+    # (vestigial/NULL in prod). The path now returns a well-formed but
+    # hollow shape: every posting counts as unscored, no per-target
+    # comparisons, empty trend. These pin exactly that, so a future reader
+    # knows the hollowness is deliberate — resurrect via the scores table
+    # if the admin view is ever needed for real.
+
+    def test_admin_path_counts_everything_unscored(self):
         postings = [
-            {
-                "id": "1",
-                "target_id": "t1",
-                "score": 80,
-                "status": "applied",
-                "created_at": _ts(_NOW),
-            },
-            {"id": "2", "target_id": "t1", "score": 60, "status": "new", "created_at": _ts(_NOW)},
-            {
-                "id": "3",
-                "target_id": "t2",
-                "score": 90,
-                "status": "interviewing",
-                "created_at": _ts(_NOW),
-            },
+            {"id": "1", "status": "new", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "new", "cataloged_at": _ts(_NOW)},
         ]
-        sb = _mock_supabase(
-            {"targets": targets, "jobs": postings, "user_jobs": _user_jobs(postings)}
-        )
-        result = compute_targets(sb, since=None, user_id=_USER)
-
-        assert len(result.targets) == 2
-        fe = next(t for t in result.targets if t.target_label == "Frontend")
-        assert fe.job_count == 2
-        assert fe.avg_score == 70.0
-        assert fe.applied_count == 1
-
-        be = next(t for t in result.targets if t.target_label == "Backend")
-        assert be.job_count == 1
-        assert be.avg_score == 90.0
-
-    def test_targets_with_no_jobs_are_filtered_out(self):
-        targets = [
-            {"id": "t1", "label": "Frontend"},
-            {"id": "t2", "label": "Backend"},
-            {"id": "t3", "label": "DevOps"},  # no postings — should be dropped
-        ]
-        postings = [
-            {"id": "1", "target_id": "t1", "score": 80, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "2", "target_id": "t2", "score": 70, "status": "new", "created_at": _ts(_NOW)},
-        ]
-        sb = _mock_supabase({"targets": targets, "jobs": postings})
+        sb = _mock_supabase({"targets": [{"id": "t1", "label": "Frontend"}], "jobs": postings})
         result = compute_targets(sb, since=None)
-
-        labels = {t.target_label for t in result.targets}
-        assert labels == {"Frontend", "Backend"}
-        assert "DevOps" not in labels
-
-    def test_unscored_postings_excluded_from_distribution(self):
-        """Postings with score=None bump unscored_count, not the 0-10 bucket."""
-        postings = [
-            {"id": "1", "target_id": None, "score": None, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "2", "target_id": None, "score": None, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "3", "target_id": None, "score": 5, "status": "new", "created_at": _ts(_NOW)},
-        ]
-        sb = _mock_supabase({"jobs": postings})
-        result = compute_targets(sb, since=None)
-
         assert result.unscored_count == 2
-        bucket_map = {b.bucket: b.count for b in result.score_distribution}
-        # Only the score=5 row contributes to 0-10
-        assert bucket_map["0-10"] == 1
+        assert result.targets == []
 
-    def test_score_distribution(self):
-        postings = [
-            {"id": "1", "target_id": None, "score": 15, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "2", "target_id": None, "score": 85, "status": "new", "created_at": _ts(_NOW)},
-            {"id": "3", "target_id": None, "score": 85, "status": "new", "created_at": _ts(_NOW)},
-        ]
-        sb = _mock_supabase({"jobs": postings})
+    def test_admin_path_shape_is_well_formed(self):
+        postings = [{"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)}]
+        sb = _mock_supabase({"targets": [], "jobs": postings})
         result = compute_targets(sb, since=None)
-
-        bucket_map = {b.bucket: b.count for b in result.score_distribution}
-        assert bucket_map["10-20"] == 1
-        assert bucket_map["80-90"] == 2
-        assert bucket_map["0-10"] == 0
+        assert len(result.score_distribution) == 10
+        assert result.score_trend == []
 
     def test_empty_targets(self):
         sb = _mock_supabase({})
@@ -650,19 +593,26 @@ class TestComputeTargets:
         assert result.score_trend == []
         assert result.unscored_count == 0
 
-    def test_score_trend(self):
-        postings = [
-            {"id": "1", "target_id": None, "score": 60, "status": "new", "created_at": _ts(_NOW)},
-            {
-                "id": "2",
-                "target_id": None,
-                "score": 80,
-                "status": "new",
-                "created_at": _ts(_NOW - timedelta(days=8)),
-            },
+    def test_score_trend_per_user_from_scores(self):
+        """Per-user trend comes from the scores table joined to jobs
+        cataloged_at (the inline jobs.score column is gone post-R2)."""
+        scores = [
+            {"job_posting_id": "1", "target_id": "t1", "score": 60},
+            {"job_posting_id": "2", "target_id": "t1", "score": 80},
         ]
-        sb = _mock_supabase({"jobs": postings})
-        result = compute_targets(sb, since=None)
+        postings = [
+            {"id": "1", "status": "new", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "new", "cataloged_at": _ts(_NOW - timedelta(days=8))},
+        ]
+        sb = _mock_supabase(
+            {
+                "targets": [{"id": "t1", "label": "Frontend"}],
+                "scores": scores,
+                "jobs": postings,
+                "user_jobs": [],
+            }
+        )
+        result = compute_targets(sb, since=None, target_ids={"t1"}, user_id=_USER)
 
         # At least 1 week bucket
         assert len(result.score_trend) >= 1
@@ -725,9 +675,9 @@ class TestComputeTargets:
         # reality (the poller writes both into ``scores``, not back
         # onto ``jobs``).
         postings = [
-            {"id": "1", "status": "applied", "created_at": _ts(_NOW)},
-            {"id": "2", "status": "new", "created_at": _ts(_NOW)},
-            {"id": "3", "status": "interviewing", "created_at": _ts(_NOW)},
+            {"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)},
+            {"id": "2", "status": "new", "cataloged_at": _ts(_NOW)},
+            {"id": "3", "status": "interviewing", "cataloged_at": _ts(_NOW)},
         ]
         scores = [
             {"job_posting_id": "1", "target_id": "t1", "score": 80},
@@ -801,7 +751,7 @@ def _rpc_targets_groupby(seed: dict[str, list[dict]], params: dict) -> dict:
         job = jobs_by_id.get(s["job_posting_id"])
         if job is None:
             continue
-        created = job.get("created_at")
+        created = job.get("cataloged_at")
         if since is not None and not (created is not None and created >= since):
             continue
         member.append(
@@ -944,7 +894,7 @@ def _reference_target_insights(
         job = jobs_by_id.get(pid)
         if job is None:
             continue
-        created = job.get("created_at")
+        created = job.get("cataloged_at")
         if since_iso is not None and not (created is not None and created >= since_iso):
             continue
         postings.append(job)
@@ -1020,7 +970,7 @@ def _reference_target_insights(
         best = max((score_lookup.get((pid, t), 0) for t in tids), default=0)
         if best <= 0:
             continue
-        d = datetime.fromisoformat(p["created_at"]).date()
+        d = datetime.fromisoformat(p["cataloged_at"]).date()
         week = d - timedelta(days=d.weekday())
         week_scores.setdefault(week, []).append(best)
     score_trend = sorted(
@@ -1051,14 +1001,14 @@ class TestTargetsGroupByRpcByteIdentical:
         last_week = _ts(_NOW - timedelta(days=8))
         old = _ts(_NOW - timedelta(days=120))
         jobs = [
-            {"id": "p1", "created_at": recent},  # t1 score 15
-            {"id": "p2", "created_at": recent},  # t1 score 85, applied
-            {"id": "p3", "created_at": recent},  # t2 score 90, interviewing
-            {"id": "p4", "created_at": recent},  # t1=40 t2=80 (best 80), offer
-            {"id": "p5", "created_at": recent},  # t1 score 0 → unscored
-            {"id": "p6", "created_at": last_week},  # t2 score 60, new
-            {"id": "p7", "created_at": old},  # out of window → dropped
-            {"id": "p8", "created_at": recent},  # only excluded score → drop
+            {"id": "p1", "cataloged_at": recent},  # t1 score 15
+            {"id": "p2", "cataloged_at": recent},  # t1 score 85, applied
+            {"id": "p3", "cataloged_at": recent},  # t2 score 90, interviewing
+            {"id": "p4", "cataloged_at": recent},  # t1=40 t2=80 (best 80), offer
+            {"id": "p5", "cataloged_at": recent},  # t1 score 0 → unscored
+            {"id": "p6", "cataloged_at": last_week},  # t2 score 60, new
+            {"id": "p7", "cataloged_at": old},  # out of window → dropped
+            {"id": "p8", "cataloged_at": recent},  # only excluded score → drop
         ]
         scores = [
             {"job_posting_id": "p1", "target_id": "t1", "score": 15, "excluded": False},
@@ -1164,10 +1114,10 @@ class TestTargetsGroupByRpcByteIdentical:
         recent = _ts(_NOW)
         seed = {
             "jobs": [
-                {"id": "p1", "created_at": recent},
-                {"id": "p2", "created_at": recent},
-                {"id": "p3", "created_at": recent},
-                {"id": "p4", "created_at": recent},
+                {"id": "p1", "cataloged_at": recent},
+                {"id": "p2", "cataloged_at": recent},
+                {"id": "p3", "cataloged_at": recent},
+                {"id": "p4", "cataloged_at": recent},
             ],
             "scores": [
                 {"job_posting_id": "p1", "target_id": "t1", "score": 1, "excluded": False},
@@ -1551,7 +1501,7 @@ class TestComputeChunksLargeIdLists:
         n = 250
         targets = [{"id": "t1", "label": "Frontend"}]
         scores = [{"job_posting_id": f"p{i}", "target_id": "t1", "score": 50} for i in range(n)]
-        postings = [{"id": f"p{i}", "created_at": _ts(_NOW)} for i in range(n)]
+        postings = [{"id": f"p{i}", "cataloged_at": _ts(_NOW)} for i in range(n)]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
             {

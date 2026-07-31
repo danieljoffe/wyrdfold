@@ -298,11 +298,11 @@ def _pipeline_status_counts_python(
         return Counter()
 
     def _base() -> Any:
-        q = supabase.table("jobs").select("id, created_at")
+        q = supabase.table("jobs").select("id, cataloged_at")
         if since:
-            q = q.gte("created_at", since.isoformat())
+            q = q.gte("cataloged_at", since.isoformat())
         if until:
-            q = q.lt("created_at", until.isoformat())
+            q = q.lt("cataloged_at", until.isoformat())
         return q
 
     if posting_ids is not None:
@@ -583,11 +583,11 @@ def _targets_groupby_python(
     ``_assemble_target_insights`` — guaranteeing the RPC and fallback produce
     byte-identical output (the rounding all happens downstream, in Python)."""
 
-    # Postings within the window, hydrated with created_at + per-user status.
+    # Postings within the window, hydrated with cataloged_at + per-user status.
     def _postings_base() -> Any:
-        q = supabase.table("jobs").select("id, created_at")
+        q = supabase.table("jobs").select("id, cataloged_at")
         if since:
-            q = q.gte("created_at", since.isoformat())
+            q = q.gte("cataloged_at", since.isoformat())
         return q
 
     if posting_ids:
@@ -675,7 +675,7 @@ def _targets_groupby_python(
         best = max((score_lookup.get((pid, t), 0) for t in tids), default=0)
         if best <= 0:
             continue
-        w = _iso_week_start(_parse_dt(p["created_at"]))
+        w = _iso_week_start(_parse_dt(p["cataloged_at"]))
         week_sum[w] += best
         week_n[w] += 1
     trend = [(w, week_sum[w], week_n[w]) for w in week_sum]
@@ -854,15 +854,15 @@ def compute_targets(
         return _assemble_target_insights(target_labels, agg)
 
     # --- Global / admin path (target_ids is None — tests only) ---
-    # Read the legacy inline ``target_id`` + ``score`` columns straight off
-    # the postings row (``jobs.target_id`` is vestigial / NULL in production,
-    # so this path mainly surfaces the unscored count + score distribution
-    # from the inline ``score`` column). This path stays in Python — it's the
-    # unbounded admin view, not the per-user hot path the RPC optimizes.
+    # The legacy inline ``jobs.target_id`` / ``jobs.score`` columns this path
+    # once read were DROPPED in R2 (they were vestigial/NULL in production).
+    # The path now degrades coherently: every posting counts as unscored and
+    # the per-target comparison stays empty — it remains only so the api-key
+    # global view returns a well-formed (if hollow) shape instead of a 400.
     def _postings_base() -> Any:
-        q = supabase.table("jobs").select("id, target_id, score, created_at")
+        q = supabase.table("jobs").select("id, cataloged_at")
         if since:
-            q = q.gte("created_at", since.isoformat())
+            q = q.gte("cataloged_at", since.isoformat())
         return q
 
     postings = _rows(_postings_base(), label="insights/targets_postings")
@@ -937,7 +937,7 @@ def compute_targets(
         inline = p.get("score")
         if inline is None:
             continue
-        week_scores[_iso_week_start(_parse_dt(p["created_at"]))].append(int(inline))
+        week_scores[_iso_week_start(_parse_dt(p["cataloged_at"]))].append(int(inline))
 
     score_trend = sorted(
         [
