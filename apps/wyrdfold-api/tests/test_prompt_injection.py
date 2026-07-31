@@ -145,7 +145,7 @@ def _target() -> JobTarget:
             negative=NegativeProfile(keywords=["junior"], weight=-10.0),
         ),
         search_keywords=["frontend engineer"],
-        is_active=True,
+        app_active=True,
         example_promising_titles=["Senior Frontend Engineer"],
         example_unpromising_titles=["Backend Engineer"],
         created_at=datetime.now(UTC),

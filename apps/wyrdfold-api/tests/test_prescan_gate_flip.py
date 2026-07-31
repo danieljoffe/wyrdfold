@@ -32,7 +32,7 @@ def _target(target_id: str = "tgt-1") -> JobTarget:
         id=target_id,
         label="Staff Frontend Engineer",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

@@ -44,7 +44,9 @@ test.beforeAll(async () => {
   const { error: targetErr } = await admin.from('targets').upsert({
     id: TARGET_ID,
     label: 'e2e-tabs-target',
-    is_active: true,
+    // P0 re-semantics: no flag on the shared row — the ACTIVE MEMBERSHIP
+    // below is what makes this target pipeline-active (app_active is the
+    // instance-sponsorship floor, not a user-target concept).
     activation_status: 'ready',
     scoring_profile: {},
   });

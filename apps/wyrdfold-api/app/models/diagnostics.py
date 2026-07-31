@@ -19,7 +19,7 @@ class FunnelNomenclature(BaseModel):
     target_id: str
     label: str
     normalized_label: str | None
-    is_active: bool
+    app_active: bool
     activation_status: str
     profile_version: int
     seniority_hint: str | None

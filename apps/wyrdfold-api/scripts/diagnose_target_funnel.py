@@ -72,7 +72,7 @@ def _print_report(report: Any) -> None:
 
     print(f"\n# Nomenclature  ({n.target_id})")
     print(f"  label:          {n.label!r}")
-    print(f"  is_active:      {n.is_active}  status={n.activation_status}  v{n.profile_version}")
+    print(f"  app_active:     {n.app_active}  status={n.activation_status}  v{n.profile_version}")
     print(f"  seniority_hint: {n.seniority_hint!r}")
     print(f"  domain_hints:   {n.domain_hints}")
     print(f"  example_promising_titles  ({len(n.example_promising_titles)}):")

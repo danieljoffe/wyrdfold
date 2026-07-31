@@ -39,7 +39,7 @@ def _target(
     *,
     target_id: str = "target-1",
     core: dict[str, int] | None = None,
-    is_active: bool = True,
+    app_active: bool = True,
 ) -> JobTarget:
     cats: dict[str, CategoryProfile] = {}
     if core is not None:
@@ -53,7 +53,7 @@ def _target(
             domain=DomainProfile(signals=["fintech"], weight=0.5),
             negative=NegativeProfile(keywords=["junior"], weight=-10.0),
         ),
-        is_active=is_active,
+        app_active=app_active,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -448,15 +448,19 @@ def test_bulk_score_for_target_handles_no_stale_jobs() -> None:
     assert count == 0
 
 
-def test_bulk_score_for_target_skips_inactive_target() -> None:
-    """Inactive targets short-circuit before any DB read.
+def test_bulk_score_for_target_skips_inactive_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-pipeline-active targets short-circuit before any DB read.
 
-    ``targets.is_active=False`` means no user currently has this target
-    enabled (the trigger off ``user_targets`` ORs across users). Re-scoring
-    would just burn LLM/CPU on rows nobody will see in the list view.
+    Pipeline-active = ``app_active`` (instance floor) OR any active
+    membership — the derived predicate (``crud.is_pipeline_active``, P0
+    re-semantics). When neither arm holds, re-scoring would just burn
+    LLM/CPU on rows nobody will see in the list view.
     """
+    monkeypatch.setattr(
+        "app.services.targets.crud.is_pipeline_active", lambda sb, tid: False
+    )
     supabase = MagicMock()
-    target = _target(core={"React": 3}, is_active=False)
+    target = _target(core={"React": 3}, app_active=False)
 
     count = bulk_score_for_target(supabase, target)
 

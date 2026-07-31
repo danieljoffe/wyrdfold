@@ -30,6 +30,7 @@ from app.services.db_write import poll_db_read, poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
 from app.services.scoring import score_job_with_profile, score_title_against_profile
 from app.services.supabase_retry import execute_with_retry_sync
+from app.services.targets import crud
 
 logger = logging.getLogger(__name__)
 
@@ -429,18 +430,19 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
     ``profile_version`` (lazy re-scoring). Used by the re-score endpoint
     when a target's profile changes.
 
-    Skips inactive targets entirely. The ``targets.is_active`` flag is
-    the OR across all users via the user_targets trigger; if it's
-    ``False`` nobody currently has this target enabled, so the
-    re-score would just burn LLM/CPU on rows nobody will see.
+    Skips non-pipeline-active targets entirely. Pipeline-active =
+    ``app_active`` (instance floor) OR any active membership — the
+    derived predicate from ``crud.is_pipeline_active`` (the
+    trigger-cached flag is gone, schema audit P0). If neither arm holds,
+    the re-score would just burn LLM/CPU on rows nobody will see.
 
     Streams the stale rows page-by-page (peak memory O(page), not
     O(catalog)) — see the loop below for why each iteration re-reads the
     first page (audit #29).
     """
-    if not target.is_active:
+    if not crud.is_pipeline_active(supabase, target.id):
         logger.info(
-            "bulk_score_for_target: skipping inactive target %s (%s)",
+            "bulk_score_for_target: skipping non-pipeline-active target %s (%s)",
             target.id,
             target.label,
         )

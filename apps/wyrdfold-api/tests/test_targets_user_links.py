@@ -2,7 +2,7 @@
 
 Covers:
   1. set_user_target_inactive deactivates via user_targets (so the trigger
-     can sync targets.is_active).
+     fed the old targets.is_active trigger; the flag is now the derived pipeline predicate).
   2. FitScoreResult tolerates reasoning strings up to 1500 chars (the LLM
      occasionally exceeds the original 500 cap, which caused 502s).
 """

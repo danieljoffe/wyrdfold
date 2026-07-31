@@ -157,16 +157,15 @@ async def main() -> None:
         )
 
     # ---- 3. ADMISSION -------------------------------------------------
-    targets = cast(
-        list[dict[str, Any]],
-        supabase.table("targets")
-        .select("label, role_family")
-        .eq("is_active", True)
-        .execute()
-        .data
-        or [],
-    )
-    logger.info("== 3. ADMISSION (active targets — titles must prematch these to ingest) ==")
+    # Pipeline-active = app_active floor OR any active membership — the same
+    # derived predicate the poller iterates (crud.get_active, P0 2026-07-31).
+    from app.services.targets.crud import get_active as get_pipeline_active_targets
+
+    targets = [
+        {"label": t.label, "role_family": t.role_family}
+        for t in get_pipeline_active_targets(supabase)
+    ]
+    logger.info("== 3. ADMISSION (pipeline-active targets — titles must prematch these to ingest) ==")
     if not targets:
         logger.info("  NONE — nothing can ingest (free gates drop everything)")
     for t in targets:

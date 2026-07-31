@@ -46,7 +46,7 @@ def _target() -> JobTarget:
         id=_TARGET,
         label="Role",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         profile_version=3,
         created_at=now,
         updated_at=now,

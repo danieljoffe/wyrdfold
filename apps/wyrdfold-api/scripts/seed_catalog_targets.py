@@ -9,10 +9,12 @@ on the instance key).
 
 Per label: exact ``normalized_label`` find-or-create (``crud.create``), then
 the SAME derive-persist mapping as the user flow (``derive_manual_target_bg``)
-via ``derive_profile_from_label`` + ``crud.update``, then ``is_active=True``.
-Catalog rows get NO ``user_targets`` links — so the ``trg_sync_target_active``
-trigger never touches them, Phase-2/alerts never run for them, and per-user
-surfaces are unaffected.
+via ``derive_profile_from_label`` + ``crud.update``, then ``app_active=True``
+— the standing instance-sponsorship floor (schema audit P0, 2026-07-31).
+``app_active`` is never written by user actions, so catalog rows stay in the
+pipeline no matter what memberships come and go; Phase-2/alerts still never
+run for them (both key off active *memberships*), and per-user surfaces are
+unaffected.
 
 HARD GUARD — never adopt a user's row: if a label resolves (by exact
 normalized label) to a target that has ANY ``user_targets`` links, it is
@@ -94,7 +96,7 @@ async def _seed_one(supabase: Client, llm: Any, label: str, *, execute: bool) ->
                 links,
             )
             return "skipped_user_row"
-        if existing.is_active and existing.role_family is not None:
+        if existing.app_active and existing.role_family is not None:
             logger.info("  OK   %r — already an active catalog row (%s)", label, existing.id[:8])
             return "already_active"
 
@@ -131,11 +133,11 @@ async def _seed_one(supabase: Client, llm: Any, label: str, *, execute: bool) ->
                 domain_hints=derived.domain_hints or None,
                 role_family=derived.role_family,
                 activation_status="idle",
-                is_active=True,
+                app_active=True,
             ),
         )
     else:
-        updated = crud.update(supabase, target.id, TargetUpdate(is_active=True))
+        updated = crud.update(supabase, target.id, TargetUpdate(app_active=True))
 
     if updated is None:
         logger.error("  FAIL %r — update returned no row (%s)", label, target.id[:8])
