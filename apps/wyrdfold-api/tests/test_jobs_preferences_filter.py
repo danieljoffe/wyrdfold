@@ -7,9 +7,10 @@ must guarantee:
 1. The score cutoff filters out low-scoring jobs (folded into ``min_score``,
    server-side, so it's always enforceable — ``scores.score`` always exists).
 2. Rows whose backing firewall tag is NULL/absent are KEPT (lenient) — the
-   job-side tag columns (employment_type / seniority / metro / is_remote) are
-   added by a separate, un-backfilled firewall PR, so the filters must be inert
-   until then.
+   tagger does not backfill, so unknown means keep. (Historical note: until
+   the R2 release the tag columns were never SELECTED at all, so the filters
+   silently passed everything — the "starved tags" finding, schema audit
+   2026-07-30. ``test_jp_select_serves_the_firewall_tags`` pins the wiring.)
 3. The employment-type / seniority / location filters DO drop jobs once a
    concrete tag value is present.
 """
@@ -489,3 +490,14 @@ def test_integration_employment_type_filter_drops_known_mismatch() -> None:
 
     assert {p["id"] for p in result["postings"]} == {"ft", "unk"}
     assert result["total"] == 2  # post-filter count, contract dropped
+
+
+def test_jp_select_serves_the_firewall_tags() -> None:
+    """The starved-tags regression pin (schema audit Group B addendum): the
+    preference filters only work if the tag columns actually ARRIVE. Keep all
+    four in the list/detail projections — removing one silently reverts its
+    filter to pass-everything (the failure mode that went unnoticed for a
+    year, because lenient-on-absence looks identical to no-filter)."""
+    for col in ("employment_type", "seniority", "metro", "is_remote"):
+        assert col in jobs_mod._JP_SELECT_COLS
+        assert col in jobs_mod._JP_DETAIL_SELECT_COLS

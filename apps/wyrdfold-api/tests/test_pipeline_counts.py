@@ -130,7 +130,7 @@ def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -
 def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
     import app.routers.jobs as jobs_mod
 
-    monkeypatch.setattr(jobs_mod, "get_user_target_ids", lambda _sb, _uid: {"t1"})
+    monkeypatch.setattr(jobs_mod, "get_active_target_ids", lambda _sb, _uid: {"t1"})
     monkeypatch.setattr(jobs_mod, "_default_min_score_for_user", lambda _sb, _uid: None)
     monkeypatch.setattr(
         jobs_mod,
@@ -161,7 +161,7 @@ def test_endpoint_no_targets_short_circuits() -> None:
     import app.routers.jobs as jobs_mod
 
     sb = MagicMock()
-    with patch.object(jobs_mod, "get_user_target_ids", return_value=set()):
+    with patch.object(jobs_mod, "get_active_target_ids", return_value=set()):
         counts = pipeline_counts(supabase=sb, user_id="u-none")
     assert all(v == 0 for v in counts.values())
     sb.rpc.assert_not_called()
@@ -174,7 +174,7 @@ def test_endpoint_caches_per_user() -> None:
 
     grouped = MagicMock(return_value={"new": 2})
     with (
-        patch.object(jobs_mod, "get_user_target_ids", return_value={"t1"}),
+        patch.object(jobs_mod, "get_active_target_ids", return_value={"t1"}),
         patch.object(jobs_mod, "_default_min_score_for_user", return_value=None),
         patch.object(jobs_mod, "_pipeline_counts_grouped", grouped),
     ):

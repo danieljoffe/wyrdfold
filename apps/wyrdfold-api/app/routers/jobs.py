@@ -63,8 +63,8 @@ from app.services.targets.crud import get as get_target
 from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.crud import (
     get_active_for_user,
+    get_active_target_ids,
     get_user_target,
-    get_user_target_ids,
     list_user_targets,
     preferences_from_user_target,
 )
@@ -113,6 +113,10 @@ _JP_SELECT_COLS = (
     "city, state, country, location_remote, department, "
     "absolute_url, score, score_breakdown, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "
+    # Firewall tag columns (#524 tagger): serving them is what makes the
+    # per-target preference filters real — they were written-but-never-
+    # selected for a year ("starved tags", schema audit Group B addendum).
+    "employment_type, seniority, metro, is_remote, "
     "greenhouse_updated_at, first_seen_at, created_at"
 )
 
@@ -1531,12 +1535,14 @@ def _apply_logistics_filter(
 #
 # Score cutoff is pushed into ``min_score`` (server-side, exact, keeps
 # pagination correct). The remaining filters (employment_type / seniority /
-# location-via-metro-or-text) are POST-FETCH, mirroring how the location chip
-# already works — they read the job's firewall tag columns when present and are
-# LENIENT on absence: the tag columns (employment_type / seniority / metro /
-# is_remote) are added by a separate firewall PR and are not backfilled, so a
-# missing-or-NULL tag means "unknown" and the job is KEPT. This makes the
-# filters inert until the firewall lands without coupling this PR to it.
+# location-via-metro-or-text) are POST-FETCH and read the job's firewall tag
+# columns. The tags are SERVED as of the R2 release (added to
+# ``_JP_SELECT_COLS`` here; to the list RPCs in the R2 migration) — before
+# that they were written by the tagger but never selected, so these filters
+# silently passed everything ("starved tags", schema audit 2026-07-30).
+# Still LENIENT on absence: the tagger doesn't backfill, so a missing/NULL
+# tag means "unknown" and the job is KEPT — only a KNOWN tag outside the
+# preference drops it.
 
 
 def _job_tag(posting: dict[str, Any], column: str) -> str | None:
@@ -1793,12 +1799,14 @@ def list_jobs(
     if cached is not None:
         return cached
 
-    # JWT callers see only postings whose target_id is in their user_targets.
-    # The api-key path (cron/poller) bypasses scoping — it operates on the
+    # JWT callers see only postings from their ACTIVE memberships — pausing
+    # a target removes its jobs from the list (Group D decision, 2026-07-30;
+    # the link itself and all authz/dedup surfaces stay any-status). The
+    # api-key path (cron/poller) bypasses scoping — it operates on the
     # whole table by design (e.g. backfill, rescore-all, cost rollup).
     user_target_ids: set[str] | None = None
     if user_id is not None:
-        user_target_ids = get_user_target_ids(supabase, user_id)
+        user_target_ids = get_active_target_ids(supabase, user_id)
         if not user_target_ids:
             empty: dict[str, Any] = {
                 "postings": [],
@@ -2126,7 +2134,8 @@ def pipeline_counts(
         return cached
 
     counts: dict[str, int] = dict.fromkeys(_JOB_STATUSES, 0)
-    target_ids = get_user_target_ids(supabase, user_id)
+    # ACTIVE memberships only — the tab counts must match the list scope.
+    target_ids = get_active_target_ids(supabase, user_id)
     if target_ids:
         min_score = _default_min_score_for_user(supabase, user_id)
         grouped = _pipeline_counts_grouped(
