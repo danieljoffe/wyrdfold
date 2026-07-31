@@ -82,7 +82,7 @@ async def main() -> None:
     rows = cast(
         list[dict[str, Any]],
         supabase.table("targets")
-        .select("id, label, is_active")
+        .select("id, label, app_active")
         .is_("role_family", "null")
         .execute()
         .data
@@ -90,7 +90,7 @@ async def main() -> None:
     )
     logger.info("targets with role_family NULL: %d", len(rows))
     for r in rows:
-        logger.info("  %s  active=%s  %s", cast(str, r["id"])[:8], r.get("is_active"), r.get("label"))
+        logger.info("  %s  app_active=%s  %s", cast(str, r["id"])[:8], r.get("app_active"), r.get("label"))
     if not rows:
         return
     if not args.execute:

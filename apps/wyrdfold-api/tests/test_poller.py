@@ -30,7 +30,7 @@ def _make_target(core_keywords: dict[str, int]) -> JobTarget:
             seniority=SeniorityProfile(signals=["senior", "staff", "lead"]),
         ),
         search_keywords=[],
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -187,7 +187,7 @@ def _search_kw_target(search_keywords: list[str], core: dict[str, int]) -> JobTa
             seniority=SeniorityProfile(signals=["senior", "staff", "lead"]),
         ),
         search_keywords=search_keywords,
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -325,7 +325,7 @@ def _target_with_keywords(
             seniority=SeniorityProfile(signals=["director", "head of"]),
         ),
         search_keywords=search_keywords,
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -376,7 +376,7 @@ def test_and_semantics_admits_excluded_for_audit():
 # ---- poll_sources_for_target: inactive-target guard -----------------------
 
 
-def _full_target(*, is_active: bool, search_keywords: list[str]) -> JobTarget:
+def _full_target(*, app_active: bool, search_keywords: list[str]) -> JobTarget:
     """Build a target with a real search_keywords list so the inactive
     guard is exercised in isolation from the 'empty keywords' guard.
     """
@@ -390,27 +390,32 @@ def _full_target(*, is_active: bool, search_keywords: list[str]) -> JobTarget:
             seniority=SeniorityProfile(signals=["staff"]),
         ),
         search_keywords=search_keywords,
-        is_active=is_active,
+        app_active=app_active,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
 
 
-def test_poll_sources_for_target_skips_inactive_target() -> None:
-    """Inactive targets short-circuit before any sources query.
+def test_poll_sources_for_target_skips_inactive_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-pipeline-active targets short-circuit before any sources query.
 
-    ``targets.is_active=False`` means no user currently has the target
-    enabled (trigger OR across user_targets). Fanning out a per-target
-    poll across every ATS source for a target nobody will see is pure
-    waste — return an empty PollResult immediately.
+    Pipeline-active = ``app_active`` floor OR any active membership,
+    checked live via ``crud.is_pipeline_active`` (P0 re-semantics — the
+    trigger-cached flag is gone). Fanning out a per-target poll across
+    every ATS source for a target nobody will see is pure waste —
+    return an empty PollResult immediately.
     """
     import asyncio
     from unittest.mock import MagicMock
 
+    import app.services.poller as poller_mod
     from app.services.poller import poll_sources_for_target
 
+    monkeypatch.setattr(poller_mod, "target_is_pipeline_active", lambda sb, tid: False)
     supabase = MagicMock()
-    target = _full_target(is_active=False, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=False, search_keywords=["frontend engineer"])
 
     result = asyncio.run(poll_sources_for_target(supabase, target))
 
@@ -1093,7 +1098,7 @@ async def test_targeted_triage_only_sees_free_gate_survivors(monkeypatch):
             _job("k3", "Staff Frontend Engineer", "Remote"),  # survivor
         ]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
@@ -1145,7 +1150,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     async def fetch(_token: str) -> list[StandardJob]:
         return [_job("k3", "Staff Frontend Engineer", "Remote")]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     doc = MagicMock()
     doc.payload = {"profile": "stub"}
 
@@ -1484,7 +1489,7 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
         MagicMock(send_alerts_for_new_jobs=AsyncMock(), send_sms_alerts_for_new_jobs=AsyncMock()),
     )
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer", "react"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer", "react"])
     sync_client = _SyncClientForbidden()
 
     summary = await poller_mod._poll_one_source(
@@ -1820,7 +1825,7 @@ async def test_targeted_poll_ingests_fail_open_when_payer_over_budget(monkeypatc
     async def fetch(_token: str) -> list[StandardJob]:
         return [_job("k3", "Staff Frontend Engineer", "Remote")]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
 
     summary = await poller_mod._poll_one_source_for_target(
@@ -1864,7 +1869,7 @@ async def test_targeted_poll_known_job_bypasses_triage_and_refreshes(monkeypatch
             _job("k-new", "Senior Frontend Engineer", "Remote"),
         ]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     # The one candidate (the NEW title) is rejected via a REAL LLM result —
     # a None result means a failed call, whose candidates defer un-attempted.
     ok = LLMResult(
@@ -2166,7 +2171,7 @@ async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
 
     supabase, _jobs_table, _user_targets = _make_targeted_poll_supabase()
     fake_triage = _rejecting_triage()
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
 
     async def fetch(_token: str) -> list[StandardJob]:
         return [_job("k3", "Staff Frontend Engineer", "Remote")]

@@ -65,7 +65,7 @@ def _target() -> JobTarget:
             domain=DomainProfile(signals=["saas", "consumer"], weight=0.5),
             negative=NegativeProfile(keywords=["junior", "intern"], weight=-10.0),
         ),
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )

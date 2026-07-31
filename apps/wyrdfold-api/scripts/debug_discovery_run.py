@@ -38,7 +38,7 @@ async def _run(target_id: str) -> None:
 
     print("\n# target")
     print(f"  id:            {target.id}")
-    print(f"  is_active:     {target.is_active}")
+    print(f"  app_active:    {target.app_active}")
     kws = target.search_keywords or []
     print(f"  search_keywords ({len(kws)}): {kws[:20]}")
 

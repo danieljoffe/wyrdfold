@@ -84,7 +84,7 @@ def _job_target() -> Any:
         label="Senior Frontend Engineer",
         description="Lead FE engineer at consumer-facing companies",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )

@@ -301,7 +301,10 @@ export default function TargetDetail({ id }: TargetDetailProps) {
           {target.label}
         </Heading>
 
-        {target.is_active && (
+        {/* The caller's OWN membership state — mirrors TargetCard. (Was the
+            shared catalog flag pre-P0; that now means "instance-sponsored",
+            which is not what a user's "Active" badge should say.) */}
+        {userTarget?.is_active && (
           <Badge variant='brand-solid' size='sm'>
             Active
           </Badge>

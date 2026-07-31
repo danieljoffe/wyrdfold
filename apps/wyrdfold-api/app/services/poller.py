@@ -89,6 +89,7 @@ from app.services.target_scoring import (
     score_title_and_upsert_poll as target_title_score_and_upsert,
 )
 from app.services.targets.crud import get_active as get_active_target
+from app.services.targets.crud import is_pipeline_active as target_is_pipeline_active
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
@@ -3488,16 +3489,16 @@ async def _poll_one_source_for_target(
 async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollResult:
     """Poll all enabled sources, filtering for jobs matching a target's search keywords.
 
-    Skips inactive targets entirely (returns an empty ``PollResult``).
-    The ``targets.is_active`` flag is the OR across all users via the
-    user_targets trigger; if it's ``False`` no one currently has the
-    target enabled, so a per-target poll would fan out work nobody
-    will see. The /activate endpoint sets ``is_active`` to ``True``
-    before calling this, so the activation pipeline still works.
+    Skips non-pipeline-active targets entirely (returns an empty
+    ``PollResult``). Pipeline-active = ``app_active`` (the instance
+    floor) OR any active membership — the derived predicate from
+    ``crud.is_pipeline_active`` (the trigger-cached flag is gone, schema
+    audit P0). The /activate endpoint activates the caller's membership
+    before invoking this, which satisfies the membership arm.
     """
-    if not target.is_active:
+    if not await asyncio.to_thread(target_is_pipeline_active, supabase, target.id):
         logger.info(
-            "poll_sources_for_target: skipping inactive target %s (%s)",
+            "poll_sources_for_target: skipping non-pipeline-active target %s (%s)",
             target.id,
             target.label,
         )

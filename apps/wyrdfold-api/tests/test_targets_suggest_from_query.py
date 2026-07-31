@@ -149,7 +149,7 @@ async def test_suggest_and_match_from_query_excludes_existing(
         id="t-owned",
         label="Senior Frontend Engineer",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -320,7 +320,7 @@ def _create_or_link_result() -> CreateOrLinkResult:
         id="t-new",
         label="Senior Frontend Engineer",
         scoring_profile=ScoringProfile(),
-        is_active=False,
+        app_active=False,
         created_at=now,
         updated_at=now,
     )

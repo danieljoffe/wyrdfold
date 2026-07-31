@@ -594,10 +594,10 @@ def get_active_targets(
     """Active targets for the caller.
 
     JWT callers get only their own active targets — the bare
-    ``crud.get_active`` returns the global union of every user's active
-    targets (the shared ``targets.is_active`` flag is OR'd across users
-    by the user_targets trigger), which would leak every other user's
-    roles + scoring profiles to any authenticated caller. api-key /
+    ``crud.get_active`` returns every PIPELINE-ACTIVE target (the
+    instance's ``app_active`` floor OR any user's active membership,
+    derived at read time), which would leak every other user's roles +
+    scoring profiles to any authenticated caller. api-key /
     operator callers (user_id is None) keep the instance-wide view for
     tooling. Mirrors the scoping the rest of the targets router applies.
     """
@@ -1337,11 +1337,11 @@ async def create_target_from_posting(
     # with "All set!" but the user lands on a dashboard with zero
     # targets — the catalog row is created and globally active, but
     # ``user_targets`` was never populated, so every per-user view is
-    # empty. ``set_active`` only updates the catalog flag; the DB
-    # trigger on ``user_targets`` is what keeps that in sync for
-    # real users. Fall back to the legacy ``set_active`` for api-key
-    # (cron) callers where ``user_id is None`` — they don't have a
-    # user identity to link.
+    # empty. For real users the active membership itself makes the
+    # target pipeline-active (derived predicate, no catalog write).
+    # api-key (cron) callers have no user identity to link — raise the
+    # instance floor (``app_active``) instead so the target still
+    # enters the pipeline.
     if user_id is not None:
         try:
             await asyncio.to_thread(
@@ -1364,11 +1364,11 @@ async def create_target_from_posting(
                     ),
                 },
             ) from e
-        # Re-read the target row so the response carries the
-        # trigger-synced ``is_active``.
+        # Re-read the target row so the response reflects any writes the
+        # linking flow made.
         refreshed = await asyncio.to_thread(crud.get, supabase, target.id)
         return refreshed or target
-    activated = await asyncio.to_thread(crud.set_active, supabase, target_id=target.id)
+    activated = await asyncio.to_thread(crud.set_app_active, supabase, target_id=target.id)
     return activated or target
 
 

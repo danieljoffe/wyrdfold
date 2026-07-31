@@ -31,7 +31,7 @@ def _target(tid: str = "t-1") -> JobTarget:
             seniority=SeniorityProfile(signals=["senior"]),
         ),
         search_keywords=["frontend engineer"],
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
