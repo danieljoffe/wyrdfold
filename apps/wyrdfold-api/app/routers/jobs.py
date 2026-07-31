@@ -759,6 +759,7 @@ def _assemble_jobs_page(
     preferences: TargetPreferences | None,
     user_id: str | None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Shared tail of both two-query list paths (per-target + cross-target).
 
@@ -775,6 +776,22 @@ def _assemble_jobs_page(
     # its target's family BEFORE ranking/paginating — a post-fetch drop would
     # render short pages. Mirrors the get_target_jobs SQL gate for these paths.
     by_id = _gate_off_family(supabase, by_id)
+
+    def _include_unknown_salary(p: dict[str, Any]) -> bool:
+        """Per-row ``pref_include_unknown_salary`` (wired 2026-07-31).
+
+        Single-target path: the one ``preferences`` object. Cross-target: the
+        row's winning target's pref from ``include_unknown_salary_by_target``
+        (absent target → the model default, True). api-key/global paths pass
+        neither → strict False, the pre-wiring behavior.
+        """
+        if preferences is not None:
+            return preferences.pref_include_unknown_salary
+        if include_unknown_salary_by_target is None:
+            return False
+        ts = by_id.get(p["id"])
+        tid = ts.get("target_id") if ts else None
+        return include_unknown_salary_by_target.get(str(tid), True) if tid else True
 
     has_location_filter = bool(exclude_terms or only_terms)
     # Per-user preference filters (employment-type / seniority / location) are
@@ -878,7 +895,9 @@ def _assemble_jobs_page(
         if has_pref_filter:
             postings = _apply_preferences_filter(postings, preferences)
         if logistics is not None and logistics.active:
-            postings = _apply_logistics_filter(postings, logistics)
+            postings = _apply_logistics_filter(
+                postings, logistics, include_unknown_salary_for=_include_unknown_salary
+            )
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
@@ -1223,6 +1242,7 @@ def _list_jobs_across_user_targets(
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — the union of jobs scored against any of the user's
     active targets, deduplicated by job id.
@@ -1257,6 +1277,7 @@ def _list_jobs_across_user_targets(
             weights_by_target=weights_by_target,
             user_id=user_id,
             logistics=logistics,
+            include_unknown_salary_by_target=include_unknown_salary_by_target,
         )
     try:
         return _list_jobs_across_user_targets_rpc(
@@ -1296,6 +1317,7 @@ def _list_jobs_across_user_targets(
         weights_by_target=weights_by_target,
         user_id=user_id,
         logistics=logistics,
+        include_unknown_salary_by_target=include_unknown_salary_by_target,
     )
 
 
@@ -1316,6 +1338,7 @@ def _list_jobs_across_user_targets_two_query(
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -1388,6 +1411,7 @@ def _list_jobs_across_user_targets_two_query(
         preferences=None,  # untargeted view has no per-target preference filter
         user_id=user_id,
         logistics=logistics,
+        include_unknown_salary_by_target=include_unknown_salary_by_target,
     )
 
 
@@ -1490,14 +1514,20 @@ def _apply_location_filter(
     ]
 
 
-def _logistics_passes(posting: dict[str, Any], f: _LogisticsFilter) -> bool:
+def _logistics_passes(
+    posting: dict[str, Any], f: _LogisticsFilter, *, include_unknown_salary: bool = False
+) -> bool:
     """One posting against the active logistics filters.
 
     Semantics per plan-wyrdfold-logistics-chips.md:
     - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
       unknown/``unspecified`` status is dropped; the user explicitly asked for
       remote, so surfacing unknowns would dilute the filter).
-    - ``min_salary`` — STRICT: an undisclosed salary is dropped. The bound
+    - ``min_salary`` — STRICT by default: an undisclosed salary is dropped.
+      ``include_unknown_salary`` (the per-(user, target)
+      ``pref_include_unknown_salary``, wired 2026-07-31) relaxes exactly that
+      unknown-drop — a KNOWN salary below the floor is dropped either way. The
+      api-key/global paths keep the strict default. The bound
       PREFERS the deterministic jobs-level columns (``salary_max``/``salary_min``
       parsed from the posting's own salary text — present for the whole corpus,
       yearly-USD gated) and falls back to the Phase-2 grader's
@@ -1516,7 +1546,10 @@ def _logistics_passes(posting: dict[str, Any], f: _LogisticsFilter) -> bool:
             bound = posting.get("salary_max") or posting.get("salary_min")
         else:
             bound = log.get("salary_max")
-        if bound is None or bound < f.min_salary:
+        if bound is None:
+            if not include_unknown_salary:
+                return False
+        elif bound < f.min_salary:
             return False
     if f.country:
         country = log.get("location_country")
@@ -1526,7 +1559,9 @@ def _logistics_passes(posting: dict[str, Any], f: _LogisticsFilter) -> bool:
 
 
 def _apply_logistics_filter(
-    postings: list[dict[str, Any]], f: _LogisticsFilter
+    postings: list[dict[str, Any]],
+    f: _LogisticsFilter,
+    include_unknown_salary_for: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Drop postings failing the logistics filters (#86), reading each row's
     overlaid ``logistics_filters`` dict. Post-fetch like the location filter, so
@@ -1535,7 +1570,12 @@ def _apply_logistics_filter(
     it)."""
     if not f.active:
         return postings
-    return [p for p in postings if _logistics_passes(p, f)]
+    resolve = include_unknown_salary_for or (lambda _p: False)
+    return [
+        p
+        for p in postings
+        if _logistics_passes(p, f, include_unknown_salary=resolve(p))
+    ]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -1901,9 +1941,13 @@ def list_jobs(
         # Build target_id -> AxisWeights map for any pairings that have
         # custom weights set. Missing entries fall through to raw score.
         weights_by_target: dict[str, AxisWeights] = {}
+        # Per-target pref_include_unknown_salary (wired 2026-07-31) — rides
+        # the same user_targets read as the weights.
+        include_unknown_salary_by_target: dict[str, bool] = {}
         for ut in list_user_targets(supabase, user_id):  # type: ignore[arg-type]
             if ut.axis_weights is not None:
                 weights_by_target[ut.target_id] = ut.axis_weights
+            include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
         result = _list_jobs_across_user_targets(
             supabase,
             user_target_ids=user_target_ids,
@@ -1920,6 +1964,7 @@ def list_jobs(
             weights_by_target=weights_by_target or None,
             user_id=user_id,
             logistics=logistics,
+            include_unknown_salary_by_target=include_unknown_salary_by_target,
         )
         # Decay the displayed score by posting age (read-time, never stale).
         # raw_score keeps the undecayed fit. No-op when the flag is off.

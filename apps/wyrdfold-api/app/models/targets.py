@@ -226,7 +226,8 @@ class TargetPreferences(BaseModel):
       ``SENIORITY_ORDER`` ladder. ``None`` = open-ended on that end.
     * ``pref_employment_types`` — keep jobs whose ``employment_type`` firewall
       tag is in this set. ``None``/empty = no employment-type filter.
-    * ``pref_include_unknown_salary`` — out of scope for v1 filtering (salary
+    * ``pref_include_unknown_salary`` — WIRED 2026-07-31: relaxes the /jobs
+      min-salary logistics filter's strict unknown-drop for this pairing (salary
       filtering isn't implemented yet); stored so the UI can round-trip the
       toggle. Default True.
 
