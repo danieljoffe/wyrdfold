@@ -770,6 +770,12 @@ async def _qualify_one_job(
         and not positively_us_location(row.get("location"))
     ):
         payload["archived_at"] = datetime.now(UTC).isoformat()
+    # Non-postings (#60 wire-up): an explicit ``is_genuine_role=false``
+    # verdict ("join our talent community", evergreen collectors) archives in
+    # the same write — these aren't jobs, so they leave every serving surface
+    # via the standard liveness gate. Lenient: ``None`` never archives.
+    if settings.qualification_archive_non_genuine and tags.is_genuine_role is False:
+        payload["archived_at"] = datetime.now(UTC).isoformat()
     try:
         await poll_db_write(
             supabase,

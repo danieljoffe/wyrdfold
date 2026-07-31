@@ -392,6 +392,14 @@ class Settings(BaseSettings):
     # global catalog leaves it off, and the tagger still records ``is_us`` for
     # anyone who'd rather filter on it than archive.
     qualification_archive_non_us: bool = False
+    # Talent-pool / "general application" / evergreen NON-postings (#60,
+    # schema-audit wire-up 2026-07-31): the tagger's ``is_genuine_role=false``
+    # verdict archives the row in the same firewall write — a non-posting has
+    # no business in the corpus (prod had 139 of them being served in public
+    # search). Lenient by construction: only an explicit ``false`` archives;
+    # ``None`` (malformed/absent verdict) keeps the row. Reversible
+    # (archived_at flag), default ON.
+    qualification_archive_non_genuine: bool = True
     # Minimum ``us_confidence`` (0-100) for the archive above to fire. 80 keeps
     # the tagger's genuinely-uncertain calls (which include most US
     # false-negatives) live; a prod sample of the >=80 set was 100% non-US.
