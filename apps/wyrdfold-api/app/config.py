@@ -182,6 +182,10 @@ class Settings(BaseSettings):
     jsonld_salary_max_fetches: int = 10
 
     # Periodic job URL health checks (see app/services/url_health.py).
+    # 2026-07-31 cadence fix: batch 50 → 250 (HEADs are free; full live-corpus
+    # sweep ~every 2 weeks) + the due-ordering RPC now serves rows carrying
+    # strikes FIRST, so a dead URL archives in ~threshold days instead of
+    # never (the pre-fix cascade had archived 0 jobs ever — audit doc).
     # Off by default. When enabled, the scheduler ticks every
     # ``url_health_tick_hours`` and HEAD-checks the oldest
     # ``url_health_batch_size`` live jobs. Jobs that fail
@@ -189,7 +193,7 @@ class Settings(BaseSettings):
     # error) get archived and their heavy fields NULL'd to reclaim space.
     url_health_check_enabled: bool = False
     url_health_tick_hours: int = Field(default=24, ge=1, le=720)
-    url_health_batch_size: int = Field(default=50, ge=1, le=500)
+    url_health_batch_size: int = Field(default=250, ge=1, le=500)
     url_health_concurrency: int = Field(default=10, ge=1, le=50)
     url_health_failure_threshold: int = Field(default=3, ge=1, le=10)
 

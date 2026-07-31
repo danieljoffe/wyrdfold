@@ -175,7 +175,6 @@ async def fetch_workday_jobs(board_token: str) -> list[StandardJob]:
                 external_id=external_path or str(list_item.get("bulletFields", [""])[0]),
                 title=detail_result.get("title", list_item.get("title", "")),
                 location_name=list_item.get("locationsText"),
-                department=None,
                 content=detail_result.get("jobDescription", ""),
                 posted_at=detail_result.get("postedOn", list_item.get("postedOn", "")),
                 absolute_url=absolute_url,

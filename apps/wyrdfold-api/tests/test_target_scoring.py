@@ -634,7 +634,6 @@ def test_list_jobs_with_target_overlays_target_score(
                 "title": "Frontend Engineer",
                 "company_name": "Acme",
                 "location": "Remote",
-                "department": None,
                 "absolute_url": "https://example.com/job-1",
                 "score": 50,
                 "score_breakdown": None,

@@ -14,7 +14,6 @@ export interface JobSearchResult {
   state: string | null;
   country: string | null;
   location_remote: boolean | null;
-  department: string | null;
   salary_text: string | null;
   // Structured salary parsed from salary_text at ingest (query-grade; the raw
   // text stays the display value; the salary filter applies server-side).

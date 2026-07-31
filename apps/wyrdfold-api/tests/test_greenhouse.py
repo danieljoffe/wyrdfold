@@ -60,7 +60,6 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
     assert job.external_id == "123"
     assert job.title == "Senior Frontend Engineer"
     assert job.location_name == "Remote"
-    assert job.department == "Engineering"
     assert job.content == "<p>desc</p>"
     assert job.posted_at == "2024-01-01T00:00:00Z"
     assert job.absolute_url == "https://example.com/jobs/123"
@@ -119,4 +118,3 @@ async def test_fetch_missing_location_and_departments(mock_http_client):
     mock_http_client.get = AsyncMock(return_value=resp)
     result = await fetch_board_jobs("foo")
     assert result[0].location_name is None
-    assert result[0].department is None

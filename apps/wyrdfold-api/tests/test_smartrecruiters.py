@@ -88,7 +88,6 @@ async def test_fetch_pulls_jd_body_and_posting_url_from_detail(mock_http_client)
                 "id": "sr-001",
                 "name": "Backend Engineer",
                 "location": {"city": "Berlin", "country": "DE"},
-                "department": {"label": "Engineering"},
                 "releasedDate": "2026-04-01T00:00:00Z",
             }
         ]
@@ -97,7 +96,6 @@ async def test_fetch_pulls_jd_body_and_posting_url_from_detail(mock_http_client)
         "id": "sr-001",
         "name": "Backend Engineer",
         "location": {"city": "Berlin", "country": "DE"},
-        "department": {"label": "Engineering"},
         "releasedDate": "2026-04-01T00:00:00Z",
         "postingUrl": ("https://jobs.smartrecruiters.com/example/sr-001-backend-engineer"),
         "applyUrl": ("https://jobs.smartrecruiters.com/example/sr-001-backend-engineer?oga=true"),

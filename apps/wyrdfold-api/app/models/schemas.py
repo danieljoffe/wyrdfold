@@ -33,7 +33,6 @@ class JobPosting(BaseModel):
     title: str
     company_name: str
     location: str | None
-    department: str | None
     absolute_url: str | None
     score: int
     score_breakdown: ScoreBreakdown | None

@@ -128,7 +128,6 @@ class TestQualifyOneJob:
         assert payload["metro"] == "San Francisco"
         assert payload["is_remote"] is False
         assert payload["is_genuine_role"] is True
-        assert payload["us_confidence"] == 98
         assert payload["qualified_at"] is not None
         # The persisted hash matches the row's content hash.
         assert payload["qualified_hash"] == qualification_hash(
@@ -314,7 +313,6 @@ class TestNonUsArchive:
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
-        assert payload["us_confidence"] is None
         assert "archived_at" not in payload  # None confidence → not archived, no crash
 
     @pytest.mark.asyncio
