@@ -1,12 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
-import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
@@ -29,9 +27,6 @@ import { useJobsUrlState } from './useJobsUrlState';
 export interface TargetTab {
   id: string;
   label: string;
-  /** Deactivated link — saved jobs stay viewable, but polling/grading
-   * is paused until the user reactivates. */
-  paused: boolean;
 }
 
 const BATCH_POLL_INTERVAL = 3000;
@@ -43,8 +38,8 @@ const BATCH_POLL_INTERVAL = 3000;
  * at 20 req/min (#851 P4; re-activation pipelines that re-poll sources
  * can legitimately run for minutes, and prod logs showed the fast cadence
  * sustained across those windows). On cap reached we clear the timer and
- * rely on the next tab switch or router.refresh() to pick up the
- * eventually-settled state. Hidden tabs don't tick at all — the
+ * rely on the next tab switch to pick up the eventually-settled state.
+ * Hidden tabs don't tick at all — the
  * visibilitychange listener resumes the loop, so a backgrounded /jobs tab
  * stops contributing request noise entirely.
  */
@@ -217,34 +212,6 @@ export default function JobsList({
   const activatingRef = useRef<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const { toast } = useToast();
-  const router = useRouter();
-
-  // Paused-tab reactivation. The server re-render (router.refresh) flips
-  // the tab's ``paused`` flag and the activation pipeline takes over.
-  const [reactivating, setReactivating] = useState(false);
-  const selectedTab = initialTargets.find(t => t.id === activeTargetId);
-
-  const handleReactivate = useCallback(async () => {
-    if (!activeTargetId) return;
-    setReactivating(true);
-    try {
-      const res = await fetch(`/api/targets/${activeTargetId}/activate`, {
-        method: 'POST',
-      });
-      if (!res.ok)
-        throw new Error(await extractApiError(res, 'Reactivate failed'));
-      toast({ variant: 'success', title: 'Target reactivated' });
-      router.refresh();
-    } catch (err) {
-      toast({
-        variant: 'error',
-        title:
-          err instanceof Error ? err.message : 'Failed to reactivate target',
-      });
-    } finally {
-      setReactivating(false);
-    }
-  }, [activeTargetId, toast, router]);
 
   const targets = initialTargets;
 
@@ -695,39 +662,11 @@ export default function JobsList({
                       : 'border-transparent text-text-secondary hover:text-text-primary hover:border-border-secondary'
                   )}
                 >
-                  {target.paused ? `${target.label} (paused)` : target.label}
+                  {target.label}
                 </button>
               ))}
             </div>
           </div>
-
-          {selectedTab?.paused && (
-            <Card padding='none'>
-              <CardContent className='flex flex-col items-start gap-3 p-4 sm:flex-row sm:items-center sm:justify-between'>
-                <Text variant='caption' className='text-text-secondary'>
-                  This target is paused — showing saved jobs; new roles
-                  aren&apos;t being fetched or scored. Reactivate to resume
-                  matching.
-                </Text>
-                <Button
-                  name='jobs-reactivate-target'
-                  variant='outline'
-                  size='sm'
-                  onClick={handleReactivate}
-                  disabled={reactivating}
-                >
-                  {reactivating ? (
-                    <>
-                      <Spinner size='sm' aria-label='Reactivating' />
-                      <span>Reactivating...</span>
-                    </>
-                  ) : (
-                    <span>Reactivate</span>
-                  )}
-                </Button>
-              </CardContent>
-            </Card>
-          )}
 
           {activeTargetId && activationStatus === 'deriving' && (
             <div className='flex items-center gap-2 text-sm text-text-secondary'>

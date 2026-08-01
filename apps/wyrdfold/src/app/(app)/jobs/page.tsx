@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { fetchJsonFromWyrdfoldAPI } from '@/lib/api/proxy';
 import type { UserTargetWithSummary } from '../targets/types';
 import JobsList, { type TargetTab } from './JobsList';
+import { toActiveTargetTabs } from './targetTabs';
 import { JOB_STATUSES, type JobStatus } from './types';
 
 export const metadata: Metadata = {
@@ -36,13 +37,11 @@ export default async function FittedJobsPage({
   const targetsRes = await fetchJsonFromWyrdfoldAPI<{
     targets: UserTargetWithSummary[];
   }>('/targets/mine');
-  // Deactivated targets stay visible as paused tabs — their saved jobs
-  // remain browsable (DB reads are free); only polling/grading stops.
-  const initialTargets: TargetTab[] = (targetsRes?.targets ?? []).map(t => ({
-    id: t.target.id,
-    label: t.target.label,
-    paused: !t.user_target.is_active,
-  }));
+  // Paused (deactivated) targets are omitted entirely — see toActiveTargetTabs.
+  // A deep link to a paused target falls through to the redirect below.
+  const initialTargets: TargetTab[] = toActiveTargetTabs(
+    targetsRes?.targets ?? []
+  );
 
   // If the URL points to a target this user isn't linked to at all, drop
   // the filter rather than rendering an empty list. Server-side redirect
