@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -91,6 +90,22 @@ def test_last4() -> None:
 # ---- in-memory fake supabase for the store ----------------------------
 
 
+class _Result:
+    """A query result that works for BOTH call styles the store now mixes:
+    the async write path (``set_key`` / ``delete_key`` / ``list_key_meta``)
+    ``await``s ``.execute()``, while the still-sync read path (``get_key`` /
+    ``has_usable_key``) calls it directly. ``__await__`` returns ``self`` so an
+    awaited ``execute()`` yields this same object, and ``.data`` reads work
+    either way (#57 slice 4)."""
+
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        yield from ()
+        return self
+
+
 class _FakeQuery:
     def __init__(self, store: list[dict[str, Any]]) -> None:
         self._store = store
@@ -125,29 +140,29 @@ class _FakeQuery:
     def _matches(self, row: dict[str, Any]) -> bool:
         return all(row.get(c) == v for c, v in self._filters)
 
-    def execute(self) -> SimpleNamespace:
+    def execute(self) -> _Result:
         if self._op == "upsert":
             assert self._row is not None
             keys_ = (self._conflict or "").split(",")
             for existing in self._store:
                 if all(existing.get(k) == self._row.get(k) for k in keys_):
                     existing.update(self._row)
-                    return SimpleNamespace(data=[existing])
+                    return _Result(data=[existing])
             new = dict(self._row)
             new.setdefault("id", f"row-{len(self._store)}")
             new.setdefault("created_at", datetime.now(UTC).isoformat())
             new.setdefault("rotated_at", None)
             new.setdefault("last4", None)
             self._store.append(new)
-            return SimpleNamespace(data=[new])
+            return _Result(data=[new])
         if self._op == "select":
             cols = [c.strip() for c in (self._cols or "").split(",")]
             out = [{c: row.get(c) for c in cols} for row in self._store if self._matches(row)]
-            return SimpleNamespace(data=out)
+            return _Result(data=out)
         if self._op == "delete":
             removed = [r for r in self._store if self._matches(r)]
             self._store[:] = [r for r in self._store if not self._matches(r)]
-            return SimpleNamespace(data=removed)
+            return _Result(data=removed)
         raise AssertionError(f"unhandled op {self._op}")
 
 
@@ -163,15 +178,15 @@ class _FakeSupabase:
 # ---- store ------------------------------------------------------------
 
 
-def test_set_then_get_round_trips_plaintext() -> None:
+async def test_set_then_get_round_trips_plaintext() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-secret9999")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-secret9999")
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "sk-or-v1-secret9999"
 
 
-def test_stored_row_holds_ciphertext_not_plaintext() -> None:
+async def test_stored_row_holds_ciphertext_not_plaintext() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-plain")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-plain")
     row = sb.rows[0]
     assert "sk-or-v1-plain" not in row["ciphertext"]
     assert row["last4"] == "lain"
@@ -182,42 +197,42 @@ def test_get_missing_returns_none() -> None:
     assert keys.get_key(sb, user_id="nobody", provider="openrouter") is None
 
 
-def test_set_overwrites_in_place() -> None:
+async def test_set_overwrites_in_place() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="first-key")
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="second-key")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="first-key")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="second-key")
     assert len([r for r in sb.rows if r["user_id"] == "u1"]) == 1
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "second-key"
 
 
-def test_two_users_isolated() -> None:
+async def test_two_users_isolated() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="u1-key")
-    keys.set_key(sb, user_id="u2", provider="openrouter", plaintext="u2-key")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="u1-key")
+    await keys.set_key(sb, user_id="u2", provider="openrouter", plaintext="u2-key")
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "u1-key"
     assert keys.get_key(sb, user_id="u2", provider="openrouter") == "u2-key"
 
 
-def test_rotate_stamps_rotated_at() -> None:
+async def test_rotate_stamps_rotated_at() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="old")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="old")
     assert sb.rows[0]["rotated_at"] is None
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="new", rotating=True)
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="new", rotating=True)
     assert sb.rows[0]["rotated_at"] is not None
     assert keys.get_key(sb, user_id="u1", provider="openrouter") == "new"
 
 
-def test_set_key_returns_upserted_meta() -> None:
+async def test_set_key_returns_upserted_meta() -> None:
     # The router relies on this so it never re-reads to build its response
     # (a concurrent delete could empty that read and spuriously 500 — found
     # by P4 stress testing). set_key returns the upsert's own row metadata.
     sb = _FakeSupabase()
-    meta = keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-abcd")
+    meta = await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-abcd")
     assert meta.provider == "openrouter"
     assert meta.last4 == "abcd"
     assert meta.rotated_at is None
 
-    rotated = keys.set_key(
+    rotated = await keys.set_key(
         sb,
         user_id="u1",
         provider="openrouter",
@@ -228,18 +243,18 @@ def test_set_key_returns_upserted_meta() -> None:
     assert rotated.rotated_at is not None
 
 
-def test_delete_removes_row() -> None:
+async def test_delete_removes_row() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="k")
-    assert keys.delete_key(sb, user_id="u1", provider="openrouter") is True
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="k")
+    assert await keys.delete_key(sb, user_id="u1", provider="openrouter") is True
     assert keys.get_key(sb, user_id="u1", provider="openrouter") is None
-    assert keys.delete_key(sb, user_id="u1", provider="openrouter") is False
+    assert await keys.delete_key(sb, user_id="u1", provider="openrouter") is False
 
 
-def test_list_key_meta_omits_ciphertext() -> None:
+async def test_list_key_meta_omits_ciphertext() -> None:
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-zzzz")
-    meta = keys.list_key_meta(sb, user_id="u1")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-zzzz")
+    meta = await keys.list_key_meta(sb, user_id="u1")
     assert len(meta) == 1
     assert meta[0].provider == "openrouter"
     assert meta[0].last4 == "zzzz"
@@ -247,13 +262,13 @@ def test_list_key_meta_omits_ciphertext() -> None:
     assert not hasattr(meta[0], "ciphertext")
 
 
-def test_set_rejects_unknown_provider() -> None:
+async def test_set_rejects_unknown_provider() -> None:
     sb = _FakeSupabase()
     with pytest.raises(ValueError, match="unknown provider"):
-        keys.set_key(sb, user_id="u1", provider="cohere", plaintext="x")  # type: ignore[arg-type]
+        await keys.set_key(sb, user_id="u1", provider="cohere", plaintext="x")  # type: ignore[arg-type]
 
 
-def test_set_rejects_empty_key() -> None:
+async def test_set_rejects_empty_key() -> None:
     sb = _FakeSupabase()
     with pytest.raises(ValueError, match="must not be empty"):
-        keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="   ")
+        await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="   ")

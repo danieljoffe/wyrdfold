@@ -27,7 +27,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.job_search import JobSearchResult
 from app.services.scoring import strip_html
@@ -156,8 +156,8 @@ def _rank_key(query_groups: set[str], row: dict[str, Any]) -> tuple[int, str]:
     return (overlap, recency)
 
 
-def search_jobs(
-    supabase: Client,
+async def search_jobs(
+    supabase: AsyncClient,
     *,
     q: str,
     limit: int = DEFAULT_PAGE_SIZE,
@@ -229,7 +229,7 @@ def search_jobs(
             .or_(f"salary_max.gte.{floor},and(salary_max.is.null,salary_min.gte.{floor})")
         )
 
-    resp = (
+    resp = await (
         # Bias the capped candidate pull toward recent postings before re-ranking.
         query.order("cataloged_at", desc=True).limit(_CANDIDATE_CAP).execute()
     )
@@ -259,7 +259,7 @@ def search_jobs(
     return [JobSearchResult.model_validate(r) for r in page], has_more
 
 
-def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
+async def get_listing(supabase: AsyncClient, listing_id: str) -> JobSearchResult | None:
     """One publicly-eligible listing by id — the shareable-URL detail read
     (#467 §11.2 fast-follow).
 
@@ -269,10 +269,10 @@ def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
     non-US) both return ``None`` — the caller maps both to one indistinguishable
     404, so a public prober can't learn whether a delisted id ever existed.
 
-    Blocking supabase round-trips (row fetch + snippet fetch) — the caller runs
-    this in a worker thread (#107), mirroring ``search_jobs_with_snippets``.
+    Native async round-trips (row fetch + snippet fetch) on the pooled async
+    service client (#57 slice 4), mirroring ``search_jobs_with_snippets``.
     """
-    resp = (
+    resp = await (
         supabase.table("jobs")
         .select(_SEARCH_COLS)
         # Live + US corpus gate — MUST match search_jobs exactly, or a shared
@@ -288,7 +288,7 @@ def get_listing(supabase: Client, listing_id: str) -> JobSearchResult | None:
     if not rows:
         return None
     result = JobSearchResult.model_validate(rows[0])
-    attach_snippets(supabase, [result])
+    await attach_snippets(supabase, [result])
     return result
 
 
@@ -312,8 +312,8 @@ def _html_to_snippet(html: str | None, max_len: int = SNIPPET_MAX_LEN) -> str | 
     return text[:max_len].rstrip() + "…"
 
 
-def attach_snippets(
-    supabase: Client,
+async def attach_snippets(
+    supabase: AsyncClient,
     results: list[JobSearchResult],
     *,
     max_len: int = SNIPPET_MAX_LEN,
@@ -327,14 +327,14 @@ def attach_snippets(
     authed search leaves snippets ``None``, sparing its hot path this extra read.
 
     Best-effort: a fetch failure logs and leaves snippets ``None`` rather than
-    failing the search — a snippet is an enhancement, not the result. The caller
-    runs this inside a worker thread (blocking supabase round-trip, #107).
+    failing the search — a snippet is an enhancement, not the result. Runs
+    natively on the pooled async service client (#57 slice 4).
     """
     if not results:
         return
     ids = [r.id for r in results]  # ≤ page size, so no in_() chunking (#414 guard)
     try:
-        resp = supabase.table("jobs").select("id, description_html").in_("id", ids).execute()
+        resp = await supabase.table("jobs").select("id, description_html").in_("id", ids).execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
     except Exception:
         logger.warning("snippet fetch failed; leaving snippets empty", exc_info=True)
@@ -344,8 +344,8 @@ def attach_snippets(
         r.snippet = _html_to_snippet(by_id.get(r.id), max_len)
 
 
-def search_jobs_with_snippets(
-    supabase: Client,
+async def search_jobs_with_snippets(
+    supabase: AsyncClient,
     *,
     q: str,
     limit: int = DEFAULT_PAGE_SIZE,
@@ -354,14 +354,14 @@ def search_jobs_with_snippets(
     posted_within_days: int | None = None,
     salary_floor: int | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
-    """``search_jobs`` + the page-only snippet fetch, composed so both blocking
-    round-trips run in a single worker thread.
+    """``search_jobs`` + the page-only snippet fetch, both native async round-trips
+    on the pooled async service client (#57 slice 4).
 
     Used by BOTH the authed and public search endpoints: the card-grid UX (#467
     §11) shows a snippet on every result, so the preview is no longer public-only.
     The extra read is bounded to the ≤page ids and cached — see ``attach_snippets``.
     """
-    results, has_more = search_jobs(
+    results, has_more = await search_jobs(
         supabase,
         q=q,
         limit=limit,
@@ -370,5 +370,5 @@ def search_jobs_with_snippets(
         posted_within_days=posted_within_days,
         salary_floor=salary_floor,
     )
-    attach_snippets(supabase, results)
+    await attach_snippets(supabase, results)
     return results, has_more
