@@ -1417,7 +1417,6 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
     monkeypatch.setattr(live_settings, "qualification_enabled", False)
     monkeypatch.setattr(live_settings, "prescan_embed_enabled", False)
     monkeypatch.setattr(live_settings, "recency_decay_enabled", False)
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
 
     async_client = _AsyncSeamClient()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)

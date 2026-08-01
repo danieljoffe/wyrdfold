@@ -30,14 +30,13 @@ from typing import Any
 
 from supabase import Client
 
-from app.config import settings
 from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
 
 async def _lock_rpc(supabase: Client, fn: str, key: int) -> Any:
-    """Run one advisory-lock RPC on the flag-selected backend (#57).
+    """Run one advisory-lock RPC on the async client, sync-in-thread fallback (#57).
 
     Deliberately NOT routed through the ``db_write`` seam: the seam retries
     transient blips, but ``pg_try_advisory_lock`` is re-entrant per backend
@@ -47,10 +46,9 @@ async def _lock_rpc(supabase: Client, fn: str, key: int) -> Any:
     on either path; a lost response degrades to "skip this tick", which the
     callers already treat as harmless.
     """
-    if settings.poller_async_db:
-        async_sb = get_async_supabase()
-        if async_sb is not None:
-            return await async_sb.rpc(fn, {"p_key": key}).execute()
+    async_sb = get_async_supabase()
+    if async_sb is not None:
+        return await async_sb.rpc(fn, {"p_key": key}).execute()
     return await asyncio.to_thread(lambda: supabase.rpc(fn, {"p_key": key}).execute())
 
 
