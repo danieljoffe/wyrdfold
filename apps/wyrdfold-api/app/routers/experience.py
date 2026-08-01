@@ -10,15 +10,18 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
-from supabase import Client
+from supabase import AsyncClient, Client
 
+from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
+    get_async_user_supabase,
     get_current_user_id,
     get_embeddings_client,
     get_llm_client,
@@ -36,6 +39,7 @@ from app.models.conversation import (
 from app.models.experience import (
     ConversationType,
     OptimizedDoc,
+    OptimizedDocSource,
     OptimizedDocUpsert,
     OptimizedPayload,
     Preferences,
@@ -81,31 +85,145 @@ router = APIRouter(
 _PARSE_TIMEOUT_SECONDS = 30.0
 
 
+# ---- Inline async reads/writes (#57 slice 3) ------------------------------
+#
+# Handlers now run on the async user/service client. A few experience-service
+# helpers (``prose.get_latest`` / ``prose.create_version`` / ``optimized.get_latest``
+# / ``preferences.get``) are still called SYNC by not-yet-converted modules
+# (conversation orchestrator, tailor, analysis, targets, fit_refresh) that hold a
+# sync client — converting them would break those callers, and a sync helper
+# cannot take the async client. So the sync helpers stay, and these thin async
+# inlines run the same queries on the async client (the insights.py::_user_target_ids
+# pattern). No sync+async twin in the shared layer.
+
+
+async def _prose_latest(supabase: AsyncClient, user_id: str | None) -> ProseDoc | None:
+    """Async inline of ``prose.get_latest`` (sync twin kept for orchestrator/fit_refresh)."""
+    resp = await (
+        supabase.table(prose.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return ProseDoc.model_validate(rows[0]) if rows else None
+
+
+async def _prose_create_version(
+    supabase: AsyncClient, user_id: str | None, content: str
+) -> ProseDoc:
+    """Async inline of ``prose.create_version`` (sync twin kept for orchestrator)."""
+    latest = await _prose_latest(supabase, user_id)
+    next_version = (latest.version + 1) if latest else 1
+    resp = await (
+        supabase.table(prose.TABLE)
+        .insert({"user_id": user_id, "version": next_version, "content": content})
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert prose doc version")
+    return ProseDoc.model_validate(rows[0])
+
+
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (sync twin kept for
+    tailor/analysis/targets/orchestrator/annotations). Reads fresh: the module TTL
+    cache is populated/read only by those sync callers and every write invalidates
+    it, so a direct read here is always coherent."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
+
+
+async def _optimized_create_version(
+    supabase: AsyncClient,
+    user_id: str | None,
+    payload: OptimizedPayload,
+    prose_doc_id: str | None,
+    source: OptimizedDocSource,
+    markdown_view: str | None = None,
+) -> OptimizedDoc:
+    """Async inline of ``optimized.create_version`` — the sync twin stays for its
+    not-yet-converted caller chain (``annotations`` ← conversation orchestrator).
+    Invalidates the shared module TTL cache so sync readers (tailor/analysis/
+    targets) never serve the pre-write version (#57 slice 3)."""
+    latest = await _optimized_latest(supabase, user_id)
+    next_version = (latest.version + 1) if latest else 1
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .insert(
+            {
+                "user_id": user_id,
+                "prose_doc_id": prose_doc_id,
+                "version": next_version,
+                "payload": payload.model_dump(mode="json"),
+                "markdown_view": markdown_view,
+                "source": source,
+            }
+        )
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert optimized doc version")
+    doc = OptimizedDoc.model_validate(rows[0])
+    optimized._doc_cache.invalidate(optimized._cache_key(user_id))
+    return doc
+
+
+async def _preferences_get(supabase: AsyncClient, user_id: str | None) -> Preferences | None:
+    """Async inline of ``preferences.get`` (sync twin kept for tailor)."""
+    resp = await (
+        supabase.table(preferences.TABLE)
+        .select("*")
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return Preferences.model_validate(rows[0]) if rows else None
+
+
+async def _insert_uploaded_resume(supabase: AsyncClient, row: dict[str, Any]) -> None:
+    """Async inline of the ``uploaded_resumes`` tracking insert. Lives in a
+    helper (not the handler body) so the #107 guard sees the handler delegate
+    the round-trip rather than run a bare ``.execute()`` on the loop."""
+    await supabase.table("uploaded_resumes").insert(row).execute()
+
+
 # ---- Prose doc ------------------------------------------------------------
 
 
-# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
-# this in its threadpool, keeping the blocking `.execute()` round-trips off
-# the event loop. See #107.
+# `async def` on the async user client (#57 slice 3): the DB read runs natively
+# on the event loop, no threadpool worker held for the supabase round-trip.
 @router.get("/prose")
-def get_prose(
-    supabase: Client = Depends(get_user_supabase),
+async def get_prose(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc | dict[str, None]:
-    doc = prose.get_latest(supabase, user_id=user_id)
+    doc = await _prose_latest(supabase, user_id=user_id)
     if doc is None:
         return {"prose": None}
     return doc
 
 
-# Sync `def`: blocking supabase write runs in the threadpool (#107).
 @router.post("/prose")
-def create_prose(
+async def create_prose(
     body: ProseDocCreate,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ProseDoc:
-    return prose.create_version(supabase, user_id=user_id, content=body.content)
+    return await _prose_create_version(supabase, user_id=user_id, content=body.content)
 
 
 @router.delete("/prose")
@@ -130,10 +248,10 @@ def delete_master_document(
 @limiter.limit("3/minute")
 async def consolidate_prose(
     request: Request,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
-    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),  # service-role cost ledger
 ) -> ProseConsolidateResponse:
     """LLM-dedupe the latest prose doc and persist as a new version.
 
@@ -141,7 +259,7 @@ async def consolidate_prose(
     contain multiple near-identical resume copies. This pass merges them.
     The result is always a new version — the original stays in history.
     """
-    latest = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
+    latest = await _prose_latest(supabase, user_id=user_id)
     if latest is None:
         raise HTTPException(status_code=404, detail="no prose doc to consolidate")
 
@@ -157,8 +275,7 @@ async def consolidate_prose(
         }
         if fallback_reason is not None:
             metadata["fallback_reason"] = fallback_reason
-        await asyncio.to_thread(
-            cost_log.record,
+        await cost_log.record_async(
             cost_supabase,
             user_id=user_id,
             purpose=consolidate.DEFAULT_PURPOSE,
@@ -180,9 +297,7 @@ async def consolidate_prose(
             fallback_reason=fallback_reason,
         )
 
-    new_doc = await asyncio.to_thread(
-        prose.create_version, supabase, user_id=user_id, content=consolidated
-    )
+    new_doc = await _prose_create_version(supabase, user_id=user_id, content=consolidated)
     return ProseConsolidateResponse(
         prose=new_doc,
         chars_before=len(latest.content),
@@ -201,7 +316,7 @@ async def upload_resume(
     request: Request,
     file: UploadFile,
     auto_derive: bool = Query(default=False),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
@@ -259,8 +374,7 @@ async def upload_resume(
     upload_id = str(uuid.uuid4())
     file_ext = parsed.file_type
     try:
-        storage_path = await asyncio.to_thread(
-            upload_file,
+        storage_path = await upload_file(
             supabase,
             user_id=user_id,
             upload_id=upload_id,
@@ -273,18 +387,15 @@ async def upload_resume(
         storage_path = ""
 
     # Merge into prose doc — semantic merge via LLM (#497).
-    existing = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
+    existing = await _prose_latest(supabase, user_id=user_id)
     merged, merge_result = await merge_into_prose(
         llm,
         existing_content=existing.content if existing else None,
         parsed=parsed,
     )
-    prose_doc = await asyncio.to_thread(
-        prose.create_version, supabase, user_id=user_id, content=merged
-    )
+    prose_doc = await _prose_create_version(supabase, user_id=user_id, content=merged)
     if merge_result is not None:
-        await asyncio.to_thread(
-            cost_log.record,
+        await cost_log.record_async(
             supabase,
             user_id=user_id,
             purpose="experience.ingest_merge",
@@ -305,14 +416,13 @@ async def upload_resume(
         "file_size_bytes": len(file_bytes),
         "warnings": warnings,
     }
-    await asyncio.to_thread(lambda: supabase.table("uploaded_resumes").insert(upload_row).execute())
+    await _insert_uploaded_resume(supabase, upload_row)
 
     # Optional: auto-derive
     optimized_doc_id: str | None = None
     if auto_derive:
         payload, result = await derive.derive_from_prose(llm, prose_text=prose_doc.content)
-        await asyncio.to_thread(
-            cost_log.record,
+        await cost_log.record_async(
             supabase,
             user_id=user_id,
             purpose=derive.DEFAULT_PURPOSE,
@@ -322,7 +432,7 @@ async def upload_resume(
 
         # Carry forward annotations from previous doc and merge with any
         # the LLM extracted from inline prose comments this round (#499).
-        previous_opt = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+        previous_opt = await _optimized_latest(supabase, user_id=user_id)
         carried = (
             annotations.validate_annotation_refs(previous_opt.payload.annotations, payload)
             if previous_opt and previous_opt.payload.annotations
@@ -331,8 +441,7 @@ async def upload_resume(
         merged_annotations = annotations.merge_annotations(carried, payload.annotations)
         payload = payload.model_copy(update={"annotations": merged_annotations})
 
-        doc = await asyncio.to_thread(
-            optimized.create_version,
+        doc = await _optimized_create_version(
             supabase,
             user_id=user_id,
             payload=payload,
@@ -358,11 +467,11 @@ async def upload_resume(
 
 
 @router.get("/optimized")
-def get_optimized(
-    supabase: Client = Depends(get_user_supabase),
+async def get_optimized(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> OptimizedDoc | dict[str, None]:
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id=user_id)
     if doc is None:
         return {"optimized": None}
     return doc
@@ -371,13 +480,12 @@ def get_optimized(
 @router.post("/optimized")
 async def create_optimized(
     body: OptimizedDocUpsert,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
-    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),  # service-role cost ledger
 ) -> OptimizedDoc:
-    doc = await asyncio.to_thread(
-        optimized.create_version,
+    doc = await _optimized_create_version(
         supabase,
         user_id=user_id,
         payload=body.payload,
@@ -399,7 +507,7 @@ async def create_optimized(
 @limiter.limit("10/minute")
 async def derive_optimized(
     request: Request,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
@@ -407,7 +515,7 @@ async def derive_optimized(
     # the cost ledger goes through this service-role client — llm_costs has no
     # INSERT policy for `authenticated` on purpose (a user must not be able to
     # write cost rows). #88/Phase-1 dual-client pattern.
-    cost_supabase: Client = Depends(get_supabase),
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> OptimizedDoc:
     """Read the latest prose doc, derive an OptimizedPayload via LLM,
     persist it as a new optimized version, embed its chunks, and log cost.
@@ -417,11 +525,11 @@ async def derive_optimized(
     otherwise. User-edited optimized docs (source="user_edit") never
     short-circuit; the user has explicitly asked to regenerate.
     """
-    prose_doc = await asyncio.to_thread(prose.get_latest, supabase, user_id=user_id)
+    prose_doc = await _prose_latest(supabase, user_id=user_id)
     if prose_doc is None:
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
-    previous = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    previous = await _optimized_latest(supabase, user_id=user_id)
     if previous is not None and previous.prose_doc_id == prose_doc.id and previous.source == "llm":
         return previous
 
@@ -429,8 +537,7 @@ async def derive_optimized(
         llm,
         prose_text=prose_doc.content,
     )
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         cost_supabase,
         user_id=user_id,
         purpose=derive.DEFAULT_PURPOSE,
@@ -448,8 +555,7 @@ async def derive_optimized(
     merged = annotations.merge_annotations(carried, payload.annotations)
     payload = payload.model_copy(update={"annotations": merged})
 
-    doc = await asyncio.to_thread(
-        optimized.create_version,
+    doc = await _optimized_create_version(
         supabase,
         user_id=user_id,
         payload=payload,
@@ -481,11 +587,11 @@ def _sse_event(event: str, data: dict[str, Any]) -> bytes:
 @limiter.limit("10/minute")
 async def derive_optimized_stream(
     request: Request,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     embeddings: EmbeddingsClient = Depends(get_embeddings_client),
     user_id: str = Depends(get_current_user_id),
-    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),  # service-role cost ledger
 ) -> StreamingResponse:
     """Streaming variant of /derive.
 
@@ -501,11 +607,11 @@ async def derive_optimized_stream(
     have already been sent. Pre-flight errors (missing prose) still come
     back as HTTP 404 before any SSE frame is written.
     """
-    prose_doc = await asyncio.to_thread(lambda: prose.get_latest(supabase, user_id=user_id))
+    prose_doc = await _prose_latest(supabase, user_id=user_id)
     if prose_doc is None:
         raise HTTPException(status_code=404, detail="no prose doc to derive from")
 
-    previous = await asyncio.to_thread(lambda: optimized.get_latest(supabase, user_id=user_id))
+    previous = await _optimized_latest(supabase, user_id=user_id)
 
     async def generate() -> AsyncIterator[bytes]:
         if (
@@ -560,18 +666,16 @@ async def derive_optimized_stream(
                 yield _sse_event("error", {"detail": f"invalid payload: {exc}"})
                 return
 
-            await asyncio.to_thread(
-                lambda: cost_log.record(
-                    cost_supabase,
-                    user_id=user_id,
-                    purpose=derive.DEFAULT_PURPOSE,
-                    result=result,
-                    metadata={
-                        "prose_doc_id": prose_doc.id,
-                        "prose_version": prose_doc.version,
-                        "streamed": True,
-                    },
-                )
+            await cost_log.record_async(
+                cost_supabase,
+                user_id=user_id,
+                purpose=derive.DEFAULT_PURPOSE,
+                result=result,
+                metadata={
+                    "prose_doc_id": prose_doc.id,
+                    "prose_version": prose_doc.version,
+                    "streamed": True,
+                },
             )
 
             carried = (
@@ -582,14 +686,12 @@ async def derive_optimized_stream(
             merged = annotations.merge_annotations(carried, payload.annotations)
             payload = payload.model_copy(update={"annotations": merged})
 
-            doc = await asyncio.to_thread(
-                lambda: optimized.create_version(
-                    supabase,
-                    user_id=user_id,
-                    payload=payload,
-                    prose_doc_id=prose_doc.id,
-                    source="llm",
-                )
+            doc = await _optimized_create_version(
+                supabase,
+                user_id=user_id,
+                payload=payload,
+                prose_doc_id=prose_doc.id,
+                source="llm",
             )
             await chunks.upsert_for_optimized(
                 supabase,
@@ -628,11 +730,11 @@ async def derive_optimized_stream(
 
 
 @router.get("/gap-health")
-def get_gap_health(
-    supabase: Client = Depends(get_user_supabase),
+async def get_gap_health(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> GapHealthResult:
-    doc = optimized.get_latest(supabase, user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id=user_id)
     if doc is None:
         return gap_tracker.gap_health(OptimizedPayload())
     return gap_tracker.gap_health(doc.payload)
@@ -641,36 +743,33 @@ def get_gap_health(
 # ---- Preferences ----------------------------------------------------------
 
 
-# Sync `def` (not `async def`): blocking supabase reads/writes run in the
-# threadpool, keeping them off the event loop. See #107.
+# `async def` on the async user client (#57 slice 3).
 @router.get("/preferences")
-def get_preferences(
-    supabase: Client = Depends(get_user_supabase),
+async def get_preferences(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> Preferences | dict[str, None]:
-    row = preferences.get(supabase, user_id=user_id)
+    row = await _preferences_get(supabase, user_id=user_id)
     if row is None:
         return {"preferences": None}
     return row
 
 
-# Sync `def`: blocking supabase upsert runs in the threadpool (#107).
 @router.put("/preferences")
-def upsert_preferences(
+async def upsert_preferences(
     body: PreferencesUpsert,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> Preferences:
-    return preferences.upsert(supabase, user_id=user_id, payload=body.payload)
+    return await preferences.upsert(supabase, user_id=user_id, payload=body.payload)
 
 
-# Sync `def`: blocking supabase delete runs in the threadpool (#107).
 @router.delete("/preferences")
-def reset_preferences(
-    supabase: Client = Depends(get_user_supabase),
+async def reset_preferences(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, bool]:
-    preferences.reset(supabase, user_id=user_id)
+    await preferences.reset(supabase, user_id=user_id)
     return {"success": True}
 
 

@@ -6,7 +6,7 @@ so users can reference what they uploaded.
 
 from __future__ import annotations
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 STORAGE_BUCKET = "resume-uploads"
 
@@ -15,8 +15,8 @@ def _storage_path(user_id: str, upload_id: str, file_ext: str) -> str:
     return f"{user_id}/{upload_id}.{file_ext}"
 
 
-def upload_file(
-    supabase: Client,
+async def upload_file(
+    supabase: AsyncClient,
     *,
     user_id: str,
     upload_id: str,
@@ -26,12 +26,12 @@ def upload_file(
 ) -> str:
     """Upload a resume file to Supabase Storage. Returns the storage path.
 
-    ``supabase`` must be the JWT-bound user client and ``user_id`` the
+    ``supabase`` must be the async service/user client and ``user_id`` the
     caller's id: storage RLS keys access on the ``<user_id>/`` path prefix,
     so the object lands in (and is readable from) only the owner's folder.
-    """
+    Async on the pooled client (#57 slice 3)."""
     path = _storage_path(user_id, upload_id, file_ext)
-    supabase.storage.from_(STORAGE_BUCKET).upload(
+    await supabase.storage.from_(STORAGE_BUCKET).upload(
         path=path,
         file=file_bytes,
         file_options={"content-type": content_type, "upsert": "true"},

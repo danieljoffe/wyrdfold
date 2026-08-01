@@ -35,25 +35,34 @@ def _make_upload_file(
 
 
 def _mock_supabase() -> MagicMock:
-    """Build a Supabase mock that handles prose + upload tracking."""
+    """Build an async Supabase mock that handles prose + upload tracking.
+
+    Handlers run on the async client since #57 slice 3, so every ``.execute()``
+    and the Storage ``upload`` are AsyncMocks."""
     supabase = MagicMock()
 
-    # prose get_latest → None (first upload)
-    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.eq.return_value.execute.return_value.data = []
+    # select chains (prose/optimized get_latest inline) → [] (first upload)
+    supabase.table.return_value.select.return_value.order.return_value.limit.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
 
-    # prose create_version → new doc
-    supabase.table.return_value.insert.return_value.execute.return_value.data = [
-        {
-            "id": "prose-1",
-            "user_id": None,
-            "version": 1,
-            "content": "test content",
-            "created_at": "2026-04-24T12:00:00Z",
-        }
-    ]
+    # inserts (prose create_version, uploaded_resumes) → new row
+    supabase.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[
+                {
+                    "id": "prose-1",
+                    "user_id": None,
+                    "version": 1,
+                    "content": "test content",
+                    "created_at": "2026-04-24T12:00:00Z",
+                }
+            ]
+        )
+    )
 
-    # storage mock
-    supabase.storage.from_.return_value.upload.return_value = None
+    # storage upload (async)
+    supabase.storage.from_.return_value.upload = AsyncMock(return_value=None)
 
     return supabase
 
@@ -66,7 +75,7 @@ class TestUploadResumeEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=None))
 
         from datetime import UTC, datetime
 
@@ -80,18 +89,18 @@ class TestUploadResumeEndpoint:
             created_at=datetime.now(UTC),
         )
         monkeypatch.setattr(
-            "app.services.experience.prose.create_version",
-            lambda *a, **kw: created_doc,
+            exp_router,
+            "_prose_create_version",
+            AsyncMock(return_value=created_doc),
         )
 
-        # Mock storage
-        monkeypatch.setattr(
-            "app.services.ingest.storage.upload_file",
-            lambda *a, **kw: "anon/upload-1.docx",
-        )
+        # Mock storage (async)
+        monkeypatch.setattr(exp_router, "upload_file", AsyncMock(return_value="anon/upload-1.docx"))
 
-        # Mock the upload tracking insert
-        supabase.table.return_value.insert.return_value.execute.return_value.data = [{}]
+        # Mock the upload tracking insert (async)
+        supabase.table.return_value.insert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[{}])
+        )
 
         file = _make_upload_file(docx_bytes)
         result = await exp_router.upload_resume(
@@ -265,14 +274,11 @@ class TestUploadResumeEndpoint:
             content="Existing career narrative here.",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr(
-            "app.services.experience.prose.get_latest",
-            lambda *a, **kw: existing_doc,
-        )
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=existing_doc))
 
         created_content: list[str] = []
 
-        def fake_create(supabase: Any, user_id: Any, content: str) -> ProseDoc:
+        async def fake_create(supabase: Any, user_id: Any, content: str) -> ProseDoc:
             created_content.append(content)
             return ProseDoc(
                 id="prose-new",
@@ -282,17 +288,11 @@ class TestUploadResumeEndpoint:
                 created_at=datetime.now(UTC),
             )
 
+        monkeypatch.setattr(exp_router, "_prose_create_version", fake_create)
+        monkeypatch.setattr(exp_router, "upload_file", AsyncMock(return_value="anon/upload-2.docx"))
         monkeypatch.setattr(
-            "app.services.experience.prose.create_version",
-            fake_create,
-        )
-        monkeypatch.setattr(
-            "app.services.ingest.storage.upload_file",
-            lambda *a, **kw: "anon/upload-2.docx",
-        )
-        monkeypatch.setattr(
-            "app.services.llm.cost_log.record",
-            MagicMock(),
+            "app.services.llm.cost_log.record_async",
+            AsyncMock(),
         )
 
         merged_doc = "Existing career narrative here.\nNew upload content"
@@ -326,24 +326,21 @@ class TestUploadResumeEndpoint:
 
         docx_bytes = _make_docx_bytes(["Career content"])
 
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=None))
         monkeypatch.setattr(
-            "app.services.experience.prose.get_latest",
-            lambda *a, **kw: None,
-        )
-        monkeypatch.setattr(
-            "app.services.experience.prose.create_version",
-            lambda *a, **kw: ProseDoc(
-                id="prose-1",
-                user_id=None,
-                version=1,
-                content="Career content",
-                created_at=datetime.now(UTC),
+            exp_router,
+            "_prose_create_version",
+            AsyncMock(
+                return_value=ProseDoc(
+                    id="prose-1",
+                    user_id=None,
+                    version=1,
+                    content="Career content",
+                    created_at=datetime.now(UTC),
+                )
             ),
         )
-        monkeypatch.setattr(
-            "app.services.ingest.storage.upload_file",
-            lambda *a, **kw: "anon/upload.docx",
-        )
+        monkeypatch.setattr(exp_router, "upload_file", AsyncMock(return_value="anon/upload.docx"))
 
         derive_called = {"count": 0}
 
@@ -364,20 +361,24 @@ class TestUploadResumeEndpoint:
             fake_derive,
         )
         monkeypatch.setattr(
-            "app.services.llm.cost_log.record",
-            MagicMock(),
+            "app.services.llm.cost_log.record_async",
+            AsyncMock(),
         )
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=None))
         monkeypatch.setattr(
-            "app.services.experience.optimized.create_version",
-            lambda *a, **kw: OptimizedDoc(
-                id="opt-1",
-                user_id=None,
-                prose_doc_id="prose-1",
-                version=1,
-                payload=OptimizedPayload(summary="Derived summary"),
-                markdown_view=None,
-                source="llm",
-                created_at=datetime.now(UTC),
+            exp_router,
+            "_optimized_create_version",
+            AsyncMock(
+                return_value=OptimizedDoc(
+                    id="opt-1",
+                    user_id=None,
+                    prose_doc_id="prose-1",
+                    version=1,
+                    payload=OptimizedPayload(summary="Derived summary"),
+                    markdown_view=None,
+                    source="llm",
+                    created_at=datetime.now(UTC),
+                )
             ),
         )
         monkeypatch.setattr(

@@ -11,12 +11,11 @@ unit-tested without a DB or embedding client.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from typing import Any, cast
 
 from pydantic import BaseModel, Field
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.embeddings import EmbeddingModelId
 from app.models.experience import Chunk, ChunkType, OptimizedDoc, OptimizedPayload
@@ -103,17 +102,17 @@ def chunks_for_optimized(payload: OptimizedPayload) -> list[ChunkInput]:
     return out
 
 
-def _delete_existing(supabase: Client, optimized_doc_id: str) -> None:
-    supabase.table(TABLE).delete().eq("optimized_doc_id", optimized_doc_id).execute()
+async def _delete_existing(supabase: AsyncClient, optimized_doc_id: str) -> None:
+    await supabase.table(TABLE).delete().eq("optimized_doc_id", optimized_doc_id).execute()
 
 
 async def upsert_for_optimized(
-    supabase: Client,
+    supabase: AsyncClient,
     embeddings: EmbeddingsClient,
     optimized: OptimizedDoc,
     *,
     user_id: str | None,
-    cost_supabase: Client | None = None,
+    cost_supabase: AsyncClient | None = None,
     # voyage-3 retired by Voyage 2026-07; 3.5 = same dims/price. Chunks are
     # model-tagged rows, so old v3 chunks coexist — but retrieval that mixes
     # spaces is meaningless; re-embed on next doc regeneration.
@@ -134,7 +133,7 @@ async def upsert_for_optimized(
     ``supabase`` for service-role callers (poller, batch) that pass one directly.
     """
     inputs = chunks_for_optimized(optimized.payload)
-    _delete_existing(supabase, optimized.id)
+    await _delete_existing(supabase, optimized.id)
 
     if not inputs:
         return []
@@ -144,7 +143,7 @@ async def upsert_for_optimized(
         inputs=[c.content for c in inputs],
         purpose=purpose,
     )
-    cost_log.record_embedding(
+    await cost_log.record_embedding_async(
         cost_supabase or supabase,
         user_id=user_id,
         purpose=purpose,
@@ -163,6 +162,6 @@ async def upsert_for_optimized(
         }
         for c, vector in zip(inputs, result.embeddings, strict=True)
     ]
-    resp = await asyncio.to_thread(lambda: supabase.table(TABLE).insert(rows).execute())
+    resp = await supabase.table(TABLE).insert(rows).execute()
     inserted = cast(list[dict[str, Any]], resp.data or [])
     return [Chunk.model_validate(r) for r in inserted]
