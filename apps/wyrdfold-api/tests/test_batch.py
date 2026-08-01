@@ -435,7 +435,6 @@ class TestBatchEndpoint:
 
         supabase = MagicMock()
         llm = MagicMock()
-        background = MagicMock()
 
         with patch(
             "app.routers.tailor._optimized_latest",
@@ -449,7 +448,6 @@ class TestBatchEndpoint:
                         job_posting_ids=["job-1"],
                         contact=_CONTACT,
                     ),
-                    background_tasks=background,
                     supabase=supabase,
                     llm=llm,
                 )
@@ -464,7 +462,6 @@ class TestBatchEndpoint:
         supabase = MagicMock()
         _set_mock_data(supabase, [])
         llm = MagicMock()
-        background = MagicMock()
 
         with patch(
             "app.routers.tailor._optimized_latest",
@@ -478,7 +475,6 @@ class TestBatchEndpoint:
                         job_posting_ids=["nonexistent"],
                         contact=_CONTACT,
                     ),
-                    background_tasks=background,
                     supabase=supabase,
                     llm=llm,
                 )
@@ -493,7 +489,18 @@ class TestBatchEndpoint:
         # Mock jobs lookup
         _set_mock_data(supabase, [{"id": "job-1", "title": "SWE", "description_html": "<p>JD</p>"}])
         llm = MagicMock()
-        background = MagicMock()
+
+        # The endpoint dispatches the batch via ``spawn_detached`` (create_task),
+        # NOT ``BackgroundTasks.add_task`` — the latter deadlocks the pooled async
+        # client under uvloop (see the handler docstring). Capture the dispatch and
+        # close the constructed-but-unrun coroutine to avoid a "never awaited" warning.
+        dispatched: list[str | None] = []
+
+        def _capture(coro: Any, *, name: str | None = None) -> None:
+            coro.close()
+            dispatched.append(name)
+
+        monkeypatch.setattr("app.routers.tailor.spawn_detached", _capture)
 
         monkeypatch.setattr(
             "app.routers.tailor._optimized_latest",
@@ -530,7 +537,6 @@ class TestBatchEndpoint:
                 job_posting_ids=["job-1"],
                 contact=_CONTACT,
             ),
-            background_tasks=background,
             supabase=supabase,
             llm=llm,
         )
@@ -538,7 +544,7 @@ class TestBatchEndpoint:
         assert result.batch_id == "batch-1"
         assert result.total == 1
         assert result.status == "pending"
-        background.add_task.assert_called_once()
+        assert dispatched == ["batch:batch-1"]  # dispatched once, with the batch-id name
 
     @pytest.mark.asyncio
     async def test_get_batch_not_found(self) -> None:

@@ -25,11 +25,12 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 from supabase import AsyncClient
 
+from app.background import spawn_detached
 from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
@@ -890,7 +891,6 @@ async def download_tailored_resume(
 async def create_batch_resumes(
     request: Request,
     body: BatchRequest,
-    background_tasks: BackgroundTasks,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     # JWT-required: batch generation stores each .docx under the caller's
@@ -904,8 +904,11 @@ async def create_batch_resumes(
     for progress.
 
     `async def`: the setup DB round-trips run natively on the async service
-    client (#57 slice 3); the background ``process_batch`` (an async task) is
-    handed the same pooled client via ``add_task`` (deferred, off the request).
+    client (#57 slice 3); ``process_batch`` (an async task on the SAME pooled
+    client) is spawned as a DETACHED task, NOT via starlette ``BackgroundTasks``
+    — ``add_task`` work on the pooled async client deadlocks the httpx pool under
+    uvloop (see app/background.py), which is why /analysis uses ``spawn_detached``
+    too.
     """
     current_optimized = await _optimized_latest(supabase, user_id=user_id)
     if current_optimized is None:
@@ -954,20 +957,22 @@ async def create_batch_resumes(
         job_posting_ids=body.job_posting_ids,
     )
 
-    background_tasks.add_task(
-        process_batch,
-        supabase,
-        llm,
-        batch_id=batch.id,
-        user_id=user_id,
-        optimized=current_optimized,
-        jobs=postings,
-        contact=contact,
-        preferences=prefs_payload,
-        resume_type=body.resume_type or "generic",
-        page_budget=body.page_budget,
-        force_fresh=body.force_fresh,
-        target_id=target_id,
+    spawn_detached(
+        process_batch(
+            supabase,
+            llm,
+            batch_id=batch.id,
+            user_id=user_id,
+            optimized=current_optimized,
+            jobs=postings,
+            contact=contact,
+            preferences=prefs_payload,
+            resume_type=body.resume_type or "generic",
+            page_budget=body.page_budget,
+            force_fresh=body.force_fresh,
+            target_id=target_id,
+        ),
+        name=f"batch:{batch.id}",
     )
 
     return BatchResponse(
