@@ -8,11 +8,10 @@ resolves it server-side. Request bodies may still pass an override for one-off
 generations, but the typical path is "no contact in body, read from profile".
 """
 
-import asyncio
 from typing import Any, cast
 
 from fastapi import HTTPException
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.models.tailor import ContactInfo
@@ -21,7 +20,7 @@ _IDENTITY_COLUMNS = "name, email, phone_number, location, linkedin_url, website_
 
 
 async def resolve_contact(
-    supabase: Client,
+    supabase: AsyncClient,
     user_id: str | None,
     override: ContactInfo | None = None,
 ) -> ContactInfo:
@@ -40,12 +39,9 @@ async def resolve_contact(
     if override is not None and override.name:
         return override
 
-    def _query() -> Any:
-        q = supabase.table("user_profiles").select(_IDENTITY_COLUMNS)
-        q = q.eq("user_id", resolve_owner(user_id))
-        return q.limit(1).execute()
-
-    resp = await asyncio.to_thread(_query)
+    q = supabase.table("user_profiles").select(_IDENTITY_COLUMNS)
+    q = q.eq("user_id", resolve_owner(user_id))
+    resp = await q.limit(1).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     row = rows[0] if rows else {}
     name = row.get("name")

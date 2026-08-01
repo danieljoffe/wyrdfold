@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -25,7 +25,7 @@ def _profile_supabase(profile_row: dict[str, Any] | None) -> MagicMock:
     chain.eq.return_value = chain
     chain.eq.return_value = chain
     chain.limit.return_value = chain
-    chain.execute.return_value = _ExecuteStub([profile_row] if profile_row else [])
+    chain.execute = AsyncMock(return_value=_ExecuteStub([profile_row] if profile_row else []))
 
     supabase = MagicMock()
     supabase.table.return_value = chain

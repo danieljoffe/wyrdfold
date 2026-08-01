@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel
-from supabase import Client
+from supabase import AsyncClient
 
 VERSIONS_TABLE = "document_versions"
 
@@ -33,8 +33,8 @@ class ResumeVersion(BaseModel):
     model_config = {"extra": "ignore"}
 
 
-def record(
-    supabase: Client,
+async def record(
+    supabase: AsyncClient,
     *,
     resume_id: str,
     payload: dict[str, Any],
@@ -54,11 +54,11 @@ def record(
     }
     if payload_md is not None:
         row["payload_md"] = payload_md
-    supabase.table(VERSIONS_TABLE).insert(row).execute()
-    _prune(supabase, resume_id=resume_id, keep=FREE_TIER_VERSION_CAP)
+    await supabase.table(VERSIONS_TABLE).insert(row).execute()
+    await _prune(supabase, resume_id=resume_id, keep=FREE_TIER_VERSION_CAP)
 
 
-def checkpoint(supabase: Client, resume_id: str) -> bool:
+async def checkpoint(supabase: AsyncClient, resume_id: str) -> bool:
     """Snapshot the resume's current payload_md as a 'user_edit' version,
     deduped against the most recent version's payload_md.
 
@@ -70,7 +70,7 @@ def checkpoint(supabase: Client, resume_id: str) -> bool:
     calls do NOT snapshot — that would flood the free-tier cap within
     minutes of typing.
     """
-    resume_resp = (
+    resume_resp = await (
         supabase.table("documents")
         .select("payload, payload_md")
         .eq("id", resume_id)
@@ -83,7 +83,7 @@ def checkpoint(supabase: Client, resume_id: str) -> bool:
     current_md = row.get("payload_md")
     current_payload = row.get("payload") or {}
 
-    last_resp = (
+    last_resp = await (
         supabase.table(VERSIONS_TABLE)
         .select("payload_md")
         .eq("resume_id", resume_id)
@@ -95,7 +95,7 @@ def checkpoint(supabase: Client, resume_id: str) -> bool:
     if last_rows and last_rows[0].get("payload_md") == current_md:
         return False
 
-    record(
+    await record(
         supabase,
         resume_id=resume_id,
         payload=current_payload,
@@ -105,9 +105,9 @@ def checkpoint(supabase: Client, resume_id: str) -> bool:
     return True
 
 
-def list_for_resume(supabase: Client, resume_id: str) -> list[ResumeVersion]:
+async def list_for_resume(supabase: AsyncClient, resume_id: str) -> list[ResumeVersion]:
     """Most recent versions first. Capped at FREE_TIER_VERSION_CAP by storage."""
-    resp = (
+    resp = await (
         supabase.table(VERSIONS_TABLE)
         .select("*")
         .eq("resume_id", resume_id)
@@ -119,11 +119,11 @@ def list_for_resume(supabase: Client, resume_id: str) -> list[ResumeVersion]:
     return [ResumeVersion.model_validate(r) for r in rows]
 
 
-def _prune(supabase: Client, *, resume_id: str, keep: int) -> None:
+async def _prune(supabase: AsyncClient, *, resume_id: str, keep: int) -> None:
     """Delete oldest versions beyond `keep`. Two-step (read ids, delete) keeps
     us in PostgREST without needing a custom RPC.
     """
-    resp = (
+    resp = await (
         supabase.table(VERSIONS_TABLE)
         .select("id")
         .eq("resume_id", resume_id)
@@ -134,4 +134,4 @@ def _prune(supabase: Client, *, resume_id: str, keep: int) -> None:
     if len(rows) <= keep:
         return
     expired_ids = [r["id"] for r in rows[keep:]]
-    supabase.table(VERSIONS_TABLE).delete().in_("id", expired_ids).execute()
+    await supabase.table(VERSIONS_TABLE).delete().in_("id", expired_ids).execute()
