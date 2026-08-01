@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.feedback import (
     FeedbackRow,
@@ -118,8 +118,14 @@ def _parse_row(row: dict[str, Any]) -> FeedbackRow:
     return FeedbackRow.model_validate(row)
 
 
-def upsert_feedback(
-    supabase: Client,
+# `async def` on the async user client (#57 slice 4): the interactive
+# job_feedback CRUD runs natively on the event loop, off the threadpool. The
+# deterministic learner below stays sync — it leans on the shared #191
+# profile-write RPC + ``bulk_score_for_target`` (service-role, poller-shared),
+# so an async fork would twin those; the async handlers drive it via
+# ``asyncio.to_thread`` on the pooled sync client instead.
+async def upsert_feedback(
+    supabase: AsyncClient,
     *,
     user_id: str,
     job_posting_id: str,
@@ -143,7 +149,7 @@ def upsert_feedback(
         "updated_at": datetime.now(UTC).isoformat(),
     }
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .upsert(payload, on_conflict="user_id,job_posting_id,target_id")
         .execute()
     )
@@ -153,10 +159,12 @@ def upsert_feedback(
     return _parse_row(rows[0])
 
 
-def delete_feedback(supabase: Client, *, user_id: str, job_posting_id: str, target_id: str) -> bool:
+async def delete_feedback(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, target_id: str
+) -> bool:
     """Remove a feedback row. Returns True if a row was deleted."""
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .delete()
         .eq("user_id", user_id)
         .eq("job_posting_id", job_posting_id)
@@ -167,8 +175,8 @@ def delete_feedback(supabase: Client, *, user_id: str, job_posting_id: str, targ
     return bool(rows)
 
 
-def list_for_target(
-    supabase: Client,
+async def list_for_target(
+    supabase: AsyncClient,
     *,
     user_id: str,
     target_id: str,
@@ -179,7 +187,7 @@ def list_for_target(
     from postgrest import CountMethod
 
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .select("*", count=CountMethod.exact)
         .eq("user_id", user_id)
         .eq("target_id", target_id)
