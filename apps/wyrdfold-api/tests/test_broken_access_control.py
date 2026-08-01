@@ -12,11 +12,12 @@ M3 — GET /targets/{id} and GET /targets/{id}/reference-jds must reject
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase,
@@ -167,15 +168,18 @@ def test_delete_job_unowned_posting_is_404(
 
 
 def test_target_status_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-mine"})
-    crud_get = MagicMock()
-    monkeypatch.setattr(crud, "get", crud_get)
+    # #57 slice 3: the handler inlines the crud reads as async helpers.
+    from app.routers import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "_user_target_ids", AsyncMock(return_value={"tgt-mine"}))
+    target_get = AsyncMock()
+    monkeypatch.setattr(targets_mod, "_target_get", target_get)
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
         }
@@ -187,32 +191,37 @@ def test_target_status_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
         app.dependency_overrides.clear()
 
     # 404'd on ownership BEFORE reading the target row.
-    crud_get.assert_not_called()
+    target_get.assert_not_called()
 
 
 def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> None:
     """api-key/operator path (user_id None) bypasses ownership."""
 
-    def _get_user_target_ids(*_a: Any, **_kw: Any) -> set[str]:
+    from app.routers import targets as targets_mod
+
+    def _user_target_ids(*_a: Any, **_kw: Any) -> set[str]:
         raise AssertionError("ownership check should be skipped for operators")
 
-    monkeypatch.setattr(crud, "get_user_target_ids", _get_user_target_ids)
+    monkeypatch.setattr(targets_mod, "_user_target_ids", _user_target_ids)
 
     target = MagicMock()
     target.activation_status = "ready"
-    monkeypatch.setattr(crud, "get", lambda *_a, **_kw: target)
+    monkeypatch.setattr(targets_mod, "_target_get", AsyncMock(return_value=target))
 
     supabase = MagicMock()
-    # Count chain: .select(count).eq(target_id).eq(excluded).eq(job_is_live)
+    # Count chain: .select(count).eq(target_id).eq(excluded).eq(job_is_live).
+    # The handler now AWAITS the count round-trip on the async client, so the
+    # terminal ``.execute`` is an AsyncMock; the rest of the chain stays a plain
+    # MagicMock so the call-arg introspection below still works.
     (
-        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value.count
-    ) = 3
+        supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.execute
+    ) = AsyncMock(return_value=MagicMock(count=3))
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: supabase,
+            get_async_service_supabase: lambda: supabase,
             verify_api_key_or_jwt: lambda: None,
             get_current_user_id_optional: lambda: None,
         }
@@ -245,15 +254,17 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_get_target_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-mine"})
-    crud_get = MagicMock()
-    monkeypatch.setattr(crud, "get", crud_get)
+    from app.routers import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "_user_target_ids", AsyncMock(return_value={"tgt-mine"}))
+    target_get = AsyncMock()
+    monkeypatch.setattr(targets_mod, "_target_get", target_get)
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
         }
@@ -264,7 +275,7 @@ def test_get_target_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         app.dependency_overrides.clear()
 
-    crud_get.assert_not_called()
+    target_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +284,17 @@ def test_get_target_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_reference_jds_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-mine"})
-    list_ref = MagicMock()
-    monkeypatch.setattr(crud, "list_reference_jds", list_ref)
+    from app.routers import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "_user_target_ids", AsyncMock(return_value={"tgt-mine"}))
+    list_ref = AsyncMock()
+    monkeypatch.setattr(targets_mod, "_list_reference_jds_async", list_ref)
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
         }
@@ -303,8 +316,9 @@ def test_reference_jds_strips_contributor_user_id(
     from datetime import UTC, datetime
 
     from app.models.targets import ScoringProfile, TargetReferenceJD
+    from app.routers import targets as targets_mod
 
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-mine"})
+    monkeypatch.setattr(targets_mod, "_user_target_ids", AsyncMock(return_value={"tgt-mine"}))
     ref = TargetReferenceJD(
         id="ref-1",
         target_id="tgt-mine",
@@ -315,13 +329,13 @@ def test_reference_jds_strips_contributor_user_id(
         suppressed=False,
         created_at=datetime.now(UTC),
     )
-    monkeypatch.setattr(crud, "list_reference_jds", lambda *_a, **_kw: [ref])
+    monkeypatch.setattr(targets_mod, "_list_reference_jds_async", AsyncMock(return_value=[ref]))
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
         }
