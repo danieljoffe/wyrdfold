@@ -18,12 +18,12 @@ import contextlib
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 
 import httpx
 import jwt
 import pytest
-from supabase import Client, create_client
+from supabase import AsyncClient, Client, create_client
 
 from app import supabase_pool
 
@@ -105,6 +105,26 @@ def user_client_factory(
 
     def _make(user_id: str) -> Client:
         return supabase_pool.get_user_client(_mint_user_jwt(user_id))
+
+    return _make
+
+
+@pytest.fixture
+def async_user_client_factory(
+    _require_stack: None, monkeypatch: pytest.MonkeyPatch
+) -> Callable[[str], Awaitable[AsyncClient]]:
+    """Async mirror of ``user_client_factory`` (#57 slice 3). Points the app's
+    async per-request user-client factory at the local stack, then hands back a
+    builder that mints a JWT for ``user_id`` and awaits the exact async client
+    the API uses in production (``supabase_pool.get_async_user_client``).
+    """
+    monkeypatch.setattr(supabase_pool.settings, "supabase_url", LOCAL_URL)
+    monkeypatch.setattr(supabase_pool.settings, "supabase_anon_key", ANON_KEY)
+    # Force a fresh real async pool (other tests monkeypatch this to a mock).
+    monkeypatch.setattr(supabase_pool, "_async_user_httpx", None)
+
+    async def _make(user_id: str) -> AsyncClient:
+        return await supabase_pool.get_async_user_client(_mint_user_jwt(user_id))
 
     return _make
 
