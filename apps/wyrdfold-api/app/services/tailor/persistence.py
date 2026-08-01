@@ -21,7 +21,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.constants import resolve_owner
 from app.models.llm import LLMResult
@@ -75,7 +75,7 @@ def download_docx(supabase: Client, storage_path: str) -> bytes:
     return supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
 
 
-def purge_user_objects(supabase: Client, user_id: str) -> int:
+async def purge_user_objects(supabase: AsyncClient, user_id: str) -> int:
     """Delete every object under the user's ``<user_id>/`` prefix.
 
     Returns the number of objects removed. Used by account deletion
@@ -83,15 +83,15 @@ def purge_user_objects(supabase: Client, user_id: str) -> int:
     than one storage page; bounded to avoid an unbounded loop if a
     backend ever fails to remove. Paths are flat
     (``<user_id>/<resume_id>.docx``), so a single-level listing suffices.
-    """
+    Async on the pooled client (#57 slice 3)."""
     bucket = supabase.storage.from_(STORAGE_BUCKET)
     removed = 0
     for _ in range(1000):  # safety bound: 1000 pages
-        listing = bucket.list(user_id) or []
+        listing = await bucket.list(user_id) or []
         names = [obj["name"] for obj in listing if obj.get("name")]
         if not names:
             break
-        bucket.remove([f"{user_id}/{name}" for name in names])
+        await bucket.remove([f"{user_id}/{name}" for name in names])
         removed += len(names)
     return removed
 

@@ -19,10 +19,12 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 from app.dependencies import (
+    get_async_service_supabase,
+    get_async_user_supabase,
     get_current_user_email,
     get_current_user_id,
     get_supabase,
@@ -88,7 +90,7 @@ _ONBOARDING_COLUMNS = "onboarding_completed_at, onboarding_path, onboarding_curr
 
 
 async def _get_or_create_profile(
-    supabase: Client,
+    supabase: AsyncClient,
     user_id: str,
     columns: str,
     seed_email: str | None = None,
@@ -105,14 +107,12 @@ async def _get_or_create_profile(
     rows aren't touched, since the user may have intentionally cleared
     or changed the value in Settings.
     """
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles")
-            .select(columns)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
+    resp = (
+        await supabase.table("user_profiles")
+        .select(columns)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
     )
     rows = resp.data or []
     if rows:
@@ -121,26 +121,33 @@ async def _get_or_create_profile(
     seed: dict[str, Any] = {"user_id": user_id}
     if seed_email:
         seed["email"] = seed_email
-    insert = await asyncio.to_thread(lambda: supabase.table("user_profiles").insert(seed).execute())
+    insert = await supabase.table("user_profiles").insert(seed).execute()
     if not insert.data:
         raise HTTPException(status_code=500, detail="Failed to create profile")
-    resp2 = await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles")
-            .select(columns)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
+    resp2 = (
+        await supabase.table("user_profiles")
+        .select(columns)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
     )
     return cast(dict[str, Any], (resp2.data or [{}])[0])
+
+
+async def _update_profile(supabase: AsyncClient, user_id: str, updates: dict[str, Any]) -> None:
+    """Apply a partial update to the caller's ``user_profiles`` row.
+
+    A module-level async helper so the handlers hold no inline ``.execute()``
+    on the loop (#57 slice 3): the write awaits natively on the pooled user
+    client, and RLS (``auth.uid() = user_id``) scopes it to the row owner."""
+    await supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
 
 
 @router.get("/notifications")
 async def get_notification_preferences(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> NotificationPreferences:
     row = await _get_or_create_profile(supabase, user_id, _PREFS_COLUMNS, seed_email=user_email)
     return NotificationPreferences(
@@ -155,7 +162,7 @@ async def update_notification_preferences(
     body: NotificationPreferencesUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> NotificationPreferences:
     if body.job_notifications_enabled is True and not _email_channel_available():
         raise HTTPException(
@@ -180,9 +187,7 @@ async def update_notification_preferences(
             sms_available=_sms_channel_available(),
         )
 
-    await asyncio.to_thread(
-        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
-    )
+    await _update_profile(supabase, user_id, updates)
 
     merged = {**profile, **updates}
     return NotificationPreferences(
@@ -201,7 +206,7 @@ async def update_notification_preferences(
 async def get_identity(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> IdentityFields:
     row = await _get_or_create_profile(supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email)
     return IdentityFields(**row)
@@ -212,7 +217,7 @@ async def update_identity(
     body: IdentityFieldsUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> IdentityFields:
     profile = await _get_or_create_profile(
         supabase, user_id, _IDENTITY_COLUMNS, seed_email=user_email
@@ -227,9 +232,7 @@ async def update_identity(
     if not updates:
         return IdentityFields(**profile)
 
-    await asyncio.to_thread(
-        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
-    )
+    await _update_profile(supabase, user_id, updates)
 
     merged = {**profile, **updates}
     return IdentityFields(**merged)
@@ -256,7 +259,7 @@ def _read_style(row: dict[str, Any]) -> ResumeStyleSettings:
 async def get_resume_style(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> ResumeStyleSettings:
     row = await _get_or_create_profile(
         supabase, user_id, _RESUME_STYLE_COLUMNS, seed_email=user_email
@@ -269,7 +272,7 @@ async def update_resume_style(
     body: ResumeStyleSettingsUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> ResumeStyleSettings:
     profile = await _get_or_create_profile(
         supabase, user_id, _RESUME_STYLE_COLUMNS, seed_email=user_email
@@ -281,14 +284,7 @@ async def update_resume_style(
         return current
 
     merged = current.model_copy(update=updates)
-    await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles")
-            .update({"resume_style_settings": merged.model_dump()})
-            .eq("user_id", user_id)
-            .execute()
-        )
-    )
+    await _update_profile(supabase, user_id, {"resume_style_settings": merged.model_dump()})
     return merged
 
 
@@ -334,7 +330,7 @@ def _read_onboarding(row: dict[str, Any]) -> OnboardingStatus:
 async def get_onboarding_status(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> OnboardingStatus:
     """Return the user's onboarding progress.
 
@@ -353,7 +349,7 @@ async def update_onboarding_step(
     body: OnboardingStepUpdate,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> OnboardingStatus:
     """Update the user's current onboarding step (and optionally path).
 
@@ -370,9 +366,7 @@ async def update_onboarding_step(
     if body.current_step is not None:
         updates["onboarding_current_step"] = body.current_step
     if updates:
-        await asyncio.to_thread(
-            lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
-        )
+        await _update_profile(supabase, user_id, updates)
 
     row = await _get_or_create_profile(
         supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
@@ -384,7 +378,7 @@ async def update_onboarding_step(
 async def complete_onboarding(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> OnboardingStatus:
     """Mark the user's onboarding as complete.
 
@@ -409,9 +403,7 @@ async def complete_onboarding(
         # a clean way to pass a `now()` literal anyway.
         updates["onboarding_completed_at"] = datetime.now(UTC).isoformat()
 
-    await asyncio.to_thread(
-        lambda: supabase.table("user_profiles").update(updates).eq("user_id", user_id).execute()
-    )
+    await _update_profile(supabase, user_id, updates)
 
     fresh = await _get_or_create_profile(
         supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
@@ -423,7 +415,7 @@ async def complete_onboarding(
 async def reset_onboarding(
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> OnboardingStatus:
     """Clear the user's onboarding completion + step state so the wizard
     treats them as fresh.
@@ -443,18 +435,10 @@ async def reset_onboarding(
     """
     await _get_or_create_profile(supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email)
 
-    await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles")
-            .update(
-                {
-                    "onboarding_completed_at": None,
-                    "onboarding_current_step": None,
-                }
-            )
-            .eq("user_id", user_id)
-            .execute()
-        )
+    await _update_profile(
+        supabase,
+        user_id,
+        {"onboarding_completed_at": None, "onboarding_current_step": None},
     )
 
     fresh = await _get_or_create_profile(
@@ -465,6 +449,14 @@ async def reset_onboarding(
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)
 async def get_llm_usage(
+    # `/llm-usage` stays on the SYNC clients (#57 slice 3 holdout): its entire
+    # DB access flows through shared sync budget/cost_log helpers
+    # (resolve_llm_quota, total_spend, total_billable_spend) that the analysis /
+    # tailor / poller verticals + enforce_llm_budget still call — converting
+    # them belongs to the LLM-budget vertical, not this one, and inlining the
+    # billing-critical quota logic here would duplicate it. The `_snapshot`
+    # nested-fn runs via `asyncio.to_thread`, so the blocking calls never touch
+    # the event loop (the #107 guard's `test_scanner_skips_nested_def_scope`).
     supabase: Client = Depends(get_user_supabase),
     user_id: str = Depends(get_current_user_id),
     # Dual-client (the analysis.py pattern): the quota RESOLUTION needs
@@ -579,7 +571,7 @@ async def get_llm_usage(
 @router.delete("/account")
 async def delete_account(
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
     """Right-to-erasure (#29): permanently delete the caller's account.
 
@@ -596,15 +588,15 @@ async def delete_account(
     """
     from app.services import account_deletion
 
-    report = await asyncio.to_thread(account_deletion.delete_account, supabase, user_id=user_id)
+    report = await account_deletion.delete_account(supabase, user_id=user_id)
     return {"deleted": True, "report": report}
 
 
 @router.get("/export")
 async def export_account_data(
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_user_supabase),
-    service_supabase: Client = Depends(get_supabase),  # RLS-gap reads only
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+    service_supabase: AsyncClient = Depends(get_async_service_supabase),  # RLS-gap reads only
 ) -> Response:
     """Personal-data export / portability (#29 P2).
 
@@ -634,8 +626,7 @@ async def export_account_data(
     # the streaming generator's finally once the response body has been sent.
     spool = tempfile.SpooledTemporaryFile(max_size=_EXPORT_SPOOL_MAX_MEMORY)  # noqa: SIM115
     try:
-        await asyncio.to_thread(
-            data_export.write_export_zip,
+        await data_export.write_export_zip(
             supabase,
             spool,
             user_id=user_id,

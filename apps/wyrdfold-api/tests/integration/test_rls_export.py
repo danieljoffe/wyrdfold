@@ -22,11 +22,11 @@ proves the three claims that justify the flip:
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.services.data_export import build_export_zip, collect_user_data
 
@@ -165,18 +165,22 @@ def _normalized(data: dict[str, list[dict[str, Any]]]) -> dict[str, list[str]]:
     }
 
 
-def test_dual_client_export_identical_to_service_role(
-    service_client: Client,
-    user_client_factory: Callable[[str], Client],
+async def test_dual_client_export_identical_to_service_role(
+    async_service_client: AsyncClient,
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     seeded_export_user: tuple[str, str],
 ) -> None:
     """Row-for-row equivalence: flipping the per-user reads onto the RLS
     user client must not change the export by a single row."""
     uid_a, _ = seeded_export_user
-    flipped = collect_user_data(
-        user_client_factory(uid_a), user_id=uid_a, service_supabase=service_client
+    flipped = await collect_user_data(
+        await async_user_client_factory(uid_a),
+        user_id=uid_a,
+        service_supabase=async_service_client,
     )
-    pre_flip = collect_user_data(service_client, user_id=uid_a, service_supabase=service_client)
+    pre_flip = await collect_user_data(
+        async_service_client, user_id=uid_a, service_supabase=async_service_client
+    )
     assert _normalized(flipped) == _normalized(pre_flip)
     # The seeds actually landed — an empty==empty pass would prove nothing.
     for table in (
@@ -197,9 +201,9 @@ def test_dual_client_export_identical_to_service_role(
     }
 
 
-def test_zip_inventory_identical_across_clients(
-    service_client: Client,
-    user_client_factory: Callable[[str], Client],
+async def test_zip_inventory_identical_across_clients(
+    async_service_client: AsyncClient,
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     seeded_export_user: tuple[str, str],
 ) -> None:
     """End-to-end ZIP diff: same file inventory (incl. Storage objects) and
@@ -208,10 +212,14 @@ def test_zip_inventory_identical_across_clients(
     import zipfile
 
     uid_a, _ = seeded_export_user
-    flipped = build_export_zip(
-        user_client_factory(uid_a), user_id=uid_a, service_supabase=service_client
+    flipped = await build_export_zip(
+        await async_user_client_factory(uid_a),
+        user_id=uid_a,
+        service_supabase=async_service_client,
     )
-    pre_flip = build_export_zip(service_client, user_id=uid_a, service_supabase=service_client)
+    pre_flip = await build_export_zip(
+        async_service_client, user_id=uid_a, service_supabase=async_service_client
+    )
     zf_flipped = zipfile.ZipFile(io.BytesIO(flipped))
     zf_pre = zipfile.ZipFile(io.BytesIO(pre_flip))
     assert sorted(zf_flipped.namelist()) == sorted(zf_pre.namelist())
@@ -252,9 +260,9 @@ def test_gap_tables_break_on_the_user_client(
     assert "unfollowed-target contribution" not in visible
 
 
-def test_rls_backstop_blocks_cross_user_export(
-    service_client: Client,
-    user_client_factory: Callable[[str], Client],
+async def test_rls_backstop_blocks_cross_user_export(
+    async_service_client: AsyncClient,
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     seeded_export_user: tuple[str, str],
 ) -> None:
     """The flip's payoff: B's client collecting with A's user_id gets ZERO
@@ -262,8 +270,9 @@ def test_rls_backstop_blocks_cross_user_export(
     ``.eq("user_id", uid_a)`` filters ask for A's data. Before the flip the
     service-role client would have returned everything."""
     uid_a, uid_b = seeded_export_user
-    stolen = collect_user_data(
-        user_client_factory(uid_b), user_id=uid_a, service_supabase=service_client
+    client_b = await async_user_client_factory(uid_b)
+    stolen = await collect_user_data(
+        client_b, user_id=uid_a, service_supabase=async_service_client
     )
     for table in (
         "user_targets",
@@ -279,4 +288,4 @@ def test_rls_backstop_blocks_cross_user_export(
     # No profile row visible -> the notifications_sent service read never runs.
     assert "notifications_sent" not in stolen
     # And B's client cannot list A's Storage prefix.
-    assert (user_client_factory(uid_b).storage.from_(_BUCKET).list(uid_a) or []) == []
+    assert (await client_b.storage.from_(_BUCKET).list(uid_a) or []) == []
