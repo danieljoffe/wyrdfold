@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, get_supabase, verify_api_key
 from app.services.llm import cost_log
 from app.services.retention import purge_expired_records
 from app.supabase_pool import get_async_supabase
@@ -100,6 +100,10 @@ class CostSummaryResponse(BaseModel):
     )
 
 
+# Sync `def` (residual, #57 slice 4): reads the ``cost_log.*_all`` aggregates,
+# which stay synchronous because the poller imports ``total_spend_all`` — making
+# them async would ripple into the poller (out of scope). FastAPI threadpools
+# this handler, keeping the blocking round-trips off the event loop (#107).
 @router.get("/cost-summary", response_model=CostSummaryResponse)
 def get_cost_summary(
     supabase: Client = Depends(get_supabase),
@@ -211,23 +215,34 @@ class WaitlistInviteResult(BaseModel):
     from_waitlist: bool
 
 
-# Sync `def`: blocking supabase read in the threadpool (#107).
-@router.get("/waitlist", response_model=WaitlistListResponse)
-def list_waitlist(
-    pending: bool = False,
-    supabase: Client = Depends(get_supabase),
-) -> WaitlistListResponse:
-    """The operator's funnel view; ``?pending=true`` = not yet invited."""
+# Module-level async helper so the handler holds no inline ``.execute()`` on the
+# loop (#57 slice 4) — the CI guard scans only router handlers.
+async def _fetch_waitlist(supabase: AsyncClient, *, pending: bool) -> list[Any]:
     query = (
         supabase.table("waitlist_signups").select("email,created_at,invited_at").order("created_at")
     )
     if pending:
         query = query.is_("invited_at", "null")
-    rows = query.execute().data or []
+    resp = await query.execute()
+    return resp.data or []
+
+
+# Native async handler (#57 slice 4): the read runs on the pooled async service
+# client instead of a threadpool worker.
+@router.get("/waitlist", response_model=WaitlistListResponse)
+async def list_waitlist(
+    pending: bool = False,
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> WaitlistListResponse:
+    """The operator's funnel view; ``?pending=true`` = not yet invited."""
+    rows = await _fetch_waitlist(supabase, pending=pending)
     return WaitlistListResponse(entries=[WaitlistEntry.model_validate(r) for r in rows])
 
 
-# Sync `def`: blocking supabase + auth-admin work in the threadpool (#107).
+# Sync `def` (documented holdout, #57 slice 4): built around
+# ``auth.admin.invite_user_by_email`` (async auth-admin coverage is uncertain);
+# FastAPI threadpools the whole handler, keeping its blocking supabase +
+# auth-admin work off the event loop (#107).
 @router.post("/waitlist/invite", response_model=WaitlistInviteResult)
 def invite_from_waitlist(
     body: WaitlistInviteRequest,
@@ -297,11 +312,25 @@ class SignupModeResult(BaseModel):
     mode: str
 
 
-# Sync `def`: blocking supabase write in the threadpool (#107).
+# Module-level async helper so the handler holds no inline ``.execute()`` on the
+# loop (#57 slice 4) — the CI guard scans only router handlers.
+async def _upsert_signup_mode(supabase: AsyncClient, mode: str) -> None:
+    await supabase.table("app_settings").upsert(
+        {
+            "key": "signup_mode",
+            "value": mode,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="key",
+    ).execute()
+
+
+# Native async handler (#57 slice 4): the write runs on the pooled async service
+# client instead of a threadpool worker.
 @router.post("/signup-mode", response_model=SignupModeResult)
-def set_signup_mode(
+async def set_signup_mode(
     body: SignupModeRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> SignupModeResult:
     """The open-signup flip lever (Phase 3 slice 5).
 
@@ -310,13 +339,6 @@ def set_signup_mode(
     Supabase config push, no redeploy. The public `GET /signup-mode`
     and the FE follow the same row.
     """
-    supabase.table("app_settings").upsert(
-        {
-            "key": "signup_mode",
-            "value": body.mode,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="key",
-    ).execute()
+    await _upsert_signup_mode(supabase, body.mode)
     logger.warning("signup_mode set to '%s' by operator", body.mode)
     return SignupModeResult(mode=body.mode)

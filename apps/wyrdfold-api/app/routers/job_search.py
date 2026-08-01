@@ -20,15 +20,14 @@ gating change, not a rewrite.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import cast
 
 from fastapi import APIRouter, Depends, Query, Request
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache, make_cache_key
-from app.dependencies import get_supabase, verify_api_key_or_jwt
+from app.dependencies import get_async_service_supabase, verify_api_key_or_jwt
 from app.models.job_search import JobSearchResponse
 from app.rate_limit import limiter
 from app.services import job_search, search_events
@@ -62,7 +61,7 @@ async def search_jobs_endpoint(
         le=job_search.MAX_SALARY_FLOOR,
         description="Only postings whose yearly USD salary range reaches this floor",
     ),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> JobSearchResponse:
     """Keyword search over the live, US jobs corpus (one page).
 
@@ -102,11 +101,10 @@ async def search_jobs_endpoint(
         _instrument(response)
         return response
 
-    # supabase-py is blocking; offload the round-trip off the event loop.
-    # search + the page snippet (both blocking round-trips in one worker thread).
-    # The card-grid UX (#467 §11) shows a preview on every result, authed too.
-    results, has_more = await asyncio.to_thread(
-        job_search.search_jobs_with_snippets,
+    # Native async round-trips on the pooled service client (#57 slice 4): search
+    # + the page snippet. The card-grid UX (#467 §11) shows a preview on every
+    # result, authed too.
+    results, has_more = await job_search.search_jobs_with_snippets(
         supabase,
         q=q,
         limit=page_size,

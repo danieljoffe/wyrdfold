@@ -12,10 +12,10 @@ from typing import Any, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from supabase import Client
+from supabase import AsyncClient
 
 from app.dependencies import (
-    get_supabase,
+    get_async_service_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -40,55 +40,97 @@ router = APIRouter(
 _SOURCE_LIST_COLS = "id, board_token, company_name, provider, enabled, job_count"
 
 
-# Sync `def` (not `async def`): the supabase-py client is synchronous, so
-# FastAPI runs these handlers in its threadpool — keeping the blocking
-# `.execute()` round-trips off the event loop. See #107.
+# Module-level async helpers so the handlers hold no inline ``.execute()`` on the
+# loop (#57 slice 4): each awaits natively on the pooled async service client. The
+# CI guard (tests/test_no_blocking_supabase_in_async_handlers.py) scans only the
+# router handlers, so the query bodies live here.
+async def _fetch_source_list(supabase: AsyncClient) -> list[Any]:
+    resp = await supabase.table("sources").select(_SOURCE_LIST_COLS).order("company_name").execute()
+    return resp.data or []
+
+
+async def _upsert_source(
+    supabase: AsyncClient, *, board_token: str, company_name: str, provider: str
+) -> dict[str, Any] | None:
+    resp = await (
+        supabase.table("sources")
+        .upsert(
+            {
+                "board_token": board_token,
+                "company_name": company_name,
+                "provider": provider,
+            },
+            on_conflict="board_token",
+        )
+        .execute()
+    )
+    return cast("dict[str, Any]", resp.data[0]) if resp.data else None
+
+
+async def _delete_source(supabase: AsyncClient, *, board_token: str) -> None:
+    await supabase.table("sources").delete().eq("board_token", board_token).execute()
+
+
+async def _source_enabled(supabase: AsyncClient, *, board_token: str) -> dict[str, Any] | None:
+    resp = await (
+        supabase.table("sources")
+        .select("enabled")
+        .eq("board_token", board_token)
+        .single()
+        .execute()
+    )
+    return cast("dict[str, Any] | None", resp.data)
+
+
+async def _set_source_enabled(supabase: AsyncClient, *, board_token: str, enabled: bool) -> None:
+    await (
+        supabase.table("sources")
+        .update({"enabled": enabled})
+        .eq("board_token", board_token)
+        .execute()
+    )
+
+
+async def _seed_source_catalog(supabase: AsyncClient) -> None:
+    await supabase.table("sources").upsert(list(COMPANY_SEED), on_conflict="board_token").execute()
+
+
+# Native async handlers (#57 slice 4): DB round-trips run on the event loop via
+# the pooled async service client, so they no longer tie up a threadpool worker.
 @router.get("")
-def list_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
-    resp = supabase.table("sources").select(_SOURCE_LIST_COLS).order("company_name").execute()
-    return {"sources": resp.data or []}
+async def list_sources(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> dict[str, Any]:
+    return {"sources": await _fetch_source_list(supabase)}
 
 
 @router.post("", dependencies=[Depends(verify_api_key)])
-def manage_source(
+async def manage_source(
     body: SourceAction,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
     if body.action == "add":
         if not body.company_name:
             raise HTTPException(status_code=422, detail="company_name required for add")
-        resp = (
-            supabase.table("sources")
-            .upsert(
-                {
-                    "board_token": body.board_token,
-                    "company_name": body.company_name,
-                    "provider": body.provider,
-                },
-                on_conflict="board_token",
-            )
-            .execute()
+        source = await _upsert_source(
+            supabase,
+            board_token=body.board_token,
+            company_name=body.company_name,
+            provider=body.provider,
         )
-        return {"success": True, "source": resp.data[0] if resp.data else None}
+        return {"success": True, "source": source}
 
     elif body.action == "remove":
-        supabase.table("sources").delete().eq("board_token", body.board_token).execute()
+        await _delete_source(supabase, board_token=body.board_token)
         return {"success": True}
 
     elif body.action == "toggle":
-        current = (
-            supabase.table("sources")
-            .select("enabled")
-            .eq("board_token", body.board_token)
-            .single()
-            .execute()
-        )
-        if current.data:
-            row = cast(dict[str, Any], current.data)
-            new_enabled = not row["enabled"]
-            supabase.table("sources").update({"enabled": new_enabled}).eq(
-                "board_token", body.board_token
-            ).execute()
+        current = await _source_enabled(supabase, board_token=body.board_token)
+        if current:
+            new_enabled = not current["enabled"]
+            await _set_source_enabled(
+                supabase, board_token=body.board_token, enabled=new_enabled
+            )
             return {"success": True, "enabled": new_enabled}
         return {"error": "Source not found"}
 
@@ -133,6 +175,8 @@ async def detect_provider(
 
 
 @router.post("/seed", dependencies=[Depends(verify_api_key)])
-def seed_sources(supabase: Client = Depends(get_supabase)) -> dict[str, Any]:
-    supabase.table("sources").upsert(list(COMPANY_SEED), on_conflict="board_token").execute()
+async def seed_sources(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> dict[str, Any]:
+    await _seed_source_catalog(supabase)
     return {"success": True, "seeded": len(COMPANY_SEED)}

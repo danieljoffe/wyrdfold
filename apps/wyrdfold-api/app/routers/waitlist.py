@@ -19,16 +19,15 @@ SECURITY POSTURE (audit #29):
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from supabase import Client
+from supabase import AsyncClient
 
-from app.dependencies import get_supabase, require_bff_secret
+from app.dependencies import get_async_service_supabase, require_bff_secret
 from app.models.waitlist import WaitlistSignup, WaitlistSignupResponse
 from app.rate_limit import limiter
 
@@ -42,15 +41,15 @@ router = APIRouter(tags=["waitlist"])
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-def _insert_signup(supabase: Client, email: str) -> None:
-    """Idempotent insert via the service-role client.
+async def _insert_signup(supabase: AsyncClient, email: str) -> None:
+    """Idempotent insert via the async service-role client.
 
     ``ignore_duplicates=True`` → ``ON CONFLICT DO NOTHING``: a duplicate is
     NOT an error here, it just means the address is already on the list, which
     we surface identically to a fresh signup (no enumeration). The
     case-insensitive unique index de-dupes regardless of caller casing.
     """
-    (
+    await (
         supabase.table("waitlist_signups")
         .upsert(
             {"email": email},
@@ -72,7 +71,7 @@ def _insert_signup(supabase: Client, email: str) -> None:
 async def join_waitlist(
     request: Request,
     body: WaitlistSignup,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> WaitlistSignupResponse:
     """Public, unauthenticated waitlist join.
 
@@ -89,10 +88,8 @@ async def join_waitlist(
         raise HTTPException(status_code=422, detail="Please enter a valid email address.")
 
     try:
-        # supabase-py is synchronous; ``to_thread`` keeps the blocking
-        # ``.execute()`` round-trip off the event loop (repo #107 convention,
-        # enforced by tests/test_no_blocking_supabase_in_async_handlers.py).
-        await asyncio.to_thread(_insert_signup, supabase, email)
+        # Native async round-trip on the pooled service client (#57 slice 4).
+        await _insert_signup(supabase, email)
     except Exception:
         # Generic 500 — no internal detail (PostgREST/SQL fragments) leaked.
         logger.exception("waitlist signup failed")
@@ -107,16 +104,24 @@ class SignupModeResponse(BaseModel):
     mode: Literal["closed", "open"]
 
 
-# Sync `def`: blocking supabase read in the threadpool (#107).
+# Module-level async helper so the handler holds no inline ``.execute()`` on the
+# loop (#57 slice 4) — the CI guard scans only router handlers.
+async def _read_signup_mode_rows(supabase: AsyncClient) -> list[dict[str, str]]:
+    resp = await supabase.table("app_settings").select("value").eq("key", "signup_mode").execute()
+    return cast("list[dict[str, str]]", resp.data or [])
+
+
+# Native async handler (#57 slice 4): the read runs on the pooled async service
+# client instead of tying up a threadpool worker.
 @router.get(
     "/signup-mode",
     response_model=SignupModeResponse,
     dependencies=[Depends(require_bff_secret)],  # SEC-5: BFF-only (see join_waitlist)
 )
 @limiter.limit("30/minute")
-def get_signup_mode(
+async def get_signup_mode(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> SignupModeResponse:
     """Public perimeter probe (Phase 3 slice 5).
 
@@ -128,11 +133,7 @@ def get_signup_mode(
     """
     mode: Literal["closed", "open"] = "closed"
     try:
-        rows = cast(
-            "list[dict[str, str]]",
-            supabase.table("app_settings").select("value").eq("key", "signup_mode").execute().data
-            or [],
-        )
+        rows = await _read_signup_mode_rows(supabase)
         if rows and rows[0].get("value") == "open":
             mode = "open"
     except Exception:

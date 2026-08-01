@@ -12,7 +12,7 @@ import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,8 +25,6 @@ from app.models.experience import (
     Role,
 )
 from app.services.conversation import orchestrator
-from app.services.experience import optimized as optimized_mod
-from app.services.experience import prose as prose_mod
 from app.services.experience import turns as turns_mod
 from app.services.llm import cost_log as cost_log_mod
 from app.services.llm.mock import MockLLMClient
@@ -71,10 +69,12 @@ def _llm_response(
 
 @pytest.fixture
 def mock_service_layer(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    """Patch the service-module attributes the orchestrator imports.
+    """Patch the async service seams the orchestrator now calls (#57 slice 4).
 
-    Return a dict of mocks so each test can tune return values and assert
-    on call args.
+    Since slice 4 the orchestrator runs on the async client via its own inline
+    helpers (``_prose_latest`` / ``_prose_create_version``) and awaits
+    ``turns.*`` / ``cost_log.record_async``, so these are AsyncMocks. Return a
+    dict of mocks so each test can tune return values and assert on call args.
     """
     appended: list[dict[str, Any]] = []
 
@@ -83,13 +83,13 @@ def mock_service_layer(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         return _turn(kwargs["role"], kwargs["content"], kwargs.get("skipped", False))
 
     mocks: dict[str, MagicMock] = {
-        "turns_list": MagicMock(return_value=[]),
-        "turns_append": MagicMock(side_effect=fake_append),
-        "prose_get_latest": MagicMock(return_value=None),
-        "prose_create_version": MagicMock(
+        "turns_list": AsyncMock(return_value=[]),
+        "turns_append": AsyncMock(side_effect=fake_append),
+        "prose_get_latest": AsyncMock(return_value=None),
+        "prose_create_version": AsyncMock(
             side_effect=lambda _s, user_id, content: _prose(content, version=2)
         ),
-        "cost_log_record": MagicMock(return_value=None),
+        "cost_log_record": AsyncMock(return_value=None),
         "_appended_turns": appended,  # type: ignore[dict-item]
     }
 
@@ -97,9 +97,9 @@ def mock_service_layer(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     # handle_turn reads the capped LLM window via list_recent_turns; same mock.
     monkeypatch.setattr(turns_mod, "list_recent_turns", mocks["turns_list"])
     monkeypatch.setattr(turns_mod, "append", mocks["turns_append"])
-    monkeypatch.setattr(prose_mod, "get_latest", mocks["prose_get_latest"])
-    monkeypatch.setattr(prose_mod, "create_version", mocks["prose_create_version"])
-    monkeypatch.setattr(cost_log_mod, "record", mocks["cost_log_record"])
+    monkeypatch.setattr(orchestrator, "_prose_latest", mocks["prose_get_latest"])
+    monkeypatch.setattr(orchestrator, "_prose_create_version", mocks["prose_create_version"])
+    monkeypatch.setattr(cost_log_mod, "record_async", mocks["cost_log_record"])
     return mocks
 
 
@@ -294,7 +294,7 @@ async def test_handle_turn_annotates_skipped_history(
 async def test_next_probe_returns_default_when_no_optimized_doc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(optimized_mod, "get_latest", lambda _s, user_id: None)
+    monkeypatch.setattr(orchestrator, "_optimized_latest", AsyncMock(return_value=None))
     result = await orchestrator.next_probe(MagicMock(), MockLLMClient(), user_id=None)
     assert result.gap is None
     assert "most recent role" in result.question.lower()
@@ -327,8 +327,8 @@ async def test_next_probe_phrases_gap_via_llm(
         source="llm",
         created_at=datetime.now(UTC),
     )
-    monkeypatch.setattr(optimized_mod, "get_latest", lambda _s, user_id: opt_doc)
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(orchestrator, "_optimized_latest", AsyncMock(return_value=opt_doc))
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(
         scripted={orchestrator.PURPOSE_PROBE: "What number would you lead with from FC?"}
@@ -339,12 +339,21 @@ async def test_next_probe_phrases_gap_via_llm(
     assert result.question.startswith("What")
 
 
-def test_reset_content_deletes_three_tables() -> None:
+def _reset_supabase_mock() -> MagicMock:
+    """A MagicMock whose ``.table(t).delete().eq(...).execute()`` is awaitable
+    and yields an empty result set (#57 slice 4 — reset_content is now async)."""
     supabase = MagicMock()
     delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.is_.return_value.execute.return_value.data = []
+    delete_chain.eq.return_value.execute = AsyncMock(
+        return_value=SimpleNamespace(data=[])
+    )
+    return supabase
 
-    result = orchestrator.reset_content(supabase, user_id=None)
+
+async def test_reset_content_deletes_three_tables() -> None:
+    supabase = _reset_supabase_mock()
+
+    result = await orchestrator.reset_content(supabase, user_id=None)
 
     tables_deleted = [c.args[0] for c in supabase.table.call_args_list]
     assert "experience_prose_docs" in tables_deleted
@@ -353,14 +362,12 @@ def test_reset_content_deletes_three_tables() -> None:
     assert result.prose_versions_deleted == 0
 
 
-def test_reset_content_keeps_turns_when_include_turns_false() -> None:
+async def test_reset_content_keeps_turns_when_include_turns_false() -> None:
     """Deleting just the master document (DELETE /experience/prose) wipes prose
     + the derived optimized doc but preserves conversation turns."""
-    supabase = MagicMock()
-    delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.is_.return_value.execute.return_value.data = []
+    supabase = _reset_supabase_mock()
 
-    result = orchestrator.reset_content(supabase, user_id=None, include_turns=False)
+    result = await orchestrator.reset_content(supabase, user_id=None, include_turns=False)
 
     tables_deleted = [c.args[0] for c in supabase.table.call_args_list]
     assert "experience_prose_docs" in tables_deleted
@@ -411,7 +418,7 @@ class _RecordingQuery:
     def eq(self, *_a: Any, **_kw: Any) -> _RecordingQuery:
         return self
 
-    def execute(self) -> Any:
+    async def execute(self) -> Any:
         return SimpleNamespace(data=self._rows)
 
 
@@ -430,14 +437,14 @@ def _turn_row(idx: int) -> dict[str, Any]:
     }
 
 
-def test_list_recent_turns_queries_newest_first_and_returns_ascending() -> None:
+async def test_list_recent_turns_queries_newest_first_and_returns_ascending() -> None:
     """The window must be the LAST N turns (query desc + limit), handed back
     in conversation order (ascending) for the prompt."""
     calls: dict[str, Any] = {}
     # DB answers newest-first, as the desc query would.
     stub = _RecordingQuery([_turn_row(5), _turn_row(4), _turn_row(3)], calls)
 
-    result = turns_mod.list_recent_turns(
+    result = await turns_mod.list_recent_turns(
         cast(Any, stub), user_id="u", conversation_type="onboarding", limit=3
     )
 

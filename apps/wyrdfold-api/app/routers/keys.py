@@ -18,11 +18,11 @@ a per-user key story (Voyage stays on the instance key; Twilio with #13).
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Path, status
-from supabase import Client
+from supabase import AsyncClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
-    get_supabase,
     verify_supabase_jwt,
 )
 from app.models.keys import (
@@ -63,24 +63,24 @@ def _require_byok_configured() -> None:
 
 
 @router.get("", response_model=UserApiKeysResponse)
-def list_keys(
+async def list_keys(
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> UserApiKeysResponse:
     """Non-secret metadata for the caller's stored keys, plus whether BYOK
     is available on this instance (``BYOK_MASTER_KEY`` configured). When
     unavailable the key list is empty and the UI hides the fields."""
     available = keys.is_configured()
-    meta = keys.list_key_meta(supabase, user_id=user_id) if available else []
+    meta = await keys.list_key_meta(supabase, user_id=user_id) if available else []
     return UserApiKeysResponse(available=available, keys=meta)
 
 
 @router.put("/{provider}", response_model=UserApiKeyMeta)
-def put_key(
+async def put_key(
     body: SetUserApiKeyRequest,
     provider: Provider = Path(...),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> UserApiKeyMeta:
     """Add or replace the caller's key for ``provider`` (write-only).
 
@@ -100,9 +100,9 @@ def put_key(
     # this pre-read can race a concurrent set/delete but only mislabels,
     # never errors. The key write + the returned metadata are one atomic
     # upsert, so there's no read-back that a concurrent delete could defeat.
-    existing = keys.list_key_meta(supabase, user_id=user_id)
+    existing = await keys.list_key_meta(supabase, user_id=user_id)
     rotating = any(m.provider == provider for m in existing)
-    return keys.set_key(
+    return await keys.set_key(
         supabase,
         user_id=user_id,
         provider=provider,
@@ -112,14 +112,14 @@ def put_key(
 
 
 @router.delete("/{provider}")
-def delete_key(
+async def delete_key(
     provider: Provider = Path(...),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, bool]:
     """Remove the caller's key for ``provider``. Idempotent: deleting a key
     that isn't there returns ``{"deleted": false}`` rather than 404 — the
     desired end-state (no key) holds either way."""
     _require_v1_provider(provider)
-    deleted = keys.delete_key(supabase, user_id=user_id, provider=provider)
+    deleted = await keys.delete_key(supabase, user_id=user_id, provider=provider)
     return {"deleted": deleted}

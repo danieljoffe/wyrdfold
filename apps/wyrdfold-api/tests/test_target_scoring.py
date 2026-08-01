@@ -689,7 +689,7 @@ def test_rescore_endpoint_returns_count(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import get_supabase, verify_api_key, verify_api_key_or_jwt
+    from app.dependencies import verify_api_key, verify_api_key_or_jwt
     from app.main import app
     from app.routers import jobs as jobs_router
 
@@ -698,7 +698,8 @@ def test_rescore_endpoint_returns_count(
     monkeypatch.setattr(jobs_router, "bulk_score_for_target", lambda *_a, **_kw: 42)
 
     supabase = MagicMock()
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    # #57 slice 4: the sync service client is fetched in-body, not a Depends.
+    monkeypatch.setattr(jobs_router, "get_supabase", lambda: supabase)
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     # /rescore now requires the operator-only ``verify_api_key`` dep —
     # not callable from the FE, so the route's auth model is api-key.
@@ -720,14 +721,14 @@ def test_rescore_endpoint_missing_target_returns_404(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import get_supabase, verify_api_key, verify_api_key_or_jwt
+    from app.dependencies import verify_api_key, verify_api_key_or_jwt
     from app.main import app
     from app.routers import jobs as jobs_router
 
     monkeypatch.setattr(jobs_router, "get_target", lambda *_a, **_kw: None)
 
     supabase = MagicMock()
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    monkeypatch.setattr(jobs_router, "get_supabase", lambda: supabase)
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[verify_api_key] = lambda: "test"
 

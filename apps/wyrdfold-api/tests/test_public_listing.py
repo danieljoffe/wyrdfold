@@ -18,14 +18,14 @@ same preview projection). These mirror ``test_public_search.py`` and pin:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from app.cache import job_list_cache
 from app.config import Settings
-from app.dependencies import get_settings, get_supabase
+from app.dependencies import get_async_service_supabase, get_settings
 from app.main import app
 from app.models.job_search import JobSearchResult
 from app.routers import public_search
@@ -59,13 +59,13 @@ def _stub_get_listing(
     """Patch the service so the endpoint returns a controlled row (or the
     None → 404 path), recording each forwarded id."""
 
-    def fake(supabase, listing_id: str) -> JobSearchResult | None:
+    async def fake(supabase, listing_id: str) -> JobSearchResult | None:
         if calls is not None:
             calls.append(listing_id)
         return result
 
     monkeypatch.setattr(public_search.job_search, "get_listing", fake)
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
 
 
 # ---- shape (a preview: no score, no JD body; snippet riding along) ----------
@@ -112,7 +112,7 @@ def test_missing_id_is_404(monkeypatch) -> None:
     assert r.status_code == 404
 
 
-def test_delisted_row_is_the_same_404_via_the_eligibility_gate(monkeypatch) -> None:
+async def test_delisted_row_is_the_same_404_via_the_eligibility_gate(monkeypatch) -> None:
     """An archived/purged/non-US row must 404 exactly like a missing one.
 
     The gate lives in the SERVICE query (the same live/US predicate as
@@ -126,12 +126,14 @@ def test_delisted_row_is_the_same_404_via_the_eligibility_gate(monkeypatch) -> N
     qb.not_.is_.return_value = qb
     qb.eq.return_value = qb
     qb.limit.return_value = qb
-    qb.execute.return_value.data = []  # filtered out (or absent) → no rows
+    result = MagicMock()
+    result.data = []  # filtered out (or absent) → no rows
+    qb.execute = AsyncMock(return_value=result)
     sb = MagicMock()
     sb.table.return_value = qb
 
     rid = str(uuid4())
-    assert job_search.get_listing(sb, rid) is None
+    assert await job_search.get_listing(sb, rid) is None
 
     qb.is_.assert_any_call("archived_at", "null")
     qb.is_.assert_any_call("purged_at", "null")
@@ -139,7 +141,7 @@ def test_delisted_row_is_the_same_404_via_the_eligibility_gate(monkeypatch) -> N
     qb.eq.assert_called_once_with("id", rid)
 
 
-def test_service_attaches_the_snippet_to_a_live_row(monkeypatch) -> None:
+async def test_service_attaches_the_snippet_to_a_live_row(monkeypatch) -> None:
     """``get_listing`` runs the existing snippet helper over the single row."""
     rid = str(uuid4())
     qb = MagicMock()
@@ -148,21 +150,21 @@ def test_service_attaches_the_snippet_to_a_live_row(monkeypatch) -> None:
     qb.not_.is_.return_value = qb
     qb.eq.return_value = qb
     qb.limit.return_value = qb
-    qb.execute.return_value.data = [
-        {"id": rid, "title": "Frontend Engineer", "company_name": "Acme"}
-    ]
+    result = MagicMock()
+    result.data = [{"id": rid, "title": "Frontend Engineer", "company_name": "Acme"}]
+    qb.execute = AsyncMock(return_value=result)
     sb = MagicMock()
     sb.table.return_value = qb
 
     seen: dict[str, Any] = {}
 
-    def fake_attach(supabase, results, **kw) -> None:
+    async def fake_attach(supabase, results, **kw) -> None:
         seen["ids"] = [r.id for r in results]
         results[0].snippet = "Preview."
 
     monkeypatch.setattr(job_search, "attach_snippets", fake_attach)
 
-    out = job_search.get_listing(sb, rid)
+    out = await job_search.get_listing(sb, rid)
     assert out is not None
     assert out.snippet == "Preview."
     assert seen["ids"] == [rid]  # page-only fetch: exactly this row

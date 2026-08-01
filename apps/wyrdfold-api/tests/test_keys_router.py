@@ -10,14 +10,14 @@ not the crypto/store internals (covered by test_byok_keys.py).
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
-    get_supabase,
     verify_supabase_jwt,
 )
 from app.main import app
@@ -37,7 +37,7 @@ def _meta(provider: str = "openrouter", last4: str = "ab12") -> UserApiKeyMeta:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_supabase_jwt] = lambda: "user-1"
     yield TestClient(app)
@@ -48,7 +48,7 @@ def test_get_lists_meta_when_available(client, monkeypatch):
     from app.routers import keys as router_mod
 
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
-    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()])
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", AsyncMock(return_value=[_meta()]))
 
     resp = client.get("/profile/keys")
 
@@ -86,9 +86,9 @@ def test_put_new_key_sets_without_rotation(client, monkeypatch):
     set_calls: list[dict] = []
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
     # Rotation check sees nothing → first-time set.
-    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [])
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", AsyncMock(return_value=[]))
 
-    def _set_key(*_a, **k):
+    async def _set_key(*_a, **k):
         set_calls.append(k)
         return _meta()  # the atomic upsert returns its own row metadata
 
@@ -110,9 +110,9 @@ def test_put_replacing_existing_key_marks_rotation(client, monkeypatch):
 
     set_calls: list[dict] = []
     monkeypatch.setattr(router_mod.keys, "is_configured", lambda: True)
-    monkeypatch.setattr(router_mod.keys, "list_key_meta", lambda *_a, **_k: [_meta()])
+    monkeypatch.setattr(router_mod.keys, "list_key_meta", AsyncMock(return_value=[_meta()]))
 
-    def _set_key(*_a, **k):
+    async def _set_key(*_a, **k):
         set_calls.append(k)
         return _meta(last4="9999")
 
@@ -179,7 +179,7 @@ def test_delete_returns_true_when_removed(client, monkeypatch):
 
     delete_calls: list[dict] = []
 
-    def _delete(*_a, **k):
+    async def _delete(*_a, **k):
         delete_calls.append(k)
         return True
 
@@ -196,7 +196,7 @@ def test_delete_returns_true_when_removed(client, monkeypatch):
 def test_delete_idempotent_when_absent(client, monkeypatch):
     from app.routers import keys as router_mod
 
-    monkeypatch.setattr(router_mod.keys, "delete_key", lambda *_a, **_k: False)
+    monkeypatch.setattr(router_mod.keys, "delete_key", AsyncMock(return_value=False))
 
     resp = client.delete("/profile/keys/openrouter")
 

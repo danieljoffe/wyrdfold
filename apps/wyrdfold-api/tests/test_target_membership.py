@@ -14,13 +14,13 @@ counted ANY scores row and off-family listings badged as In "<target>" on
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -74,7 +74,7 @@ def _mock_sb(
             ],
             "scores": score_rows,
         }[name]
-        qb.execute.return_value.data = data
+        qb.execute = AsyncMock(return_value=MagicMock(data=data))
         return qb
 
     sb = MagicMock(name="supabase")
@@ -82,7 +82,7 @@ def _mock_sb(
     return sb
 
 
-def test_membership_maps_listings_to_the_callers_targets() -> None:
+async def test_membership_maps_listings_to_the_callers_targets() -> None:
     sb = _mock_sb(
         user_target_ids=["t1", "t2"],
         labels={"t1": "Frontend Roles", "t2": "Staff SWE"},
@@ -92,14 +92,14 @@ def test_membership_maps_listings_to_the_callers_targets() -> None:
             {"job_posting_id": "b", "target_id": "t1"},
         ],
     )
-    out = _membership(sb, _USER, ["a", "b", "c"])
+    out = await _membership(sb, _USER, ["a", "b", "c"])
     assert {r.target_id for r in out["a"]} == {"t1", "t2"}
     assert out["a"][0].label in {"Frontend Roles", "Staff SWE"}
     assert [r.target_id for r in out["b"]] == ["t1"]
     assert "c" not in out  # not in any of the caller's targets
 
 
-def test_scores_read_is_scoped_to_the_callers_targets_not_request() -> None:
+async def test_scores_read_is_scoped_to_the_callers_targets_not_request() -> None:
     """The authz guarantee: the scores read filters on the CALLER's own target
     ids (from user_targets) — a foreign target is never queried, so membership in
     another user's target can't leak, whatever ids the request carries."""
@@ -110,12 +110,12 @@ def test_scores_read_is_scoped_to_the_callers_targets_not_request() -> None:
         score_rows=[{"job_posting_id": "a", "target_id": "mine-1"}],
         capture=capture,
     )
-    _membership(sb, _USER, ["a", "b"])
+    await _membership(sb, _USER, ["a", "b"])
     # The scores read was bounded to the caller's own target ids — nothing else.
     assert capture["scores_target_filter"] == ["mine-1"]
 
 
-def test_off_family_rows_never_badge() -> None:
+async def test_off_family_rows_never_badge() -> None:
     """The prod bug: a customer_experience listing must not badge as a member
     of an engineering target, however its scores row looks. Untagged jobs
     (NULL family) keep the benefit of the doubt — the #277 keep-null rule."""
@@ -129,13 +129,13 @@ def test_off_family_rows_never_badge() -> None:
             {"job_posting_id": "untagged", "target_id": "t-eng", "job_role_family": None},
         ],
     )
-    out = _membership(sb, _USER, ["cx", "eng", "untagged"])
+    out = await _membership(sb, _USER, ["cx", "eng", "untagged"])
     assert "cx" not in out
     assert [r.label for r in out["eng"]] == ["Senior Frontend Engineer"]
     assert "untagged" in out  # keep-null
 
 
-def test_unclassified_target_is_ungated() -> None:
+async def test_unclassified_target_is_ungated() -> None:
     """A target with NULL role_family accepts any job family (#277)."""
     sb = _mock_sb(
         user_target_ids=["t"],
@@ -143,10 +143,10 @@ def test_unclassified_target_is_ungated() -> None:
         families={"t": None},
         score_rows=[{"job_posting_id": "cx", "target_id": "t", "job_role_family": "customer_experience"}],
     )
-    assert "cx" in _membership(sb, _USER, ["cx"])
+    assert "cx" in await _membership(sb, _USER, ["cx"])
 
 
-def test_scores_read_requires_promising_and_non_excluded() -> None:
+async def test_scores_read_requires_promising_and_non_excluded() -> None:
     """Membership is 'in the pipeline', not 'was ever evaluated': the scores
     read itself must ask for ``promising IS TRUE`` and ``excluded IS FALSE``.
     Pinned at the filter level (the stub can't drop rows server-side)."""
@@ -157,17 +157,17 @@ def test_scores_read_requires_promising_and_non_excluded() -> None:
         score_rows=[],
         capture=capture,
     )
-    _membership(sb, _USER, ["a"])
+    await _membership(sb, _USER, ["a"])
     assert ("promising", True) in capture["scores_eq_filters"]
     assert ("excluded", False) in capture["scores_eq_filters"]
 
 
-def test_no_targets_or_no_ids_returns_empty() -> None:
+async def test_no_targets_or_no_ids_returns_empty() -> None:
     empty_ids = _mock_sb(user_target_ids=["t1"], labels={"t1": "X"}, score_rows=[])
-    assert _membership(empty_ids, _USER, []) == {}  # no ids → no query
+    assert await _membership(empty_ids, _USER, []) == {}  # no ids → no query
 
     no_targets = _mock_sb(user_target_ids=[], labels={}, score_rows=[])
-    assert _membership(no_targets, _USER, ["a"]) == {}  # no targets → nothing
+    assert await _membership(no_targets, _USER, ["a"]) == {}  # no targets → nothing
 
 
 def test_endpoint_requires_auth_and_returns_memberships() -> None:
@@ -178,7 +178,7 @@ def test_endpoint_requires_auth_and_returns_memberships() -> None:
     )
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
     app.dependency_overrides[get_current_user_id] = lambda: _USER
-    app.dependency_overrides[get_user_supabase] = lambda: sb
+    app.dependency_overrides[get_async_user_supabase] = lambda: sb
 
     r = TestClient(app).post(
         "/jobs/target-membership", json={"job_posting_ids": ["a", "b"]}

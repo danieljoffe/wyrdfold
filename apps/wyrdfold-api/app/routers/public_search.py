@@ -29,16 +29,15 @@ SECURITY POSTURE — mirrors the waitlist, the app's other public endpoint:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache, make_cache_key
-from app.dependencies import get_supabase, require_bff_secret
+from app.dependencies import get_async_service_supabase, require_bff_secret
 from app.models.job_search import JobSearchResponse, JobSearchResult
 from app.rate_limit import limiter
 from app.services import job_search, search_events
@@ -100,7 +99,7 @@ async def public_search_endpoint(
         le=job_search.MAX_SALARY_FLOOR,
         description="Only postings whose yearly USD salary range reaches this floor",
     ),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> JobSearchResponse:
     """Public keyword search over the live, US jobs corpus (one shallow page).
 
@@ -140,10 +139,9 @@ async def public_search_endpoint(
         _instrument(response)
         return response
 
-    # supabase-py is blocking; offload both round-trips (search + the page snippet
-    # fetch) onto one worker thread off the event loop (#107).
-    results, has_more = await asyncio.to_thread(
-        job_search.search_jobs_with_snippets,
+    # Native async round-trips on the pooled service client (#57 slice 4): search
+    # + the page snippet fetch.
+    results, has_more = await job_search.search_jobs_with_snippets(
         supabase,
         q=q,
         limit=page_size,
@@ -163,7 +161,7 @@ async def public_search_endpoint(
 async def public_listing_endpoint(
     request: Request,
     listing_id: UUID,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> JobSearchResult:
     """One public listing by id — the shareable `/search/<id>` URL's data read
     (#467 §11.2 fast-follow).
@@ -184,9 +182,9 @@ async def public_listing_endpoint(
     if cached is not None:
         return cast(JobSearchResult, cached)
 
-    # supabase-py is blocking; offload both round-trips (row + snippet) onto one
-    # worker thread off the event loop (#107).
-    result = await asyncio.to_thread(job_search.get_listing, supabase, str(listing_id))
+    # Native async round-trips on the pooled service client (row + snippet, #57
+    # slice 4).
+    result = await job_search.get_listing(supabase, str(listing_id))
     if result is None:
         raise HTTPException(status_code=404, detail="Listing not found")
     job_list_cache.set(cache_key, result)

@@ -48,6 +48,15 @@ def _patch_size_cap_fetch(
     return mock
 
 
+def _patch_service_client(monkeypatch, client) -> None:
+    """The handler now fetches its sync service-role client in-body via
+    ``get_supabase()`` (the retired sync ``Depends`` is gone, #57 slice 4), so
+    tests inject the mock by patching that getter rather than a kwarg."""
+    from app.routers import jobs as jobs_router
+
+    monkeypatch.setattr(jobs_router, "get_supabase", lambda: client)
+
+
 JSONLD_HTML = """
 <html><head>
 <script type="application/ld+json">
@@ -90,14 +99,13 @@ class TestManualJobEndpoint:
         mock_upsert = MagicMock()
         mock_upsert.execute = MagicMock(return_value=MagicMock(data=[{"id": "posting-uuid-1"}]))
         mock_supabase.table.return_value.upsert.return_value = mock_upsert
+        _patch_service_client(monkeypatch, mock_supabase)
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
-        result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-1"
@@ -152,30 +160,21 @@ class TestManualJobEndpoint:
         mock_service.table.return_value.upsert.return_value.execute = MagicMock(
             return_value=MagicMock(data=[{"id": "posting-uuid-r2"}])
         )
-        mock_caller = MagicMock()
+        _patch_service_client(monkeypatch, mock_service)
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/jobs/r2")
-        result = await add_manual_job(
-            request=MagicMock(),
-            body=body,
-            user_id="user-a",
-            supabase=mock_service,
-            caller_supabase=mock_caller,
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id="user-a")
 
         assert result.posting_id == "posting-uuid-r2"
         # Per-target scoring ran on the SERVICE-ROLE client, gated (SEC-H2).
         assert captured["score_client"] is mock_service
         assert captured["gated"] is True
-        # Force-include went through the gated RPC on the service-role client,
-        # NOT the user/caller client.
+        # Force-include went through the gated RPC on the service-role client.
         rpc_names = [c.args[0] for c in mock_service.rpc.call_args_list]
         assert "user_set_scores_included" in rpc_names
-        caller_rpc_names = [c.args[0] for c in mock_caller.rpc.call_args_list]
-        assert "user_set_scores_included" not in caller_rpc_names
 
     @pytest.mark.asyncio
     async def test_user_overrides(self, monkeypatch):
@@ -187,6 +186,8 @@ class TestManualJobEndpoint:
             data=[{"id": "posting-uuid-2"}]
         )
 
+        _patch_service_client(monkeypatch, mock_supabase)
+
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
@@ -195,9 +196,7 @@ class TestManualJobEndpoint:
             title="My Custom Title",
             company_name="Override Corp",
         )
-        result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert result.success is True
         # User overrides should win
@@ -215,7 +214,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="not-a-url")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(request=MagicMock(), body=body, user_id=None)
         assert exc_info.value.status_code == 400
         assert "Malformed" in exc_info.value.detail
 
@@ -228,7 +227,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://www.ziprecruiter.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(request=MagicMock(), body=body, user_id=None)
         assert exc_info.value.status_code == 400
         assert "Banned" in exc_info.value.detail
 
@@ -241,9 +240,7 @@ class TestManualJobEndpoint:
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/opaque-page")
-        result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert result.success is False
         assert result.needs_manual_fields is True
@@ -258,6 +255,7 @@ class TestManualJobEndpoint:
         mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
             data=[{"id": "posting-uuid-3"}]
         )
+        _patch_service_client(monkeypatch, mock_supabase)
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
@@ -267,9 +265,7 @@ class TestManualJobEndpoint:
             title="Manually Entered Job",
             company_name="Some Company",
         )
-        result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-3"
@@ -288,12 +284,13 @@ class TestManualJobEndpoint:
         mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
             data=[{"id": "uuid"}]
         )
+        _patch_service_client(monkeypatch, mock_supabase)
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url=url)
-        await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
+        await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         upsert_call = mock_supabase.table.return_value.upsert.call_args
         row = upsert_call[0][0]
@@ -310,7 +307,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(request=MagicMock(), body=body, user_id=None)
         assert exc_info.value.status_code == 400
         assert "fetch" in exc_info.value.detail.lower()
 
@@ -325,7 +322,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://legit.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(request=MagicMock(), body=body, user_id=None)
         assert exc_info.value.status_code == 400
         assert "banned" in exc_info.value.detail.lower()
 
@@ -339,14 +336,13 @@ class TestManualJobEndpoint:
         mock_supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(
             data=[{"id": "posting-uuid-1"}]
         )
+        _patch_service_client(monkeypatch, mock_supabase)
 
         from app.models.schemas import ManualJobRequest
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
-        result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        result = await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert result.success is True
 
@@ -383,6 +379,7 @@ class TestManualJobEndpoint:
         mock_supabase.table.return_value.upsert.return_value.execute.side_effect = APIError(
             {"message": raw_pg_message}
         )
+        _patch_service_client(monkeypatch, mock_supabase)
 
         from fastapi import HTTPException
 
@@ -391,9 +388,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-            )
+            await add_manual_job(request=MagicMock(), body=body, user_id=None)
 
         assert exc_info.value.status_code == 502
         # No raw Postgres internals leak to the client.

@@ -23,15 +23,14 @@ this pins the corrected wiring.)
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_supabase,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -82,10 +81,18 @@ def _wire(
     target: object | None,
     captured: dict[str, object],
 ) -> None:
-    """Patch the router's collaborators and capture which client each receives."""
-    monkeypatch.setattr("app.routers.jobs._load_live_job", lambda sb, jid: job)
+    """Patch the router's collaborators and capture which client each receives.
 
-    def fake_get_user_target(sb, uid, tid):
+    Post-#57-slice-4 the handler is ``async``: the ownership reads are awaited on
+    the async user client (``_load_live_job`` / ``_get_user_target_async``), and
+    the service-role writes run on a sync service client fetched in-body via
+    ``get_supabase()`` and driven off-loop via ``to_thread`` (so ``get_target`` /
+    ``score_and_upsert`` / ``upsert_user_job`` stubs stay plain sync)."""
+
+    async def fake_load_live_job(sb, jid):
+        return job
+
+    async def fake_get_user_target(sb, uid, tid):
         captured["ownership_client"] = sb
         return object() if follows_target else None
 
@@ -97,7 +104,6 @@ def _wire(
         captured["score_kwargs"] = kwargs
         return _fake_score()
 
-
     def fake_upsert_user_job(sb, **kwargs):
         captured["userjob_client"] = sb
         captured["userjob_kwargs"] = kwargs
@@ -105,14 +111,16 @@ def _wire(
     def _boom(*_a: object, **_k: object) -> None:
         raise AssertionError("materialize_and_score_job must never run on the add path")
 
-    monkeypatch.setattr("app.routers.jobs.get_user_target", fake_get_user_target)
+    monkeypatch.setattr("app.routers.jobs._load_live_job", fake_load_live_job)
+    monkeypatch.setattr("app.routers.jobs._get_user_target_async", fake_get_user_target)
     monkeypatch.setattr("app.routers.jobs.get_target", fake_get_target)
     monkeypatch.setattr("app.routers.jobs.score_and_upsert", fake_score_and_upsert)
     monkeypatch.setattr("app.routers.jobs.materialize_and_score_job", _boom)
     monkeypatch.setattr("app.routers.jobs.persistence.upsert_user_job", fake_upsert_user_job)
+    # The service-role client is now fetched in-body (not injected as a Depends).
+    monkeypatch.setattr("app.routers.jobs.get_supabase", lambda: service_sb)
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
-    app.dependency_overrides[get_supabase] = lambda: service_sb
-    app.dependency_overrides[get_user_supabase] = lambda: user_sb
+    app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _USER_ID
 
 
@@ -218,20 +226,23 @@ def _query_stub(rows: list[dict[str, Any]]) -> tuple[MagicMock, MagicMock]:
     q.is_.return_value = q
     q.not_.is_.return_value = q
     q.limit.return_value = q
-    q.execute.return_value.data = rows
+    # #57 slice 4: ``_load_live_job`` awaits the terminal ``.execute()`` on the
+    # async user client, so the terminal call is an AsyncMock; the rest of the
+    # chain stays plain MagicMock so the call-arg introspection still works.
+    q.execute = AsyncMock(return_value=MagicMock(data=rows))
     sb = MagicMock(name="supabase")
     sb.table.return_value = q
     return sb, q
 
 
-def test_load_live_job_applies_the_live_us_predicate() -> None:
+async def test_load_live_job_applies_the_live_us_predicate() -> None:
     """Only a LIVE, US posting is addable — the loader must mirror search's
     predicate exactly (archived_at IS NULL, purged_at IS NULL, is_us IS NOT
     FALSE) so a dead/purged/non-US id can't be resurrected into a pipeline."""
     from app.routers.jobs import _load_live_job
 
     sb, q = _query_stub([{"id": _JOB_ID, "title": "T", "description_html": "D"}])
-    row = _load_live_job(sb, _JOB_ID)
+    row = await _load_live_job(sb, _JOB_ID)
 
     assert row == {"id": _JOB_ID, "title": "T", "description_html": "D"}
     sb.table.assert_called_once_with("jobs")
@@ -241,8 +252,8 @@ def test_load_live_job_applies_the_live_us_predicate() -> None:
     q.not_.is_.assert_any_call("is_us", "false")
 
 
-def test_load_live_job_returns_none_when_no_row_matches() -> None:
+async def test_load_live_job_returns_none_when_no_row_matches() -> None:
     from app.routers.jobs import _load_live_job
 
     sb, _q = _query_stub([])
-    assert _load_live_job(sb, _JOB_ID) is None
+    assert await _load_live_job(sb, _JOB_ID) is None

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast, get_args
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.keys import Provider, UserApiKeyMeta
 from app.services.keys import crypto
@@ -31,8 +31,8 @@ def _validate_provider(provider: str) -> None:
         )
 
 
-def set_key(
-    supabase: Client,
+async def set_key(
+    supabase: AsyncClient,
     *,
     user_id: str,
     provider: Provider,
@@ -67,7 +67,7 @@ def set_key(
     if rotating:
         row["rotated_at"] = now
 
-    resp = supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
+    resp = await supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         # PostgREST returns the upserted representation by default; an empty
@@ -76,6 +76,11 @@ def set_key(
     return UserApiKeyMeta.model_validate(rows[0])
 
 
+# ``get_key`` / ``has_usable_key`` stay SYNC on ``Client`` (#57 slice 4): their
+# callers are the synchronous LLM-client factory (``services.llm.get_client``)
+# and the synchronous budget resolver (``services.llm.budget``) — both out of
+# this slice's scope. The write-path helpers the keys router owns (``set_key`` /
+# ``delete_key`` / ``list_key_meta``) are async on ``AsyncClient``.
 def get_key(
     supabase: Client,
     *,
@@ -120,18 +125,18 @@ def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> boo
         return False
 
 
-def list_key_meta(supabase: Client, *, user_id: str) -> list[UserApiKeyMeta]:
+async def list_key_meta(supabase: AsyncClient, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""
-    resp = (
+    resp = await (
         supabase.table(TABLE).select(_META_COLS).eq("user_id", user_id).order("provider").execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [UserApiKeyMeta.model_validate(r) for r in rows]
 
 
-def delete_key(
-    supabase: Client,
+async def delete_key(
+    supabase: AsyncClient,
     *,
     user_id: str,
     provider: Provider,
@@ -139,5 +144,7 @@ def delete_key(
     """Delete a user's key for ``provider``. Returns True if a row was
     removed, False if there was nothing to delete."""
     _validate_provider(provider)
-    resp = supabase.table(TABLE).delete().eq("user_id", user_id).eq("provider", provider).execute()
+    resp = await (
+        supabase.table(TABLE).delete().eq("user_id", user_id).eq("provider", provider).execute()
+    )
     return bool(resp.data)
