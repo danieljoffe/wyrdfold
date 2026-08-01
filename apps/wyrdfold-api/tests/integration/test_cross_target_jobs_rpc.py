@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.routers.jobs import (
     _list_jobs_across_user_targets_rpc,
@@ -265,9 +265,9 @@ def _score(job_id, target_id, score, *, graded):
     }
 
 
-def _rpc_page(service_client, user_id, target_ids, **kw):
-    return _list_jobs_across_user_targets_rpc(
-        service_client,
+async def _rpc_page(client, user_id, target_ids, **kw):
+    return await _list_jobs_across_user_targets_rpc(
+        client,
         user_target_ids=target_ids,
         page_size=kw.get("page_size", 50),
         sort=kw["sort"],
@@ -282,9 +282,9 @@ def _rpc_page(service_client, user_id, target_ids, **kw):
     )
 
 
-def _py_page(service_client, user_id, target_ids, **kw):
-    return _list_jobs_across_user_targets_two_query(
-        service_client,
+async def _py_page(client, user_id, target_ids, **kw):
+    return await _list_jobs_across_user_targets_two_query(
+        client,
         user_target_ids=target_ids,
         page_size=kw.get("page_size", 50),
         sort=kw["sort"],
@@ -310,8 +310,9 @@ def _ids(page):
 @pytest.mark.parametrize("ascending", [False, True])
 @pytest.mark.parametrize("status", [None, "new"])
 @pytest.mark.parametrize("min_score", [0, 60])
-def test_rpc_matches_python_across_matrix(
+async def test_rpc_matches_python_across_matrix(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
     monkeypatch: pytest.MonkeyPatch,
     decay: bool,
@@ -327,8 +328,8 @@ def test_rpc_matches_python_across_matrix(
     monkeypatch.setattr(settings, "recency_decay_enabled", decay)
     user_id, target_ids = seeded_cross_target
     kw = {"sort": sort, "ascending": ascending, "status": status, "min_score": min_score}
-    rpc = _rpc_page(service_client, user_id, target_ids, **kw)
-    py = _py_page(service_client, user_id, target_ids, **kw)
+    rpc = await _rpc_page(async_service_client, user_id, target_ids, **kw)
+    py = await _py_page(async_service_client, user_id, target_ids, **kw)
 
     # The exact same jobs, in the exact same order.
     assert _ids(rpc) == _ids(py), (
@@ -349,8 +350,9 @@ _SKEWED = {"title_fit": 0.4, "skills_fit": 0.1, "seniority_fit": 0.4, "domain_fi
 @pytest.mark.parametrize("decay", [False, True], ids=["decay-off", "decay-on"])
 @pytest.mark.parametrize("ascending", [False, True])
 @pytest.mark.parametrize("min_score", [0, 60])
-def test_rpc_weighted_blend_matches_python(
+async def test_rpc_weighted_blend_matches_python(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
     monkeypatch: pytest.MonkeyPatch,
     decay: bool,
@@ -375,8 +377,8 @@ def test_rpc_weighted_blend_matches_python(
         "min_score": min_score,
         "weights_by_target": weights,
     }
-    rpc = _rpc_page(service_client, user_id, target_ids, **kw)
-    py = _py_page(service_client, user_id, target_ids, **kw)
+    rpc = await _rpc_page(async_service_client, user_id, target_ids, **kw)
+    py = await _py_page(async_service_client, user_id, target_ids, **kw)
 
     assert _ids(rpc) == _ids(py), (
         f"weighted order drift asc={ascending} min={min_score} decay={decay}: "
@@ -388,8 +390,9 @@ def test_rpc_weighted_blend_matches_python(
     assert rpc_score == py_score, f"weighted score drift: rpc={rpc_score} py={py_score}"
 
 
-def test_weighted_blend_actually_moves_the_score(
+async def test_weighted_blend_actually_moves_the_score(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -404,8 +407,8 @@ def test_weighted_blend_actually_moves_the_score(
     user_id, target_ids = seeded_cross_target
     weights = {tid: AxisWeights(**_SKEWED) for tid in target_ids}
 
-    weighted = _rpc_page(
-        service_client, user_id, target_ids, sort="score", ascending=False,
+    weighted = await _rpc_page(
+        async_service_client, user_id, target_ids, sort="score", ascending=False,
         weights_by_target=weights,
     )
     # raw_score rides along on every RPC row now (#457) — the undecayed Sonnet fit.
@@ -419,15 +422,16 @@ def test_weighted_blend_actually_moves_the_score(
     )
 
 
-def test_rpc_drops_offfamily_liveness_and_dedups(
+async def test_rpc_drops_offfamily_liveness_and_dedups(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """Pin the fixture's semantics directly (not just RPC==Python): the
     non-live + off-family-on-best-rep jobs are gone, and the cross-target job
     appears once at its best representative's score."""
     user_id, target_ids = seeded_cross_target
-    page = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    page = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
     by_title = {p["title"]: p for p in page["postings"]}
 
     # Live + in-family (or null-family) jobs present; dead + off-family-drop gone.
@@ -443,8 +447,9 @@ def test_rpc_drops_offfamily_liveness_and_dedups(
     assert dedup_rows[0]["score"] == 75
 
 
-def test_rpc_company_and_search_filters_match_python(
+async def test_rpc_company_and_search_filters_match_python(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """The rare page path joins jobs for a company/search filter (the denormalized
@@ -455,13 +460,14 @@ def test_rpc_company_and_search_filters_match_python(
         {"search": "Graded"},  # "Alpha Graded High" + "Bravo Graded Low"
         {"company": "Bristol", "search": "Bravo"},  # both filters together
     ):
-        rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False, **kw)
-        py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False, **kw)
+        rpc = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False, **kw)
+        py = await _py_page(async_service_client, user_id, target_ids, sort="score", ascending=False, **kw)
         assert _ids(rpc) == _ids(py), f"filter {kw}: rpc={_ids(rpc)} py={_ids(py)}"
 
 
-def test_jobs_archival_trigger_syncs_and_drops(
+async def test_jobs_archival_trigger_syncs_and_drops(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """The denormalization's liveness can go stale if a job is archived AFTER
@@ -471,9 +477,9 @@ def test_jobs_archival_trigger_syncs_and_drops(
     user_id, target_ids = seeded_cross_target
     before = {
         p["title"]
-        for p in _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)[
-            "postings"
-        ]
+        for p in (
+            await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
+        )["postings"]
     }
     assert "Alpha Graded High" in before
 
@@ -502,14 +508,15 @@ def test_jobs_archival_trigger_syncs_and_drops(
     )
 
     # And the RPC now drops it, still matching the live-reading Python path.
-    rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
-    py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    rpc = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
+    py = await _py_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
     assert "Alpha Graded High" not in {p["title"] for p in rpc["postings"]}
     assert _ids(rpc) == _ids(py)
 
 
-def test_jobs_refamily_trigger_syncs_and_gates(
+async def test_jobs_refamily_trigger_syncs_and_gates(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """Re-tagging a job's role_family must sync to scores so the off-family gate
@@ -538,14 +545,15 @@ def test_jobs_refamily_trigger_syncs_and_gates(
     )
 
     # Now off-family for the eng target → gated out, matching Python.
-    rpc = _rpc_page(service_client, user_id, target_ids, sort="score", ascending=False)
-    py = _py_page(service_client, user_id, target_ids, sort="score", ascending=False)
+    rpc = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
+    py = await _py_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
     assert "Bravo Graded Low" not in {p["title"] for p in rpc["postings"]}
     assert _ids(rpc) == _ids(py)
 
 
-def test_per_target_score_sort_routes_through_cross_target_and_gates(
+async def test_per_target_score_sort_routes_through_cross_target_and_gates(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """#2: per-target `/jobs?target_id=…&sort=score` used to run the Python
@@ -579,8 +587,8 @@ def test_per_target_score_sort_routes_through_cross_target_and_gates(
         "cursor": {},
         "user_id": user_id,
     }
-    new = _list_jobs_for_target(service_client, **common)  # new routing
-    old = _list_jobs_for_target_two_query(service_client, **common)  # prior behavior
+    new = await _list_jobs_for_target(async_service_client, **common)  # new routing
+    old = await _list_jobs_for_target_two_query(async_service_client, **common)  # prior behavior
     new_titles = [p["title"] for p in new["postings"]]
     old_titles = [p["title"] for p in old["postings"]]
 
@@ -592,20 +600,21 @@ def test_per_target_score_sort_routes_through_cross_target_and_gates(
     assert new_titles == [t for t in old_titles if t != "Delta OffFamily Drop"]
 
 
-def test_rpc_offset_pagination_and_has_more(
+async def test_rpc_offset_pagination_and_has_more(
     service_client: Client,
+    async_service_client: AsyncClient,
     seeded_cross_target: tuple[str, set[str]],
 ) -> None:
     """page_size=2 yields a next cursor; walking it covers the full set once."""
     user_id, target_ids = seeded_cross_target
-    full = _ids(_rpc_page(service_client, user_id, target_ids, sort="score", ascending=False))
+    full = _ids(await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False))
     assert len(full) >= 4  # enough to page
 
     seen: list[str] = []
     cursor: dict = {}
     for _ in range(10):  # bounded walk
-        page = _rpc_page(
-            service_client,
+        page = await _rpc_page(
+            async_service_client,
             user_id,
             target_ids,
             sort="score",
