@@ -11,19 +11,19 @@ scopes the per-user tables even if a service-layer filter slips.
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Query
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import insights_cache, make_cache_key
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.insights import PipelineInsights, SkillsCostInsights, TargetInsights
 from app.services.insights import compute_pipeline, compute_skills_cost, compute_targets
-from app.services.targets.crud import get_user_target_ids
 
 # JWT-only — insights are personal analytics. The api-key path would let a
 # leaked operator key dump cross-tenant aggregates.
@@ -94,19 +94,31 @@ def _empty_skills_cost() -> SkillsCostInsights:
     )
 
 
-# Handlers are sync `def` so FastAPI runs each request in a threadpool worker.
-# These endpoints make multiple sync supabase `.execute()` calls; using `async
-# def` would block the event loop and serialize concurrent requests.
+async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
+    """Any-status target ids for the user. An async inline of
+    ``crud.get_user_target_ids`` (which stays sync for its sync callers) — an
+    async handler holds the async user client and can't hand it to that sync
+    helper (#57 slice 3)."""
+    resp = (
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+# Handlers are `async def`: their DB reads run natively on the event loop via the
+# pooled async user client (#57 slice 3), so interactive requests no longer tie up
+# a threadpool worker for the duration of each supabase call.
 
 
 @router.get("/pipeline")
-def pipeline_insights(
+async def pipeline_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
     # #88 Phase 3: read-only over user_jobs/status_log/analyses/llm_costs
     # (self-SELECT policies) + the shared catalog (SELECT true) — RLS scopes
     # the per-user tables underneath the service-layer user_id filters.
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> PipelineInsights:
     # Cache first: the key is (user, period), so a hit needs no DB at all. The
     # user_targets lookup only runs on a miss — the empty-targets early-return
@@ -115,10 +127,10 @@ def pipeline_insights(
     cached: PipelineInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
-    target_ids = get_user_target_ids(supabase, user_id)
+    target_ids = await _user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_pipeline()
-    result = compute_pipeline(
+    result = await compute_pipeline(
         supabase,
         _since(period),
         _prior_window(period),
@@ -130,36 +142,40 @@ def pipeline_insights(
 
 
 @router.get("/targets")
-def target_insights(
+async def target_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> TargetInsights:
     cache_key = make_cache_key(f"insights:targets:u={user_id}", period=period)
     cached: TargetInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
-    target_ids = get_user_target_ids(supabase, user_id)
+    target_ids = await _user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_targets()
-    result = compute_targets(supabase, _since(period), target_ids=target_ids, user_id=user_id)
+    result = await compute_targets(
+        supabase, _since(period), target_ids=target_ids, user_id=user_id
+    )
     insights_cache.set(cache_key, result)
     return result
 
 
 @router.get("/skills-cost")
-def skills_cost_insights(
+async def skills_cost_insights(
     period: str = Query("30d", pattern=r"^(7d|30d|90d|all)$"),
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 3: see /pipeline
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 3: see /pipeline
 ) -> SkillsCostInsights:
     cache_key = make_cache_key(f"insights:skills-cost:u={user_id}", period=period)
     cached: SkillsCostInsights | None = insights_cache.get(cache_key)
     if cached is not None:
         return cached
-    target_ids = get_user_target_ids(supabase, user_id)
+    target_ids = await _user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_skills_cost()
-    result = compute_skills_cost(supabase, _since(period), user_id=user_id, target_ids=target_ids)
+    result = await compute_skills_cost(
+        supabase, _since(period), user_id=user_id, target_ids=target_ids
+    )
     insights_cache.set(cache_key, result)
     return result
