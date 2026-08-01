@@ -18,10 +18,9 @@ import pytest
 
 from app.dependencies import (
     get_async_service_supabase,
+    get_async_user_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.services.targets import crud
@@ -42,14 +41,14 @@ def _client_with_overrides(overrides: dict[Any, Any]) -> Any:
 
 
 def _owned_posting_supabase() -> tuple[MagicMock, dict[str, MagicMock]]:
-    """A service-role client mock where ``_assert_user_owns_posting`` passes.
+    """An async RLS client mock where ``_assert_user_owns_posting_async`` passes.
 
-    The helper queries ``jobs`` (exists), ``user_targets`` (caller's target
-    ids), then ``scores`` (a score row for the posting under one of those
-    targets). Return data for each so ownership resolves True. Per-name table
-    mocks are cached + returned so the test can inspect whether ``.delete()``
-    was ever called on the shared ``jobs`` table.
-    """
+    The probe awaits ``jobs`` (exists), ``user_targets`` (caller's target ids),
+    then ``scores`` (a score row for the posting under one of those targets), so
+    each terminal ``.execute`` is an ``AsyncMock``; the archive write awaits a
+    ``user_jobs`` upsert. Per-name table mocks are cached + returned so the test
+    can inspect the archive payload and that ``.delete()`` never fired on
+    ``jobs`` (#57 slice 4 made ``delete_job`` async)."""
     supabase = MagicMock()
     tables: dict[str, MagicMock] = {}
 
@@ -58,17 +57,19 @@ def _owned_posting_supabase() -> tuple[MagicMock, dict[str, MagicMock]]:
             return tables[name]
         tbl = MagicMock()
         if name == "jobs":
-            (
-                tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value.data
-            ) = [{"id": "job-1"}]
+            tbl.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=[{"id": "job-1"}])
+            )
         elif name == "user_targets":
-            (tbl.select.return_value.eq.return_value.execute.return_value.data) = [
-                {"target_id": "tgt-a"}
-            ]
+            tbl.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=[{"target_id": "tgt-a"}])
+            )
         elif name == "scores":
-            (
-                tbl.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute.return_value.data
-            ) = [{"target_id": "tgt-a", "score": 90, "score_breakdown": {}}]
+            tbl.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=[{"target_id": "tgt-a", "score": 90, "score_breakdown": {}}])
+            )
+        elif name == "user_jobs":
+            tbl.upsert.return_value.execute = AsyncMock(return_value=MagicMock(data=None))
         tables[name] = tbl
         return tbl
 
@@ -76,28 +77,16 @@ def _owned_posting_supabase() -> tuple[MagicMock, dict[str, MagicMock]]:
     return supabase, tables
 
 
-def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row() -> None:
     """The route soft-archives the caller's own user_jobs row and never
     issues a ``jobs.delete()`` against the shared catalog (audit #29 H1)."""
-    from app.routers import jobs as jobs_mod
-
     supabase, tables = _owned_posting_supabase()
-
-    upsert_calls: list[dict[str, Any]] = []
-
-    def _fake_upsert(_sb: Any, **kwargs: Any) -> None:
-        upsert_calls.append(kwargs)
-
-    monkeypatch.setattr(jobs_mod.persistence, "upsert_user_job", _fake_upsert)
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: supabase,
-            get_user_supabase: lambda: supabase,
+            get_async_user_supabase: lambda: supabase,
             get_current_user_id: lambda: "user-a",
             verify_api_key_or_jwt: lambda: "user-a",
         }
@@ -109,8 +98,11 @@ def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row(
     finally:
         app.dependency_overrides.clear()
 
-    # Per-user archive happened, scoped to the caller.
-    assert upsert_calls == [{"user_id": "user-a", "job_posting_id": "job-1", "status": "archived"}]
+    # Per-user archive happened, scoped to the caller, on the user_jobs table.
+    archive_payload = tables["user_jobs"].upsert.call_args.args[0]
+    assert archive_payload["user_id"] == "user-a"
+    assert archive_payload["job_posting_id"] == "job-1"
+    assert archive_payload["status"] == "archived"
     # The shared `jobs` row was NEVER hard-deleted — that was the regression
     # that cascade-wiped every other user's data. `jobs` is still *read* for
     # the ownership check, but `.delete()` must never be issued on it.
@@ -118,36 +110,34 @@ def test_delete_job_archives_caller_user_jobs_never_deletes_shared_row(
     assert tables["jobs"].delete.call_count == 0
 
 
-def test_delete_job_unowned_posting_is_404(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_delete_job_unowned_posting_is_404() -> None:
     """A caller with no scored target for the posting → 404, no archive."""
-    from app.routers import jobs as jobs_mod
-
     supabase = MagicMock()
+    tables: dict[str, MagicMock] = {}
 
     def _table(name: str) -> MagicMock:
+        if name in tables:
+            return tables[name]
         tbl = MagicMock()
         if name == "jobs":
-            (
-                tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value.data
-            ) = [{"id": "job-1"}]
+            tbl.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=[{"id": "job-1"}])
+            )
         elif name == "user_targets":
             # Caller follows no targets → unowned.
-            tbl.select.return_value.eq.return_value.execute.return_value.data = []
+            tbl.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=[])
+            )
+        tables[name] = tbl
         return tbl
 
     supabase.table.side_effect = _table
-
-    upsert = MagicMock()
-    monkeypatch.setattr(jobs_mod.persistence, "upsert_user_job", upsert)
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: supabase,
-            get_user_supabase: lambda: supabase,
+            get_async_user_supabase: lambda: supabase,
             get_current_user_id: lambda: "user-b",
             verify_api_key_or_jwt: lambda: "user-b",
         }
@@ -158,8 +148,8 @@ def test_delete_job_unowned_posting_is_404(
     finally:
         app.dependency_overrides.clear()
 
-    upsert.assert_not_called()
-    assert supabase.table.return_value.delete.call_count == 0
+    # No archive write on an unowned posting.
+    assert "user_jobs" not in tables
 
 
 # ---------------------------------------------------------------------------

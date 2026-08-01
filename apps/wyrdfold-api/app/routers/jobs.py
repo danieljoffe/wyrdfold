@@ -14,17 +14,17 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache, jobs_cache_prefix, make_cache_key
 from app.config import settings
 from app.dependencies import (
+    get_async_service_supabase,
     get_async_supabase_for_caller,
+    get_async_user_supabase,
     get_current_user_id,
     get_current_user_id_optional,
     get_supabase,
-    get_supabase_for_caller,
-    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -62,7 +62,6 @@ from app.services.target_scoring import (
 from app.services.targets.crud import (
     _parse_user_target,
     get_active_for_user,
-    get_user_target,
     preferences_from_user_target,
 )
 from app.services.targets.crud import get as get_target
@@ -2316,15 +2315,17 @@ async def validate_url(
 async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
-    supabase: Client = Depends(get_supabase),
-    # #6 R2 step 2: the manual-add scores writes are gated through SECURITY
-    # DEFINER RPCs on the caller's client (user JWT → target ownership enforced
-    # in-DB; api-key/operator → service-role, exempt). Reads + the job insert
-    # stay on the service-role `supabase`.
-    caller_supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ManualJobResponse:
-    """Add a job posting by URL. Extracts metadata via cascade."""
+    """Add a job posting by URL. Extracts metadata via cascade.
+
+    The materialize + gated-score path (``materialize_and_score_job`` /
+    ``score_and_upsert``) is the SYNC service-role scorer shared with the
+    poller-adjacent from-url flow (``targets.from_input``), so it runs on the
+    sync service client — awaited (``materialize_and_score_job`` threads its
+    own blocking work) / off-loaded via ``to_thread`` here (#57 slice 4). The
+    handler itself is ``async`` only for the genuine ``httpx`` fetch below.
+    """
     warnings: list[str] = []
 
     # Layer 1: Format validation
@@ -2447,6 +2448,10 @@ async def add_manual_job(
     # scores→user_targets join. Operator/api-key callers (user_id None) keep the
     # global fan-out for cron/admin back-compat. Shared with the from-url target
     # flow via materialize_and_score_job (upsert + score + global + force-include).
+    # Sync service-role client for the shared materialize/score path (see the
+    # handler docstring). Obtained here rather than injected as a sync `Depends`
+    # so the retired sync-user-client deps stay off this router (#57 slice 4).
+    supabase = get_supabase()
     if user_id is not None:
         active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
     else:
@@ -2480,16 +2485,18 @@ async def add_manual_job(
     )
 
 
-def _load_live_job(supabase: Client, job_id: str) -> dict[str, Any] | None:
+async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
     """Load a LIVE, US posting's scoring inputs (title + JD body) by id, or None.
 
     Mirrors ``job_search``'s live+US predicate exactly (archived_at IS NULL AND
     purged_at IS NULL AND is_us IS NOT FALSE) so "addable" ⇔ "searchable": a
     dead / purged / non-US id 404s instead of letting a caller resurrect a
     hidden row into their pipeline by guessing its UUID.
+
+    Async (#57 slice 4): read on the caller's pooled async RLS client.
     """
     resp = (
-        supabase.table("jobs")
+        await supabase.table("jobs")
         .select("id, title, description_html")
         .eq("id", job_id)
         .is_("archived_at", "null")
@@ -2502,27 +2509,17 @@ def _load_live_job(supabase: Client, job_id: str) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
-# Sync `def` (not `async def`): all the work is blocking supabase round-trips
-# (score compute + gated upserts), so FastAPI runs it in its threadpool and
-# keeps them off the event loop. See #107.
 @router.post("/{job_id}/add-to-target", response_model=AddToTargetResponse)
 @limiter.limit("30/minute")
-def add_job_to_target(
+async def add_job_to_target(
     request: Request,
     job_id: str,
     body: AddToTargetRequest,
     user_id: str = Depends(get_current_user_id),
-    # SEC-H2 (migration 20260718010000): the user_upsert_score /
-    # user_set_scores_included SECURITY DEFINER RPCs are NOT executable by
-    # `authenticated` — their in-DB check only verifies the caller *follows* the
-    # target, which is insufficient for a SHARED, ownerless target catalog (a
-    # follower could tamper with co-followers' scores). So all score writes go on
-    # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
-    # branch), and OWNERSHIP is enforced in the API here (``get_user_target``
-    # below) — exactly the model ``POST /jobs/manual`` uses. ``caller_supabase`` is
-    # only for the RLS-backstopped reads (job load + the ownership check).
-    caller_supabase: Client = Depends(get_user_supabase),
-    service_supabase: Client = Depends(get_supabase),
+    # The RLS-backstopped reads (job load + ownership check) ride the caller's
+    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes use a
+    # sync service client obtained in-body (see below).
+    caller_supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> AddToTargetResponse:
     """Score an EXISTING posting (a search result's ``jobs.id``) against one of
     the caller's own targets and save it to their pipeline (#467 power-action).
@@ -2533,7 +2530,7 @@ def add_job_to_target(
     """
     # Load the posting's scoring inputs. Must be a live+US posting (exactly what
     # search surfaces); a dead / purged / unknown id 404s.
-    job = _load_live_job(caller_supabase, job_id)
+    job = await _load_live_job(caller_supabase, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -2541,10 +2538,20 @@ def add_job_to_target(
     # service-role writes below carry no in-DB ownership check). Same 404 for
     # "target doesn't exist" and "not yours" so the response never leaks another
     # user's target ids. Read on the caller's client so RLS is the backstop.
-    if get_user_target(caller_supabase, user_id, body.target_id) is None:
+    if await _get_user_target_async(caller_supabase, user_id, body.target_id) is None:
         raise HTTPException(status_code=404, detail="Target not found for user")
 
-    target = get_target(service_supabase, body.target_id)
+    # SEC-H2 (migration 20260718010000): the user_upsert_score /
+    # user_set_scores_included SECURITY DEFINER RPCs are NOT executable by
+    # `authenticated` — their in-DB check only verifies the caller *follows* the
+    # target, which is insufficient for a SHARED, ownerless target catalog (a
+    # follower could tamper with co-followers' scores). So all score writes go on
+    # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
+    # branch), and OWNERSHIP is enforced in the API above. ``score_and_upsert`` is
+    # the shared SYNC interactive scorer (also the poller-adjacent job_ingest
+    # path), so drive it + the follow-up writes off the loop via ``to_thread``.
+    service_supabase = get_supabase()
+    target = await asyncio.to_thread(get_target, service_supabase, body.target_id)
     if target is None:  # catalog row vanished between the two reads — defensive
         raise HTTPException(status_code=404, detail="Target not found")
 
@@ -2553,7 +2560,8 @@ def add_job_to_target(
     # but with auth.uid() NULL it takes the function's service-role-exempt branch
     # (the RPC isn't authenticated-executable post-lockdown — see above).
     try:
-        result = score_and_upsert(
+        result = await asyncio.to_thread(
+            score_and_upsert,
             service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",
@@ -2583,18 +2591,24 @@ def add_job_to_target(
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
     try:
-        service_supabase.rpc(
-            "user_set_scores_included",
-            {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
-        ).execute()
+        await asyncio.to_thread(
+            lambda: service_supabase.rpc(
+                "user_set_scores_included",
+                {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
+            ).execute()
+        )
     except Exception:
         logger.exception("add-to-target force-include failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
     #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
     try:
-        persistence.upsert_user_job(
-            service_supabase, user_id=user_id, job_posting_id=job_id, status="saved"
+        await asyncio.to_thread(
+            persistence.upsert_user_job,
+            service_supabase,
+            user_id=user_id,
+            job_posting_id=job_id,
+            status="saved",
         )
     except Exception:
         logger.exception("add-to-target user_job save failed for job %s", job_id)
@@ -2608,14 +2622,8 @@ def add_job_to_target(
     )
 
 
-# Sync `def` (not `async def`): the bulk re-score is blocking supabase work,
-# so FastAPI runs it in its threadpool and keeps the O(jobs x keywords) DB
-# round-trips off the event loop. See #107.
 @router.post("/rescore/{target_id}", dependencies=[Depends(verify_api_key)])
-def rescore_for_target(
-    target_id: str,
-    supabase: Client = Depends(get_supabase),
-) -> dict[str, Any]:
+async def rescore_for_target(target_id: str) -> dict[str, Any]:
     """Re-score all jobs against a target's scoring profile.
 
     Admin / operator-only: gated by ``verify_api_key`` so an
@@ -2623,19 +2631,70 @@ def rescore_for_target(
     DB-heavy re-score by hitting the API directly. Not reachable from
     the wyrdfold FE — only invoked manually from the operator console
     or from CLI scripts that supply the api key.
+
+    ``bulk_score_for_target`` is the shared SYNC bulk scorer (also the feedback
+    learner's re-score path), so it runs on a sync service client obtained
+    in-body and driven off the event loop via ``to_thread`` (#57 slice 4).
     """
-    target = get_target(supabase, target_id)
+    supabase = get_supabase()
+    target = await asyncio.to_thread(get_target, supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    scored = bulk_score_for_target(supabase, target)
+    scored = await asyncio.to_thread(bulk_score_for_target, supabase, target)
     job_list_cache.invalidate()
     return {"target_id": target_id, "jobs_scored": scored}
 
 
+def _extract_salary_updates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """CPU-bound salary extraction over one page of ``jobs`` rows — kept out of
+    the event loop (run via ``to_thread``) since it regex-scans each JD body."""
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        html = row.get("description_html") or ""
+        if not html:
+            continue
+        salary = extract_salary_from_html(html)
+        if salary:
+            updates.append({"id": row["id"], "salary_text": salary, **salary_columns(salary)})
+    return updates
+
+
+async def _run_salary_backfill(supabase: AsyncClient) -> int:
+    """The backfill loop, factored out of the handler so its awaited ``.execute``
+    round-trips live in an async helper (the handler body stays execute-free —
+    the #107 guard convention)."""
+    batch_size = 500
+    offset = 0
+    updated = 0
+
+    while True:
+        resp = (
+            await supabase.table("jobs")
+            .select("id, description_html")
+            .is_("salary_text", "null")
+            .range(offset, offset + batch_size - 1)
+            .execute()
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if not rows:
+            break
+
+        updates = await asyncio.to_thread(_extract_salary_updates, rows)
+        if updates:
+            await supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()
+            updated += len(updates)
+
+        if len(rows) < batch_size:
+            break
+        offset += batch_size
+
+    return updated
+
+
 @router.post("/backfill-salary", dependencies=[Depends(verify_api_key)])
-def backfill_salary(
-    supabase: Client = Depends(get_supabase),
+async def backfill_salary(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
     """One-off: extract salary from description_html for jobs missing salary_text.
 
@@ -2647,39 +2706,7 @@ def backfill_salary(
     caller can't trigger a full-table scan + per-row salary extraction.
     Not reachable from the wyrdfold FE.
     """
-    batch_size = 500
-    offset = 0
-    updated = 0
-
-    while True:
-        resp = (
-            supabase.table("jobs")
-            .select("id, description_html")
-            .is_("salary_text", "null")
-            .range(offset, offset + batch_size - 1)
-            .execute()
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
-            break
-
-        updates: list[dict[str, Any]] = []
-        for row in rows:
-            html = row.get("description_html") or ""
-            if not html:
-                continue
-            salary = extract_salary_from_html(html)
-            if salary:
-                updates.append({"id": row["id"], "salary_text": salary, **salary_columns(salary)})
-
-        if updates:
-            supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()
-            updated += len(updates)
-
-        if len(rows) < batch_size:
-            break
-        offset += batch_size
-
+    updated = await _run_salary_backfill(supabase)
     job_list_cache.invalidate()
     return {"updated": updated}
 
@@ -2691,11 +2718,10 @@ async def _assert_user_owns_posting_async(
     *,
     include_description: bool = False,
 ) -> dict[str, Any]:
-    """Async twin of :func:`_assert_user_owns_posting` for the ``async def``
-    read handler (``get_job``, #57 slice 3). The sync original stays for the
-    still-sync ``delete_job`` write handler — same three reads, awaited here
-    on the pooled async user client. Keep the two in lockstep until
-    ``delete_job`` migrates too."""
+    """Posting-ownership probe for the ``async def`` handlers (``get_job`` +
+    ``delete_job``, #57 slice 3/4): the three reads awaited on the pooled async
+    user client. (The sync twin retired with ``delete_job``'s migration; the
+    ``status`` router keeps its own separate sync copy.)"""
     # 1. Fetch the posting (and projection).
     select_cols = _JP_DETAIL_SELECT_COLS if include_description else _JP_SELECT_COLS
     posting_resp = (
@@ -2753,76 +2779,23 @@ async def _user_job_status(supabase: AsyncClient, *, user_id: str, posting_id: s
     return cast(str, uj_rows[0]["status"]) if uj_rows else "new"
 
 
-def _assert_user_owns_posting(
-    supabase: Client,
-    posting_id: str,
-    user_id: str,
-    *,
-    include_description: bool = False,
-) -> dict[str, Any]:
-    """Look up a posting and verify the caller is linked (via
-    ``user_targets``) to at least one target that has scored this
-    posting. 404 on either missing or unowned (don't leak existence of
-    postings outside the user's targets).
-
-    ``include_description=True`` adds ``description_html`` to the
-    projection — needed by the per-posting detail GET, omitted from the
-    other callers (delete, ownership-only checks) so we don't move the
-    full JD body across the wire on every status mutation.
-
-    Ownership is derived through ``scores``: the poller writes
-    ``scores`` rows keyed by ``(job_posting_id, target_id)``, while
-    ``jobs.target_id`` is **not** populated. Checking ``jobs.target_id``
-    directly (the previous shape) always 404'd on real postings. This
-    mirrors the fix applied in ``status.py`` (PR #676) — same root
-    cause, separate copy of the helper.
-    """
-    # 1. Fetch the posting (and projection).
-    select_cols = _JP_DETAIL_SELECT_COLS if include_description else _JP_SELECT_COLS
-    posting_resp = (
-        supabase.table("jobs").select(select_cols).eq("id", posting_id).limit(1).execute()
-    )
-    rows = posting_resp.data or []
-    if not rows or not isinstance(rows[0], dict):
-        raise HTTPException(status_code=404, detail="Posting not found")
-    row = cast(dict[str, Any], rows[0])
-
-    # 2. Resolve the caller's target ids.
-    user_targets_resp = (
-        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
-    )
-    user_target_ids = {cast(dict[str, Any], r)["target_id"] for r in user_targets_resp.data or []}
-    if not user_target_ids:
-        raise HTTPException(status_code=404, detail="Posting not found")
-
-    # 3. Confirm at least one of the user's targets has a score row for
-    # this posting. Exposing the matched target_id on the returned row
-    # so callers can scope cache invalidation, mirroring the old
-    # ``jobs.target_id`` contract. Also pull ``score`` + ``score_breakdown``
-    # so detail callers can overlay them — ``jobs.score`` and
-    # ``jobs.score_breakdown`` are vestigial pre-shared-targets columns
-    # that the poller doesn't update (it writes ``scores``), so reading
-    # them directly off the posting row yields stale ``0`` / ``{}``.
-    score_resp = (
-        supabase.table("scores")
-        .select("target_id, score, score_breakdown")
-        .eq("job_posting_id", posting_id)
-        .in_("target_id", list(user_target_ids))
-        .order("score", desc=True)
-        .limit(1)
-        .execute()
-    )
-    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
-    if not score_rows:
-        raise HTTPException(status_code=404, detail="Posting not found")
-    best = score_rows[0]
-    row["target_id"] = best["target_id"]
-    # Stash the live score onto the row under an alias so callers can opt
-    # in to the overlay without changing the existing ``score`` /
-    # ``score_breakdown`` semantics on routes that don't need it.
-    row["_target_score"] = best.get("score")
-    row["_target_score_breakdown"] = best.get("score_breakdown")
-    return row
+async def _upsert_user_job_async(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Async inline of ``persistence.upsert_user_job`` — the per-user pipeline
+    status write (``user_jobs``). ``persistence.upsert_user_job`` stays sync for
+    the not-yet-converted routers, so the async handler inlines the same upsert
+    rather than fork a twin (#57 slice 3/4 — mirrors ``persistence.
+    mark_job_resume_draft``)."""
+    await supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
 
 
 @router.get("/{posting_id}")
@@ -2866,14 +2839,15 @@ async def get_job(
 
 
 @router.delete("/{posting_id}")
-def delete_job(
+async def delete_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     # #88 Phase 3: RLS client — the only write is the caller's own user_jobs
     # row (full CRUD self-policy); the ownership probe reads shared-catalog
     # tables (SELECT true). RLS makes the cross-tenant-cascade class of bug
-    # (audit #29 r3 H1) structurally impossible, not just guarded.
-    supabase: Client = Depends(get_user_supabase),
+    # (audit #29 r3 H1) structurally impossible, not just guarded. Async on the
+    # pooled RLS user client (#57 slice 4).
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> dict[str, Any]:
     """Per-user "delete" of a job from the caller's pipeline.
 
@@ -2892,9 +2866,9 @@ def delete_job(
     if ever needed, must be gated behind operator/api-key auth — not a
     follower's JWT. Mirrors the per-user write pattern in ``status.py``.
     """
-    _assert_user_owns_posting(supabase, posting_id, user_id)
+    await _assert_user_owns_posting_async(supabase, posting_id, user_id)
 
-    persistence.upsert_user_job(
+    await _upsert_user_job_async(
         supabase,
         user_id=user_id,
         job_posting_id=posting_id,

@@ -1,10 +1,11 @@
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
     get_supabase,
     get_user_supabase,
@@ -303,24 +304,64 @@ def test_status_422_on_invalid_status(client_factory):
 # --- DELETE /jobs/{posting_id} ---
 
 
+def _async_delete_supabase(*, posting_exists: bool, owns: bool = True) -> MagicMock:
+    """Async RLS client mock for ``delete_job`` (async since #57 slice 4): the
+    ``_assert_user_owns_posting_async`` probe (jobs → user_targets → scores) plus
+    the ``user_jobs`` archive upsert, each awaited so its terminal ``.execute``
+    is an ``AsyncMock``."""
+    sb = MagicMock()
+
+    def _table(name: str) -> MagicMock:
+        t = MagicMock()
+        if name == "jobs":
+            t.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([{"id": "abc"}] if posting_exists else None)
+            )
+        elif name == "user_targets":
+            t.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=_Resp([{"target_id": _TEST_TARGET_ID}] if owns else [])
+            )
+        elif name == "scores":
+            t.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([{"target_id": _TEST_TARGET_ID, "score": 90, "score_breakdown": {}}] if owns else [])
+            )
+        elif name == "user_jobs":
+            t.upsert.return_value.execute = AsyncMock(return_value=_Resp(None))
+        return t
+
+    sb.table.side_effect = _table
+    return sb
+
+
+def _delete_client(sb: MagicMock) -> TestClient:
+    app.dependency_overrides[get_async_user_supabase] = lambda: sb
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
+    app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
+    return TestClient(app)
+
+
 def test_delete_unauth_returns_401():
     client = TestClient(app)
     r = client.delete("/jobs/abc")
     assert r.status_code == 401
 
 
-def test_delete_404_when_posting_missing(client_factory):
-    sb = _build_supabase(posting_data=None)
-    client = client_factory(sb)
-    r = client.delete("/jobs/abc")
-    assert r.status_code == 404
+def test_delete_404_when_posting_missing():
+    try:
+        client = _delete_client(_async_delete_supabase(posting_exists=False))
+        r = client.delete("/jobs/abc")
+        assert r.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
 
 
-def test_delete_200_on_valid_delete(client_factory):
-    sb = _build_supabase(posting_data={"id": "abc"})
-    client = client_factory(sb)
-    r = client.delete("/jobs/abc")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["success"] is True
-    assert body["deleted_id"] == "abc"
+def test_delete_200_on_valid_delete():
+    try:
+        client = _delete_client(_async_delete_supabase(posting_exists=True))
+        r = client.delete("/jobs/abc")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is True
+        assert body["deleted_id"] == "abc"
+    finally:
+        app.dependency_overrides.clear()
