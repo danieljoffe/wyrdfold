@@ -22,7 +22,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.schemas import JobTargetScore, ScoreBreakdown, ScoreResult, ScoringStatus
 from app.models.targets import JobTarget
@@ -622,8 +622,8 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
     return written
 
 
-def get_target_scores(
-    supabase: Client,
+async def get_target_scores(
+    supabase: AsyncClient,
     target_id: str,
     job_posting_ids: list[str] | None = None,
 ) -> dict[str, JobTargetScore]:
@@ -640,14 +640,14 @@ def get_target_scores(
     SELECT.
     """
     if job_posting_ids is None:
-        resp = supabase.table(TABLE).select("*").eq("target_id", target_id).execute()
+        resp = await supabase.table(TABLE).select("*").eq("target_id", target_id).execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
         return {r["job_posting_id"]: _parse_score(r) for r in rows}
 
     if not job_posting_ids:
         return {}
 
-    resp = supabase.rpc(
+    resp = await supabase.rpc(
         "get_target_scores_by_ids",
         {"p_target_id": target_id, "p_ids": job_posting_ids},
     ).execute()
