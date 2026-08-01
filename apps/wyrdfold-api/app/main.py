@@ -51,6 +51,7 @@ from app.services.owner_provisioning import provision_owner
 from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
     close_async_supabase,
+    close_async_user_client,
     close_supabase,
     get_async_supabase,
     get_supabase_pool,
@@ -258,6 +259,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await search_events_buffer.stop(supabase_for_buffer)
         close_supabase()
         await close_async_supabase()
+        await close_async_user_client()
         await close_http_client()
         await close_safe_http_client()
 
