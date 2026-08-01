@@ -39,6 +39,19 @@ def get_supabase() -> Client:
     return client
 
 
+def get_async_service_supabase() -> AsyncClient:
+    """Async service-role client (#57 slice 3) — the async mirror of
+    :func:`get_supabase` for router paths that bypass RLS (cost ledger,
+    shared-catalog reads). Returns the shared singleton (no await; created in
+    the lifespan); 503 when unconfigured."""
+    from app.supabase_pool import get_async_supabase
+
+    client = get_async_supabase()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    return client
+
+
 def get_user_supabase(
     request: Request,
     s: Settings = Depends(get_settings),
