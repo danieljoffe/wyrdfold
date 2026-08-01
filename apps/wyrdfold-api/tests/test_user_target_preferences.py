@@ -70,6 +70,22 @@ def _wire_update(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
     chain.return_value.data = rows
 
 
+# ── Async wiring for the endpoint path (#57 slice 4) ─────────────────────────
+# The PUT handler now holds the async user client and inlines the read-then-
+# write as ``_set_preferences_async``; its ``.execute()`` is a coroutine. The
+# sync crud helpers above keep the sync wiring.
+
+
+def _awire_select(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
+    chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+    chain.execute = AsyncMock(return_value=MagicMock(data=rows))
+
+
+def _awire_update(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
+    chain = supabase.table.return_value.update.return_value.eq.return_value.eq.return_value
+    chain.execute = AsyncMock(return_value=MagicMock(data=rows))
+
+
 # ---- crud -----------------------------------------------------------------
 
 
@@ -210,8 +226,8 @@ def test_set_preferences_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    # PUT still runs on the sync user client; GET moved to the async one
-    # (#57 slice 3). Override both so either handler resolves its dep.
+    # GET (#57 slice 3) and PUT (#57 slice 4) both run on the async user client
+    # now; override both providers so either handler resolves its dep.
     app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
@@ -261,9 +277,9 @@ def test_put_endpoint_persists_and_busts_cache(
     from app.routers import targets as router_mod
 
     supabase = MagicMock()
-    _wire_select(supabase, [_row()])
-    _wire_update(supabase, [_row(pref_score_cutoff=90, pref_locations=["nyc"])])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row()])
+    _awire_update(supabase, [_row(pref_score_cutoff=90, pref_locations=["nyc"])])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     busted: list[str] = []
     monkeypatch.setattr(
@@ -285,8 +301,8 @@ def test_put_endpoint_persists_and_busts_cache(
 
 def test_put_endpoint_404_when_no_link(client: TestClient) -> None:
     supabase = MagicMock()
-    _wire_select(supabase, [])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -301,8 +317,8 @@ def test_put_idor_other_users_link_404(client: TestClient) -> None:
     """The (user, target) link doesn't exist for this caller → 404, no write —
     the service-role client can't be steered onto another user's row."""
     supabase = MagicMock()
-    _wire_select(supabase, [])  # no link for this (user, target)
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [])  # no link for this (user, target)
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -318,9 +334,9 @@ def test_put_score_cutoff_boundary_validation(
     client: TestClient, value: int, expected: int
 ) -> None:
     supabase = MagicMock()
-    _wire_select(supabase, [_row()])
-    _wire_update(supabase, [_row(pref_score_cutoff=value if 0 <= value <= 200 else 40)])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row()])
+    _awire_update(supabase, [_row(pref_score_cutoff=value if 0 <= value <= 200 else 40)])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",
@@ -356,9 +372,9 @@ def test_put_rejects_unknown_seniority_level(client: TestClient) -> None:
 def test_put_empty_body_uses_defaults(client: TestClient) -> None:
     """PUT with an empty body is a valid full-replace to defaults."""
     supabase = MagicMock()
-    _wire_select(supabase, [_row(pref_score_cutoff=99)])
-    _wire_update(supabase, [_row()])  # reset to defaults
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row(pref_score_cutoff=99)])
+    _awire_update(supabase, [_row()])  # reset to defaults
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.put("/targets/target-1/preferences", json={})
 
