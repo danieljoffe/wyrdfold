@@ -8,11 +8,11 @@ the live stack via the JWT-bound user client (the same client the endpoints use)
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import pytest
 from postgrest.exceptions import APIError
-from supabase import Client
+from supabase import AsyncClient, Client
 
 pytestmark = pytest.mark.integration
 
@@ -97,9 +97,9 @@ def test_turns_write_own_ok_and_read_scoped(
     assert uid_b not in seen, "RLS leak: A sees B's conversation turn"
 
 
-def test_reset_content_via_user_client_wipes_only_own(
+async def test_reset_content_via_user_client_wipes_only_own(
     two_seeded_users: tuple[str, str],
-    user_client_factory: Callable[[str], Client],
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     service_client: Client,
 ) -> None:
     """delete / conversation/reset run reset_content on the RLS client. A
@@ -117,7 +117,7 @@ def test_reset_content_via_user_client_wipes_only_own(
         ]
     ).execute()
 
-    orchestrator.reset_content(user_client_factory(uid_a), user_id=uid_a)
+    await orchestrator.reset_content(await async_user_client_factory(uid_a), user_id=uid_a)
 
     # Checked via service-role (bypasses RLS) so we see the true DB state.
     a_left = (

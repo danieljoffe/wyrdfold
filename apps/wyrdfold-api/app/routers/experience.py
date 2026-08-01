@@ -15,7 +15,7 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.dependencies import (
@@ -25,8 +25,6 @@ from app.dependencies import (
     get_current_user_id,
     get_embeddings_client,
     get_llm_client,
-    get_supabase,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.models.conversation import (
@@ -90,7 +88,7 @@ _PARSE_TIMEOUT_SECONDS = 30.0
 # Handlers now run on the async user/service client. A few experience-service
 # helpers (``prose.get_latest`` / ``prose.create_version`` / ``optimized.get_latest``
 # / ``preferences.get``) are still called SYNC by not-yet-converted modules
-# (conversation orchestrator, tailor, analysis, targets, fit_refresh) that hold a
+# (tailor, analysis, targets, fit_refresh) that hold a
 # sync client — converting them would break those callers, and a sync helper
 # cannot take the async client. So the sync helpers stay, and these thin async
 # inlines run the same queries on the async client (the insights.py::_user_target_ids
@@ -227,8 +225,8 @@ async def create_prose(
 
 
 @router.delete("/prose")
-def delete_master_document(
-    supabase: Client = Depends(get_user_supabase),
+async def delete_master_document(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Delete the master document and everything derived from it.
@@ -241,7 +239,7 @@ def delete_master_document(
     client (Phase 1): RLS scopes the wipe to the caller's own rows
     (``auth.uid() = user_id``), backstopping the app-layer ``user_id`` filter.
     """
-    return orchestrator.reset_content(supabase, user_id=user_id, include_turns=False)
+    return await orchestrator.reset_content(supabase, user_id=user_id, include_turns=False)
 
 
 @router.post("/prose/consolidate", dependencies=[Depends(enforce_llm_budget)])
@@ -776,15 +774,16 @@ async def reset_preferences(
 # ---- Conversation turns --------------------------------------------------
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
+# `async def` on the async user client (#57 slice 4): the DB read runs natively
+# on the event loop.
 @router.get("/turns")
-def list_turns(
+async def list_turns(
     conversation_type: ConversationType | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
-    rows = turns.list_turns(
+    rows = await turns.list_turns(
         supabase,
         user_id=user_id,
         conversation_type=conversation_type,
@@ -793,16 +792,17 @@ def list_turns(
     return {"turns": [r.model_dump(mode="json") for r in rows]}
 
 
-# Sync `def`: blocking supabase write runs in the threadpool (#107).
+# `async def` on the async user client (#57 slice 4): the DB write runs natively
+# on the event loop.
 @router.post("/turns")
-def append_turn(
+async def append_turn(
     body: TurnAppend,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     if body.skipped and body.role != "user":
         raise HTTPException(status_code=400, detail="only user turns can be skipped")
-    turn = turns.append(
+    turn = await turns.append(
         supabase,
         user_id=user_id,
         conversation_type=body.conversation_type,
@@ -822,10 +822,10 @@ def append_turn(
 async def conversation_turn(
     request: Request,
     body: TurnRequest,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
-    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),  # service-role cost ledger
 ) -> TurnResult:
     """Run one orchestrated turn. Persists user + assistant turns,
     appends to prose doc if the LLM determined fresh content was shared.
@@ -841,24 +841,23 @@ async def conversation_turn(
     )
 
 
-# Sync `def`: blocking supabase wipe runs in the threadpool (#107).
 @router.post("/conversation/reset")
-def conversation_reset(
-    supabase: Client = Depends(get_user_supabase),
+async def conversation_reset(
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ResetResult:
     """Wipe prose, optimized (chunks cascade), and turns. Preferences are
     preserved — delete them via DELETE /experience/preferences if wanted.
     """
-    return orchestrator.reset_content(supabase, user_id=user_id)
+    return await orchestrator.reset_content(supabase, user_id=user_id)
 
 
 @router.get("/conversation/next-probe", dependencies=[Depends(enforce_llm_budget)])
 async def conversation_next_probe(
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
-    cost_supabase: Client = Depends(get_supabase),  # service-role cost ledger
+    cost_supabase: AsyncClient = Depends(get_async_service_supabase),  # service-role cost ledger
 ) -> ProbeResult:
     """Top-priority gap phrased as a user-facing question by the LLM."""
     return await orchestrator.next_probe(

@@ -20,9 +20,10 @@ import contextlib
 import json
 import logging
 import re
+import uuid
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import UNVERIFIED_MARKER, resolve_owner
 from app.models.conversation import (
@@ -31,19 +32,150 @@ from app.models.conversation import (
     ResetResult,
     TurnResult,
 )
-from app.models.experience import AnnotationCreate, ConversationType
+from app.models.experience import (
+    Annotation,
+    AnnotationCreate,
+    ConversationType,
+    OptimizedDoc,
+    OptimizedDocSource,
+    OptimizedPayload,
+    ProseDoc,
+)
 from app.models.llm import Message, ModelId
 from app.services.conversation.prompts import (
     ONBOARDING_SYSTEM,
     PROBE_SYSTEM,
     UPDATE_SYSTEM,
 )
-from app.services.experience import annotations as annotation_svc
 from app.services.experience import gap_tracker, optimized, prose, turns
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient, complete_json
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Inline async reads/writes (#57 slice 4) ------------------------------
+#
+# The conversation handlers now run on the async user/service client. The
+# experience-service helpers ``prose.get_latest`` / ``prose.create_version`` /
+# ``optimized.get_latest`` / ``optimized.create_version`` are still called SYNC
+# by not-yet-converted modules (tailor / analysis / targets / fit_refresh /
+# annotations) that hold a sync client, so their sync twins stay. These thin
+# async inlines run the same queries on the async client (the
+# ``routers/insights.py::_user_target_ids`` pattern) — no sync+async twin in the
+# shared layer. ``add_annotation`` was orchestrator-only, so its logic inlines
+# here too rather than growing an async twin in ``annotations``.
+
+
+async def _prose_latest(supabase: AsyncClient, user_id: str | None) -> ProseDoc | None:
+    """Async inline of ``prose.get_latest`` (sync twin kept for fit_refresh)."""
+    resp = await (
+        supabase.table(prose.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return ProseDoc.model_validate(rows[0]) if rows else None
+
+
+async def _prose_create_version(
+    supabase: AsyncClient, user_id: str | None, content: str
+) -> ProseDoc:
+    """Async inline of ``prose.create_version`` (sync twin kept for other callers)."""
+    latest = await _prose_latest(supabase, user_id)
+    next_version = (latest.version + 1) if latest else 1
+    resp = await (
+        supabase.table(prose.TABLE)
+        .insert({"user_id": user_id, "version": next_version, "content": content})
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert prose doc version")
+    return ProseDoc.model_validate(rows[0])
+
+
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest``. Reads fresh: the module TTL cache
+    is populated/read only by the sync callers and every write invalidates it, so
+    a direct read here is always coherent (#57 slice 4)."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
+
+
+async def _optimized_create_version(
+    supabase: AsyncClient,
+    user_id: str | None,
+    payload: OptimizedPayload,
+    prose_doc_id: str | None,
+    source: OptimizedDocSource,
+) -> OptimizedDoc:
+    """Async inline of ``optimized.create_version``. Invalidates the shared module
+    TTL cache so sync readers never serve the pre-write version (#57 slice 4)."""
+    latest = await _optimized_latest(supabase, user_id)
+    next_version = (latest.version + 1) if latest else 1
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .insert(
+            {
+                "user_id": user_id,
+                "prose_doc_id": prose_doc_id,
+                "version": next_version,
+                "payload": payload.model_dump(mode="json"),
+                "markdown_view": None,
+                "source": source,
+            }
+        )
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert optimized doc version")
+    doc = OptimizedDoc.model_validate(rows[0])
+    optimized._doc_cache.invalidate(optimized._cache_key(user_id))
+    return doc
+
+
+async def _add_annotation(
+    supabase: AsyncClient, user_id: str | None, body: AnnotationCreate
+) -> OptimizedDoc:
+    """Async inline of ``annotations.add_annotation`` (orchestrator-only caller).
+
+    Appends an annotation to the latest optimized doc as a new ``user_edit``
+    version. Raises ``ValueError`` when no optimized doc exists yet (the caller
+    suppresses it)."""
+    latest = await _optimized_latest(supabase, user_id)
+    if latest is None:
+        raise ValueError("no optimized doc to annotate")
+    annotation = Annotation(
+        id=str(uuid.uuid4()),
+        action=body.action,
+        ref_type=body.ref_type,
+        ref_value=body.ref_value,
+        target_label=body.target_label,
+        reason=body.reason,
+    )
+    updated_payload = latest.payload.model_copy(
+        update={"annotations": [*latest.payload.annotations, annotation]}
+    )
+    return await _optimized_create_version(
+        supabase,
+        user_id=user_id,
+        payload=updated_payload,
+        prose_doc_id=latest.prose_doc_id,
+        source="user_edit",
+    )
 
 PURPOSE_TURN_ONBOARDING = "conversation.onboarding"
 PURPOSE_TURN_UPDATE = "conversation.update"
@@ -184,7 +316,7 @@ def _history_as_messages(
 
 
 async def handle_turn(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str | None,
@@ -195,7 +327,7 @@ async def handle_turn(
     # RLS caller passes a service-role client for the cost write while `supabase`
     # stays the RLS client for turns/prose. Defaults to `supabase` for
     # service-role callers (backward-compatible). #88/Phase-1 dual-client.
-    cost_supabase: Client | None = None,
+    cost_supabase: AsyncClient | None = None,
 ) -> TurnResult:
     """Persist the user turn, run the LLM, persist the assistant reply,
     and optionally append to the prose doc."""
@@ -204,15 +336,15 @@ async def handle_turn(
     # LLM context window, not history truncation: every turn stays persisted;
     # only the slice re-sent to the model is capped (#29 — previously the
     # entire history, unbounded, was resent every turn).
-    history = turns.list_recent_turns(
+    history = await turns.list_recent_turns(
         supabase,
         user_id=user_id,
         conversation_type=conversation_type,
         limit=settings.conversation_history_max_turns,
     )
-    current_prose = prose.get_latest(supabase, user_id=user_id)
+    current_prose = await _prose_latest(supabase, user_id=user_id)
 
-    turns.append(
+    await turns.append(
         supabase,
         user_id=user_id,
         conversation_type=conversation_type,
@@ -250,7 +382,7 @@ async def handle_turn(
         purpose=purpose,
         cache_system=True,
     )
-    cost_log.record(
+    await cost_log.record_async(
         cost_supabase or supabase,
         user_id=user_id,
         purpose=purpose,
@@ -286,7 +418,7 @@ async def handle_turn(
             append_text = f"{UNVERIFIED_MARKER}\n{append_text}"
         existing = current_prose.content if current_prose else ""
         new_content = (existing + "\n\n" + append_text).strip() if existing else append_text
-        new_doc = prose.create_version(supabase, user_id=user_id, content=new_content)
+        new_doc = await _prose_create_version(supabase, user_id=user_id, content=new_content)
         new_prose_version = new_doc.version
         prose_updated = True
 
@@ -294,7 +426,7 @@ async def handle_turn(
     # ValueError is raised when no optimized doc exists yet — skip silently.
     if parsed.annotation:
         with contextlib.suppress(ValueError):
-            annotation_svc.add_annotation(
+            await _add_annotation(
                 supabase,
                 user_id=user_id,
                 body=AnnotationCreate(
@@ -306,7 +438,7 @@ async def handle_turn(
                 ),
             )
 
-    turns.append(
+    await turns.append(
         supabase,
         user_id=user_id,
         conversation_type=conversation_type,
@@ -325,8 +457,8 @@ async def handle_turn(
     )
 
 
-def reset_content(
-    supabase: Client,
+async def reset_content(
+    supabase: AsyncClient,
     *,
     user_id: str | None,
     include_turns: bool = True,
@@ -343,15 +475,15 @@ def reset_content(
         q = supabase.table(table).delete()
         return q.eq("user_id", resolve_owner(user_id))
 
-    prose_resp = _scoped("experience_prose_docs").execute()
-    optimized_resp = _scoped("experience_optimized_docs").execute()
+    prose_resp = await _scoped("experience_prose_docs").execute()
+    optimized_resp = await _scoped("experience_optimized_docs").execute()
 
     prose_deleted = len(cast(list[Any], prose_resp.data or []))
     optimized_deleted = len(cast(list[Any], optimized_resp.data or []))
 
     turns_deleted = 0
     if include_turns:
-        turns_resp = _scoped("experience_conversation_turns").execute()
+        turns_resp = await _scoped("experience_conversation_turns").execute()
         turns_deleted = len(cast(list[Any], turns_resp.data or []))
 
     return ResetResult(
@@ -362,14 +494,14 @@ def reset_content(
 
 
 async def next_probe(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str | None,
-    cost_supabase: Client | None = None,  # service-role cost ledger; see handle_turn
+    cost_supabase: AsyncClient | None = None,  # service-role cost ledger; see handle_turn
 ) -> ProbeResult:
     """Find the top-priority gap and phrase it as a user-facing question."""
-    current = optimized.get_latest(supabase, user_id=user_id)
+    current = await _optimized_latest(supabase, user_id=user_id)
     if current is None:
         return ProbeResult(
             question=(
@@ -392,7 +524,7 @@ async def next_probe(
         purpose=PURPOSE_PROBE,
         cache_system=True,
     )
-    cost_log.record(
+    await cost_log.record_async(
         cost_supabase or supabase,
         user_id=user_id,
         purpose=PURPOSE_PROBE,
