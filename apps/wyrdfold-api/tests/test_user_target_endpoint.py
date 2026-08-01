@@ -10,12 +10,13 @@ target data.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
@@ -60,6 +61,7 @@ def _user_target() -> UserTarget:
 @pytest.fixture
 def client() -> TestClient:
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     # GET /targets/{id} now resolves the caller via the optional dep and
     # ownership-checks it (#29 round 3 / M3), so the fixture must supply it.
@@ -127,8 +129,8 @@ def test_returns_user_target_with_target_data(
 ) -> None:
     from app.routers import targets as router_mod
 
-    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
-    monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=_user_target()))
+    monkeypatch.setattr(router_mod, "_target_get", AsyncMock(return_value=_job_target()))
 
     resp = client.get("/targets/target-1/user-target")
 
@@ -144,7 +146,7 @@ def test_404_when_no_user_target_row(client: TestClient, monkeypatch: pytest.Mon
     """The user might query a target they've never linked to. 404."""
     from app.routers import targets as router_mod
 
-    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: None)
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=None))
 
     resp = client.get("/targets/target-1/user-target")
 
@@ -159,8 +161,8 @@ def test_404_when_user_target_exists_but_target_missing(
     deleted. Surface as 404 rather than a 500."""
     from app.routers import targets as router_mod
 
-    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
-    monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: None)
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=_user_target()))
+    monkeypatch.setattr(router_mod, "_target_get", AsyncMock(return_value=None))
 
     resp = client.get("/targets/target-1/user-target")
 
@@ -178,11 +180,11 @@ def test_does_not_collide_with_get_target_route(
     from app.routers import targets as router_mod
 
     # Stub both endpoints; the test passes as long as the right handler is hit.
-    monkeypatch.setattr(router_mod.crud, "get", lambda *_a, **_kw: _job_target())
-    monkeypatch.setattr(router_mod.crud, "get_user_target", lambda *_a, **_kw: _user_target())
+    monkeypatch.setattr(router_mod, "_target_get", AsyncMock(return_value=_job_target()))
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=_user_target()))
     # GET /targets/{id} ownership-checks the caller (#29 round 3 / M3); the
     # fixture user owns target-1.
-    monkeypatch.setattr(router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"})
+    monkeypatch.setattr(router_mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
 
     plain = client.get("/targets/target-1")
     assert plain.status_code == 200

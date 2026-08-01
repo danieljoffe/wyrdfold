@@ -10,33 +10,35 @@ of the client, the user is free to navigate away and come back to a finished
 analysis. Cache key is ``(job_posting_id, target_id, optimized_doc_id)``.
 """
 
-import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
-from supabase import Client
+from supabase import AsyncClient
 
 from app.background import spawn_detached
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.config import Settings
+from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
+    get_async_supabase_for_caller,
     get_current_user_id_optional,
     get_llm_client,
     get_settings,
-    get_supabase,
-    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.models.analysis import AnalysisStatusResponse, JobAnalysisRecord
 from app.models.experience import OptimizedDoc
+from app.models.targets import JobTarget
 from app.services.analysis import persistence, run_registry
 from app.services.analysis.analyze import DEFAULT_PURPOSE, analyze_job
 from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.experience import optimized
-from app.services.llm import budget, cost_log
+from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.targets import crud as targets_crud
 
@@ -65,12 +67,115 @@ def _no_profile_response() -> JSONResponse:
     )
 
 
+# ---- Inline async reads (#57 slice 3) -------------------------------------
+#
+# Handlers run on the async user/service client. A few shared sync helpers
+# (``targets_crud.get_user_target_ids`` / ``targets_crud.get`` /
+# ``optimized.get_latest`` / ``budget.check_daily_count``) stay SYNC for their
+# not-yet-converted callers (poller / targets / experience chain) — a sync
+# helper can't take the async client, and converting them would break those
+# callers. So these thin async inlines run the same queries on the async client
+# (the insights.py::_user_target_ids / experience.py / tailor.py pattern). No
+# sync+async twin in the shared layer.
+
+
+async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
+    """Any-status target ids for the user. Async inline of
+    ``targets_crud.get_user_target_ids`` (sync twin kept for its sync callers)."""
+    resp = (
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (sync twin kept for the poller /
+    targets / annotations chain). Reads fresh: the module TTL cache is populated
+    only by those sync callers and every write invalidates it."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
+
+
+async def _target_get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``targets_crud.get`` (sync twin kept for its other
+    callers). Reuses ``crud._parse_target`` so the row shape stays identical."""
+    resp = await (
+        supabase.table(targets_crud.TARGETS_TABLE).select("*").eq("id", target_id).execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return targets_crud._parse_target(rows[0]) if rows else None
+
+
+async def _fetch_job_description(supabase: AsyncClient, job_id: str) -> str | None:
+    """The posting's ``description_html`` (empty string when NULL), or ``None``
+    when the posting doesn't exist — so the caller can 404 vs 422 distinctly."""
+    resp = await (
+        supabase.table("jobs")
+        .select("id, description_html")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return rows[0].get("description_html") or ""
+
+
+async def _check_daily_count(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    purpose: str,
+    limit: int,
+    in_flight: int = 0,
+) -> None:
+    """Async inline of ``budget.check_daily_count`` (sync twin kept for its unit
+    test). Raise 429 if the user already has ``limit`` ``llm_costs`` rows for
+    ``purpose`` in the rolling 24h window; ``in_flight`` is added before the
+    comparison so a burst of concurrent kicks (whose cost rows land ~26s later)
+    can't slip past a gate that only sees already-persisted rows. ``limit=0``
+    disables."""
+    if limit <= 0:
+        return
+    since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    resp = await (
+        supabase.table("llm_costs")
+        # head=True → count only, no rows shipped (HEAD request).
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("user_id", user_id)
+        .eq("purpose", purpose)
+        .gte("created_at", since)
+        .execute()
+    )
+    used = resp.count or 0
+    if used + in_flight >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "analysis_daily_limit",
+                "purpose": purpose,
+                "limit": limit,
+                "used": used + in_flight,
+            },
+        )
+
+
 async def _resolve_state(
     job_id: str,
     target_id: str,
     *,
-    supabase: Client,
-    caller_supabase: Client,
+    supabase: AsyncClient,
+    caller_supabase: AsyncClient,
     user_id: str | None,
 ) -> tuple[OptimizedDoc | None, JobAnalysisRecord | None]:
     """Shared POST/GET preamble: ownership gate → optimized doc → cache read.
@@ -88,19 +193,14 @@ async def _resolve_state(
     Returns ``(optimized, cached)``: ``optimized is None`` → no-profile;
     ``cached is not None`` → a persisted analysis exists.
     """
-    if user_id is not None and target_id not in await asyncio.to_thread(
-        targets_crud.get_user_target_ids, caller_supabase, user_id
-    ):
+    if user_id is not None and target_id not in await _user_target_ids(caller_supabase, user_id):
         raise HTTPException(status_code=404, detail="Target not found.")
 
-    current_optimized = await asyncio.to_thread(
-        optimized.get_latest, caller_supabase, user_id=user_id
-    )
+    current_optimized = await _optimized_latest(caller_supabase, user_id)
     if current_optimized is None:
         return None, None
 
-    cached = await asyncio.to_thread(
-        persistence.get_cached,
+    cached = await persistence.get_cached(
         supabase,
         job_id,
         target_id=target_id,
@@ -118,7 +218,7 @@ async def _resolve_state(
 async def create_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     # #6 R2 / #88 dual-client split:
     # * `caller_supabase` (JWT → RLS user client, api-key → service-role)
     #   carries every read a JWT caller is entitled to make directly — the
@@ -131,7 +231,7 @@ async def create_analysis(
     #   design, and an RLS surprise on the cache read or the daily-count
     #   read would silently turn into duplicate LLM spend / a widened
     #   budget — the failure mode must stay impossible, not just tested.
-    caller_supabase: Client = Depends(get_supabase_for_caller),
+    caller_supabase: AsyncClient = Depends(get_async_supabase_for_caller),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
     s: Settings = Depends(get_settings),
@@ -158,8 +258,7 @@ async def create_analysis(
         # still see the keyword-only score in the list view. ``_apply_llm_blend``
         # is idempotent, so re-running it on every cache hit is a cheap no-op
         # once the row already has the blended score.
-        await asyncio.to_thread(
-            _apply_llm_blend,
+        await _apply_llm_blend(
             supabase,
             job_posting_id=job_id,
             target_id=target_id,
@@ -195,8 +294,7 @@ async def create_analysis(
         # that only sees persisted rows and blow past the cap.
         if user_id is not None:
             other_in_flight = max(0, run_registry.running_count_for_user(user_id) - 1)
-            await asyncio.to_thread(
-                budget.check_daily_count,
+            await _check_daily_count(
                 supabase,
                 user_id=user_id,
                 purpose=DEFAULT_PURPOSE,
@@ -206,23 +304,13 @@ async def create_analysis(
 
         # Fetch target (existence + LLM context) and the JD in-line so 404/422
         # surface as real HTTP status on the POST, not as a silent task failure.
-        target = await asyncio.to_thread(targets_crud.get, caller_supabase, target_id)
+        target = await _target_get(caller_supabase, target_id)
         if target is None:
             raise HTTPException(status_code=404, detail="Target not found.")
 
-        resp = await asyncio.to_thread(
-            lambda: (
-                caller_supabase.table("jobs")
-                .select("id, description_html")
-                .eq("id", job_id)
-                .limit(1)
-                .execute()
-            )
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
+        description_html = await _fetch_job_description(caller_supabase, job_id)
+        if description_html is None:
             raise HTTPException(status_code=404, detail="Job posting not found.")
-        description_html = rows[0].get("description_html") or ""
         if not description_html.strip():
             raise HTTPException(
                 status_code=422,
@@ -268,8 +356,8 @@ async def create_analysis(
 async def get_analysis(
     job_id: str,
     target_id: str = Query(..., description="Target the user is viewing the job under"),
-    supabase: Client = Depends(get_supabase),
-    caller_supabase: Client = Depends(get_supabase_for_caller),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+    caller_supabase: AsyncClient = Depends(get_async_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobAnalysisRecord | JSONResponse:
     """Poll the state of a (possibly backgrounded) analysis (#459).
@@ -311,7 +399,7 @@ async def get_analysis(
 async def _run_analysis_task(
     *,
     key: run_registry.Key,
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     job_id: str,
     target_id: str,
@@ -340,8 +428,7 @@ async def _run_analysis_task(
         # Persist FIRST — once the cache row exists the analysis is "done" from
         # the user's perspective (a poll returns it), so a later best-effort
         # hiccup can't demote a finished analysis back to an error.
-        record = await asyncio.to_thread(
-            persistence.persist,
+        record = await persistence.persist(
             supabase,
             job_posting_id=job_id,
             target_id=target_id,
@@ -354,8 +441,7 @@ async def _run_analysis_task(
         # Cost logging is best-effort: a ledger hiccup must not discard the
         # analysis the user is waiting on (already persisted above).
         try:
-            await asyncio.to_thread(
-                cost_log.record,
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=DEFAULT_PURPOSE,
@@ -378,8 +464,7 @@ async def _run_analysis_task(
         # Blend the LLM score into the per-target row. Done BEFORE finish() so a
         # poll that reads the freshly-cached record already sees the blended
         # ranking. Idempotent + best-effort inside _apply_llm_blend.
-        await asyncio.to_thread(
-            _apply_llm_blend,
+        await _apply_llm_blend(
             supabase,
             job_posting_id=job_id,
             target_id=target_id,
@@ -394,8 +479,8 @@ async def _run_analysis_task(
         run_registry.fail(key, message="Analysis failed. Please retry.")
 
 
-def _apply_llm_blend(
-    supabase: Client,
+async def _apply_llm_blend(
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     target_id: str,
@@ -413,7 +498,7 @@ def _apply_llm_blend(
     blend hiccup doesn't fail the user's request.
     """
     try:
-        cur_resp = (
+        cur_resp = await (
             supabase.table("scores")
             .select("score")
             .eq("job_posting_id", job_posting_id)
@@ -427,7 +512,7 @@ def _apply_llm_blend(
         blended = blend_scores(keyword_score, llm_score)
         # Gated write: updates the shared (job, target) scores row + stamps
         # jobs.llm_analysis_id behind an ownership check enforced in Postgres.
-        supabase.rpc(
+        await supabase.rpc(
             "user_apply_score_blend",
             {
                 "p_job_posting_id": job_posting_id,

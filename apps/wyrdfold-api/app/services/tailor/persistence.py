@@ -21,7 +21,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.constants import resolve_owner
 from app.models.llm import LLMResult
@@ -50,8 +50,8 @@ def _storage_path(user_id: str, resume_id: str) -> str:
     return f"{user_id}/{resume_id}.docx"
 
 
-def upload_docx(
-    supabase: Client,
+async def upload_docx(
+    supabase: AsyncClient,
     *,
     user_id: str,
     resume_id: str,
@@ -63,7 +63,7 @@ def upload_docx(
     caller's id: storage RLS keys access on the ``<user_id>/`` path prefix.
     """
     path = _storage_path(user_id, resume_id)
-    supabase.storage.from_(STORAGE_BUCKET).upload(
+    await supabase.storage.from_(STORAGE_BUCKET).upload(
         path=path,
         file=docx_bytes,
         file_options={"content-type": DOCX_CONTENT_TYPE, "upsert": "true"},
@@ -71,11 +71,11 @@ def upload_docx(
     return path
 
 
-def download_docx(supabase: Client, storage_path: str) -> bytes:
-    return supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
+async def download_docx(supabase: AsyncClient, storage_path: str) -> bytes:
+    return await supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
 
 
-def purge_user_objects(supabase: Client, user_id: str) -> int:
+async def purge_user_objects(supabase: AsyncClient, user_id: str) -> int:
     """Delete every object under the user's ``<user_id>/`` prefix.
 
     Returns the number of objects removed. Used by account deletion
@@ -83,32 +83,32 @@ def purge_user_objects(supabase: Client, user_id: str) -> int:
     than one storage page; bounded to avoid an unbounded loop if a
     backend ever fails to remove. Paths are flat
     (``<user_id>/<resume_id>.docx``), so a single-level listing suffices.
-    """
+    Async on the pooled client (#57 slice 3)."""
     bucket = supabase.storage.from_(STORAGE_BUCKET)
     removed = 0
     for _ in range(1000):  # safety bound: 1000 pages
-        listing = bucket.list(user_id) or []
+        listing = await bucket.list(user_id) or []
         names = [obj["name"] for obj in listing if obj.get("name")]
         if not names:
             break
-        bucket.remove([f"{user_id}/{name}" for name in names])
+        await bucket.remove([f"{user_id}/{name}" for name in names])
         removed += len(names)
     return removed
 
 
-def insert_row(
-    supabase: Client,
+async def insert_row(
+    supabase: AsyncClient,
     row: dict[str, Any],
     *,
     payload_md: str | None = None,
 ) -> TailoredResumeRecord:
-    resp = supabase.table(TABLE).insert(row).execute()
+    resp = await supabase.table(TABLE).insert(row).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to insert documents row")
     record = TailoredResumeRecord.model_validate(rows[0])
     # F3-H: capture the initial payload as version 1.
-    versions.record(
+    await versions.record(
         supabase,
         resume_id=record.id,
         payload=record.payload,
@@ -118,8 +118,8 @@ def insert_row(
     return record
 
 
-def persist(
-    supabase: Client,
+async def persist(
+    supabase: AsyncClient,
     *,
     user_id: str | None,
     job_posting_id: str | None,
@@ -149,11 +149,11 @@ def persist(
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
     }
-    return insert_row(supabase, row, payload_md=payload_md)
+    return await insert_row(supabase, row, payload_md=payload_md)
 
 
-def persist_cover_letter(
-    supabase: Client,
+async def persist_cover_letter(
+    supabase: AsyncClient,
     *,
     user_id: str | None,
     job_posting_id: str | None,
@@ -187,11 +187,11 @@ def persist_cover_letter(
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
     }
-    return insert_row(supabase, row, payload_md=payload_md)
+    return await insert_row(supabase, row, payload_md=payload_md)
 
 
-def get(
-    supabase: Client,
+async def get(
+    supabase: AsyncClient,
     resume_id: str,
     *,
     user_id: str | None,
@@ -215,7 +215,7 @@ def get(
     """
     query = supabase.table(TABLE).select("*").eq("id", resume_id)
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = query.single().execute()
+    resp = await query.single().execute()
     if not resp.data:
         return None
     return TailoredResumeRecord.model_validate(cast(dict[str, Any], resp.data))
@@ -230,8 +230,8 @@ def _scope_to_user(query: Any, user_id: str | None) -> Any:
     return query.eq("user_id", resolve_owner(user_id))
 
 
-def update_payload(
-    supabase: Client,
+async def update_payload(
+    supabase: AsyncClient,
     resume_id: str,
     payload_dict: dict[str, Any],
     storage_path: str | None = None,
@@ -250,7 +250,7 @@ def update_payload(
     Same convention as ``persistence.get`` — ``user_id=None`` matches
     the legacy single-tenant rows.
     """
-    versions.record(
+    await versions.record(
         supabase,
         resume_id=resume_id,
         payload=payload_dict,
@@ -263,15 +263,15 @@ def update_payload(
     if storage_path is not None:
         updates["storage_path"] = storage_path
     query = supabase.table(TABLE).update(updates).eq("id", resume_id)
-    resp = _scope_to_user(query, user_id).execute()
+    resp = await _scope_to_user(query, user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError(f"Failed to update documents row {resume_id}")
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def update_payload_md(
-    supabase: Client,
+async def update_payload_md(
+    supabase: AsyncClient,
     resume_id: str,
     payload_md: str,
     *,
@@ -301,15 +301,15 @@ def update_payload_md(
         "updated_at": "now()",
     }
     query = supabase.table(TABLE).update(updates).eq("id", resume_id)
-    resp = _scope_to_user(query, user_id).execute()
+    resp = await _scope_to_user(query, user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError(f"Failed to update documents row {resume_id}")
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def mark_docx_rendered(
-    supabase: Client,
+async def mark_docx_rendered(
+    supabase: AsyncClient,
     resume_id: str,
     *,
     storage_path: str,
@@ -334,12 +334,17 @@ def mark_docx_rendered(
         )
         .eq("id", resume_id)
     )
-    _scope_to_user(query, user_id).execute()
+    await _scope_to_user(query, user_id).execute()
 
 
 def upsert_user_job(supabase: Client, *, user_id: str, job_posting_id: str, status: str) -> None:
     """Mirror a jobs.status write into the per-user user_jobs table (#75 C1).
-    Service-role client; the row is keyed by (user_id, job_posting_id)."""
+    Service-role client; the row is keyed by (user_id, job_posting_id).
+
+    Stays **sync** (#57 slice 3): still called by the not-yet-converted
+    ``jobs`` / ``status`` routers and ``targets.from_input`` on a sync client.
+    The async tailor paths inline the same upsert (router ``_upsert_user_job``
+    / ``mark_job_resume_draft`` below) rather than fork a sync+async twin."""
     supabase.table("user_jobs").upsert(
         {
             "user_id": user_id,
@@ -351,7 +356,9 @@ def upsert_user_job(supabase: Client, *, user_id: str, job_posting_id: str, stat
     ).execute()
 
 
-def mark_job_resume_draft(supabase: Client, job_posting_id: str, *, user_id: str | None) -> None:
+async def mark_job_resume_draft(
+    supabase: AsyncClient, job_posting_id: str, *, user_id: str | None
+) -> None:
     """Advance a job posting to status='resume_draft' for the caller.
 
     Called after a tailored resume is persisted (single, batch, or reuse
@@ -362,44 +369,54 @@ def mark_job_resume_draft(supabase: Client, job_posting_id: str, *, user_id: str
     touches the global ``jobs.status``. When ``user_id`` is known (JWT
     caller) it mirrors the status into ``user_jobs``; the api-key/cron paths
     (``user_id=None``) have no per-user pipeline, so they're a no-op.
+
+    Inlines the ``user_jobs`` upsert (async) rather than delegate to the sync
+    ``upsert_user_job`` twin kept for the not-yet-converted routers (#57 slice 3).
     """
     if user_id is not None:
-        upsert_user_job(
-            supabase,
-            user_id=user_id,
-            job_posting_id=job_posting_id,
-            status="resume_draft",
-        )
+        await supabase.table("user_jobs").upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": "resume_draft",
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        ).execute()
 
 
-def approve(supabase: Client, resume_id: str, *, user_id: str | None) -> TailoredResumeRecord:
+async def approve(
+    supabase: AsyncClient, resume_id: str, *, user_id: str | None
+) -> TailoredResumeRecord:
     """Set approved_at on a tailored resume.
 
     Defense-in-depth (post-#714): see ``update_payload``.
     """
     query = supabase.table(TABLE).update({"approved_at": "now()"}).eq("id", resume_id)
-    resp = _scope_to_user(query, user_id).execute()
+    resp = await _scope_to_user(query, user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError(f"Failed to approve documents row {resume_id}")
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def unapprove(supabase: Client, resume_id: str, *, user_id: str | None) -> TailoredResumeRecord:
+async def unapprove(
+    supabase: AsyncClient, resume_id: str, *, user_id: str | None
+) -> TailoredResumeRecord:
     """Clear approved_at on a tailored resume — reopens it for editing.
 
     Defense-in-depth (post-#714): see ``update_payload``.
     """
     query = supabase.table(TABLE).update({"approved_at": None}).eq("id", resume_id)
-    resp = _scope_to_user(query, user_id).execute()
+    resp = await _scope_to_user(query, user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError(f"Failed to unapprove documents row {resume_id}")
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def get_by_job(
-    supabase: Client,
+async def get_by_job(
+    supabase: AsyncClient,
     job_posting_id: str,
     *,
     user_id: str | None,
@@ -418,15 +435,15 @@ def get_by_job(
         .eq("document_type", document_type)
     )
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = query.order("created_at", desc=True).limit(1).execute()
+    resp = await query.order("created_at", desc=True).limit(1).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
     return TailoredResumeRecord.model_validate(rows[0])
 
 
-def list_recent(
-    supabase: Client,
+async def list_recent(
+    supabase: AsyncClient,
     *,
     user_id: str | None,
     limit: int = 50,
@@ -436,6 +453,6 @@ def list_recent(
     query = query.eq("user_id", resolve_owner(user_id))
     if document_type is not None:
         query = query.eq("document_type", document_type)
-    resp = query.execute()
+    resp = await query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [TailoredResumeRecord.model_validate(r) for r in rows]

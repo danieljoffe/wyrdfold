@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.services.tailor import versions
 
@@ -44,7 +44,7 @@ class _RecordingChain:
     def limit(self, *_: Any, **__: Any) -> _RecordingChain:
         return self
 
-    def execute(self) -> _ExecuteStub:
+    async def execute(self) -> _ExecuteStub:
         return self.returns
 
 
@@ -58,12 +58,12 @@ def _supabase_with_existing_count(count: int) -> tuple[MagicMock, _RecordingChai
     return supabase, chain
 
 
-def test_record_inserts_then_prunes_when_over_cap() -> None:
+async def test_record_inserts_then_prunes_when_over_cap() -> None:
     # 6 existing versions; new insert pushes to 7 — but the prune query reads
     # them ordered desc, so the oldest (rows beyond index `keep`) gets cut.
     supabase, chain = _supabase_with_existing_count(7)
 
-    versions.record(
+    await versions.record(
         supabase,
         resume_id="resume-abc",
         payload={"summary": "v"},
@@ -78,10 +78,10 @@ def test_record_inserts_then_prunes_when_over_cap() -> None:
     assert chain.deletes_in_ids == [["v5", "v6"]]
 
 
-def test_record_skips_prune_when_under_cap() -> None:
+async def test_record_skips_prune_when_under_cap() -> None:
     supabase, chain = _supabase_with_existing_count(3)
 
-    versions.record(
+    await versions.record(
         supabase,
         resume_id="resume-xyz",
         payload={"summary": "v"},
@@ -122,24 +122,30 @@ def _checkpoint_supabase(
     def table_factory(name: str) -> MagicMock:
         chain = MagicMock()
         if name == "documents":
-            chain.select.return_value.eq.return_value.single.return_value.execute.return_value.data = resume_row
+            chain.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=resume_row)
+            )
             return chain
         assert name == "document_versions"
 
         def insert_capturing(row: dict[str, Any]) -> MagicMock:
             inserts.append(row)
             ret = MagicMock()
-            ret.execute.return_value.data = []
+            ret.execute = AsyncMock(return_value=MagicMock(data=[]))
             return ret
 
         chain.insert.side_effect = insert_capturing
         # Last-version select (terminates with `.limit(1).execute()`).
-        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data = last_versions
-        # Prune select (terminates with `.order().execute()` — no .limit).
-        chain.select.return_value.eq.return_value.order.return_value.execute.return_value.data = (
-            last_versions
+        chain.select.return_value.eq.return_value.order.return_value.limit.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=last_versions))
         )
-        chain.delete.return_value.in_.return_value.execute.return_value.data = []
+        # Prune select (terminates with `.order().execute()` — no .limit).
+        chain.select.return_value.eq.return_value.order.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=last_versions)
+        )
+        chain.delete.return_value.in_.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
         return chain
 
     supabase = MagicMock()
@@ -147,13 +153,13 @@ def _checkpoint_supabase(
     return supabase, inserts
 
 
-def test_checkpoint_records_when_markdown_differs_from_last_version() -> None:
+async def test_checkpoint_records_when_markdown_differs_from_last_version() -> None:
     supabase, inserts = _checkpoint_supabase(
         current_md="# Daniel\n\nNew content\n",
         last_versions=[{"payload_md": "# Daniel\n\nOld content\n"}],
     )
 
-    wrote = versions.checkpoint(supabase, "rec-1")
+    wrote = await versions.checkpoint(supabase, "rec-1")
 
     assert wrote is True
     assert len(inserts) == 1
@@ -161,35 +167,37 @@ def test_checkpoint_records_when_markdown_differs_from_last_version() -> None:
     assert inserts[0]["source"] == "user_edit"
 
 
-def test_checkpoint_dedups_when_markdown_matches_last_version() -> None:
+async def test_checkpoint_dedups_when_markdown_matches_last_version() -> None:
     md = "# Daniel\n\nUnchanged\n"
     supabase, inserts = _checkpoint_supabase(
         current_md=md,
         last_versions=[{"payload_md": md}],
     )
 
-    wrote = versions.checkpoint(supabase, "rec-1")
+    wrote = await versions.checkpoint(supabase, "rec-1")
 
     assert wrote is False
     assert inserts == []
 
 
-def test_checkpoint_records_when_no_prior_versions() -> None:
+async def test_checkpoint_records_when_no_prior_versions() -> None:
     supabase, inserts = _checkpoint_supabase(
         current_md="# Daniel\n\nFirst snapshot\n",
         last_versions=[],
     )
 
-    wrote = versions.checkpoint(supabase, "rec-1")
+    wrote = await versions.checkpoint(supabase, "rec-1")
 
     assert wrote is True
     assert len(inserts) == 1
 
 
-def test_checkpoint_returns_false_when_resume_missing() -> None:
+async def test_checkpoint_returns_false_when_resume_missing() -> None:
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value.data = None
+    supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=None)
+    )
 
-    wrote = versions.checkpoint(supabase, "missing")
+    wrote = await versions.checkpoint(supabase, "missing")
 
     assert wrote is False

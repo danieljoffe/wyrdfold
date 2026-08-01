@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.constants import resolve_owner
 from app.models.embeddings import EmbeddingResult
@@ -26,6 +26,67 @@ _log = logging.getLogger(__name__)
 
 def _insert_row(supabase: Client, row: dict[str, Any]) -> LLMCallRecord:
     resp = supabase.table(TABLE).insert(row).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert llm_costs row")
+    return LLMCallRecord.model_validate(rows[0])
+
+
+def _embedding_row_for(
+    *,
+    user_id: str | None,
+    purpose: str,
+    result: EmbeddingResult,
+    metadata: dict[str, str | int | float | bool] | None,
+) -> dict[str, Any]:
+    return {
+        "user_id": resolve_owner(user_id),
+        "model": result.model,
+        "purpose": purpose,
+        "input_tokens": result.usage.input_tokens,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cost_usd": result.cost_usd,
+        "latency_ms": result.latency_ms,
+        "metadata": metadata or {},
+    }
+
+
+async def record_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    purpose: str,
+    result: LLMResult,
+    metadata: dict[str, str | int | float | bool] | None = None,
+) -> LLMCallRecord:
+    """Async mirror of :func:`record` (#57 slice 3).
+
+    The interactive cost write for an ``async def`` handler on the pooled async
+    service client — the row lands on the event loop instead of a threadpool
+    worker. Same immediate-INSERT semantics as :func:`record` (budget guard sees
+    fresh totals). The sync :func:`record` stays for the poller/batch paths."""
+    resp = await supabase.table(TABLE).insert(_row_for(
+        user_id=user_id, purpose=purpose, result=result, metadata=metadata
+    )).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert llm_costs row")
+    return LLMCallRecord.model_validate(rows[0])
+
+
+async def record_embedding_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    purpose: str,
+    result: EmbeddingResult,
+    metadata: dict[str, str | int | float | bool] | None = None,
+) -> LLMCallRecord:
+    """Async mirror of :func:`record_embedding` (#57 slice 3) for ``async def``
+    callers on the pooled async client."""
+    resp = await supabase.table(TABLE).insert(_embedding_row_for(
+        user_id=user_id, purpose=purpose, result=result, metadata=metadata
+    )).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to insert llm_costs row")

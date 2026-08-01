@@ -15,12 +15,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.models.tailor import TailoredResumeRecord
 from app.models.targets import ScoringProfile
-from app.services.experience.optimized import get_latest as get_latest_optimized
+from app.services.experience import optimized
 from app.services.tailor.persistence import insert_row, jd_hash
 
 SIMILARITY_THRESHOLD = 0.70
@@ -61,16 +61,43 @@ def jd_similarity(
     return len(hits_a & hits_b) / len(union)
 
 
-def _current_master_created_at(supabase: Client, user_id: str | None) -> datetime | None:
+async def _current_master_created_at(
+    supabase: AsyncClient, user_id: str | None
+) -> datetime | None:
     """``created_at`` of the user's CURRENT master optimized doc, or None.
+
+    Async inline of ``optimized.get_latest``'s timestamp read — the sync helper
+    stays for its not-yet-converted callers (poller / analysis / targets /
+    annotations); an async caller can't hand it the async client (#57 slice 3).
+    Reads fresh (the module TTL cache is populated only by those sync callers).
 
     Best-effort: a lookup failure must never block reuse, so any error returns
     None (which disables the staleness check, falling back to the old behavior)."""
     try:
-        master = get_latest_optimized(supabase, user_id)
+        resp = await (
+            supabase.table(optimized.TABLE)
+            .select("created_at")
+            .order("version", desc=True)
+            .limit(1)
+            .eq("user_id", resolve_owner(user_id))
+            .execute()
+        )
     except Exception:
         return None
-    return master.created_at if master else None
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    raw = rows[0].get("created_at")
+    if not raw:
+        return None
+    try:
+        return (
+            raw
+            if isinstance(raw, datetime)
+            else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        )
+    except (ValueError, TypeError):
+        return None
 
 
 def _resume_predates_master(row: dict[str, Any], master_created_at: datetime | None) -> bool:
@@ -106,8 +133,8 @@ _RECENT_RESUMES_WINDOW = 50
 _MAX_CANDIDATES = 10
 
 
-def find_reusable_resume(
-    supabase: Client,
+async def find_reusable_resume(
+    supabase: AsyncClient,
     *,
     target_id: str,
     job_description: str,
@@ -137,14 +164,14 @@ def find_reusable_resume(
         .limit(_RECENT_RESUMES_WINDOW)
     )
     docs_query = docs_query.eq("user_id", resolve_owner(user_id))
-    rows = cast(list[dict[str, Any]], docs_query.execute().data or [])
+    rows = cast(list[dict[str, Any]], (await docs_query.execute()).data or [])
     posting_ids = list(
         {cast(str, r.get("job_posting_id")) for r in rows if r.get("job_posting_id")}
     )
     if not posting_ids:
         return None
 
-    scores_resp = (
+    scores_resp = await (
         supabase.table("scores")
         .select("job_posting_id")
         .eq("target_id", target_id)
@@ -159,7 +186,7 @@ def find_reusable_resume(
 
     # Resumes built from an older master doc version would clone stale,
     # pre-edit content — refuse them so the caller regenerates fresh (#47).
-    master_created_at = _current_master_created_at(supabase, user_id)
+    master_created_at = await _current_master_created_at(supabase, user_id)
 
     best_record: TailoredResumeRecord | None = None
     best_sim = 0.0
@@ -176,8 +203,8 @@ def find_reusable_resume(
     return best_record
 
 
-def clone_resume_for_job(
-    supabase: Client,
+async def clone_resume_for_job(
+    supabase: AsyncClient,
     *,
     source: TailoredResumeRecord,
     job_posting_id: str,
@@ -208,4 +235,4 @@ def clone_resume_for_job(
         "latency_ms": 0,
         "source_resume_id": source.id,
     }
-    return insert_row(supabase, row, payload_md=source.payload_md)
+    return await insert_row(supabase, row, payload_md=source.payload_md)

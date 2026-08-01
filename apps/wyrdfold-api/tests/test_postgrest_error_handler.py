@@ -15,15 +15,15 @@ Found in the 2026-07-19 front-end red-team: ``/jobs/<garbage>`` returned 500.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 from postgrest.exceptions import APIError
 
 from app.config import settings
 from app.dependencies import (
+    get_async_supabase_for_caller,
     get_current_user_id,
-    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -102,16 +102,16 @@ def test_get_job_malformed_uuid_returns_404_not_500() -> None:
     supabase = MagicMock()
     # _assert_user_owns_posting does:
     #   table("jobs").select(...).eq("id", posting_id).limit(1).execute()
-    (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
-    ).side_effect = _api_error("22P02", 'invalid input syntax for type uuid: "not-a-uuid"')
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(side_effect=_api_error("22P02", 'invalid input syntax for type uuid: "not-a-uuid"'))
+    )
 
     # The jobs router gates every route with ``verify_api_key_or_jwt``; override
     # it (and the per-route auth + client deps) so the request reaches the
     # handler and the ownership query — where the simulated 22P02 fires.
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
     app.dependency_overrides[get_current_user_id] = lambda: "user-a"
-    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
     try:
         res = TestClient(app, raise_server_exceptions=False).get("/jobs/not-a-uuid")
         assert res.status_code == 404

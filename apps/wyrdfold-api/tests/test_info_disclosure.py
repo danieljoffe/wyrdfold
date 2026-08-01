@@ -124,7 +124,7 @@ async def test_resume_download_storage_error_is_generic() -> None:
     exception (which can carry the internal Storage path) stays server-side
     (audit #29 R3 / M4)."""
     from datetime import UTC, datetime
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     from fastapi import HTTPException
 
@@ -158,10 +158,16 @@ async def test_resume_download_storage_error_is_generic() -> None:
     secret = "Storage 403 at user-a/secret-internal-path/rec-1.docx token=XYZ"
 
     with (
-        patch("app.services.tailor.persistence.get", return_value=record),
+        patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
         patch(
             "app.services.tailor.persistence.download_docx",
+            new_callable=AsyncMock,
             side_effect=RuntimeError(secret),
+        ),
+        patch(
+            "app.routers.tailor._resolve_render_style",
+            new_callable=AsyncMock,
+            return_value=None,
         ),
     ):
         with pytest.raises(HTTPException) as exc_info:

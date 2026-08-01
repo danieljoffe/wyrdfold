@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Iterator
 import httpx
 import jwt
 import pytest
-from supabase import AsyncClient, Client, create_client
+from supabase import AsyncClient, Client, acreate_client, create_client
 
 from app import supabase_pool
 
@@ -81,6 +81,14 @@ def _require_stack() -> None:
 def service_client(_require_stack: None) -> Client:
     """Service-role client (bypasses RLS) — for seeding and cleanup only."""
     return create_client(LOCAL_URL, SERVICE_KEY)
+
+
+@pytest.fixture
+async def async_service_client(_require_stack: None) -> AsyncClient:
+    """Async service-role client (#57 slice 3) — the async mirror of
+    ``service_client`` for the converted write paths (e.g. the cost-ledger leg
+    of ``chunks.upsert_for_optimized``)."""
+    return await acreate_client(LOCAL_URL, SERVICE_KEY)
 
 
 @pytest.fixture

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.ats_lint import LintResult
@@ -77,7 +77,7 @@ PipelineResult = PipelineSuccess | PipelineLintFailure
 
 
 async def run_tailor_pipeline(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str | None,
@@ -125,7 +125,7 @@ async def run_tailor_pipeline(
             critique=crit,
             page_budget=page_budget,
         )
-        cost_log.record(
+        await cost_log.record_async(
             supabase,
             user_id=user_id,
             purpose=DEFAULT_PURPOSE,
@@ -147,7 +147,7 @@ async def run_tailor_pipeline(
         review, review_result = await review_resume_faithfulness(
             llm, resume=resume, optimized=filtered_payload
         )
-        cost_log.record(
+        await cost_log.record_async(
             supabase,
             user_id=user_id,
             purpose=FAITHFULNESS_REVIEW_PURPOSE,
@@ -183,7 +183,7 @@ async def run_tailor_pipeline(
             llm_result=llm_result,
         )
 
-    record = persistence.persist(
+    record = await persistence.persist(
         supabase,
         user_id=user_id,
         job_posting_id=job_posting_id,
@@ -195,7 +195,7 @@ async def run_tailor_pipeline(
         storage_path=None,
     )
     try:
-        storage_path = persistence.upload_docx(
+        storage_path = await persistence.upload_docx(
             supabase,
             user_id=user_id,
             resume_id=record.id,
@@ -204,13 +204,11 @@ async def run_tailor_pipeline(
     except Exception:
         storage_path = None
     if storage_path:
-        await asyncio.to_thread(
-            lambda: (
-                supabase.table(persistence.TABLE)
-                .update({"storage_path": storage_path})
-                .eq("id", record.id)
-                .execute()
-            )
+        await (
+            supabase.table(persistence.TABLE)
+            .update({"storage_path": storage_path})
+            .eq("id", record.id)
+            .execute()
         )
         record = record.model_copy(update={"storage_path": storage_path})
 
@@ -249,7 +247,7 @@ CoverLetterPipelineResult = CoverLetterPipelineSuccess | CoverLetterPipelineLint
 
 
 async def run_cover_letter_pipeline(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str | None,
@@ -292,7 +290,7 @@ async def run_cover_letter_pipeline(
         critique=critique,
     )
 
-    cost_log.record(
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=DEFAULT_COVER_LETTER_PURPOSE,
@@ -323,7 +321,7 @@ async def run_cover_letter_pipeline(
             llm_result=llm_result,
         )
 
-    record = persistence.persist_cover_letter(
+    record = await persistence.persist_cover_letter(
         supabase,
         user_id=user_id,
         job_posting_id=job_posting_id,
@@ -335,7 +333,7 @@ async def run_cover_letter_pipeline(
         storage_path=None,
     )
     try:
-        storage_path = persistence.upload_docx(
+        storage_path = await persistence.upload_docx(
             supabase,
             user_id=user_id,
             resume_id=record.id,
@@ -344,13 +342,11 @@ async def run_cover_letter_pipeline(
     except Exception:
         storage_path = None
     if storage_path:
-        await asyncio.to_thread(
-            lambda: (
-                supabase.table(persistence.TABLE)
-                .update({"storage_path": storage_path})
-                .eq("id", record.id)
-                .execute()
-            )
+        await (
+            supabase.table(persistence.TABLE)
+            .update({"storage_path": storage_path})
+            .eq("id", record.id)
+            .execute()
         )
         record = record.model_copy(update={"storage_path": storage_path})
 

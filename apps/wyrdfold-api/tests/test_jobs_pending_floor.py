@@ -20,7 +20,7 @@ whether the daily grading cap happened to reach it. These tests pin the fix:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -169,7 +169,7 @@ def test_prefer_score_row_graded_beats_pending() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
         {
@@ -189,7 +189,7 @@ def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.Monkey
         {"job_posting_id": "p20", "score": 20, "score_breakdown": {}, "scoring_status": "stage2"},
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g90", "g30", "p20")}
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
         page_size=10,
@@ -209,7 +209,7 @@ def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.Monkey
     assert ids == ["g90", "p20"]  # graded first, then Pending
 
 
-def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
         {
@@ -229,7 +229,7 @@ def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPat
         },
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("g50", "p80", "g70")}
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
         page_size=10,
@@ -255,7 +255,7 @@ def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.MonkeyPat
 # --------------------------------------------------------------------------
 
 
-def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same job scored on two targets: a graded 60 and a Pending 90.
     scores = [
@@ -276,7 +276,7 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
         },
     ]
     postings = {"j": {"id": "j", "title": "j"}}
-    result = _list_jobs_across_user_targets(
+    result = await _list_jobs_across_user_targets(
         two_query_supabase(scores, postings),
         user_target_ids={"t-1", "t-2"},
         page_size=10,
@@ -301,19 +301,19 @@ def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.Monk
 # --------------------------------------------------------------------------
 
 
-def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
     # Floored counts ride the RPC since 20260716050000 taught it the Pending
     # exemption — the Python path is the mid-deploy fallback only. Forcing
     # Python here cost floored users ~2s of chunked round-trips per dashboard
     # load (2026-07-16 audit).
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = FakeResponse([{"status": "new", "count": 7}])
+    sb.rpc.return_value.execute = AsyncMock(return_value=FakeResponse([{"status": "new", "count": 7}]))
     monkeypatch.setattr(
         jobs_mod,
         "_pipeline_counts_python",
         lambda *a, **k: pytest.fail("floored counts must use the RPC, not the Python fallback"),
     )
-    out = _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=70, user_id="u1")
+    out = await _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=70, user_id="u1")
     assert out == {"new": 7}
     sb.rpc.assert_called_once_with(
         "pipeline_counts",
@@ -321,10 +321,10 @@ def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_counts_use_rpc_when_unfloored() -> None:
+async def test_counts_use_rpc_when_unfloored() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = FakeResponse([{"status": "new", "count": 3}])
-    out = _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=None, user_id="u1")
+    sb.rpc.return_value.execute = AsyncMock(return_value=FakeResponse([{"status": "new", "count": 3}]))
+    out = await _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=None, user_id="u1")
     assert out == {"new": 3}
     sb.rpc.assert_called_once()  # no floor → keyset RPC fast path
 
@@ -334,7 +334,7 @@ def test_counts_use_rpc_when_unfloored() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_select_shaped_graded_rows_sort_by_score_not_recency(
+async def test_select_shaped_graded_rows_sort_by_score_not_recency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rows shaped EXACTLY like the list select fetches them (axis_scores
@@ -366,7 +366,7 @@ def test_select_shaped_graded_rows_sort_by_score_not_recency(
         },
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("new45", "old78", "new68")}
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
         page_size=10,
@@ -384,7 +384,7 @@ def test_select_shaped_graded_rows_sort_by_score_not_recency(
     assert all(p["pending"] is False for p in result["postings"])
 
 
-def test_ascending_score_sort_returns_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_ascending_score_sort_returns_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     """The observed symptom's second half: sort=score&order=asc returned an
     EMPTY page (all-Pending mis-tiering surfaced the oldest, dead-job rows
     into the first window). With correct tiering, ascending returns the
@@ -407,7 +407,7 @@ def test_ascending_score_sort_returns_rows(monkeypatch: pytest.MonkeyPatch) -> N
         },
     ]
     postings = {jid: {"id": jid, "title": jid} for jid in ("a78", "b45")}
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
         page_size=10,
@@ -461,15 +461,15 @@ class _LiveJoinRecorder:
         self._neg = False
         return self
 
-    def execute(self) -> FakeResponse:
+    async def execute(self) -> FakeResponse:
         return FakeResponse([])
 
 
-def test_live_view_applies_jobs_inner_join() -> None:
+async def test_live_view_applies_jobs_inner_join() -> None:
     sb = MagicMock()
     rec = _LiveJoinRecorder()
     sb.table.return_value = rec
-    _list_jobs_for_target_two_query(
+    await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         page_size=10,
@@ -494,13 +494,13 @@ def test_live_view_applies_jobs_inner_join() -> None:
     assert ("not.jobs.is_us", "false") in rec.is_calls
 
 
-def test_archived_view_keeps_archived_jobs() -> None:
+async def test_archived_view_keeps_archived_jobs() -> None:
     """status=archived must NOT liveness-join at the scores layer — the
     archived view exists to show archived jobs."""
     sb = MagicMock()
     rec = _LiveJoinRecorder()
     sb.table.return_value = rec
-    _list_jobs_for_target_two_query(
+    await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         page_size=10,
@@ -518,7 +518,7 @@ def test_archived_view_keeps_archived_jobs() -> None:
     assert rec.is_calls == []
 
 
-def test_filtered_path_keeps_graded_first_and_score_order(
+async def test_filtered_path_keeps_graded_first_and_score_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """THE 2026-07-16 follow-up regression: with a location/preference filter
@@ -555,7 +555,7 @@ def test_filtered_path_keeps_graded_first_and_score_order(
         jid: {"id": jid, "title": jid, "location": "Remote, US"}
         for jid in ("g65", "p1", "g78", "g72")
     }
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
         page_size=10,
@@ -575,7 +575,7 @@ def test_filtered_path_keeps_graded_first_and_score_order(
     assert [p["pending"] for p in result["postings"]] == [False, False, False, True]
 
 
-def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
+async def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Perf regression pin (2026-07-16, the 4-8s /jobs + dashboard renders):
@@ -602,7 +602,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
 
             return _f
 
-        def execute(self) -> FakeResponse:
+        async def execute(self) -> FakeResponse:
             return FakeResponse([{"id": "j1", "title": "j1"}, {"id": "j2", "title": "j2"}])
 
     class _ScoresRec:
@@ -615,7 +615,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
 
             return _f
 
-        def execute(self) -> FakeResponse:
+        async def execute(self) -> FakeResponse:
             return FakeResponse(
                 [
                     {
@@ -654,7 +654,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
 
             return _f
 
-        def execute(self) -> FakeResponse:
+        async def execute(self) -> FakeResponse:
             return FakeResponse([{"id": "t-1", "role_family": "engineering"}])
 
     sb = MagicMock()
@@ -664,7 +664,7 @@ def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
         "targets": _TargetsRec(),
     }[name]
 
-    result = _list_jobs_across_user_targets(
+    result = await _list_jobs_across_user_targets(
         sb,
         user_target_ids={"t-1"},
         page_size=10,

@@ -16,12 +16,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_current_user_id, get_user_supabase, verify_api_key_or_jwt
+from app.dependencies import (
+    get_async_user_supabase,
+    get_current_user_id,
+    get_user_supabase,
+    verify_api_key_or_jwt,
+)
 from app.main import app
 from app.models.targets import TargetPreferences
 from app.services.targets import crud
@@ -205,17 +210,27 @@ def test_set_preferences_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
+    # PUT still runs on the sync user client; GET moved to the async one
+    # (#57 slice 3). Override both so either handler resolves its dep.
     app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
     app.dependency_overrides.clear()
 
 
-def test_get_endpoint_returns_preferences(client: TestClient) -> None:
-    supabase = MagicMock()
-    _wire_select(supabase, [_row(pref_score_cutoff=55, pref_locations=["berlin"])])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+def test_get_endpoint_returns_preferences(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #57 slice 3: GET runs on the async user client and inlines the junction
+    # read (``_get_user_target``); the handler still projects via
+    # ``crud.preferences_from_user_target``, so mock the async read and let the
+    # real projection run.
+    from app.routers import targets as router_mod
+
+    ut = crud._parse_user_target(_row(pref_score_cutoff=55, pref_locations=["berlin"]))
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=ut))
 
     resp = client.get("/targets/target-1/preferences")
 
@@ -226,12 +241,14 @@ def test_get_endpoint_returns_preferences(client: TestClient) -> None:
     assert body["pref_remote_ok"] is True
 
 
-def test_get_endpoint_404_when_no_link(client: TestClient) -> None:
+def test_get_endpoint_404_when_no_link(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A user querying a target they never linked gets 404 and no leak of the
     target's existence."""
-    supabase = MagicMock()
-    _wire_select(supabase, [])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    from app.routers import targets as router_mod
+
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=None))
 
     resp = client.get("/targets/target-1/preferences")
 
@@ -360,16 +377,12 @@ def test_preferences_route_does_not_collide_with_get_target(
     swallowed by the {target_id} placeholder."""
     from app.routers import targets as router_mod
 
-    supabase = MagicMock()
-    _wire_select(supabase, [_row(pref_score_cutoff=33)])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
-    # GET /targets/{id} ownership-checks the caller; the fixture user owns it.
-    monkeypatch.setattr(router_mod.crud, "get_user_target_ids", lambda *_a, **_kw: {"target-1"})
-    monkeypatch.setattr(
-        router_mod.crud,
-        "get",
-        lambda *_a, **_kw: _job_target(),
-    )
+    ut = crud._parse_user_target(_row(pref_score_cutoff=33))
+    monkeypatch.setattr(router_mod, "_get_user_target", AsyncMock(return_value=ut))
+    # GET /targets/{id} (the sibling route that must NOT swallow this) inlines
+    # its own async reads; stub them defensively in case of misdispatch.
+    monkeypatch.setattr(router_mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(router_mod, "_target_get", AsyncMock(return_value=_job_target()))
 
     prefs = client.get("/targets/target-1/preferences")
     assert prefs.status_code == 200
@@ -384,7 +397,7 @@ def _job_target() -> Any:
         id="target-1",
         label="Some Target",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

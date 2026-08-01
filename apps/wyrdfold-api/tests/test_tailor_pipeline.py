@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from docx import Document
@@ -131,9 +131,14 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
 
 def _make_supabase_mock(*, insert_data: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    supabase.table.return_value.insert.return_value.execute.return_value.data = insert_data
-    supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = []
-    supabase.storage.from_.return_value.upload.return_value = None
+    tbl = supabase.table.return_value
+    tbl.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=insert_data))
+    tbl.update.return_value.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    tbl.select.return_value.eq.return_value.order.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    supabase.storage.from_.return_value.upload = AsyncMock(return_value=None)
     return supabase
 
 
@@ -144,7 +149,7 @@ async def test_success_returns_record_and_persists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -167,8 +172,8 @@ async def test_success_cost_logs_under_tailor_purpose(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    cost_record = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", cost_record)
+    cost_record = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", cost_record)
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     await run_tailor_pipeline(
@@ -187,7 +192,7 @@ async def test_preferences_are_passed_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     seen: dict[str, str] = {}
 
@@ -222,7 +227,7 @@ async def test_lint_failure_does_not_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     # Force the linter to report an error.
     def fake_lint(_b: bytes) -> LintResult:
@@ -263,7 +268,7 @@ async def test_storage_upload_failure_does_not_raise(
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
     supabase.storage.from_.return_value.upload.side_effect = RuntimeError("s3 down")
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -295,7 +300,7 @@ async def test_rendered_output_opens_as_valid_docx(
         return real_lint(data)
 
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
     monkeypatch.setattr("app.services.tailor.pipeline.lint_docx", capturing_lint)
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
@@ -362,8 +367,8 @@ def _scripted_llm(review: FaithfulnessReview) -> MockLLMClient:
 async def test_review_disabled_skips_review(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", False)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     result = await run_tailor_pipeline(
         supabase,
@@ -380,8 +385,8 @@ async def test_review_disabled_skips_review(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_review_clean_does_not_regenerate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     # Only a low-severity flag → not actionable → no corrective regen.
     review = FaithfulnessReview(
@@ -404,8 +409,8 @@ async def test_review_flags_trigger_one_regeneration(
 ) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     review = FaithfulnessReview(
         flags=[

@@ -1,8 +1,7 @@
 """Tests for resume reuse within targets (#504)."""
 
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -27,8 +26,13 @@ from app.services.tailor.reuse import (
 def _no_master_doc_by_default():
     """Default the master-doc lookup to None so the staleness check (#47) is
     a no-op for the existing reuse tests. The staleness tests below override
-    this with their own ``patch`` to supply a master with a known created_at."""
-    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=None):
+    this with their own ``patch`` to supply a master created_at. Patches the
+    async inline ``_current_master_created_at`` (#57 slice 3 replaced the
+    ``get_latest_optimized`` read with an inline async DB read)."""
+    with patch(
+        "app.services.tailor.reuse._current_master_created_at",
+        AsyncMock(return_value=None),
+    ):
         yield
 
 
@@ -156,13 +160,12 @@ def _reuse_supabase(
 ) -> MagicMock:
     docs_mock = MagicMock()
     docs_chain = docs_mock.select.return_value.eq.return_value.order.return_value.limit.return_value
-    # ``user_id=None`` path uses .is_("user_id", "null"); a real user uses .eq.
-    docs_chain.is_.return_value.execute.return_value.data = doc_rows
-    docs_chain.eq.return_value.execute.return_value.data = doc_rows
+    # user scoping applies ``.eq("user_id", resolve_owner(user_id))`` then execute.
+    docs_chain.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=doc_rows))
 
     scores_mock = MagicMock()
-    scores_mock.select.return_value.eq.return_value.in_.return_value.execute.return_value.data = (
-        score_rows
+    scores_mock.select.return_value.eq.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=score_rows)
     )
 
     supabase = MagicMock()
@@ -173,10 +176,10 @@ def _reuse_supabase(
     return supabase
 
 
-def test_find_reusable_resume_no_resumes() -> None:
+async def test_find_reusable_resume_no_resumes() -> None:
     supabase = _reuse_supabase(doc_rows=[], score_rows=[])
 
-    result = find_reusable_resume(
+    result = await find_reusable_resume(
         supabase,
         target_id="target-1",
         job_description="We need React and TypeScript experience",
@@ -185,7 +188,7 @@ def test_find_reusable_resume_no_resumes() -> None:
     assert result is None
 
 
-def test_find_reusable_resume_posting_not_in_target() -> None:
+async def test_find_reusable_resume_posting_not_in_target() -> None:
     """A recent resume whose posting has no scores row for this target
     must not be reused."""
     resume_row = _record(jd_snapshot="React TypeScript GraphQL Node.js developer").model_dump(
@@ -193,7 +196,7 @@ def test_find_reusable_resume_posting_not_in_target() -> None:
     )
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[])
 
-    result = find_reusable_resume(
+    result = await find_reusable_resume(
         supabase,
         target_id="target-1",
         job_description="React TypeScript GraphQL Node.js developer needed",
@@ -202,13 +205,13 @@ def test_find_reusable_resume_posting_not_in_target() -> None:
     assert result is None
 
 
-def test_find_reusable_resume_below_threshold() -> None:
+async def test_find_reusable_resume_below_threshold() -> None:
     resume_row = _record(jd_snapshot="Looking for a Python Django developer").model_dump(
         mode="json"
     )
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
 
-    result = find_reusable_resume(
+    result = await find_reusable_resume(
         supabase,
         target_id="target-1",
         job_description="We need React and TypeScript experience",
@@ -217,14 +220,14 @@ def test_find_reusable_resume_below_threshold() -> None:
     assert result is None
 
 
-def test_find_reusable_resume_above_threshold() -> None:
+async def test_find_reusable_resume_above_threshold() -> None:
     resume_row = _record(
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
 
     kws = {"react", "typescript", "graphql", "node.js"}
-    result = find_reusable_resume(
+    result = await find_reusable_resume(
         supabase,
         target_id="target-1",
         job_description="React TypeScript GraphQL Node.js developer needed",
@@ -237,7 +240,7 @@ def test_find_reusable_resume_above_threshold() -> None:
     assert all(c.args[0] != "jobs" for c in supabase.table.call_args_list)
 
 
-def test_reuse_refused_when_resume_predates_master_edit() -> None:
+async def test_reuse_refused_when_resume_predates_master_edit() -> None:
     # The candidate resume was built 2026-04-25; the user re-versioned their
     # master doc on 2026-05-01 (e.g. fixed a fabrication) — cloning it would
     # ship pre-edit content, so refuse despite a high JD similarity (#47).
@@ -245,9 +248,12 @@ def test_reuse_refused_when_resume_predates_master_edit() -> None:
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
-    master = SimpleNamespace(created_at=datetime(2026, 5, 1, tzinfo=UTC))
-    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
-        result = find_reusable_resume(
+    master_created = datetime(2026, 5, 1, tzinfo=UTC)
+    with patch(
+        "app.services.tailor.reuse._current_master_created_at",
+        AsyncMock(return_value=master_created),
+    ):
+        result = await find_reusable_resume(
             supabase,
             target_id="target-1",
             job_description="React TypeScript GraphQL Node.js developer needed",
@@ -256,15 +262,18 @@ def test_reuse_refused_when_resume_predates_master_edit() -> None:
     assert result is None  # stale → regenerate fresh
 
 
-def test_reuse_allowed_when_resume_newer_than_master_version() -> None:
+async def test_reuse_allowed_when_resume_newer_than_master_version() -> None:
     resume_row = _record(
         jd_snapshot="Senior React TypeScript developer with GraphQL and Node.js"
     ).model_dump(mode="json")
     supabase = _reuse_supabase(doc_rows=[resume_row], score_rows=[{"job_posting_id": "jp-1"}])
     # Current master last versioned BEFORE the resume was generated → not stale.
-    master = SimpleNamespace(created_at=datetime(2026, 4, 1, tzinfo=UTC))
-    with patch("app.services.tailor.reuse.get_latest_optimized", return_value=master):
-        result = find_reusable_resume(
+    master_created = datetime(2026, 4, 1, tzinfo=UTC)
+    with patch(
+        "app.services.tailor.reuse._current_master_created_at",
+        AsyncMock(return_value=master_created),
+    ):
+        result = await find_reusable_resume(
             supabase,
             target_id="target-1",
             job_description="React TypeScript GraphQL Node.js developer needed",
@@ -277,7 +286,7 @@ def test_reuse_allowed_when_resume_newer_than_master_version() -> None:
 # ---- clone_resume_for_job ----
 
 
-def test_clone_resume_preserves_payload() -> None:
+async def test_clone_resume_preserves_payload() -> None:
     supabase = MagicMock()
     source = _record(id="source-1", jd_snapshot="original jd")
 
@@ -292,9 +301,15 @@ def test_clone_resume_preserves_payload() -> None:
         "cost_usd": 0.0,
         "latency_ms": 0,
     }
-    supabase.table.return_value.insert.return_value.execute.return_value.data = [cloned_row]
+    supabase.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[cloned_row])
+    )
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    supabase.table.return_value.select.return_value.eq.return_value.order.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
+    )
 
-    result = clone_resume_for_job(
+    result = await clone_resume_for_job(
         supabase,
         source=source,
         job_posting_id="jp-new",
@@ -309,7 +324,7 @@ def test_clone_resume_preserves_payload() -> None:
     assert result.storage_path == source.storage_path
 
 
-def test_clone_resume_carries_markdown_and_cache_hash() -> None:
+async def test_clone_resume_carries_markdown_and_cache_hash() -> None:
     """Cloned rows must inherit payload_md + docx_payload_md_hash so the
     download endpoint serves the cached .docx without re-rendering. If
     either field is dropped the clone forces a pandoc round-trip on first
@@ -330,9 +345,15 @@ def test_clone_resume_carries_markdown_and_cache_hash() -> None:
         "job_posting_id": "jp-new",
         "source_resume_id": "source-1",
     }
-    supabase.table.return_value.insert.return_value.execute.return_value.data = [cloned_row]
+    supabase.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[cloned_row])
+    )
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    supabase.table.return_value.select.return_value.eq.return_value.order.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
+    )
 
-    result = clone_resume_for_job(
+    result = await clone_resume_for_job(
         supabase,
         source=source,
         job_posting_id="jp-new",
@@ -351,7 +372,7 @@ def test_clone_resume_carries_markdown_and_cache_hash() -> None:
     assert result.docx_payload_md_hash == "hash-source"
 
 
-def test_clone_resume_adds_reuse_warning() -> None:
+async def test_clone_resume_adds_reuse_warning() -> None:
     supabase = MagicMock()
     source = _record(id="source-1")
 
@@ -361,9 +382,15 @@ def test_clone_resume_adds_reuse_warning() -> None:
         "warnings": [*source.warnings, "reused_from_similar_job"],
         "source_resume_id": "source-1",
     }
-    supabase.table.return_value.insert.return_value.execute.return_value.data = [cloned_row]
+    supabase.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[cloned_row])
+    )
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    supabase.table.return_value.select.return_value.eq.return_value.order.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
+    )
 
-    result = clone_resume_for_job(
+    result = await clone_resume_for_job(
         supabase,
         source=source,
         job_posting_id="jp-new",

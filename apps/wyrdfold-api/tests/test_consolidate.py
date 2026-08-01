@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -130,7 +130,7 @@ class TestConsolidateEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=None))
 
         with pytest.raises(HTTPException) as exc_info:
             await exp_router.consolidate_prose(
@@ -149,16 +149,16 @@ class TestConsolidateEndpoint:
             content="Short bio.",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: existing)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=existing))
 
         # Should never be called when doc is short — but guard if it is.
         create_called = {"count": 0}
 
-        def fake_create(*a: Any, **kw: Any) -> ProseDoc:
+        async def fake_create(*a: Any, **kw: Any) -> ProseDoc:
             create_called["count"] += 1
             return existing
 
-        monkeypatch.setattr("app.services.experience.prose.create_version", fake_create)
+        monkeypatch.setattr(exp_router, "_prose_create_version", fake_create)
 
         result = await exp_router.consolidate_prose(
             request=MagicMock(), supabase=MagicMock(), llm=MockLLMClient()
@@ -181,7 +181,7 @@ class TestConsolidateEndpoint:
         )
         clean = "Senior FE Engineer at Acme. Built React apps."
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: existing)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=existing))
 
         new_doc = ProseDoc(
             id="prose-2",
@@ -190,11 +190,8 @@ class TestConsolidateEndpoint:
             content=clean,
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr(
-            "app.services.experience.prose.create_version",
-            lambda *a, **kw: new_doc,
-        )
-        monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
+        monkeypatch.setattr(exp_router, "_prose_create_version", AsyncMock(return_value=new_doc))
+        monkeypatch.setattr("app.services.llm.cost_log.record_async", AsyncMock())
 
         # Set scripted output well above the MIN_OUTPUT_RATIO floor (0.05);
         # 25% of bloated length keeps a wide safety margin.

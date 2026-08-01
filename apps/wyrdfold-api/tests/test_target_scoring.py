@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -468,41 +468,49 @@ def test_bulk_score_for_target_skips_inactive_target(monkeypatch: pytest.MonkeyP
 # ---------------------------------------------------------------------------
 
 
-def test_get_target_scores_returns_dict_keyed_by_job_id() -> None:
+@pytest.mark.asyncio
+async def test_get_target_scores_returns_dict_keyed_by_job_id() -> None:
     rows = [
         _upserted_score_row(job_posting_id="job-1"),
         _upserted_score_row(job_posting_id="job-2"),
     ]
     supabase = _make_supabase_mock(select_data=rows)
+    # get_target_scores is async now (#57 slice 3); the id-list branch awaits
+    # the get_target_scores_by_ids RPC.
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=rows))
 
-    scores = get_target_scores(supabase, "target-1", ["job-1", "job-2"])
+    scores = await get_target_scores(supabase, "target-1", ["job-1", "job-2"])
 
     assert "job-1" in scores
     assert "job-2" in scores
     assert scores["job-1"].score == 70
 
 
-def test_get_target_scores_returns_empty_dict_when_no_scores() -> None:
+@pytest.mark.asyncio
+async def test_get_target_scores_returns_empty_dict_when_no_scores() -> None:
     supabase = _make_supabase_mock(select_data=[])
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    scores = get_target_scores(supabase, "target-1", ["job-1"])
+    scores = await get_target_scores(supabase, "target-1", ["job-1"])
 
     assert scores == {}
 
 
-def test_get_target_scores_empty_id_list_skips_query() -> None:
+@pytest.mark.asyncio
+async def test_get_target_scores_empty_id_list_skips_query() -> None:
     """An empty ``job_posting_ids`` must NOT relax to an unbounded SELECT —
     ``.in_("…", [])`` returns all target scores in PostgREST. The guard
     short-circuits to an empty dict with zero queries."""
     supabase = MagicMock()
 
-    scores = get_target_scores(supabase, "target-1", [])
+    scores = await get_target_scores(supabase, "target-1", [])
 
     assert scores == {}
     supabase.table.assert_not_called()
 
 
-def test_get_target_scores_uses_rpc_body() -> None:
+@pytest.mark.asyncio
+async def test_get_target_scores_uses_rpc_body() -> None:
     """A large id-list score lookup is ONE ``get_target_scores_by_ids`` RPC
     carrying the target id + every job id in the jsonb body (no URL
     ``.in_()`` chunking), folded into the same {job_id: score} dict (#93)."""
@@ -510,9 +518,9 @@ def test_get_target_scores_uses_rpc_body() -> None:
     rpc_rows = [_upserted_score_row(job_posting_id=jid) for jid in job_ids]
 
     supabase = MagicMock()
-    supabase.rpc.return_value.execute.return_value.data = rpc_rows
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=rpc_rows))
 
-    scores = get_target_scores(supabase, "target-1", job_ids)
+    scores = await get_target_scores(supabase, "target-1", job_ids)
 
     supabase.rpc.assert_called_once_with(
         "get_target_scores_by_ids",
@@ -537,16 +545,17 @@ def test_list_jobs_without_target_returns_global_view(
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_supabase_for_caller,
         get_current_user_id_optional,
         get_supabase,
-        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
     from app.main import app
 
     def _fluent_mock(data: list[dict]) -> MagicMock:
         m = MagicMock()
-        m.execute.return_value = MagicMock(data=data, count=len(data))
+        # /jobs is async now (#57 slice 3) — the handler awaits .execute().
+        m.execute = AsyncMock(return_value=MagicMock(data=data, count=len(data)))
         for method in ("select", "eq", "neq", "gte", "in_", "is_", "ilike", "order", "range"):
             getattr(m, method).return_value = m
         m.not_ = m  # `.not_.is_(...)` negation is an attribute access (#60 non-US gate)
@@ -570,8 +579,8 @@ def test_list_jobs_without_target_returns_global_view(
 
     app.dependency_overrides[get_supabase] = lambda: supabase
     # api-key caller (user_id None): dual-auth resolves the caller client to
-    # the service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
+    # the (async) service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
 
@@ -593,17 +602,18 @@ def test_list_jobs_with_target_overlays_target_score(
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_supabase_for_caller,
         get_current_user_id_optional,
         get_supabase,
-        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
     from app.main import app
 
     def _fluent_mock(data: list[dict]) -> MagicMock:
-        """Mock that chains any query method and returns data on .execute()."""
+        """Mock that chains any query method and awaits data on .execute()."""
         m = MagicMock()
-        m.execute.return_value = MagicMock(data=data, count=len(data))
+        # /jobs is async now (#57 slice 3) — the handler awaits .execute().
+        m.execute = AsyncMock(return_value=MagicMock(data=data, count=len(data)))
         for method in ("select", "eq", "neq", "gte", "in_", "is_", "ilike", "order", "range"):
             getattr(m, method).return_value = m
         m.not_ = m  # `.not_.is_(...)` negation is an attribute access (#60 non-US gate)
@@ -646,11 +656,15 @@ def test_list_jobs_with_target_overlays_target_score(
 
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: ts_mock if name == "scores" else jp_mock
+    # The per-target score sort tries the cross-target RPC first; a non-list
+    # payload makes it fall back to the two-query path (ts_mock + jp_mock),
+    # exactly as before — the await just needs an awaitable .execute().
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=None))
 
     app.dependency_overrides[get_supabase] = lambda: supabase
     # api-key caller (user_id None): dual-auth resolves the caller client to
-    # the service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
+    # the (async) service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from app.models.insights import FunnelStage
 from app.services.insights import (
@@ -16,6 +18,8 @@ from app.services.insights import (
     compute_skills_cost,
     compute_targets,
 )
+
+pytestmark = pytest.mark.asyncio
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,7 +50,7 @@ def _mock_supabase(tables: dict[str, list[dict]]) -> MagicMock:
         # Every chainable method returns the same table mock
         for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq", "in_"):
             getattr(tbl, method).return_value = tbl
-        tbl.execute.return_value = result
+        tbl.execute = AsyncMock(return_value=result)
         return tbl
 
     client.table.side_effect = table_side_effect
@@ -80,7 +84,7 @@ _USER = "u1"
 
 
 class TestComputePipeline:
-    def test_basic_funnel_counts(self):
+    async def test_basic_funnel_counts(self):
         postings = [
             {"id": "1", "status": "new", "cataloged_at": _ts(_NOW)},
             {"id": "2", "status": "new", "cataloged_at": _ts(_NOW)},
@@ -89,7 +93,7 @@ class TestComputePipeline:
             {"id": "5", "status": "offer", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
-        result = compute_pipeline(sb, since=None, user_id=_USER)
+        result = await compute_pipeline(sb, since=None, user_id=_USER)
 
         assert result.total_applications == 3  # applied + interviewing + offer
         assert result.total_interviews == 2  # interviewing + offer
@@ -101,7 +105,7 @@ class TestComputePipeline:
         assert funnel_map["interviewing"] == 1
         assert funnel_map["offer"] == 1
 
-    def test_response_rate(self):
+    async def test_response_rate(self):
         postings = [
             {"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)},
             {"id": "2", "status": "applied", "cataloged_at": _ts(_NOW)},
@@ -109,12 +113,12 @@ class TestComputePipeline:
             {"id": "4", "status": "offer", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
-        result = compute_pipeline(sb, since=None, user_id=_USER)
+        result = await compute_pipeline(sb, since=None, user_id=_USER)
 
         # 4 applied-or-beyond, 2 interviewing-or-beyond → 0.5
         assert result.response_rate == 0.5
 
-    def test_avg_days_to_response(self):
+    async def test_avg_days_to_response(self):
         logs = [
             {
                 "posting_id": "1",
@@ -131,11 +135,11 @@ class TestComputePipeline:
         ]
         postings = [{"id": "1", "status": "interviewing", "cataloged_at": _ts(_NOW)}]
         sb = _mock_supabase({"jobs": postings, "status_log": logs})
-        result = compute_pipeline(sb, since=None)
+        result = await compute_pipeline(sb, since=None)
 
         assert result.avg_days_to_response == 6.0
 
-    def test_status_logs_window_scopes_to_user(self):
+    async def test_status_logs_window_scopes_to_user(self):
         """#113: a shared posting can carry transitions from several users; the
         window fetch returns only the caller's rows, and the admin/global path
         (user_id=None) sees everyone's."""
@@ -159,42 +163,42 @@ class TestComputePipeline:
                 },
             ]
         }
-        mine = _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, _USER)
+        mine = await _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, _USER)
         assert [r["posting_id"] for r in mine] == ["p1"]
         assert len(mine) == 1
 
-        everyone = _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, None)
+        everyone = await _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, None)
         assert len(everyone) == 2
 
-    def test_empty_data(self):
+    async def test_empty_data(self):
         sb = _mock_supabase({})
-        result = compute_pipeline(sb, since=None)
+        result = await compute_pipeline(sb, since=None)
 
         assert result.total_applications == 0
         assert result.response_rate is None
         assert result.avg_days_to_response is None
         assert result.velocity == []
 
-    def test_velocity_grouping(self):
+    async def test_velocity_grouping(self):
         resumes = [
             {"job_posting_id": "1", "created_at": _ts(_NOW)},
             {"job_posting_id": "2", "created_at": _ts(_NOW - timedelta(days=1))},
             {"job_posting_id": "3", "created_at": _ts(_NOW - timedelta(days=8))},
         ]
         sb = _mock_supabase({"documents": resumes})
-        result = compute_pipeline(sb, since=None)
+        result = await compute_pipeline(sb, since=None)
 
         # Should group into weeks — at least 1 or 2 week buckets
         assert len(result.velocity) >= 1
         total_resumes = sum(v.resumes_generated for v in result.velocity)
         assert total_resumes == 3
 
-    def test_previous_is_none_without_prior_window(self):
+    async def test_previous_is_none_without_prior_window(self):
         sb = _mock_supabase({})
-        result = compute_pipeline(sb, since=None)
+        result = await compute_pipeline(sb, since=None)
         assert result.previous is None
 
-    def test_previous_populated_when_prior_window_supplied(self):
+    async def test_previous_populated_when_prior_window_supplied(self):
         # Mock supabase ignores filter args, so both windows resolve to the
         # same row set. We're asserting that a prior_window triggers the
         # second aggregation pass — not the math, which is covered above.
@@ -205,7 +209,7 @@ class TestComputePipeline:
         sb = _mock_supabase({"jobs": postings, "user_jobs": _user_jobs(postings)})
         prior_until = _NOW - timedelta(days=30)
         prior_since = _NOW - timedelta(days=60)
-        result = compute_pipeline(
+        result = await compute_pipeline(
             sb,
             since=_NOW - timedelta(days=30),
             prior_window=(prior_since, prior_until),
@@ -267,7 +271,7 @@ class _FaithfulQuery:
     def limit(self, *_a: object, **_kw: object) -> _FaithfulQuery:
         return self
 
-    def execute(self) -> MagicMock:
+    async def execute(self) -> MagicMock:
         resp = MagicMock()
         resp.data = self._rows
         return resp
@@ -316,7 +320,7 @@ def _faithful_supabase(seed: dict[str, list[dict]]) -> MagicMock:
         resp = MagicMock()
         resp.data = _rpc_status_counts(seed, params)
         call = MagicMock()
-        call.execute.return_value = resp
+        call.execute = AsyncMock(return_value=resp)
         return call
 
     client.rpc.side_effect = rpc_side_effect
@@ -428,7 +432,7 @@ class TestPipelineGroupByRpcByteIdentical:
             "documents": documents,
         }
 
-    def test_rpc_backed_matches_python_reference(self):
+    async def test_rpc_backed_matches_python_reference(self):
         from app.services.insights import (
             FUNNEL_ORDER,
             _fetch_status_logs_window,
@@ -440,7 +444,7 @@ class TestPipelineGroupByRpcByteIdentical:
         prior = (_NOW - timedelta(days=60), _NOW - timedelta(days=30))
         targets = {"t1", "t2"}
 
-        result = compute_pipeline(
+        result = await compute_pipeline(
             _faithful_supabase(seed),
             since,
             prior_window=prior,
@@ -466,7 +470,7 @@ class TestPipelineGroupByRpcByteIdentical:
         }
         jobs_by_id = {j["id"]: j for j in seed["jobs"]}
         win_pids = {pid for pid in member if jobs_by_id[pid]["cataloged_at"] >= since.isoformat()}
-        ref_logs = _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
+        ref_logs = await _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
         ref_current = _kpis_from(ref_counts, ref_logs)
 
         # Funnel is byte-identical to the Python recompute.
@@ -508,12 +512,12 @@ class TestPipelineGroupByRpcByteIdentical:
         assert result.previous.total_interviews == 0
         assert result.previous.total_offers == 0
 
-    def test_rpc_path_uses_the_rpc_not_a_posting_scan(self):
+    async def test_rpc_path_uses_the_rpc_not_a_posting_scan(self):
         """The RPC must actually be invoked for the status tally — proving the
         ~11k posting + user_jobs counting is gone in the deployed path."""
         seed = self._seed()
         sb = _faithful_supabase(seed)
-        compute_pipeline(
+        await compute_pipeline(
             sb,
             _NOW - timedelta(days=30),
             target_ids={"t1", "t2"},
@@ -522,13 +526,13 @@ class TestPipelineGroupByRpcByteIdentical:
         called = [c.args[0] for c in sb.rpc.call_args_list]
         assert "insights_pipeline_status_counts" in called
 
-    def test_fallback_equals_rpc_when_rpc_unavailable(self):
+    async def test_fallback_equals_rpc_when_rpc_unavailable(self):
         """When the RPC isn't deployed yet the client-side fallback must
         produce the identical funnel — mid-deploy safety."""
         seed = self._seed()
         since = _NOW - timedelta(days=30)
 
-        rpc_result = compute_pipeline(
+        rpc_result = await compute_pipeline(
             _faithful_supabase(seed),
             since,
             target_ids={"t1", "t2"},
@@ -538,7 +542,7 @@ class TestPipelineGroupByRpcByteIdentical:
         # Same faithful table behaviour, but the RPC raises (not deployed).
         sb = _faithful_supabase(seed)
         sb.rpc.side_effect = Exception("function not found")
-        fallback_result = compute_pipeline(
+        fallback_result = await compute_pipeline(
             sb,
             since,
             target_ids={"t1", "t2"},
@@ -567,33 +571,33 @@ class TestComputeTargets:
     # knows the hollowness is deliberate — resurrect via the scores table
     # if the admin view is ever needed for real.
 
-    def test_admin_path_counts_everything_unscored(self):
+    async def test_admin_path_counts_everything_unscored(self):
         postings = [
             {"id": "1", "status": "new", "cataloged_at": _ts(_NOW)},
             {"id": "2", "status": "new", "cataloged_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"targets": [{"id": "t1", "label": "Frontend"}], "jobs": postings})
-        result = compute_targets(sb, since=None)
+        result = await compute_targets(sb, since=None)
         assert result.unscored_count == 2
         assert result.targets == []
 
-    def test_admin_path_shape_is_well_formed(self):
+    async def test_admin_path_shape_is_well_formed(self):
         postings = [{"id": "1", "status": "applied", "cataloged_at": _ts(_NOW)}]
         sb = _mock_supabase({"targets": [], "jobs": postings})
-        result = compute_targets(sb, since=None)
+        result = await compute_targets(sb, since=None)
         assert len(result.score_distribution) == 10
         assert result.score_trend == []
 
-    def test_empty_targets(self):
+    async def test_empty_targets(self):
         sb = _mock_supabase({})
-        result = compute_targets(sb, since=None)
+        result = await compute_targets(sb, since=None)
 
         assert result.targets == []
         assert len(result.score_distribution) == 10  # Always 10 buckets
         assert result.score_trend == []
         assert result.unscored_count == 0
 
-    def test_score_trend_per_user_from_scores(self):
+    async def test_score_trend_per_user_from_scores(self):
         """Per-user trend comes from the scores table joined to jobs
         cataloged_at (the inline jobs.score column is gone post-R2)."""
         scores = [
@@ -612,12 +616,12 @@ class TestComputeTargets:
                 "user_jobs": [],
             }
         )
-        result = compute_targets(sb, since=None, target_ids={"t1"}, user_id=_USER)
+        result = await compute_targets(sb, since=None, target_ids={"t1"}, user_id=_USER)
 
         # At least 1 week bucket
         assert len(result.score_trend) >= 1
 
-    def test_per_user_path_excludes_excluded_scores(self):
+    async def test_per_user_path_excludes_excluded_scores(self):
         """Scores marked ``excluded=true`` (closed jobs, irrelevant matches)
         must not inflate the funnel / distribution. The list endpoint
         filters ``excluded = False`` and insights has to mirror that —
@@ -648,20 +652,20 @@ class TestComputeTargets:
         tbl.lt.return_value = tbl
         tbl.order.return_value = tbl
         tbl.limit.return_value = tbl
-        tbl.execute.return_value.data = []
+        tbl.execute = AsyncMock(return_value=MagicMock(data=[]))
         sb.table.return_value = tbl
         # Force the client-side fallback so the scores query (which carries the
         # excluded=False filter under test) is actually issued.
         sb.rpc.side_effect = Exception("rpc not simulated")
 
-        compute_targets(sb, since=None, target_ids={"t1"})
+        await compute_targets(sb, since=None, target_ids={"t1"})
 
         # At least one .eq("excluded", False) on the scores table path.
         assert ("excluded", False) in eq_calls, (
             f"expected scores query to filter excluded=False, got eq() calls: {eq_calls}"
         )
 
-    def test_per_user_path_pivots_through_scores_table(self):
+    async def test_per_user_path_pivots_through_scores_table(self):
         """When ``target_ids`` is passed, membership + score come from
         the ``scores`` table — ``jobs.target_id`` is vestigial and
         ``jobs.score`` is the global blended score, neither is
@@ -692,7 +696,7 @@ class TestComputeTargets:
                 "user_jobs": _user_jobs(postings),
             }
         )
-        result = compute_targets(sb, since=None, target_ids={"t1", "t2"}, user_id=_USER)
+        result = await compute_targets(sb, since=None, target_ids={"t1", "t2"}, user_id=_USER)
 
         assert len(result.targets) == 2
         fe = next(t for t in result.targets if t.target_label == "Frontend")
@@ -848,7 +852,7 @@ def _faithful_targets_supabase(seed: dict[str, list[dict]]) -> MagicMock:
         resp = MagicMock()
         resp.data = _rpc_targets_groupby(seed, params)
         call = MagicMock()
-        call.execute.return_value = resp
+        call.execute = AsyncMock(return_value=resp)
         return call
 
     client.rpc.side_effect = rpc_side_effect
@@ -1040,12 +1044,12 @@ class TestTargetsGroupByRpcByteIdentical:
             "user_jobs": user_jobs,
         }
 
-    def test_rpc_backed_matches_python_reference(self):
+    async def test_rpc_backed_matches_python_reference(self):
         seed = self._seed()
         since = _NOW - timedelta(days=30)
         targets = {"t1", "t2", "t3"}
 
-        result = compute_targets(
+        result = await compute_targets(
             _faithful_targets_supabase(seed),
             since,
             target_ids=targets,
@@ -1100,7 +1104,7 @@ class TestTargetsGroupByRpcByteIdentical:
         assert len(result.score_trend) == 2
         assert sorted(trend.values()) == [60.0, 67.5]
 
-    def test_average_is_rounded_in_python_not_sql(self):
+    async def test_average_is_rounded_in_python_not_sql(self):
         """The byte-identity linchpin: avg_score must use Python's banker's
         round (half-to-even), NOT Postgres round() (half-away-from-zero). A
         target whose avg lands EXACTLY on a tenths half-way value (0.25) proves
@@ -1128,7 +1132,7 @@ class TestTargetsGroupByRpcByteIdentical:
             "targets": [{"id": "t1", "label": "Frontend"}],
             "user_jobs": [],
         }
-        result = compute_targets(
+        result = await compute_targets(
             _faithful_targets_supabase(seed),
             since=None,
             target_ids={"t1"},
@@ -1144,7 +1148,7 @@ class TestTargetsGroupByRpcByteIdentical:
 
         assert Decimal("0.25").quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) == Decimal("0.3")
 
-    def test_rpc_equals_python_fallback(self):
+    async def test_rpc_equals_python_fallback(self):
         """RPC-backed output == client-side fallback output (mid-deploy safety:
         before the migration lands the RPC raises and the Python fallback must
         produce the identical TargetInsights)."""
@@ -1152,7 +1156,7 @@ class TestTargetsGroupByRpcByteIdentical:
         since = _NOW - timedelta(days=30)
         targets = {"t1", "t2", "t3"}
 
-        rpc_result = compute_targets(
+        rpc_result = await compute_targets(
             _faithful_targets_supabase(seed),
             since,
             target_ids=targets,
@@ -1162,17 +1166,17 @@ class TestTargetsGroupByRpcByteIdentical:
         # Same faithful table behaviour, but the RPC raises (not deployed).
         sb = _faithful_targets_supabase(seed)
         sb.rpc.side_effect = Exception("function not found")
-        fallback_result = compute_targets(sb, since, target_ids=targets, user_id=_USER)
+        fallback_result = await compute_targets(sb, since, target_ids=targets, user_id=_USER)
 
         assert fallback_result == rpc_result
 
-    def test_rpc_path_uses_the_rpc_not_a_posting_scan(self):
+    async def test_rpc_path_uses_the_rpc_not_a_posting_scan(self):
         """The RPC must actually be invoked for the scoped tally — proving the
         ~11k posting / user_jobs / 2×scores scan is gone in the deployed path
         (only the membership probe via the `scores` table remains)."""
         seed = self._seed()
         sb = _faithful_targets_supabase(seed)
-        compute_targets(sb, _NOW - timedelta(days=30), target_ids={"t1", "t2"}, user_id=_USER)
+        await compute_targets(sb, _NOW - timedelta(days=30), target_ids={"t1", "t2"}, user_id=_USER)
         called = [c.args[0] for c in sb.rpc.call_args_list]
         assert "insights_targets_groupby" in called
         # The RPC path must NOT re-read jobs/user_jobs (only `targets` for
@@ -1188,7 +1192,7 @@ class TestTargetsGroupByRpcByteIdentical:
 
 
 class TestComputeSkillsCost:
-    def test_basic_skill_frequencies(self):
+    async def test_basic_skill_frequencies(self):
         analyses = [
             {
                 "scorecard": {
@@ -1211,7 +1215,7 @@ class TestComputeSkillsCost:
             },
         ]
         sb = _mock_supabase({"analyses": analyses})
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         skill_map = {s.skill: s for s in result.top_skills}
         assert "Python" in skill_map
@@ -1229,7 +1233,7 @@ class TestComputeSkillsCost:
         missing_skills = [m.skill for m in result.top_missing]
         assert "Docker" in missing_skills
 
-    def test_top_missing_ranked_by_score_weighted_priority(self):
+    async def test_top_missing_ranked_by_score_weighted_priority(self):
         """A skill missing from one HIGH-scoring analysis outranks a skill
         missing from two LOW-scoring ones. Since R2 the weight is derived
         from the analysis's own scorecard (scorecard_to_numeric) — the
@@ -1264,7 +1268,7 @@ class TestComputeSkillsCost:
             {"job_posting_id": "low-2", "scorecard": dict(weak), "created_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"analyses": analyses})
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         skills = [m.skill for m in result.top_missing]
         assert skills[0] == "Kubernetes"  # one ~88-weight miss beats two ~0s
@@ -1280,7 +1284,7 @@ class TestComputeSkillsCost:
         assert rust.avg_job_score == 0.0  # two weak fits, numeric 0 each
         assert rust.priority_score == 0.0
 
-    def test_top_missing_falls_back_to_count_when_no_scores(self):
+    async def test_top_missing_falls_back_to_count_when_no_scores(self):
         """If no posting has llm_score, ranking should still produce a
         stable order using missing_count."""
         analyses = [
@@ -1293,7 +1297,7 @@ class TestComputeSkillsCost:
         # postings with no llm_score
         postings = [{"id": "p1", "llm_score": None, "created_at": _ts(_NOW)}]
         sb = _mock_supabase({"analyses": analyses, "jobs": postings})
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         by_skill = {m.skill: m for m in result.top_missing}
         assert by_skill["A"].avg_job_score is None
@@ -1302,7 +1306,7 @@ class TestComputeSkillsCost:
         # A ranks above B
         assert result.top_missing[0].skill == "A"
 
-    def test_cost_over_time(self):
+    async def test_cost_over_time(self):
         resume_costs = [
             {"cost_usd": "0.0050", "created_at": _ts(_NOW)},
             {"cost_usd": "0.0030", "created_at": _ts(_NOW - timedelta(days=1))},
@@ -1316,7 +1320,7 @@ class TestComputeSkillsCost:
                 "llm_costs": cost_logs,
             }
         )
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         assert result.total_cost == 0.008
         assert result.avg_cost_per_resume is not None
@@ -1324,23 +1328,23 @@ class TestComputeSkillsCost:
         total_resume_cost = sum(c.total_cost for c in result.cost_over_time)
         assert total_resume_cost == 0.008
 
-    def test_cost_by_purpose(self):
+    async def test_cost_by_purpose(self):
         cost_logs = [
             {"purpose": "tailor", "cost_usd": "0.01", "created_at": _ts(_NOW)},
             {"purpose": "tailor", "cost_usd": "0.02", "created_at": _ts(_NOW)},
             {"purpose": "analysis", "cost_usd": "0.005", "created_at": _ts(_NOW)},
         ]
         sb = _mock_supabase({"llm_costs": cost_logs})
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         purpose_map = {p.purpose: p for p in result.cost_by_purpose}
         assert purpose_map["tailor"].total_cost == 0.03
         assert purpose_map["tailor"].call_count == 2
         assert purpose_map["analysis"].total_cost == 0.005
 
-    def test_empty_data(self):
+    async def test_empty_data(self):
         sb = _mock_supabase({})
-        result = compute_skills_cost(sb, since=None)
+        result = await compute_skills_cost(sb, since=None)
 
         assert result.top_skills == []
         assert result.top_missing == []
@@ -1362,7 +1366,7 @@ class TestComputeSkillsCost:
 
 
 class TestFetchInChunks:
-    def test_batches_at_200_and_concatenates(self):
+    async def test_batches_at_200_and_concatenates(self):
         """A >200-id list is split into 200-id batches; ``make_query`` is
         called once per batch and the rows are concatenated in order."""
         ids = [f"id-{i}" for i in range(450)]  # 200 + 200 + 50 → 3 batches
@@ -1373,10 +1377,10 @@ class TestFetchInChunks:
             seen_batches.append(batch)
             q = MagicMock()
             # Each chunk returns one row per id so we can verify the union.
-            q.execute.return_value.data = [{"id": i} for i in batch]
+            q.execute = AsyncMock(return_value=MagicMock(data=[{"id": i} for i in batch]))
             return q
 
-        rows = _fetch_in_chunks(make_query, ids, label="test")
+        rows = await _fetch_in_chunks(make_query, ids, label="test")
 
         # One call per 200-id chunk: 200, 200, 50.
         assert [len(b) for b in seen_batches] == [200, 200, 50]
@@ -1385,7 +1389,7 @@ class TestFetchInChunks:
         # Union of chunk rows == what a single ``.in_(all_ids)`` would return.
         assert [r["id"] for r in rows] == ids
 
-    def test_single_batch_when_under_chunk_size(self):
+    async def test_single_batch_when_under_chunk_size(self):
         ids = [f"id-{i}" for i in range(5)]
         calls = 0
 
@@ -1393,40 +1397,40 @@ class TestFetchInChunks:
             nonlocal calls
             calls += 1
             q = MagicMock()
-            q.execute.return_value.data = [{"id": i} for i in batch]
+            q.execute = AsyncMock(return_value=MagicMock(data=[{"id": i} for i in batch]))
             return q
 
-        rows = _fetch_in_chunks(make_query, ids, label="test")
+        rows = await _fetch_in_chunks(make_query, ids, label="test")
 
         assert calls == 1
         assert [r["id"] for r in rows] == ids
 
-    def test_exact_multiple_of_chunk_size(self):
+    async def test_exact_multiple_of_chunk_size(self):
         ids = [f"id-{i}" for i in range(400)]  # exactly 2 batches
         batch_sizes: list[int] = []
 
         def make_query(batch: list[str]) -> MagicMock:
             batch_sizes.append(len(batch))
             q = MagicMock()
-            q.execute.return_value.data = [{"id": i} for i in batch]
+            q.execute = AsyncMock(return_value=MagicMock(data=[{"id": i} for i in batch]))
             return q
 
-        rows = _fetch_in_chunks(make_query, ids, label="test")
+        rows = await _fetch_in_chunks(make_query, ids, label="test")
 
         assert batch_sizes == [200, 200]
         assert len(rows) == 400
 
-    def test_custom_chunk_size(self):
+    async def test_custom_chunk_size(self):
         ids = [f"id-{i}" for i in range(5)]
         batch_sizes: list[int] = []
 
         def make_query(batch: list[str]) -> MagicMock:
             batch_sizes.append(len(batch))
             q = MagicMock()
-            q.execute.return_value.data = []
+            q.execute = AsyncMock(return_value=MagicMock(data=[]))
             return q
 
-        _fetch_in_chunks(make_query, ids, label="test", chunk=2)
+        await _fetch_in_chunks(make_query, ids, label="test", chunk=2)
 
         assert batch_sizes == [2, 2, 1]
 
@@ -1458,7 +1462,7 @@ def _chunk_tracking_supabase(
             return tbl
 
         tbl.in_.side_effect = in_recorder
-        tbl.execute.return_value = result
+        tbl.execute = AsyncMock(return_value=result)
         return tbl
 
     client.table.side_effect = table_side_effect
@@ -1472,7 +1476,7 @@ class TestComputeChunksLargeIdLists:
     """End-to-end: a target-scoped compute over >200 postings issues the
     posting-id ``.in_(...)`` filters in 200-id batches (#93)."""
 
-    def test_compute_pipeline_scopes_velocity_by_user_not_posting_membership(self):
+    async def test_compute_pipeline_scopes_velocity_by_user_not_posting_membership(self):
         # #260-perf: the velocity / response-time follow-ups (status_log + resume
         # documents) scope by ``user_id`` directly — no window posting-id
         # membership pull, no per-posting chunking (both tables carry user_id).
@@ -1491,13 +1495,13 @@ class TestComputeChunksLargeIdLists:
             in_batches,
         )
 
-        compute_pipeline(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+        await compute_pipeline(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
         # The follow-ups are scoped by .eq(user_id), never chunked by posting id.
         assert "status_log" not in in_batches
         assert "documents" not in in_batches
 
-    def test_compute_targets_chunks_posting_id_filters(self):
+    async def test_compute_targets_chunks_posting_id_filters(self):
         n = 250
         targets = [{"id": "t1", "label": "Frontend"}]
         scores = [{"job_posting_id": f"p{i}", "target_id": "t1", "score": 50} for i in range(n)]
@@ -1513,7 +1517,7 @@ class TestComputeChunksLargeIdLists:
             in_batches,
         )
 
-        compute_targets(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+        await compute_targets(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
         # jobs (postings) chunked by id; scores chunked by job_posting_id.
         for table in ("jobs", "scores"):
@@ -1521,7 +1525,7 @@ class TestComputeChunksLargeIdLists:
             big = [s for s in sizes if s > 1]  # ignore the small target_id in_()
             assert big and all(s <= 200 for s in big), f"{table} not chunked at 200: {sizes}"
 
-    def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
+    async def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
         """#60-perf: skills-cost no longer resolves posting membership via
         ``scores`` (tens of thousands of rows) + fetches every target posting.
         It scopes analyses by ``target_id`` directly; since R2 the priority
@@ -1550,7 +1554,7 @@ class TestComputeChunksLargeIdLists:
             in_batches,
         )
 
-        result = compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
+        result = await compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
         # No membership pull: skills-cost must not touch the ``scores`` table.
         assert "scores" not in in_batches
@@ -1568,13 +1572,14 @@ class TestComputeChunksLargeIdLists:
 
 
 class TestCostByPurpose:
-    def test_uses_rpc_when_user_scoped(self):
+    async def test_uses_rpc_when_user_scoped(self):
         sb = MagicMock()
+        sb.rpc.return_value.execute = AsyncMock()
         sb.rpc.return_value.execute.return_value.data = {
             "tailor.resume": {"sum": 0.5, "count": 3},
             "analysis": {"sum": 0.25, "count": 2},
         }
-        totals, counts = _cost_by_purpose(sb, user_id="u1", since=None)
+        totals, counts = await _cost_by_purpose(sb, user_id="u1", since=None)
         assert totals == {"tailor.resume": 0.5, "analysis": 0.25}
         assert counts == {"tailor.resume": 3, "analysis": 2}
         # RPC path resolved it; no per-row table fetch.
@@ -1583,7 +1588,7 @@ class TestCostByPurpose:
         assert args.args[0] == "cost_by_purpose_since"
         assert args.args[1] == {"p_user_id": "u1", "p_since": None}
 
-    def test_falls_back_to_client_group_when_rpc_unavailable(self):
+    async def test_falls_back_to_client_group_when_rpc_unavailable(self):
         # _mock_supabase makes .rpc raise -> exercises the client-side group.
         sb = _mock_supabase(
             {
@@ -1594,12 +1599,12 @@ class TestCostByPurpose:
                 ]
             }
         )
-        totals, counts = _cost_by_purpose(sb, user_id="u1", since=None)
+        totals, counts = await _cost_by_purpose(sb, user_id="u1", since=None)
         assert totals["analysis"] == 0.20
         assert abs(totals["tailor.resume"] - 0.15) < 1e-9
         assert counts == {"tailor.resume": 2, "analysis": 1}
 
-    def test_user_id_none_sums_all_rows_via_python(self):
+    async def test_user_id_none_sums_all_rows_via_python(self):
         # user_id=None must not call the per-user RPC (it sums every row).
         sb = _mock_supabase(
             {
@@ -1609,7 +1614,7 @@ class TestCostByPurpose:
                 ]
             }
         )
-        totals, counts = _cost_by_purpose(sb, user_id=None, since=None)
+        totals, counts = await _cost_by_purpose(sb, user_id=None, since=None)
         sb.rpc.assert_not_called()
         assert abs(totals["analysis"] - 0.50) < 1e-9
         assert counts == {"analysis": 2}
@@ -1661,7 +1666,7 @@ class _PaginatingScores:
         self._limit = n
         return self
 
-    def execute(self) -> MagicMock:
+    async def execute(self) -> MagicMock:
         rows = sorted(
             (r for r in self._all if r["target_id"] in self._targets),
             key=lambda r: r["id"],
@@ -1690,7 +1695,7 @@ class TestPostingTargetMapPagination:
     un-paginated read dropped every (job, target) row past the first 1000,
     undercounting insights for any user with a busy target."""
 
-    def test_fetches_all_rows_past_the_cap(self) -> None:
+    async def test_fetches_all_rows_past_the_cap(self) -> None:
         # 2,500 non-excluded postings under T (> 2x the 1000 cap), plus rows
         # that must be excluded: 30 excluded=true, and 40 under another target.
         rows: list[dict] = [
@@ -1712,7 +1717,7 @@ class TestPostingTargetMapPagination:
         ]
         client = _paginating_client(rows)
 
-        m = _posting_target_map(client, {"T"})
+        m = await _posting_target_map(client, {"T"})
 
         assert m is not None
         # All 2,500 non-excluded postings under T — NOT truncated to 1000.
@@ -1721,7 +1726,7 @@ class TestPostingTargetMapPagination:
         assert not any(k.startswith("jobx-") for k in m)  # excluded dropped
         assert not any(k.startswith("jobo-") for k in m)  # other target dropped
 
-    def test_multi_target_membership_survives_pagination(self) -> None:
+    async def test_multi_target_membership_survives_pagination(self) -> None:
         # Same posting scored under two requested targets → maps to BOTH,
         # even across the cap (3,000 total rows, 1,500 distinct postings).
         rows: list[dict] = []
@@ -1744,29 +1749,29 @@ class TestPostingTargetMapPagination:
             )
         client = _paginating_client(rows)
 
-        m = _posting_target_map(client, {"T1", "T2"})
+        m = await _posting_target_map(client, {"T1", "T2"})
 
         assert m is not None
         assert len(m) == 1500
         assert all(v == {"T1", "T2"} for v in m.values())
 
-    def test_exact_multiple_of_page_size_terminates(self) -> None:
+    async def test_exact_multiple_of_page_size_terminates(self) -> None:
         # Exactly 2000 rows (2x page size) must not loop forever and must
         # return all 2000 — the full-page cursor advance + empty terminal page.
         rows = [
             {"id": f"{i:08d}", "job_posting_id": f"job-{i}", "target_id": "T", "excluded": False}
             for i in range(2 * _SCORES_PAGE_SIZE)
         ]
-        m = _posting_target_map(_paginating_client(rows), {"T"})
+        m = await _posting_target_map(_paginating_client(rows), {"T"})
         assert m is not None
         assert len(m) == 2 * _SCORES_PAGE_SIZE
 
-    def test_empty_targets_returns_empty_without_reading(self) -> None:
+    async def test_empty_targets_returns_empty_without_reading(self) -> None:
         client = MagicMock()
-        assert _posting_target_map(client, set()) == {}
+        assert await _posting_target_map(client, set()) == {}
         client.table.assert_not_called()
 
-    def test_none_targets_is_unscoped(self) -> None:
+    async def test_none_targets_is_unscoped(self) -> None:
         client = MagicMock()
-        assert _posting_target_map(client, None) is None
+        assert await _posting_target_map(client, None) is None
         client.table.assert_not_called()

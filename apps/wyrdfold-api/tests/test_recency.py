@@ -376,7 +376,7 @@ class _ListChain:
     def range(self, *_a: Any, **_kw: Any) -> _ListChain:
         return self
 
-    def execute(self) -> _ListResp:
+    async def execute(self) -> _ListResp:
         return self._resp
 
 
@@ -388,7 +388,7 @@ def _list_supabase(table_resps: dict[str, _ListResp]) -> MagicMock:
     return sb
 
 
-def test_target_two_query_orders_by_recency_when_enabled(
+async def test_target_two_query_orders_by_recency_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A high-fit but stale job sorts BELOW a fresher, lower-fit job once
@@ -426,7 +426,7 @@ def test_target_two_query_orders_by_recency_when_enabled(
         }
     )
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
@@ -448,7 +448,7 @@ def test_target_two_query_orders_by_recency_when_enabled(
     assert [p["score"] for p in result["postings"]] == [70, 95]
 
 
-def test_across_targets_orders_by_recency_when_enabled(
+async def test_across_targets_orders_by_recency_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
@@ -481,7 +481,7 @@ def test_across_targets_orders_by_recency_when_enabled(
     ]
     sb = _list_supabase({"scores": _ListResp(score_rows), "jobs": _ListResp(postings)})
 
-    result = _list_jobs_across_user_targets(
+    result = await _list_jobs_across_user_targets(
         sb,
         user_target_ids={"t-1", "t-2"},
         cursor={},
@@ -500,7 +500,7 @@ def test_across_targets_orders_by_recency_when_enabled(
     assert [p["score"] for p in result["postings"]] == [70, 95]
 
 
-def test_two_query_sorts_by_weighted_display_not_raw(
+async def test_two_query_sorts_by_weighted_display_not_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With custom axis weights, the list sorts by the WEIGHTED score the user
@@ -542,7 +542,7 @@ def test_two_query_sorts_by_weighted_display_not_raw(
     sb = _list_supabase({"scores": _ListResp(ts_rows, count=2), "jobs": _ListResp(postings)})
     weights = AxisWeights(title_fit=0.5, skills_fit=0.5, seniority_fit=0.0, domain_fit=0.0)
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
