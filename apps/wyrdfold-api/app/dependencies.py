@@ -9,7 +9,7 @@ import jwt
 from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 from jwt import PyJWK, PyJWKClient, PyJWKClientError
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import Settings, settings
 
@@ -34,6 +34,19 @@ def get_supabase() -> Client:
     from app.supabase_pool import get_supabase_pool
 
     client = get_supabase_pool()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    return client
+
+
+def get_async_service_supabase() -> AsyncClient:
+    """Async service-role client (#57 slice 3) — the async mirror of
+    :func:`get_supabase` for router paths that bypass RLS (cost ledger,
+    shared-catalog reads). Returns the shared singleton (no await; created in
+    the lifespan); 503 when unconfigured."""
+    from app.supabase_pool import get_async_supabase
+
+    client = get_async_supabase()
     if client is None:
         raise HTTPException(status_code=503, detail="Supabase not configured")
     return client
@@ -98,6 +111,59 @@ def get_supabase_for_caller(
                 from app.supabase_pool import get_user_client
 
                 return get_user_client(token)
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def get_async_user_supabase(
+    request: Request,
+    s: Settings = Depends(get_settings),
+) -> AsyncClient:
+    """Async mirror of :func:`get_user_supabase` (#57 slice 3).
+
+    Per-request, RLS-enforced user client on the pooled async HTTP/2 transport.
+    JWT-only, same guards as the sync version. Not wired into any route yet —
+    the per-user router paths migrate onto it module-by-module.
+    """
+    if not s.supabase_url or not s.supabase_anon_key:
+        raise HTTPException(status_code=503, detail="Supabase user client not configured")
+    token = _extract_bearer_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+
+    from app.supabase_pool import get_async_user_client
+
+    return await get_async_user_client(token)
+
+
+async def get_async_supabase_for_caller(
+    request: Request,
+    s: Settings = Depends(get_settings),
+) -> AsyncClient:
+    """Async mirror of :func:`get_supabase_for_caller` (#57 slice 3).
+
+    Same JWT-only, RLS-scoped contract as the sync version. The JWT decode can
+    trigger a blocking JWKS fetch (cold cache / unknown kid), so it runs in a
+    worker thread — never on the event loop this async dependency executes on.
+    """
+    if s.supabase_url:
+        token = _extract_bearer_token(request)
+        if token:
+            try:
+                await asyncio.to_thread(_decode_supabase_jwt, token, s)
+            except HTTPException:
+                logger.warning(
+                    "auth_jwt_decode_failed path=%s reason=client_select",
+                    request.url.path,
+                )
+            else:
+                if not s.supabase_anon_key:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Supabase user client not configured",
+                    )
+                from app.supabase_pool import get_async_user_client
+
+                return await get_async_user_client(token)
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 

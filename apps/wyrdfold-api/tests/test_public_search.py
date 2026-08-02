@@ -19,12 +19,12 @@ the auth posture, and the wiring.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.dependencies import get_settings, get_supabase
+from app.dependencies import get_async_service_supabase, get_settings
 from app.main import app
 from app.models.job_search import JobSearchResult
 from app.routers import public_search
@@ -54,7 +54,7 @@ def _stub_search(
     """Patch the service so the endpoint returns controlled rows, and capture the
     (q, limit, offset, filters) it forwarded."""
 
-    def fake(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
+    async def fake(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
         if captured is not None:
             captured.update(
                 q=q,
@@ -67,10 +67,14 @@ def _stub_search(
         return (results if results is not None else [_result("a")], has_more)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake)
+
     # No-op the snippet fetch so the cap / BFF / forwarding tests stay focused;
     # the snippet path has its own tests below.
-    monkeypatch.setattr(public_search.job_search, "attach_snippets", lambda sb, res, **kw: None)
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    async def _noop_attach(sb: object, res: object, **kw: object) -> None:
+        return None
+
+    monkeypatch.setattr(public_search.job_search, "attach_snippets", _noop_attach)
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
 
 
 # ---- depth cap (the anti-scraping guard) -----------------------------------
@@ -165,7 +169,7 @@ def test_populates_snippet_from_page_jd_html(monkeypatch) -> None:
     """The public endpoint runs the real ``attach_snippets`` after ``search_jobs``:
     a page-only ``description_html`` fetch, tag-stripped into a preview."""
 
-    def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
+    async def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
         return ([_result("a"), _result("b")], False)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake_search)
@@ -174,13 +178,15 @@ def test_populates_snippet_from_page_jd_html(monkeypatch) -> None:
     qb = MagicMock()
     qb.select.return_value = qb
     qb.in_.return_value = qb
-    qb.execute.return_value.data = [
+    result = MagicMock()
+    result.data = [
         {"id": "a", "description_html": "<p>Build <b>fast</b> UIs.</p>"},
         {"id": "b", "description_html": ""},  # empty JD → no snippet
     ]
+    qb.execute = AsyncMock(return_value=result)
     sb = MagicMock()
     sb.table.return_value = qb
-    app.dependency_overrides[get_supabase] = lambda: sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
 
     r = TestClient(app).get("/public/search?q=frontend")
     assert r.status_code == 200

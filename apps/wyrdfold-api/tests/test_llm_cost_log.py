@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.constants import SYSTEM_USER_ID
+from app.models.embeddings import EmbeddingResult, EmbeddingUsage
 from app.models.llm import LLMResult, LLMUsage
 from app.services.llm import cost_log
 from app.services.llm.cost_log_buffer import buffer
@@ -209,3 +210,103 @@ def test_enqueue_carries_metadata_when_provided() -> None:
     # user_id=None (a cron enqueue) is stamped SYSTEM at row-build time (#88
     # groundwork) — the buffered write is no longer a NULL-owner row.
     assert drained[0]["user_id"] == SYSTEM_USER_ID
+
+
+# ---- async writers (record_async / record_embedding_async, #57 slice 3) -----
+
+
+def _embedding_result(cost: float = 0.002) -> EmbeddingResult:
+    return EmbeddingResult(
+        embeddings=[[0.1, 0.2]],
+        model="voyage-3.5",
+        usage=EmbeddingUsage(input_tokens=8),
+        cost_usd=cost,
+        latency_ms=12,
+    )
+
+
+def _stored_row(**over: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "row-1",
+        "user_id": "u1",
+        "model": "claude-haiku-4-5",
+        "purpose": "experience.derive",
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cost_usd": 0.01,
+        "latency_ms": 42,
+        "metadata": {},
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    row.update(over)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_record_async_awaits_insert_and_returns_record() -> None:
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=_Resp([_stored_row()])
+    )
+
+    rec = await cost_log.record_async(
+        sb,
+        user_id="u1",
+        purpose="experience.derive",
+        result=_llm_result(0.01),
+        metadata={"prose_doc_id": "p1"},
+    )
+
+    assert rec.id == "row-1"
+    inserted = sb.table.return_value.insert.call_args[0][0]
+    assert inserted["purpose"] == "experience.derive"
+    assert inserted["cost_usd"] == 0.01
+    assert inserted["output_tokens"] == 5
+    assert inserted["metadata"] == {"prose_doc_id": "p1"}
+    sb.table.return_value.insert.return_value.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_record_async_stamps_system_owner_for_none_user() -> None:
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=_Resp([_stored_row(user_id=SYSTEM_USER_ID)])
+    )
+    await cost_log.record_async(sb, user_id=None, purpose="p", result=_llm_result())
+    inserted = sb.table.return_value.insert.call_args[0][0]
+    assert inserted["user_id"] == SYSTEM_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_record_async_raises_when_insert_returns_no_rows() -> None:
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute = AsyncMock(return_value=_Resp([]))
+    with pytest.raises(RuntimeError, match="Failed to insert"):
+        await cost_log.record_async(sb, user_id="u1", purpose="p", result=_llm_result())
+
+
+@pytest.mark.asyncio
+async def test_record_embedding_async_awaits_insert_and_zeroes_output_tokens() -> None:
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=_Resp([_stored_row(model="voyage-3.5", output_tokens=0)])
+    )
+    rec = await cost_log.record_embedding_async(
+        sb,
+        user_id="u1",
+        purpose="experience.chunks",
+        result=_embedding_result(0.002),
+        metadata={"optimized_doc_id": "o1"},
+    )
+    assert rec.id == "row-1"
+    inserted = sb.table.return_value.insert.call_args[0][0]
+    # Embedding rows carry input tokens only — output/cache buckets are zeroed.
+    assert inserted["input_tokens"] == 8
+    assert inserted["output_tokens"] == 0
+    assert inserted["cache_read_input_tokens"] == 0
+    assert inserted["cache_creation_input_tokens"] == 0
+    assert inserted["cost_usd"] == 0.002
+    assert inserted["metadata"] == {"optimized_doc_id": "o1"}
+    sb.table.return_value.insert.return_value.execute.assert_awaited_once()

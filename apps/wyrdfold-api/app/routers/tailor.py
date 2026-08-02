@@ -22,22 +22,26 @@ import re
 import tempfile
 import zipfile
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any, cast
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
-from supabase import Client
+from supabase import AsyncClient
 
+from app.background import spawn_detached
+from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
+    get_async_user_supabase,
     get_current_user_id,
     get_llm_client,
-    get_supabase,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.models.batch import BatchJob, BatchRequest, BatchResponse
+from app.models.experience import OptimizedDoc, Preferences
 from app.models.tailor import (
     BulkExportRequest,
     CoverLetterRequest,
@@ -87,8 +91,104 @@ router = APIRouter(
 )
 
 
-def _resolve_target_for_posting(
-    supabase: Client, *, user_id: str | None, job_posting_id: str
+# ---- Inline async reads/writes (#57 slice 3) ------------------------------
+#
+# Handlers run on the async user/service client. A few shared experience-service
+# helpers (``optimized.get_latest`` / ``preferences.get``) and the persistence
+# ``upsert_user_job`` mirror stay SYNC for their not-yet-converted callers
+# (poller / analysis / targets / the jobs+status routers) — a sync helper can't
+# take the async client, and converting them would break those callers. So these
+# thin async inlines run the same queries on the async client (the
+# insights.py::_user_target_ids / experience.py pattern). No sync+async twin in
+# the shared layer.
+
+
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (sync twin kept for the poller /
+    analysis / targets / annotations chain). Reads fresh: the module TTL cache
+    is populated only by those sync callers and every write invalidates it."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
+
+
+async def _preferences_get(supabase: AsyncClient, user_id: str | None) -> Preferences | None:
+    """Async inline of ``preferences.get`` (sync twin kept for other callers)."""
+    resp = await (
+        supabase.table(preferences.TABLE)
+        .select("*")
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return Preferences.model_validate(rows[0]) if rows else None
+
+
+async def _upsert_user_job(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Async inline of ``persistence.upsert_user_job`` (sync twin kept for the
+    jobs / status routers). Mirrors a pipeline-status write into ``user_jobs``."""
+    await supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
+
+
+async def _get_records(
+    supabase: AsyncClient, resume_ids: list[str], *, user_id: str
+) -> list[TailoredResumeRecord | None]:
+    """Fetch each record concurrently — independent reads, overlapped via gather.
+    A non-handler helper so the #107 guard sees the handler await the fan-out."""
+    return await asyncio.gather(
+        *(persistence.get(supabase, rid, user_id=user_id) for rid in resume_ids)
+    )
+
+
+async def _download_all(supabase: AsyncClient, storage_paths: list[str]) -> list[bytes]:
+    """Download each .docx concurrently (independent network reads)."""
+    return await asyncio.gather(
+        *(persistence.download_docx(supabase, path) for path in storage_paths)
+    )
+
+
+async def _target_scoring_profile_row(
+    supabase: AsyncClient, target_id: str
+) -> dict[str, Any] | None:
+    """The ``targets`` row (scoring_profile only) for *target_id*, or None.
+    A non-handler helper so the #107 guard sees the handler await the read."""
+    resp = await (
+        supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0] if rows else None
+
+
+async def _fetch_postings_by_ids(
+    supabase: AsyncClient, ids: list[str]
+) -> list[dict[str, Any]]:
+    """Batch-fetch ``jobs`` rows for *ids* (id/title/description_html)."""
+    resp = await (
+        supabase.table("jobs").select("id, title, description_html").in_("id", ids).execute()
+    )
+    return cast(list[dict[str, Any]], resp.data or [])
+
+
+async def _resolve_target_for_posting(
+    supabase: AsyncClient, *, user_id: str | None, job_posting_id: str
 ) -> str | None:
     """Resolve which target a posting belongs to, via ``scores``.
 
@@ -100,7 +200,7 @@ def _resolve_target_for_posting(
     """
     target_ids: list[str] | None = None
     if user_id is not None:
-        ut_resp = (
+        ut_resp = await (
             supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
         )
         target_ids = [
@@ -114,7 +214,8 @@ def _resolve_target_for_posting(
     score_query = supabase.table("scores").select("target_id").eq("job_posting_id", job_posting_id)
     if target_ids is not None:
         score_query = score_query.in_("target_id", target_ids)
-    rows = score_query.order("score", desc=True).limit(1).execute().data or []
+    resp = await score_query.order("score", desc=True).limit(1).execute()
+    rows = resp.data or []
     if not rows:
         return None
     return cast(str, cast(dict[str, Any], rows[0])["target_id"])
@@ -129,17 +230,16 @@ def _resolve_target_for_posting(
 async def create_tailored_resume(
     request: Request,
     body: TailorRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     # JWT-required: the generated .docx is stored under the caller's
     # <user_id>/ Storage folder, so anonymous generation is no longer allowed.
     user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
-    # Genuinely async (awaits the LLM tailor pipeline + contact resolve), so
-    # it stays `async def`. supabase-py is synchronous, so each blocking
-    # round-trip is offloaded via asyncio.to_thread to keep it off the event
-    # loop. See #107.
-    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    # `async def`: the LLM tailor pipeline + every DB round-trip now run
+    # natively on the async service client (#57 slice 3), no threadpool worker
+    # held for the supabase calls.
+    current_optimized = await _optimized_latest(supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -163,30 +263,20 @@ async def create_tailored_resume(
 
     # Reuse check (#504): skip pipeline if a similar resume exists in the target
     if not body.force_fresh and body.job_posting_id:
-        target_id = await asyncio.to_thread(
-            _resolve_target_for_posting,
+        target_id = await _resolve_target_for_posting(
             supabase,
             user_id=user_id,
             job_posting_id=body.job_posting_id,
         )
         if target_id:
-            target_resp = await asyncio.to_thread(
-                lambda: (
-                    supabase.table("targets")
-                    .select("scoring_profile")
-                    .eq("id", target_id)
-                    .execute()
-                )
-            )
-            if target_resp.data:
+            target_row = await _target_scoring_profile_row(supabase, target_id)
+            if target_row:
                 from app.models.targets import ScoringProfile
 
-                target_row = cast(dict[str, Any], target_resp.data[0])
                 profile = ScoringProfile.model_validate(target_row["scoring_profile"])
                 keywords = extract_profile_keywords(profile)
                 if keywords:
-                    reusable = await asyncio.to_thread(
-                        find_reusable_resume,
+                    reusable = await find_reusable_resume(
                         supabase,
                         target_id=target_id,
                         job_description=body.job_description,
@@ -194,16 +284,14 @@ async def create_tailored_resume(
                         user_id=user_id,
                     )
                     if reusable is not None:
-                        cloned = await asyncio.to_thread(
-                            clone_resume_for_job,
+                        cloned = await clone_resume_for_job(
                             supabase,
                             source=reusable,
                             job_posting_id=body.job_posting_id,
                             job_description=body.job_description,
                             user_id=user_id,
                         )
-                        await asyncio.to_thread(
-                            persistence.mark_job_resume_draft,
+                        await persistence.mark_job_resume_draft(
                             supabase,
                             body.job_posting_id,
                             user_id=user_id,
@@ -213,7 +301,7 @@ async def create_tailored_resume(
                             lint_warnings=[],
                         )
 
-    prefs_row = await asyncio.to_thread(preferences.get, supabase, user_id=user_id)
+    prefs_row = await _preferences_get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
     contact = await resolve_contact(supabase, user_id, body.contact)
 
@@ -244,8 +332,7 @@ async def create_tailored_resume(
     if not isinstance(result, PipelineSuccess):
         raise HTTPException(status_code=500, detail="Unexpected pipeline result")
     if body.job_posting_id:
-        await asyncio.to_thread(
-            persistence.mark_job_resume_draft,
+        await persistence.mark_job_resume_draft(
             supabase,
             body.job_posting_id,
             user_id=user_id,
@@ -265,15 +352,14 @@ async def create_tailored_resume(
 async def create_tailored_cover_letter(
     request: Request,
     body: CoverLetterRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     # JWT-required: see create_tailored_resume (per-user Storage folder).
     user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
-    # Genuinely async (awaits the LLM cover-letter pipeline + contact
-    # resolve), so it stays `async def`; the blocking supabase round-trips are
-    # offloaded via asyncio.to_thread to keep them off the event loop. See #107.
-    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    # `async def`: the LLM cover-letter pipeline + every DB round-trip run
+    # natively on the async service client (#57 slice 3).
+    current_optimized = await _optimized_latest(supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -295,7 +381,7 @@ async def create_tailored_cover_letter(
             },
         )
 
-    prefs_row = await asyncio.to_thread(preferences.get, supabase, user_id=user_id)
+    prefs_row = await _preferences_get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
     contact = await resolve_contact(supabase, user_id, body.contact)
 
@@ -331,15 +417,15 @@ async def create_tailored_cover_letter(
     )
 
 
-# Sync `def` (not `async def`): blocking supabase reads run in the threadpool,
-# keeping them off the event loop. See #107.
+# `async def` on the async user client (#57 slice 3): the DB read runs natively
+# on the event loop, no threadpool worker held for the supabase round-trip.
 @router.get("/resumes")
-def list_documents(
+async def list_documents(
     limit: int = 50,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, list[TailoredResumeRecord]]:
-    rows = persistence.list_recent(
+    rows = await persistence.list_recent(
         supabase,
         user_id=user_id,
         limit=max(1, min(limit, 200)),
@@ -348,14 +434,13 @@ def list_documents(
     return {"resumes": rows}
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/cover-letters")
-def list_tailored_cover_letters(
+async def list_tailored_cover_letters(
     limit: int = 50,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, list[TailoredResumeRecord]]:
-    rows = persistence.list_recent(
+    rows = await persistence.list_recent(
         supabase,
         user_id=user_id,
         limit=max(1, min(limit, 200)),
@@ -367,11 +452,10 @@ def list_tailored_cover_letters(
 # ---- Resume lifecycle (#505) -------------------------------------------------
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/resumes/by-job/{job_posting_id}")
-def get_resume_by_job(
+async def get_resume_by_job(
     job_posting_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord | None:
     """Most recent resume for a given job posting, or ``null`` if none exists.
@@ -383,21 +467,20 @@ def get_resume_by_job(
     ``null`` and 404 the same way — render a "Generate Resume"
     CTA — so dropping the 404 is a no-op for the user.
     """
-    return persistence.get_by_job(supabase, job_posting_id, user_id=user_id)
+    return await persistence.get_by_job(supabase, job_posting_id, user_id=user_id)
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/cover-letters/by-job/{job_posting_id}")
-def get_cover_letter_by_job(
+async def get_cover_letter_by_job(
     job_posting_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord | None:
     """Most recent cover letter for a given job posting, or ``null``
     if none exists. See ``get_resume_by_job`` for the 200-with-null
     rationale.
     """
-    return persistence.get_by_job(
+    return await persistence.get_by_job(
         supabase, job_posting_id, user_id=user_id, document_type="cover_letter"
     )
 
@@ -412,8 +495,8 @@ _EXPORT_STREAM_CHUNK_BYTES = 64 * 1024
 @router.post("/resumes/export-zip")
 async def export_resumes_zip(
     body: BulkExportRequest,
-    supabase: Client = Depends(get_supabase),
-    user_supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+    user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> Response:
     """Download approved resumes as a single .zip archive.
@@ -421,20 +504,15 @@ async def export_resumes_zip(
     JWT-required: file bytes come from per-user Storage (RLS) via
     ``user_supabase``; DB lookups stay on the service-role ``supabase``.
 
-    supabase-py is synchronous, so every blocking round-trip is offloaded via
-    ``asyncio.to_thread`` to keep it off the event loop. The per-file Storage
-    downloads — the dominant, network-bound cost — run concurrently via
-    ``asyncio.gather`` instead of a serial blocking loop (#107). The zip itself
-    is built into a ``SpooledTemporaryFile`` (spills to disk past
-    ``_EXPORT_SPOOL_MAX_MEMORY``) and streamed in chunks (#192 P-H2), so a large
-    bulk export never holds the whole archive in RAM.
+    The DB reads + per-file Storage downloads run natively on the async clients
+    (#57 slice 3); the downloads — the dominant, network-bound cost — still run
+    concurrently via ``asyncio.gather`` (in the non-handler ``_get_records`` /
+    ``_download_all`` helpers). The zip itself is built into a
+    ``SpooledTemporaryFile`` (spills to disk past ``_EXPORT_SPOOL_MAX_MEMORY``)
+    and streamed in chunks (#192 P-H2), so a large bulk export never holds the
+    whole archive in RAM.
     """
-    rows = await asyncio.gather(
-        *(
-            asyncio.to_thread(persistence.get, supabase, rid, user_id=user_id)
-            for rid in body.resume_ids
-        )
-    )
+    rows = await _get_records(supabase, list(body.resume_ids), user_id=user_id)
     records: list[TailoredResumeRecord] = []
     unapproved: list[str] = []
     for rid, row in zip(body.resume_ids, rows, strict=True):
@@ -453,15 +531,8 @@ async def export_resumes_zip(
     # Download every .docx concurrently — these are independent network reads,
     # so gather() overlaps them instead of paying the round-trips serially.
     to_download = [rec for rec in records if rec.storage_path]
-    downloaded = await asyncio.gather(
-        *(
-            asyncio.to_thread(
-                persistence.download_docx,
-                user_supabase,
-                cast(str, rec.storage_path),
-            )
-            for rec in to_download
-        )
+    downloaded = await _download_all(
+        user_supabase, [cast(str, rec.storage_path) for rec in to_download]
     )
 
     # SIM115 suppressed: the spool must outlive this handler — it's closed by
@@ -505,12 +576,11 @@ async def export_resumes_zip(
     )
 
 
-# Sync `def`: blocking supabase read/update runs in the threadpool (#107).
 @router.patch("/resumes/{resume_id}")
-def edit_tailored_resume(
+async def edit_tailored_resume(
     resume_id: str,
     body: ResumeEditRequest,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailorResponse:
     """Edit a draft resume's markdown. Rejected if already approved.
@@ -518,7 +588,7 @@ def edit_tailored_resume(
     The .docx isn't re-rendered eagerly — saving is cheap and the
     download endpoint detects a stale hash to re-render lazily.
     """
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored document not found")
     if row.approved_at is not None:
@@ -534,16 +604,17 @@ def edit_tailored_resume(
             },
         )
 
-    record = persistence.update_payload_md(supabase, resume_id, body.markdown, user_id=user_id)
+    record = await persistence.update_payload_md(
+        supabase, resume_id, body.markdown, user_id=user_id
+    )
     return TailorResponse(record=record, lint_warnings=lint_result.warnings)
 
 
-# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
 @router.post("/resumes/{resume_id}/checkpoint")
-def checkpoint_tailored_resume(
+async def checkpoint_tailored_resume(
     resume_id: str,
     body: ResumeCheckpointRequest | None = None,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     """Snapshot a draft resume's current markdown into version history.
@@ -557,7 +628,7 @@ def checkpoint_tailored_resume(
     Idempotent via dedup: if the latest snapshot already matches, no
     new row is written.
     """
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored document not found")
     if row.approved_at is not None:
@@ -574,21 +645,20 @@ def checkpoint_tailored_resume(
                     "violations": [v.model_dump() for v in lint_result.violations],
                 },
             )
-        persistence.update_payload_md(supabase, resume_id, body.markdown, user_id=user_id)
+        await persistence.update_payload_md(supabase, resume_id, body.markdown, user_id=user_id)
 
-    recorded = versions.checkpoint(supabase, resume_id)
+    recorded = await versions.checkpoint(supabase, resume_id)
     return {"recorded": recorded}
 
 
-# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
 @router.post("/resumes/{resume_id}/approve")
-def approve_tailored_resume(
+async def approve_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
     """Approve (lock) a tailored resume or cover letter. Idempotent if already approved."""
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored document not found")
 
@@ -596,7 +666,7 @@ def approve_tailored_resume(
     if row.approved_at is not None:
         return row
 
-    record = persistence.approve(supabase, resume_id, user_id=user_id)
+    record = await persistence.approve(supabase, resume_id, user_id=user_id)
 
     # Resume approval also advances the linked job posting to resume_ready;
     # cover letters don't drive job status.
@@ -604,7 +674,7 @@ def approve_tailored_resume(
     # the global jobs.status. Api-key callers (user_id None) have no per-user
     # pipeline, so they skip the mirror; cover letters don't drive job status.
     if row.document_type == "resume" and row.job_posting_id and user_id:
-        persistence.upsert_user_job(
+        await _upsert_user_job(
             supabase,
             user_id=user_id,
             job_posting_id=row.job_posting_id,
@@ -614,29 +684,28 @@ def approve_tailored_resume(
     return record
 
 
-# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
 @router.post("/resumes/{resume_id}/unapprove")
-def unapprove_tailored_resume(
+async def unapprove_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
     """Reopen an approved resume or cover letter for editing. Idempotent if already unlocked."""
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored document not found")
 
     if row.approved_at is None:
         return row
 
-    record = persistence.unapprove(supabase, resume_id, user_id=user_id)
+    record = await persistence.unapprove(supabase, resume_id, user_id=user_id)
 
     # Mirror the approve side: resume unlock walks the linked job back to
     # resume_draft so the lifecycle stays in sync.
     # Per-user pipeline state lives in user_jobs (#75 C3): see
     # approve_tailored_resume.
     if row.document_type == "resume" and row.job_posting_id and user_id:
-        persistence.upsert_user_job(
+        await _upsert_user_job(
             supabase,
             user_id=user_id,
             job_posting_id=row.job_posting_id,
@@ -649,40 +718,40 @@ def unapprove_tailored_resume(
 # ---- Single resume lookup + download ----------------------------------------
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/resumes/{resume_id}")
-def get_tailored_resume(
+async def get_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TailoredResumeRecord:
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored resume not found")
     return row
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/resumes/{resume_id}/versions")
-def list_resume_versions(
+async def list_resume_versions(
     resume_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     """Return up to FREE_TIER_VERSION_CAP recent payload snapshots (F3-H)."""
-    row = persistence.get(supabase, resume_id, user_id=user_id)
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored resume not found")
-    history = versions.list_for_resume(supabase, resume_id)
+    history = await versions.list_for_resume(supabase, resume_id)
     return {
         "versions": [v.model_dump(mode="json") for v in history],
         "cap": versions.FREE_TIER_VERSION_CAP,
     }
 
 
-def _fetch_user_resume_style(supabase: Client, user_id: str) -> ResumeStyleSettings | None:
+async def _fetch_user_resume_style(
+    supabase: AsyncClient, user_id: str
+) -> ResumeStyleSettings | None:
     """Read the user's saved default resume style, or None if unset/malformed."""
-    resp = (
+    resp = await (
         supabase.table("user_profiles")
         .select("resume_style_settings")
         .eq("user_id", user_id)
@@ -699,8 +768,8 @@ def _fetch_user_resume_style(supabase: Client, user_id: str) -> ResumeStyleSetti
         return None
 
 
-def _resolve_render_style(
-    supabase: Client, row: TailoredResumeRecord, user_id: str | None
+async def _resolve_render_style(
+    supabase: AsyncClient, row: TailoredResumeRecord, user_id: str | None
 ) -> ResumeStyleSettings | None:
     """Effective docx style for a download: per-record override, else the
     user's profile default, else None (today's unstyled pandoc render).
@@ -711,28 +780,27 @@ def _resolve_render_style(
         except ValidationError:
             pass
     if user_id is not None:
-        return _fetch_user_resume_style(supabase, user_id)
+        return await _fetch_user_resume_style(supabase, user_id)
     return None
 
 
 @router.get("/resumes/{resume_id}/download")
 async def download_tailored_resume(
     resume_id: str,
-    supabase: Client = Depends(get_supabase),
-    user_supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+    user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> Response:
     # JWT-required: docx bytes are read/written through per-user Storage
     # (RLS) via user_supabase; DB lookups stay on the service-role client.
     #
-    # Genuinely async (awaits the pandoc render via to_thread), so it stays
-    # `async def`; each blocking supabase round-trip is offloaded via
-    # asyncio.to_thread to keep it off the event loop. See #107.
-    row = await asyncio.to_thread(persistence.get, supabase, resume_id, user_id=user_id)
+    # `async def`: DB round-trips run natively on the async clients (#57 slice 3);
+    # only the pandoc render (CPU-bound subprocess) stays in asyncio.to_thread.
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored resume not found")
 
-    style = await asyncio.to_thread(_resolve_render_style, supabase, row, user_id)
+    style = await _resolve_render_style(supabase, row, user_id)
     expected_hash = md_payload_hash(row.payload_md, style) if row.payload_md else None
     cache_fresh = (
         row.storage_path is not None
@@ -746,9 +814,7 @@ async def download_tailored_resume(
                 raise HTTPException(status_code=404, detail="no .docx persisted for this resume")
             # Legacy row with cached docx but no markdown — serve cached bytes.
             try:
-                data = await asyncio.to_thread(
-                    persistence.download_docx, user_supabase, row.storage_path
-                )
+                data = await persistence.download_docx(user_supabase, row.storage_path)
             except Exception as exc:
                 # Generic client message — the raw exception (Storage path,
                 # internal errors) stays server-side only (audit #29 R3 / M4).
@@ -775,15 +841,13 @@ async def download_tailored_resume(
             raise HTTPException(status_code=500, detail="failed to render resume document") from exc
 
         try:
-            storage_path = await asyncio.to_thread(
-                persistence.upload_docx,
+            storage_path = await persistence.upload_docx(
                 supabase,
                 user_id=user_id,
                 resume_id=resume_id,
                 docx_bytes=data,
             )
-            await asyncio.to_thread(
-                persistence.mark_docx_rendered,
+            await persistence.mark_docx_rendered(
                 supabase,
                 resume_id,
                 storage_path=storage_path,
@@ -801,8 +865,7 @@ async def download_tailored_resume(
             )
     else:
         try:
-            data = await asyncio.to_thread(
-                persistence.download_docx,
+            data = await persistence.download_docx(
                 user_supabase,
                 row.storage_path,  # type: ignore[arg-type]
             )
@@ -828,8 +891,7 @@ async def download_tailored_resume(
 async def create_batch_resumes(
     request: Request,
     body: BatchRequest,
-    background_tasks: BackgroundTasks,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     # JWT-required: batch generation stores each .docx under the caller's
     # <user_id>/ Storage folder (the background task uploads via service-role
@@ -841,11 +903,14 @@ async def create_batch_resumes(
     Returns immediately with a batch_id. Poll GET /tailor/batch/{id}
     for progress.
 
-    Genuinely async (awaits the jobs query + contact resolve), so it stays
-    `async def`; the blocking supabase round-trips are offloaded via
-    asyncio.to_thread to keep them off the event loop. See #107.
+    `async def`: the setup DB round-trips run natively on the async service
+    client (#57 slice 3); ``process_batch`` (an async task on the SAME pooled
+    client) is spawned as a DETACHED task, NOT via starlette ``BackgroundTasks``
+    — ``add_task`` work on the pooled async client deadlocks the httpx pool under
+    uvloop (see app/background.py), which is why /analysis uses ``spawn_detached``
+    too.
     """
-    current_optimized = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    current_optimized = await _optimized_latest(supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
             status_code=404,
@@ -856,17 +921,8 @@ async def create_batch_resumes(
     # Single .in_() round-trip; .in_() does not guarantee row order, so re-map
     # by id to preserve the input ordering (downstream processes jobs in
     # request order).
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("jobs")
-            .select("id, title, description_html")
-            .in_("id", body.job_posting_ids)
-            .execute()
-        )
-    )
-    fetched = {
-        cast(dict[str, Any], row)["id"]: cast(dict[str, Any], row) for row in (resp.data or [])
-    }
+    posting_rows = await _fetch_postings_by_ids(supabase, list(body.job_posting_ids))
+    fetched = {row["id"]: row for row in posting_rows}
 
     warnings: list[str] = []
     postings: list[dict[str, Any]] = []
@@ -882,8 +938,7 @@ async def create_batch_resumes(
     # a target). Resolved via ``scores`` — ``jobs.target_id`` is vestigial
     # and always NULL, which silently disabled batch reuse.
     target_id: str | None = (
-        await asyncio.to_thread(
-            _resolve_target_for_posting,
+        await _resolve_target_for_posting(
             supabase,
             user_id=user_id,
             job_posting_id=body.job_posting_ids[0],
@@ -892,31 +947,32 @@ async def create_batch_resumes(
         else None
     )
 
-    prefs_row = await asyncio.to_thread(preferences.get, supabase, user_id=user_id)
+    prefs_row = await _preferences_get(supabase, user_id=user_id)
     prefs_payload = prefs_row.payload if prefs_row else None
     contact = await resolve_contact(supabase, user_id, body.contact)
 
-    batch = await asyncio.to_thread(
-        create_batch,
+    batch = await create_batch(
         supabase,
         user_id=user_id,
         job_posting_ids=body.job_posting_ids,
     )
 
-    background_tasks.add_task(
-        process_batch,
-        supabase,
-        llm,
-        batch_id=batch.id,
-        user_id=user_id,
-        optimized=current_optimized,
-        jobs=postings,
-        contact=contact,
-        preferences=prefs_payload,
-        resume_type=body.resume_type or "generic",
-        page_budget=body.page_budget,
-        force_fresh=body.force_fresh,
-        target_id=target_id,
+    spawn_detached(
+        process_batch(
+            supabase,
+            llm,
+            batch_id=batch.id,
+            user_id=user_id,
+            optimized=current_optimized,
+            jobs=postings,
+            contact=contact,
+            preferences=prefs_payload,
+            resume_type=body.resume_type or "generic",
+            page_budget=body.page_budget,
+            force_fresh=body.force_fresh,
+            target_id=target_id,
+        ),
+        name=f"batch:{batch.id}",
     )
 
     return BatchResponse(
@@ -927,15 +983,14 @@ async def create_batch_resumes(
     )
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/batch/{batch_id}")
-def get_batch_status(
+async def get_batch_status(
     batch_id: str,
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> BatchJob:
     """Poll batch processing progress."""
-    batch = get_batch(supabase, batch_id, user_id=user_id)
+    batch = await get_batch(supabase, batch_id, user_id=user_id)
     if batch is None:
         raise HTTPException(status_code=404, detail="batch not found")
     return batch

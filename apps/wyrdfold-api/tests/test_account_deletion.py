@@ -76,7 +76,7 @@ class _FakeTableQuery:
             row.get(c) in vals for c, vals in self._in_filters
         )
 
-    def execute(self) -> SimpleNamespace:
+    async def execute(self) -> SimpleNamespace:
         matched = [r for r in self._rows if self._matches(r)]
         self._log.append((self._op, self.name, dict(self._filters)))
         if self._op == "delete":
@@ -94,10 +94,10 @@ class _FakeBucket:
         self._log = log
         self.removed: list[list[str]] = []
 
-    def list(self, prefix: str) -> list[dict[str, str]]:
+    async def list(self, prefix: str) -> list[dict[str, str]]:
         return [{"name": n} for n in self._objects.get(self.name, {}).get(prefix, [])]
 
-    def remove(self, paths: list[str]) -> list[dict[str, str]]:
+    async def remove(self, paths: list[str]) -> list[dict[str, str]]:
         self._log.append(("storage_remove", self.name, paths))
         self.removed.append(list(paths))
         for p in paths:
@@ -125,7 +125,7 @@ class _FakeAdmin:
         self._log = log
         self.deleted: list[str] = []
 
-    def delete_user(self, user_id: str, should_soft_delete: bool = False) -> None:
+    async def delete_user(self, user_id: str, should_soft_delete: bool = False) -> None:
         self._log.append(("auth_delete", user_id, {}))
         self.deleted.append(user_id)
 
@@ -177,12 +177,12 @@ def _seeded() -> _FakeSupabase:
 # ---- service ----------------------------------------------------------
 
 
-def test_reference_jds_anonymized_and_votes_deleted() -> None:
+async def test_reference_jds_anonymized_and_votes_deleted() -> None:
     """Erasure deletes the user's anonymous votes, and nulls the user link on
     their shared reference-JD contributions (collective content) rather than
     deleting the rows — never touching another contributor's JDs (#29)."""
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     # Votes deleted; reference_jds anonymized via UPDATE, never DELETE.
     assert ("delete", "contribution_votes", {"user_id": _UID}) in sb.log
@@ -197,9 +197,9 @@ def test_reference_jds_anonymized_and_votes_deleted() -> None:
     assert report["reference_jds_anonymized"] == 1
 
 
-def test_deletes_every_per_user_table_by_user_id() -> None:
+async def test_deletes_every_per_user_table_by_user_id() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     deleted = {(table, frozenset(filt.items())) for op, table, filt in sb.log if op == "delete"}
     expected_filter = frozenset({"user_id": _UID}.items())
@@ -208,18 +208,18 @@ def test_deletes_every_per_user_table_by_user_id() -> None:
         assert table in report
 
 
-def test_notifications_deleted_by_resolved_profile_id() -> None:
+async def test_notifications_deleted_by_resolved_profile_id() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert ("delete", "notifications_sent", {"user_profile_id": _PROFILE_ID}) in sb.log
     assert report["notifications_sent"] == 2
 
 
-def test_shared_catalog_is_never_deleted() -> None:
+async def test_shared_catalog_is_never_deleted() -> None:
     """The multi-tenant safety invariant: erasing one user must not delete
     rows from the shared catalog."""
     sb = _seeded()
-    account_deletion.delete_account(sb, user_id=_UID)
+    await account_deletion.delete_account(sb, user_id=_UID)
     deleted_tables = {table for op, table, _ in sb.log if op == "delete"}
     assert deleted_tables.isdisjoint(_SHARED_TABLES)
     # And the shared rows are physically still present.
@@ -227,7 +227,7 @@ def test_shared_catalog_is_never_deleted() -> None:
     assert sb.tables["jobs"] == [{"id": "j1", "status": "applied"}]
 
 
-def test_scrubs_shared_score_pii_for_user_targets() -> None:
+async def test_scrubs_shared_score_pii_for_user_targets() -> None:
     """Erasure nulls the Phase-2 grader PII on shared ``scores`` rows for
     the user's targets (without deleting the rows), re-opens them to grade,
     and leaves scores for *other* tenants' targets untouched."""
@@ -254,7 +254,7 @@ def test_scrubs_shared_score_pii_for_user_targets() -> None:
         ],
     }
     sb = _FakeSupabase(tables, {})
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     scrubbed = next(r for r in sb.tables["scores"] if r["target_id"] == "t1")
     assert scrubbed["fit_reasoning"] is None
@@ -271,17 +271,17 @@ def test_scrubs_shared_score_pii_for_user_targets() -> None:
     assert "scores" not in {table for op, table, _ in sb.log if op == "delete"}
 
 
-def test_no_targets_skips_score_scrub() -> None:
+async def test_no_targets_skips_score_scrub() -> None:
     """A user with no target links issues no scores update (no ``.in_([])``)."""
     sb = _seeded()  # seeded user_targets row carries no target_id
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert report["scores_scrubbed"] == 0
     assert ("update", "scores", {}) not in sb.log
 
 
-def test_both_storage_buckets_purged() -> None:
+async def test_both_storage_buckets_purged() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert report["resume_uploads_objects"] == 2
     assert report["tailored_resume_objects"] == 1
     assert sb.storage.buckets["resume-uploads"].removed == [
@@ -290,9 +290,9 @@ def test_both_storage_buckets_purged() -> None:
     assert sb.storage.buckets["tailored-resumes"].removed == [[f"{_UID}/r-1.docx"]]
 
 
-def test_auth_user_deleted_last() -> None:
+async def test_auth_user_deleted_last() -> None:
     sb = _seeded()
-    account_deletion.delete_account(sb, user_id=_UID)
+    await account_deletion.delete_account(sb, user_id=_UID)
     ops = [(op, table) for op, table, _ in sb.log]
     assert ("auth_delete", _UID) in ops
     # auth deletion comes after the profile row delete (data first).
@@ -300,9 +300,9 @@ def test_auth_user_deleted_last() -> None:
     assert sb.auth.admin.deleted == [_UID]
 
 
-def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
+async def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
     sb = _FakeSupabase(tables={"documents": [{"user_id": _UID}]}, objects={})
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert "notifications_sent" not in report  # no profile id to resolve
     assert sb.auth.admin.deleted == [_UID]
     assert report["auth_user"] == 1
@@ -311,18 +311,18 @@ def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
 # ---- storage helper ---------------------------------------------------
 
 
-def test_purge_user_objects_empty_prefix_returns_zero() -> None:
+async def test_purge_user_objects_empty_prefix_returns_zero() -> None:
     from app.services.ingest import storage
 
     sb = _FakeSupabase(objects={"resume-uploads": {}})
-    assert storage.purge_user_objects(sb, _UID) == 0
+    assert await storage.purge_user_objects(sb, _UID) == 0
 
 
-def test_purge_user_objects_loops_until_empty() -> None:
+async def test_purge_user_objects_loops_until_empty() -> None:
     from app.services.tailor import persistence
 
     sb = _FakeSupabase(objects={"tailored-resumes": {_UID: ["a.docx", "b.docx"]}})
-    assert persistence.purge_user_objects(sb, _UID) == 2
+    assert await persistence.purge_user_objects(sb, _UID) == 2
     assert sb.storage.buckets["tailored-resumes"]._objects["tailored-resumes"][_UID] == []
 
 
@@ -333,8 +333,8 @@ def test_delete_account_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_service_supabase,
         get_current_user_id,
-        get_supabase,
         verify_supabase_jwt,
     )
     from app.main import app
@@ -342,7 +342,7 @@ def test_delete_account_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     sb = _seeded()
     app.dependency_overrides[verify_supabase_jwt] = lambda: _UID
     app.dependency_overrides[get_current_user_id] = lambda: _UID
-    app.dependency_overrides[get_supabase] = lambda: sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
     try:
         client = TestClient(app)
         resp = client.delete("/profile/account")

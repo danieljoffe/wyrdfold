@@ -33,6 +33,16 @@ _client: Client | None = None
 _async_client: AsyncClient | None = None
 _async_httpx: httpx.AsyncClient | None = None
 
+# Shared httpx pool for the per-request ASYNC user clients (#57 slice 3). The
+# async mirror of ``_user_httpx``: one bounded HTTP/2 pool (safe multiplexed in a
+# single event loop, unlike the sync side which must pin HTTP/1.1 for
+# thread-safety) shared across all concurrent per-request user clients, so only
+# the lightweight per-request ``AsyncClient`` wrapper + its own bearer are
+# allocated per call. The shared pool carries NO Authorization — each request's
+# token lives on its own client only, so there is no token bleed (see the #79
+# analysis behind ``get_user_client``).
+_async_user_httpx: httpx.AsyncClient | None = None
+
 # Shared httpx connection pool for the per-request user clients. httpx
 # clients are thread-safe for requests, so one pool serves the whole
 # threadpool; only the lightweight per-request Client wrapper + its own
@@ -145,6 +155,51 @@ async def close_async_supabase() -> None:
     if _async_httpx is not None:
         await _async_httpx.aclose()
         _async_httpx = None
+
+
+def _get_async_user_httpx() -> httpx.AsyncClient:
+    """Lazily build the shared async user pool on first use (on the loop)."""
+    global _async_user_httpx
+    if _async_user_httpx is None:
+        # Same bounded HTTP/2 transport as the async service client. Safe to
+        # multiplex here because every per-request user client runs in the one
+        # event loop. Pool size is tunable at the #57 load-test gate.
+        _async_user_httpx = _build_async_http2_client()
+    return _async_user_httpx
+
+
+async def get_async_user_client(access_token: str) -> AsyncClient:
+    """Async per-request Supabase client bound to ``access_token`` (#57 slice 3).
+
+    The async mirror of :func:`get_user_client`. The anon key is the base (so a
+    missing token degrades to anon, never service-role) and the caller's JWT is
+    set as the bearer on THIS request's own client, so PostgREST runs every query
+    under that user and RLS applies. Reuses the shared async httpx pool.
+
+    The bearer is passed in ``AsyncClientOptions.headers`` up front: it binds
+    Authorization for the lazily-created storage sub-client AND makes
+    ``AsyncClient.create`` skip its ``get_session()`` network round-trip (it only
+    fetches a session when no Authorization header is present), so the
+    per-request build is pure construction — no I/O. ``postgrest.auth`` binds the
+    DB path. Nothing else references this client, so there is no shared-auth
+    bleed (see ``get_user_client``).
+    """
+    options = AsyncClientOptions(
+        httpx_client=_get_async_user_httpx(),
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    client = await acreate_client(settings.supabase_url, settings.supabase_anon_key, options)
+    # Bind the bearer on the postgrest sub-client for DB queries (the options
+    # header above covers storage). Mirrors the sync ``get_user_client``.
+    client.postgrest.auth(access_token)
+    return client
+
+
+async def close_async_user_client() -> None:
+    global _async_user_httpx
+    if _async_user_httpx is not None:
+        await _async_user_httpx.aclose()
+        _async_user_httpx = None
 
 
 def init_supabase() -> None:

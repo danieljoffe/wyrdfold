@@ -7,7 +7,7 @@ Reset by deleting the row — this is also what re-running onboarding does.
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.constants import resolve_owner
 from app.models.experience import Preferences, PreferencesPayload
@@ -25,12 +25,19 @@ def get(supabase: Client, user_id: str | None) -> Preferences | None:
     return Preferences.model_validate(rows[0])
 
 
-def upsert(
-    supabase: Client,
+async def upsert(
+    supabase: AsyncClient,
     user_id: str | None,
     payload: PreferencesPayload,
 ) -> Preferences:
-    existing = get(supabase, user_id)
+    # Inline the existing-row probe on the async client: the sync ``get`` above
+    # stays for its not-yet-converted caller (tailor), so this async path can't
+    # reuse it (#57 slice 3).
+    existing_resp = await (
+        supabase.table(TABLE).select("*").limit(1).eq("user_id", resolve_owner(user_id)).execute()
+    )
+    existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
+    existing = Preferences.model_validate(existing_rows[0]) if existing_rows else None
     now_iso = datetime.now(UTC).isoformat()
     row: dict[str, Any] = {
         "payload": payload.model_dump(mode="json"),
@@ -38,16 +45,14 @@ def upsert(
     }
     if existing is None:
         row["user_id"] = user_id
-        resp = supabase.table(TABLE).insert(row).execute()
+        resp = await supabase.table(TABLE).insert(row).execute()
     else:
-        resp = supabase.table(TABLE).update(row).eq("id", existing.id).execute()
+        resp = await supabase.table(TABLE).update(row).eq("id", existing.id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert preferences")
     return Preferences.model_validate(rows[0])
 
 
-def reset(supabase: Client, user_id: str | None) -> None:
-    query = supabase.table(TABLE).delete()
-    query = query.eq("user_id", resolve_owner(user_id))
-    query.execute()
+async def reset(supabase: AsyncClient, user_id: str | None) -> None:
+    await supabase.table(TABLE).delete().eq("user_id", resolve_owner(user_id)).execute()

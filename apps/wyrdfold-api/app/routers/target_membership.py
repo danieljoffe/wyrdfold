@@ -24,17 +24,16 @@ bounded to target ids they own, and target ids are never taken from request inpu
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from supabase import Client
+from supabase import AsyncClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.services.qualification.family_gate import passes_family_gate
@@ -66,8 +65,8 @@ class TargetMembershipResponse(BaseModel):
     memberships: dict[str, list[TargetRef]]
 
 
-def _membership(
-    supabase: Client, user_id: str, job_posting_ids: list[str]
+async def _membership(
+    supabase: AsyncClient, user_id: str, job_posting_ids: list[str]
 ) -> dict[str, list[TargetRef]]:
     ids = list(dict.fromkeys(job_posting_ids))  # dedup, preserve order
     if not ids:
@@ -77,11 +76,12 @@ def _membership(
     # This is the ONLY source of the target ids the scores read is filtered by.
     ut_rows = cast(
         list[dict[str, Any]],
-        supabase.table("user_targets")
-        .select("target_id")
-        .eq("user_id", user_id)
-        .execute()
-        .data
+        (
+            await supabase.table("user_targets")
+            .select("target_id")
+            .eq("user_id", user_id)
+            .execute()
+        ).data
         or [],
     )
     target_ids = [r["target_id"] for r in ut_rows]
@@ -90,11 +90,12 @@ def _membership(
 
     label_rows = cast(
         list[dict[str, Any]],
-        supabase.table("targets")
-        .select("id, label, role_family")
-        .in_("id", target_ids)
-        .execute()
-        .data
+        (
+            await supabase.table("targets")
+            .select("id, label, role_family")
+            .in_("id", target_ids)
+            .execute()
+        ).data
         or [],
     )
     label_by_id = {r["id"]: r.get("label") or "" for r in label_rows}
@@ -105,14 +106,15 @@ def _membership(
     # member); the family gate is relational, so it filters below in Python.
     score_rows = cast(
         list[dict[str, Any]],
-        supabase.table("scores")
-        .select("job_posting_id, target_id, job_role_family")
-        .in_("job_posting_id", ids)
-        .in_("target_id", target_ids)
-        .eq("excluded", False)
-        .eq("promising", True)
-        .execute()
-        .data
+        (
+            await supabase.table("scores")
+            .select("job_posting_id, target_id, job_role_family")
+            .in_("job_posting_id", ids)
+            .in_("target_id", target_ids)
+            .eq("excluded", False)
+            .eq("promising", True)
+            .execute()
+        ).data
         or [],
     )
     out: dict[str, list[TargetRef]] = {}
@@ -130,15 +132,13 @@ def _membership(
 async def target_membership(
     body: TargetMembershipRequest,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_user_supabase),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> TargetMembershipResponse:
     """Which of the caller's targets already contain each listing (batch).
 
     Uses the caller's RLS-scoped client; the scores read is filtered to the
-    caller's own target ids (see the module docstring). ``supabase-py`` is
-    blocking, so the round-trips run in a worker thread (#107).
+    caller's own target ids (see the module docstring). The three DB reads
+    await natively on the pooled async user client (#57 slice 4).
     """
-    memberships = await asyncio.to_thread(
-        _membership, supabase, user_id, body.job_posting_ids
-    )
+    memberships = await _membership(supabase, user_id, body.job_posting_ids)
     return TargetMembershipResponse(memberships=memberships)

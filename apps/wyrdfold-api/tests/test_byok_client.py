@@ -170,14 +170,14 @@ def test_decrypt_error_then_required_raises(
 # ---- end-to-end through the real store + crypto -----------------------
 
 
-def test_end_to_end_stored_key_threads_through(
+async def test_end_to_end_stored_key_threads_through(
     monkeypatch: pytest.MonkeyPatch, openrouter_mode: None
 ) -> None:
     """encrypt → persist → fetch → decrypt → client, with no mocking of
     the keys service — only the storage backend is faked."""
     monkeypatch.setattr(settings, "byok_master_key", _TEST_MASTER_KEY)
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-REAL42")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-REAL42")
     client = get_client(sb, "u1")
     assert isinstance(client, OpenRouterLLMClient)
     assert _client_key(client) == "sk-or-REAL42"
@@ -204,6 +204,18 @@ def test_get_llm_client_translates_missing_key_to_402(
 
 
 # ---- in-memory fake supabase (mirrors test_byok_keys.py) --------------
+
+
+class _Result:
+    """Dual result: the async ``set_key`` write path ``await``s ``execute()``
+    while the still-sync ``get_key`` read path calls it directly (#57 slice 4)."""
+
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        yield from ()
+        return self
 
 
 class _FakeQuery:
@@ -233,7 +245,7 @@ class _FakeQuery:
     def _matches(self, row: dict[str, Any]) -> bool:
         return all(row.get(c) == v for c, v in self._filters)
 
-    def execute(self) -> SimpleNamespace:
+    def execute(self) -> _Result:
         if self._op == "upsert":
             assert self._row is not None
             # Mimic PostgREST's RETURNING representation: the full row,
@@ -242,11 +254,11 @@ class _FakeQuery:
             stored.setdefault("created_at", "2026-01-01T00:00:00+00:00")
             stored.setdefault("rotated_at", None)
             self._store.append(stored)
-            return SimpleNamespace(data=[stored])
+            return _Result(data=[stored])
         if self._op == "select":
             cols = [c.strip() for c in (self._cols or "").split(",")]
             out = [{c: row.get(c) for c in cols} for row in self._store if self._matches(row)]
-            return SimpleNamespace(data=out)
+            return _Result(data=out)
         raise AssertionError(f"unhandled op {self._op}")
 
 

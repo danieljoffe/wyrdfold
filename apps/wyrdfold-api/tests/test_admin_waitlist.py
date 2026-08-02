@@ -15,13 +15,13 @@ tests/integration/test_waitlist_invite.py.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, get_supabase, verify_api_key
 from app.main import app
 
 
@@ -31,7 +31,10 @@ def sb() -> Any:
     # waitlist select → no rows by default (direct invite).
     fake.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
     app.dependency_overrides[verify_api_key] = lambda: None
+    # invite_from_waitlist stays sync (auth-admin holdout) → get_supabase;
+    # list_waitlist is async (#57 slice 4) → get_async_service_supabase.
     app.dependency_overrides[get_supabase] = lambda: fake
+    app.dependency_overrides[get_async_service_supabase] = lambda: fake
     yield fake
     app.dependency_overrides.clear()
 
@@ -108,10 +111,18 @@ def test_invalid_email_is_422_with_no_side_effects(sb: MagicMock) -> None:
 
 def test_pending_filter_queries_null_invited_at(sb: MagicMock) -> None:
     chain = sb.table.return_value.select.return_value.order.return_value
-    chain.is_.return_value.execute.return_value.data = [
-        {"email": "p@example.com", "created_at": "2026-07-01T00:00:00+00:00", "invited_at": None}
-    ]
-    chain.execute.return_value.data = []
+    chain.is_.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[
+                {
+                    "email": "p@example.com",
+                    "created_at": "2026-07-01T00:00:00+00:00",
+                    "invited_at": None,
+                }
+            ]
+        )
+    )
+    chain.execute = AsyncMock(return_value=MagicMock(data=[]))
 
     r = TestClient(app).get("/admin/waitlist", params={"pending": "true"})
 

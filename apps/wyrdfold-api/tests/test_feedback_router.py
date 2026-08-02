@@ -1,25 +1,41 @@
 """Router wiring tests for feedback reads (#79 Phase 2 — job_feedback slice).
 
 The headline assertion: GET /targets/{id}/feedback now reads through the
-JWT-bound user client (``get_user_supabase``), not the service-role client,
-so Postgres RLS is the backstop. The cross-tenant RLS proof itself lives in
-``tests/integration/test_rls_feedback.py`` (needs a live stack).
+JWT-bound user client (``get_async_user_supabase``), not the service-role
+client, so Postgres RLS is the backstop. The cross-tenant RLS proof itself
+lives in ``tests/integration/test_rls_feedback.py`` (needs a live stack).
+
+Since #57 slice 4 the handlers are ``async def`` on the pooled async clients:
+the user-path reads/writes run on ``get_async_user_supabase``; the shared-catalog
+learner + staged-patch writes stay sync (service-role, #191 RPC) and are driven
+off the loop via ``asyncio.to_thread`` / ``BackgroundTasks`` on the sync client
+resolved by the ``_service_client`` seam.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_current_user_id, get_supabase, get_user_supabase
+from app.dependencies import (
+    get_async_service_supabase,
+    get_async_user_supabase,
+    get_current_user_id,
+)
 from app.main import app
 from app.models.feedback import FeedbackRow
 
 _TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
 _TARGET_ID = "11111111-1111-1111-1111-111111111111"
+
+
+async def _atrue(*_a: object, **_k: object) -> bool:
+    """Async stand-in for the now-``async`` ownership prechecks."""
+    return True
 
 
 @pytest.fixture
@@ -35,16 +51,16 @@ def test_list_feedback_reads_via_user_client(
     service_sb = MagicMock(name="service_client")
     captured: dict[str, object] = {}
 
-    def fake_list_for_target(supabase, *, user_id, target_id, limit, offset):
+    async def fake_list_for_target(supabase, *, user_id, target_id, limit, offset):
         captured["client"] = supabase
         return ([], 0)
 
     # Pass the ownership gate without touching the DB, and capture which
     # client the read path receives.
-    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
     monkeypatch.setattr("app.routers.feedback.list_for_target", fake_list_for_target)
-    app.dependency_overrides[get_supabase] = lambda: service_sb
-    app.dependency_overrides[get_user_supabase] = lambda: user_sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: service_sb
+    app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     r = TestClient(app).get(f"/targets/{_TARGET_ID}/feedback")
@@ -80,20 +96,22 @@ def test_create_feedback_upsert_via_user_client_learner_via_service(
     service_sb = MagicMock(name="service_client")
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr("app.routers.feedback._job_exists", lambda *a, **k: True)
-    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback._job_exists", _atrue)
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
 
-    def fake_upsert(supabase, **kwargs):
+    async def fake_upsert(supabase, **kwargs):
         captured["upsert_client"] = supabase
         return _make_row()
 
+    # The learner is a sync BackgroundTask (threadpooled) handed the sync client
+    # the ``_service_client`` seam resolves — patch the seam to capture it.
     def fake_safe_run(supabase, user_id, target_id):
         captured["learner_client"] = supabase
 
     monkeypatch.setattr("app.routers.feedback.upsert_feedback", fake_upsert)
     monkeypatch.setattr("app.routers.feedback._safe_run_learner", fake_safe_run)
-    app.dependency_overrides[get_supabase] = lambda: service_sb
-    app.dependency_overrides[get_user_supabase] = lambda: user_sb
+    monkeypatch.setattr("app.routers.feedback._service_client", lambda: service_sb)
+    app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     r = TestClient(app).post(
@@ -114,13 +132,13 @@ def test_remove_feedback_deletes_via_user_client(
     service_sb = MagicMock(name="service_client")
     captured: dict[str, object] = {}
 
-    def fake_delete(supabase, **kwargs):
+    async def fake_delete(supabase, **kwargs):
         captured["client"] = supabase
         return True
 
     monkeypatch.setattr("app.routers.feedback.delete_feedback", fake_delete)
-    app.dependency_overrides[get_supabase] = lambda: service_sb
-    app.dependency_overrides[get_user_supabase] = lambda: user_sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: service_sb
+    app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     r = TestClient(app).delete(f"/jobs/job-1/feedback?target_id={_TARGET_ID}")
@@ -134,15 +152,15 @@ def test_learning_log_reads_via_user_client(
     overrides: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     user_sb = MagicMock(name="user_client")
-    service_sb = MagicMock(name="service_client")
-    # The endpoint queries supabase.table(...) directly; make the chain return
-    # no rows so the response validates, and assert which client was used.
-    (
-        user_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value.data
-    ) = []
-    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
-    app.dependency_overrides[get_supabase] = lambda: service_sb
-    app.dependency_overrides[get_user_supabase] = lambda: user_sb
+    # The endpoint reads via ``_learning_log_rows`` on the user client; make the
+    # async chain return no rows so the response validates, and assert which
+    # client was used.
+    chain = (
+        user_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
+    )
+    chain.execute = AsyncMock(return_value=SimpleNamespace(data=[]))
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
+    app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     r = TestClient(app).get(f"/targets/{_TARGET_ID}/learning-log")
@@ -150,7 +168,6 @@ def test_learning_log_reads_via_user_client(
     assert r.status_code == 200
     assert r.json() == []
     user_sb.table.assert_called_once_with("target_learning_log")
-    service_sb.table.assert_not_called()
 
 
 # ---- #191 hardening wiring: rate limits + staged-apply conflict ------------
@@ -163,13 +180,16 @@ def test_staged_apply_conflict_maps_to_409(
     and not a silent 404."""
     from app.services.llm_learner import StagedPatchConflictError
 
-    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
 
     def _raise(*_a: object, **_k: object) -> None:
         raise StagedPatchConflictError("profile moved")
 
+    # ``apply_staged_patch`` runs (sync) inside ``asyncio.to_thread`` on the
+    # ``_service_client`` seam — patch both so no real pool is hit.
     monkeypatch.setattr("app.routers.feedback.apply_staged_patch", _raise)
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    monkeypatch.setattr("app.routers.feedback._service_client", lambda: MagicMock())
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     r = TestClient(app).post(f"/targets/{_TARGET_ID}/learn/run-1/apply")
@@ -186,9 +206,11 @@ def test_learner_trigger_rate_limited_at_10_per_minute(
     (conftest RATE_LIMIT_ENABLED=false); flip it on for this case."""
     from app.rate_limit import limiter
 
-    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", lambda *a, **k: True)
+    monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
+    # Sync learner driven via ``asyncio.to_thread`` on the ``_service_client`` seam.
     monkeypatch.setattr("app.routers.feedback.maybe_run_learner", lambda *a, **k: None)
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    monkeypatch.setattr("app.routers.feedback._service_client", lambda: MagicMock())
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
     client = TestClient(app)

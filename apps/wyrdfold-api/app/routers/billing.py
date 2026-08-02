@@ -144,7 +144,10 @@ class BillingAccountResponse(BaseModel):
     byok: bool
 
 
-# Sync `def`: blocking supabase reads in the threadpool (#107).
+# Sync `def` (residual, #57 slice 4): reads go through ``budget.get_llm_account``
+# and ``keys_store.has_usable_key``, which stay synchronous for their other
+# callers — the sync budget resolver + LLM-client factory, both out of scope.
+# FastAPI threadpools this handler, keeping the blocking reads off the loop (#107).
 @router.get(
     "/account",
     response_model=BillingAccountResponse,
@@ -166,8 +169,9 @@ def get_billing_account(
     )
 
 
-# Sync `def`: the Stripe SDK and supabase-py are blocking; FastAPI's
-# threadpool keeps them off the event loop (#107).
+# Sync `def` (documented holdout, #57 slice 4): ``_ensure_customer`` calls
+# ``auth.admin.get_user_by_id`` (async auth-admin coverage is uncertain), plus
+# the blocking Stripe SDK. FastAPI's threadpool keeps them off the loop (#107).
 @router.post(
     "/checkout-session",
     response_model=BillingUrlResponse,
@@ -202,7 +206,8 @@ def create_checkout_session(
     return BillingUrlResponse(url=session.url)
 
 
-# Sync `def`: blocking SDK + supabase work in the threadpool (#107).
+# Sync `def` (residual, #57 slice 4): dominated by the blocking Stripe SDK
+# (no real await), so #107 keeps it a plain threadpooled handler.
 @router.post(
     "/portal-session",
     response_model=BillingUrlResponse,

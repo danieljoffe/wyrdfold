@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.services.ingest import storage as resume_storage
 from app.services.tailor import persistence as tailored_storage
@@ -107,7 +107,7 @@ _SCORE_PII_COLUMNS: tuple[str, ...] = (
 )
 
 
-def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
+async def delete_account(supabase: AsyncClient, *, user_id: str) -> dict[str, int]:
     """Erase all data for ``user_id`` and delete the auth user.
 
     Returns a per-resource count map for the audit log / API response.
@@ -130,15 +130,15 @@ def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
 
     # Capture the user's target links BEFORE step 2 deletes ``user_targets``,
     # so step 3 can scrub their derived PII from the shared scores rows.
-    target_ids = _user_target_ids(supabase, user_id)
+    target_ids = await _user_target_ids(supabase, user_id)
 
     # 1. Storage — both buckets namespace objects under <user_id>/.
-    report["resume_uploads_objects"] = resume_storage.purge_user_objects(supabase, user_id)
-    report["tailored_resume_objects"] = tailored_storage.purge_user_objects(supabase, user_id)
+    report["resume_uploads_objects"] = await resume_storage.purge_user_objects(supabase, user_id)
+    report["tailored_resume_objects"] = await tailored_storage.purge_user_objects(supabase, user_id)
 
     # 2. Per-user DB rows (incl. the user's anonymous ref-JD votes).
     for table in _USER_ID_TABLES:
-        report[table] = _delete_by(supabase, table, "user_id", user_id)
+        report[table] = await _delete_by(supabase, table, "user_id", user_id)
 
     # 2b. Anonymize the user's shared reference-JD contributions: keep the JD
     #     content in the collective catalog, null only the personal link (merge
@@ -146,64 +146,72 @@ def delete_account(supabase: Client, *, user_id: str) -> dict[str, int]:
     #     the votes above can leave a contribution's ``suppressed`` flag
     #     momentarily stale, but it stays consistent with the already-merged
     #     profile and self-heals on the next vote (which re-tallies + re-merges).
-    report["reference_jds_anonymized"] = _anonymize_user_id(supabase, "reference_jds", user_id)
+    report["reference_jds_anonymized"] = await _anonymize_user_id(
+        supabase, "reference_jds", user_id
+    )
 
     # 3. Scrub this user's PII off the shared scores rows for their targets.
-    report["scores_scrubbed"] = _scrub_shared_scores(supabase, target_ids)
+    report["scores_scrubbed"] = await _scrub_shared_scores(supabase, target_ids)
 
     # 4. notifications_sent is keyed by user_profiles.id, not the auth uid.
-    profile_id = _resolve_profile_id(supabase, user_id)
+    profile_id = await _resolve_profile_id(supabase, user_id)
     if profile_id is not None:
-        report["notifications_sent"] = _delete_by(
+        report["notifications_sent"] = await _delete_by(
             supabase, "notifications_sent", "user_profile_id", profile_id
         )
 
     # 5. The profile row itself (also ON DELETE CASCADEs notifications_sent,
     #    a no-op now that step 4 already cleared them).
-    report["user_profiles"] = _delete_by(supabase, "user_profiles", "user_id", user_id)
+    report["user_profiles"] = await _delete_by(supabase, "user_profiles", "user_id", user_id)
 
     # 6. Finally the auth account.
-    supabase.auth.admin.delete_user(user_id)
+    await supabase.auth.admin.delete_user(user_id)
     report["auth_user"] = 1
 
     logger.info("account_deleted user=%s report=%s", user_id, report)
     return report
 
 
-def _delete_by(supabase: Client, table: str, column: str, value: Any) -> int:
+async def _delete_by(supabase: AsyncClient, table: str, column: str, value: Any) -> int:
     """Delete rows where ``column == value``; return the count removed.
 
     Supabase returns the deleted rows by default (``return=representation``),
     so ``len(data)`` is the deleted count — same idiom as
     ``services.keys.store.delete_key``.
     """
-    resp = supabase.table(table).delete().eq(column, value).execute()
+    resp = await supabase.table(table).delete().eq(column, value).execute()
     return len(resp.data or [])
 
 
-def _anonymize_user_id(supabase: Client, table: str, user_id: str) -> int:
+async def _anonymize_user_id(supabase: AsyncClient, table: str, user_id: str) -> int:
     """NULL the ``user_id`` on a shared table's rows for the user — the row
     (shared content) survives, only the personal link is removed. Returns the
     count anonymized. Idempotent: a second run matches nothing (already NULL).
     """
-    resp = supabase.table(table).update({"user_id": None}).eq("user_id", user_id).execute()
+    resp = await supabase.table(table).update({"user_id": None}).eq("user_id", user_id).execute()
     return len(resp.data or [])
 
 
-def _resolve_profile_id(supabase: Client, user_id: str) -> str | None:
-    resp = supabase.table("user_profiles").select("id").eq("user_id", user_id).limit(1).execute()
+async def _resolve_profile_id(supabase: AsyncClient, user_id: str) -> str | None:
+    resp = (
+        await supabase.table("user_profiles")
+        .select("id")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return str(rows[0]["id"]) if rows else None
 
 
-def _user_target_ids(supabase: Client, user_id: str) -> list[str]:
+async def _user_target_ids(supabase: AsyncClient, user_id: str) -> list[str]:
     """The shared-target ids this user is linked to via ``user_targets``."""
-    resp = supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [tid for r in rows if (tid := r.get("target_id"))]
 
 
-def _scrub_shared_scores(supabase: Client, target_ids: list[str]) -> int:
+async def _scrub_shared_scores(supabase: AsyncClient, target_ids: list[str]) -> int:
     """Null the Phase-2 personal fields on shared ``scores`` rows for the
     user's targets and re-open them for grading; return rows updated.
 
@@ -217,5 +225,10 @@ def _scrub_shared_scores(supabase: Client, target_ids: list[str]) -> int:
         return 0
     update_payload: dict[str, Any] = dict.fromkeys(_SCORE_PII_COLUMNS, None)
     update_payload["scoring_status"] = "stage2"
-    resp = supabase.table("scores").update(update_payload).in_("target_id", target_ids).execute()
+    resp = (
+        await supabase.table("scores")
+        .update(update_payload)
+        .in_("target_id", target_ids)
+        .execute()
+    )
     return len(resp.data or [])

@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.analysis import Scorecard
 from app.models.insights import (
@@ -35,7 +35,7 @@ from app.models.insights import (
     WeeklyCount,
 )
 from app.services.analysis.scoring import scorecard_to_numeric
-from app.services.supabase_retry import execute_with_retry_sync
+from app.services.supabase_retry import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,8 @@ logger = logging.getLogger(__name__)
 Row = dict[str, Any]
 
 
-def _cost_by_purpose(
-    supabase: Client, user_id: str | None, since: datetime | None
+async def _cost_by_purpose(
+    supabase: AsyncClient, user_id: str | None, since: datetime | None
 ) -> tuple[dict[str, float], dict[str, int]]:
     """Per-purpose ``(total_cost, call_count)`` for the user's ``llm_costs``.
 
@@ -58,7 +58,7 @@ def _cost_by_purpose(
     """
     if user_id is not None:
         try:
-            resp = supabase.rpc(
+            resp = await supabase.rpc(
                 "cost_by_purpose_since",
                 {
                     "p_user_id": user_id,
@@ -78,7 +78,7 @@ def _cost_by_purpose(
         cq = cq.gte("created_at", since.isoformat())
     if user_id is not None:
         cq = cq.eq("user_id", user_id)
-    rows = _rows(cq, label="insights/skills_cost_llm_costs")
+    rows = await _rows(cq, label="insights/skills_cost_llm_costs")
 
     totals_acc: defaultdict[str, float] = defaultdict(float)
     counts_acc: Counter[str] = Counter()
@@ -89,7 +89,7 @@ def _cost_by_purpose(
     return dict(totals_acc), dict(counts_acc)
 
 
-def _rows(query: Any, label: str) -> list[Row]:
+async def _rows(query: Any, label: str) -> list[Row]:
     """Run a built supabase query through the transient-retry wrapper and
     return rows as ``list[Row]``.
 
@@ -101,7 +101,7 @@ def _rows(query: Any, label: str) -> list[Row]:
     crashes the chart on the dashboard. Wrap each query so a transient
     failure is absorbed by one retry instead of bubbling.
     """
-    resp = execute_with_retry_sync(lambda: query.execute(), label=label)
+    resp = await execute_with_retry(query.execute, label=label)
     return cast(list[Row], resp.data or [])
 
 
@@ -115,7 +115,7 @@ def _rows(query: Any, label: str) -> list[Row]:
 _IN_CHUNK = 200
 
 
-def _fetch_in_chunks(
+async def _fetch_in_chunks(
     make_query: Any,
     ids: list[str],
     label: str,
@@ -137,7 +137,7 @@ def _fetch_in_chunks(
     out: list[Row] = []
     for i in range(0, len(ids), chunk):
         batch = ids[i : i + chunk]
-        out.extend(_rows(make_query(batch), label=label))
+        out.extend(await _rows(make_query(batch), label=label))
     return out
 
 
@@ -184,8 +184,8 @@ def _parse_dt(value: str) -> datetime:
 _SCORES_PAGE_SIZE = 1000
 
 
-def _posting_target_map(
-    supabase: Client, target_ids: set[str] | None
+async def _posting_target_map(
+    supabase: AsyncClient, target_ids: set[str] | None
 ) -> dict[str, set[str]] | None:
     """Return ``{job_posting_id → {target_id, ...}}`` for the user's targets.
 
@@ -226,7 +226,7 @@ def _posting_target_map(
         )
         if after is not None:
             query = query.gt("id", after)
-        page = _rows(query, label="insights/posting_target_map")
+        page = await _rows(query, label="insights/posting_target_map")
         if not page:
             break
         for r in page:
@@ -252,8 +252,8 @@ def _flatten_posting_ids(
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 
-def _user_status_map(
-    supabase: Client,
+async def _user_status_map(
+    supabase: AsyncClient,
     user_id: str | None,
     posting_ids: list[str],
 ) -> dict[str, str]:
@@ -267,7 +267,7 @@ def _user_status_map(
     out: dict[str, str] = {}
     for i in range(0, len(posting_ids), 200):
         chunk = posting_ids[i : i + 200]
-        rows = _rows(
+        rows = await _rows(
             supabase.table("user_jobs")
             .select("job_posting_id, status")
             .eq("user_id", user_id)
@@ -279,8 +279,8 @@ def _user_status_map(
     return out
 
 
-def _pipeline_status_counts_python(
-    supabase: Client,
+async def _pipeline_status_counts_python(
+    supabase: AsyncClient,
     since: datetime | None,
     until: datetime | None,
     target_ids: set[str] | None,
@@ -293,7 +293,7 @@ def _pipeline_status_counts_python(
     Counter did: postings under the caller's targets (``excluded = false``)
     within the window, deduplicated by posting id, grouped by the caller's
     per-user status (``user_jobs`` row; absent → ``'new'``)."""
-    posting_ids = _flatten_posting_ids(_posting_target_map(supabase, target_ids))
+    posting_ids = _flatten_posting_ids(await _posting_target_map(supabase, target_ids))
     if posting_ids is not None and not posting_ids:
         return Counter()
 
@@ -308,22 +308,22 @@ def _pipeline_status_counts_python(
     if posting_ids is not None:
         # Chunk the id filter so the PostgREST URL stays under safe limits
         # at multi-thousand-posting scale (#93).
-        rows = _fetch_in_chunks(
+        rows = await _fetch_in_chunks(
             lambda batch: _base().in_("id", batch),
             list(posting_ids),
             label="insights/pipeline_status_counts_fallback",
         )
     else:
-        rows = _rows(_base(), label="insights/pipeline_status_counts_fallback")
-    status_map = _user_status_map(supabase, user_id, [str(r["id"]) for r in rows])
+        rows = await _rows(_base(), label="insights/pipeline_status_counts_fallback")
+    status_map = await _user_status_map(supabase, user_id, [str(r["id"]) for r in rows])
     counts: Counter[str] = Counter()
     for r in rows:
         counts[status_map.get(str(r["id"]), "new")] += 1
     return counts
 
 
-def _pipeline_status_counts(
-    supabase: Client,
+async def _pipeline_status_counts(
+    supabase: AsyncClient,
     since: datetime | None,
     until: datetime | None,
     target_ids: set[str] | None,
@@ -340,12 +340,12 @@ def _pipeline_status_counts(
     client-side count if the RPC isn't deployed yet (mirrors
     ``_pipeline_counts_grouped`` in routers/jobs.py)."""
     if target_ids is None:
-        return _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
+        return await _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
     if not target_ids:
         return Counter()
     try:
-        resp = execute_with_retry_sync(
-            lambda: supabase.rpc(
+        resp = await execute_with_retry(
+            supabase.rpc(
                 "insights_pipeline_status_counts",
                 {
                     "p_target_ids": sorted(target_ids),
@@ -353,18 +353,18 @@ def _pipeline_status_counts(
                     "p_until": until.isoformat() if until else None,
                     "p_user_id": user_id,
                 },
-            ).execute(),
+            ).execute,
             label="insights/pipeline_status_counts",
         )
     except Exception:
-        return _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
+        return await _pipeline_status_counts_python(supabase, since, until, target_ids, user_id)
     return Counter(
         {cast(str, row["status"]): int(row["count"]) for row in cast(list[Row], resp.data or [])}
     )
 
 
-def _fetch_status_logs_window(
-    supabase: Client,
+async def _fetch_status_logs_window(
+    supabase: AsyncClient,
     since: datetime | None,
     until: datetime | None,
     posting_ids: set[str] | None,
@@ -391,12 +391,12 @@ def _fetch_status_logs_window(
     if posting_ids is not None:
         # Chunk the id filter so the PostgREST URL stays under safe limits
         # at multi-thousand-posting scale (#93).
-        return _fetch_in_chunks(
+        return await _fetch_in_chunks(
             lambda batch: _base().in_("posting_id", batch),
             list(posting_ids),
             label="insights/status_logs_window",
         )
-    return _rows(_base(), label="insights/status_logs_window")
+    return await _rows(_base(), label="insights/status_logs_window")
 
 
 def _kpis_from(status_counts: Counter[str], status_logs: list[Row]) -> PipelinePeriodKpis:
@@ -438,8 +438,8 @@ def _kpis_from(status_counts: Counter[str], status_logs: list[Row]) -> PipelineP
     )
 
 
-def compute_pipeline(
-    supabase: Client,
+async def compute_pipeline(
+    supabase: AsyncClient,
     since: datetime | None,
     prior_window: tuple[datetime, datetime] | None = None,
     target_ids: set[str] | None = None,
@@ -467,8 +467,8 @@ def compute_pipeline(
     # it. The old `_fetch_window_posting_ids` pulled ~tens of thousands of score
     # rows to the API to bound two tiny queries (status_log is ~a handful of rows
     # per user; documents likewise), which dominated /insights at scale.
-    status_logs = _fetch_status_logs_window(supabase, since, None, None, user_id)
-    status_counts = _pipeline_status_counts(supabase, since, None, target_ids, user_id)
+    status_logs = await _fetch_status_logs_window(supabase, since, None, None, user_id)
+    status_counts = await _pipeline_status_counts(supabase, since, None, target_ids, user_id)
 
     # Tailored-resume velocity — scope by ``documents.user_id`` (the user's own
     # resumes are exactly the set the weekly velocity counts). Was a fan-out over
@@ -481,9 +481,11 @@ def compute_pipeline(
 
     resumes: list[Row]
     if user_id is not None:
-        resumes = _rows(_resume_base().eq("user_id", user_id), label="insights/pipeline_resumes")
+        resumes = await _rows(
+            _resume_base().eq("user_id", user_id), label="insights/pipeline_resumes"
+        )
     else:
-        resumes = _rows(_resume_base(), label="insights/pipeline_resumes")
+        resumes = await _rows(_resume_base(), label="insights/pipeline_resumes")
 
     # --- Funnel counts (from the GROUP BY RPC, #101) ---
     funnel = [FunnelStage(stage=s, count=status_counts.get(s, 0)) for s in FUNNEL_ORDER]
@@ -495,8 +497,10 @@ def compute_pipeline(
     previous: PipelinePeriodKpis | None = None
     if prior_window is not None:
         prior_since, prior_until = prior_window
-        prior_logs = _fetch_status_logs_window(supabase, prior_since, prior_until, None, user_id)
-        prior_counts = _pipeline_status_counts(
+        prior_logs = await _fetch_status_logs_window(
+            supabase, prior_since, prior_until, None, user_id
+        )
+        prior_counts = await _pipeline_status_counts(
             supabase, prior_since, prior_until, target_ids, user_id
         )
         previous = _kpis_from(prior_counts, prior_logs)
@@ -563,8 +567,8 @@ class _TargetGroupBy:
         self.unscored = unscored
 
 
-def _targets_groupby_python(
-    supabase: Client,
+async def _targets_groupby_python(
+    supabase: AsyncClient,
     since: datetime | None,
     target_ids: set[str],
     target_labels: dict[str, str],
@@ -593,14 +597,14 @@ def _targets_groupby_python(
     if posting_ids:
         # Chunk the id filter so the PostgREST URL stays under safe limits
         # at multi-thousand-posting scale (#93).
-        postings = _fetch_in_chunks(
+        postings = await _fetch_in_chunks(
             lambda batch: _postings_base().in_("id", batch),
             list(posting_ids),
             label="insights/targets_postings",
         )
     else:
         postings = []
-    status_map = _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
+    status_map = await _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
     for p in postings:
         p["status"] = status_map.get(str(p["id"]), "new")
 
@@ -618,7 +622,7 @@ def _targets_groupby_python(
 
         # Chunk the job_posting_id filter so the PostgREST URL stays under
         # safe limits at multi-thousand-posting scale (#93).
-        score_rows = _fetch_in_chunks(
+        score_rows = await _fetch_in_chunks(
             lambda batch: _scores_base().in_("job_posting_id", batch),
             list(posting_ids),
             label="insights/targets_scores",
@@ -683,8 +687,8 @@ def _targets_groupby_python(
     return _TargetGroupBy(per_target, dict(distribution), trend, unscored)
 
 
-def _targets_groupby(
-    supabase: Client,
+async def _targets_groupby(
+    supabase: AsyncClient,
     since: datetime | None,
     target_ids: set[str],
     target_labels: dict[str, str],
@@ -703,19 +707,19 @@ def _targets_groupby(
     ``_assemble_target_insights``. Falls back to the client-side aggregate
     when the RPC isn't deployed yet (mirrors ``_pipeline_status_counts``)."""
     try:
-        resp = execute_with_retry_sync(
-            lambda: supabase.rpc(
+        resp = await execute_with_retry(
+            supabase.rpc(
                 "insights_targets_groupby",
                 {
                     "p_target_ids": sorted(target_ids),
                     "p_since": since.isoformat() if since else None,
                     "p_user_id": user_id,
                 },
-            ).execute(),
+            ).execute,
             label="insights/targets_groupby",
         )
     except Exception:
-        return _targets_groupby_python(
+        return await _targets_groupby_python(
             supabase,
             since,
             target_ids,
@@ -799,8 +803,8 @@ def _assemble_target_insights(target_labels: dict[str, str], agg: _TargetGroupBy
     )
 
 
-def compute_targets(
-    supabase: Client,
+async def compute_targets(
+    supabase: AsyncClient,
     since: datetime | None,
     target_ids: set[str] | None = None,
     user_id: str | None = None,
@@ -813,14 +817,14 @@ def compute_targets(
     tq = supabase.table("targets").select("id, label")
     if target_ids is not None:
         tq = tq.in_("id", list(target_ids))
-    targets_data = _rows(tq, label="insights/targets_labels")
+    targets_data = await _rows(tq, label="insights/targets_labels")
     target_labels = {t["id"]: t["label"] for t in targets_data}
 
     # Resolve target membership via the ``scores`` table. ``jobs.target_id``
     # is vestigial — the poller never writes it, so the previous filter
     # collapsed every per-target bucket to empty. Same architectural
     # fix as ownership checks in #676 / #678.
-    membership = _posting_target_map(supabase, target_ids)
+    membership = await _posting_target_map(supabase, target_ids)
     posting_ids = _flatten_posting_ids(membership)
     if target_ids is not None and not posting_ids:
         return TargetInsights(
@@ -842,7 +846,7 @@ def compute_targets(
     if target_ids is not None:
         # membership / posting_ids are non-None here (target_ids is not None
         # and the empty case returned above).
-        agg = _targets_groupby(
+        agg = await _targets_groupby(
             supabase,
             since,
             target_ids,
@@ -865,8 +869,8 @@ def compute_targets(
             q = q.gte("cataloged_at", since.isoformat())
         return q
 
-    postings = _rows(_postings_base(), label="insights/targets_postings")
-    status_map = _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
+    postings = await _rows(_postings_base(), label="insights/targets_postings")
+    status_map = await _user_status_map(supabase, user_id, [str(p["id"]) for p in postings])
     for p in postings:
         p["status"] = status_map.get(str(p["id"]), "new")
 
@@ -958,8 +962,8 @@ def compute_targets(
 # ── Skills + Cost ────────────────────────────────────────────────────────────
 
 
-def compute_skills_cost(
-    supabase: Client,
+async def compute_skills_cost(
+    supabase: AsyncClient,
     since: datetime | None,
     user_id: str | None = None,
     target_ids: set[str] | None = None,
@@ -986,12 +990,12 @@ def compute_skills_cost(
 
     analyses: list[Row]
     if target_ids is not None:
-        analyses = _rows(
+        analyses = await _rows(
             _analyses_base().in_("target_id", list(target_ids)),
             label="insights/skills_cost_analyses",
         )
     else:
-        analyses = _rows(_analyses_base(), label="insights/skills_cost_analyses")
+        analyses = await _rows(_analyses_base(), label="insights/skills_cost_analyses")
 
     # The analysis's own scorecard weights the missing-skill priority —
     # derived in-hand from rows we already fetched. (Until R2 this read the
@@ -1013,7 +1017,7 @@ def compute_skills_cost(
 
     # Per-purpose LLM spend — aggregated server-side via the
     # cost_by_purpose_since RPC (#105), client-side fallback inside the helper.
-    purpose_totals, purpose_counts = _cost_by_purpose(supabase, user_id, since)
+    purpose_totals, purpose_counts = await _cost_by_purpose(supabase, user_id, since)
 
     # Tailored-resume costs scope directly by ``documents.user_id`` — documents
     # has no target_id, and the user's own resumes are exactly the set we want
@@ -1027,12 +1031,12 @@ def compute_skills_cost(
 
     resume_costs: list[Row]
     if user_id is not None:
-        resume_costs = _rows(
+        resume_costs = await _rows(
             _resume_base().eq("user_id", user_id),
             label="insights/skills_cost_resumes",
         )
     else:
-        resume_costs = _rows(_resume_base(), label="insights/skills_cost_resumes")
+        resume_costs = await _rows(_resume_base(), label="insights/skills_cost_resumes")
 
     # --- Skill frequencies ---
     matched_counts: Counter[str] = Counter()

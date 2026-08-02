@@ -6,7 +6,7 @@ as user turns with skipped=True so the LLM can see which prompts were declined.
 
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.models.experience import (
@@ -22,8 +22,8 @@ def _scope_user(query: Any, user_id: str | None) -> Any:
     return query.eq("user_id", resolve_owner(user_id))
 
 
-def list_turns(
-    supabase: Client,
+async def list_turns(
+    supabase: AsyncClient,
     user_id: str | None,
     conversation_type: ConversationType | None = None,
     limit: int = 200,
@@ -32,13 +32,13 @@ def list_turns(
     query = _scope_user(query, user_id)
     if conversation_type is not None:
         query = query.eq("conversation_type", conversation_type)
-    resp = query.execute()
+    resp = await query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [ConversationTurn.model_validate(r) for r in rows]
 
 
-def list_recent_turns(
-    supabase: Client,
+async def list_recent_turns(
+    supabase: AsyncClient,
     user_id: str | None,
     conversation_type: ConversationType | None = None,
     limit: int = 50,
@@ -53,13 +53,13 @@ def list_recent_turns(
     query = _scope_user(query, user_id)
     if conversation_type is not None:
         query = query.eq("conversation_type", conversation_type)
-    resp = query.execute()
+    resp = await query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [ConversationTurn.model_validate(r) for r in reversed(rows)]
 
 
-def append(
-    supabase: Client,
+async def append(
+    supabase: AsyncClient,
     user_id: str | None,
     conversation_type: ConversationType,
     role: TurnRole,
@@ -76,10 +76,10 @@ def append(
         .limit(1)
     )
     max_query = _scope_user(max_query, user_id)
-    max_resp = max_query.execute()
+    max_resp = await max_query.execute()
     max_rows = cast(list[dict[str, Any]], max_resp.data or [])
     next_index = (max_rows[0]["turn_index"] + 1) if max_rows else 1
-    resp = (
+    resp = await (
         supabase.table(TABLE)
         .insert(
             {

@@ -18,7 +18,7 @@ must guarantee:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.models.targets import TargetPreferences
 from app.routers import jobs as jobs_mod
@@ -243,12 +243,12 @@ def test_remote_detected_via_location_text_when_no_flag() -> None:
 # ---- score-cutoff fold + routing (endpoint / dispatcher) ------------------
 
 
-def test_score_cutoff_folds_into_min_score(monkeypatch: Any) -> None:
+async def test_score_cutoff_folds_into_min_score(monkeypatch: Any) -> None:
     """The per-user cutoff is pushed into the effective ``min_score`` so the
     filter happens server-side over the shared cached score (not a re-grade)."""
     captured: dict[str, Any] = {}
 
-    def _fake_two_query(supabase: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _fake_two_query(supabase: Any, **kwargs: Any) -> dict[str, Any]:
         captured.update(kwargs)
         return {"postings": [], "next_cursor": None, "total": 0}
 
@@ -256,7 +256,7 @@ def test_score_cutoff_folds_into_min_score(monkeypatch: Any) -> None:
     # Force the two-query path (employment-type filter) so we can inspect kwargs.
     prefs = TargetPreferences(pref_score_cutoff=75, pref_employment_types=["full_time"])
 
-    _list_jobs_for_target(
+    await _list_jobs_for_target(
         MagicMock(),
         target_id="target-1",
         page_size=20,
@@ -277,24 +277,24 @@ def test_score_cutoff_folds_into_min_score(monkeypatch: Any) -> None:
     assert captured["preferences"] is prefs
 
 
-def test_post_fetch_pref_filter_forces_two_query(monkeypatch: Any) -> None:
+async def test_post_fetch_pref_filter_forces_two_query(monkeypatch: Any) -> None:
     """An employment-type/seniority/location preference must bypass the RPC
     (which paginates server-side with no knowledge of the post-fetch filter)
     and use the two-query path."""
     calls = {"rpc": 0, "two_query": 0}
 
-    def _fake_rpc(supabase: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _fake_rpc(supabase: Any, **kwargs: Any) -> dict[str, Any]:
         calls["rpc"] += 1
         return {"postings": [], "next_cursor": None, "total": 0}
 
-    def _fake_two_query(supabase: Any, **kwargs: Any) -> dict[str, Any]:
+    async def _fake_two_query(supabase: Any, **kwargs: Any) -> dict[str, Any]:
         calls["two_query"] += 1
         return {"postings": [], "next_cursor": None, "total": 0}
 
     monkeypatch.setattr(jobs_mod, "_list_jobs_for_target_rpc", _fake_rpc)
     monkeypatch.setattr(jobs_mod, "_list_jobs_for_target_two_query", _fake_two_query)
 
-    _list_jobs_for_target(
+    await _list_jobs_for_target(
         MagicMock(),
         target_id="target-1",
         page_size=20,
@@ -314,7 +314,7 @@ def test_post_fetch_pref_filter_forces_two_query(monkeypatch: Any) -> None:
     assert calls == {"rpc": 0, "two_query": 1}
 
 
-def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
+async def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
     """A cutoff-only preference set (no post-fetch filter) must still allow a fast
     RPC path — the cutoff rides in ``min_score`` and needs no post-fetch work.
     Score sort routes to the cross-target RPC restricted to this one target (#2,
@@ -325,29 +325,35 @@ def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_across_user_targets_rpc",
-        lambda supabase, **kw: (
-            calls.__setitem__("cross_rpc", calls["cross_rpc"] + 1)
-            or {"postings": [], "next_cursor": None, "total": None}
+        AsyncMock(
+            side_effect=lambda supabase, **kw: (
+                calls.__setitem__("cross_rpc", calls["cross_rpc"] + 1)
+                or {"postings": [], "next_cursor": None, "total": None}
+            )
         ),
     )
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_for_target_rpc",
-        lambda supabase, **kw: (
-            calls.__setitem__("target_rpc", calls["target_rpc"] + 1)
-            or {"postings": [], "next_cursor": None, "total": 0}
+        AsyncMock(
+            side_effect=lambda supabase, **kw: (
+                calls.__setitem__("target_rpc", calls["target_rpc"] + 1)
+                or {"postings": [], "next_cursor": None, "total": 0}
+            )
         ),
     )
     monkeypatch.setattr(
         jobs_mod,
         "_list_jobs_for_target_two_query",
-        lambda supabase, **kw: (
-            calls.__setitem__("two_query", calls["two_query"] + 1)
-            or {"postings": [], "next_cursor": None, "total": 0}
+        AsyncMock(
+            side_effect=lambda supabase, **kw: (
+                calls.__setitem__("two_query", calls["two_query"] + 1)
+                or {"postings": [], "next_cursor": None, "total": 0}
+            )
         ),
     )
 
-    _list_jobs_for_target(
+    await _list_jobs_for_target(
         MagicMock(),
         target_id="target-1",
         page_size=20,
@@ -377,7 +383,7 @@ def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> None:
 # Python code path.
 
 
-def test_integration_cutoff_drops_low_scores() -> None:
+async def test_integration_cutoff_drops_low_scores() -> None:
     """The score cutoff (folded into ``min_score``) drops jobs below the bar at
     the DB layer — a real filter over the shared cached score, not a re-grade."""
     scores = [
@@ -393,7 +399,7 @@ def test_integration_cutoff_drops_low_scores() -> None:
     sb = two_query_supabase(scores, jobs)
 
     # Caller folds pref_score_cutoff=60 into min_score before calling.
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
@@ -413,7 +419,7 @@ def test_integration_cutoff_drops_low_scores() -> None:
     assert kept == {"hi"}  # mid (55) and lo (20) are below the 60 cutoff
 
 
-def test_integration_null_tags_kept_with_active_pref_filter() -> None:
+async def test_integration_null_tags_kept_with_active_pref_filter() -> None:
     """With employment_type + seniority + location preferences ALL set but the
     job tags absent (pre-firewall), every above-cutoff row is KEPT — proving
     the post-fetch filter is lenient end-to-end through the real two-query
@@ -429,7 +435,7 @@ def test_integration_null_tags_kept_with_active_pref_filter() -> None:
     }
     sb = two_query_supabase(scores, jobs)
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
@@ -456,7 +462,7 @@ def test_integration_null_tags_kept_with_active_pref_filter() -> None:
     assert result["total"] == 2
 
 
-def test_integration_employment_type_filter_drops_known_mismatch() -> None:
+async def test_integration_employment_type_filter_drops_known_mismatch() -> None:
     """Once a concrete employment_type tag is present, the post-fetch filter
     drops mismatches while keeping matches AND unknown-tag rows — through the
     real two-query pipeline (total reflects the post-filter count)."""
@@ -472,7 +478,7 @@ def test_integration_employment_type_filter_drops_known_mismatch() -> None:
     }
     sb = two_query_supabase(scores, jobs)
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},

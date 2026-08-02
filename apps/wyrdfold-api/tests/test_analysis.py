@@ -12,11 +12,12 @@ import contextlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
 
+import app.routers.analysis as analysis_router
 from app.constants import SYSTEM_USER_ID
 from app.models.analysis import (
     JobAnalysis,
@@ -158,12 +159,15 @@ def _make_supabase_mock(
     select_data: list[dict[str, Any]] | None = None,
 ) -> MagicMock:
     supabase = MagicMock()
-    # upsert chain (persist now upserts on the cache-key conflict target)
-    supabase.table.return_value.upsert.return_value.execute.return_value.data = insert_data or []
+    # upsert chain (persist now upserts on the cache-key conflict target).
+    # #57 slice 3: persist/get_cached are async → .execute must be awaitable.
+    supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=insert_data or [])
+    )
     # select chain (get_cached uses .eq * 3 → .order → .limit → .is_/.eq → .execute)
     cached_chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
-    cached_chain.is_.return_value.execute.return_value.data = select_data or []
-    cached_chain.eq.return_value.execute.return_value.data = select_data or []
+    cached_chain.is_.return_value.execute = AsyncMock(return_value=MagicMock(data=select_data or []))
+    cached_chain.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=select_data or []))
     return supabase
 
 
@@ -260,18 +264,18 @@ def test_build_user_message_omits_target_when_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_get_cached_returns_none_on_empty() -> None:
+async def test_get_cached_returns_none_on_empty() -> None:
     supabase = _make_supabase_mock(select_data=[])
-    result = persistence_mod.get_cached(
+    result = await persistence_mod.get_cached(
         supabase, "job-1", target_id="tgt-1", optimized_doc_id="opt-1", user_id=None
     )
     assert result is None
 
 
-def test_get_cached_returns_record_when_exists() -> None:
+async def test_get_cached_returns_record_when_exists() -> None:
     row = _analysis_record_row()
     supabase = _make_supabase_mock(select_data=[row])
-    result = persistence_mod.get_cached(
+    result = await persistence_mod.get_cached(
         supabase, "job-1", target_id="tgt-1", optimized_doc_id="opt-1", user_id=None
     )
     assert result is not None
@@ -279,7 +283,7 @@ def test_get_cached_returns_record_when_exists() -> None:
     assert result.recommendation.startswith("Apply")
 
 
-def test_get_cached_scopes_query_to_user_tenant() -> None:
+async def test_get_cached_scopes_query_to_user_tenant() -> None:
     """The cache read must filter by ``user_id`` so one user's analysis is
     never returned to another (and so the poller — which now stamps the
     doc's owning user — shares the same cache entry the user view reads).
@@ -289,7 +293,7 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
     Phase-0 SYSTEM partition, replacing the retired ``.is_("user_id","null")``.
     """
     supabase = _make_supabase_mock(select_data=[])
-    persistence_mod.get_cached(
+    await persistence_mod.get_cached(
         supabase, "job-1", target_id="tgt-1", optimized_doc_id="opt-1", user_id="user-A"
     )
     # The terminal filter for a real user is the user_id .eq on the
@@ -300,7 +304,7 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
     # And a no-user (api-key) caller reads the SYSTEM partition via .eq,
     # never the retired .is_("user_id","null") branch (#88 groundwork).
     supabase_null = _make_supabase_mock(select_data=[])
-    persistence_mod.get_cached(
+    await persistence_mod.get_cached(
         supabase_null,
         "job-1",
         target_id="tgt-1",
@@ -312,7 +316,7 @@ def test_get_cached_scopes_query_to_user_tenant() -> None:
     null_chain.is_.assert_not_called()
 
 
-def test_persist_upserts_and_returns_record() -> None:
+async def test_persist_upserts_and_returns_record() -> None:
     from app.models.llm import LLMResult, LLMUsage
 
     supabase = _make_supabase_mock(insert_data=[_analysis_record_row()])
@@ -323,7 +327,7 @@ def test_persist_upserts_and_returns_record() -> None:
         cost_usd=0.001,
         latency_ms=50,
     )
-    record = persistence_mod.persist(
+    record = await persistence_mod.persist(
         supabase,
         job_posting_id="job-1",
         target_id="tgt-1",
@@ -342,7 +346,7 @@ def test_persist_upserts_and_returns_record() -> None:
     assert args[0]["user_id"] == SYSTEM_USER_ID
 
 
-def test_persist_raises_on_empty_upsert() -> None:
+async def test_persist_raises_on_empty_upsert() -> None:
     from app.models.llm import LLMResult, LLMUsage
 
     supabase = _make_supabase_mock(insert_data=[])
@@ -354,7 +358,7 @@ def test_persist_raises_on_empty_upsert() -> None:
         latency_ms=50,
     )
     with pytest.raises(RuntimeError, match="Failed to upsert"):
-        persistence_mod.persist(
+        await persistence_mod.persist(
             supabase,
             job_posting_id="job-1",
             target_id="tgt-1",
@@ -409,26 +413,29 @@ async def test_router_cache_hit_skips_llm(
     """When a cached analysis exists, the LLM should not be called."""
 
     cached_record = JobAnalysisRecord.model_validate(_analysis_record_row())
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: cached_record)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=cached_record))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
 
     llm = MockLLMClient()
-    supabase = MagicMock()
+    # Cache-hit re-runs _apply_llm_blend (best-effort); give it an async client
+    # so the scores read + RPC await cleanly instead of the swallowed no-op.
+    supabase = _job_supabase()
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
 
     try:
         tc = TestClient(app)
@@ -466,10 +473,12 @@ def _analysis_client(
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
-    app.dependency_overrides[get_supabase_for_caller] = (
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_supabase_for_caller] = (
         (lambda: caller) if caller is not None else (lambda: supabase)
     )
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: (llm if llm is not None else MockLLMClient())
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
@@ -499,13 +508,16 @@ def _job_supabase(description_html: str = "We want a React engineer.") -> MagicM
     """A service-role mock whose jobs SELECT returns one row + whose scores
     read (for the blend) returns a keyword score."""
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-        {"id": "job-1", "description_html": description_html}
-    ]
+    # #57 slice 3: the jobs read + scores read + blend RPC are awaited on the
+    # async client → every .execute must be an AsyncMock.
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"id": "job-1", "description_html": description_html}])
+    )
     # _apply_llm_blend's keyword-score read (.select.eq.eq.limit.execute).
-    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-        {"score": 60}
-    ]
+    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"score": 60}])
+    )
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     return supabase
 
 
@@ -515,21 +527,17 @@ async def test_router_cache_miss_kicks_off_202_and_backgrounds_llm(
     """Cache miss → 202 running, LLM NOT called inside the request; the run is
     handed to a detached task that (when driven) calls the LLM once, persists,
     and cost-logs."""
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
     monkeypatch.setattr(
         persistence_mod,
         "persist",
-        lambda *_a, **kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+        AsyncMock(return_value=JobAnalysisRecord.model_validate(_analysis_record_row())),
     )
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
     supabase = _job_supabase()
@@ -547,7 +555,7 @@ async def test_router_cache_miss_kicks_off_202_and_backgrounds_llm(
         # Drive the detached task: LLM runs once, persists, cost-logs.
         await captured[0]
         assert len(llm.calls) == 1
-        cost_log_mod.record.assert_called_once()
+        cost_log_mod.record_async.assert_called_once()
     finally:
         for coro in captured:
             coro.close()
@@ -558,15 +566,11 @@ async def test_router_dedup_second_kick_does_not_respawn(
 ) -> None:
     """Two kicks for the same (job, target, optimized) key → only ONE detached
     task; the second dedups to 202 running (no double LLM spend)."""
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     supabase = _job_supabase()
     captured = _capture_spawned(monkeypatch)
@@ -593,11 +597,11 @@ async def test_run_analysis_task_persists_blends_and_clears_flag(
     from app.routers.analysis import _run_analysis_task
     from app.services.analysis import run_registry
 
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
     monkeypatch.setattr(
         persistence_mod,
         "persist",
-        lambda *_a, **kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+        AsyncMock(return_value=JobAnalysisRecord.model_validate(_analysis_record_row())),
     )
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
@@ -618,7 +622,7 @@ async def test_run_analysis_task_persists_blends_and_clears_flag(
     )
 
     assert len(llm.calls) == 1
-    cost_log_mod.record.assert_called_once()
+    cost_log_mod.record_async.assert_called_once()
     # Blend written via the SECURITY DEFINER RPC on the service-role client.
     supabase.rpc.assert_called_once()
     assert supabase.rpc.call_args[0][0] == "user_apply_score_blend"
@@ -672,13 +676,14 @@ async def test_get_poll_running_idle_error_and_record(
     """GET reflects each state: running (in flight), idle (nothing), error
     (failed run), and the persisted record once the cache is populated."""
     from app.services.analysis import run_registry
-    from app.services.experience import optimized as opt_mod
 
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
     key = ("job-1", "tgt-1", "opt-1")
 
     # idle: no cache, nothing in flight.
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
     with _analysis_client(supabase=MagicMock()) as tc:
         assert tc.get("/analysis/job-1?target_id=tgt-1").json()["status"] == "idle"
 
@@ -698,7 +703,7 @@ async def test_get_poll_running_idle_error_and_record(
     monkeypatch.setattr(
         persistence_mod,
         "get_cached",
-        lambda *_a, **_kw: JobAnalysisRecord.model_validate(_analysis_record_row()),
+        AsyncMock(return_value=JobAnalysisRecord.model_validate(_analysis_record_row())),
     )
     supabase = MagicMock()
     with _analysis_client(supabase=supabase) as tc:
@@ -729,7 +734,7 @@ async def test_end_to_end_kick_poll_persists_via_real_async_task(
     # In-memory analyses cache the task actually writes and the poll reads.
     store: dict[tuple[str, str, str, str | None], Any] = {}
 
-    def fake_get_cached(
+    async def fake_get_cached(
         _sb: Any,
         job_posting_id: str,
         *,
@@ -739,7 +744,7 @@ async def test_end_to_end_kick_poll_persists_via_real_async_task(
     ) -> Any:
         return store.get((job_posting_id, target_id, optimized_doc_id, user_id))
 
-    def fake_persist(
+    async def fake_persist(
         _sb: Any,
         *,
         job_posting_id: str,
@@ -757,24 +762,22 @@ async def test_end_to_end_kick_poll_persists_via_real_async_task(
 
     monkeypatch.setattr(persistence_mod, "get_cached", fake_get_cached)
     monkeypatch.setattr(persistence_mod, "persist", fake_persist)
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_analysis_json()})
     supabase = _job_supabase()
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
-    app.dependency_overrides[get_supabase_for_caller] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -833,23 +836,22 @@ def test_check_daily_count_counts_in_flight_runs() -> None:
 async def test_router_missing_optimized_doc_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: None)
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(analysis_router, "_optimized_latest", AsyncMock(return_value=None))
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
 
     try:
         tc = TestClient(app)
@@ -871,32 +873,30 @@ async def test_router_empty_description_returns_422(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A job with no description_html should 422, not silently call the LLM."""
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-        {"id": "job-1", "description_html": ""}
-    ]
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"id": "job-1", "description_html": ""}])
+    )
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
 
     try:
         tc = TestClient(app)
@@ -910,30 +910,30 @@ async def test_router_empty_description_returns_422(
 async def test_router_missing_job_posting_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: _job_target())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = []
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
 
     try:
         tc = TestClient(app)
@@ -948,27 +948,25 @@ async def test_router_missing_target_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Unknown target_id returns 404, not a silent LLM call."""
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: None)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
-
-    from app.services.targets import crud as targets_crud_mod
-
-    monkeypatch.setattr(targets_crud_mod, "get", lambda *_a, **_kw: None)
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
+    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=None))
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_supabase_for_caller] = app.dependency_overrides[get_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
 
     try:
         tc = TestClient(app)
@@ -987,28 +985,30 @@ async def test_router_blend_writes_score_via_service_rpc(
     service_role-only (ownership gated upstream in create_analysis), never on
     the user/caller client, and not a direct scores UPDATE."""
     cached_record = JobAnalysisRecord.model_validate(_analysis_record_row())
-    monkeypatch.setattr(persistence_mod, "get_cached", lambda *_a, **_kw: cached_record)
-
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: _optimized_doc())
+    monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=cached_record))
+    monkeypatch.setattr(
+        analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
+    )
 
     supabase = MagicMock(name="service_role")
     # The keyword-score read in _apply_llm_blend (.select.eq.eq.limit.execute).
-    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
-        {"score": 60}
-    ]
+    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"score": 60}])
+    )
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     caller = MagicMock(name="caller")
 
     from fastapi.testclient import TestClient
 
     from app.main import app
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
-    app.dependency_overrides[get_supabase_for_caller] = lambda: caller
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: caller
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    # enforce_llm_budget (route dep) still resolves the SYNC service client.
+    app.dependency_overrides[get_supabase] = lambda: MagicMock()
 
     try:
         resp = TestClient(app).post("/analysis/job-1?target_id=tgt-1")
@@ -1028,9 +1028,10 @@ async def test_router_blend_writes_score_via_service_rpc(
 
 # Need these imports for dependency overrides
 from app.dependencies import (
+    get_async_service_supabase,
+    get_async_supabase_for_caller,
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
-    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )

@@ -18,12 +18,12 @@ Pins the contract:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.dependencies import (
-    get_supabase,
+    get_async_service_supabase,
     require_bff_secret,
     verify_api_key_or_jwt,
 )
@@ -105,16 +105,12 @@ def test_empty_location_becomes_null_not_empty_string(
 def _search_supabase_stub() -> MagicMock:
     """Supabase stub for the search service: empty pages everywhere."""
     qb = MagicMock()
-    qb.select.return_value = qb
-    qb.eq.return_value = qb
-    qb.in_.return_value = qb
-    qb.ilike.return_value = qb
-    qb.gte.return_value = qb
-    qb.or_.return_value = qb
-    qb.order.return_value = qb
-    qb.range.return_value = qb
-    qb.limit.return_value = qb
-    qb.execute.return_value.data = []
+    for meth in ("select", "eq", "in_", "ilike", "gte", "is_", "or_", "order", "range", "limit"):
+        getattr(qb, meth).return_value = qb
+    qb.not_ = qb  # ``.not_`` is a property, not a call → same builder
+    result = MagicMock()
+    result.data = []
+    qb.execute = AsyncMock(return_value=result)
     sb = MagicMock()
     sb.table.return_value = qb
     return sb
@@ -130,7 +126,7 @@ def test_authed_search_emits_search_event_even_on_cache_hit(
     captured_rows: list[dict[str, Any]],
 ) -> None:
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
-    app.dependency_overrides[get_supabase] = _search_supabase_stub
+    app.dependency_overrides[get_async_service_supabase] = _search_supabase_stub
 
     client = _client()
     r1 = client.get("/search", params={"q": "cache-hit-probe-authed"})
@@ -147,7 +143,7 @@ def test_public_search_emits_search_event_with_public_surface(
     captured_rows: list[dict[str, Any]],
 ) -> None:
     app.dependency_overrides[require_bff_secret] = lambda: None
-    app.dependency_overrides[get_supabase] = _search_supabase_stub
+    app.dependency_overrides[get_async_service_supabase] = _search_supabase_stub
 
     r = _client().get("/public/search", params={"q": "public-emit-probe"})
     assert r.status_code == 200
@@ -166,7 +162,7 @@ def test_enqueue_failure_never_fails_the_search(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(search_events.buffer, "enqueue", _boom)
     app.dependency_overrides[require_bff_secret] = lambda: None
-    app.dependency_overrides[get_supabase] = _search_supabase_stub
+    app.dependency_overrides[get_async_service_supabase] = _search_supabase_stub
 
     r = _client().get("/public/search", params={"q": "resilience-probe"})
     assert r.status_code == 200

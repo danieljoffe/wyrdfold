@@ -1,10 +1,11 @@
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
     get_supabase,
     get_user_supabase,
@@ -63,45 +64,49 @@ def _build_supabase(
         t = MagicMock()
         if name == "jobs":
             sel = t.select.return_value
-            # status.py uses .single().execute() — selects just ``id``
-            sel.eq.return_value.single.return_value.execute.return_value = _Resp(posting_id_only)
-            # jobs.py delete/get use .limit(1).execute() — still selects target_id
-            sel.eq.return_value.limit.return_value.execute.return_value = _Resp(
-                [posting_with_target] if posting_with_target else None
+            # status.py (async since #57 slice 4) uses .single().execute() — id only
+            sel.eq.return_value.single.return_value.execute = AsyncMock(
+                return_value=_Resp(posting_id_only)
             )
-            t.insert.return_value.execute.return_value = _Resp(None)
-            t.update.return_value.eq.return_value.execute.return_value = _Resp(None)
+            # jobs.py delete/get use .limit(1).execute() — still selects target_id
+            sel.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([posting_with_target] if posting_with_target else None)
+            )
+            t.insert.return_value.execute = AsyncMock(return_value=_Resp(None))
+            t.update.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
             delete_chain = t.delete.return_value.eq.return_value
-            delete_chain.execute.return_value = _Resp(
-                [posting_with_target] if posting_with_target else None
+            delete_chain.execute = AsyncMock(
+                return_value=_Resp([posting_with_target] if posting_with_target else None)
             )
         elif name == "user_targets":
             # Status route: ``.select("target_id").eq("user_id", uid).execute()``
-            t.select.return_value.eq.return_value.execute.return_value = _Resp(
-                [{"target_id": _TEST_TARGET_ID}] if owns_posting else []
+            t.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=_Resp([{"target_id": _TEST_TARGET_ID}] if owns_posting else [])
             )
             # Legacy delete-path chain (kept for jobs.py compatibility).
-            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-                [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp(
+                    [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
+                )
             )
         elif name == "scores":
             # Status route: ``.eq("job_posting_id", id).in_("target_id", [...]).limit(1).execute()``
             score_rows = (
                 [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
             )
-            t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
-                score_rows
+            t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp(score_rows)
             )
         elif name == "status_log":
-            t.insert.return_value.execute.return_value = _Resp(None)
+            t.insert.return_value.execute = AsyncMock(return_value=_Resp(None))
         elif name == "user_jobs":
             # Prior per-user status read (#75 C4):
             # ``.select("status").eq(...).eq(...).limit(1).execute()``.
-            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-                [{"status": prior_status}] if posting_data is not None else []
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([{"status": prior_status}] if posting_data is not None else [])
             )
             # Dual-write target (#75 C1): upsert(...).execute().
-            t.upsert.return_value.execute.return_value = _Resp(None)
+            t.upsert.return_value.execute = AsyncMock(return_value=_Resp(None))
         return t
 
     sb.table.side_effect = _table
@@ -112,8 +117,10 @@ def _build_supabase(
 def client_factory():
     def _make(supabase: MagicMock, *, authed: bool = True) -> TestClient:
         # The routes this file exercises moved to the RLS user client across
-        # the #88 phases — override both clients with the same mock so every
-        # route resolves regardless of which dependency it declares.
+        # the #88 phases, then to the ASYNC RLS client in #57 slice 4 — override
+        # every client dep with the same mock so a route resolves regardless of
+        # which dependency it declares.
+        app.dependency_overrides[get_async_user_supabase] = lambda: supabase
         app.dependency_overrides[get_user_supabase] = lambda: supabase
         app.dependency_overrides[get_supabase] = lambda: supabase
         if authed:
@@ -164,35 +171,35 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute.return_value = (
-                    _Resp({"id": "abc"})
+                t.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
+                    return_value=_Resp({"id": "abc"})
                 )
-                t.update.return_value.eq.return_value.execute.return_value = _Resp(None)
+                t.update.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
             elif name == "user_targets":
-                t.select.return_value.eq.return_value.execute.return_value = _Resp(
-                    [{"target_id": _TEST_TARGET_ID}]
+                t.select.return_value.eq.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"target_id": _TEST_TARGET_ID}])
                 )
             elif name == "scores":
-                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
-                    [{"target_id": _TEST_TARGET_ID}]
+                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"target_id": _TEST_TARGET_ID}])
                 )
             elif name == "status_log":
 
                 def _insert(payload: Any):
                     seen["status_log"] = payload
-                    return MagicMock(execute=lambda: _Resp(None))
+                    return MagicMock(execute=AsyncMock(return_value=_Resp(None)))
 
                 t.insert.side_effect = _insert
             elif name == "user_jobs":
                 # Prior per-user status read (#75 C4).
-                t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-                    [{"status": "saved"}]
+                t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"status": "saved"}])
                 )
 
                 def _upsert(payload: Any, **kwargs: Any):
                     seen["user_jobs"] = payload
                     seen["user_jobs_kwargs"] = kwargs
-                    return MagicMock(execute=lambda: _Resp(None))
+                    return MagicMock(execute=AsyncMock(return_value=_Resp(None)))
 
                 t.upsert.side_effect = _upsert
             return t
@@ -225,16 +232,16 @@ def test_status_history_scopes_to_caller(client_factory):
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute.return_value = (
-                    _Resp({"id": "abc"})
+                t.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
+                    return_value=_Resp({"id": "abc"})
                 )
             elif name == "user_targets":
-                t.select.return_value.eq.return_value.execute.return_value = _Resp(
-                    [{"target_id": _TEST_TARGET_ID}]
+                t.select.return_value.eq.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"target_id": _TEST_TARGET_ID}])
                 )
             elif name == "scores":
-                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute.return_value = _Resp(
-                    [{"target_id": _TEST_TARGET_ID}]
+                t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"target_id": _TEST_TARGET_ID}])
                 )
             elif name == "status_log":
                 q = MagicMock()
@@ -244,16 +251,18 @@ def test_status_history_scopes_to_caller(client_factory):
                     return q
 
                 q.eq.side_effect = _eq
-                q.order.return_value.limit.return_value.execute.return_value = _Resp(
-                    [
-                        {
-                            "id": "l1",
-                            "old_status": "saved",
-                            "new_status": "applied",
-                            "note": None,
-                            "created_at": "2026-01-01T00:00:00Z",
-                        }
-                    ]
+                q.order.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp(
+                        [
+                            {
+                                "id": "l1",
+                                "old_status": "saved",
+                                "new_status": "applied",
+                                "note": None,
+                                "created_at": "2026-01-01T00:00:00Z",
+                            }
+                        ]
+                    )
                 )
                 t.select.return_value = q
             return t
@@ -303,24 +312,64 @@ def test_status_422_on_invalid_status(client_factory):
 # --- DELETE /jobs/{posting_id} ---
 
 
+def _async_delete_supabase(*, posting_exists: bool, owns: bool = True) -> MagicMock:
+    """Async RLS client mock for ``delete_job`` (async since #57 slice 4): the
+    ``_assert_user_owns_posting_async`` probe (jobs → user_targets → scores) plus
+    the ``user_jobs`` archive upsert, each awaited so its terminal ``.execute``
+    is an ``AsyncMock``."""
+    sb = MagicMock()
+
+    def _table(name: str) -> MagicMock:
+        t = MagicMock()
+        if name == "jobs":
+            t.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([{"id": "abc"}] if posting_exists else None)
+            )
+        elif name == "user_targets":
+            t.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=_Resp([{"target_id": _TEST_TARGET_ID}] if owns else [])
+            )
+        elif name == "scores":
+            t.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([{"target_id": _TEST_TARGET_ID, "score": 90, "score_breakdown": {}}] if owns else [])
+            )
+        elif name == "user_jobs":
+            t.upsert.return_value.execute = AsyncMock(return_value=_Resp(None))
+        return t
+
+    sb.table.side_effect = _table
+    return sb
+
+
+def _delete_client(sb: MagicMock) -> TestClient:
+    app.dependency_overrides[get_async_user_supabase] = lambda: sb
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
+    app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
+    return TestClient(app)
+
+
 def test_delete_unauth_returns_401():
     client = TestClient(app)
     r = client.delete("/jobs/abc")
     assert r.status_code == 401
 
 
-def test_delete_404_when_posting_missing(client_factory):
-    sb = _build_supabase(posting_data=None)
-    client = client_factory(sb)
-    r = client.delete("/jobs/abc")
-    assert r.status_code == 404
+def test_delete_404_when_posting_missing():
+    try:
+        client = _delete_client(_async_delete_supabase(posting_exists=False))
+        r = client.delete("/jobs/abc")
+        assert r.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
 
 
-def test_delete_200_on_valid_delete(client_factory):
-    sb = _build_supabase(posting_data={"id": "abc"})
-    client = client_factory(sb)
-    r = client.delete("/jobs/abc")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["success"] is True
-    assert body["deleted_id"] == "abc"
+def test_delete_200_on_valid_delete():
+    try:
+        client = _delete_client(_async_delete_supabase(posting_exists=True))
+        r = client.delete("/jobs/abc")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is True
+        assert body["deleted_id"] == "abc"
+    finally:
+        app.dependency_overrides.clear()

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_supabase
+from app.dependencies import get_async_service_supabase
 from app.main import app
 from app.rate_limit import limiter
 
@@ -28,7 +28,7 @@ class _FakeQuery:
         self._rec["kwargs"] = kwargs
         return self
 
-    def execute(self) -> MagicMock:
+    async def execute(self) -> MagicMock:
         return MagicMock(data=[])
 
 
@@ -40,7 +40,7 @@ def _supabase_with_recorder() -> tuple[MagicMock, dict[str, Any]]:
 
 
 def _client(supabase: MagicMock) -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     return TestClient(app)
 
 

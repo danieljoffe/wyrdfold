@@ -45,7 +45,7 @@ class _FakeQuery:
         self._in_filters.append((col, list(vals)))
         return self
 
-    def execute(self) -> SimpleNamespace:
+    async def execute(self) -> SimpleNamespace:
         matched = [
             r
             for r in self._rows
@@ -68,14 +68,14 @@ class _FakeBucket:
     def __init__(self, objects: dict[str, dict[str, bytes]]) -> None:
         self._objects = objects
 
-    def list(self, prefix: str, options: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    async def list(self, prefix: str, options: dict[str, Any] | None = None) -> list[dict[str, str]]:
         names = sorted(self._objects.get(prefix, {}))
         opts = options or {}
         limit = opts.get("limit", self.DEFAULT_LIMIT)
         offset = opts.get("offset", 0)
         return [{"name": n} for n in names[offset : offset + limit]]
 
-    def download(self, path: str) -> bytes:
+    async def download(self, path: str) -> bytes:
         prefix, name = path.split("/", 1)
         return self._objects.get(prefix, {}).get(name, b"")
 
@@ -127,10 +127,12 @@ def _seeded() -> _FakeSupabase:
     return _FakeSupabase(tables, buckets)
 
 
-def _export(sb: _FakeSupabase, service: _FakeSupabase | None = None) -> bytes:
+async def _export(sb: _FakeSupabase, service: _FakeSupabase | None = None) -> bytes:
     """Build the export zip; same fake on both clients unless the user/service
     split is what's under test."""
-    return build_export_zip(sb, user_id=_UID, service_supabase=sb if service is None else service)
+    return await build_export_zip(
+        sb, user_id=_UID, service_supabase=sb if service is None else service
+    )
 
 
 def _open(blob: bytes) -> zipfile.ZipFile:
@@ -149,8 +151,8 @@ def test_export_inventory_in_lockstep_with_deletion() -> None:
     )
 
 
-def test_data_json_covers_all_tables_with_rows() -> None:
-    data = _data_json(_export(_seeded()))
+async def test_data_json_covers_all_tables_with_rows() -> None:
+    data = _data_json(await _export(_seeded()))
     for table in _EXPORT_TABLES:
         assert table in data, table
     assert data["user_profiles"][0]["email"] == "j@example.com"
@@ -158,7 +160,7 @@ def test_data_json_covers_all_tables_with_rows() -> None:
     assert data["job_feedback"][0]["reason"] == "too junior"
 
 
-def test_scores_pii_exported_for_user_targets_only() -> None:
+async def test_scores_pii_exported_for_user_targets_only() -> None:
     """The shared ``scores`` catalog has no user_id; the export must include
     the Phase-2 grader PII for the user's own targets and nothing else."""
     sb = _FakeSupabase(
@@ -180,7 +182,7 @@ def test_scores_pii_exported_for_user_targets_only() -> None:
             ],
         }
     )
-    data = _data_json(_export(sb))
+    data = _data_json(await _export(sb))
     assert len(data["scores"]) == 1
     row = data["scores"][0]
     assert row["target_id"] == "t1"
@@ -188,13 +190,13 @@ def test_scores_pii_exported_for_user_targets_only() -> None:
     assert row["axis_scores"] == {"skills_fit": 90}
 
 
-def test_scores_absent_when_user_has_no_targets() -> None:
-    data = _data_json(_export(_seeded()))
+async def test_scores_absent_when_user_has_no_targets() -> None:
+    data = _data_json(await _export(_seeded()))
     assert data["scores"] == []
 
 
-def test_api_keys_exported_without_ciphertext() -> None:
-    blob = _export(_seeded())
+async def test_api_keys_exported_without_ciphertext() -> None:
+    blob = await _export(_seeded())
     key_row = _data_json(blob)["user_api_keys"][0]
     assert key_row["provider"] == "openrouter"
     assert key_row["last4"] == "ab12"
@@ -203,13 +205,13 @@ def test_api_keys_exported_without_ciphertext() -> None:
     assert _SECRET.encode() not in blob
 
 
-def test_notifications_keyed_by_resolved_profile_id() -> None:
-    data = _data_json(_export(_seeded()))
+async def test_notifications_keyed_by_resolved_profile_id() -> None:
+    data = _data_json(await _export(_seeded()))
     assert data["notifications_sent"][0]["channel"] == "email"
 
 
-def test_storage_files_bundled_from_both_buckets() -> None:
-    zf = _open(_export(_seeded()))
+async def test_storage_files_bundled_from_both_buckets() -> None:
+    zf = _open(await _export(_seeded()))
     names = set(zf.namelist())
     assert "files/resume-uploads/original.pdf" in names
     assert "files/tailored-resumes/resume-1.docx" in names
@@ -217,14 +219,14 @@ def test_storage_files_bundled_from_both_buckets() -> None:
     assert "README.txt" in names
 
 
-def test_no_profile_skips_notifications_without_crashing() -> None:
+async def test_no_profile_skips_notifications_without_crashing() -> None:
     sb = _FakeSupabase({"experience_prose_docs": [{"user_id": _UID, "prose": "x"}]})
-    data = _data_json(_export(sb))
+    data = _data_json(await _export(sb))
     assert "notifications_sent" not in data
     assert data["user_profiles"] == []
 
 
-def test_storage_export_pages_past_one_page() -> None:
+async def test_storage_export_pages_past_one_page() -> None:
     """A user with >1 page of files must get ALL of them bundled.
 
     Regression: ``bucket.list`` caps a page at 100 objects, so a single
@@ -236,7 +238,7 @@ def test_storage_export_pages_past_one_page() -> None:
         {"user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}]},
         {"resume-uploads": {_UID: many}, "tailored-resumes": {}},
     )
-    zf = _open(_export(sb))
+    zf = _open(await _export(sb))
     bundled = [n for n in zf.namelist() if n.startswith("files/resume-uploads/")]
     assert len(bundled) == 150
     # Every distinct object made it (no overwrite/dupe from offset reuse).
@@ -244,21 +246,21 @@ def test_storage_export_pages_past_one_page() -> None:
     assert zf.read("files/resume-uploads/resume-149.pdf") == b"BYTES-149"
 
 
-def test_readme_file_count_matches_bundled_files() -> None:
+async def test_readme_file_count_matches_bundled_files() -> None:
     """The README manifest must not under-report when paging kicks in."""
     many = {f"r-{i:03d}.pdf": f"B{i}".encode() for i in range(150)}
     sb = _FakeSupabase(
         {"user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}]},
         {"resume-uploads": {_UID: many}, "tailored-resumes": {}},
     )
-    zf = _open(_export(sb))
+    zf = _open(await _export(sb))
     bundled = len([n for n in zf.namelist() if n.startswith("files/")])
     readme = zf.read("README.txt").decode()
     files_line = next(ln for ln in readme.splitlines() if ln.startswith("Files:"))
     assert int(files_line.split(":", 1)[1].strip()) == bundled == 150
 
 
-def test_same_filename_in_both_buckets_does_not_collide() -> None:
+async def test_same_filename_in_both_buckets_does_not_collide() -> None:
     """Identical object names in each bucket both survive (namespaced by
     ``files/<bucket>/``)."""
     sb = _FakeSupabase(
@@ -268,12 +270,12 @@ def test_same_filename_in_both_buckets_does_not_collide() -> None:
             "tailored-resumes": {_UID: {"doc.pdf": b"FROM-TAILORED"}},
         },
     )
-    zf = _open(_export(sb))
+    zf = _open(await _export(sb))
     assert zf.read("files/resume-uploads/doc.pdf") == b"FROM-UPLOADS"
     assert zf.read("files/tailored-resumes/doc.pdf") == b"FROM-TAILORED"
 
 
-def test_rls_gap_tables_read_via_service_client_only() -> None:
+async def test_rls_gap_tables_read_via_service_client_only() -> None:
     """#88 dual-client split: user_api_keys / reference_jds /
     notifications_sent MUST come from the service client (their RLS returns
     nothing on the user client), and every other table MUST come from the
@@ -306,7 +308,7 @@ def test_rls_gap_tables_read_via_service_client_only() -> None:
         {"resume-uploads": {_UID: {"leak.pdf": b"SERVICE-CLIENT-BYTES"}}},
     )
 
-    zf = _open(_export(user_sb, service_sb))
+    zf = _open(await _export(user_sb, service_sb))
     data = json.loads(zf.read("data.json"))
 
     # Gap reads ride the service client — otherwise silently empty.
@@ -327,9 +329,9 @@ def test_export_endpoint_is_jwt_gated_and_streams_zip() -> None:
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_service_supabase,
+        get_async_user_supabase,
         get_current_user_id,
-        get_supabase,
-        get_user_supabase,
         verify_supabase_jwt,
     )
     from app.main import app
@@ -337,8 +339,8 @@ def test_export_endpoint_is_jwt_gated_and_streams_zip() -> None:
     sb = _seeded()
     app.dependency_overrides[verify_supabase_jwt] = lambda: _UID
     app.dependency_overrides[get_current_user_id] = lambda: _UID
-    app.dependency_overrides[get_supabase] = lambda: sb
-    app.dependency_overrides[get_user_supabase] = lambda: sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
+    app.dependency_overrides[get_async_user_supabase] = lambda: sb
     try:
         client = TestClient(app)
         # identity encoding: GZipMiddleware re-chunks gzip-accepting requests
@@ -357,7 +359,7 @@ def test_export_endpoint_is_jwt_gated_and_streams_zip() -> None:
     assert data["user_profiles"][0]["user_id"] == _UID
 
 
-def test_write_export_zip_valid_after_disk_spill() -> None:
+async def test_write_export_zip_valid_after_disk_spill() -> None:
     """H-r2-4: the export is built into a file object, not RAM. Force the
     spool to roll over to disk immediately (max_size=1) and prove the
     disk-backed archive still round-trips as a valid zip."""
@@ -367,7 +369,7 @@ def test_write_export_zip_valid_after_disk_spill() -> None:
 
     sb = _seeded()
     with tempfile.SpooledTemporaryFile(max_size=1) as spool:
-        write_export_zip(sb, spool, user_id=_UID, service_supabase=sb)
+        await write_export_zip(sb, spool, user_id=_UID, service_supabase=sb)
         assert spool._rolled  # type: ignore[attr-defined]  # actually on disk
         spool.seek(0)
         zf = zipfile.ZipFile(spool)

@@ -7,19 +7,22 @@ target's composite scoring profile.
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from postgrest.types import CountMethod
 from pydantic import ValidationError
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.background import spawn_detached
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.config import settings
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
+    get_async_user_supabase,
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
@@ -52,6 +55,7 @@ from app.models.targets import (
     TargetFromUrl,
     TargetPreferences,
     TargetPreferencesUpdate,
+    TargetReferenceJD,
     TargetSearchResponse,
     TargetSearchResult,
     TargetsListResponse,
@@ -173,6 +177,406 @@ def _require_operator(user_id: str | None) -> None:
         )
 
 
+# ── Async inlines of shared crud reads (#57 slice 3) ─────────────────────────
+# The interactive GET handlers below are now `async def` and hold the async
+# client. ``crud.*`` stays SYNC for its many not-yet-converted callers — the
+# poller, the activation / from_input background pipelines, target_scoring's
+# poll twins, the discovery / learner services, and crud's own unit +
+# RLS-integration tests. A sync helper can't take the async client, and
+# converting crud would ripple into every one of those (the poller is
+# explicitly out of scope for this slice). So these thin async inlines run the
+# same queries on the async client (the routers/insights.py::_user_target_ids
+# pattern); the row→model parse is reused from crud so the shape stays
+# identical. No sync+async twin in the shared layer. The write handlers that
+# fan out into crud's complex write helpers (link/update/axis-weights/…) stay
+# sync `def` — FastAPI threadpools them, so their blocking round-trips never
+# touch the loop (#107).
+
+
+async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
+    """Async inline of ``crud.get_user_target_ids`` — any-status memberships."""
+    resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+async def _require_user_owns_target_async(
+    supabase: AsyncClient, *, user_id: str | None, target_id: str
+) -> None:
+    """Async twin of :func:`_require_user_owns_target` (the sync version is kept
+    for the sync / threadpooled handlers). 404s a JWT caller not linked to
+    ``target_id``; the operator/api-key path (``user_id`` None) bypasses."""
+    if user_id is None:
+        return
+    if target_id not in await _user_target_ids(supabase, user_id):
+        raise HTTPException(status_code=404, detail="Target not found")
+
+
+async def _target_get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get``. Reuses ``crud._parse_target`` for shape."""
+    resp = await supabase.table(crud.TARGETS_TABLE).select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
+
+
+async def _get_user_target(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> UserTarget | None:
+    """Async inline of ``crud.get_user_target``."""
+    resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_user_target(rows[0]) if rows else None
+
+
+async def _search_targets_by_label(
+    supabase: AsyncClient, query: str, *, limit: int
+) -> list[JobTarget]:
+    """Async inline of ``crud.search_by_label`` — case-insensitive ``ILIKE``
+    substring over the shared catalog. A blank / too-short query short-circuits
+    without a DB hit (never dump the whole catalog)."""
+    trimmed = query.strip()
+    if len(trimmed) < 2:
+        return []
+    resp = (
+        await supabase.table(crud.TARGETS_TABLE)
+        .select("*")
+        .ilike("label", f"%{trimmed}%")
+        .order("label")
+        .limit(limit)
+        .execute()
+    )
+    return [crud._parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _active_targets_for_user(supabase: AsyncClient, user_id: str) -> list[JobTarget]:
+    """Async inline of ``crud.get_active_for_user`` — the user's active memberships."""
+    ut_resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    ut_rows = cast(list[dict[str, Any]], ut_resp.data or [])
+    target_ids = [r["target_id"] for r in ut_rows]
+    if not target_ids:
+        return []
+    resp = await supabase.table(crud.TARGETS_TABLE).select("*").in_("id", target_ids).execute()
+    return [crud._parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
+    """Async inline of ``crud.get_active`` — the derived ``app_active OR
+    EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
+    Python (see the crud docstring for the dropped-trigger history)."""
+    floor_resp = (
+        await supabase.table(crud.TARGETS_TABLE).select("*").eq("app_active", True).execute()
+    )
+    member_ids_resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("is_active", True)
+        .execute()
+    )
+    member_ids = {
+        cast(str, r["target_id"])
+        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+    }
+    rows = cast(list[dict[str, Any]], floor_resp.data or [])
+    seen = {cast(str, r["id"]) for r in rows}
+    missing = sorted(member_ids - seen)
+    if missing:
+        member_resp = (
+            await supabase.table(crud.TARGETS_TABLE).select("*").in_("id", missing).execute()
+        )
+        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
+    return [crud._parse_target(r) for r in rows]
+
+
+async def _list_reference_jds_async(
+    supabase: AsyncClient, target_id: str
+) -> list[TargetReferenceJD]:
+    """Async inline of ``crud.list_reference_jds``."""
+    resp = (
+        await supabase.table(crud.REF_JDS_TABLE)
+        .select("*")
+        .eq("target_id", target_id)
+        .order("created_at")
+        .execute()
+    )
+    return [crud._parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _get_user_target_preferences(
+    supabase: AsyncClient, *, user_id: str, target_id: str
+) -> TargetPreferences | None:
+    """Async inline of ``crud.get_user_target_preferences`` — the single
+    junction read, re-projected into the preference shape."""
+    ut = await _get_user_target(supabase, user_id, target_id)
+    if ut is None:
+        return None
+    return crud.preferences_from_user_target(ut)
+
+
+async def _live_scored_job_count(supabase: AsyncClient, target_id: str) -> int:
+    """Count of the target's live, non-excluded ``scores`` rows — the number the
+    /targets/{id}/status card shows.
+
+    Gate ``excluded=False`` AND ``job_is_live`` so this reflects what
+    /jobs?target_id=... actually lists — the list hides both scorer-excluded
+    rows (negative-keyword matches) and jobs that are no longer live
+    (archived/purged). Counting only ``excluded=False`` over-reported badly: on
+    the heaviest prod target the not-excluded count was 12,853 but only 2,808
+    were live.
+
+    ``head=True`` → PostgREST issues a HEAD, returning only the Content-Range
+    count and *zero* rows. The ``job_is_live AND NOT excluded`` predicate matches
+    the ``idx_scores_live_dedup`` partial index, so this stays an index-only
+    count (no rows, no new index).
+    """
+    count_resp = (
+        await supabase.table("scores")
+        .select("id", count=CountMethod.exact, head=True)
+        .eq("target_id", target_id)
+        .eq("excluded", False)
+        .eq("job_is_live", True)
+        .execute()
+    )
+    return count_resp.count or 0
+
+
+# ── Async inlines of shared crud WRITES (#57 slice 4) ────────────────────────
+# The write handlers below are now `async def` and hold the async client. As
+# with the slice-3 read inlines above, ``crud.*`` stays SYNC for its many
+# not-yet-converted callers — the poller, the activation / from_input background
+# pipelines, target_scoring's poll twins, the discovery / learner services, and
+# crud's own unit + RLS-integration tests. A sync helper can't take the async
+# client, and converting crud would ripple into every one of those (all out of
+# this slice's scope). So these thin async inlines run the SAME writes on the
+# async client; the row→model parse is reused from ``crud`` so the persisted
+# shape stays byte-identical. No sync+async twin in the shared layer. Handlers
+# that fan out into crud's complex write helpers still reachable only from the
+# LLM/poller paths (link / activate / add_reference_jd / …) stay on the sync
+# client + ``to_thread`` — their blocking round-trips already never touch the
+# loop (#107), and their downstream services (poller, profile_writes, votes,
+# match, resolve, source_discovery, cost_log) are out of this slice's scope.
+
+
+async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> JobTarget:
+    """Async inline of ``crud.create`` — find-or-create on ``normalized_label``."""
+    normalized = crud.normalize_label(payload.label)
+    row: dict[str, Any] = {
+        "label": payload.label,
+        "description": payload.description,
+        "normalized_label": normalized,
+        "scoring_profile": payload.scoring_profile.model_dump(),
+        "search_keywords": payload.search_keywords,
+    }
+    resp = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .upsert(row, on_conflict="normalized_label", ignore_duplicates=True)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if rows:
+        return crud._parse_target(rows[0])
+    # Conflict → the canonical row already existed; return it rather than 500.
+    existing = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .select("*")
+        .eq("normalized_label", normalized)
+        .limit(1)
+        .execute()
+    )
+    existing_rows = cast(list[dict[str, Any]], existing.data or [])
+    if existing_rows:
+        return crud._parse_target(existing_rows[0])
+    raise RuntimeError("Failed to insert or locate targets row")
+
+
+async def _update_target_async(
+    supabase: AsyncClient, target_id: str, payload: TargetUpdate
+) -> JobTarget | None:
+    """Async inline of ``crud.update`` — same partial field mapping."""
+    updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
+    if payload.label is not None:
+        updates["label"] = payload.label
+        updates["normalized_label"] = crud.normalize_label(payload.label)
+    if payload.description is not None:
+        updates["description"] = payload.description
+    if payload.scoring_profile is not None:
+        updates["scoring_profile"] = payload.scoring_profile.model_dump()
+    if payload.search_keywords is not None:
+        updates["search_keywords"] = payload.search_keywords
+    if payload.activation_status is not None:
+        updates["activation_status"] = payload.activation_status
+    if payload.app_active is not None:
+        updates["app_active"] = payload.app_active
+    if payload.profile_version is not None:
+        updates["profile_version"] = payload.profile_version
+    if payload.example_promising_titles is not None:
+        updates["example_promising_titles"] = payload.example_promising_titles
+    if payload.example_unpromising_titles is not None:
+        updates["example_unpromising_titles"] = payload.example_unpromising_titles
+    if payload.seniority_hint is not None:
+        updates["seniority_hint"] = payload.seniority_hint
+    if payload.domain_hints is not None:
+        updates["domain_hints"] = payload.domain_hints
+    if payload.role_family is not None:
+        updates["role_family"] = payload.role_family
+    resp = await supabase.table(crud.TARGETS_TABLE).update(updates).eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
+
+
+async def _set_user_target_inactive_async(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> UserTarget | None:
+    """Async inline of ``crud.set_user_target_inactive``."""
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update({"is_active": False, "updated_at": datetime.now(UTC).isoformat()})
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_user_target(rows[0]) if rows else None
+
+
+async def _unlink_user_from_target_async(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> bool:
+    """Async inline of ``crud.unlink_user_from_target``."""
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .delete()
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    return bool(resp.data)
+
+
+async def _delete_target_async(supabase: AsyncClient, target_id: str) -> bool:
+    """Async inline of ``crud.delete`` — operator-only hard delete."""
+    resp = await supabase.table(crud.TARGETS_TABLE).delete().eq("id", target_id).execute()
+    return bool(resp.data)
+
+
+async def _set_axis_weights_async(
+    supabase: AsyncClient, *, user_id: str, target_id: str, weights: AxisWeights | None
+) -> UserTarget | None:
+    """Async inline of ``crud.set_user_target_axis_weights`` — snapshot prior into
+    ``axis_weights_previous`` then write. ``weights=None`` resets to defaults."""
+    current = await _get_user_target(supabase, user_id, target_id)
+    if current is None:
+        return None
+    updates: dict[str, Any] = {
+        "axis_weights": weights.model_dump() if weights is not None else None,
+        "axis_weights_previous": (
+            current.axis_weights.model_dump() if current.axis_weights is not None else None
+        ),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_user_target(rows[0]) if rows else None
+
+
+async def _undo_axis_weights_async(
+    supabase: AsyncClient, *, user_id: str, target_id: str
+) -> UserTarget | None:
+    """Async inline of ``crud.undo_user_target_axis_weights`` — swap current ↔ previous."""
+    current = await _get_user_target(supabase, user_id, target_id)
+    if current is None:
+        return None
+    new_current = current.axis_weights_previous
+    new_previous = current.axis_weights
+    updates: dict[str, Any] = {
+        "axis_weights": new_current.model_dump() if new_current is not None else None,
+        "axis_weights_previous": (new_previous.model_dump() if new_previous is not None else None),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_user_target(rows[0]) if rows else None
+
+
+async def _set_notification_thresholds_async(
+    supabase: AsyncClient, *, user_id: str, target_id: str, thresholds: dict[str, int | None]
+) -> UserTarget | None:
+    """Async inline of ``crud.set_user_target_notification_thresholds`` — partial
+    write of only the channels present in *thresholds*."""
+    current = await _get_user_target(supabase, user_id, target_id)
+    if current is None:
+        return None
+    updates: dict[str, Any] = {
+        col: thresholds[col]
+        for col in crud._NOTIFICATION_THRESHOLD_COLUMNS
+        if col in thresholds
+    }
+    if not updates:
+        return current
+    updates["updated_at"] = datetime.now(UTC).isoformat()
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_user_target(rows[0]) if rows else None
+
+
+async def _set_preferences_async(
+    supabase: AsyncClient, *, user_id: str, target_id: str, preferences: TargetPreferences
+) -> TargetPreferences | None:
+    """Async inline of ``crud.set_user_target_preferences`` — full PUT replace of
+    every preference column, re-projected off the updated row."""
+    current = await _get_user_target(supabase, user_id, target_id)
+    if current is None:
+        return None
+    payload = preferences.model_dump()
+    updates: dict[str, Any] = {col: payload[col] for col in crud._PREFERENCE_COLUMNS}
+    updates["updated_at"] = datetime.now(UTC).isoformat()
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(updates)
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return crud.preferences_from_user_target(crud._parse_user_target(rows[0]))
+
+
 async def _activate_pipeline(
     supabase: Client, llm: LLMClient, target: JobTarget, user_id: str
 ) -> None:
@@ -286,13 +690,14 @@ async def _activate_pipeline(
 # ---- Target CRUD -----------------------------------------------------------
 
 
-# Sync `def`: blocking supabase write runs in the threadpool (#107).
+# Async `def` (#57 slice 4): the write runs natively on the async client via the
+# router-inline ``_create_target_async`` (crud stays sync for its bg/poller callers).
 @router.post("", response_model=JobTarget, status_code=201)
-def create_target(
+async def create_target(
     body: TargetCreate,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> JobTarget:
-    return crud.create(supabase, payload=body)
+    return await _create_target_async(supabase, payload=body)
 
 
 @router.post(
@@ -587,8 +992,8 @@ async def suggest_from_query(
 
 
 @router.get("/active", response_model=TargetsListResponse)
-def get_active_targets(
-    supabase: Client = Depends(get_supabase),
+async def get_active_targets(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> TargetsListResponse:
     """Active targets for the caller.
@@ -602,9 +1007,9 @@ def get_active_targets(
     tooling. Mirrors the scoping the rest of the targets router applies.
     """
     targets = (
-        crud.get_active_for_user(supabase, user_id)
+        await _active_targets_for_user(supabase, user_id)
         if user_id is not None
-        else crud.get_active(supabase)
+        else await _active_targets(supabase)
     )
     return TargetsListResponse(targets=targets)
 
@@ -643,10 +1048,10 @@ async def get_my_targets(
 
 # Declared before ``/{target_id}`` so "search" isn't captured as a target id.
 @router.get("/search", response_model=TargetSearchResponse)
-def search_targets(
+async def search_targets(
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=50),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TargetSearchResponse:
     """Search the shared catalog by label so the caller can follow an existing
@@ -658,8 +1063,8 @@ def search_targets(
     full row is served by ``GET /targets/{id}`` once followed. A blank / 1-char
     query returns no results rather than dumping the catalog.
     """
-    matches = crud.search_by_label(supabase, q, limit=limit)
-    linked_ids = crud.get_user_target_ids(supabase, user_id) if matches else set()
+    matches = await _search_targets_by_label(supabase, q, limit=limit)
+    linked_ids = await _user_target_ids(supabase, user_id) if matches else set()
     results = [
         TargetSearchResult(
             id=t.id,
@@ -673,9 +1078,9 @@ def search_targets(
 
 
 @router.get("/{target_id}", response_model=JobTarget)
-def get_target(
+async def get_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
     # Targets are shared, service-role-read (no RLS backstop). Without this
@@ -683,17 +1088,17 @@ def get_target(
     # scoring profile by id (audit #29 round 3 / M3). Operators (api-key,
     # user_id None) bypass; non-owners get 404 so they can't enumerate
     # target existence.
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
     return target
 
 
 @router.get("/{target_id}/user-target", response_model=UserTargetWithTarget)
-def get_my_user_target(
+async def get_my_user_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> UserTargetWithTarget:
     """Return the current user's user_targets row for a specific target,
@@ -703,13 +1108,13 @@ def get_my_user_target(
     row when rendering a per-target settings page. JWT-only (no api-key
     fallback) because there is no "current user" without a JWT.
     """
-    ut = crud.get_user_target(supabase, user_id, target_id)
+    ut = await _get_user_target(supabase, user_id, target_id)
     if ut is None:
         raise HTTPException(
             status_code=404,
             detail="No user_targets row for (user, target).",
         )
-    target = crud.get(supabase, target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         # user_targets row exists but the shared target was deleted —
         # data integrity issue, surface as a 404 not a 500.
@@ -718,17 +1123,17 @@ def get_my_user_target(
 
 
 @router.patch("/{target_id}", response_model=JobTarget)
-def update_target(
+async def update_target(
     target_id: str,
     body: TargetUpdate,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
     # Shared-catalog write → operator-only (SEC-2, #366). End users can't edit
     # the shared scoring profile / label; they tune their own view via
     # axis-weights / preferences and contribute via the bounded #191 path.
     _require_operator(user_id)
-    target = crud.update(supabase, target_id, body)
+    target = await _update_target_async(supabase, target_id, body)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
     return target
@@ -826,11 +1231,12 @@ async def discover_sources_for_target_endpoint(
     return await run_discovery_for_target(supabase, target)
 
 
-# Sync `def`: blocking supabase reads/writes run in the threadpool (#107).
+# Async `def` (#57 slice 4): reads/writes run natively on the async client via
+# the router-inline helpers (crud stays sync for its bg/poller callers).
 @router.post("/{target_id}/deactivate", response_model=JobTarget)
-def deactivate_target(
+async def deactivate_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
     # Ownership gate (#29 R3 / SEC-4): every sibling route carries this, but
@@ -839,13 +1245,13 @@ def deactivate_target(
     # (scoring_profile / search_keywords / example titles) on the service-role
     # client. set_user_target_inactive is already caller-scoped (a harmless
     # no-op for a non-follower), but the response still leaked the row.
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    crud.set_user_target_inactive(supabase, user_id=user_id, target_id=target_id)
-    return crud.get(supabase, target_id) or target
+    await _set_user_target_inactive_async(supabase, user_id=user_id, target_id=target_id)
+    return await _target_get(supabase, target_id) or target
 
 
 # ---- Axis weights (PR E follow-up) ----------------------------------------
@@ -860,15 +1266,15 @@ def deactivate_target(
 #   snapshots, so undo recovers the prior custom weights.
 
 
-# Sync `def` (not `async def`): blocking supabase round-trips run in the
-# threadpool, keeping them off the event loop. See #107.
+# Async `def` (#57 slice 4): the write runs natively on the async user client via
+# the router-inline helper (crud stays sync for its bg/poller callers).
 @router.patch("/{target_id}/axis-weights", response_model=UserTarget)
-def set_axis_weights(
+async def set_axis_weights(
     target_id: str,
     weights: AxisWeights,
     # #88 Phase 2: RLS client — writes only the caller's user_targets row
-    # (full CRUD self-policy), so RLS backstops the crud helper's user_id filter.
-    supabase: Client = Depends(get_user_supabase),
+    # (full CRUD self-policy), so RLS backstops the helper's user_id filter.
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Set the user's per-target axis weights.
@@ -877,7 +1283,7 @@ def set_axis_weights(
     /undo endpoint can revert. Pure read-time math — does NOT trigger
     any re-grade; existing scores rows are unchanged.
     """
-    updated = crud.set_user_target_axis_weights(
+    updated = await _set_axis_weights_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -892,11 +1298,11 @@ def set_axis_weights(
     return updated
 
 
-# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+# Async `def` (#57 slice 4): runs natively on the async user client.
 @router.delete("/{target_id}/axis-weights", response_model=UserTarget)
-def reset_axis_weights(
+async def reset_axis_weights(
     target_id: str,
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Reset axis_weights to defaults (NULL — equal quartile).
@@ -905,7 +1311,7 @@ def reset_axis_weights(
     ``axis_weights_previous`` so /undo can put them back. "Reset" and
     "undo" cancel each other out in one round-trip.
     """
-    updated = crud.set_user_target_axis_weights(
+    updated = await _set_axis_weights_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -920,11 +1326,11 @@ def reset_axis_weights(
     return updated
 
 
-# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+# Async `def` (#57 slice 4): runs natively on the async user client.
 @router.post("/{target_id}/axis-weights/undo", response_model=UserTarget)
-def undo_axis_weights(
+async def undo_axis_weights(
     target_id: str,
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Swap ``axis_weights`` and ``axis_weights_previous``.
@@ -933,7 +1339,7 @@ def undo_axis_weights(
     consecutive undos toggle back and forth — that's the intended
     contract (undo, then change-my-mind-and-redo).
     """
-    updated = crud.undo_user_target_axis_weights(supabase, user_id=user_id, target_id=target_id)
+    updated = await _undo_axis_weights_async(supabase, user_id=user_id, target_id=target_id)
     if updated is None:
         raise HTTPException(
             status_code=404,
@@ -943,12 +1349,12 @@ def undo_axis_weights(
     return updated
 
 
-# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+# Async `def` (#57 slice 4): runs natively on the async user client.
 @router.patch("/{target_id}/notification-thresholds", response_model=UserTarget)
-def set_notification_thresholds(
+async def set_notification_thresholds(
     target_id: str,
     body: NotificationThresholdsUpdate,
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Set this target's per-channel email/SMS score thresholds (#15).
@@ -960,7 +1366,7 @@ def set_notification_thresholds(
     Thresholds only gate which *new* matches alert; stored scores and the
     jobs list are unaffected, so no cache invalidation is needed.
     """
-    updated = crud.set_user_target_notification_thresholds(
+    updated = await _set_notification_thresholds_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -996,11 +1402,11 @@ def _invalidate_jobs_cache_for_target(target_id: str) -> None:
 # means Postgres itself refuses to surface or mutate another user's row.
 
 
-# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
 @router.get("/{target_id}/preferences", response_model=TargetPreferences)
-def get_target_preferences(
+async def get_target_preferences(
     target_id: str,
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
+    # #88 Phase 2: RLS user client — reads only the caller's user_targets row.
+    supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> TargetPreferences:
     """Return the calling user's preferences for a target.
@@ -1009,7 +1415,7 @@ def get_target_preferences(
     meaningless without a (user, target) pairing, and a 404 keeps a
     non-owner from confirming the target exists.
     """
-    prefs = crud.get_user_target_preferences(supabase, user_id=user_id, target_id=target_id)
+    prefs = await _get_user_target_preferences(supabase, user_id=user_id, target_id=target_id)
     if prefs is None:
         raise HTTPException(
             status_code=404,
@@ -1018,12 +1424,12 @@ def get_target_preferences(
     return prefs
 
 
-# Sync `def`: blocking supabase round-trips run in the threadpool (#107).
+# Async `def` (#57 slice 4): runs natively on the async user client.
 @router.put("/{target_id}/preferences", response_model=TargetPreferences)
-def set_target_preferences(
+async def set_target_preferences(
     target_id: str,
     body: TargetPreferencesUpdate,
-    supabase: Client = Depends(get_user_supabase),  # #88 Phase 2: user_targets only
+    supabase: AsyncClient = Depends(get_async_user_supabase),  # #88 Phase 2: user_targets only
     user_id: str = Depends(get_current_user_id),
 ) -> TargetPreferences:
     """Replace the calling user's preferences for a target (PUT semantics).
@@ -1034,7 +1440,7 @@ def set_target_preferences(
     ``scores`` rows are untouched. The jobs-list cache is busted so the
     next list read reflects the new filters.
     """
-    prefs = crud.set_user_target_preferences(
+    prefs = await _set_preferences_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -1144,50 +1550,22 @@ async def poll_jobs_for_target(
     return await poll_sources_for_target(supabase, target)
 
 
-# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
-# this in its threadpool, keeping the blocking `.execute()` round-trips off
-# the event loop. See #107.
 @router.get("/{target_id}/status", response_model=TargetStatusResponse)
-def get_target_status(
+async def get_target_status(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> TargetStatusResponse:
     """Return activation status and job count for a target."""
     # Without this, any authenticated user could read any target's
     # activation status + scored-job count by id (audit #29 round 3 / M2).
     # Operators (user_id None) bypass; non-owners get 404.
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    # Gate ``excluded=False`` AND ``job_is_live`` so this count reflects
-    # what /jobs?target_id=... actually shows — the list hides both
-    # scorer-excluded rows (negative-keyword matches) and jobs that are no
-    # longer live (archived/purged). Counting only ``excluded=False``
-    # over-reported badly: on the heaviest prod target the not-excluded
-    # count was 12,853 but only 2,808 were live — a "12,853 jobs scored"
-    # status landing the user on a list of ~2,808. (The list additionally
-    # applies the off-family gate + per-user score floor; those are
-    # smaller, per-user refinements left as a follow-up — this closes the
-    # dominant liveness gap.)
-    #
-    # ``head=True`` → PostgREST issues a HEAD, returning only the
-    # Content-Range count and *zero* rows (not the up-to-1,000-row page a
-    # GET would ship just to read one integer, then discard). The
-    # ``job_is_live AND NOT excluded`` predicate matches the
-    # ``idx_scores_live_dedup`` partial index, so this stays an index-only
-    # count (no rows, no new index).
-    count_resp = (
-        supabase.table("scores")
-        .select("id", count=CountMethod.exact, head=True)
-        .eq("target_id", target_id)
-        .eq("excluded", False)
-        .eq("job_is_live", True)
-        .execute()
-    )
-    jobs_count = count_resp.count or 0
+    jobs_count = await _live_scored_job_count(supabase, target_id)
 
     return TargetStatusResponse(
         activation_status=target.activation_status,
@@ -1218,15 +1596,15 @@ def get_target_funnel(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-# Sync `def`: blocking supabase ownership-check + delete run in the
-# threadpool (#107).
+# Async `def` (#57 slice 4): ownership-check + delete run natively on the async
+# client via the router-inline helpers (crud stays sync for its bg/poller callers).
 @router.delete("/{target_id}", response_model=DeleteResponse)
-def delete_target(
+async def delete_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> DeleteResponse:
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     # Targets are a SHARED catalog — find_matching_target dedups by normalized
     # label across users, so distinct users routinely co-follow one row. A JWT
     # caller "deleting" their target must therefore only drop THEIR link: hard-
@@ -1238,11 +1616,11 @@ def delete_target(
     # hard delete. Mirrors the audit-#29 H1 fix that turned the jobs "delete"
     # into a per-user unlink for the same shared-row reason.
     if user_id is not None:
-        unlinked = crud.unlink_user_from_target(supabase, user_id, target_id)
+        unlinked = await _unlink_user_from_target_async(supabase, user_id, target_id)
         if not unlinked:
             raise HTTPException(status_code=404, detail="Target not found")
         return DeleteResponse(deleted=True)
-    deleted = crud.delete(supabase, target_id)
+    deleted = await _delete_target_async(supabase, target_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Target not found")
     return DeleteResponse(deleted=True)
@@ -1719,19 +2097,18 @@ async def add_reference_jd(
     )
 
 
-# Sync `def`: blocking supabase read runs in the threadpool (#107).
 @router.get("/{target_id}/reference-jds", response_model=ReferenceJDsListResponse)
-def list_reference_jds(
+async def list_reference_jds(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> ReferenceJDsListResponse:
     # Reference JDs are read via the service-role client with no RLS
     # backstop. Without this guard any authenticated user could read any
     # target's full reference-JD text by id (audit #29 round 3 / M3).
     # Operators (user_id None) bypass; non-owners get 404.
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    ref_jds = crud.list_reference_jds(supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    ref_jds = await _list_reference_jds_async(supabase, target_id)
     # Strip the contributor ``user_id``: the contribution graph is meant to
     # be anonymous (votes are anonymous, #5 P3), and surfacing the
     # per-row ``user_id`` here deanonymizes who contributed each JD.
