@@ -2560,8 +2560,7 @@ async def add_job_to_target(
     # but with auth.uid() NULL it takes the function's service-role-exempt branch
     # (the RPC isn't authenticated-executable post-lockdown — see above).
     try:
-        result = await asyncio.to_thread(
-            score_and_upsert,
+        result = await score_and_upsert(
             service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",

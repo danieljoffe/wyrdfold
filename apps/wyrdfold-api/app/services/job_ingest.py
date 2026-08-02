@@ -126,14 +126,15 @@ async def materialize_and_score_job(
         job_list_cache.invalidate()
         return posting_id
 
-    # Stage-2 score against each target. Each call is independent + IO-bound
-    # (sync SDK), so gather them off the loop rather than round-trip serially.
+    # Stage-2 score against each target. Each call is independent + IO-bound,
+    # so gather them concurrently rather than round-trip serially. The scorer
+    # (#57) offloads its keyword compute to a thread internally and awaits the
+    # upsert IO on the loop, so no ``to_thread`` wrapper here.
     desc = description_html or ""
     parsed = parse_jd(desc)
     results = await asyncio.gather(
         *[
-            asyncio.to_thread(
-                score_and_upsert,
+            score_and_upsert(
                 supabase,
                 job_posting_id=posting_id,
                 title=title,

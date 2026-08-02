@@ -83,11 +83,12 @@ def _wire(
 ) -> None:
     """Patch the router's collaborators and capture which client each receives.
 
-    Post-#57-slice-4 the handler is ``async``: the ownership reads are awaited on
-    the async user client (``_load_live_job`` / ``_get_user_target_async``), and
-    the service-role writes run on a sync service client fetched in-body via
-    ``get_supabase()`` and driven off-loop via ``to_thread`` (so ``get_target`` /
-    ``score_and_upsert`` / ``upsert_user_job`` stubs stay plain sync)."""
+    Post-#57 the handler is ``async``: the ownership reads are awaited on the
+    async user client (``_load_live_job`` / ``_get_user_target_async``), and the
+    service-role writes run on a sync service client fetched in-body via
+    ``get_supabase()``. ``score_and_upsert`` is now awaited directly (so its stub
+    is ``async``); ``get_target`` / ``upsert_user_job`` are still sync, driven
+    off-loop via ``to_thread``."""
 
     async def fake_load_live_job(sb, jid):
         return job
@@ -99,7 +100,7 @@ def _wire(
     def fake_get_target(sb, tid):
         return target
 
-    def fake_score_and_upsert(sb, **kwargs):
+    async def fake_score_and_upsert(sb, **kwargs):
         captured["score_client"] = sb
         captured["score_kwargs"] = kwargs
         return _fake_score()

@@ -29,8 +29,9 @@ from app.models.targets import JobTarget
 from app.services.db_write import poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
 from app.services.scoring import score_job_with_profile, score_title_against_profile
-from app.services.supabase_retry import execute_with_retry_sync
+from app.services.supabase_retry import execute_with_retry, execute_with_retry_sync
 from app.services.targets import crud
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,9 @@ def _score_row_payload(
     promising: bool | None = None,
     phase1_confidence: int | None = None,
 ) -> dict[str, Any]:
-    """Build the ``scores`` upsert row. Pure; shared by :func:`_upsert_score`
-    and its poll twin :func:`_upsert_score_poll` so the sync and async-seam
-    paths can't drift (#57)."""
+    """Build the ``scores`` upsert row. Pure; the single source of the upsert
+    payload for :func:`_upsert_score` (#57 collapsed the sync/poll scoring
+    twins into one async writer)."""
     row: dict[str, Any] = {
         "job_posting_id": job_posting_id,
         "target_id": target_id,
@@ -107,7 +108,7 @@ def _parse_upsert_response(resp: Any) -> JobTargetScore:
     return _parse_score(rows[0])
 
 
-def _upsert_score(
+async def _upsert_score(
     supabase: Client,
     *,
     job_posting_id: str,
@@ -134,6 +135,24 @@ def _upsert_score(
     verdict. Same None-leaves-untouched semantics. Used by
     ``phase2_runner`` to order candidates by phase1_confidence DESC so
     the daily Sonnet cap goes to highest-likelihood-promising jobs first.
+
+    Idempotent upsert (``on_conflict`` matches the unique constraint), so
+    retrying a Supabase HTTP/2 stream drop is safe. Two write paths, unified
+    here from the #57 poll/interactive twins:
+
+    - ``gated`` (the user-facing manual-add path, #6 R2) routes through the
+      ``user_upsert_score`` SECURITY DEFINER RPC so Postgres enforces target
+      ownership. Interactive + single-call, so it runs a bare async retry on
+      the pooled async client — deliberately NOT the poll write-herd
+      semaphore, which would head-of-line-block an interactive write behind a
+      mid-cycle poll burst.
+    - non-gated (poller / service-role rescore) takes the direct upsert
+      through :func:`app.services.db_write.poll_db_write`, bounded by the
+      cycle's write-herd semaphore.
+
+    Both pick the pooled async client with a sync-in-thread fallback;
+    ``supabase`` is that fallback client (in prod the async client always
+    serves the write).
     """
     row = _score_row_payload(
         job_posting_id=job_posting_id,
@@ -147,63 +166,27 @@ def _upsert_score(
         promising=promising,
         phase1_confidence=phase1_confidence,
     )
-    # Idempotent upsert (`on_conflict` matches the unique constraint), so
-    # retrying on a Supabase HTTP/2 stream drop is safe. When ``gated`` (the
-    # user-facing manual-add path, #6 R2), route through the user_upsert_score
-    # SECURITY DEFINER RPC on the caller's client so Postgres enforces target
-    # ownership; the poller keeps the direct service-role upsert.
     resp: Any
     if gated:
-        resp = execute_with_retry_sync(
-            supabase.rpc("user_upsert_score", {"p_row": row}).execute,
-            label="scores upsert (gated)",
-        )
+        async_sb = get_async_supabase()
+        if async_sb is not None:
+            resp = await execute_with_retry(
+                async_sb.rpc("user_upsert_score", {"p_row": row}).execute,
+                label="scores upsert (gated)",
+            )
+        else:
+            resp = await asyncio.to_thread(
+                lambda: execute_with_retry_sync(
+                    supabase.rpc("user_upsert_score", {"p_row": row}).execute,
+                    label="scores upsert (gated)",
+                )
+            )
     else:
-        resp = execute_with_retry_sync(
-            supabase.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id").execute,
+        resp = await poll_db_write(
+            supabase,
+            lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
             label="scores upsert",
         )
-    return _parse_upsert_response(resp)
-
-
-async def _upsert_score_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    target_id: str,
-    score: int,
-    breakdown: ScoreBreakdown,
-    matched_keywords: list[str],
-    excluded: bool,
-    scoring_status: ScoringStatus,
-    scored_profile_version: int = 1,
-    promising: bool | None = None,
-    phase1_confidence: int | None = None,
-) -> JobTargetScore:
-    """Poll-seam twin of :func:`_upsert_score`: the same row (via
-    :func:`_score_row_payload`), written through
-    :func:`app.services.db_write.poll_db_write` (see its docstring for
-    backend selection, retry and herd bounding). Service-role only — there is
-    no ``gated`` parameter because the gated ``user_upsert_score`` RPC path
-    is user-client-only (manual add, #6 R2) and never runs in the poller.
-    """
-    row = _score_row_payload(
-        job_posting_id=job_posting_id,
-        target_id=target_id,
-        score=score,
-        breakdown=breakdown,
-        matched_keywords=matched_keywords,
-        excluded=excluded,
-        scoring_status=scoring_status,
-        scored_profile_version=scored_profile_version,
-        promising=promising,
-        phase1_confidence=phase1_confidence,
-    )
-    resp = await poll_db_write(
-        supabase,
-        lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
-        label="scores upsert",
-    )
     return _parse_upsert_response(resp)
 
 
@@ -224,60 +207,30 @@ def _title_score_result(title: str, target: JobTarget) -> ScoreResult | None:
     return result
 
 
-def score_title_and_upsert(
+async def score_title_and_upsert(
     supabase: Client,
     *,
     job_posting_id: str,
     title: str,
     target: JobTarget,
 ) -> JobTargetScore | None:
-    """Stage 1: Score a job title against a target and upsert if any match.
+    """Stage 1: score a job title against a target and upsert if any match.
 
     Returns the upserted score, or None if no keywords matched (skip).
-    """
-    result = _title_score_result(title, target)
-    if result is None:
-        return None
+    Service-role only — Stage 1 never gates (the ``user_upsert_score`` RPC
+    path is the manual-add flow, #6 R2, which starts at Stage 2).
 
-    return _upsert_score(
-        supabase,
-        job_posting_id=job_posting_id,
-        target_id=target.id,
-        score=result.score,
-        breakdown=result.breakdown,
-        matched_keywords=result.matched_keywords,
-        excluded=result.excluded,
-        scoring_status="stage1",
-        scored_profile_version=target.profile_version,
-    )
-
-
-async def score_title_and_upsert_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    title: str,
-    target: JobTarget,
-) -> JobTargetScore | None:
-    """The poller's seam twin of :func:`score_title_and_upsert` (#57 slice 2):
-    identical Stage 1 compute (:func:`_title_score_result`), with the upsert
-    routed through :func:`app.services.db_write.poll_db_write` — see that
-    docstring for backend selection. Service-role only; the ``gated`` path is
-    user-client-only and never runs in the poller. Slice 4 (#57) collapses
-    the pair once the sync callers migrate.
-
-    The keyword compute runs in the executor, NOT on the event loop: the
-    sync path always had it inside ``to_thread`` (the whole helper was
-    offloaded), and the poll fans this out per (row x target) — at cycle
-    scale that is tens of seconds of pure-Python scoring, which on the loop
-    taxes every interactive request (measured ~+45ms p50 in the #57 load
-    test). Only the IO awaits on the loop.
+    The keyword compute runs in the executor, NOT on the event loop: the poll
+    fans this out per (row x target), and at cycle scale that is tens of
+    seconds of pure-Python scoring, which on the loop would tax every
+    interactive request (measured ~+45ms p50 in the #57 load test). Only the
+    IO awaits on the loop.
     """
     result = await asyncio.to_thread(_title_score_result, title, target)
     if result is None:
         return None
 
-    return await _upsert_score_poll(
+    return await _upsert_score(
         supabase,
         job_posting_id=job_posting_id,
         target_id=target.id,
@@ -315,7 +268,7 @@ def _stage2_score_result(
     return result
 
 
-def score_and_upsert(
+async def score_and_upsert(
     supabase: Client,
     *,
     job_posting_id: str,
@@ -328,7 +281,7 @@ def score_and_upsert(
     phase1_confidence: int | None = None,
     gated: bool = False,
 ) -> JobTargetScore:
-    """Stage 2: Score one job's full JD against one target and upsert.
+    """Stage 2: score one job's full JD against one target and upsert.
 
     Pass ``parsed_jd`` to reuse a pre-parsed JD across multiple targets.
 
@@ -345,8 +298,17 @@ def score_and_upsert(
     that column. Pass ``None`` to leave the column unchanged on re-
     upserts (the default — keyword-only callers don't need to know about
     Phase 1).
+
+    ``gated`` routes the write through the ``user_upsert_score`` ownership
+    RPC (the manual-add path, #6 R2); the poller / rescore paths leave it
+    False. See :func:`_upsert_score` for the write-path split.
+
+    Compute in the executor, IO on the loop: full-JD scoring is the heaviest
+    per-row compute in the cycle and the poll fans it out per (row x target),
+    so running it on the loop would tax every interactive request.
     """
-    result = _stage2_score_result(
+    result = await asyncio.to_thread(
+        _stage2_score_result,
         title,
         description_html,
         target,
@@ -354,7 +316,7 @@ def score_and_upsert(
         excluded_by_prefilter=excluded_by_prefilter,
     )
 
-    return _upsert_score(
+    return await _upsert_score(
         supabase,
         job_posting_id=job_posting_id,
         target_id=target.id,
@@ -367,53 +329,6 @@ def score_and_upsert(
         promising=promising,
         phase1_confidence=phase1_confidence,
         gated=gated,
-    )
-
-
-async def score_and_upsert_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    title: str,
-    description_html: str,
-    target: JobTarget,
-    parsed_jd: ParsedJD | None = None,
-    excluded_by_prefilter: bool = False,
-    promising: bool | None = None,
-    phase1_confidence: int | None = None,
-) -> JobTargetScore:
-    """The poller's seam twin of :func:`score_and_upsert` (#57 slice 2):
-    identical Stage 2 compute (:func:`_stage2_score_result`), with the upsert
-    routed through :func:`app.services.db_write.poll_db_write` — see that
-    docstring for backend selection. Service-role only; the ``gated`` path is
-    user-client-only and never runs in the poller. Slice 4 (#57) collapses
-    the pair once the sync callers migrate.
-
-    Compute in the executor, IO on the loop — see
-    :func:`score_title_and_upsert_poll` for why (full-JD scoring is the
-    heaviest per-row compute in the cycle).
-    """
-    result = await asyncio.to_thread(
-        _stage2_score_result,
-        title,
-        description_html,
-        target,
-        parsed_jd=parsed_jd,
-        excluded_by_prefilter=excluded_by_prefilter,
-    )
-
-    return await _upsert_score_poll(
-        supabase,
-        job_posting_id=job_posting_id,
-        target_id=target.id,
-        score=result.score,
-        breakdown=result.breakdown,
-        matched_keywords=result.matched_keywords,
-        excluded=result.excluded,
-        scoring_status="stage2",
-        scored_profile_version=target.profile_version,
-        promising=promising,
-        phase1_confidence=phase1_confidence,
     )
 
 

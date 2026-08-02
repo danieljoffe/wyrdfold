@@ -154,7 +154,7 @@ class TestManualJobEndpoint:
             captured["gated"] = kwargs.get("gated")
             return None
 
-        monkeypatch.setattr(job_ingest, "score_and_upsert", fake_score)
+        monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(side_effect=fake_score))
 
         mock_service = MagicMock()
         mock_service.table.return_value.upsert.return_value.execute = MagicMock(
