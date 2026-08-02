@@ -2547,9 +2547,11 @@ async def add_job_to_target(
     # target, which is insufficient for a SHARED, ownerless target catalog (a
     # follower could tamper with co-followers' scores). So all score writes go on
     # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
-    # branch), and OWNERSHIP is enforced in the API above. ``score_and_upsert`` is
-    # the shared SYNC interactive scorer (also the poller-adjacent job_ingest
-    # path), so drive it + the follow-up writes off the loop via ``to_thread``.
+    # branch), and OWNERSHIP is enforced in the API above. ``score_and_upsert``
+    # is the shared async scorer (#57 — the same one the poller and job_ingest
+    # use), so it's awaited directly; the remaining sync service-role calls here
+    # (``get_target`` and the follow-up ``user_set_scores_included`` / 'saved'
+    # writes) stay off the loop via ``to_thread``.
     service_supabase = get_supabase()
     target = await asyncio.to_thread(get_target, service_supabase, body.target_id)
     if target is None:  # catalog row vanished between the two reads — defensive
@@ -2560,8 +2562,7 @@ async def add_job_to_target(
     # but with auth.uid() NULL it takes the function's service-role-exempt branch
     # (the RPC isn't authenticated-executable post-lockdown — see above).
     try:
-        result = await asyncio.to_thread(
-            score_and_upsert,
+        result = await score_and_upsert(
             service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",

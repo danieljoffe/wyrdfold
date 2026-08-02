@@ -113,12 +113,16 @@ def _make_supabase_mock(
 # ---------------------------------------------------------------------------
 
 
-def test_score_and_upsert_calls_upsert_with_correct_shape() -> None:
+@pytest.mark.asyncio
+async def test_score_and_upsert_calls_upsert_with_correct_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seam_sync_fallback(monkeypatch)
     row = _upserted_score_row()
     supabase = _make_supabase_mock(upsert_data=[row])
     target = _target(core={"React": 3, "TypeScript": 3})
 
-    result = score_and_upsert(
+    result = await score_and_upsert(
         supabase,
         job_posting_id="job-1",
         title="Senior Frontend Engineer",
@@ -132,12 +136,16 @@ def test_score_and_upsert_calls_upsert_with_correct_shape() -> None:
     supabase.table.assert_any_call("scores")
 
 
-def test_score_and_upsert_raises_on_empty_response() -> None:
+@pytest.mark.asyncio
+async def test_score_and_upsert_raises_on_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seam_sync_fallback(monkeypatch)
     supabase = _make_supabase_mock(upsert_data=[])
     target = _target(core={"React": 3})
 
     with pytest.raises(RuntimeError, match="Failed to upsert"):
-        score_and_upsert(
+        await score_and_upsert(
             supabase,
             job_posting_id="job-1",
             title="Engineer",
@@ -146,18 +154,22 @@ def test_score_and_upsert_raises_on_empty_response() -> None:
         )
 
 
-def test_score_and_upsert_excluded_by_prefilter_forces_true() -> None:
+@pytest.mark.asyncio
+async def test_score_and_upsert_excluded_by_prefilter_forces_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When the caller signals a prefilter rejection, the upserted row
     must carry ``excluded=True`` regardless of what the keyword scorer
     decided. This is the contract the poller relies on so that re-scores
     preserve cosine exclusions.
     """
+    _seam_sync_fallback(monkeypatch)
     supabase = _make_supabase_mock(upsert_data=[_upserted_score_row()])
     # A target with NO negative keywords — the scorer would normally
     # leave ``excluded=False`` for any input.
     target = _target(core={"React": 3})
 
-    score_and_upsert(
+    await score_and_upsert(
         supabase,
         job_posting_id="job-1",
         title="Pharmacy Technician",
@@ -170,15 +182,19 @@ def test_score_and_upsert_excluded_by_prefilter_forces_true() -> None:
     assert payload["excluded"] is True
 
 
-def test_score_and_upsert_excluded_by_prefilter_false_preserves_scorer() -> None:
+@pytest.mark.asyncio
+async def test_score_and_upsert_excluded_by_prefilter_false_preserves_scorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``excluded_by_prefilter=False`` is the default and must not change
     the scorer's verdict — negative keyword matches still exclude the row.
     """
+    _seam_sync_fallback(monkeypatch)
     supabase = _make_supabase_mock(upsert_data=[_upserted_score_row()])
     # ``junior`` is in the negative list (see ``_target`` fixture).
     target = _target(core={"React": 3})
 
-    score_and_upsert(
+    await score_and_upsert(
         supabase,
         job_posting_id="job-1",
         title="Junior React Developer",
@@ -762,15 +778,15 @@ def _score_row(
 
 
 # ---------------------------------------------------------------------------
-# Async-seam poll variants (#57 slice 2)
+# Async DB seam (#57)
 #
-# The ``*_poll`` functions are the poller's seam twins of the sync originals:
-# identical compute + payload, with the DB hop routed through
-# ``app.services.db_write.poll_db_write`` / ``poll_db_read``. These tests
-# mirror tests/test_db_write.py's recorder pattern — a chainable query-builder
+# ``score_and_upsert`` / ``score_title_and_upsert`` (and the surviving
+# ``mark_complete_poll`` twin) route their DB hop through
+# ``app.services.db_write.poll_db_write`` — async-on-loop with a
+# sync-in-thread fallback when the async client is absent. These tests mirror
+# tests/test_db_write.py's recorder pattern — a chainable query-builder
 # stand-in that records ops and answers ``execute()`` from a queue, in a sync
-# and an async flavour. The drift guards pin the sync/poll pairs together
-# until #57 slice 4 collapses them.
+# and an async flavour — so each backend selection is pinned.
 # ---------------------------------------------------------------------------
 
 
@@ -889,19 +905,19 @@ def _seam_flag_on(monkeypatch: pytest.MonkeyPatch, async_client: _AsyncSeamClien
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
 
 
-# ---- score_title_and_upsert_poll -------------------------------------------
+# ---- score_title_and_upsert -------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_score_title_and_upsert_poll_flag_off_uses_sync_client(
+async def test_score_title_and_upsert_flag_off_uses_sync_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from app.services.target_scoring import score_title_and_upsert_poll
+    from app.services.target_scoring import score_title_and_upsert
 
     lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
 
-    result = await score_title_and_upsert_poll(
+    result = await score_title_and_upsert(
         sync_client,  # type: ignore[arg-type]
         job_posting_id="job-1",
         title="Senior React Engineer",
@@ -917,16 +933,16 @@ async def test_score_title_and_upsert_poll_flag_off_uses_sync_client(
 
 
 @pytest.mark.asyncio
-async def test_score_title_and_upsert_poll_flag_on_uses_async_client(
+async def test_score_title_and_upsert_flag_on_uses_async_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from app.services.target_scoring import score_title_and_upsert_poll
+    from app.services.target_scoring import score_title_and_upsert
 
     async_client = _AsyncSeamClient(responses=[[_upserted_score_row(score=41)]])
     _seam_flag_on(monkeypatch, async_client)
     sync_client = _SyncSeamClient()
 
-    result = await score_title_and_upsert_poll(
+    result = await score_title_and_upsert(
         sync_client,  # type: ignore[arg-type]
         job_posting_id="job-1",
         title="Senior React Engineer",
@@ -946,17 +962,17 @@ async def test_score_title_and_upsert_poll_flag_on_uses_async_client(
 
 
 @pytest.mark.asyncio
-async def test_score_title_and_upsert_poll_no_match_skips_write(
+async def test_score_title_and_upsert_no_match_skips_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Same skip contract as the sync original: no keyword match and no
     exclusion -> ``None`` and zero DB traffic on either backend."""
-    from app.services.target_scoring import score_title_and_upsert_poll
+    from app.services.target_scoring import score_title_and_upsert
 
     lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient()
 
-    result = await score_title_and_upsert_poll(
+    result = await score_title_and_upsert(
         sync_client,  # type: ignore[arg-type]
         job_posting_id="job-1",
         title="Pharmacy Technician",
@@ -969,19 +985,19 @@ async def test_score_title_and_upsert_poll_no_match_skips_write(
     assert lookups == []  # no match → write skipped before the seam is reached
 
 
-# ---- score_and_upsert_poll --------------------------------------------------
+# ---- score_and_upsert --------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_score_and_upsert_poll_flag_off_uses_sync_client(
+async def test_score_and_upsert_flag_off_uses_sync_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from app.services.target_scoring import score_and_upsert_poll
+    from app.services.target_scoring import score_and_upsert
 
     lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
 
-    result = await score_and_upsert_poll(
+    result = await score_and_upsert(
         sync_client,  # type: ignore[arg-type]
         job_posting_id="job-1",
         title="Senior Frontend Engineer",
@@ -997,16 +1013,16 @@ async def test_score_and_upsert_poll_flag_off_uses_sync_client(
 
 
 @pytest.mark.asyncio
-async def test_score_and_upsert_poll_flag_on_uses_async_client(
+async def test_score_and_upsert_flag_on_uses_async_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from app.services.target_scoring import score_and_upsert_poll
+    from app.services.target_scoring import score_and_upsert
 
     async_client = _AsyncSeamClient(responses=[[_upserted_score_row()]])
     _seam_flag_on(monkeypatch, async_client)
     sync_client = _SyncSeamClient()
 
-    result = await score_and_upsert_poll(
+    result = await score_and_upsert(
         sync_client,  # type: ignore[arg-type]
         job_posting_id="job-1",
         title="Senior Frontend Engineer",
@@ -1029,115 +1045,6 @@ async def test_score_and_upsert_poll_flag_on_uses_async_client(
     assert payload["promising"] is False
     assert payload["phase1_confidence"] == 91
     assert async_client.op("upsert")[2] == {"on_conflict": "job_posting_id,target_id"}
-
-
-@pytest.mark.asyncio
-async def test_score_and_upsert_poll_raises_on_empty_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Empty upsert rows raise exactly like the sync ``_upsert_score``."""
-    from app.services.target_scoring import score_and_upsert_poll
-
-    _seam_sync_fallback(monkeypatch)
-    sync_client = _SyncSeamClient()  # queue empty -> execute() yields data=[]
-
-    with pytest.raises(RuntimeError, match="Failed to upsert"):
-        await score_and_upsert_poll(
-            sync_client,  # type: ignore[arg-type]
-            job_posting_id="job-1",
-            title="Engineer",
-            description_html="<p>React.</p>",
-            target=_target(core={"React": 3}),
-        )
-
-
-# ---- Drift guards: poll payloads must equal the sync originals' -------------
-
-
-@pytest.mark.asyncio
-async def test_score_and_upsert_poll_payload_matches_sync(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DRIFT GUARD (#57): for identical inputs — including the Phase 1
-    columns — the poll variant must upsert the *identical* payload dict the
-    sync original does (modulo the per-call ``updated_at`` stamp), with the
-    same conflict target. Pins the pair together until slice 4 deletes one.
-    """
-    from app.services.target_scoring import score_and_upsert_poll
-
-    _seam_sync_fallback(monkeypatch)
-    kwargs: dict[str, Any] = {
-        "job_posting_id": "job-1",
-        "title": "Senior Frontend Engineer",
-        "description_html": "<p>React and TypeScript required.</p>",
-        "target": _target(core={"React": 3, "TypeScript": 3}),
-        "excluded_by_prefilter": False,
-        "promising": True,
-        "phase1_confidence": 88,
-    }
-
-    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
-    score_and_upsert(sync_client, **kwargs)  # type: ignore[arg-type]
-
-    poll_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
-    await score_and_upsert_poll(poll_client, **kwargs)  # type: ignore[arg-type]
-
-    sync_payload = sync_client.upsert_payload()
-    poll_payload = poll_client.upsert_payload()
-    assert sync_payload.pop("updated_at")
-    assert poll_payload.pop("updated_at")
-    assert sync_payload == poll_payload
-    # The interesting keys really are present (not vacuously equal-by-absence).
-    assert sync_payload["promising"] is True
-    assert sync_payload["phase1_confidence"] == 88
-    assert sync_payload["scoring_status"] == "stage2"
-    assert sync_payload["recency_score"] == sync_payload["score"]
-    assert sync_client.op("upsert")[2] == poll_client.op("upsert")[2]
-
-
-@pytest.mark.asyncio
-async def test_score_title_and_upsert_poll_payload_matches_sync(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DRIFT GUARD (#57), Stage 1 flavour: identical title inputs produce
-    identical upsert payloads (modulo ``updated_at``) — including the
-    *absence* of the conditional Phase 1 keys."""
-    from app.services.target_scoring import score_title_and_upsert, score_title_and_upsert_poll
-
-    _seam_sync_fallback(monkeypatch)
-    target = _target(core={"React": 3})
-
-    sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
-    assert (
-        score_title_and_upsert(
-            sync_client,  # type: ignore[arg-type]
-            job_posting_id="job-1",
-            title="Senior React Engineer",
-            target=target,
-        )
-        is not None
-    )
-
-    poll_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
-    assert (
-        await score_title_and_upsert_poll(
-            poll_client,  # type: ignore[arg-type]
-            job_posting_id="job-1",
-            title="Senior React Engineer",
-            target=target,
-        )
-        is not None
-    )
-
-    sync_payload = sync_client.upsert_payload()
-    poll_payload = poll_client.upsert_payload()
-    assert sync_payload.pop("updated_at")
-    assert poll_payload.pop("updated_at")
-    assert sync_payload == poll_payload
-    assert sync_payload["scoring_status"] == "stage1"
-    assert "promising" not in sync_payload  # None -> key omitted, both paths
-    assert "phase1_confidence" not in sync_payload
-    assert sync_client.op("upsert")[2] == poll_client.op("upsert")[2]
 
 
 # ---- mark_complete_poll ------------------------------------------------------
