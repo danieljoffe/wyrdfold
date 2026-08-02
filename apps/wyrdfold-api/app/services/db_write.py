@@ -1,16 +1,14 @@
 """Poll-cycle DB routing — the async/sync seam + the write-herd cap.
 
 Every write the poll cycle issues routes through :func:`poll_db_write`, and
-every direct read through :func:`poll_db_read`. Both pick the backend by the
-``POLLER_ASYNC_DB`` flag:
-
-- **flag on + async client up** — run the query natively on the event loop via
-  the pooled HTTP/2 ``AsyncClient`` (#225). Async I/O doesn't occupy an
-  executor thread, so the poll's DB fan-out stops starving the threads that
-  interactive requests need — the #57 regression this targets.
-- **otherwise** — the #107 path: the sync client in a thread. This is also the
-  fail-safe: a missing async client silently falls back to sync, so the flag
-  never drops a query.
+every direct read through :func:`poll_db_read`. Both run natively on the event
+loop via the pooled HTTP/2 ``AsyncClient`` (#225) — async I/O doesn't occupy an
+executor thread, so the poll's DB fan-out stops starving the threads that
+interactive requests need (the #57 regression this targets). The
+``POLLER_ASYNC_DB`` flag that once gated this was removed in slice 4: the poll
+cycle is unconditionally async now. FAIL-SAFE: when the async client isn't up,
+the call silently falls back to the sync client in a thread (the #107 path), so
+a query is never dropped — in practice prod always has the async client.
 
 Writes additionally retry transient transport blips (idempotent writes only —
 see :mod:`app.services.supabase_retry`) and are bounded by
@@ -30,7 +28,6 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from app.config import settings
 from app.services.supabase_retry import execute_with_retry, execute_with_retry_sync
 from app.supabase_pool import get_async_supabase
 
@@ -73,7 +70,7 @@ async def poll_db_write(
     *,
     label: str,
 ) -> Any:
-    """Execute one poll-cycle write, async-on-loop or sync-in-thread by flag.
+    """Execute one poll-cycle write, async-on-loop (sync-in-thread fallback).
 
     ``build(client)`` receives a supabase client — the sync ``Client`` passed
     in ``supabase`` or the pooled ``AsyncClient`` — and returns a *built,
@@ -88,11 +85,13 @@ async def poll_db_write(
     so use this only for idempotent writes (the poll's upserts / stable-WHERE
     updates all are).
     """
-    if settings.poller_async_db:
-        async_sb = get_async_supabase()
-        if async_sb is not None:
-            async with _db_write_semaphore():
-                return await execute_with_retry(build(async_sb).execute, label=label)
+    async_sb = get_async_supabase()
+    if async_sb is not None:
+        async with _db_write_semaphore():
+            return await execute_with_retry(build(async_sb).execute, label=label)
+    # Fail-safe only: prod always has the async client (the flag was removed in
+    # #57 slice 4 — the poll cycle is unconditionally async now). This sync path
+    # survives for tests/local runs that don't init the async client.
     return await db_to_thread(lambda: execute_with_retry_sync(build(supabase).execute, label=label))
 
 
@@ -103,7 +102,7 @@ async def poll_db_read(
     label: str,
     retry_sync: bool = False,
 ) -> Any:
-    """Execute one poll-cycle read, async-on-loop or sync-in-thread by flag.
+    """Execute one poll-cycle read, async-on-loop (sync-in-thread fallback).
 
     Same ``build(client)`` contract as :func:`poll_db_write`, minus the write
     semaphore: poll reads never held it on the sync path (only the write herd
@@ -114,15 +113,14 @@ async def poll_db_read(
 
     ``retry_sync`` mirrors the pre-seam behavior of each call site: the few
     reads that already wrapped ``execute_with_retry_sync`` keep their retry on
-    the sync path; the rest stay bare so the flag-off path is byte-for-byte
+    the sync path; the rest stay bare so the sync-fallback path is byte-for-byte
     today's behavior. The async path always retries — a re-issued read is
     harmless and the pooled h2 connection is where transient stream drops
     live.
     """
-    if settings.poller_async_db:
-        async_sb = get_async_supabase()
-        if async_sb is not None:
-            return await execute_with_retry(build(async_sb).execute, label=label)
+    async_sb = get_async_supabase()
+    if async_sb is not None:
+        return await execute_with_retry(build(async_sb).execute, label=label)
     if retry_sync:
         return await asyncio.to_thread(
             lambda: execute_with_retry_sync(build(supabase).execute, label=label)

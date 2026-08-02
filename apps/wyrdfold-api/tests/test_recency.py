@@ -245,7 +245,6 @@ class _AsyncSeamClient:
 
 
 def _flag_on(monkeypatch: pytest.MonkeyPatch, async_client: _AsyncSeamClient) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
 
 
@@ -796,7 +795,6 @@ async def test_refresh_poll_read_chunks_stay_url_safe(
 
             return _H()
 
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: _Client())
 
     ids = [f"00000000-0000-4000-8000-{i:012d}" for i in range(400)]

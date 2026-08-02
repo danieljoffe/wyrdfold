@@ -215,15 +215,6 @@ class Settings(BaseSettings):
     # 40 = the "solid match" band (aligns with the #89 pre-scan cutoff).
     default_list_min_score: int = Field(default=40, ge=0, le=100)
 
-    # Poller async DB migration (#57). When True, hot poll-cycle DB writes run
-    # on the native async service-role client (HTTP/2, its own bounded pool)
-    # instead of the sync client in an ``asyncio.to_thread`` — so the poll's
-    # write herd stops competing for the shared ~40-thread executor with
-    # interactive requests. FAIL-SAFE: if the async client isn't initialised the
-    # call falls back to the sync/thread path, never dropping the write. Default
-    # off; flipped per the migration rollout after the before/after load test.
-    poller_async_db: bool = False
-
     # Synthetic "mock" board provider for local load testing (#57). When True,
     # a source row with ``provider='mock'`` synthesizes a deterministic job
     # feed in-process (no network) so a poll burst is reproducible without

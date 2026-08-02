@@ -869,14 +869,15 @@ class _AsyncSeamClient(_SeamRecorder):
         return self._result()
 
 
-def _seam_flag_off(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Force the sync seam path. Returns the async-client lookup log — flag
-    off means ``get_async_supabase`` must never even be consulted, so the
-    list must stay empty."""
+def _seam_sync_fallback(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Force the sync seam fallback by making the async client absent (#57
+    slice 4 removed the POLLER_ASYNC_DB flag; the seam is unconditionally async
+    now, falling back to sync only when ``get_async_supabase`` returns None).
+    Returns the async-client lookup log: the seam DOES consult it (recording the
+    lookup) but it returns None, so the sync path takes the call."""
     from app.services import db_write
 
     lookups: list[int] = []
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: lookups.append(1))
     return lookups
 
@@ -885,7 +886,6 @@ def _seam_flag_on(monkeypatch: pytest.MonkeyPatch, async_client: _AsyncSeamClien
     """Route the seam's async path onto ``async_client``."""
     from app.services import db_write
 
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
 
 
@@ -898,7 +898,7 @@ async def test_score_title_and_upsert_poll_flag_off_uses_sync_client(
 ) -> None:
     from app.services.target_scoring import score_title_and_upsert_poll
 
-    lookups = _seam_flag_off(monkeypatch)
+    lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
 
     result = await score_title_and_upsert_poll(
@@ -911,7 +911,7 @@ async def test_score_title_and_upsert_poll_flag_off_uses_sync_client(
     assert result is not None
     assert result.job_posting_id == "job-1"
     assert sync_client.executed == 1  # sync client took the write
-    assert lookups == []  # flag off: async client never consulted
+    assert lookups == [1]  # async consulted, returned None → sync fallback
     assert ("table", "scores") in sync_client.ops
     assert sync_client.op("upsert")[2] == {"on_conflict": "job_posting_id,target_id"}
 
@@ -953,7 +953,7 @@ async def test_score_title_and_upsert_poll_no_match_skips_write(
     exclusion -> ``None`` and zero DB traffic on either backend."""
     from app.services.target_scoring import score_title_and_upsert_poll
 
-    lookups = _seam_flag_off(monkeypatch)
+    lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient()
 
     result = await score_title_and_upsert_poll(
@@ -966,7 +966,7 @@ async def test_score_title_and_upsert_poll_no_match_skips_write(
     assert result is None
     assert sync_client.executed == 0
     assert sync_client.ops == []
-    assert lookups == []
+    assert lookups == []  # no match → write skipped before the seam is reached
 
 
 # ---- score_and_upsert_poll --------------------------------------------------
@@ -978,7 +978,7 @@ async def test_score_and_upsert_poll_flag_off_uses_sync_client(
 ) -> None:
     from app.services.target_scoring import score_and_upsert_poll
 
-    lookups = _seam_flag_off(monkeypatch)
+    lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
 
     result = await score_and_upsert_poll(
@@ -991,7 +991,7 @@ async def test_score_and_upsert_poll_flag_off_uses_sync_client(
 
     assert result.job_posting_id == "job-1"
     assert sync_client.executed == 1
-    assert lookups == []
+    assert lookups == [1]
     assert ("table", "scores") in sync_client.ops
     assert sync_client.upsert_payload()["scoring_status"] == "stage2"
 
@@ -1038,7 +1038,7 @@ async def test_score_and_upsert_poll_raises_on_empty_response(
     """Empty upsert rows raise exactly like the sync ``_upsert_score``."""
     from app.services.target_scoring import score_and_upsert_poll
 
-    _seam_flag_off(monkeypatch)
+    _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient()  # queue empty -> execute() yields data=[]
 
     with pytest.raises(RuntimeError, match="Failed to upsert"):
@@ -1065,7 +1065,7 @@ async def test_score_and_upsert_poll_payload_matches_sync(
     """
     from app.services.target_scoring import score_and_upsert_poll
 
-    _seam_flag_off(monkeypatch)
+    _seam_sync_fallback(monkeypatch)
     kwargs: dict[str, Any] = {
         "job_posting_id": "job-1",
         "title": "Senior Frontend Engineer",
@@ -1104,7 +1104,7 @@ async def test_score_title_and_upsert_poll_payload_matches_sync(
     *absence* of the conditional Phase 1 keys."""
     from app.services.target_scoring import score_title_and_upsert, score_title_and_upsert_poll
 
-    _seam_flag_off(monkeypatch)
+    _seam_sync_fallback(monkeypatch)
     target = _target(core={"React": 3})
 
     sync_client = _SyncSeamClient(responses=[[_upserted_score_row()]])
@@ -1149,13 +1149,13 @@ async def test_mark_complete_poll_flag_off_uses_sync_client(
 ) -> None:
     from app.services.target_scoring import mark_complete_poll
 
-    lookups = _seam_flag_off(monkeypatch)
+    lookups = _seam_sync_fallback(monkeypatch)
     sync_client = _SyncSeamClient()
 
     await mark_complete_poll(sync_client, "job-9")  # type: ignore[arg-type]
 
     assert sync_client.executed == 1
-    assert lookups == []
+    assert lookups == [1]
     assert ("table", "scores") in sync_client.ops
     assert ("update", {"scoring_status": "complete"}) in sync_client.ops
     assert ("eq", "job_posting_id", "job-9") in sync_client.ops

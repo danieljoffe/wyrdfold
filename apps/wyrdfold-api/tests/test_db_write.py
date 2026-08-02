@@ -157,7 +157,6 @@ def _scores_update(c: Any) -> Any:
 async def test_flag_on_with_async_client_writes_on_the_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncClient()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
     sync_client = _SyncClient()
@@ -175,7 +174,6 @@ async def test_flag_on_with_async_client_writes_on_the_loop(
 async def test_flag_on_but_no_async_client_falls_back_to_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)  # not up
     sync_client = _SyncClient()
 
@@ -186,10 +184,9 @@ async def test_flag_on_but_no_async_client_falls_back_to_sync(
 
 
 @pytest.mark.asyncio
-async def test_flag_off_uses_sync_and_never_consults_async_client(
+async def test_no_async_client_falls_back_to_sync_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
     looked_up: list[int] = []
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: looked_up.append(1))
     sync_client = _SyncClient()
@@ -197,14 +194,14 @@ async def test_flag_off_uses_sync_and_never_consults_async_client(
     await db_write.poll_db_write(sync_client, _scores_update, label="t")
 
     assert sync_client.executed == 1
-    assert looked_up == []  # async client not even looked up when flag is off
+    assert looked_up == [1]  # async consulted, returned None → sync fallback took the write
 
 
 @pytest.mark.asyncio
 async def test_sync_path_retries_transient_blip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
     sync_client = _SyncClient(fail_times=1)
 
     resp = await db_write.poll_db_write(sync_client, _scores_update, label="t")
@@ -217,7 +214,6 @@ async def test_sync_path_retries_transient_blip(
 async def test_async_path_retries_transient_blip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncClient(fail_times=1)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
 
@@ -236,7 +232,6 @@ def _sources_select(c: Any) -> Any:
 
 @pytest.mark.asyncio
 async def test_read_flag_on_uses_async_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncClient()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
     sync_client = _SyncClient()
@@ -252,7 +247,6 @@ async def test_read_flag_on_uses_async_client(monkeypatch: pytest.MonkeyPatch) -
 async def test_read_flag_on_no_async_client_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
     sync_client = _SyncClient()
 
@@ -269,7 +263,7 @@ async def test_read_flag_off_sync_no_retry_by_default(
     """Flag-off reads must be byte-for-byte today's behavior: bare execute in
     a thread, NO retry — a transient blip propagates to the caller exactly as
     the pre-seam ``asyncio.to_thread(query.execute)`` did."""
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
     sync_client = _SyncClient(fail_times=1)
 
     with pytest.raises(httpx.RemoteProtocolError):
@@ -283,7 +277,7 @@ async def test_read_flag_off_retry_sync_opt_in(
 ) -> None:
     """Call sites that already wrapped their read in the sync retry helper
     keep that behavior via ``retry_sync=True``."""
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
     sync_client = _SyncClient(fail_times=1)
 
     resp = await db_write.poll_db_read(sync_client, _sources_select, label="r", retry_sync=True)
@@ -294,7 +288,6 @@ async def test_read_flag_off_retry_sync_opt_in(
 
 @pytest.mark.asyncio
 async def test_read_flag_on_always_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncClient(fail_times=1)
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
 
@@ -311,7 +304,7 @@ async def test_read_does_not_hold_the_write_semaphore(
     """A read must proceed even when the write herd has the semaphore fully
     saturated — reads never queued behind writes pre-seam, and coupling them
     would stretch the cycle."""
-    monkeypatch.setattr(db_write.settings, "poller_async_db", False)
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
     sem = db_write._db_write_semaphore()
     holds = [await sem.acquire() for _ in range(db_write.DB_WRITE_CONCURRENCY)]
     try:
