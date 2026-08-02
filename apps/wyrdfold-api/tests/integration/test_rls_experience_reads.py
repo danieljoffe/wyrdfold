@@ -74,7 +74,7 @@ def test_prose_create_version_via_user_client_writes_own(
     """The production write path (`prose.create_version`) over the JWT-bound
     user client succeeds for the caller's own user_id — the RLS INSERT policy
     (WITH CHECK auth.uid()=user_id) permits it. This is the write side of the
-    Phase-1 RLS migration: the prose endpoints now use `get_user_supabase`.
+    Phase-1 RLS migration: the prose endpoints now use `get_async_user_supabase`.
     """
     from app.services.experience import prose
 

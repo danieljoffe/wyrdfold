@@ -249,6 +249,52 @@ def total_spend(
     return round(float(cast(Any, raw)), 6)
 
 
+async def _total_spend_python_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    since: datetime | None,
+) -> float:
+    """Async mirror of :func:`_total_spend_python` (#57 PR-F). Same select+sum
+    fallback, awaited on the pooled async user client."""
+    query = supabase.table(TABLE).select("cost_usd")
+    query = query.eq("user_id", resolve_owner(user_id))
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = await query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return round(sum(float(r["cost_usd"]) for r in rows), 6)
+
+
+async def total_spend_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    since: datetime | None = None,
+) -> float:
+    """Async mirror of :func:`total_spend` (#57 PR-F).
+
+    The user-scoped spend read for an ``async def`` handler on the pooled async
+    RLS user client — same ``total_spend_since`` RPC-first / client-side-sum
+    fallback and same rounding as the sync version, awaited instead of run in a
+    threadpool. The sync :func:`total_spend` stays for the budget-gate / payer
+    paths."""
+    try:
+        resp = await supabase.rpc(
+            "total_spend_since",
+            {
+                "p_user_id": resolve_owner(user_id),
+                "p_since": since.isoformat() if since is not None else None,
+            },
+        ).execute()
+    except Exception:
+        _log.debug("total_spend_since RPC unavailable, falling back to client-side sum")
+        return await _total_spend_python_async(supabase, user_id, since)
+
+    raw = resp.data
+    if raw is None:
+        return 0.0
+    return round(float(cast(Any, raw)), 6)
+
+
 def _total_billable_spend_python(
     supabase: Client,
     user_id: str | None,
@@ -298,6 +344,62 @@ def total_billable_spend(
     except Exception:
         _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
         return _total_billable_spend_python(supabase, user_id, since, excluded_purposes)
+
+    raw = resp.data
+    if raw is None:
+        return 0.0
+    return round(float(cast(Any, raw)), 6)
+
+
+async def _total_billable_spend_python_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    since: datetime | None,
+    excluded_purposes: tuple[str, ...],
+) -> float:
+    """Async mirror of :func:`_total_billable_spend_python` (#57 PR-F). Same
+    select + purpose-filter + sum fallback, awaited on the async user client."""
+    query = supabase.table(TABLE).select("cost_usd,purpose")
+    query = query.eq("user_id", resolve_owner(user_id))
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = await query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    excluded = set(excluded_purposes)
+    return round(
+        sum(float(r["cost_usd"]) for r in rows if r.get("purpose") not in excluded),
+        6,
+    )
+
+
+async def total_billable_spend_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    since: datetime | None = None,
+    *,
+    excluded_purposes: tuple[str, ...],
+) -> float:
+    """Async mirror of :func:`total_billable_spend` (#57 PR-F).
+
+    The user-scoped billable-spend read for an ``async def`` handler on the
+    pooled async RLS user client — same ``total_billable_spend_since`` RPC-first
+    / client-side fallback and rounding as the sync version, awaited instead of
+    threadpooled. The sync :func:`total_billable_spend` stays for the budget-gate
+    paths."""
+    try:
+        resp = await supabase.rpc(
+            "total_billable_spend_since",
+            {
+                "p_user_id": resolve_owner(user_id),
+                "p_since": since.isoformat() if since is not None else None,
+                "p_excluded_purposes": list(excluded_purposes),
+            },
+        ).execute()
+    except Exception:
+        _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
+        return await _total_billable_spend_python_async(
+            supabase, user_id, since, excluded_purposes
+        )
 
     raw = resp.data
     if raw is None:

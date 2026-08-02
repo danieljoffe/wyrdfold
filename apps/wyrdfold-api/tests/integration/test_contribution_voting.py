@@ -10,11 +10,11 @@ shared-profile merge — restored if up-votes later rescue it.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 
 import pytest
 from postgrest.exceptions import APIError
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.targets import CategoryProfile, ScoringProfile
 from app.services.targets import crud, votes
@@ -51,8 +51,9 @@ def target_with_contribution(service_client: Client) -> Iterator[tuple[str, str]
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
-def test_votes_are_anonymous_and_own_row_only(
+async def test_votes_are_anonymous_and_own_row_only(
     user_client_factory: Callable[[str], Client],
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     two_seeded_users: tuple[str, str],
     target_with_contribution: tuple[str, str],
 ) -> None:
@@ -61,8 +62,14 @@ def test_votes_are_anonymous_and_own_row_only(
     a = user_client_factory(uid_a)
     b = user_client_factory(uid_b)
 
-    votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=-1)
-    votes.set_user_vote(b, reference_jd_id=ref_id, user_id=uid_b, value=-1)
+    # The vote write rides the ASYNC RLS user client now (#57 PR-F); the sync
+    # clients above still serve the raw-read / spoof checks below.
+    await votes.set_user_vote(
+        await async_user_client_factory(uid_a), reference_jd_id=ref_id, user_id=uid_a, value=-1
+    )
+    await votes.set_user_vote(
+        await async_user_client_factory(uid_b), reference_jd_id=ref_id, user_id=uid_b, value=-1
+    )
 
     # A sees their own vote...
     assert votes.get_user_vote(a, reference_jd_id=ref_id, user_id=uid_a) == -1
@@ -103,26 +110,26 @@ def test_recompute_rpc_is_service_role_only(
         ).execute()
 
 
-def test_quorum_suppresses_and_upvote_rescues(
+async def test_quorum_suppresses_and_upvote_rescues(
     service_client: Client,
-    user_client_factory: Callable[[str], Client],
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     two_seeded_users: tuple[str, str],
     target_with_contribution: tuple[str, str],
 ) -> None:
     uid_a, uid_b = two_seeded_users
     target_id, ref_id = target_with_contribution
-    a = user_client_factory(uid_a)
-    b = user_client_factory(uid_b)
+    a = await async_user_client_factory(uid_a)
+    b = await async_user_client_factory(uid_b)
 
     # One down-vote: net 1 < quorum 2 -> not suppressed.
-    votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=-1)
+    await votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=-1)
     assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
         False,
         False,
     )
 
     # Second down-vote: net 2 >= quorum 2 -> suppressed (and it CHANGED).
-    votes.set_user_vote(b, reference_jd_id=ref_id, user_id=uid_b, value=-1)
+    await votes.set_user_vote(b, reference_jd_id=ref_id, user_id=uid_b, value=-1)
     assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
         True,
         True,
@@ -134,7 +141,7 @@ def test_quorum_suppresses_and_upvote_rescues(
     assert merge_reference_jds(ref_jds) == ScoringProfile()
 
     # A switches to an up-vote: net 0 < quorum -> rescued (un-suppressed).
-    votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=1)
+    await votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=1)
     assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
         False,
         True,

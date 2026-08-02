@@ -1,6 +1,6 @@
 """RLS gate for Phase 1 slice-3 — the derive / optimized-POST write path.
 
-Those endpoints (now on `get_user_supabase`) write the optimized doc THEN its
+Those endpoints (now on `get_async_user_supabase`) write the optimized doc THEN its
 embedding chunks through the JWT-bound user client. `experience_chunks` has a
 *parent-scoped* policy — a chunk is writable only if its `optimized_doc_id`
 belongs to a doc the caller owns. Prove both legs succeed for own data and that
