@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -176,9 +175,8 @@ def test_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    # #57 slice 4: the PATCH handler holds the async user client; override both
-    # (the sync one is kept harmlessly for any not-yet-converted sibling).
-    app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
+    # #57: the PATCH handler holds the async user client (the sync per-request
+    # client was retired in PR-F).
     app.dependency_overrides[get_async_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"

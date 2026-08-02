@@ -14,9 +14,9 @@ from app.config import Settings
 from app.dependencies import (
     _api_key_matches,
     enforce_llm_budget,
+    get_async_supabase_for_caller,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase_for_caller,
     refresh_jwks_cache,
     try_decode_jwt_sub_cache_only,
     verify_api_key,
@@ -543,25 +543,32 @@ def test_enforce_llm_budget_propagates_429(monkeypatch):
     assert exc.value.detail["scope"] == "hourly"
 
 
-# ---- get_supabase_for_caller (dual-auth client selection, #79 Phase 2) ----
+# ---- get_async_supabase_for_caller (dual-auth client selection, #79 P2 / #57) --
+# The sync ``get_supabase_for_caller`` was retired in #57 PR-F; these exercise the
+# async replacement (same JWT-only, RLS-scoped contract), so they ``await`` and
+# patch the async ``get_async_user_client``.
 
 
-def test_caller_client_jwt_returns_user_client(monkeypatch):
-    """A valid JWT -> the per-request RLS-enforced user client."""
+async def test_caller_client_jwt_returns_user_client(monkeypatch):
+    """A valid JWT -> the per-request RLS-enforced async user client."""
     import app.supabase_pool as pool
 
     sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_user_client", lambda token: sentinel)
+
+    async def _fake(token: str) -> MagicMock:
+        return sentinel
+
+    monkeypatch.setattr(pool, "get_async_user_client", _fake)
     s = Settings(
         wyrdfold_api_key="testkey",
         supabase_url=TEST_SUPABASE_URL,
         supabase_anon_key="anon",
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_supabase_for_caller(req, s=s) is sentinel
+    assert await get_async_supabase_for_caller(req, s=s) is sentinel
 
 
-def test_caller_client_jwt_without_anon_key_503():
+async def test_caller_client_jwt_without_anon_key_503():
     """Valid JWT but the user client isn't configured -> 503, never a
     silent fall-back to the service-role client (that would bypass RLS)."""
     s = Settings(
@@ -571,11 +578,11 @@ def test_caller_client_jwt_without_anon_key_503():
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=s)
+        await get_async_supabase_for_caller(req, s=s)
     assert exc.value.status_code == 503
 
 
-def test_caller_client_api_key_rejected(monkeypatch):
+async def test_caller_client_api_key_rejected(monkeypatch):
     """#192 defense-in-depth: an api-key caller (no bearer) gets NO client —
     401, never the service-role client. A leaked shared key can't obtain an
     RLS-bypassing client on a user route."""
@@ -584,24 +591,24 @@ def test_caller_client_api_key_rejected(monkeypatch):
     monkeypatch.setattr(pool, "get_supabase_pool", lambda: MagicMock())
     req = _make_request()  # x-api-key is no longer even read by this dep
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_caller_client_invalid_jwt_401():
+async def test_caller_client_invalid_jwt_401():
     """A bearer that fails verification 401s — there is no api-key fall-back
     anymore (the user-data gate is JWT-only)."""
     bad = _mint(private_pem=_OTHER_PRIVATE_PEM)  # wrong signature
     req = _make_request({"authorization": f"Bearer {bad}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_caller_client_no_auth_401():
+async def test_caller_client_no_auth_401():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
 
 

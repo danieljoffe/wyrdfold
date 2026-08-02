@@ -1,8 +1,8 @@
 """User profile router — notification preferences + identity (contact) fields.
 
 All endpoints scope to the JWT subject. Both read (GET) and write
-(PATCH/POST) paths go through the per-request JWT-bound client
-(`get_user_supabase`), so Postgres RLS is the control: the
+(PATCH/POST) paths go through the per-request JWT-bound async client
+(`get_async_user_supabase`), so Postgres RLS is the control: the
 `user_profiles`/`llm_costs` policies (`auth.uid() = user_id`) enforce
 isolation even if the explicit `.eq("user_id", ...)` filter were dropped.
 Writes are covered by the `user_profiles` `ALL` policy, which permits the
@@ -28,7 +28,6 @@ from app.dependencies import (
     get_current_user_email,
     get_current_user_id,
     get_supabase,
-    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.user_profile import (
@@ -449,20 +448,15 @@ async def reset_onboarding(
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)
 async def get_llm_usage(
-    # `/llm-usage` stays on the SYNC clients (#57 slice 3 holdout): its entire
-    # DB access flows through shared sync budget/cost_log helpers
-    # (resolve_llm_quota, total_spend, total_billable_spend) that the analysis /
-    # tailor / poller verticals + enforce_llm_budget still call — converting
-    # them belongs to the LLM-budget vertical, not this one, and inlining the
-    # billing-critical quota logic here would duplicate it. The `_snapshot`
-    # nested-fn runs via `asyncio.to_thread`, so the blocking calls never touch
-    # the event loop (the #107 guard's `test_scanner_skips_nested_def_scope`).
-    supabase: Client = Depends(get_user_supabase),
+    # The user-visible spend reads run on the caller's ASYNC RLS user client
+    # (#57 PR-F) — awaited natively instead of the old ThreadPoolExecutor
+    # fan-out.
+    user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
-    # Dual-client (the analysis.py pattern): the quota RESOLUTION needs
-    # the service client — it reads user_api_keys ("who pays"), which has
-    # no authenticated grant by design. The user-visible spend queries
-    # stay on the caller's RLS client.
+    # Dual-client (the analysis.py pattern): the quota RESOLUTION needs the
+    # SYNC service client — it reads user_api_keys ("who pays"), which has no
+    # authenticated grant by design, so it stays service-role and runs via
+    # `asyncio.to_thread` (PR-G2 retires the sync service client, not this PR).
     service_supabase: Client = Depends(get_supabase),
 ) -> LlmUsageResponse:
     """The user's allowance state across all budget windows.
@@ -478,94 +472,87 @@ async def get_llm_usage(
 
     now = datetime.now(UTC)
 
-    def _snapshot() -> LlmUsageResponse:
-        from concurrent.futures import ThreadPoolExecutor
+    # Quota resolution reads user_api_keys ("who pays") on the sync service
+    # client (no authenticated grant by design); offloaded to a worker thread so
+    # its blocking round-trip never touches the loop.
+    quota = await asyncio.to_thread(budget.resolve_llm_quota, service_supabase, user_id=user_id)
+    monthly_cap = quota.monthly_cap_usd
+    month_since = now - timedelta(days=budget.MONTHLY_WINDOW_DAYS)
+    day_since = now - timedelta(hours=24)
 
-        quota = budget.resolve_llm_quota(service_supabase, user_id=user_id)
-        monthly_cap = quota.monthly_cap_usd
-        month_since = now - timedelta(days=budget.MONTHLY_WINDOW_DAYS)
-        day_since = now - timedelta(hours=24)
-
-        def _month_spend() -> float:
-            if quota.monthly_excluded_purposes:
-                return cost_log.total_billable_spend(
-                    supabase,
-                    user_id=user_id,
-                    since=month_since,
-                    excluded_purposes=quota.monthly_excluded_purposes,
-                )
-            return cost_log.total_spend(supabase, user_id=user_id, since=month_since)
-
-        def _resets_at() -> datetime | None:
-            # Approximate refill point: oldest cost row in the window + 30d.
-            oldest = cast(
-                list[dict[str, Any]],
-                supabase.table("llm_costs")
-                .select("created_at")
-                .eq("user_id", user_id)
-                .gte("created_at", month_since.isoformat())
-                .order("created_at")
-                .limit(1)
-                .execute()
-                .data
-                or [],
-            )
-            if not oldest:
-                return None
-            oldest_dt = datetime.fromisoformat(str(oldest[0]["created_at"]).replace("Z", "+00:00"))
-            return oldest_dt + timedelta(days=budget.MONTHLY_WINDOW_DAYS)
-
-        def _analysis_used() -> int:
-            return (
-                supabase.table("llm_costs")
-                # head=True → count only, no rows shipped (HEAD request).
-                .select("id", count="exact", head=True)  # type: ignore[arg-type]
-                .eq("user_id", user_id)
-                .eq("purpose", DEFAULT_PURPOSE)
-                .gte("created_at", day_since.isoformat())
-                .execute()
-                .count
-                or 0
-            )
-
-        # These five reads are independent PostgREST round-trips. Run them
-        # concurrently — sequentially they were the endpoint's bottleneck
-        # (~7-8 round-trips, ~2-3s on a heavy account even with each query at
-        # <30ms post-VACUUM). The supabase client's httpx pool is safe for
-        # concurrent reads; all five are read-only. #260
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            f_month = pool.submit(_month_spend)
-            f_resets = pool.submit(_resets_at)
-            f_analysis = pool.submit(_analysis_used)
-            f_hourly = pool.submit(
-                cost_log.total_spend,
-                supabase,
+    async def _month_spend() -> float:
+        if quota.monthly_excluded_purposes:
+            return await cost_log.total_billable_spend_async(
+                user_supabase,
                 user_id=user_id,
-                since=now - timedelta(hours=1),
+                since=month_since,
+                excluded_purposes=quota.monthly_excluded_purposes,
             )
-            f_daily = pool.submit(cost_log.total_spend, supabase, user_id=user_id, since=day_since)
-            spent_month = f_month.result()
-            resets_at = f_resets.result()
-            analysis_used = f_analysis.result()
-            hourly_spent = f_hourly.result()
-            daily_spent = f_daily.result()
+        return await cost_log.total_spend_async(user_supabase, user_id=user_id, since=month_since)
 
-        return LlmUsageResponse(
-            hourly=LlmUsageWindow(
-                spent_usd=hourly_spent,
-                limit_usd=settings.user_llm_hourly_budget_usd,
-            ),
-            daily=LlmUsageWindow(
-                spent_usd=daily_spent,
-                limit_usd=settings.user_llm_daily_budget_usd,
-            ),
-            monthly=LlmUsageWindow(spent_usd=spent_month, limit_usd=monthly_cap),
-            monthly_resets_at=resets_at,
-            analysis_daily_used=analysis_used,
-            analysis_daily_limit=settings.analysis_daily_limit,
+    async def _resets_at() -> datetime | None:
+        # Approximate refill point: oldest cost row in the window + 30d.
+        resp = (
+            await user_supabase.table("llm_costs")
+            .select("created_at")
+            .eq("user_id", user_id)
+            .gte("created_at", month_since.isoformat())
+            .order("created_at")
+            .limit(1)
+            .execute()
+        )
+        oldest = cast(list[dict[str, Any]], resp.data or [])
+        if not oldest:
+            return None
+        oldest_dt = datetime.fromisoformat(str(oldest[0]["created_at"]).replace("Z", "+00:00"))
+        return oldest_dt + timedelta(days=budget.MONTHLY_WINDOW_DAYS)
+
+    async def _analysis_used() -> int:
+        resp = (
+            await user_supabase.table("llm_costs")
+            # head=True → count only, no rows shipped (HEAD request).
+            .select("id", count="exact", head=True)  # type: ignore[arg-type]
+            .eq("user_id", user_id)
+            .eq("purpose", DEFAULT_PURPOSE)
+            .gte("created_at", day_since.isoformat())
+            .execute()
+        )
+        return resp.count or 0
+
+    async def _hourly_spend() -> float:
+        return await cost_log.total_spend_async(
+            user_supabase, user_id=user_id, since=now - timedelta(hours=1)
         )
 
-    return await asyncio.to_thread(_snapshot)
+    async def _daily_spend() -> float:
+        return await cost_log.total_spend_async(user_supabase, user_id=user_id, since=day_since)
+
+    # These five reads are independent PostgREST round-trips. Run them
+    # concurrently on the event loop (the async twins / awaited queries) —
+    # sequentially they were the endpoint's bottleneck (~7-8 round-trips,
+    # ~2-3s on a heavy account). All five are read-only. #260
+    spent_month, resets_at, analysis_used, hourly_spent, daily_spent = await asyncio.gather(
+        _month_spend(),
+        _resets_at(),
+        _analysis_used(),
+        _hourly_spend(),
+        _daily_spend(),
+    )
+
+    return LlmUsageResponse(
+        hourly=LlmUsageWindow(
+            spent_usd=hourly_spent,
+            limit_usd=settings.user_llm_hourly_budget_usd,
+        ),
+        daily=LlmUsageWindow(
+            spent_usd=daily_spent,
+            limit_usd=settings.user_llm_daily_budget_usd,
+        ),
+        monthly=LlmUsageWindow(spent_usd=spent_month, limit_usd=monthly_cap),
+        monthly_resets_at=resets_at,
+        analysis_daily_used=analysis_used,
+        analysis_daily_limit=settings.analysis_daily_limit,
+    )
 
 
 @router.delete("/account")

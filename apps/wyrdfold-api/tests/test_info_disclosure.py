@@ -85,14 +85,14 @@ def test_manual_job_ssrf_rejection_is_generic(monkeypatch) -> None:  # type: ign
     monkeypatch.setattr(validate_mod, "_resolve_addresses", _internal)
 
     from app.dependencies import (
+        get_async_supabase_for_caller,
         get_current_user_id_optional,
         get_supabase,
-        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
 
     app.dependency_overrides[get_supabase] = lambda: MagicMock()
-    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-a"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-a"
     try:

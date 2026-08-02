@@ -57,14 +57,6 @@ def test_service_role_singleton_is_http1(_service_role_settings: None) -> None:
         sp.close_supabase()
 
 
-def test_per_request_user_client_is_http1(_service_role_settings: None) -> None:
-    try:
-        client = sp.get_user_client("fake-jwt")
-        assert _pool_http2(client) is False
-    finally:
-        sp.close_supabase()
-
-
 def test_default_supabase_client_would_be_http2() -> None:
     """Negative control: prove the default (un-pinned) supabase transport
     IS HTTP/2 — i.e. the bug is real and our pin is what changes it. If

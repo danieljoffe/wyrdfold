@@ -7,7 +7,7 @@ share the SAME scored job see DIFFERENT statuses, and a NULL ``p_user_id``
 stack (self-skips when unreachable — see conftest).
 
 #88 dual-auth flip: GET /jobs, /pipeline-counts and GET /{id} now run on the
-caller's RLS user client for JWT callers (``get_supabase_for_caller``). The
+caller's RLS user client for JWT callers (``get_async_supabase_for_caller``). The
 second half of this file proves that flip is loss-free and adds teeth:
 
 * both list RPCs (``get_target_jobs``, ``pipeline_counts``) return

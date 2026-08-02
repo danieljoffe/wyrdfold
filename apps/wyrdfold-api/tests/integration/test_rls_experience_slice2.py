@@ -1,7 +1,8 @@
 """RLS gate for Phase 1 — the experience "slice 2" tables.
 
 `optimized` GET, `preferences`, and `turns` endpoints now use
-`get_user_supabase` (Phase 1), so each table's `auth.uid() = user_id` policy
+`get_async_user_supabase` (Phase 1; async since #57), so each table's
+`auth.uid() = user_id` policy
 must scope reads to the caller and reject a forged-owner write. Proven here on
 the live stack via the JWT-bound user client (the same client the endpoints use).
 """

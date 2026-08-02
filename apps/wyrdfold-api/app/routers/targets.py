@@ -27,7 +27,6 @@ from app.dependencies import (
     get_current_user_id_optional,
     get_llm_client,
     get_supabase,
-    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -2193,22 +2192,23 @@ def delete_reference_jd(
     )
 
 
-# Sync `def` (not `async def`): the whole body is blocking supabase work
-# (vote write + tally + conditional re-merge), so FastAPI runs it in its
-# threadpool, keeping it off the event loop. slowapi's @limiter.limit works
-# on sync handlers too (it reads the `request` arg). See #107.
+# `async def` (#57 PR-F): the caller's vote write rides the ASYNC RLS user
+# client (awaited), so the handler must be async. The service-role ops stay sync
+# and are each offloaded via `asyncio.to_thread`, so no blocking `.execute()`
+# hits the loop (#107). slowapi's @limiter.limit works on async handlers too (it
+# reads the `request` arg). PR-G2 later retires the sync service client.
 @router.post(
     "/{target_id}/reference-jds/{ref_jd_id}/vote",
     response_model=ContributionVoteResult,
 )
 @limiter.limit("30/minute")
-def vote_on_reference_jd(
+async def vote_on_reference_jd(
     request: Request,
     target_id: str,
     ref_jd_id: str,
     body: ReferenceJDVote,
     supabase: Client = Depends(get_supabase),
-    user_supabase: Client = Depends(get_user_supabase),
+    user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ContributionVoteResult:
     """Up/down-vote (or clear) a reference-JD contribution (#5 P3).
@@ -2219,18 +2219,24 @@ def vote_on_reference_jd(
     rescue it). Votes are anonymous — only the caller's own vote and the
     suppression outcome are returned, never the tally or who voted.
     """
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
+    await asyncio.to_thread(
+        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
+    )
 
     # The contribution must belong to this target — no cross-target voting, and
     # a 404 rather than leaking the existence of another target's JD.
-    if not any(j.id == ref_jd_id for j in crud.list_reference_jds(supabase, target_id)):
+    ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
+    if not any(j.id == ref_jd_id for j in ref_jds):
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
-    # The caller's vote goes through their RLS client (DB enforces own-row).
-    votes.set_user_vote(user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value)
+    # The caller's vote goes through their async RLS client (DB enforces own-row).
+    await votes.set_user_vote(
+        user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
+    )
 
     # Tally every vote (service-role) and reconcile the suppression flag.
-    suppressed, changed = votes.recompute_suppression(
+    suppressed, changed = await asyncio.to_thread(
+        votes.recompute_suppression,
         supabase,
         reference_jd_id=ref_jd_id,
         quorum=settings.contribution_downvote_quorum,
@@ -2246,30 +2252,34 @@ def vote_on_reference_jd(
         # contribution's removal behind the learning-rate cap would be
         # backwards. Retried once on a concurrent-write conflict; a second
         # conflict leaves the profile to the next reconciliation (the vote
-        # itself and the suppression flag are already durable).
-        for _attempt in range(2):
-            target = crud.get(supabase, target_id)
-            if target is None:
-                break
-            composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
-            outcome, new_version = apply_profile_patch_rpc(
-                supabase,
-                user_id=user_id,
-                target_id=target_id,
-                next_profile=composite.model_dump(),
-                expected_version=target.profile_version,
-            )
-            if outcome == "applied":
-                profile_version = new_version
-                break
-            if outcome != "version_conflict":
-                logger.warning(
-                    "Vote re-merge refused by RPC (%s) for (user=%s, target=%s)",
-                    outcome,
-                    user_id,
-                    target_id,
+        # itself and the suppression flag are already durable). The whole
+        # sync service-role loop runs in one worker thread — off the loop.
+        def _remerge() -> int | None:
+            for _attempt in range(2):
+                target = crud.get(supabase, target_id)
+                if target is None:
+                    return None
+                composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
+                outcome, new_version = apply_profile_patch_rpc(
+                    supabase,
+                    user_id=user_id,
+                    target_id=target_id,
+                    next_profile=composite.model_dump(),
+                    expected_version=target.profile_version,
                 )
-                break
+                if outcome == "applied":
+                    return new_version
+                if outcome != "version_conflict":
+                    logger.warning(
+                        "Vote re-merge refused by RPC (%s) for (user=%s, target=%s)",
+                        outcome,
+                        user_id,
+                        target_id,
+                    )
+                    return None
+            return None
+
+        profile_version = await asyncio.to_thread(_remerge)
 
     return ContributionVoteResult(
         reference_jd_id=ref_jd_id,

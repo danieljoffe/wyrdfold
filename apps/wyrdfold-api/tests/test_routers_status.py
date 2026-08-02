@@ -8,7 +8,6 @@ from app.dependencies import (
     get_async_user_supabase,
     get_current_user_id,
     get_supabase,
-    get_user_supabase,
     verify_api_key_or_jwt,
     verify_supabase_jwt,
 )
@@ -117,11 +116,11 @@ def _build_supabase(
 def client_factory():
     def _make(supabase: MagicMock, *, authed: bool = True) -> TestClient:
         # The routes this file exercises moved to the RLS user client across
-        # the #88 phases, then to the ASYNC RLS client in #57 slice 4 — override
-        # every client dep with the same mock so a route resolves regardless of
-        # which dependency it declares.
+        # the #88 phases, then to the ASYNC RLS client in #57 (the sync
+        # per-request client was retired in PR-F) — override both remaining
+        # client deps with the same mock so a route resolves regardless of which
+        # it declares.
         app.dependency_overrides[get_async_user_supabase] = lambda: supabase
-        app.dependency_overrides[get_user_supabase] = lambda: supabase
         app.dependency_overrides[get_supabase] = lambda: supabase
         if authed:
             app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"

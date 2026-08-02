@@ -1,16 +1,17 @@
 """Supabase clients.
 
-Two clients, two trust levels:
+Two trust levels:
 
-- The **service-role** singleton (`get_supabase_pool`) — created once at
-  startup, reused across requests, **bypasses RLS**. Used by background
-  work, shared-catalog writes, and the api-key/cron path.
-- The **per-request user client** (`get_user_client`) — built per request
-  bound to the caller's JWT so Postgres RLS enforces per-user access
-  (#79). Each call returns a fresh `Client` whose Authorization header
-  carries that request's token (no shared mutable auth state — see the
-  token-bleed analysis on #79), but they all share one module-level
-  httpx connection pool so there's no per-request socket cost.
+- The **service-role** singleton (`get_supabase_pool`, sync / `get_async_supabase`,
+  async) — created once at startup, reused across requests, **bypasses RLS**.
+  Used by background work, shared-catalog writes, and the api-key/cron path.
+- The **per-request user client** (`get_async_user_client`) — built per request
+  bound to the caller's JWT so Postgres RLS enforces per-user access (#79). Each
+  call returns a fresh `AsyncClient` whose Authorization header carries that
+  request's token (no shared mutable auth state — see the token-bleed analysis
+  on #79), but they all share one module-level async httpx connection pool so
+  there's no per-request socket cost. The sync per-request client was retired in
+  #57 PR-F once every RLS route moved onto this async client.
 """
 
 from __future__ import annotations
@@ -33,25 +34,19 @@ _client: Client | None = None
 _async_client: AsyncClient | None = None
 _async_httpx: httpx.AsyncClient | None = None
 
-# Shared httpx pool for the per-request ASYNC user clients (#57 slice 3). The
-# async mirror of ``_user_httpx``: one bounded HTTP/2 pool (safe multiplexed in a
-# single event loop, unlike the sync side which must pin HTTP/1.1 for
-# thread-safety) shared across all concurrent per-request user clients, so only
-# the lightweight per-request ``AsyncClient`` wrapper + its own bearer are
-# allocated per call. The shared pool carries NO Authorization — each request's
-# token lives on its own client only, so there is no token bleed (see the #79
-# analysis behind ``get_user_client``).
+# Shared httpx pool for the per-request ASYNC user clients (#57). One bounded
+# HTTP/2 pool (safe multiplexed in a single event loop, unlike a sync pool which
+# must pin HTTP/1.1 for thread-safety) shared across all concurrent per-request
+# user clients, so only the lightweight per-request ``AsyncClient`` wrapper + its
+# own bearer are allocated per call. The shared pool carries NO Authorization —
+# each request's token lives on its own client only, so there is no token bleed
+# (see the #79 analysis behind ``get_async_user_client``).
 _async_user_httpx: httpx.AsyncClient | None = None
 
-# Shared httpx connection pool for the per-request user clients. httpx
-# clients are thread-safe for requests, so one pool serves the whole
-# threadpool; only the lightweight per-request Client wrapper + its own
-# headers are allocated per call.
-_user_httpx: httpx.Client | None = None
-
-# Deliberate ceiling for each sync postgrest pool (service-role singleton + the
-# shared user pool). The poller's to_thread fan-out is already gated well below
-# this by its own semaphores; this just caps the accidental worst case.
+# Deliberate ceiling for the sync service-role postgrest pool (the sync
+# per-request user pool was retired in #57 PR-F). The poller's to_thread fan-out
+# is already gated well below this by its own semaphores; this just caps the
+# accidental worst case.
 _SYNC_MAX_CONNECTIONS = 25
 _SYNC_MAX_KEEPALIVE = 10
 
@@ -59,11 +54,10 @@ _SYNC_MAX_KEEPALIVE = 10
 def _build_http1_client() -> httpx.Client:
     """httpx transport for supabase clients — HTTP/1.1, never HTTP/2.
 
-    supabase-py's default postgrest transport sets ``http2=True``. Both
-    the shared service-role singleton and the shared per-request user pool
-    get hit by many *concurrent* requests at once — the service-role
-    client most acutely, since the poller fans out a burst of
-    ``asyncio.to_thread`` upserts/queries against the single shared client.
+    supabase-py's default postgrest transport sets ``http2=True``. The
+    shared service-role singleton gets hit by many *concurrent* requests at
+    once, since the poller fans out a burst of ``asyncio.to_thread``
+    upserts/queries against the single shared client.
 
     httpcore's HTTP/2 connection object is **not** safe for concurrent use
     from multiple threads: under the poll burst its streams interleave and
@@ -83,12 +77,10 @@ def _build_http1_client() -> httpx.Client:
         follow_redirects=True,
         timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
         # Bound the pool deliberately. Without limits httpx defaults to 100 max
-        # connections — and there are TWO sync pools (service-role singleton +
-        # shared user pool), so the worst case is 200 sockets to the Supabase
-        # pooler, undercutting the small-instance IO posture the async pool is
-        # explicitly capped for. In practice anyio's threadpool bounds it, but
-        # that ceiling was accidental; make it intentional (hardening review
-        # 2026-07-21, Perf-F6).
+        # connections on the service-role singleton, undercutting the
+        # small-instance IO posture the async pool is explicitly capped for. In
+        # practice anyio's threadpool bounds it, but that ceiling was accidental;
+        # make it intentional (hardening review 2026-07-21, Perf-F6).
         limits=httpx.Limits(
             max_connections=_SYNC_MAX_CONNECTIONS,
             max_keepalive_connections=_SYNC_MAX_KEEPALIVE,
@@ -169,12 +161,13 @@ def _get_async_user_httpx() -> httpx.AsyncClient:
 
 
 async def get_async_user_client(access_token: str) -> AsyncClient:
-    """Async per-request Supabase client bound to ``access_token`` (#57 slice 3).
+    """Async per-request Supabase client bound to ``access_token`` (#57).
 
-    The async mirror of :func:`get_user_client`. The anon key is the base (so a
-    missing token degrades to anon, never service-role) and the caller's JWT is
-    set as the bearer on THIS request's own client, so PostgREST runs every query
-    under that user and RLS applies. Reuses the shared async httpx pool.
+    The anon key is the base (so a missing token degrades to anon, never
+    service-role) and the caller's JWT is set as the bearer on THIS request's own
+    client, so PostgREST runs every query under that user and RLS applies. Reuses
+    the shared async httpx pool. This is the per-request user client for every
+    RLS route since PR-F retired the sync per-request client.
 
     The bearer is passed in ``AsyncClientOptions.headers`` up front: it binds
     Authorization for the lazily-created storage sub-client AND makes
@@ -182,7 +175,7 @@ async def get_async_user_client(access_token: str) -> AsyncClient:
     fetches a session when no Authorization header is present), so the
     per-request build is pure construction — no I/O. ``postgrest.auth`` binds the
     DB path. Nothing else references this client, so there is no shared-auth
-    bleed (see ``get_user_client``).
+    bleed (each call builds a fresh client).
     """
     options = AsyncClientOptions(
         httpx_client=_get_async_user_httpx(),
@@ -190,7 +183,7 @@ async def get_async_user_client(access_token: str) -> AsyncClient:
     )
     client = await acreate_client(settings.supabase_url, settings.supabase_anon_key, options)
     # Bind the bearer on the postgrest sub-client for DB queries (the options
-    # header above covers storage). Mirrors the sync ``get_user_client``.
+    # header above covers storage).
     client.postgrest.auth(access_token)
     return client
 
@@ -220,43 +213,6 @@ def get_supabase_pool() -> Client | None:
     return _client
 
 
-def _get_user_httpx() -> httpx.Client:
-    global _user_httpx
-    if _user_httpx is None:
-        # HTTP/1.1 here too: this single pool is shared across all
-        # concurrent per-request user clients, so it must be
-        # concurrency-safe under load (see _build_http1_client).
-        _user_httpx = _build_http1_client()
-    return _user_httpx
-
-
-def get_user_client(access_token: str) -> Client:
-    """Build a per-request Supabase client bound to ``access_token``.
-
-    The anon key is the base (so a missing/empty token degrades to anon,
-    never service-role), and the caller's JWT is set as the Authorization
-    bearer on this request's own client — PostgREST then runs every query
-    under that user, so RLS policies apply. Reuses the shared httpx pool.
-    """
-    options = ClientOptions(httpx_client=_get_user_httpx())
-    client = create_client(settings.supabase_url, settings.supabase_anon_key, options)
-    # Bind the bearer on this per-request client only. Safe vs. the
-    # service-role singleton's bleed risk because nothing else holds a
-    # reference to this client (each call builds a fresh one).
-    #
-    # postgrest.auth() covers DB queries. Storage (and any other sub-client)
-    # is created lazily from `client.options.headers`, so we also set the
-    # Authorization there — otherwise storage would keep the anon key and
-    # RLS-protected buckets would deny the user their own objects. apikey
-    # stays the anon key.
-    client.options.headers["Authorization"] = f"Bearer {access_token}"
-    client.postgrest.auth(access_token)
-    return client
-
-
 def close_supabase() -> None:
-    global _client, _user_httpx
+    global _client
     _client = None
-    if _user_httpx is not None:
-        _user_httpx.close()
-        _user_httpx = None
