@@ -131,7 +131,11 @@ async def materialize_and_score_job(
     # (#57) offloads its keyword compute to a thread internally and awaits the
     # upsert IO on the loop, so no ``to_thread`` wrapper here.
     desc = description_html or ""
-    parsed = parse_jd(desc)
+    # Parse the JD once (reused across targets). Offload the sync CPU parse to a
+    # thread — on an interactive manual-add it otherwise blocks the event loop
+    # (the scorer offloads its own keyword compute; this parse was the one CPU
+    # step left running on the loop here).
+    parsed = await asyncio.to_thread(parse_jd, desc)
     results = await asyncio.gather(
         *[
             score_and_upsert(
