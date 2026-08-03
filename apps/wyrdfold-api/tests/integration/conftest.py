@@ -18,12 +18,13 @@ import contextlib
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 import httpx
 import jwt
 import pytest
 from supabase import AsyncClient, Client, acreate_client, create_client
+from supabase.lib.client_options import AsyncClientOptions
 
 from app import supabase_pool
 
@@ -84,11 +85,20 @@ def service_client(_require_stack: None) -> Client:
 
 
 @pytest.fixture
-async def async_service_client(_require_stack: None) -> AsyncClient:
+async def async_service_client(_require_stack: None) -> AsyncIterator[AsyncClient]:
     """Async service-role client (#57 slice 3) — the async mirror of
     ``service_client`` for the converted write paths (e.g. the cost-ledger leg
-    of ``chunks.upsert_for_optimized``)."""
-    return await acreate_client(LOCAL_URL, SERVICE_KEY)
+    of ``chunks.upsert_for_optimized``).
+
+    Yielded so the per-test httpx pool is closed afterwards — otherwise a fresh
+    ``acreate_client`` per test leaks connections/FDs across the run (Copilot,
+    #575). Sub-clients share the passed httpx, so one ``aclose`` covers all."""
+    http = httpx.AsyncClient()
+    client = await acreate_client(LOCAL_URL, SERVICE_KEY, AsyncClientOptions(httpx_client=http))
+    try:
+        yield client
+    finally:
+        await http.aclose()
 
 
 @pytest.fixture
