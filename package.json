@@ -92,7 +92,7 @@
     "jest-axe": "^11.0.0",
     "jest-environment-jsdom": "30.4.1",
     "jest-util": "^30.0.2",
-    "jsdom": "^29.0.2",
+    "jsdom": "^30.0.1",
     "knip": "^6.29.0",
     "lint-staged": "17.2.0",
     "nx": "23.1.0",
