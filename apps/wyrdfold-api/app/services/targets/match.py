@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult
@@ -34,8 +34,8 @@ from app.models.targets import (
 from app.services.llm.client import LLMClient
 from app.services.targets.crud import (
     TARGETS_TABLE,
+    USER_TARGETS_TABLE,
     _parse_target,
-    get_user_target_ids,
     normalize_label,
 )
 from app.services.targets.suggest import (
@@ -53,7 +53,27 @@ _SIMILARITY_THRESHOLD = 0.7
 _normalize_label = normalize_label
 
 
-def find_matching_target(supabase: Client, label: str) -> JobTarget | None:
+# ── #57 PR-G2b: this module + its callers (from_input, the targets suggest
+# handlers) all run on the pooled async service client now. crud stays SYNC for
+# the poller/learner; the two reads this module needs — the shared-catalog
+# label lookup and the caller's any-status memberships (crud.get_user_target_ids)
+# — are inlined async here (reusing crud._parse_target for shape) rather than
+# converting crud. No sync+async twin in the shared layer.
+
+
+async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
+    """Async inline of ``crud.get_user_target_ids`` — any-status memberships."""
+    resp = (
+        await supabase.table(USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+async def find_matching_target(supabase: AsyncClient, label: str) -> JobTarget | None:
     """Find an existing target matching a label, or None.
 
     Tries exact match first, then fuzzy via pg_trgm similarity.
@@ -62,7 +82,7 @@ def find_matching_target(supabase: Client, label: str) -> JobTarget | None:
 
     # Exact match
     resp = (
-        supabase.table(TARGETS_TABLE)
+        await supabase.table(TARGETS_TABLE)
         .select("*")
         .eq("normalized_label", normalized)
         .limit(1)
@@ -74,7 +94,7 @@ def find_matching_target(supabase: Client, label: str) -> JobTarget | None:
 
     # Fuzzy match via pg_trgm (requires the extension enabled in Phase 1)
     try:
-        rpc_resp = supabase.rpc(
+        rpc_resp = await supabase.rpc(
             "match_target_by_label",
             {"query_label": normalized, "threshold": _SIMILARITY_THRESHOLD},
         ).execute()
@@ -88,8 +108,8 @@ def find_matching_target(supabase: Client, label: str) -> JobTarget | None:
     return None
 
 
-def _match_suggestions(
-    supabase: Client,
+async def _match_suggestions(
+    supabase: AsyncClient,
     suggestions: list[TargetSuggestion],
     existing_ids: set[str],
 ) -> list[MatchedSuggestion]:
@@ -102,7 +122,7 @@ def _match_suggestions(
     """
     matches: list[MatchedSuggestion] = []
     for suggestion in suggestions:
-        matched = find_matching_target(supabase, suggestion.label)
+        matched = await find_matching_target(supabase, suggestion.label)
 
         if matched and matched.id in existing_ids:
             # User already has this target — skip
@@ -119,7 +139,7 @@ def _match_suggestions(
 
 
 async def suggest_and_match(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     payload: OptimizedPayload,
@@ -130,14 +150,14 @@ async def suggest_and_match(
 
     Returns (matched_suggestions, llm_result) so callers can log cost.
     """
-    existing_ids = get_user_target_ids(supabase, user_id)
+    existing_ids = await _user_target_ids(supabase, user_id)
     suggestions, result = await suggest_targets(llm, payload=payload)
-    matches = _match_suggestions(supabase, suggestions.suggestions, existing_ids)
+    matches = await _match_suggestions(supabase, suggestions.suggestions, existing_ids)
     return MatchedSuggestions(matches=matches), result
 
 
 async def suggest_and_match_from_query(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     query: str,
@@ -154,7 +174,7 @@ async def suggest_and_match_from_query(
 
     Returns (matched_suggestions, llm_result) so callers can log cost.
     """
-    existing_ids = get_user_target_ids(supabase, user_id)
+    existing_ids = await _user_target_ids(supabase, user_id)
     suggestions, result = await suggest_targets_from_query(llm, query=query, payload=payload)
-    matches = _match_suggestions(supabase, suggestions.suggestions, existing_ids)
+    matches = await _match_suggestions(supabase, suggestions.suggestions, existing_ids)
     return MatchedSuggestions(matches=matches), result

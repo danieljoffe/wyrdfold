@@ -13,11 +13,25 @@ Performance: the only LLM call that has to run inline is
 ``normalize_manual_input`` — its canonical label drives duplicate
 detection via ``find_matching_target``. The expensive steps
 (``derive_profile_*`` + ``derive_fit_score``, 5-9s of sequential Sonnet
-calls) are deferred to a ``BackgroundTask`` so the endpoint can return an
+calls) are deferred to a DETACHED task so the endpoint can return an
 optimistic ``CreateOrLinkResult`` immediately. New targets are created in
 ``activation_status="deriving"`` and flip to ``idle`` (or ``error``) once
-the background work completes; the frontend polls until then. This mirrors
-the ``_activate_pipeline`` BackgroundTask pattern in ``routers/targets``.
+the background work completes; the frontend polls until then.
+
+#57 PR-G2b: this module runs on the pooled async service client
+(``AsyncClient``). The interactive create-or-link path writes its own crud
+reads/writes through thin async inlines here (crud stays SYNC for the
+poller/learner — see the ``_link`` etc. helpers below), the cost ledger via
+``cost_log.record_async``, and the #191 shared-profile merge via
+``apply_profile_merge_rpc_async``. The deferred derivation tasks touch that
+same async pool, so they are spawned as DETACHED loop tasks
+(``spawn_detached``) rather than starlette ``BackgroundTasks`` — the latter
+deadlocks the pooled async client under uvloop (see ``app/background.py``).
+The few genuinely-not-yet-async deep services (``resolve_current_payload``,
+``derive_profile_from_jd`` content-cache, ``materialize_and_score_job``,
+``persistence.upsert_user_job``, ``register_source_from_url``) still want a
+SYNC service client, obtained locally via ``get_supabase()`` and offloaded
+with ``asyncio.to_thread`` — the ``routers/jobs.py`` materialize pattern.
 """
 
 from __future__ import annotations
@@ -25,12 +39,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import pydantic
-from fastapi import BackgroundTasks, HTTPException
-from supabase import Client
+from fastapi import HTTPException
+from supabase import AsyncClient, Client
 
+from app.background import spawn_detached
 from app.config import settings
+from app.dependencies import get_supabase
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult
 from app.models.targets import (
@@ -38,8 +56,10 @@ from app.models.targets import (
     JobTarget,
     ScoringProfile,
     TargetCreate,
+    TargetReferenceJD,
     TargetSuggestion,
     TargetUpdate,
+    UserTarget,
 )
 from app.services.experience.resolve import resolve_current_payload
 from app.services.job_ingest import materialize_and_score_job
@@ -74,7 +94,7 @@ from app.services.targets.normalize_manual import (
 from app.services.targets.normalize_manual import (
     normalize_manual_input,
 )
-from app.services.targets.profile_writes import apply_profile_merge_rpc
+from app.services.targets.profile_writes import apply_profile_merge_rpc_async
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +106,180 @@ logger = logging.getLogger(__name__)
 DERIVATION_TIMEOUT_S = 60.0
 
 
+# ── Async inlines of shared crud reads/writes (#57 PR-G2b) ───────────────────
+# crud stays SYNC for its poller/learner/discovery callers; a sync helper can't
+# take the async client and converting crud would ripple into all of them. So
+# the queries this module needs run here on the async client, reusing crud's
+# row→model parsers so the persisted shape stays byte-identical. Mirrors the
+# router-inline pattern in routers/targets.py.
+
+
+async def _create(supabase: AsyncClient, payload: TargetCreate) -> JobTarget:
+    """Async inline of ``crud.create`` — find-or-create on ``normalized_label``."""
+    normalized = crud.normalize_label(payload.label)
+    row: dict[str, Any] = {
+        "label": payload.label,
+        "description": payload.description,
+        "normalized_label": normalized,
+        "scoring_profile": payload.scoring_profile.model_dump(),
+        "search_keywords": payload.search_keywords,
+    }
+    resp = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .upsert(row, on_conflict="normalized_label", ignore_duplicates=True)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if rows:
+        return crud._parse_target(rows[0])
+    existing = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .select("*")
+        .eq("normalized_label", normalized)
+        .limit(1)
+        .execute()
+    )
+    existing_rows = cast(list[dict[str, Any]], existing.data or [])
+    if existing_rows:
+        return crud._parse_target(existing_rows[0])
+    raise RuntimeError("Failed to insert or locate targets row")
+
+
+async def _update(supabase: AsyncClient, target_id: str, payload: TargetUpdate) -> JobTarget | None:
+    """Async inline of ``crud.update`` — same partial field mapping."""
+    updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
+    if payload.label is not None:
+        updates["label"] = payload.label
+        updates["normalized_label"] = crud.normalize_label(payload.label)
+    if payload.description is not None:
+        updates["description"] = payload.description
+    if payload.scoring_profile is not None:
+        updates["scoring_profile"] = payload.scoring_profile.model_dump()
+    if payload.search_keywords is not None:
+        updates["search_keywords"] = payload.search_keywords
+    if payload.activation_status is not None:
+        updates["activation_status"] = payload.activation_status
+    if payload.app_active is not None:
+        updates["app_active"] = payload.app_active
+    if payload.profile_version is not None:
+        updates["profile_version"] = payload.profile_version
+    if payload.example_promising_titles is not None:
+        updates["example_promising_titles"] = payload.example_promising_titles
+    if payload.example_unpromising_titles is not None:
+        updates["example_unpromising_titles"] = payload.example_unpromising_titles
+    if payload.seniority_hint is not None:
+        updates["seniority_hint"] = payload.seniority_hint
+    if payload.domain_hints is not None:
+        updates["domain_hints"] = payload.domain_hints
+    if payload.role_family is not None:
+        updates["role_family"] = payload.role_family
+    resp = await supabase.table(crud.TARGETS_TABLE).update(updates).eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
+
+
+async def _get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get``."""
+    resp = await supabase.table(crud.TARGETS_TABLE).select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
+
+
+async def _link(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    is_active: bool = False,
+    fit_score: int | None = None,
+    fit_score_reasoning: str | None = None,
+    fit_score_prose_doc_id: str | None = None,
+) -> UserTarget:
+    """Async inline of ``crud.link_user_to_target`` for the create-or-link path.
+
+    Every from-input link is ``is_active=False`` (following a target never trips
+    the active-target cap — activation is a separate step), so the cap-check
+    branch of ``crud.link_user_to_target`` never runs here and this is a plain
+    upsert. The active-cap read path stays in sync crud for the activate route.
+    """
+    row: dict[str, Any] = {
+        "user_id": user_id,
+        "target_id": target_id,
+        "is_active": is_active,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    if fit_score is not None:
+        row["fit_score"] = fit_score
+    if fit_score_reasoning is not None:
+        row["fit_score_reasoning"] = fit_score_reasoning
+    if fit_score_prose_doc_id is not None:
+        row["fit_score_prose_doc_id"] = fit_score_prose_doc_id
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .upsert(row, on_conflict="user_id,target_id")
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to upsert user_targets row")
+    return crud._parse_user_target(rows[0])
+
+
+async def _add_reference_jd(
+    supabase: AsyncClient,
+    *,
+    target_id: str,
+    jd_text: str,
+    jd_url: str | None,
+    extracted_profile: ScoringProfile,
+    user_id: str | None = None,
+) -> TargetReferenceJD:
+    """Async inline of ``crud.add_reference_jd``."""
+    row = {
+        "target_id": target_id,
+        "user_id": user_id,
+        "jd_text": jd_text,
+        "jd_url": jd_url,
+        "extracted_profile": extracted_profile.model_dump(),
+    }
+    resp = await supabase.table(crud.REF_JDS_TABLE).insert(row).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert reference_jds row")
+    return crud._parse_ref_jd(rows[0])
+
+
+async def _list_reference_jds(supabase: AsyncClient, target_id: str) -> list[TargetReferenceJD]:
+    """Async inline of ``crud.list_reference_jds``."""
+    resp = (
+        await supabase.table(crud.REF_JDS_TABLE)
+        .select("*")
+        .eq("target_id", target_id)
+        .order("created_at")
+        .execute()
+    )
+    return [crud._parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _count_user_reference_jds(
+    supabase: AsyncClient, *, target_id: str, user_id: str
+) -> int:
+    """Async inline of ``crud.count_user_reference_jds`` (the #47 per-user cap)."""
+    resp = (
+        await supabase.table(crud.REF_JDS_TABLE)
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("target_id", target_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return resp.count or 0
+
+
 # ---- Deferred fit-score helper ---------------------------------------------
 
 
 async def _apply_fit_score(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str,
@@ -110,24 +299,23 @@ async def _apply_fit_score(
     the stale-payload seam). ``payload`` (captured inline) is kept only as a
     fallback for the rare case the live resolve yields nothing.
     """
+    # ``resolve_current_payload`` is not-yet-async and threads a SYNC service
+    # client for its cost ledger; obtain one locally (jobs.py materialize
+    # pattern). The fit-score link + cost write ride the async client.
+    svc = get_supabase()
     fresh, prose_doc_id = await resolve_current_payload(
-        supabase, llm, cost_supabase=supabase, user_id=user_id
+        svc, llm, cost_supabase=svc, user_id=user_id
     )
     payload = fresh if fresh is not None else payload
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
-    # supabase-py is sync; this runs inside a BackgroundTask that FastAPI *awaits*
-    # on the event loop (an async bg task is not threadpooled), so each blocking
-    # round-trip is offloaded to keep it off the loop (#107).
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=FIT_SCORE_PURPOSE,
         result=llm_result,
         metadata={"target_id": target.id, "user_id": user_id},
     )
-    await asyncio.to_thread(
-        crud.link_user_to_target,
+    await _link(
         supabase,
         user_id=user_id,
         target_id=target.id,
@@ -142,7 +330,7 @@ async def _apply_fit_score(
 
 
 async def derive_manual_target_bg(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str,
@@ -152,9 +340,10 @@ async def derive_manual_target_bg(
 ) -> None:
     """Derive profile-from-label then fit score for a new manual target.
 
-    Runs as a ``BackgroundTask``. The target already exists in
-    ``activation_status="deriving"``; on success it flips to ``idle`` with
-    the derived scoring profile, on failure (or timeout) to ``error``.
+    Runs as a DETACHED loop task (``spawn_detached``). The target already
+    exists in ``activation_status="deriving"``; on success it flips to
+    ``idle`` with the derived scoring profile, on failure (or timeout) to
+    ``error``.
 
     ``payload`` is ``None`` when the caller has no experience profile (the
     ``from_suggestion`` search-fallback path): the label-derived scoring
@@ -164,19 +353,14 @@ async def derive_manual_target_bg(
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
             derived, derive_result = await derive_profile_from_label(llm, label=label)
-            # Blocking supabase calls run in the threadpool: this bg task is an
-            # async fn FastAPI awaits on the event loop, so a bare call would
-            # block every concurrent request (#107).
-            await asyncio.to_thread(
-                cost_log.record,
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_LABEL_PURPOSE,
                 result=derive_result,
                 metadata={"user_id": user_id, "label": label},
             )
-            updated = await asyncio.to_thread(
-                crud.update,
+            updated = await _update(
                 supabase,
                 target_id,
                 TargetUpdate(
@@ -185,7 +369,7 @@ async def derive_manual_target_bg(
                     example_promising_titles=derived.example_promising_titles,
                     example_unpromising_titles=derived.example_unpromising_titles,
                     # Slim shape — populated when the LLM emits them; None is
-                    # treated as "leave unchanged" by crud.update, so the
+                    # treated as "leave unchanged" by _update, so the
                     # canonical description from normalize survives.
                     description=derived.description,
                     seniority_hint=derived.seniority_hint,
@@ -207,18 +391,14 @@ async def derive_manual_target_bg(
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        await asyncio.to_thread(
-            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
-        )
+        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
     except Exception:
         logger.exception("Deferred manual-target derivation failed for target %s", target_id)
-        await asyncio.to_thread(
-            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
-        )
+        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
 
 
-def _contribute_reference_jd(
-    supabase: Client,
+async def _contribute_reference_jd(
+    supabase: AsyncClient,
     *,
     user_id: str,
     target_id: str,
@@ -238,14 +418,16 @@ def _contribute_reference_jd(
     a raw version-unguarded ``.update()`` — which let any authenticated follower
     tilt a shared target's scoring profile (hardening review 2026-07-21, SEC-1).
 
-    Runs inside the deferred BackgroundTask, so an over-cap contribution is
+    Runs inside the deferred derivation task, so an over-cap contribution is
     logged and skipped (the caller still fit-scores against the current profile)
     rather than surfaced as an HTTP error.
     """
     # #47 per-user cap — bounds a single follower's footprint on the shared
     # profile. Over cap: skip the contribution entirely (do NOT touch the shared
     # profile).
-    contributed = crud.count_user_reference_jds(supabase, target_id=target_id, user_id=user_id)
+    contributed = await _count_user_reference_jds(
+        supabase, target_id=target_id, user_id=user_id
+    )
     if contributed >= settings.reference_jd_max_per_user_per_target:
         logger.info(
             "URL corpus contribution skipped: user %s at reference-JD cap (%d) for target %s",
@@ -256,7 +438,7 @@ def _contribute_reference_jd(
         return
 
     # Attributed to the contributing user so the merge can de-bias by contributor.
-    crud.add_reference_jd(
+    await _add_reference_jd(
         supabase,
         target_id=target_id,
         jd_text=jd_text,
@@ -269,12 +451,12 @@ def _contribute_reference_jd(
     # re-check + optimistic version guard). Retry once on a concurrent-write
     # version conflict, mirroring the reference-JD router.
     for _attempt in range(2):
-        current = crud.get(supabase, target_id)
+        current = await _get(supabase, target_id)
         if current is None:
             logger.error("Target %s vanished during URL corpus merge", target_id)
             return
-        composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
-        outcome, _new_version = apply_profile_merge_rpc(
+        composite = merge_reference_jds(await _list_reference_jds(supabase, target_id))
+        outcome, _new_version = await apply_profile_merge_rpc_async(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -295,7 +477,7 @@ def _contribute_reference_jd(
 
 
 async def derive_url_target_bg(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str,
@@ -311,24 +493,25 @@ async def derive_url_target_bg(
     """Derive profile-from-JD, contribute the reference JD, re-merge, fit score,
     then materialize the posting itself as a saved, tailorable job.
 
-    Runs as a ``BackgroundTask`` for both the new-target and matched
+    Runs as a DETACHED loop task for both the new-target and matched
     (corpus-building) URL flows. The shared-profile write goes through
     :func:`_contribute_reference_jd` so the corpus builder is held to the same
     per-user cap + contributor de-bias + version-checked RPC as
     ``POST /targets/{id}/reference-jds`` (SEC-1). On failure (or timeout) the
     target flips to ``error``.
     """
+    # ``derive_profile_from_jd`` (content-hash cache), ``materialize_and_score_job``
+    # and ``persistence.upsert_user_job`` are not-yet-async and take a SYNC
+    # service client; obtain one locally and offload their blocking round-trips
+    # with ``to_thread`` (jobs.py materialize pattern). Everything else rides the
+    # async client.
+    svc = get_supabase()
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
             derived, derive_result = await derive_profile_from_jd(
-                llm, jd_text=jd_text, supabase=supabase
+                llm, jd_text=jd_text, supabase=svc
             )
-            # Blocking supabase work runs in the threadpool: this bg task is an
-            # async fn FastAPI awaits on the event loop, so bare calls would
-            # freeze every concurrent request (#107). _contribute_reference_jd
-            # bundles its own several round-trips, so one to_thread covers them.
-            await asyncio.to_thread(
-                cost_log.record,
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_JD_PURPOSE,
@@ -336,8 +519,7 @@ async def derive_url_target_bg(
                 metadata={"user_id": user_id, "jd_url": final_url},
             )
 
-            await asyncio.to_thread(
-                _contribute_reference_jd,
+            await _contribute_reference_jd(
                 supabase,
                 user_id=user_id,
                 target_id=target_id,
@@ -349,10 +531,8 @@ async def derive_url_target_bg(
 
             # Flip activation status (a per-target column, not the shared
             # profile) and re-read the canonical post-merge target for scoring.
-            await asyncio.to_thread(
-                crud.update, supabase, target_id, TargetUpdate(activation_status="idle")
-            )
-            target = await asyncio.to_thread(crud.get, supabase, target_id)
+            await _update(supabase, target_id, TargetUpdate(activation_status="idle"))
+            target = await _get(supabase, target_id)
             if target is None:
                 logger.error("Target %s vanished during deferred URL derive", target_id)
                 return
@@ -365,7 +545,7 @@ async def derive_url_target_bg(
             # via materialize_and_score_job. Without this the URL was dissolved
             # into the target profile as a reference JD and never became a job.
             posting_id = await materialize_and_score_job(
-                supabase,
+                svc,
                 final_url=final_url,
                 title=extracted_title,
                 company_name=company_name,
@@ -377,7 +557,7 @@ async def derive_url_target_bg(
             if posting_id is not None:
                 await asyncio.to_thread(
                     persistence.upsert_user_job,
-                    supabase,
+                    svc,
                     user_id=user_id,
                     job_posting_id=posting_id,
                     status="saved",
@@ -388,14 +568,10 @@ async def derive_url_target_bg(
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        await asyncio.to_thread(
-            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
-        )
+        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
     except Exception:
         logger.exception("Deferred URL-target derivation failed for target %s", target_id)
-        await asyncio.to_thread(
-            crud.update, supabase, target_id, TargetUpdate(activation_status="error")
-        )
+        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
 
 
 # ---- Inline create-or-link orchestration -----------------------------------
@@ -444,9 +620,8 @@ async def _normalize_suggestion(
 
 
 async def _create_or_link_from_suggestion(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
-    background_tasks: BackgroundTasks,
     *,
     user_id: str,
     suggestion: TargetSuggestion,
@@ -466,50 +641,49 @@ async def _create_or_link_from_suggestion(
     none. When ``None`` the label-derived scoring profile is still produced,
     but the per-user fit score (which needs the payload) is skipped.
     """
-    matched = find_matching_target(supabase, suggestion.label)
+    matched = await find_matching_target(supabase, suggestion.label)
     if matched is not None:
-        link = crud.link_user_to_target(
-            supabase, user_id=user_id, target_id=matched.id, is_active=False
-        )
+        link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
         if payload is not None:
-            background_tasks.add_task(
-                _apply_fit_score,
-                supabase,
-                llm,
-                user_id=user_id,
-                target=matched,
-                payload=payload,
+            spawn_detached(
+                _apply_fit_score(
+                    supabase, llm, user_id=user_id, target=matched, payload=payload
+                ),
+                name=f"fit-score-{matched.id}",
             )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
     # New target: create immediately in "deriving" so it appears in the
     # list with a pending indicator while the background task derives the
     # scoring profile (+ fit score when we have a profile).
-    target = crud.create(
+    target = await _create(
         supabase,
         payload=TargetCreate(
             label=suggestion.label,
             description=suggestion.description,
         ),
     )
-    target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
-    link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
-    background_tasks.add_task(
-        derive_manual_target_bg,
-        supabase,
-        llm,
-        user_id=user_id,
-        target_id=target.id,
-        label=suggestion.label,
-        payload=payload,
+    target = (
+        await _update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
+    )
+    link = await _link(supabase, user_id=user_id, target_id=target.id, is_active=False)
+    spawn_detached(
+        derive_manual_target_bg(
+            supabase,
+            llm,
+            user_id=user_id,
+            target_id=target.id,
+            label=suggestion.label,
+            payload=payload,
+        ),
+        name=f"derive-manual-{target.id}",
     )
     return CreateOrLinkResult(user_target=link, target=target, was_matched=False)
 
 
 async def from_manual(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
-    background_tasks: BackgroundTasks,
     *,
     user_id: str,
     label: str,
@@ -519,7 +693,7 @@ async def from_manual(
     """Manual flow: user-typed title + description.
 
     Inline (fast): LLM-normalize the input, match against existing
-    targets, and link the user. Deferred (BackgroundTask): derive the
+    targets, and link the user. Deferred (detached task): derive the
     scoring profile (new targets) and the per-user fit score.
 
     1. LLM normalizes input into a canonical ``TargetSuggestion``
@@ -530,7 +704,7 @@ async def from_manual(
     suggestion, norm_result = await _normalize_suggestion(
         llm, label=label, description=description, payload=payload
     )
-    cost_log.record(
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=NORMALIZE_PURPOSE,
@@ -540,7 +714,6 @@ async def from_manual(
     return await _create_or_link_from_suggestion(
         supabase,
         llm,
-        background_tasks,
         user_id=user_id,
         suggestion=suggestion,
         payload=payload,
@@ -548,9 +721,8 @@ async def from_manual(
 
 
 async def from_suggestion(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
-    background_tasks: BackgroundTasks,
     *,
     user_id: str,
     label: str,
@@ -575,7 +747,6 @@ async def from_suggestion(
     return await _create_or_link_from_suggestion(
         supabase,
         llm,
-        background_tasks,
         user_id=user_id,
         suggestion=suggestion,
         payload=payload,
@@ -583,8 +754,8 @@ async def from_suggestion(
 
 
 def _schedule_url_bg_tasks(
-    background_tasks: BackgroundTasks,
-    supabase: Client,
+    supabase: AsyncClient,
+    svc: Client,
     llm: LLMClient,
     *,
     user_id: str,
@@ -600,38 +771,42 @@ def _schedule_url_bg_tasks(
     """Schedule the two deferred halves of the from-url flow for ``target_id``.
 
     1. ``derive_url_target_bg`` — profile derivation, reference-JD contribution,
-       fit score, and job materialization.
+       fit score, and job materialization (async client).
     2. ``register_source_from_url`` — register the company's board as a pollable
        source (best-effort, capped) so we pull MORE jobs from it going forward.
+       Not-yet-async and takes the SYNC service client ``svc``.
 
-    Registration is scheduled AFTER derive so the user-visible deriving→ready
-    flip isn't held behind the ATS probe. Shared by both the matched and
-    newly-created branches so their scheduling can't drift (a new
-    ``derive_url_target_bg`` arg added to one branch but missed in the other).
+    Both are spawned DETACHED (never starlette ``BackgroundTasks`` — the derive
+    task fans out on the pooled async client, which deadlocks under uvloop
+    there). Registration is scheduled AFTER derive so the user-visible
+    deriving→ready flip isn't held behind the ATS probe. Shared by both the
+    matched and newly-created branches so their scheduling can't drift.
     """
-    background_tasks.add_task(
-        derive_url_target_bg,
-        supabase,
-        llm,
-        user_id=user_id,
-        target_id=target_id,
-        jd_text=jd_text,
-        final_url=final_url,
-        extracted_title=extracted_title,
-        company_name=company_name,
-        location=location,
-        salary_text=salary_text,
-        payload=payload,
+    spawn_detached(
+        derive_url_target_bg(
+            supabase,
+            llm,
+            user_id=user_id,
+            target_id=target_id,
+            jd_text=jd_text,
+            final_url=final_url,
+            extracted_title=extracted_title,
+            company_name=company_name,
+            location=location,
+            salary_text=salary_text,
+            payload=payload,
+        ),
+        name=f"derive-url-{target_id}",
     )
-    background_tasks.add_task(
-        register_source_from_url, supabase, user_id=user_id, final_url=final_url
+    spawn_detached(
+        register_source_from_url(svc, user_id=user_id, final_url=final_url),
+        name=f"register-source-{target_id}",
     )
 
 
 async def from_url(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
-    background_tasks: BackgroundTasks,
     *,
     user_id: str,
     final_url: str,
@@ -648,18 +823,19 @@ async def from_url(
     user-supplied title override (an inaccurate one poisons matching + the
     shared catalog). Matching keys off that derived title, so duplicate
     detection runs inline without any LLM call. The profile derivation + merge
-    + fit score + job materialization are all deferred to a BackgroundTask.
+    + fit score + job materialization are all deferred to a detached task.
     """
     label = ((extracted_title or "").strip() or "Untitled Target")[:200]
+    # SYNC service client for the not-yet-async ``register_source_from_url`` half
+    # of the deferred fan-out (see ``_schedule_url_bg_tasks``).
+    svc = get_supabase()
 
-    matched = find_matching_target(supabase, label)
+    matched = await find_matching_target(supabase, label)
     if matched is not None:
-        link = crud.link_user_to_target(
-            supabase, user_id=user_id, target_id=matched.id, is_active=False
-        )
+        link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
         _schedule_url_bg_tasks(
-            background_tasks,
             supabase,
+            svc,
             llm,
             user_id=user_id,
             target_id=matched.id,
@@ -673,12 +849,14 @@ async def from_url(
         )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
-    target = crud.create(supabase, payload=TargetCreate(label=label))
-    target = crud.update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
-    link = crud.link_user_to_target(supabase, user_id=user_id, target_id=target.id, is_active=False)
+    target = await _create(supabase, payload=TargetCreate(label=label))
+    target = (
+        await _update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
+    )
+    link = await _link(supabase, user_id=user_id, target_id=target.id, is_active=False)
     _schedule_url_bg_tasks(
-        background_tasks,
         supabase,
+        svc,
         llm,
         user_id=user_id,
         target_id=target.id,

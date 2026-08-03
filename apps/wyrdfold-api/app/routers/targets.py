@@ -61,6 +61,7 @@ from app.models.targets import (
     TargetStatusResponse,
     TargetUpdate,
     UserTarget,
+    UserTargetWithSummary,
     UserTargetWithTarget,
 )
 from app.rate_limit import limiter
@@ -109,8 +110,9 @@ from app.services.targets.match import (
 )
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
-    apply_profile_merge_rpc,
+    apply_profile_merge_rpc_async,
     apply_profile_patch_rpc,
+    apply_profile_patch_rpc_async,
 )
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
 from app.services.targets.suggest import (
@@ -315,6 +317,128 @@ async def _list_reference_jds_async(
         .execute()
     )
     return [crud._parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _add_reference_jd_async(
+    supabase: AsyncClient,
+    *,
+    target_id: str,
+    jd_text: str,
+    jd_url: str | None,
+    extracted_profile: ScoringProfile,
+    user_id: str | None = None,
+) -> TargetReferenceJD:
+    """Async inline of ``crud.add_reference_jd``."""
+    row = {
+        "target_id": target_id,
+        "user_id": user_id,
+        "jd_text": jd_text,
+        "jd_url": jd_url,
+        "extracted_profile": extracted_profile.model_dump(),
+    }
+    resp = await supabase.table(crud.REF_JDS_TABLE).insert(row).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to insert reference_jds row")
+    return crud._parse_ref_jd(rows[0])
+
+
+async def _count_user_reference_jds_async(
+    supabase: AsyncClient, *, target_id: str, user_id: str
+) -> int:
+    """Async inline of ``crud.count_user_reference_jds`` (the #47 per-user cap)."""
+    resp = (
+        await supabase.table(crud.REF_JDS_TABLE)
+        .select("id", count=CountMethod.exact, head=True)
+        .eq("target_id", target_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return resp.count or 0
+
+
+async def _list_for_user_async(supabase: AsyncClient, user_id: str) -> list[JobTarget]:
+    """Async inline of ``crud.list_for_user`` — all targets a user is linked to."""
+    ut_resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    ut_rows = cast(list[dict[str, Any]], ut_resp.data or [])
+    target_ids = [r["target_id"] for r in ut_rows]
+    if not target_ids:
+        return []
+    resp = (
+        await supabase.table(crud.TARGETS_TABLE)
+        .select("*")
+        .in_("id", target_ids)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return [crud._parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _list_user_targets_with_summary_async(
+    supabase: AsyncClient, user_id: str
+) -> list[UserTargetWithSummary]:
+    """Async inline of ``crud.list_user_targets_with_summary`` (#863 list projection)."""
+    ut_resp = (
+        await supabase.table(crud.USER_TARGETS_TABLE)
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    ut_rows = cast(list[dict[str, Any]], ut_resp.data or [])
+    if not ut_rows:
+        return []
+    target_ids = [r["target_id"] for r in ut_rows]
+    t_resp = await supabase.table(crud.TARGETS_TABLE).select("*").in_("id", target_ids).execute()
+    summaries_by_id = {
+        cast(dict[str, Any], r)["id"]: crud._summarize_target(cast(dict[str, Any], r))
+        for r in (t_resp.data or [])
+    }
+    results: list[UserTargetWithSummary] = []
+    for ut_row in ut_rows:
+        summary = summaries_by_id.get(ut_row["target_id"])
+        if summary is None:
+            continue
+        results.append(
+            UserTargetWithSummary(
+                user_target=crud._parse_user_target(ut_row),
+                target=summary,
+            )
+        )
+    return results
+
+
+async def _get_job_posting_row(supabase: AsyncClient, posting_id: str) -> dict[str, Any] | None:
+    """Read a job posting's title/description/url for /from-posting target creation."""
+    resp = (
+        await supabase.table("jobs")
+        .select("id, title, description_html, absolute_url")
+        .eq("id", posting_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0] if rows else None
+
+
+async def _suppress_reference_jd_async(supabase: AsyncClient, ref_jd_id: str) -> None:
+    """Quarantine-at-birth a capped reference-JD contribution so every merge
+    excludes it until an operator lifts it (#191 staged-merge review rail)."""
+    await (
+        supabase.table(crud.REF_JDS_TABLE)
+        .update({"suppressed": True})
+        .eq("id", ref_jd_id)
+        .execute()
+    )
+
+
+async def _insert_learning_log_row_async(supabase: AsyncClient, row: dict[str, Any]) -> None:
+    """Insert a staged ``target_learning_log`` row (a reviewable merge)."""
+    await supabase.table("target_learning_log").insert(row).execute()
 
 
 async def _get_user_target_preferences(
@@ -709,8 +833,7 @@ async def create_target(
 async def create_target_from_manual(
     request: Request,
     body: TargetFromManual,
-    background_tasks: BackgroundTasks,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> CreateOrLinkResult:
@@ -719,11 +842,13 @@ async def create_target_from_manual(
     LLM normalizes the input into a canonical ``TargetSuggestion`` and
     matches against existing targets — the only inline LLM call. The user
     is linked immediately and an optimistic ``CreateOrLinkResult`` returns
-    right away; the scoring-profile derivation + fit score run in a
-    BackgroundTask (new targets start in ``deriving`` status). The user
-    always ends up with a ``user_targets`` row.
+    right away; the scoring-profile derivation + fit score run in a detached
+    task (new targets start in ``deriving`` status). The user always ends up
+    with a ``user_targets`` row.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    # ``optimized.get_latest`` is poller-shared + not-yet-async — read it on a
+    # locally-obtained sync service client (jobs.py materialize pattern).
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     if doc is None:
         # 422 (Unprocessable Entity): the route exists and the request is
         # well-formed, but a business precondition (an experience profile
@@ -737,7 +862,6 @@ async def create_target_from_manual(
     return await from_input.from_manual(
         supabase,
         llm,
-        background_tasks,
         user_id=user_id,
         label=body.label,
         description=body.description,
@@ -755,8 +879,7 @@ async def create_target_from_manual(
 async def create_target_from_suggestion(
     request: Request,
     body: TargetFromSuggestion,
-    background_tasks: BackgroundTasks,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> CreateOrLinkResult:
@@ -774,12 +897,11 @@ async def create_target_from_suggestion(
     profile can still create a target from a role search — the query is the
     signal. Only the per-user fit score is deferred-and-skipped when absent.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     payload = doc.payload if doc is not None else None
     return await from_input.from_suggestion(
         supabase,
         llm,
-        background_tasks,
         user_id=user_id,
         label=body.label,
         description=body.description,
@@ -797,8 +919,7 @@ async def create_target_from_suggestion(
 async def create_target_from_url(
     request: Request,
     body: TargetFromUrl,
-    background_tasks: BackgroundTasks,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> CreateOrLinkResult:
@@ -808,10 +929,10 @@ async def create_target_from_url(
     against existing targets by label (no LLM call inline). The user is
     linked immediately and an optimistic result returns; profile
     derivation, reference-JD corpus building, profile re-merge, and fit
-    score all run in a BackgroundTask (new targets start in ``deriving``
+    score all run in a detached task (new targets start in ``deriving``
     status). The user is always linked.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(
@@ -832,7 +953,6 @@ async def create_target_from_url(
     return await from_input.from_url(
         supabase,
         llm,
-        background_tasks,
         user_id=user_id,
         final_url=final_url,
         extracted_title=extraction.title,
@@ -852,7 +972,7 @@ async def create_target_from_url(
 @limiter.limit("3/minute")
 async def suggest(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MatchedSuggestions:
@@ -861,14 +981,13 @@ async def suggest(
     Returns each suggestion paired with its matched target (if one exists)
     or flagged as new. Excludes targets the user already has.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
 
     matched, result = await suggest_and_match(supabase, llm, payload=doc.payload, user_id=user_id)
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=SUGGEST_PURPOSE,
@@ -886,7 +1005,7 @@ async def suggest(
 @limiter.limit("3/minute")
 async def suggest_lateral(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> LateralSuggestions:
@@ -901,7 +1020,7 @@ async def suggest_lateral(
     confidence; the activation flow plugs them into
     ``derive_profile_from_label`` to materialise the full target.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     if doc is None:
         raise HTTPException(status_code=422, detail="No experience profile found")
 
@@ -909,7 +1028,7 @@ async def suggest_lateral(
     # don't re-suggest what they already have. list_for_user is
     # user-scoped (via user_targets junction), not the global active
     # list — exactly what we want for personalised suggestions.
-    current = await asyncio.to_thread(crud.list_for_user, supabase, user_id=user_id)
+    current = await _list_for_user_async(supabase, user_id)
 
     try:
         suggestions, result = await suggest_lateral_targets(
@@ -925,8 +1044,7 @@ async def suggest_lateral(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
         ) from None
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=LATERAL_PURPOSE,
@@ -949,7 +1067,7 @@ async def suggest_lateral(
 async def suggest_from_query(
     request: Request,
     body: SuggestFromQueryRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MatchedSuggestions:
@@ -965,7 +1083,7 @@ async def suggest_from_query(
     requires a profile. Rate-limited a touch higher than ``/suggest`` (6/min)
     since it's an interactive search affordance, and LLM-budget-gated.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
     payload = doc.payload if doc is not None else None
     try:
         matched, result = await suggest_and_match_from_query(
@@ -979,8 +1097,7 @@ async def suggest_from_query(
             status_code=502,
             detail="The model returned malformed suggestions — please retry.",
         ) from None
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=QUERY_SUGGEST_PURPOSE,
@@ -1016,7 +1133,7 @@ async def get_active_targets(
 @router.get("/mine", response_model=MyTargetsSummaryListResponse)
 async def get_my_targets(
     background_tasks: BackgroundTasks,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MyTargetsSummaryListResponse:
@@ -1031,16 +1148,18 @@ async def get_my_targets(
     returns the current cached scores immediately; fresh ones land by the next
     view.
     """
-    items = await asyncio.to_thread(crud.list_user_targets_with_summary, supabase, user_id)
+    items = await _list_user_targets_with_summary_async(supabase, user_id)
 
     # The staleness scan + refresh run ENTIRELY in the background — /mine adds no
     # queries of its own to the response path. Only schedule when the user has
     # targets (nothing to refresh otherwise); the task itself no-ops immediately
     # if the LLM provider is fatal (credits out), so an outage can't make this
-    # churn the DB on every view.
+    # churn the DB on every view. ``refresh_stale_for_user`` is not-yet-async and
+    # takes the sync service client (obtained locally); it does no async-pool
+    # fan-out, so it stays a safe starlette ``BackgroundTask``.
     if items:
         background_tasks.add_task(
-            fit_refresh.refresh_stale_for_user, supabase, llm, user_id=user_id
+            fit_refresh.refresh_stale_for_user, get_supabase(), llm, user_id=user_id
         )
     return MyTargetsSummaryListResponse(targets=items)
 
@@ -1467,15 +1586,20 @@ async def set_target_preferences(
 async def link_target(
     request: Request,
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> UserTarget:
     """Link the current user to a target and derive a fit score."""
-    target = await asyncio.to_thread(crud.get, supabase, target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
+    # ``resolve_current_payload`` and ``crud.link_user_to_target`` (active-cap
+    # read path) are not-yet-async and take the sync service client — obtain one
+    # locally (jobs.py materialize pattern); the fit-score cost write rides the
+    # async client.
+    svc = get_supabase()
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
@@ -1483,12 +1607,11 @@ async def link_target(
     # optimized doc (BUG 2, the stale-payload seam) — a profile edited just
     # before this link must affect the fit.
     payload, prose_doc_id = await resolve_current_payload(
-        supabase, llm, cost_supabase=supabase, user_id=user_id
+        svc, llm, cost_supabase=svc, user_id=user_id
     )
     if payload is not None:
         fit_result, result = await derive_fit_score(llm, payload=payload, target=target)
-        await asyncio.to_thread(
-            cost_log.record,
+        await cost_log.record_async(
             supabase,
             user_id=user_id,
             purpose=FIT_SCORE_PURPOSE,
@@ -1501,7 +1624,7 @@ async def link_target(
     try:
         return await asyncio.to_thread(
             crud.link_user_to_target,
-            supabase,
+            svc,
             user_id=user_id,
             target_id=target_id,
             fit_score=fit_score,
@@ -1636,7 +1759,7 @@ async def delete_target(
 )
 async def create_target_from_posting(
     posting_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
@@ -1646,33 +1769,29 @@ async def create_target_from_posting(
     scoring profile from the description via LLM, stores the JD as a
     reference, and activates the target.
     """
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("jobs")
-            .select("id, title, description_html, absolute_url")
-            .eq("id", posting_id)
-            .execute()
-        )
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
+    # ``derive_profile_from_jd`` (content-hash cache) and the active-cap
+    # ``crud.link_user_to_target`` / ``crud.set_app_active`` writes are
+    # not-yet-async and take the sync service client — obtain one locally
+    # (jobs.py materialize pattern). The catalog reads/writes ride the async
+    # client via the router-inline helpers.
+    svc = get_supabase()
+    posting = await _get_job_posting_row(supabase, posting_id)
+    if posting is None:
         raise HTTPException(status_code=404, detail="Job posting not found")
 
-    posting = rows[0]
     title = posting.get("title") or "Untitled Role"
     description_html: str = posting.get("description_html") or ""
     absolute_url: str | None = posting.get("absolute_url")
 
     # Create the target
-    target = await asyncio.to_thread(crud.create, supabase, payload=TargetCreate(label=title))
+    target = await _create_target_async(supabase, payload=TargetCreate(label=title))
 
     # Derive scoring profile from description if substantial
     jd_text = strip_html(description_html)
     if len(jd_text) >= 50:
         try:
-            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
-            await asyncio.to_thread(
-                cost_log.record,
+            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=svc)
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=DEFAULT_PURPOSE,
@@ -1684,8 +1803,7 @@ async def create_target_from_posting(
                 },
             )
 
-            await asyncio.to_thread(
-                crud.add_reference_jd,
+            await _add_reference_jd_async(
                 supabase,
                 target_id=target.id,
                 jd_text=jd_text,
@@ -1694,8 +1812,7 @@ async def create_target_from_posting(
             )
 
             # Update target with the derived profile + search keywords
-            await asyncio.to_thread(
-                crud.update,
+            await _update_target_async(
                 supabase,
                 target.id,
                 TargetUpdate(
@@ -1723,7 +1840,7 @@ async def create_target_from_posting(
         try:
             await asyncio.to_thread(
                 crud.link_user_to_target,
-                supabase,
+                svc,
                 user_id=user_id,
                 target_id=target.id,
                 is_active=True,
@@ -1743,9 +1860,9 @@ async def create_target_from_posting(
             ) from e
         # Re-read the target row so the response reflects any writes the
         # linking flow made.
-        refreshed = await asyncio.to_thread(crud.get, supabase, target.id)
+        refreshed = await _target_get(supabase, target.id)
         return refreshed or target
-    activated = await asyncio.to_thread(crud.set_app_active, supabase, target_id=target.id)
+    activated = await asyncio.to_thread(crud.set_app_active, svc, target_id=target.id)
     return activated or target
 
 
@@ -1853,7 +1970,7 @@ async def add_reference_jd(
     request: Request,
     target_id: str,
     body: ReferenceJDAdd,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
@@ -1865,17 +1982,20 @@ async def add_reference_jd(
     Firecrawl).
 
     Genuinely async (awaits URL validation, the JD fetch, and the LLM
-    derive), so it stays ``async def``. supabase-py is synchronous, so each
-    blocking ``crud``/``cost_log`` round-trip is offloaded via
-    ``asyncio.to_thread`` to keep it off the event loop. See #107.
+    derive). The shared-catalog reads/writes ride the async service client via
+    the router-inline helpers + the #191 merge RPC's async twin; the
+    not-yet-async ``derive_profile_from_jd`` content cache + ``project_profile_impact``
+    take a locally-obtained sync client, offloaded via ``asyncio.to_thread``. See #107.
     """
-    await asyncio.to_thread(
-        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
-    )
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     # Verify target exists
-    target = await asyncio.to_thread(crud.get, supabase, target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
+
+    # ``derive_profile_from_jd`` (content-hash cache) + ``project_profile_impact``
+    # are not-yet-async and take the sync service client (jobs.py pattern).
+    svc = get_supabase()
 
     # Cap reference-JD contributions per user per target (#47): bounds a single
     # (possibly rogue) contributor's footprint on the shared profile, on top of
@@ -1883,11 +2003,8 @@ async def add_reference_jd(
     # the LLM derive so an over-cap add costs nothing. Operator/api-key callers
     # (user_id None) are exempt. Soft cap — see config.
     if user_id is not None:
-        contributed = await asyncio.to_thread(
-            crud.count_user_reference_jds,
-            supabase,
-            target_id=target_id,
-            user_id=user_id,
+        contributed = await _count_user_reference_jds_async(
+            supabase, target_id=target_id, user_id=user_id
         )
         if contributed >= settings.reference_jd_max_per_user_per_target:
             raise HTTPException(
@@ -1933,11 +2050,10 @@ async def add_reference_jd(
     # An empty/garbage JD (failed fetch, paywall) is rejected before it can
     # poison the shared target's cached profile (#47).
     try:
-        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=svc)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         supabase,
         user_id=user_id,
         purpose=DEFAULT_PURPOSE,
@@ -1947,15 +2063,13 @@ async def add_reference_jd(
 
     # Store the reference JD, attributed to the contributing user so the
     # merge can de-bias by contributor (#5 refinement layer).
-    added_jd = await asyncio.to_thread(
-        lambda: crud.add_reference_jd(
-            supabase,
-            target_id=target_id,
-            jd_text=jd_text,
-            jd_url=body.jd_url,
-            extracted_profile=derived.scoring_profile,
-            user_id=user_id,
-        )
+    added_jd = await _add_reference_jd_async(
+        supabase,
+        target_id=target_id,
+        jd_text=jd_text,
+        jd_url=body.jd_url,
+        extracted_profile=derived.scoring_profile,
+        user_id=user_id,
     )
 
     # Operator path (api-key caller): no follower identity to RPC-gate on —
@@ -1965,10 +2079,9 @@ async def add_reference_jd(
     # examples not weighted aggregates, and merging across JDs would dilute
     # the few-shot signal. The latest JD overwrites; pools stay coherent.
     if user_id is None:
-        all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
+        all_ref_jds = await _list_reference_jds_async(supabase, target_id)
         composite = merge_reference_jds(all_ref_jds)
-        updated = await asyncio.to_thread(
-            crud.update,
+        updated = await _update_target_async(
             supabase,
             target_id,
             TargetUpdate(
@@ -1993,16 +2106,17 @@ async def add_reference_jd(
     # concurrent-write conflict.
     current = target
     for _attempt in range(2):
-        all_ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
+        all_ref_jds = await _list_reference_jds_async(supabase, target_id)
         composite = merge_reference_jds(all_ref_jds)
         prev_profile = current.scoring_profile.model_dump()
         # Project the full "after" state: the merge installs the new JD's
         # derived search_keywords alongside the profile, and keywords feed
         # scoring — evaluating the new profile under the OLD keywords would
-        # misjudge outliers (Copilot on #204).
+        # misjudge outliers (Copilot on #204). ``project_profile_impact`` is
+        # not-yet-async → sync client, offloaded via ``to_thread``.
         projection = await asyncio.to_thread(
             project_profile_impact,
-            supabase,
+            svc,
             target_id,
             prev_profile,
             composite.model_dump(),
@@ -2018,7 +2132,7 @@ async def add_reference_jd(
                 f"{projection.max_moved_fraction:.0%} cap]"
             )
             staged_diff = ProfilePatch(confidence=0.0, rationale=note)
-            staged_row = {
+            staged_row: dict[str, Any] = {
                 "user_id": user_id,
                 "target_id": target_id,
                 "status": "staged",
@@ -2038,19 +2152,8 @@ async def add_reference_jd(
                     "example_unpromising_titles": derived.example_unpromising_titles,
                 },
             }
-            await asyncio.to_thread(
-                lambda: (
-                    supabase.table("reference_jds")
-                    .update({"suppressed": True})
-                    .eq("id", added_jd.id)
-                    .execute()
-                )
-            )
-
-            def _insert_staged_row(row: dict[str, Any] = staged_row) -> None:
-                supabase.table("target_learning_log").insert(row).execute()
-
-            await asyncio.to_thread(_insert_staged_row)
+            await _suppress_reference_jd_async(supabase, added_jd.id)
+            await _insert_learning_log_row_async(supabase, staged_row)
             logger.info(
                 "Reference-JD contribution QUARANTINED for (user=%s, "
                 "target=%s): projected to move %d/%d jobs ≥%d pts (cap %.0f%%)",
@@ -2065,8 +2168,7 @@ async def add_reference_jd(
             # learning-log panel (apply lifts the quarantine).
             return current
 
-        outcome, _new_version = await asyncio.to_thread(
-            apply_profile_merge_rpc,
+        outcome, _new_version = await apply_profile_merge_rpc_async(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -2077,12 +2179,12 @@ async def add_reference_jd(
             example_unpromising=derived.example_unpromising_titles,
         )
         if outcome == "applied":
-            updated = await asyncio.to_thread(crud.get, supabase, target_id)
+            updated = await _target_get(supabase, target_id)
             if updated is None:
                 raise HTTPException(status_code=500, detail="Failed to update target profile")
             return updated
         if outcome == "version_conflict":
-            refreshed = await asyncio.to_thread(crud.get, supabase, target_id)
+            refreshed = await _target_get(supabase, target_id)
             if refreshed is None:
                 raise HTTPException(status_code=404, detail="Target not found")
             current = refreshed
@@ -2192,11 +2294,13 @@ def delete_reference_jd(
     )
 
 
-# `async def` (#57 PR-F): the caller's vote write rides the ASYNC RLS user
-# client (awaited), so the handler must be async. The service-role ops stay sync
-# and are each offloaded via `asyncio.to_thread`, so no blocking `.execute()`
-# hits the loop (#107). slowapi's @limiter.limit works on async handlers too (it
-# reads the `request` arg). PR-G2 later retires the sync service client.
+# `async def` (#57 PR-G2b): the caller's vote write rides the ASYNC RLS user
+# client and the shared-catalog reads + #191 re-merge ride the ASYNC service
+# client (all awaited). Only the service-role vote-tally RPC
+# (``recompute_suppression``) is not-yet-async — offloaded via ``asyncio.to_thread``
+# on a locally-obtained sync client, so no blocking `.execute()` hits the loop
+# (#107). slowapi's @limiter.limit works on async handlers too (it reads the
+# `request` arg).
 @router.post(
     "/{target_id}/reference-jds/{ref_jd_id}/vote",
     response_model=ContributionVoteResult,
@@ -2207,7 +2311,7 @@ async def vote_on_reference_jd(
     target_id: str,
     ref_jd_id: str,
     body: ReferenceJDVote,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> ContributionVoteResult:
@@ -2219,13 +2323,11 @@ async def vote_on_reference_jd(
     rescue it). Votes are anonymous — only the caller's own vote and the
     suppression outcome are returned, never the tally or who voted.
     """
-    await asyncio.to_thread(
-        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
-    )
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
 
     # The contribution must belong to this target — no cross-target voting, and
     # a 404 rather than leaking the existence of another target's JD.
-    ref_jds = await asyncio.to_thread(crud.list_reference_jds, supabase, target_id)
+    ref_jds = await _list_reference_jds_async(supabase, target_id)
     if not any(j.id == ref_jd_id for j in ref_jds):
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
@@ -2234,10 +2336,11 @@ async def vote_on_reference_jd(
         user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
     )
 
-    # Tally every vote (service-role) and reconcile the suppression flag.
+    # Tally every vote (service-role RPC, not-yet-async) and reconcile the
+    # suppression flag on a locally-obtained sync client, offloaded off the loop.
     suppressed, changed = await asyncio.to_thread(
         votes.recompute_suppression,
-        supabase,
+        get_supabase(),
         reference_jd_id=ref_jd_id,
         quorum=settings.contribution_downvote_quorum,
     )
@@ -2252,34 +2355,31 @@ async def vote_on_reference_jd(
         # contribution's removal behind the learning-rate cap would be
         # backwards. Retried once on a concurrent-write conflict; a second
         # conflict leaves the profile to the next reconciliation (the vote
-        # itself and the suppression flag are already durable). The whole
-        # sync service-role loop runs in one worker thread — off the loop.
-        def _remerge() -> int | None:
-            for _attempt in range(2):
-                target = crud.get(supabase, target_id)
-                if target is None:
-                    return None
-                composite = merge_reference_jds(crud.list_reference_jds(supabase, target_id))
-                outcome, new_version = apply_profile_patch_rpc(
-                    supabase,
-                    user_id=user_id,
-                    target_id=target_id,
-                    next_profile=composite.model_dump(),
-                    expected_version=target.profile_version,
+        # itself and the suppression flag are already durable). Runs on the
+        # async service client (reads + #191 patch RPC twin).
+        for _attempt in range(2):
+            target = await _target_get(supabase, target_id)
+            if target is None:
+                break
+            composite = merge_reference_jds(await _list_reference_jds_async(supabase, target_id))
+            outcome, new_version = await apply_profile_patch_rpc_async(
+                supabase,
+                user_id=user_id,
+                target_id=target_id,
+                next_profile=composite.model_dump(),
+                expected_version=target.profile_version,
+            )
+            if outcome == "applied":
+                profile_version = new_version
+                break
+            if outcome != "version_conflict":
+                logger.warning(
+                    "Vote re-merge refused by RPC (%s) for (user=%s, target=%s)",
+                    outcome,
+                    user_id,
+                    target_id,
                 )
-                if outcome == "applied":
-                    return new_version
-                if outcome != "version_conflict":
-                    logger.warning(
-                        "Vote re-merge refused by RPC (%s) for (user=%s, target=%s)",
-                        outcome,
-                        user_id,
-                        target_id,
-                    )
-                    return None
-            return None
-
-        profile_version = await asyncio.to_thread(_remerge)
+                break
 
     return ContributionVoteResult(
         reference_jd_id=ref_jd_id,
