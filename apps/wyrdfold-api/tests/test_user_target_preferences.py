@@ -24,7 +24,6 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -226,9 +225,8 @@ def test_set_preferences_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    # GET (#57 slice 3) and PUT (#57 slice 4) both run on the async user client
-    # now; override both providers so either handler resolves its dep.
-    app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
+    # GET and PUT (#57) both run on the async user client now (the sync
+    # per-request client was retired in PR-F).
     app.dependency_overrides[get_async_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
@@ -350,7 +348,7 @@ def test_put_rejects_inverted_seniority_range(client: TestClient) -> None:
     boundary (422) instead of storing a confusing no-op."""
     supabase = MagicMock()
     _wire_select(supabase, [_row()])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.put(
         "/targets/target-1/preferences",

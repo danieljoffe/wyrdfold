@@ -562,7 +562,6 @@ async def test_health_reads_ride_async_client_when_flag_on(monkeypatch) -> None:
     _arm_health(monkeypatch, discovery_enabled=True)
     _patch_sentry(monkeypatch)
 
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncHealthRecorder()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
     sync_sb = MagicMock()

@@ -310,3 +310,104 @@ async def test_record_embedding_async_awaits_insert_and_zeroes_output_tokens() -
     assert inserted["cost_usd"] == 0.002
     assert inserted["metadata"] == {"optimized_doc_id": "o1"}
     sb.table.return_value.insert.return_value.execute.assert_awaited_once()
+
+
+# ---- async spend twins (total_spend_async / total_billable_spend_async, PR-F) --
+# Mirror the sync total_spend / total_billable_spend tests: RPC-first path plus
+# the client-side fallback when the RPC isn't deployed. The async client's
+# ``.execute()`` is awaited, so it's mocked with AsyncMock.
+
+
+@pytest.mark.asyncio
+async def test_total_spend_async_uses_rpc_when_available() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp(0.42))
+
+    result = await cost_log.total_spend_async(sb, user_id="u1", since=datetime.now(UTC))
+
+    assert result == 0.42
+    args, _ = sb.rpc.call_args
+    assert args[0] == "total_spend_since"
+    assert args[1]["p_user_id"] == "u1"
+    # RPC path must not touch the select-table API.
+    sb.table.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_total_spend_async_stamps_system_owner_for_none_user_id() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp(1.5))
+
+    await cost_log.total_spend_async(sb, user_id=None, since=None)
+
+    args, _ = sb.rpc.call_args
+    assert args[1]["p_user_id"] == SYSTEM_USER_ID
+    assert args[1]["p_since"] is None
+
+
+@pytest.mark.asyncio
+async def test_total_spend_async_zero_when_rpc_returns_none() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp(None))
+
+    assert await cost_log.total_spend_async(sb, user_id="u1") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_total_spend_async_falls_back_to_python_when_rpc_unavailable() -> None:
+    sb = MagicMock()
+    sb.rpc.side_effect = Exception("function does not exist")
+
+    # Fallback path: select cost_usd, sum in Python — awaited on the async client.
+    sel = sb.table.return_value.select.return_value
+    sel.eq.return_value.gte.return_value.execute = AsyncMock(
+        return_value=_Resp([{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}])
+    )
+
+    result = await cost_log.total_spend_async(
+        sb, user_id="u1", since=datetime.now(UTC) - timedelta(hours=1)
+    )
+    assert result == pytest.approx(0.40)
+
+
+@pytest.mark.asyncio
+async def test_total_billable_spend_async_uses_rpc_when_available() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp("0.75"))
+
+    result = await cost_log.total_billable_spend_async(
+        sb, user_id="u1", since=datetime.now(UTC), excluded_purposes=("poll_scoring",)
+    )
+
+    assert result == pytest.approx(0.75)
+    args, _ = sb.rpc.call_args
+    assert args[0] == "total_billable_spend_since"
+    assert args[1]["p_excluded_purposes"] == ["poll_scoring"]
+    sb.table.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_total_billable_spend_async_falls_back_when_rpc_unavailable() -> None:
+    sb = MagicMock()
+    sb.rpc.side_effect = Exception("not deployed")
+
+    # Fallback: select (cost_usd, purpose), filter out excluded purposes, sum.
+    sel = sb.table.return_value.select.return_value
+    sel.eq.return_value.gte.return_value.execute = AsyncMock(
+        return_value=_Resp(
+            [
+                {"cost_usd": 0.10, "purpose": "job_analysis"},
+                {"cost_usd": 0.20, "purpose": "poll_scoring"},  # excluded
+                {"cost_usd": 0.05, "purpose": "tailor"},
+            ]
+        )
+    )
+
+    result = await cost_log.total_billable_spend_async(
+        sb,
+        user_id="u1",
+        since=datetime.now(UTC) - timedelta(hours=1),
+        excluded_purposes=("poll_scoring",),
+    )
+    # 0.10 + 0.05 (poll_scoring excluded).
+    assert result == pytest.approx(0.15)

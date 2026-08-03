@@ -66,10 +66,10 @@ from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
 from app.services.target_scoring import (
-    score_and_upsert_poll as target_score_and_upsert,
+    score_and_upsert as target_score_and_upsert,
 )
 from app.services.target_scoring import (
-    score_title_and_upsert_poll as target_title_score_and_upsert,
+    score_title_and_upsert as target_title_score_and_upsert,
 )
 from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.crud import is_pipeline_active as target_is_pipeline_active

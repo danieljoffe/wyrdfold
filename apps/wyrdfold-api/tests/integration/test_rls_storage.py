@@ -3,7 +3,7 @@
 Proves what mocks can't: an object uploaded under one user's `<uid>/`
 folder is downloadable through that user's JWT-bound client, and a
 different user's client is denied — Storage RLS (folder prefix =
-auth.uid()) is the control. This also guards the `get_user_client` wiring
+auth.uid()) is the control. This also guards the `get_async_user_client` wiring
 that binds the bearer onto the storage sub-client (not just postgrest);
 if that regressed, a user couldn't even read their own object and these
 fail.

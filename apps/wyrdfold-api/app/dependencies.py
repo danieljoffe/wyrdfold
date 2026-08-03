@@ -52,77 +52,17 @@ def get_async_service_supabase() -> AsyncClient:
     return client
 
 
-def get_user_supabase(
-    request: Request,
-    s: Settings = Depends(get_settings),
-) -> Client:
-    """Per-request Supabase client bound to the caller's JWT (#79).
-
-    Unlike ``get_supabase`` (service-role, bypasses RLS), this routes
-    queries through the user's token so Postgres RLS enforces per-user
-    access. JWT-only: api-key/cron callers have no user token and must
-    use ``get_supabase``. Not wired into any route yet — the per-user
-    data paths migrate onto it table-by-table in later #79 phases.
-    """
-    if not s.supabase_url or not s.supabase_anon_key:
-        raise HTTPException(status_code=503, detail="Supabase user client not configured")
-    token = _extract_bearer_token(request)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing auth token")
-
-    from app.supabase_pool import get_user_client
-
-    return get_user_client(token)
-
-
-def get_supabase_for_caller(
-    request: Request,
-    s: Settings = Depends(get_settings),
-) -> Client:
-    """Return the per-request RLS-enforced user client for a JWT caller.
-
-    Used by the dual-auth user routers to scope queries by
-    ``auth.uid() = user_id`` at Postgres (not just in Python). **JWT-only.**
-
-    Since #192 the user-data gate (``verify_api_key_or_jwt``) rejects shared
-    API keys, so no api-key caller reaches the routes that use this. This dep
-    therefore no longer honours the broad key either — defense in depth: a
-    leaked automation key can never obtain a service-role client on a user
-    route, independent of how a future route wires its auth. An absent or
-    unverifiable token 401s (and a JWT with no user client configured 503s,
-    never a silent fall-back to service-role that would bypass RLS).
-    """
-    if s.supabase_url:
-        token = _extract_bearer_token(request)
-        if token:
-            try:
-                _decode_supabase_jwt(token, s)
-            except HTTPException:
-                logger.warning(
-                    "auth_jwt_decode_failed path=%s reason=client_select",
-                    request.url.path,
-                )
-            else:
-                if not s.supabase_anon_key:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Supabase user client not configured",
-                    )
-                from app.supabase_pool import get_user_client
-
-                return get_user_client(token)
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 async def get_async_user_supabase(
     request: Request,
     s: Settings = Depends(get_settings),
 ) -> AsyncClient:
-    """Async mirror of :func:`get_user_supabase` (#57 slice 3).
+    """Per-request, RLS-enforced user client on the pooled async HTTP/2 transport.
 
-    Per-request, RLS-enforced user client on the pooled async HTTP/2 transport.
-    JWT-only, same guards as the sync version. Not wired into any route yet —
-    the per-user router paths migrate onto it module-by-module.
+    Routes queries through the caller's JWT so Postgres RLS enforces per-user
+    access (unlike ``get_supabase``, which is service-role and bypasses RLS).
+    JWT-only: api-key/cron callers have no user token and must use
+    ``get_supabase``. This is the per-request user client for every RLS route
+    since PR-F retired the sync per-request client (#57).
     """
     if not s.supabase_url or not s.supabase_anon_key:
         raise HTTPException(status_code=503, detail="Supabase user client not configured")
@@ -139,11 +79,16 @@ async def get_async_supabase_for_caller(
     request: Request,
     s: Settings = Depends(get_settings),
 ) -> AsyncClient:
-    """Async mirror of :func:`get_supabase_for_caller` (#57 slice 3).
+    """Per-request RLS-enforced user client for a JWT caller (dual-auth routers).
 
-    Same JWT-only, RLS-scoped contract as the sync version. The JWT decode can
-    trigger a blocking JWKS fetch (cold cache / unknown kid), so it runs in a
-    worker thread — never on the event loop this async dependency executes on.
+    Scopes queries by ``auth.uid() = user_id`` at Postgres (not just in Python).
+    JWT-only: since #192 the user-data gate rejects shared API keys, so this dep
+    honours no key either — a leaked automation key can never obtain a
+    service-role client on a user route. An absent/unverifiable token 401s (a JWT
+    with no user client configured 503s — never a silent service-role fall-back
+    that would bypass RLS). The JWT decode can trigger a blocking JWKS fetch
+    (cold cache / unknown kid), so it runs in a worker thread — never on the
+    event loop this async dependency executes on.
     """
     if s.supabase_url:
         token = _extract_bearer_token(request)

@@ -105,7 +105,6 @@ async def test_flag_on_lock_rpcs_use_async_client(
 ) -> None:
     from app.services import poll_lock
 
-    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
     async_client = _AsyncLockClient()
     monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: async_client)
     sync_sb, _ = _fake_lock_supabase()
@@ -127,7 +126,6 @@ async def test_flag_on_without_async_client_falls_back_to_sync(
 ) -> None:
     from app.services import poll_lock
 
-    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
     monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: None)
     sb, state = _fake_lock_supabase()
 

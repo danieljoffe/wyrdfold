@@ -14,7 +14,7 @@ from-url target flow:
 """
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -124,7 +124,9 @@ async def test_scores_each_target_and_force_includes(
     supabase = _supabase()
     scored: list[str] = []
     monkeypatch.setattr(
-        job_ingest, "score_and_upsert", lambda _c, **kw: scored.append(kw["target"].id)
+        job_ingest,
+        "score_and_upsert",
+        AsyncMock(side_effect=lambda _c, **kw: scored.append(kw["target"].id)),
     )
     posting_id = await _materialize(supabase, targets=[_target("tgt-1"), _target("tgt-2")])
 
@@ -152,7 +154,7 @@ async def test_per_target_score_failure_is_isolated(
             raise RuntimeError("scoring exploded")
         scored.append(target.id)  # type: ignore[attr-defined]
 
-    monkeypatch.setattr(job_ingest, "score_and_upsert", flaky)
+    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(side_effect=flaky))
 
     posting_id = await _materialize(supabase, targets=[_target("tgt-bad"), _target("tgt-ok")])
 
@@ -166,7 +168,7 @@ async def test_set_included_false_skips_force_include(
     monkeypatch: pytest.MonkeyPatch, invalidations: list[int]
 ) -> None:
     supabase = _supabase()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", lambda _c, **kw: None)
+    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(return_value=None))
 
     await _materialize(supabase, set_included=False)
 
@@ -181,7 +183,7 @@ async def test_force_include_failure_is_swallowed(
     visibility is nice-to-have and must never fail the materialize."""
     supabase = _supabase()
     supabase.rpc.return_value.execute.side_effect = RuntimeError("rpc down")
-    monkeypatch.setattr(job_ingest, "score_and_upsert", lambda _c, **kw: None)
+    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(return_value=None))
 
     posting_id = await _materialize(supabase)
 
