@@ -129,6 +129,7 @@ _CLIENT_ARG_NAMES = {
     "caller_supabase",
     "cost_supabase",
     "service_supabase",
+    "sync_supabase",
     "user_supabase",
 }
 _OFFLOAD_WRAPPERS = {
