@@ -21,19 +21,28 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.dependencies import get_async_service_supabase, get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
 
 
 @pytest.fixture
 def sb() -> Any:
     fake = MagicMock(name="supabase")
+    # invite_from_waitlist is now async (#57 PR-G2a): its reads/writes await
+    # ``.execute()`` on the async service client and ``auth.admin`` is awaited.
     # waitlist select → no rows by default (direct invite).
-    fake.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
+    fake.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    fake.table.return_value.upsert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    fake.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    fake.auth.admin.invite_user_by_email = AsyncMock(return_value=MagicMock())
     app.dependency_overrides[verify_api_key] = lambda: None
-    # invite_from_waitlist stays sync (auth-admin holdout) → get_supabase;
-    # list_waitlist is async (#57 slice 4) → get_async_service_supabase.
-    app.dependency_overrides[get_supabase] = lambda: fake
+    # Both invite_from_waitlist and list_waitlist run on the async service client.
     app.dependency_overrides[get_async_service_supabase] = lambda: fake
     yield fake
     app.dependency_overrides.clear()

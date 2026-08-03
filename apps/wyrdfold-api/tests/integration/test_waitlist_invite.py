@@ -13,10 +13,11 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
-from supabase import Client
+from supabase import AsyncClient, Client, acreate_client
 
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
+from tests.integration.conftest import LOCAL_URL, SERVICE_KEY
 
 pytestmark = pytest.mark.integration
 
@@ -37,9 +38,22 @@ def seeded_signup(service_client: Client) -> Iterator[str]:
         service_client.table("waitlist_signups").delete().eq("email", email).execute()
 
 
+async def _async_service_override() -> AsyncClient:
+    """A fresh async service client per request (#57 PR-G2a).
+
+    ``invite_from_waitlist`` is now an ``async def`` on the async service client,
+    and its ``auth.admin.invite_user_by_email`` is awaited. Building the client
+    inside the dependency means its httpx pool binds to the TestClient portal's
+    loop (a new loop per request) rather than a stale one — so this exercises the
+    REAL async auth-admin invite against the live stack, the whole point of this
+    gate.
+    """
+    return await acreate_client(LOCAL_URL, SERVICE_KEY)
+
+
 def _client(service_client: Client) -> TestClient:
     app.dependency_overrides[verify_api_key] = lambda: None
-    app.dependency_overrides[get_supabase] = lambda: service_client
+    app.dependency_overrides[get_async_service_supabase] = _async_service_override
     return TestClient(app)
 
 
