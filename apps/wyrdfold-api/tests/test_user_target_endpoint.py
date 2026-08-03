@@ -89,9 +89,17 @@ def test_mine_schedules_lazy_refresh_when_user_has_targets(
     SINGLE background refresh task (E2) — the whole staleness scan runs in the
     background, off the response path. TestClient runs background tasks after the
     response, so the spy is invoked with the user id."""
+    from app.routers import targets as router_mod
+
+    # #57 PR-G2b: /mine reads summaries on the async client via the router inline
+    # helper, and acquires the sync client for the bg fit-refresh via a DIRECT
+    # get_supabase() call (not Depends) — patch both.
     monkeypatch.setattr(
-        fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [_summary_item()]
+        router_mod,
+        "_list_user_targets_with_summary_async",
+        AsyncMock(return_value=[_summary_item()]),
     )
+    monkeypatch.setattr(router_mod, "get_supabase", lambda: MagicMock())
     scheduled: dict[str, object] = {}
 
     async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
@@ -110,7 +118,11 @@ def test_mine_skips_refresh_when_no_targets(
 ) -> None:
     """No linked targets → nothing to refresh → no background task scheduled at
     all (the staleness/no-profile short-circuits now live inside the task)."""
-    monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
+    from app.routers import targets as router_mod
+
+    monkeypatch.setattr(
+        router_mod, "_list_user_targets_with_summary_async", AsyncMock(return_value=[])
+    )
     called = {"n": 0}
 
     async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]

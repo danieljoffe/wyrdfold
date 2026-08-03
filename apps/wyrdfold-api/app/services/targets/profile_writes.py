@@ -24,20 +24,63 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 Outcome = str  # 'applied' | 'version_conflict' | 'not_a_follower' | 'target_not_found'
 
 
-def _call(supabase: Client, fn: str, params: dict[str, Any]) -> tuple[Outcome, int | None]:
-    resp = supabase.rpc(fn, params).execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+def _parse_rpc_result(fn: str, data: Any) -> tuple[Outcome, int | None]:
+    rows = cast(list[dict[str, Any]], data or [])
     if not rows:
         raise RuntimeError(f"{fn} returned no row — RPC missing or grants misconfigured")
     return (
         cast(str, rows[0]["outcome"]),
         cast(int | None, rows[0]["new_version"]),
     )
+
+
+def _call(supabase: Client, fn: str, params: dict[str, Any]) -> tuple[Outcome, int | None]:
+    resp = supabase.rpc(fn, params).execute()
+    return _parse_rpc_result(fn, resp.data)
+
+
+async def _call_async(
+    supabase: AsyncClient, fn: str, params: dict[str, Any]
+) -> tuple[Outcome, int | None]:
+    resp = await supabase.rpc(fn, params).execute()
+    return _parse_rpc_result(fn, resp.data)
+
+
+def _patch_params(
+    *, user_id: str, target_id: str, next_profile: dict[str, Any], expected_version: int
+) -> dict[str, Any]:
+    return {
+        "p_user_id": user_id,
+        "p_target_id": target_id,
+        "p_next_profile": next_profile,
+        "p_expected_version": expected_version,
+    }
+
+
+def _merge_params(
+    *,
+    user_id: str,
+    target_id: str,
+    next_profile: dict[str, Any],
+    expected_version: int,
+    search_keywords: list[str] | None,
+    example_promising: list[str] | None,
+    example_unpromising: list[str] | None,
+) -> dict[str, Any]:
+    return {
+        "p_user_id": user_id,
+        "p_target_id": target_id,
+        "p_next_profile": next_profile,
+        "p_expected_version": expected_version,
+        "p_search_keywords": search_keywords,
+        "p_example_promising": example_promising,
+        "p_example_unpromising": example_unpromising,
+    }
 
 
 def apply_profile_patch_rpc(
@@ -48,16 +91,47 @@ def apply_profile_patch_rpc(
     next_profile: dict[str, Any],
     expected_version: int,
 ) -> tuple[Outcome, int | None]:
-    """Write ``scoring_profile`` + version bump through the #191 patch RPC."""
+    """Write ``scoring_profile`` + version bump through the #191 patch RPC.
+
+    Sync form for the poller/learner/feedback + operator ``delete_reference_jd``
+    paths (they hold the sync service client). Interactive ``async def`` router
+    handlers on the pooled async client use :func:`apply_profile_patch_rpc_async`.
+    """
     return _call(
         supabase,
         "apply_target_profile_patch",
-        {
-            "p_user_id": user_id,
-            "p_target_id": target_id,
-            "p_next_profile": next_profile,
-            "p_expected_version": expected_version,
-        },
+        _patch_params(
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=next_profile,
+            expected_version=expected_version,
+        ),
+    )
+
+
+async def apply_profile_patch_rpc_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    next_profile: dict[str, Any],
+    expected_version: int,
+) -> tuple[Outcome, int | None]:
+    """Async mirror of :func:`apply_profile_patch_rpc` (#57 PR-G2b).
+
+    The RPC round-trip lands on the event loop instead of a threadpool worker,
+    for ``async def`` handlers on the pooled async service client. Identical
+    semantics + return shape; the sync twin stays for the sync-client callers.
+    """
+    return await _call_async(
+        supabase,
+        "apply_target_profile_patch",
+        _patch_params(
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=next_profile,
+            expected_version=expected_version,
+        ),
     )
 
 
@@ -78,17 +152,48 @@ def apply_profile_merge_rpc(
     the current value otherwise) — a staged-then-approved merge updates
     them from the stage-time ``merge_payload``; re-merges that carry no
     derivation (delete, vote flips) pass None.
+
+    Sync form for the learner path (sync service client). Interactive
+    ``async def`` callers use :func:`apply_profile_merge_rpc_async`.
     """
     return _call(
         supabase,
         "apply_target_profile_merge",
-        {
-            "p_user_id": user_id,
-            "p_target_id": target_id,
-            "p_next_profile": next_profile,
-            "p_expected_version": expected_version,
-            "p_search_keywords": search_keywords,
-            "p_example_promising": example_promising,
-            "p_example_unpromising": example_unpromising,
-        },
+        _merge_params(
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=next_profile,
+            expected_version=expected_version,
+            search_keywords=search_keywords,
+            example_promising=example_promising,
+            example_unpromising=example_unpromising,
+        ),
+    )
+
+
+async def apply_profile_merge_rpc_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    next_profile: dict[str, Any],
+    expected_version: int,
+    search_keywords: list[str] | None = None,
+    example_promising: list[str] | None = None,
+    example_unpromising: list[str] | None = None,
+) -> tuple[Outcome, int | None]:
+    """Async mirror of :func:`apply_profile_merge_rpc` (#57 PR-G2b) for
+    ``async def`` callers on the pooled async service client."""
+    return await _call_async(
+        supabase,
+        "apply_target_profile_merge",
+        _merge_params(
+            user_id=user_id,
+            target_id=target_id,
+            next_profile=next_profile,
+            expected_version=expected_version,
+            search_keywords=search_keywords,
+            example_promising=example_promising,
+            example_unpromising=example_unpromising,
+        ),
     )

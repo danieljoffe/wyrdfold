@@ -23,7 +23,6 @@ from app.dependencies import (
     get_current_user_id_optional,
     verify_api_key_or_jwt,
 )
-from app.services.targets import crud
 
 
 def _client_with_overrides(overrides: dict[Any, Any]) -> Any:
@@ -359,13 +358,20 @@ async def test_reference_jd_contribution_cap_rejects_over_cap(
     from app.models.targets import ReferenceJDAdd
     from app.routers import targets
 
-    monkeypatch.setattr(targets, "_require_user_owns_target", lambda *_a, **_kw: None)
-    monkeypatch.setattr(crud, "get", lambda *_a, **_kw: MagicMock())
+    # #57 PR-G2b: the handler ownership-checks + reads the target + counts
+    # contributions on the async service client (router inline helpers), and
+    # acquires the sync client for the deep services via a DIRECT get_supabase().
+    async def _owns(*_a: object, **_kw: object) -> None:
+        return None
+
+    monkeypatch.setattr(targets, "_require_user_owns_target_async", _owns)
+    monkeypatch.setattr(targets, "_target_get", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(targets, "get_supabase", lambda: MagicMock())
     # The caller is already at the cap.
     monkeypatch.setattr(
-        crud,
-        "count_user_reference_jds",
-        lambda *_a, **_kw: settings.reference_jd_max_per_user_per_target,
+        targets,
+        "_count_user_reference_jds_async",
+        AsyncMock(return_value=settings.reference_jd_max_per_user_per_target),
     )
 
     with pytest.raises(HTTPException) as exc:
