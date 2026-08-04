@@ -31,7 +31,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services.db_write import poll_db_read, poll_db_write
@@ -118,7 +118,7 @@ def _age_days(posted_at: Any, now: datetime) -> float:
     return max(0.0, (now - seen).total_seconds() / 86400.0)
 
 
-async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[str]) -> int:
+async def refresh_recency_scores_poll(supabase: AsyncClient, job_posting_ids: list[str]) -> int:
     """Recompute ``recency_score`` for every scores row of the given jobs.
 
     Reads each job's posted date (coalesced) to derive its age, then writes

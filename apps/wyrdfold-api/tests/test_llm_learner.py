@@ -184,8 +184,8 @@ class TestApplyPatchToProfile:
 class _Resp:
     """Awaitable fake response (#57 PR-G2e-3).
 
-    Every DB read in ``run_llm_learner`` and its now-async projection twin
-    ``project_profile_impact_async`` does ``await query.execute()``, so ``_Resp``
+    Every DB read in ``run_llm_learner`` and its now-async projection
+    ``project_profile_impact`` does ``await query.execute()``, so ``_Resp``
     is awaitable (yields itself) and also exposes ``.data`` / ``.count`` directly
     for the caller to read after the await. The apply-path tests leave the
     projection real: it awaits over empty ``scores`` (→ ``None``) exactly as

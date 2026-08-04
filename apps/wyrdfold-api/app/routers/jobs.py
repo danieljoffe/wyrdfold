@@ -60,7 +60,7 @@ from app.services.job_ingest import materialize_and_score_job
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
 from app.services.target_scoring import (
-    bulk_score_for_target_async,
+    bulk_score_for_target,
     score_and_upsert_async,
 )
 from app.services.targets.crud import (
@@ -2702,15 +2702,14 @@ async def rescore_for_target(
     the wyrdfold FE — only invoked manually from the operator console
     or from CLI scripts that supply the api key.
 
-    Runs the async twin ``bulk_score_for_target_async`` on the pooled async
-    service client, awaited on the loop (#57 PR-G2e-4). The sync
-    ``bulk_score_for_target`` stays for the CLI/backfill + feedback-learner paths.
+    Runs ``bulk_score_for_target`` on the pooled async service client, awaited on
+    the loop (#57 PR-G2e-4) — the same re-scorer the feedback learner uses.
     """
     target = await _get_target_async(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    scored = await bulk_score_for_target_async(supabase, target)
+    scored = await bulk_score_for_target(supabase, target)
     job_list_cache.invalidate()
     return {"target_id": target_id, "jobs_scored": scored}
 

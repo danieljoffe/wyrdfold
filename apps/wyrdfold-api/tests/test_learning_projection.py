@@ -117,9 +117,9 @@ def test_after_side_scores_with_next_search_keywords() -> None:
 
 
 # ---------------------------------------------------------------------------
-# project_profile_impact_async (#57 PR-G2e-3) — the async twin: fetch the recent
-# scored jobs on the pooled async client, then run the identical (pure)
-# ``project_rescore``. Used by the LLM learner.
+# project_profile_impact (#57 PR-G2e-3): fetch the recent scored jobs on the
+# pooled async client, then run the (pure) ``project_rescore``. Used by the LLM
+# learner and the reference-JD merge path.
 # ---------------------------------------------------------------------------
 
 
@@ -163,11 +163,11 @@ class _ProjSupabase:
 
 
 @pytest.mark.asyncio
-async def test_project_profile_impact_async_fetches_and_projects() -> None:
-    """End to end: the async twin awaits the recent-scored-jobs reads, then runs
-    the deterministic ``project_rescore``. Adding a ``python`` negative that
+async def test_project_profile_impact_fetches_and_projects() -> None:
+    """End to end: awaits the recent-scored-jobs reads, then runs the
+    deterministic ``project_rescore``. Adding a ``python`` negative that
     hard-excludes both scored jobs must register real score movement."""
-    from app.services.targets.learning_projection import project_profile_impact_async
+    from app.services.targets.learning_projection import project_profile_impact
 
     sb = _ProjSupabase(
         scores=[{"job_posting_id": "j1"}, {"job_posting_id": "j2"}],
@@ -179,7 +179,7 @@ async def test_project_profile_impact_async_fetches_and_projects() -> None:
     prev = _profile({"python": 3}).model_dump()
     nxt = _profile({"python": 3}, negative=["python"]).model_dump()
 
-    proj = await project_profile_impact_async(sb, "t", prev, nxt, ["python"])  # type: ignore[arg-type]
+    proj = await project_profile_impact(sb, "t", prev, nxt, ["python"])  # type: ignore[arg-type]
 
     assert proj is not None
     assert proj.jobs_considered == 2
@@ -187,11 +187,11 @@ async def test_project_profile_impact_async_fetches_and_projects() -> None:
 
 
 @pytest.mark.asyncio
-async def test_project_profile_impact_async_returns_none_without_scored_jobs() -> None:
+async def test_project_profile_impact_returns_none_without_scored_jobs() -> None:
     """No scored jobs to project against → None (the caller then applies the
     patch without a learning-rate check — nothing to over-churn yet)."""
-    from app.services.targets.learning_projection import project_profile_impact_async
+    from app.services.targets.learning_projection import project_profile_impact
 
     sb = _ProjSupabase(scores=[], jobs=[])
-    proj = await project_profile_impact_async(sb, "t", {}, {}, None)  # type: ignore[arg-type]
+    proj = await project_profile_impact(sb, "t", {}, {}, None)  # type: ignore[arg-type]
     assert proj is None

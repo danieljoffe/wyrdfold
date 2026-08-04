@@ -8,7 +8,7 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.constants import resolve_owner
@@ -80,16 +80,13 @@ from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
-# The poll cycle has TWO entry points with different client types: the
-# scheduler + force poll pass the pooled ``AsyncClient`` (#57 PR-G2d-b), while
-# the target-activation poll (``routers.targets`` → ``poll_sources_for_target``,
-# a separate #57 chunk) still passes the sync service ``Client``. Every DB touch
-# below routes through the ``db_write`` seam (client-agnostic — it uses
-# ``get_async_supabase()`` internally), and the cross-user service-role
-# collaborators (budget meter, payer resolver, alert dispatch) await on the
-# pooled async service client via ``_async_service_client`` (PR-G2e-1), so the
-# shared helpers accept either client. This alias types that contract.
-PollClient = Client | AsyncClient
+# Every poll-cycle entry point now passes the pooled ``AsyncClient`` (#57): the
+# scheduler + force poll (PR-G2d-b) and the target-activation poll
+# (``routers.targets`` → ``poll_sources_for_target``). Every DB touch below routes
+# through the ``db_write`` seam (client-agnostic — it uses ``get_async_supabase()``
+# internally), and the cross-user service-role collaborators (budget meter, payer
+# resolver, alert dispatch) await on the pooled async service client via
+# ``_async_service_client`` (PR-G2e-1).
 
 # Large id lists derived from a source's job feed (re-read of newly-inserted
 # rows, Stage 3 score lookups, stale-archive) never go through a request URL:
@@ -595,7 +592,7 @@ async def _fill_jsonld_salaries(
 
 
 async def _load_alert_rows(
-    supabase: PollClient, new_rows: list[dict[str, Any]]
+    supabase: AsyncClient, new_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Re-read newly-inserted job rows with their post-scoring state.
 
@@ -663,7 +660,7 @@ def _async_service_client() -> AsyncClient:
     return cast(AsyncClient, get_async_supabase())
 
 
-async def _active_targets(supabase: PollClient) -> list[JobTarget]:
+async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
     """Async inline of ``crud.get_active`` (the sync twin stays for its non-poll
     callers): the derived ``app_active OR EXISTS(active membership)`` pipeline
     predicate — two indexed reads deduped in Python (see the crud docstring for
@@ -700,7 +697,7 @@ async def _active_targets(supabase: PollClient) -> list[JobTarget]:
     return [crud._parse_target(r) for r in rows]
 
 
-async def _is_pipeline_active(supabase: PollClient, target_id: str) -> bool:
+async def _is_pipeline_active(supabase: AsyncClient, target_id: str) -> bool:
     """Async inline of ``crud.is_pipeline_active`` (sync twin stays for the bulk
     re-scorer): the instance floor OR any active membership. Seam-routed."""
     t_resp = await poll_db_read(
@@ -728,7 +725,7 @@ async def _is_pipeline_active(supabase: PollClient, target_id: str) -> bool:
     return bool(m_resp.count or 0)
 
 
-async def _latest_optimized(supabase: PollClient, user_id: str | None) -> OptimizedDoc | None:
+async def _latest_optimized(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
     """Async inline of ``optimized.get_latest`` (sync twin stays for the request
     path's TTL cache + non-poll callers). Seam-routed; skips the module TTL
     cache (the poller reads a user's doc at most once per cycle, and the cache
@@ -752,7 +749,7 @@ async def _latest_optimized(supabase: PollClient, user_id: str | None) -> Optimi
 
 
 async def _resolve_user_targets_for_stage3(
-    supabase: PollClient,
+    supabase: AsyncClient,
     active_targets: list[JobTarget],
     company_name: str,
 ) -> tuple[dict[str, JobTarget], dict[str, OptimizedDoc]]:
@@ -808,7 +805,7 @@ async def _resolve_user_targets_for_stage3(
 
 async def _qualify_one_job(
     llm: LLMClient,
-    supabase: PollClient,
+    supabase: AsyncClient,
     row: dict[str, Any],
 ) -> None:
     """Tag ONE job row and persist its qualification columns (#60).
@@ -917,7 +914,7 @@ async def _qualify_one_job(
 
 
 async def _qualify_jobs(
-    supabase: PollClient,
+    supabase: AsyncClient,
     rows: list[dict[str, Any]],
 ) -> None:
     """Run the #60 qualification tagger over ``rows`` (best-effort).
@@ -965,7 +962,7 @@ async def _qualify_jobs(
 
 
 async def _qualify_rows_with_budget(
-    supabase: PollClient,
+    supabase: AsyncClient,
     llm: LLMClient,
     rows: list[dict[str, Any]],
 ) -> None:
@@ -1020,7 +1017,7 @@ async def _qualify_rows_with_budget(
 _IN_CHUNK = 150
 
 
-async def _refresh_job_tags(supabase: PollClient, rows: list[dict[str, Any]]) -> None:
+async def _refresh_job_tags(supabase: AsyncClient, rows: list[dict[str, Any]]) -> None:
     """Patch fresh tag columns back into ``rows`` (in place, best-effort).
 
     The dicts the poll cycle threads into Phase 2 (``upsert_resp.data``) are
@@ -1053,7 +1050,7 @@ async def _refresh_job_tags(supabase: PollClient, rows: list[dict[str, Any]]) ->
         logger.exception("Qualification tag refresh failed (best-effort; dicts stay stale)")
 
 
-async def _reconcile_offfamily_promising(supabase: PollClient, job_ids: list[str]) -> None:
+async def _reconcile_offfamily_promising(supabase: AsyncClient, job_ids: list[str]) -> None:
     """Retract ``promising`` verdicts that the (now-landed) family tag
     hard-contradicts (best-effort).
 
@@ -1124,7 +1121,7 @@ async def _reconcile_offfamily_promising(supabase: PollClient, job_ids: list[str
         logger.exception("Family reconcile failed (best-effort; next cycle retries)")
 
 
-async def _backfill_qualify_stale(supabase: PollClient, limit: int) -> None:
+async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
     """Liveness-check + tag a bounded batch of the OLDEST untagged, unarchived
     jobs (#285); archive the ones whose listing is gone.
 
@@ -1217,7 +1214,7 @@ async def _backfill_qualify_stale(supabase: PollClient, limit: int) -> None:
 
 
 async def _drop_purged_rows(
-    supabase: PollClient, source_id: str, rows: list[dict[str, Any]]
+    supabase: AsyncClient, source_id: str, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Filter out rows whose (source, external_id) was TOMBSTONED (archival
     Stage 2, option B).
@@ -1263,7 +1260,7 @@ async def _drop_purged_rows(
         return rows
 
 
-async def _backfill_grade_stale(supabase: PollClient, limit: int) -> None:
+async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
     """Grade a bounded, view-ordered batch of the stale ``promising`` backlog.
 
     ``run_phase2_for_jobs`` only ever sees jobs a poll cycle re-touched, so a
@@ -1402,7 +1399,7 @@ async def _resolve_payer_client(
 
 async def _poll_one_source(
     source: dict[str, Any],
-    supabase: PollClient,
+    supabase: AsyncClient,
     budget_gate: PayerBudgetGate | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
@@ -1865,7 +1862,7 @@ async def _poll_one_source(
                 ) -> None:
                     try:
                         await target_title_score_and_upsert(
-                            cast(Client, supabase),
+                            supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
                             target=target,
@@ -1955,7 +1952,7 @@ async def _poll_one_source(
                             promising_arg = promising if phase1_verdicts else None
                             phase1_confidence = verdict.confidence if verdict is not None else None
                         await target_score_and_upsert(
-                            cast(Client, supabase),
+                            supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
                             description_html=row_data.get("description_html", ""),
@@ -2051,7 +2048,7 @@ async def _poll_one_source(
             # upsert in that case, so the list sort is unaffected.
             if settings.recency_decay_enabled and stage2_ids:
                 try:
-                    await refresh_recency_scores_poll(cast(Client, supabase), stage2_ids)
+                    await refresh_recency_scores_poll(supabase, stage2_ids)
                 except Exception:
                     logger.exception("Recency refresh failed for %s", company_name)
 
@@ -2186,7 +2183,7 @@ _SOURCE_LAST_ERROR_MAX_LEN = 500
 
 
 async def _record_source_failure(
-    supabase: PollClient, source: dict[str, Any], *, error: str | None = None
+    supabase: AsyncClient, source: dict[str, Any], *, error: str | None = None
 ) -> None:
     """Failure backoff: count consecutive fetch failures per source, persist
     the failure cause, and auto-disable at the threshold (a dead board
@@ -2245,7 +2242,7 @@ async def _record_source_failure(
         logger.exception("Failed to record source failure for %s", source_id)
 
 
-async def recover_stale_sources(supabase: PollClient, *, now: datetime | None = None) -> int:
+async def recover_stale_sources(supabase: AsyncClient, *, now: datetime | None = None) -> int:
     """Auto-recovery: re-enable sources the backoff auto-disabled longer ago
     than ``source_recovery_after_hours``, resetting their failure counter so
     they get polled again.
@@ -2338,7 +2335,7 @@ async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float 
     return await total_llm_spend_all_async(supabase, since=midnight) >= effective_cap
 
 
-async def _triage_budget_blocks(supabase: PollClient) -> bool:
+async def _triage_budget_blocks(supabase: AsyncClient) -> bool:
     """Async, fail-OPEN global-budget check for the Phase-1 triage loops.
 
     Reads the meter off-thread (it's a sync DB call). Returns True only when
@@ -2430,7 +2427,7 @@ async def _global_circuit_breaker_tripped(supabase: AsyncClient) -> bool:
     return True
 
 
-async def _cycle_budget_gate(supabase: PollClient) -> tuple[PayerBudgetGate, bool]:
+async def _cycle_budget_gate(supabase: AsyncClient) -> tuple[PayerBudgetGate, bool]:
     """Build the payer/allowance snapshot once per poll cycle.
 
     Returns ``(gate, has_active_targets)`` — the active-target fetch is
@@ -2524,7 +2521,7 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
-async def poll_all_sources(supabase: PollClient) -> PollResult:
+async def poll_all_sources(supabase: AsyncClient) -> PollResult:
     sources_resp = await poll_db_read(
         supabase,
         lambda c: c.table("sources").select("*").eq("enabled", True),
@@ -2607,7 +2604,7 @@ def filter_due_sources(
     return [s for s in sources if _is_due(s, moment)]
 
 
-async def poll_due_sources(supabase: PollClient) -> PollResult:
+async def poll_due_sources(supabase: AsyncClient) -> PollResult:
     """Poll only the sources whose interval has elapsed.
 
     Same shape as ``poll_all_sources`` but skips sources that were
@@ -2723,7 +2720,7 @@ async def poll_due_sources(supabase: PollClient) -> PollResult:
 
 async def _poll_one_source_for_target(
     source: dict[str, Any],
-    supabase: PollClient,
+    supabase: AsyncClient,
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_over_budget: bool = False,
@@ -2987,7 +2984,7 @@ async def _poll_one_source_for_target(
             async def _title_score_one(row_data: dict[str, Any]) -> None:
                 try:
                     await target_title_score_and_upsert(
-                        cast(Client, supabase),
+                        supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
                         target=target,
@@ -3059,7 +3056,7 @@ async def _poll_one_source_for_target(
                         promising_arg = promising if target_verdicts else None
                         phase1_confidence = verdict.confidence if verdict is not None else None
                     await target_score_and_upsert(
-                        cast(Client, supabase),
+                        supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
                         description_html=row_data.get("description_html", ""),
@@ -3162,7 +3159,7 @@ async def _poll_one_source_for_target(
     return summary
 
 
-async def poll_sources_for_target(supabase: PollClient, target: JobTarget) -> PollResult:
+async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> PollResult:
     """Poll all enabled sources, filtering for jobs matching a target's search keywords.
 
     Skips non-pipeline-active targets entirely (returns an empty
