@@ -25,18 +25,23 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
 
 
-def resolve_target_payers(supabase: Client, target_ids: list[str]) -> dict[str, str | None]:
-    """Map each target id to its payer user id (or None if orphaned)."""
+async def resolve_target_payers(
+    supabase: AsyncClient, target_ids: list[str]
+) -> dict[str, str | None]:
+    """Map each target id to its payer user id (or None if orphaned).
+
+    Async on the pooled service client (#57 PR-G2e-1): the poll cycle awaits this
+    on the loop instead of via a threadpool hop."""
     if not target_ids:
         return {}
-    resp = (
+    resp = await (
         supabase.table("user_targets")
         .select("target_id,user_id,created_at")
         .eq("is_active", True)
@@ -103,7 +108,7 @@ class PayerBudgetGate:
         )
 
 
-def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGate:
+async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:
     """Build the cycle snapshot: payers, overrides + activity, spends.
 
     Three queries total (payers IN, profiles IN, one spend RPC per
@@ -112,8 +117,13 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
     ``idle_defer_days=0`` disables idle gating. A NULL ``last_seen_at``
     (profile predating the column backfill, or no profile row) is
     treated as active — never punish missing data.
+
+    Async on the pooled service client (#57 PR-G2e-1): payers/profiles reads and
+    the per-payer spend meter all await on the loop. Logic (caps, reserves,
+    idle/disabled gating) is byte-for-byte the sync original — only the DB hop
+    model changed. Only the poll cycle calls it, so there is no sync twin.
     """
-    payers = resolve_target_payers(supabase, target_ids)
+    payers = await resolve_target_payers(supabase, target_ids)
     distinct = sorted({p for p in payers.values() if p is not None})
     if not distinct:
         return PayerBudgetGate(payer_by_target=payers)
@@ -121,7 +131,7 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
     overrides: dict[str, float | None] = {}
     last_seen: dict[str, str | None] = {}
     disabled: set[str] = set()
-    resp = (
+    resp = await (
         supabase.table("user_profiles")
         .select("user_id,llm_monthly_budget_usd,last_seen_at,llm_enabled")
         .in_("user_id", distinct)
@@ -158,7 +168,7 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
         cap = float(raw) if raw is not None else settings.user_llm_monthly_budget_usd
         if cap <= 0:
             continue
-        spent = cost_log.total_spend(supabase, user_id=uid, since=since)
+        spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
         if spent >= cap:
             over.add(uid)
 

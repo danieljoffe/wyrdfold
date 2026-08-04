@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 from app.http_client import get_http_client
@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def send_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str, Any]]) -> int:
+async def send_alerts_for_new_jobs(
+    supabase: AsyncClient, new_job_rows: list[dict[str, Any]]
+) -> int:
     """Fan out email alerts for each (profile × new-job) pair where the job
     scored above the profile's threshold *against one of that user's own
     targets* (#76).
@@ -96,13 +98,15 @@ async def send_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str
     return sent
 
 
-async def _families_by_target(supabase: Client, target_ids: list[str]) -> dict[str, str | None]:
+async def _families_by_target(
+    supabase: AsyncClient, target_ids: list[str]
+) -> dict[str, str | None]:
     """``target_id -> role_family`` for the family gate (#282). NULL family
     (unlabeled target) is kept — the gate treats it as match-anything."""
     if not target_ids:
         return {}
-    resp = await asyncio.to_thread(
-        lambda: supabase.table("targets").select("id, role_family").in_("id", target_ids).execute()
+    resp = await (
+        supabase.table("targets").select("id, role_family").in_("id", target_ids).execute()
     )
     out: dict[str, str | None] = {}
     for row in cast(list[dict[str, Any]], resp.data or []):
@@ -127,20 +131,18 @@ def _alertable(job: dict[str, Any]) -> bool:
 
 
 async def _load_scores_by_job(
-    supabase: Client, job_ids: list[str]
+    supabase: AsyncClient, job_ids: list[str]
 ) -> dict[str, list[tuple[str, int]]]:
     """Per-job ``(target_id, score)`` pairs for the given jobs, dropping rows
     the scorer flagged ``excluded``. Drives per-recipient relevance (#76)."""
     if not job_ids:
         return {}
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("scores")
-            .select("job_posting_id, target_id, score")
-            .in_("job_posting_id", job_ids)
-            .eq("excluded", False)
-            .execute()
-        )
+    resp = await (
+        supabase.table("scores")
+        .select("job_posting_id, target_id, score")
+        .in_("job_posting_id", job_ids)
+        .eq("excluded", False)
+        .execute()
     )
     by_job: dict[str, list[tuple[str, int]]] = {}
     for row in cast(list[dict[str, Any]], resp.data or []):
@@ -153,7 +155,7 @@ async def _load_scores_by_job(
 
 
 async def _active_targets_by_user(
-    supabase: Client, user_ids: list[str]
+    supabase: AsyncClient, user_ids: list[str]
 ) -> dict[str, dict[str, dict[str, int | None]]]:
     """Per user, the active ``target_id`` → per-target notification thresholds
     map, via the ``user_targets`` junction (#15).
@@ -165,14 +167,12 @@ async def _active_targets_by_user(
     """
     if not user_ids:
         return {}
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_targets")
-            .select("user_id, target_id, job_score_threshold, sms_score_threshold")
-            .in_("user_id", user_ids)
-            .eq("is_active", True)
-            .execute()
-        )
+    resp = await (
+        supabase.table("user_targets")
+        .select("user_id, target_id, job_score_threshold, sms_score_threshold")
+        .in_("user_id", user_ids)
+        .eq("is_active", True)
+        .execute()
     )
     by_user: dict[str, dict[str, dict[str, int | None]]] = {}
     for row in cast(list[dict[str, Any]], resp.data or []):
@@ -229,7 +229,7 @@ def _qualifying_score(
     return best
 
 
-async def _fetch_active_profiles(supabase: Client) -> list[dict[str, Any]]:
+async def _fetch_active_profiles(supabase: AsyncClient) -> list[dict[str, Any]]:
     query = (
         supabase.table("user_profiles")
         .select(
@@ -246,12 +246,12 @@ async def _fetch_active_profiles(supabase: Client) -> list[dict[str, Any]]:
     if settings.idle_deactivate_days > 0:
         cutoff = (datetime.now(UTC) - timedelta(days=settings.idle_deactivate_days)).isoformat()
         query = query.or_(f"last_seen_at.gte.{cutoff},last_seen_at.is.null")
-    resp = await asyncio.to_thread(query.execute)
+    resp = await query.execute()
     return cast(list[dict[str, Any]], resp.data or [])
 
 
 async def _try_send_one(
-    supabase: Client,
+    supabase: AsyncClient,
     profile: dict[str, Any],
     job: dict[str, Any],
     score: int,
@@ -259,21 +259,19 @@ async def _try_send_one(
     profile_id = profile["id"]
     job_id = job["id"]
 
-    claim = await asyncio.to_thread(
-        lambda: (
-            supabase.table("notifications_sent")
-            .upsert(
-                {
-                    "user_profile_id": profile_id,
-                    "job_posting_id": job_id,
-                    "score_at_send": score,
-                    "channel": "email",
-                },
-                on_conflict="user_profile_id,job_posting_id,channel",
-                ignore_duplicates=True,
-            )
-            .execute()
+    claim = await (
+        supabase.table("notifications_sent")
+        .upsert(
+            {
+                "user_profile_id": profile_id,
+                "job_posting_id": job_id,
+                "score_at_send": score,
+                "channel": "email",
+            },
+            on_conflict="user_profile_id,job_posting_id,channel",
+            ignore_duplicates=True,
         )
+        .execute()
     )
     claimed_rows = claim.data or []
     if not claimed_rows:
@@ -287,13 +285,11 @@ async def _try_send_one(
         return False
 
     if resend_id:
-        await asyncio.to_thread(
-            lambda: (
-                supabase.table("notifications_sent")
-                .update({"external_id": resend_id})
-                .eq("id", claim_id)
-                .execute()
-            )
+        await (
+            supabase.table("notifications_sent")
+            .update({"external_id": resend_id})
+            .eq("id", claim_id)
+            .execute()
         )
         return True
 
@@ -395,7 +391,9 @@ async def send_target_paused_email(
 # ---------------------------------------------------------------------------
 
 
-async def send_sms_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict[str, Any]]) -> int:
+async def send_sms_alerts_for_new_jobs(
+    supabase: AsyncClient, new_job_rows: list[dict[str, Any]]
+) -> int:
     """Fan out SMS alerts for each (profile × new-job) pair that clears the
     per-profile SMS threshold and daily rate limit. Returns the count sent.
     """
@@ -451,25 +449,23 @@ async def send_sms_alerts_for_new_jobs(supabase: Client, new_job_rows: list[dict
     return sent
 
 
-async def _sms_count_today(supabase: Client, profile_id: str) -> int:
+async def _sms_count_today(supabase: AsyncClient, profile_id: str) -> int:
     """Count SMS notifications sent today for a profile."""
     today = datetime.now(UTC).strftime("%Y-%m-%dT00:00:00+00:00")
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("notifications_sent")
-            # head=True → count only, no rows shipped (HEAD request).
-            .select("id", count="exact", head=True)  # type: ignore[arg-type]
-            .eq("user_profile_id", profile_id)
-            .eq("channel", "sms")
-            .gte("sent_at", today)
-            .execute()
-        )
+    resp = await (
+        supabase.table("notifications_sent")
+        # head=True → count only, no rows shipped (HEAD request).
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("user_profile_id", profile_id)
+        .eq("channel", "sms")
+        .gte("sent_at", today)
+        .execute()
     )
     return resp.count or 0
 
 
 async def _try_send_sms(
-    supabase: Client,
+    supabase: AsyncClient,
     profile: dict[str, Any],
     job: dict[str, Any],
     score: int,
@@ -490,21 +486,19 @@ async def _try_send_sms(
         return False
 
     # Claim dedup row
-    claim = await asyncio.to_thread(
-        lambda: (
-            supabase.table("notifications_sent")
-            .upsert(
-                {
-                    "user_profile_id": profile_id,
-                    "job_posting_id": job_id,
-                    "score_at_send": score,
-                    "channel": "sms",
-                },
-                on_conflict="user_profile_id,job_posting_id,channel",
-                ignore_duplicates=True,
-            )
-            .execute()
+    claim = await (
+        supabase.table("notifications_sent")
+        .upsert(
+            {
+                "user_profile_id": profile_id,
+                "job_posting_id": job_id,
+                "score_at_send": score,
+                "channel": "sms",
+            },
+            on_conflict="user_profile_id,job_posting_id,channel",
+            ignore_duplicates=True,
         )
+        .execute()
     )
     claimed_rows = claim.data or []
     if not claimed_rows:
@@ -529,13 +523,11 @@ async def _try_send_sms(
         return False
 
     if twilio_sid:
-        await asyncio.to_thread(
-            lambda: (
-                supabase.table("notifications_sent")
-                .update({"external_id": twilio_sid})
-                .eq("id", claim_id)
-                .execute()
-            )
+        await (
+            supabase.table("notifications_sent")
+            .update({"external_id": twilio_sid})
+            .eq("id", claim_id)
+            .execute()
         )
         return True
 
