@@ -88,6 +88,12 @@ def _patch_common(
     monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
+    # The qualification budget re-check reads the spend meter on the SYNC
+    # service client (``_sync_service_client`` → ``get_supabase_pool``, #57
+    # PR-G2d-b) rather than the async client threaded into the cycle. Give it a
+    # mock so the meter read stays under cap (MagicMock ``__float__`` → 1.0);
+    # budget-specific tests still patch ``total_llm_spend_all`` to override.
+    monkeypatch.setattr(poller_mod, "get_supabase_pool", lambda: MagicMock(name="sync-pool"))
     return rec
 
 

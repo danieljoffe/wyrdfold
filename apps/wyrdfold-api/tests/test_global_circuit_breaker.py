@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -90,7 +90,7 @@ async def test_breaker_tripped_returns_empty_gate(monkeypatch) -> None:
     build = MagicMock()
     monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
     monkeypatch.setattr(poller_mod, "build_budget_gate", build)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [_active_target()])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[_active_target()]))
 
     gate, has_active = await poller_mod._cycle_budget_gate(MagicMock())
 
@@ -110,7 +110,7 @@ async def test_breaker_under_cap_builds_normal_gate(monkeypatch) -> None:
     monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=1.25))
     real_gate = MagicMock()
     monkeypatch.setattr(poller_mod, "build_budget_gate", MagicMock(return_value=real_gate))
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [_active_target()])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[_active_target()]))
 
     gate, has_active = await poller_mod._cycle_budget_gate(MagicMock())
 
@@ -125,7 +125,7 @@ async def test_breaker_disabled_when_cap_is_zero(monkeypatch) -> None:
     monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
     real_gate = MagicMock()
     monkeypatch.setattr(poller_mod, "build_budget_gate", MagicMock(return_value=real_gate))
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [_active_target()])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[_active_target()]))
 
     gate, _ = await poller_mod._cycle_budget_gate(MagicMock())
 
@@ -174,7 +174,7 @@ async def test_breaker_query_failure_never_crashes_the_poll(monkeypatch) -> None
         "total_llm_spend_all",
         MagicMock(side_effect=RuntimeError("db down")),
     )
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [_active_target()])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[_active_target()]))
 
     gate, has_active = await poller_mod._cycle_budget_gate(MagicMock())
 
