@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.http_client import get_http_client
@@ -332,7 +332,7 @@ async def _post_alert(profile: dict[str, Any], job: dict[str, Any], score: int) 
 
 
 async def send_target_paused_email(
-    supabase: Client, *, user_id: str, target_labels: list[str]
+    supabase: AsyncClient, *, user_id: str, target_labels: list[str]
 ) -> bool:
     """One email telling an idle user their target(s) were auto-paused.
 
@@ -340,17 +340,19 @@ async def send_target_paused_email(
     at-most-once holds without a dedup table (a crash between flip and
     send loses the email — same trade as job alerts). Honors the same
     opt-out signals as job alerts.
+
+    Awaits natively on the pooled async service client (#57 PR-G2e-6), the
+    same client the lifecycle sweep now threads through — see
+    :func:`_fetch_active_profiles`.
     """
     if not settings.next_app_url or not settings.job_alert_secret:
         return False
 
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles")
-            .select("id, email, job_notifications_enabled, unsubscribed_at")
-            .eq("user_id", user_id)
-            .execute()
-        )
+    resp = await (
+        supabase.table("user_profiles")
+        .select("id, email, job_notifications_enabled, unsubscribed_at")
+        .eq("user_id", user_id)
+        .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:

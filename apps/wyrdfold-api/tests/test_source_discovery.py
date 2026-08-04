@@ -71,14 +71,22 @@ def _make_supabase(
     supabase = MagicMock()
 
     rows = [{"board_token": t} for t in (existing_tokens or [])]
-    supabase.table.return_value.select.return_value.execute.return_value.data = rows
+    # #57 PR-G2e-6: discovery now awaits the async client, so every ``.execute()``
+    # is an ``AsyncMock``. ``sources`` snapshot read (_existing_board_tokens) +
+    # ``source_discoveries`` audit insert (_log_discovery).
+    supabase.table.return_value.select.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=rows)
+    )
+    supabase.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
 
     # The RPC returns a bare bool (scalar-returning Postgres function). The
     # production code accepts bool / list[bool] / list[{name: bool}] response
     # shapes; tests use the bare bool form for clarity.
     rpc_resp = MagicMock()
     rpc_resp.data = rpc_insert_returns
-    supabase.rpc.return_value.execute.return_value = rpc_resp
+    supabase.rpc.return_value.execute = AsyncMock(return_value=rpc_resp)
     return supabase
 
 

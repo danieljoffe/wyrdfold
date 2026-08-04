@@ -359,14 +359,13 @@ async def test_reference_jd_contribution_cap_rejects_over_cap(
     from app.routers import targets
 
     # #57 PR-G2b: the handler ownership-checks + reads the target + counts
-    # contributions on the async service client (router inline helpers), and
-    # acquires the sync client for the deep services via a DIRECT get_supabase().
+    # contributions on the async service client (router inline helpers); the
+    # whole reference-JD path is async now, so no sync client is acquired.
     async def _owns(*_a: object, **_kw: object) -> None:
         return None
 
     monkeypatch.setattr(targets, "_require_user_owns_target_async", _owns)
     monkeypatch.setattr(targets, "_target_get", AsyncMock(return_value=MagicMock()))
-    monkeypatch.setattr(targets, "get_supabase", lambda: MagicMock())
     # The caller is already at the cap.
     monkeypatch.setattr(
         targets,

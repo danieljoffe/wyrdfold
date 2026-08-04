@@ -28,7 +28,6 @@ from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
 from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError
-from app.services.llm import get_client as get_llm_client
 from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
@@ -77,7 +76,7 @@ from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
-from app.supabase_pool import get_async_supabase, get_supabase_pool
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -654,11 +653,12 @@ def _async_service_client() -> AsyncClient:
     ``cast`` covers the unconfigured/test path, where every caller's collaborator
     is stubbed and the client is never dereferenced.
 
-    NOTE: ``run_phase2_for_jobs`` now takes this async client too (#57 PR-G2e-3 —
+    NOTE: ``run_phase2_for_jobs`` takes this async client too (#57 PR-G2e-3 —
     its scoring/embeddings vertical, incl. the Phase-2 grader, quota counter, and
-    the lazy vector reads/writes, migrated). The lifecycle/archival sweeps are
-    still NOT fed by this — their ``to_thread`` queries stay sync-client-only, so
-    they keep taking ``get_supabase_pool()`` until those subsystems migrate.
+    the lazy vector reads/writes, migrated). The lifecycle/archival sweeps and the
+    qualification tagger's LLM-client construction now take it as well (#57
+    PR-G2e-6): the sweeps route their DB through the ``db_write`` seam, so this is
+    the last sync-client escape hatch the poll cycle retired.
     """
     return cast(AsyncClient, get_async_supabase())
 
@@ -952,7 +952,7 @@ async def _qualify_jobs(
         return
     try:
         try:
-            llm = get_llm_client(get_supabase_pool(), None)
+            llm = await get_llm_client_async(_async_service_client(), None)
         except Exception:
             logger.exception("Qualification tagger: LLM client unavailable; skipping")
             return
@@ -2466,7 +2466,7 @@ _LIFECYCLE_LAST_RUN: float = 0.0
 LIFECYCLE_SWEEP_INTERVAL_S = 6 * 3600.0
 
 
-async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
+async def _maybe_run_lifecycle_sweep(supabase: AsyncClient) -> None:
     """Run the idle-account sweep at most every 6h, never blocking polls."""
     global _LIFECYCLE_LAST_RUN
 
@@ -2485,7 +2485,7 @@ async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
 _ARCHIVAL_LAST_RUN: float = 0.0
 
 
-async def _maybe_run_archival_sweep(supabase: Client) -> None:
+async def _maybe_run_archival_sweep(supabase: AsyncClient) -> None:
     """Run the archival lifecycle sweep at most every 6h (UX/IA §5).
 
     Same throttle shape as the idle-account sweep above: piggybacks the
@@ -2629,13 +2629,14 @@ async def poll_due_sources(supabase: PollClient) -> PollResult:
     all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
-    # ~6h inside; never blocks or fails the poll). Still on the sync service
-    # client — the sweeps' own DB is ``to_thread``-sync (out of PR-G2e-1 scope).
-    await _maybe_run_lifecycle_sweep(cast(Client, get_supabase_pool()))
+    # ~6h inside; never blocks or fails the poll). Runs on the pooled async
+    # service client — the sweeps' DB routes through the ``db_write`` seam now
+    # (#57 PR-G2e-6), so it awaits natively in prod.
+    await _maybe_run_lifecycle_sweep(_async_service_client())
 
     # Archival lifecycle (UX/IA §5): 30d soft-archive + 60d purge, same
     # piggyback/throttle shape, flag-gated.
-    await _maybe_run_archival_sweep(cast(Client, get_supabase_pool()))
+    await _maybe_run_archival_sweep(_async_service_client())
 
     due = filter_due_sources(all_enabled)
 

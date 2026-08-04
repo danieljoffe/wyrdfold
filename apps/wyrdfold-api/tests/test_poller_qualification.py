@@ -11,7 +11,7 @@ Covers ``poller._qualify_one_job`` / ``_qualify_jobs``:
 - A changed row (content differs from the stored hash) is re-tagged.
 - The step is best-effort: a tagger failure (tags=None) writes nothing and
   never raises; a write failure is swallowed.
-- It bills the instance key (``get_llm_client(supabase, None)``), never a
+- It bills the instance key (``get_llm_client_async(service_client, None)``), never a
   per-target payer.
 """
 
@@ -67,7 +67,7 @@ def _patch_common(
         "client_user_id": "UNSET",
     }
 
-    def fake_get_client(supabase: object, user_id: str | None) -> object:
+    async def fake_get_client(supabase: object, user_id: str | None) -> object:
         rec["client_user_id"] = user_id
         return MagicMock(name="instance-client")
 
@@ -85,7 +85,7 @@ def _patch_common(
     # the flag off it builds + executes the update on the MagicMock supabase
     # directly (the ``update`` side_effect below records the payload), so no
     # retry-helper patch is needed anymore.
-    monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
     # The qualification budget re-check reads the global spend meter on the ASYNC
@@ -204,10 +204,10 @@ class TestQualifyOneJob:
     async def test_client_resolution_failure_skips_silently(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def boom(_sb: object, _uid: str | None) -> object:
+        async def boom(_sb: object, _uid: str | None) -> object:
             raise RuntimeError("no client")
 
-        monkeypatch.setattr(poller_mod, "get_llm_client", boom)
+        monkeypatch.setattr(poller_mod, "get_llm_client_async", boom)
         # tag_job should never be reached.
         called = {"n": 0}
 
@@ -718,7 +718,7 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     contradict persisted promising rows."""
     calls: list[str] = []
 
-    def _raise(*_a: Any, **_kw: Any) -> Any:
+    async def _raise(*_a: Any, **_kw: Any) -> Any:
         raise RuntimeError("no client")
 
     async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
@@ -727,7 +727,7 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
         calls.append(f"reconcile:{','.join(job_ids)}")
 
-    monkeypatch.setattr(poller_mod, "get_llm_client", _raise)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _raise)
     monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
     monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
 

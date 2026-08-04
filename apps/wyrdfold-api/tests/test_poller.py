@@ -674,7 +674,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two_job_fetch)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     # Permissive payer-budget gate — this test is about triage scoping,
@@ -723,7 +723,7 @@ async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> tup
     target = _target_with_keywords({"brand": 3}, ["brand new role"])
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", exhausted)
 
@@ -919,7 +919,7 @@ async def test_phase1_triage_only_sees_free_gate_survivors(monkeypatch):
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -986,7 +986,7 @@ async def test_phase1_verdicts_keyed_by_original_indices_after_free_gates(monkey
     )
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -1073,7 +1073,7 @@ async def test_targeted_triage_only_sees_free_gate_survivors(monkeypatch):
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     summary = await poller_mod._poll_one_source_for_target(
@@ -1129,7 +1129,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     fake_legacy = AsyncMock()
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "_latest_optimized", AsyncMock(return_value=doc))
     # The scoring helpers are the async ``*_poll`` seam variants now (#57) —
     # the poller awaits them directly, so their stand-ins must be awaitable.
@@ -1538,7 +1538,7 @@ async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -1606,7 +1606,7 @@ async def test_engaged_job_refreshes_despite_missing_from_unengaged_view(monkeyp
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -1723,7 +1723,7 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", fake_stage2)
@@ -1816,7 +1816,7 @@ async def test_targeted_poll_known_job_bypasses_triage_and_refreshes(monkeypatch
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, ok))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     summary = await poller_mod._poll_one_source_for_target(
@@ -2029,7 +2029,7 @@ def _wire_rejection_cache_poll(monkeypatch, *, ttl_hours: float):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -2110,7 +2110,7 @@ async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
         return [_job("k3", "Staff Frontend Engineer", "Remote")]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     first = await poller_mod._poll_one_source_for_target(
