@@ -54,11 +54,11 @@ def _patch_probe(monkeypatch: pytest.MonkeyPatch, *, remaining: float | None) ->
 def _patch_week_spend(monkeypatch: pytest.MonkeyPatch, usd: float) -> list[int]:
     calls: list[int] = []
 
-    def fake_spend(_sb: Any, _since: Any = None) -> float:
+    async def fake_spend(_sb: Any, _since: Any = None) -> float:
         calls.append(1)
         return usd
 
-    monkeypatch.setattr("app.services.ingestion_health.cost_log.total_spend_all", fake_spend)
+    monkeypatch.setattr("app.services.ingestion_health.cost_log.total_spend_all_async", fake_spend)
     return calls
 
 

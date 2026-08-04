@@ -116,7 +116,7 @@ async def test_poll_due_sources_skips_when_nothing_due() -> None:
     just_now = datetime.now(UTC).isoformat()
     supabase = _supabase_returning([_src(last_polled_at=just_now, poll_interval_minutes=240)])
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         patch("app.services.poller._poll_one_source") as poll_one,
     ):
         get_opt.return_value = None
@@ -136,9 +136,9 @@ async def test_poll_due_sources_polls_only_due_rows() -> None:
     supabase = _supabase_returning([due, fresh])
 
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         # Cycle-level prefetch — irrelevant to the due-filter under test.
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         get_opt.return_value = None
@@ -171,9 +171,9 @@ async def test_poll_due_sources_aggregates_errors() -> None:
     )
 
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         # Cycle-level prefetch — irrelevant to the error aggregation under test.
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         get_opt.return_value = None
@@ -207,7 +207,7 @@ async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPat
     supabase = _supabase_returning([_src(last_polled_at=just_now, poll_interval_minutes=240)])
 
     with (
-        patch("app.services.poller.get_latest_optimized", return_value=None),
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
         patch("app.services.poller._poll_one_source") as poll_one,
         patch("app.services.poller._backfill_qualify_stale", new_callable=AsyncMock) as backfill,
     ):
@@ -250,8 +250,8 @@ async def test_poll_due_sources_caps_batch_most_overdue_first(
     supabase = _supabase_returning(_three_due_sources())
 
     with (
-        patch("app.services.poller.get_latest_optimized", return_value=None),
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         poll_one.return_value = {
@@ -281,8 +281,8 @@ async def test_poll_due_sources_cap_zero_is_unbounded(
     supabase = _supabase_returning(_three_due_sources())
 
     with (
-        patch("app.services.poller.get_latest_optimized", return_value=None),
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         poll_one.return_value = {

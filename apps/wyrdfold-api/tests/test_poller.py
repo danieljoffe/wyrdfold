@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -412,7 +412,7 @@ def test_poll_sources_for_target_skips_inactive_target(
     import app.services.poller as poller_mod
     from app.services.poller import poll_sources_for_target
 
-    monkeypatch.setattr(poller_mod, "target_is_pipeline_active", lambda sb, tid: False)
+    monkeypatch.setattr(poller_mod, "_is_pipeline_active", AsyncMock(return_value=False))
     supabase = MagicMock()
     target = _full_target(app_active=False, search_keywords=["frontend engineer"])
 
@@ -520,7 +520,7 @@ async def test_zero_job_fetch_with_existing_rows_skips_archiving(monkeypatch):
         return []
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", empty_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -558,7 +558,7 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -608,7 +608,7 @@ async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -673,7 +673,7 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
@@ -722,7 +722,7 @@ async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> tup
 
     target = _target_with_keywords({"brand": 3}, ["brand new role"])
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", exhausted)
@@ -1130,7 +1130,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
-    monkeypatch.setattr(poller_mod, "get_latest_optimized", lambda _sb, _uid: doc)
+    monkeypatch.setattr(poller_mod, "_latest_optimized", AsyncMock(return_value=doc))
     # The scoring helpers are the async ``*_poll`` seam variants now (#57) —
     # the poller awaits them directly, so their stand-ins must be awaitable.
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
@@ -1287,7 +1287,7 @@ async def test_no_candidates_leaves_last_candidate_at_unstamped(monkeypatch):
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -1535,7 +1535,7 @@ async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
@@ -1603,7 +1603,7 @@ async def test_engaged_job_refreshes_despite_missing_from_unengaged_view(monkeyp
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
@@ -1720,7 +1720,7 @@ async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
     fake_stage2 = AsyncMock()
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
@@ -1902,7 +1902,7 @@ async def test_refreshed_known_row_does_not_realert(monkeypatch):
     fake_load = AsyncMock(side_effect=lambda _sb, rows: rows)
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "_load_alert_rows", fake_load)
@@ -1977,7 +1977,7 @@ async def test_url_validation_skips_known_rows(monkeypatch):
         return _Valid(url)
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "validate_job_url", fake_validate)
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
@@ -2026,7 +2026,7 @@ def _wire_rejection_cache_poll(monkeypatch, *, ttl_hours: float):
         return [_job("new-1", "Brand New Role", "Remote")]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
@@ -2084,7 +2084,7 @@ async def test_phase1_rejection_cache_keyed_on_profile_version(monkeypatch):
     assert fake_triage.await_count == 1
 
     edited = target.model_copy(update={"profile_version": target.profile_version + 1})
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [edited])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[edited]))
     await run()
     assert fake_triage.await_count == 2  # new profile → fresh verdict
 
