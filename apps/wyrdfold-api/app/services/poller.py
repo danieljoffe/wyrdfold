@@ -29,10 +29,11 @@ from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_pag
 from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError
 from app.services.llm import get_client as get_llm_client
+from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
-from app.services.llm.cost_log import record as record_llm_cost
-from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
+from app.services.llm.cost_log import record_async as record_llm_cost_async
+from app.services.llm.cost_log import total_spend_all_async as total_llm_spend_all_async
 from app.services.llm.errors import (
     LLMQuotaExhaustedError,
     LLMRateLimitedError,
@@ -76,7 +77,7 @@ from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
-from app.supabase_pool import get_supabase_pool
+from app.supabase_pool import get_async_supabase, get_supabase_pool
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,9 @@ logger = logging.getLogger(__name__)
 # the target-activation poll (``routers.targets`` → ``poll_sources_for_target``,
 # a separate #57 chunk) still passes the sync service ``Client``. Every DB touch
 # below routes through the ``db_write`` seam (client-agnostic — it uses
-# ``get_async_supabase()`` internally) or acquires a sync client locally for the
-# handful of not-yet-async collaborators (see ``_sync_service_client``), so the
+# ``get_async_supabase()`` internally), and the cross-user service-role
+# collaborators (budget meter, payer resolver, alert dispatch) await on the
+# pooled async service client via ``_async_service_client`` (PR-G2e-1), so the
 # shared helpers accept either client. This alias types that contract.
 PollClient = Client | AsyncClient
 
@@ -632,24 +634,32 @@ async def _load_alert_rows(
     return new_rows
 
 
-def _sync_service_client() -> Client:
-    """Sync service-role client for the poll cycle's residual sync-DB callees.
+def _async_service_client() -> AsyncClient:
+    """Async service-role client for the poll cycle's now-async collaborators.
 
-    A handful of collaborators the cycle invokes still issue supabase-py SYNC
-    ``.execute()`` on the client they are handed and cannot drive the pooled
-    ``AsyncClient``: the payer BYOK resolver (``llm.get_client``), the
-    budget/spend meter (``build_budget_gate`` + the global-spend predicates,
-    which read cost_log's SYNC meter), and the alert + Phase-2 grading services
-    (``notify`` / ``fit`` — background modules not yet on the #57 seam). They
-    get the sync service client here — a few calls per cycle, never a per-row
-    fan-out. Retiring them (async cost_log meter, seam-routing notify/fit) is
-    the follow-on #57 work.
+    The async twin of the retired sync service-client escape-hatch (#57
+    PR-G2e-1): the budget/spend meter (``build_budget_gate`` + the global-spend
+    predicates on
+    cost_log's async meter twins), the per-payer BYOK resolver, the Phase-1 cost
+    write, and the email/SMS alert dispatch now await on the pooled ``AsyncClient``
+    instead of running a sync client in a thread.
 
-    Prod always has it (``init_supabase`` runs in the lifespan); the ``cast``
-    covers the unconfigured/test path, where every caller wraps the read in a
-    fail-safe and the collaborators are stubbed anyway.
+    Deliberately the SERVICE-role pool, NOT the cycle's ``supabase`` argument:
+    on the scheduled/force path ``supabase`` IS this client, but on the
+    target-activation path it can be a user-scoped client, and these are
+    cross-user reads (spend across all users, every alertable profile, every
+    payer link) that must bypass RLS — exactly what the sync helper guaranteed.
+
+    Prod always has it (``init_async_supabase`` runs in the lifespan); the
+    ``cast`` covers the unconfigured/test path, where every caller's collaborator
+    is stubbed and the client is never dereferenced.
+
+    NOTE: ``run_phase2_for_jobs`` and the lifecycle/archival sweeps are NOT fed by
+    this — their transitive DB (the embeddings vector reads / the sweeps' own
+    ``to_thread`` queries) is still sync-client-only, so they keep taking
+    ``get_supabase_pool()`` until those subsystems migrate (later #57 chunks).
     """
-    return cast(Client, get_supabase_pool())
+    return cast(AsyncClient, get_async_supabase())
 
 
 async def _active_targets(supabase: PollClient) -> list[JobTarget]:
@@ -975,9 +985,8 @@ async def _qualify_rows_with_budget(
         # refuse to spend when we can't see the budget, matching the cycle
         # gate's posture.
         try:
-            exhausted = await asyncio.to_thread(
-                _global_budget_exhausted,
-                _sync_service_client(),
+            exhausted = await _global_budget_exhausted(
+                _async_service_client(),
                 reserve_usd=settings.grading_budget_reserve_usd,
             )
         except Exception:
@@ -1304,7 +1313,7 @@ async def _backfill_grade_stale(supabase: PollClient, limit: int) -> None:
                 target.id,
             )
             continue
-        llm = _resolve_payer_client(payer_clients, get_supabase_pool(), uid)
+        llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
         if llm is None:
             continue  # BYOK require-mode without a key — defer (logged inside)
         try:
@@ -1343,7 +1352,7 @@ async def _backfill_grade_stale(supabase: PollClient, limit: int) -> None:
         )
         try:
             await run_phase2_for_jobs(
-                _sync_service_client(),
+                cast(Client, get_supabase_pool()),
                 llm,
                 target=target,
                 payload=user_optimized[uid].payload,
@@ -1355,15 +1364,15 @@ async def _backfill_grade_stale(supabase: PollClient, limit: int) -> None:
             continue
 
 
-def _resolve_payer_client(
+async def _resolve_payer_client(
     cache: dict[str | None, LLMClient | None],
-    supabase: Client | None,
+    supabase: AsyncClient | None,
     payer_user_id: str | None,
 ) -> LLMClient | None:
     """Per-payer LLM client for background grading (#5 P3 BYOK).
 
     Each payer's background LLM work bills the payer's own OpenRouter key
-    (via ``llm.get_client``), not the instance key. Memoized by payer for
+    (via ``llm.get_client_async``), not the instance key. Memoized by payer for
     the duration of one source poll, so the N targets/jobs a payer owns
     reuse a single client — one key decrypt, and that payer's calls stay
     grouped rather than interleaved across keys (interleaving would
@@ -1379,7 +1388,7 @@ def _resolve_payer_client(
     """
     if payer_user_id not in cache:
         try:
-            cache[payer_user_id] = get_llm_client(supabase, payer_user_id)
+            cache[payer_user_id] = await get_llm_client_async(supabase, payer_user_id)
         except MissingUserKeyError:
             logger.info(
                 "Background grading deferred for payer %s "
@@ -1495,8 +1504,8 @@ async def _poll_one_source(
         gate = budget_gate
         if gate is None:
             try:
-                gate = await asyncio.to_thread(
-                    build_budget_gate, _sync_service_client(), [t.id for t in active_targets]
+                gate = await build_budget_gate(
+                    _async_service_client(), [t.id for t in active_targets]
                 )
             except Exception:
                 logger.exception(
@@ -1572,7 +1581,7 @@ async def _poll_one_source(
                 # (empty verdicts → fail-open ingest, grade once a key is
                 # added).
                 payer = gate.payer_for(active_target.id)
-                llm = _resolve_payer_client(payer_clients, get_supabase_pool(), payer)
+                llm = await _resolve_payer_client(payer_clients, _async_service_client(), payer)
                 if llm is None:
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
@@ -1634,9 +1643,8 @@ async def _poll_one_source(
                         for sp in range(start, min(start + len(batch), len(send_candidates))):
                             attempted_here.add(send_candidates[sp][0] + 1)
                         try:
-                            await asyncio.to_thread(
-                                record_llm_cost,
-                                _sync_service_client(),
+                            await record_llm_cost_async(
+                                _async_service_client(),
                                 user_id=payer,
                                 purpose=PHASE1_PURPOSE,
                                 result=result,
@@ -2006,7 +2014,7 @@ async def _poll_one_source(
                         continue
                     # BYOK (#5 P3): grade on this user's own key; no key in
                     # hosted require-mode defers like over-allowance.
-                    llm = _resolve_payer_client(payer_clients, get_supabase_pool(), uid)
+                    llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
                     if llm is None:
                         logger.info(
                             "Phase 2 deferred for user %s / target %s (no BYOK key)",
@@ -2016,7 +2024,7 @@ async def _poll_one_source(
                         continue
                     try:
                         await run_phase2_for_jobs(
-                            _sync_service_client(),
+                            cast(Client, get_supabase_pool()),
                             llm,
                             target=p2_target,
                             payload=user_optimized[uid].payload,
@@ -2130,11 +2138,11 @@ async def _poll_one_source(
             # Re-read the rows now that the stages have written final scores.
             alert_rows = await _load_alert_rows(supabase, new_rows)
             try:
-                await notify.send_alerts_for_new_jobs(_sync_service_client(), alert_rows)
+                await notify.send_alerts_for_new_jobs(_async_service_client(), alert_rows)
             except Exception:
                 logger.exception("Email alert dispatch raised for %s", company_name)
             try:
-                await notify.send_sms_alerts_for_new_jobs(_sync_service_client(), alert_rows)
+                await notify.send_sms_alerts_for_new_jobs(_async_service_client(), alert_rows)
             except Exception:
                 logger.exception("SMS alert dispatch raised for %s", company_name)
 
@@ -2296,7 +2304,7 @@ async def recover_stale_sources(supabase: PollClient, *, now: datetime | None = 
 _GLOBAL_APPROACHING_DAY: str | None = None
 
 
-def _global_budget_exhausted(supabase: Client, *, reserve_usd: float = 0.0) -> bool:
+async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float = 0.0) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``. 0 disables (never True).
 
@@ -2326,7 +2334,7 @@ def _global_budget_exhausted(supabase: Client, *, reserve_usd: float = 0.0) -> b
         # spender yields entirely, leaving the budget for grading.
         return True
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    return total_llm_spend_all(supabase, since=midnight) >= effective_cap
+    return await total_llm_spend_all_async(supabase, since=midnight) >= effective_cap
 
 
 async def _triage_budget_blocks(supabase: PollClient) -> bool:
@@ -2347,7 +2355,7 @@ async def _triage_budget_blocks(supabase: PollClient) -> bool:
     if _provider_fatal_active():
         return True
     try:
-        return await asyncio.to_thread(_global_budget_exhausted, _sync_service_client())
+        return await _global_budget_exhausted(_async_service_client())
     except Exception:
         logger.exception(
             "Phase 1 triage: global-budget read failed — continuing "
@@ -2356,7 +2364,7 @@ async def _triage_budget_blocks(supabase: PollClient) -> bool:
         return False
 
 
-def _global_circuit_breaker_tripped(supabase: Client) -> bool:
+async def _global_circuit_breaker_tripped(supabase: AsyncClient) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``.
 
@@ -2374,7 +2382,7 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
         return False
     now = datetime.now(UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    spent = total_llm_spend_all(supabase, since=midnight)
+    spent = await total_llm_spend_all_async(supabase, since=midnight)
     if spent < cap:
         # Approaching-cap warning (#26 F3) — once per UTC day.
         if spent >= cap * 0.8:
@@ -2441,11 +2449,9 @@ async def _cycle_budget_gate(supabase: PollClient) -> tuple[PayerBudgetGate, boo
     """
     try:
         active = await _active_targets(supabase)
-        if await asyncio.to_thread(_global_circuit_breaker_tripped, _sync_service_client()):
+        if await _global_circuit_breaker_tripped(_async_service_client()):
             return PayerBudgetGate(), bool(active)
-        gate = await asyncio.to_thread(
-            build_budget_gate, _sync_service_client(), [t.id for t in active]
-        )
+        gate = await build_budget_gate(_async_service_client(), [t.id for t in active])
         return gate, bool(active)
     except Exception:
         logger.exception("Budget gate build failed — deferring all LLM work this cycle")
@@ -2622,12 +2628,13 @@ async def poll_due_sources(supabase: PollClient) -> PollResult:
     all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
-    # ~6h inside; never blocks or fails the poll).
-    await _maybe_run_lifecycle_sweep(_sync_service_client())
+    # ~6h inside; never blocks or fails the poll). Still on the sync service
+    # client — the sweeps' own DB is ``to_thread``-sync (out of PR-G2e-1 scope).
+    await _maybe_run_lifecycle_sweep(cast(Client, get_supabase_pool()))
 
     # Archival lifecycle (UX/IA §5): 30d soft-archive + 60d purge, same
     # piggyback/throttle shape, flag-gated.
-    await _maybe_run_archival_sweep(_sync_service_client())
+    await _maybe_run_archival_sweep(cast(Client, get_supabase_pool()))
 
     due = filter_due_sources(all_enabled)
 
@@ -2795,7 +2802,7 @@ async def _poll_one_source_for_target(
         # triage is off / over-budget / no BYOK key in require-mode — all
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
         llm = (
-            _resolve_payer_client(payer_clients, get_supabase_pool(), payer_user_id)
+            await _resolve_payer_client(payer_clients, _async_service_client(), payer_user_id)
             if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget
             else None
         )
@@ -2839,9 +2846,8 @@ async def _poll_one_source_for_target(
                     for sp in range(start, min(start + len(batch), len(send_candidates))):
                         phase1_attempted.add(send_candidates[sp][0] + 1)
                     try:
-                        await asyncio.to_thread(
-                            record_llm_cost,
-                            _sync_service_client(),
+                        await record_llm_cost_async(
+                            _async_service_client(),
                             user_id=payer_user_id,
                             purpose=PHASE1_PURPOSE,
                             result=result,
@@ -3094,7 +3100,9 @@ async def _poll_one_source_for_target(
                 # BYOK (#5 P3): grade on the payer's own key; no key in
                 # hosted require-mode defers (jobs stay promising/NULL,
                 # grade once a key is added).
-                llm = _resolve_payer_client(payer_clients, get_supabase_pool(), payer_user_id)
+                llm = await _resolve_payer_client(
+                    payer_clients, _async_service_client(), payer_user_id
+                )
                 if llm is None:
                     logger.info(
                         "Phase 2 deferred for target %s (payer %s has no BYOK key)",
@@ -3106,7 +3114,7 @@ async def _poll_one_source_for_target(
                     for uid in primary_by_user:
                         try:
                             await run_phase2_for_jobs(
-                                _sync_service_client(),
+                                cast(Client, get_supabase_pool()),
                                 llm,
                                 target=target,
                                 payload=user_optimized[uid].payload,
@@ -3194,7 +3202,7 @@ async def poll_sources_for_target(supabase: PollClient, target: JobTarget) -> Po
     # monthly allowance decides whether Phase 1 spends anything. On
     # failure: refuse to spend (defer LLM work), keep ingesting.
     try:
-        gate = await asyncio.to_thread(build_budget_gate, _sync_service_client(), [target.id])
+        gate = await build_budget_gate(_async_service_client(), [target.id])
     except Exception:
         logger.exception(
             "Budget gate build failed for target %s — deferring LLM work",

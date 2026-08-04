@@ -5,7 +5,7 @@ resolution for background work, and the poll-cycle budget gate.
 """
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -155,12 +155,13 @@ def test_daily_count_zero_limit_disables():
 
 def _supabase_user_targets(rows: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    chain = supabase.table.return_value.select.return_value.eq.return_value.in_.return_value.order.return_value.order.return_value.execute
-    chain.return_value.data = rows
+    # resolve_target_payers awaits the terminal .execute() (#57 PR-G2e-1).
+    chain = supabase.table.return_value.select.return_value.eq.return_value.in_.return_value.order.return_value.order
+    chain.return_value.execute = AsyncMock(return_value=MagicMock(data=rows))
     return supabase
 
 
-def test_resolve_payers_earliest_active_link_wins():
+async def test_resolve_payers_earliest_active_link_wins():
     # Rows arrive ordered by (created_at, user_id) — the query's contract.
     sb = _supabase_user_targets(
         [
@@ -169,13 +170,13 @@ def test_resolve_payers_earliest_active_link_wins():
             {"target_id": "t-2", "user_id": "u-solo", "created_at": "2026-03-01"},
         ]
     )
-    payers = resolve_target_payers(sb, ["t-1", "t-2", "t-orphan"])
+    payers = await resolve_target_payers(sb, ["t-1", "t-2", "t-orphan"])
     assert payers == {"t-1": "u-early", "t-2": "u-solo", "t-orphan": None}
 
 
-def test_resolve_payers_empty_input_short_circuits():
+async def test_resolve_payers_empty_input_short_circuits():
     sb = MagicMock()
-    assert resolve_target_payers(sb, []) == {}
+    assert await resolve_target_payers(sb, []) == {}
     sb.table.assert_not_called()
 
 
@@ -210,52 +211,57 @@ def test_empty_gate_blocks_everything():
 # ---- build_budget_gate ----------------------------------------------------------
 
 
-def test_build_gate_classifies_over_budget_payer(monkeypatch):
+async def test_build_gate_classifies_over_budget_payer(monkeypatch):
     import app.services.targets.payers as payers_mod
 
     monkeypatch.setattr(
         payers_mod,
         "resolve_target_payers",
-        lambda sb, ids: {"t-1": "u-over", "t-2": "u-ok"},
+        AsyncMock(return_value={"t-1": "u-over", "t-2": "u-ok"}),
     )
     # No overrides → settings default cap applies.
     sb = MagicMock()
-    profile_chain = sb.table.return_value.select.return_value.in_.return_value.execute
-    profile_chain.return_value.data = []
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(
         payers_mod.cost_log,
-        "total_spend",
-        lambda sb, user_id, since: 6.0 if user_id == "u-over" else 0.5,
+        "total_spend_async",
+        AsyncMock(side_effect=lambda sb, user_id, since: 6.0 if user_id == "u-over" else 0.5),
     )
 
-    gate = build_budget_gate(sb, ["t-1", "t-2"])
+    gate = await build_budget_gate(sb, ["t-1", "t-2"])
     assert gate.target_blocked("t-1") is True
     assert gate.target_blocked("t-2") is False
 
 
-def test_build_gate_zero_cap_disables_gating(monkeypatch):
+async def test_build_gate_zero_cap_disables_gating(monkeypatch):
     import app.services.targets.payers as payers_mod
 
-    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
+    monkeypatch.setattr(
+        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
+    )
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 0.0)
     spend_called = False
 
-    def _spend(*a, **kw):
+    async def _spend(*a, **kw):
         nonlocal spend_called
         spend_called = True
         return 999.0
 
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", _spend)
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", _spend)
 
-    gate = build_budget_gate(sb, ["t-1"])
+    gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False
     assert spend_called is False  # 0 cap short-circuits the spend query
 
 
-def test_build_gate_blocks_operator_disabled_user(monkeypatch):
+async def test_build_gate_blocks_operator_disabled_user(monkeypatch):
     """llm_enabled=false (the operator kill-switch) blocks the payer's
     background work without touching spend/idle checks."""
     import app.services.targets.payers as payers_mod
@@ -263,42 +269,51 @@ def test_build_gate_blocks_operator_disabled_user(monkeypatch):
     monkeypatch.setattr(
         payers_mod,
         "resolve_target_payers",
-        lambda sb, ids: {"t-off": "u-off", "t-on": "u-on"},
+        AsyncMock(return_value={"t-off": "u-off", "t-on": "u-on"}),
     )
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        {"user_id": "u-off", "llm_monthly_budget_usd": None, "llm_enabled": False},
-        {"user_id": "u-on", "llm_monthly_budget_usd": None, "llm_enabled": True},
-    ]
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[
+                {"user_id": "u-off", "llm_monthly_budget_usd": None, "llm_enabled": False},
+                {"user_id": "u-on", "llm_monthly_budget_usd": None, "llm_enabled": True},
+            ]
+        )
+    )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
     spend_calls: list[str] = []
 
-    def _spend(sb, user_id, since):
+    async def _spend(sb, user_id, since):
         spend_calls.append(user_id)
         return 0.0
 
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", _spend)
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", _spend)
 
-    gate = build_budget_gate(sb, ["t-off", "t-on"])
+    gate = await build_budget_gate(sb, ["t-off", "t-on"])
     assert gate.target_blocked("t-off") is True
     assert gate.user_blocked("u-off") is True
     assert gate.target_blocked("t-on") is False
     assert spend_calls == ["u-on"]  # disabled user skips the spend query
 
 
-def test_build_gate_override_raises_cap(monkeypatch):
+async def test_build_gate_override_raises_cap(monkeypatch):
     """A user_profiles override above the spend keeps the payer unblocked."""
     import app.services.targets.payers as payers_mod
 
-    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-vip"})
+    monkeypatch.setattr(
+        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-vip"})
+    )
     sb = MagicMock()
-    profile_chain = sb.table.return_value.select.return_value.in_.return_value.execute
-    profile_chain.return_value.data = [{"user_id": "u-vip", "llm_monthly_budget_usd": 50}]
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"user_id": "u-vip", "llm_monthly_budget_usd": 50}])
+    )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 20.0)
+    monkeypatch.setattr(
+        payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=20.0)
+    )
 
-    gate = build_budget_gate(sb, ["t-1"])
+    gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False  # 20 < 50 override
 
 

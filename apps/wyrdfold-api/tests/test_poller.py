@@ -747,7 +747,7 @@ async def test_phase1_triage_defers_when_global_budget_exhausted(monkeypatch):
 
     fake_triage = AsyncMock()  # must NOT be awaited
     summary, jobs_table = await _run_triage_with_budget(
-        monkeypatch, exhausted=lambda _sb: True, fake_triage=fake_triage
+        monkeypatch, exhausted=AsyncMock(return_value=True), fake_triage=fake_triage
     )
 
     assert summary["error"] is None
@@ -770,7 +770,7 @@ async def test_phase1_triage_fails_open_on_budget_read_error(monkeypatch):
     from app.models.llm import LLMResult, LLMUsage
     from app.services.relevance.title_triage import TitleVerdict
 
-    def boom(_sb: object) -> bool:
+    async def boom(_sb: object) -> bool:
         raise RuntimeError("spend meter unreachable")
 
     # A real result (not None): the read error doesn't stop the LLM call, which
@@ -798,7 +798,7 @@ async def test_phase1_triage_defers_when_the_llm_call_fails(monkeypatch):
 
     fake_triage = AsyncMock(return_value=({}, None))  # attempted, but FAILED
     summary, jobs_table = await _run_triage_with_budget(
-        monkeypatch, exhausted=lambda _sb: False, fake_triage=fake_triage
+        monkeypatch, exhausted=AsyncMock(return_value=False), fake_triage=fake_triage
     )
 
     assert summary["error"] is None
@@ -1167,18 +1167,20 @@ async def test_targeted_stage3_uses_phase2_when_flag_on(monkeypatch):
 @pytest.mark.asyncio
 async def test_targeted_grading_uses_payer_byok_key(monkeypatch):
     """#5 P3: background grading resolves the LLM client on the payer's own
-    OpenRouter key (``get_client(supabase, payer)``), not the instance key."""
+    OpenRouter key (``get_client_async(supabase, payer)``), not the instance
+    key."""
     from app.services import poller as poller_mod
 
     supabase, fake_phase2, _fake_legacy, target = _wire_targeted_stage3(
         monkeypatch, phase2_enabled=True
     )
     seen_payers: list[str | None] = []
-    monkeypatch.setattr(
-        poller_mod,
-        "get_llm_client",
-        lambda _sb, user_id: seen_payers.append(user_id) or MagicMock(),
-    )
+
+    async def _fake_resolve(_sb, user_id):
+        seen_payers.append(user_id)
+        return MagicMock()
+
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _fake_resolve)
 
     summary = await poller_mod._poll_one_source_for_target(
         dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
@@ -1201,10 +1203,10 @@ async def test_targeted_grading_deferred_when_payer_has_no_byok_key(monkeypatch)
         monkeypatch, phase2_enabled=True
     )
 
-    def _no_key(_sb, _uid):
+    async def _no_key(_sb, _uid):
         raise MissingUserKeyError("openrouter")
 
-    monkeypatch.setattr(poller_mod, "get_llm_client", _no_key)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _no_key)
 
     summary = await poller_mod._poll_one_source_for_target(
         dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"

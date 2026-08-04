@@ -189,66 +189,78 @@ def test_touch_last_seen_swallows_failures(monkeypatch):
 # ---- gate idle blocking ----------------------------------------------------------
 
 
-def test_gate_blocks_idle_payer(monkeypatch):
+async def test_gate_blocks_idle_payer(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
     monkeypatch.setattr(
         payers_mod,
         "resolve_target_payers",
-        lambda sb, ids: {"t-idle": "u-idle", "t-fresh": "u-fresh"},
+        AsyncMock(return_value={"t-idle": "u-idle", "t-fresh": "u-fresh"}),
     )
     old = (datetime.now(UTC) - timedelta(days=8)).isoformat()
     fresh = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        {"user_id": "u-idle", "llm_monthly_budget_usd": None, "last_seen_at": old},
-        {"user_id": "u-fresh", "llm_monthly_budget_usd": None, "last_seen_at": fresh},
-    ]
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[
+                {"user_id": "u-idle", "llm_monthly_budget_usd": None, "last_seen_at": old},
+                {"user_id": "u-fresh", "llm_monthly_budget_usd": None, "last_seen_at": fresh},
+            ]
+        )
+    )
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
 
-    gate = build_budget_gate(sb, ["t-idle", "t-fresh"])
+    gate = await build_budget_gate(sb, ["t-idle", "t-fresh"])
     assert gate.target_blocked("t-idle") is True
     assert gate.user_blocked("u-idle") is True
     assert gate.target_blocked("t-fresh") is False
 
 
-def test_gate_null_last_seen_not_blocked(monkeypatch):
+async def test_gate_null_last_seen_not_blocked(monkeypatch):
     """NULL last_seen_at (pre-backfill rows / missing profile) is treated
     as active — never punish missing data."""
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
+    monkeypatch.setattr(
+        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
+    )
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        {"user_id": "u-1", "llm_monthly_budget_usd": None, "last_seen_at": None},
-    ]
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[{"user_id": "u-1", "llm_monthly_budget_usd": None, "last_seen_at": None}]
+        )
+    )
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
 
-    gate = build_budget_gate(sb, ["t-1"])
+    gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False
 
 
-def test_gate_idle_defer_zero_disables(monkeypatch):
+async def test_gate_idle_defer_zero_disables(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(payers_mod, "resolve_target_payers", lambda sb, ids: {"t-1": "u-1"})
+    monkeypatch.setattr(
+        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
+    )
     ancient = (datetime.now(UTC) - timedelta(days=365)).isoformat()
     sb = MagicMock()
-    sb.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
-        {"user_id": "u-1", "llm_monthly_budget_usd": None, "last_seen_at": ancient},
-    ]
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data=[{"user_id": "u-1", "llm_monthly_budget_usd": None, "last_seen_at": ancient}]
+        )
+    )
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(payers_mod.cost_log, "total_spend", lambda sb, user_id, since: 0.0)
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
 
-    gate = build_budget_gate(sb, ["t-1"])
+    gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False
 
 
