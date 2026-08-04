@@ -551,7 +551,7 @@ def _patch_discovery_deps(
     ``_newest_discovery_at``, and a spy on the discovery run body."""
     runs: list[int] = []
 
-    monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: object())
+    monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: object())
 
     async def fake_newest(_client: object) -> "datetime | None":
         if isinstance(last_run, Exception):
@@ -618,7 +618,7 @@ class TestDiscoveryCatchup:
 
     @pytest.mark.asyncio
     async def test_missing_pool_client_skips_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: None)
         sched = _RecordingScheduler()
 
         await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # must not raise

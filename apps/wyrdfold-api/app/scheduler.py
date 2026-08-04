@@ -41,7 +41,7 @@ from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
 from app.services.url_health import run_url_health_check
-from app.supabase_pool import get_async_supabase, get_supabase_pool
+from app.supabase_pool import get_async_supabase
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -375,9 +375,9 @@ async def _anchor_discovery_schedule(
     """
     moment = now or datetime.now(UTC)
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("discovery catch-up skipped — supabase client not initialized")
+            logger.warning("discovery catch-up skipped — async supabase client not initialized")
             return
         last = await _newest_discovery_at(client)
         tick = timedelta(hours=settings.discovery_tick_hours)

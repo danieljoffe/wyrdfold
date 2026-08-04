@@ -49,7 +49,7 @@ import logging
 import threading
 from typing import Any
 
-from supabase import Client
+from supabase import AsyncClient
 
 TABLE = "llm_costs"
 
@@ -188,7 +188,7 @@ class CostLogBuffer:
                 total_dropped,
             )
 
-    async def flush(self, supabase: Client) -> int:
+    async def flush(self, supabase: AsyncClient) -> int:
         """Drain the buffer and write the rows in chunked bulk INSERTs.
 
         The drained list is sliced into ``insert_batch_size`` chunks so a
@@ -198,23 +198,21 @@ class CostLogBuffer:
         (they're durably written) and only the failing chunk + the
         remaining un-sent chunks are re-queued, then the error re-raises
         so the caller can log/retry. This makes chunking duplicate-safe.
+
+        The INSERT is awaited natively on the pooled async service client
+        (#57): the drain runs in the background flush task, so the round-trip
+        yields the loop instead of hopping to a threadpool worker.
         """
         rows = self._drain()
         if not rows:
             return 0
-
-        def _insert(batch_rows: list[dict[str, Any]]) -> None:
-            supabase.table(self._table).insert(batch_rows).execute()
 
         written = 0
         batch = self._insert_batch_size
         for start in range(0, len(rows), batch):
             chunk = rows[start : start + batch]
             try:
-                # Pass ``chunk`` as an argument (not a closure) so each
-                # iteration's slice is bound explicitly — no loop-variable
-                # capture, and mypy can infer the call's types.
-                await asyncio.to_thread(_insert, chunk)
+                await supabase.table(self._table).insert(chunk).execute()
             except Exception:
                 # Only re-queue what hasn't been committed: this failing
                 # chunk plus everything after it. Earlier chunks are
@@ -231,7 +229,7 @@ class CostLogBuffer:
             written += len(chunk)
         return written
 
-    async def _run(self, supabase: Client) -> None:
+    async def _run(self, supabase: AsyncClient) -> None:
         # `_wakeup` is created synchronously in `start` before this task
         # is scheduled, so it's never None here.
         wakeup = self._wakeup
@@ -249,7 +247,7 @@ class CostLogBuffer:
         finally:
             self._wakeup = None
 
-    def start(self, supabase: Client) -> None:
+    def start(self, supabase: AsyncClient) -> None:
         """Spawn the periodic flush task. Idempotent.
 
         Must be called from within a running asyncio loop (e.g. the
@@ -266,7 +264,7 @@ class CostLogBuffer:
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._run(supabase))
 
-    async def stop(self, supabase: Client) -> None:
+    async def stop(self, supabase: AsyncClient) -> None:
         """Drain the buffer and shut the periodic task down cooperatively.
 
         Avoids ``task.cancel()`` because ``CancelledError`` derives from
