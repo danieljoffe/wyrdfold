@@ -15,7 +15,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.learning import ProfilePatch
 from app.services.llm_learner import apply_staged_patch, reject_staged_patch
@@ -223,11 +223,11 @@ def test_merge_rpc_not_executable_by_anon(anon_client: Client, seeded: dict[str,
 # ---- staged-merge lifecycle -------------------------------------------------
 
 
-def test_apply_staged_merge_lifts_quarantine_and_remerges(
-    service_client: Client, seeded: dict[str, Any]
+async def test_apply_staged_merge_lifts_quarantine_and_remerges(
+    service_client: Client, async_service_client: AsyncClient, seeded: dict[str, Any]
 ) -> None:
-    result = apply_staged_patch(
-        service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
+    result = await apply_staged_patch(
+        async_service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
     )
 
     assert result is not None
@@ -253,11 +253,11 @@ def test_apply_staged_merge_lifts_quarantine_and_remerges(
     assert log["prev_profile"] == _BASE_PROFILE
 
 
-def test_reject_staged_merge_keeps_quarantine(
-    service_client: Client, seeded: dict[str, Any]
+async def test_reject_staged_merge_keeps_quarantine(
+    service_client: Client, async_service_client: AsyncClient, seeded: dict[str, Any]
 ) -> None:
-    result = reject_staged_patch(
-        service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
+    result = await reject_staged_patch(
+        async_service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
     )
 
     assert result is not None
@@ -270,14 +270,14 @@ def test_reject_staged_merge_keeps_quarantine(
     assert _jd_suppressed(service_client, seeded["quarantined_jd_id"]) is True
 
 
-def test_apply_staged_merge_gone_contribution_is_none(
-    service_client: Client, seeded: dict[str, Any]
+async def test_apply_staged_merge_gone_contribution_is_none(
+    service_client: Client, async_service_client: AsyncClient, seeded: dict[str, Any]
 ) -> None:
     """The quarantined JD was deleted while staged — nothing to approve."""
     service_client.table("reference_jds").delete().eq("id", seeded["quarantined_jd_id"]).execute()
 
-    result = apply_staged_patch(
-        service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
+    result = await apply_staged_patch(
+        async_service_client, user_id=seeded["uid_a"], run_id=seeded["staged_run_id"]
     )
 
     assert result is None

@@ -181,6 +181,29 @@ class TestApplyPatchToProfile:
 # ---- run_llm_learner end-to-end (mock LLM + fake supabase) ----------------
 
 
+class _Resp:
+    """Dual-mode fake response (#57 PR-G2e-2).
+
+    ``run_llm_learner`` is async on the pooled service client, so its DB reads
+    ``await query.execute()`` — hence ``_Resp`` is awaitable (yields itself). But
+    the poller-shared re-score projection (``project_profile_impact``) is still
+    SYNC and runs in a worker thread via ``asyncio.to_thread``: there it calls
+    ``query.execute()`` and reads ``.data`` WITHOUT awaiting. Exposing ``.data``
+    directly (not behind a coroutine) serves both call styles from one fake, so
+    the apply-path tests keep exercising the real projection over empty scores
+    (→ ``None``) exactly as before."""
+
+    def __init__(self, data: Any) -> None:
+        self.data = data
+        self.count = len(data or [])
+
+    def __await__(self) -> Any:
+        async def _self() -> _Resp:
+            return self
+
+        return _self().__await__()
+
+
 class _FakeQuery:
     def __init__(self, fake: _FakeSupabase, table: str) -> None:
         self._fake = fake
@@ -222,12 +245,12 @@ class _FakeQuery:
         self._single = True
         return self
 
-    def execute(self) -> Any:
+    def execute(self) -> _Resp:
         self._fake.log.append({"table": self._table, "op": self._op, "payload": self._payload})
         data = self._fake.next_response(self._table, self._op)
         if self._single:
             data = data[0] if data else None
-        return type("Resp", (), {"data": data, "count": len(data or [])})()
+        return _Resp(data)
 
 
 class _FakeSupabase:
@@ -303,7 +326,8 @@ async def test_below_threshold_returns_none(fake: _FakeSupabase) -> None:
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
     assert result is None
     mock_complete.assert_not_called()
@@ -358,7 +382,8 @@ async def test_high_confidence_patch_auto_applies(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -425,7 +450,8 @@ async def test_auto_apply_version_conflict_stages_instead(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -465,7 +491,8 @@ async def test_auto_apply_refused_for_non_follower_writes_nothing(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is None
@@ -531,7 +558,8 @@ async def test_high_confidence_outlier_patch_is_staged_by_learning_rate_cap(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -590,7 +618,8 @@ async def test_low_confidence_patch_stages_without_mutating_target(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -643,7 +672,8 @@ async def test_empty_patch_consumes_feedback_without_mutating_profile(
             fake,
             object(),
             user_id="u",
-            target_id="t",  # type: ignore[arg-type]
+            target_id="t",
+            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -659,7 +689,7 @@ async def test_empty_patch_consumes_feedback_without_mutating_profile(
 # ---- apply_staged_patch / reject_staged_patch -----------------------------
 
 
-def test_reject_staged_patch_does_not_stamp_feedback(
+async def test_reject_staged_patch_does_not_stamp_feedback(
     fake: _FakeSupabase,
 ) -> None:
     """Rejecting a stage means "wrong interpretation, try again later"
@@ -686,7 +716,7 @@ def test_reject_staged_patch_does_not_stamp_feedback(
             }
         ],
     )
-    result = reject_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+    result = await reject_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
     assert result is not None
     assert result.applied is False
     # No job_feedback writes.
@@ -694,12 +724,12 @@ def test_reject_staged_patch_does_not_stamp_feedback(
     assert feedback_updates == []
 
 
-def test_apply_staged_patch_returns_none_when_no_match(
+async def test_apply_staged_patch_returns_none_when_no_match(
     fake: _FakeSupabase,
 ) -> None:
     """Apply against an unknown / wrong-user run_id is a 404 path."""
     fake.push("target_learning_log", "select", [])  # single() → None
-    result = apply_staged_patch(fake, user_id="u", run_id="missing")  # type: ignore[arg-type]
+    result = await apply_staged_patch(fake, user_id="u", run_id="missing")  # type: ignore[arg-type]
     assert result is None
 
 
@@ -732,7 +762,7 @@ def _staged_log_row(status: str = "staged") -> dict[str, Any]:
     }
 
 
-def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
+async def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
     """#191: the human-approved apply also writes via the RPC (in-DB
     follower re-check + version guard), never a raw targets update — and it
     re-applies the PATCH to the current profile, not the stage-time
@@ -750,7 +780,7 @@ def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
     fake.push("job_feedback", "select", [{"id": "fb-1"}])
     fake.push("job_feedback", "update", [{"id": "fb-1"}])
 
-    result = apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+    result = await apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
 
     assert result is not None
     assert result.applied is True
@@ -769,7 +799,7 @@ def test_apply_staged_patch_goes_through_rpc(fake: _FakeSupabase) -> None:
     ]
 
 
-def test_apply_staged_patch_preserves_intervening_changes(
+async def test_apply_staged_patch_preserves_intervening_changes(
     fake: _FakeSupabase,
 ) -> None:
     """Copilot on #202: a reference-JD merge (or another learn) landing
@@ -798,7 +828,7 @@ def test_apply_staged_patch_preserves_intervening_changes(
     fake.push("target_learning_log", "update", [applied_row])
     fake.push("job_feedback", "select", [])
 
-    result = apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+    result = await apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
 
     assert result is not None
     assert result.profile_version_after == 6
@@ -821,7 +851,7 @@ def test_apply_staged_patch_preserves_intervening_changes(
     assert log_update["diff"]["add_negative"] == ["sales"]
 
 
-def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
+async def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
     fake: _FakeSupabase,
 ) -> None:
     """Copilot on #203: if the apply-time #47 guard drops a now-self-
@@ -855,7 +885,7 @@ def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
     fake.push("target_learning_log", "update", [applied_row])
     fake.push("job_feedback", "select", [])
 
-    result = apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+    result = await apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
 
     assert result is not None
     # The colliding negative was NOT applied…
@@ -871,7 +901,7 @@ def test_apply_staged_patch_strip_at_apply_is_reflected_in_log_diff(
     assert "self-colliding negatives" in log_update["rationale"]
 
 
-def test_apply_staged_patch_conflict_raises_and_stays_staged(
+async def test_apply_staged_patch_conflict_raises_and_stays_staged(
     fake: _FakeSupabase,
 ) -> None:
     """#191: a concurrent write between the version read and the RPC apply
@@ -886,7 +916,7 @@ def test_apply_staged_patch_conflict_raises_and_stays_staged(
     )
 
     with pytest.raises(StagedPatchConflictError):
-        apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
+        await apply_staged_patch(fake, user_id="u", run_id="stage-1")  # type: ignore[arg-type]
 
     # No status flip, no feedback stamp — the stage is still reviewable.
     assert [
