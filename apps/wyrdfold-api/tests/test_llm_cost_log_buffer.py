@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -16,8 +16,10 @@ def _row(i: int) -> dict[str, Any]:
 
 
 def _supabase_mock() -> MagicMock:
+    # ``flush`` now awaits ``.insert(...).execute()`` on the async service client
+    # (#57), so ``execute`` must be an AsyncMock.
     sb = MagicMock()
-    sb.table.return_value.insert.return_value.execute.return_value = MagicMock(data=[])
+    sb.table.return_value.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     return sb
 
 
@@ -57,7 +59,7 @@ async def test_flush_empty_buffer_is_noop() -> None:
 async def test_flush_failure_re_queues_rows_and_raises() -> None:
     buf = CostLogBuffer()
     sb = MagicMock()
-    sb.table.return_value.insert.return_value.execute.side_effect = Exception("boom")
+    sb.table.return_value.insert.return_value.execute = AsyncMock(side_effect=Exception("boom"))
 
     buf.enqueue(_row(1))
     buf.enqueue(_row(2))
@@ -72,7 +74,7 @@ async def test_flush_failure_re_queues_rows_and_raises() -> None:
 async def test_flush_failure_preserves_row_order_on_requeue() -> None:
     buf = CostLogBuffer()
     sb = MagicMock()
-    sb.table.return_value.insert.return_value.execute.side_effect = Exception("boom")
+    sb.table.return_value.insert.return_value.execute = AsyncMock(side_effect=Exception("boom"))
 
     for i in range(3):
         buf.enqueue(_row(i))
@@ -194,19 +196,17 @@ async def test_stop_does_not_lose_rows_to_cancelled_error() -> None:
 
     write_count = 0
 
-    def _slow_execute() -> Any:
+    async def _slow_execute(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal write_count
-        # Simulate Supabase taking a beat to ack. Real ``execute`` is
-        # sync, so we mirror that — ``flush`` already wraps the call in
-        # ``to_thread`` so the loop stays responsive.
-        import time
-
-        time.sleep(0.05)
+        # Simulate Supabase taking a beat to ack. The async client awaits the
+        # round-trip natively on the loop (#57), so mirror that with an async
+        # sleep — the loop stays responsive while the flush is in flight.
+        await asyncio.sleep(0.05)
         write_count += 1
         return MagicMock(data=[])
 
     sb = MagicMock()
-    sb.table.return_value.insert.return_value.execute.side_effect = _slow_execute
+    sb.table.return_value.insert.return_value.execute = AsyncMock(side_effect=_slow_execute)
 
     buf.start(sb)
     for i in range(5):
@@ -233,7 +233,7 @@ def _failing_supabase() -> MagicMock:
     """A supabase mock whose INSERT always raises — simulates a sustained
     write outage so the buffer must re-queue every flush."""
     sb = MagicMock()
-    sb.table.return_value.insert.return_value.execute.side_effect = Exception("db down")
+    sb.table.return_value.insert.return_value.execute = AsyncMock(side_effect=Exception("db down"))
     return sb
 
 
@@ -330,11 +330,11 @@ async def test_chunked_flush_partial_failure_requeues_only_uncommitted() -> None
     def _insert(rows: list[dict[str, Any]]) -> MagicMock:
         calls.append(rows)
         m = MagicMock()
-        # Fail on the 3rd chunk (rows 4,5).
+        # Fail on the 3rd chunk (rows 4,5). ``execute`` is awaited (#57).
         if len(calls) == 3:
-            m.execute.side_effect = Exception("chunk boom")
+            m.execute = AsyncMock(side_effect=Exception("chunk boom"))
         else:
-            m.execute.return_value = MagicMock(data=[])
+            m.execute = AsyncMock(return_value=MagicMock(data=[]))
         return m
 
     sb.table.return_value.insert.side_effect = _insert

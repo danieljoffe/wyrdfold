@@ -12,7 +12,7 @@ The third fix (CostLogBuffer bounded memory + chunked INSERT) lives in
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -89,17 +89,19 @@ def test_client_built_with_configured_limits_and_explicit_timeout() -> None:
 
 
 def _ping_ok_supabase() -> MagicMock:
+    # ``/ready`` awaits the ping on the async service client (#57), so ``execute``
+    # must be an AsyncMock.
     sb = MagicMock()
-    sb.table.return_value.select.return_value.limit.return_value.execute.return_value = MagicMock(
-        data=[{"id": "s1"}]
+    sb.table.return_value.select.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"id": "s1"}])
     )
     return sb
 
 
 def _ping_failing_supabase() -> MagicMock:
     sb = MagicMock()
-    sb.table.return_value.select.return_value.limit.return_value.execute.side_effect = Exception(
-        "supabase down"
+    sb.table.return_value.select.return_value.limit.return_value.execute = AsyncMock(
+        side_effect=Exception("supabase down")
     )
     return sb
 
@@ -107,7 +109,7 @@ def _ping_failing_supabase() -> MagicMock:
 def test_health_is_pure_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
     """/health never touches the dependency — stays 200 even with Supabase
     unconfigured, so a DB blip can't trigger a container restart loop."""
-    monkeypatch.setattr(main_mod, "get_supabase_pool", lambda: None)
+    monkeypatch.setattr(main_mod, "get_async_supabase", lambda: None)
     client = TestClient(app)
     resp = client.get("/health")
     assert resp.status_code == 200
@@ -115,7 +117,7 @@ def test_health_is_pure_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_ready_200_when_supabase_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main_mod, "get_supabase_pool", _ping_ok_supabase)
+    monkeypatch.setattr(main_mod, "get_async_supabase", _ping_ok_supabase)
     client = TestClient(app)
     resp = client.get("/ready")
     assert resp.status_code == 200
@@ -125,7 +127,7 @@ def test_ready_200_when_supabase_reachable(monkeypatch: pytest.MonkeyPatch) -> N
 def test_ready_503_when_supabase_unconfigured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(main_mod, "get_supabase_pool", lambda: None)
+    monkeypatch.setattr(main_mod, "get_async_supabase", lambda: None)
     client = TestClient(app)
     resp = client.get("/ready")
     assert resp.status_code == 503
@@ -139,7 +141,7 @@ def test_ready_503_when_supabase_ping_fails(
 ) -> None:
     """The crux: a reachable-but-broken Supabase (ping raises) returns 503
     so the LB stops routing readiness-gated traffic to this instance."""
-    monkeypatch.setattr(main_mod, "get_supabase_pool", _ping_failing_supabase)
+    monkeypatch.setattr(main_mod, "get_async_supabase", _ping_failing_supabase)
     client = TestClient(app)
     resp = client.get("/ready")
     assert resp.status_code == 503

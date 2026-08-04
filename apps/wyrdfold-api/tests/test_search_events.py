@@ -247,6 +247,8 @@ async def test_parameterized_buffer_inserts_into_its_own_table() -> None:
     buf = CostLogBuffer(table="search_events", label="search-events")
     buf.enqueue({"event_type": "search", "surface": "public"})
     sb = MagicMock()
+    # ``flush`` awaits ``.insert(...).execute()`` on the async service client (#57).
+    sb.table.return_value.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     written = await buf.flush(sb)
     assert written == 1
     sb.table.assert_called_once_with("search_events")

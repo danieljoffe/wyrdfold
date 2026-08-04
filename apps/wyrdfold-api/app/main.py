@@ -54,7 +54,6 @@ from app.supabase_pool import (
     close_async_user_client,
     close_supabase,
     get_async_supabase,
-    get_supabase_pool,
     init_async_supabase,
     init_supabase,
 )
@@ -215,19 +214,28 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # so a future `with TestClient(app)` test can't hit the network).
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         await _probe_supabase_keys(settings)
+    # The SYNC service-role client is retained ONLY to back the sync FastAPI
+    # dependency layer that FastAPI runs in its threadpool — ``enforce_llm_budget``,
+    # ``get_llm_client``, and ``get_current_user_id`` → ``_touch_last_seen`` (the
+    # latter deliberately sync so its JWKS decode stays off the event loop, Perf-F1).
+    # Every OTHER service-role user (owner provisioning, the cost/search-event
+    # buffers, the scheduler discovery-catchup, and ``/ready`` below) now runs on
+    # the pooled ASYNC client. Retiring the sync client entirely is a follow-up
+    # chunk that converts those three deps to async (#57).
     init_supabase()
-    # Async service-role client (#57), stood up alongside the sync one for the
-    # incremental poller migration. No-op when Supabase isn't configured.
+    # Async service-role client (#57): the pooled client every migrated hot path
+    # awaits. No-op when Supabase isn't configured.
     await init_async_supabase()
     # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
     # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
     # saas mode, when OWNER_EMAIL is unset, or when the owner already exists).
+    # Runs on the async service client (#57 — GoTrue admin create_user awaited).
     # Same test-flag guard as the key probe above: provisioning hits the
     # auth admin API — a future `with TestClient(app)` test must not create
     # real users or need a live stack.
-    supabase_for_owner = get_supabase_pool()
+    supabase_for_owner = get_async_supabase()
     if supabase_for_owner is not None and os.environ.get("WYRDFOLD_API_TESTING") != "1":
-        provision_owner(supabase_for_owner, settings)
+        await provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
     # Pre-warm the JWKS key set and start its out-of-band refresher, so the
     # rate-limit key_func (which runs on the event loop) never blocks on a JWKS
@@ -237,10 +245,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         jwks_refresher = await prewarm_and_start_jwks_refresher(settings)
     # Background cost-log flush task. Cron paths enqueue rows and the
-    # buffer drains them in a single bulk INSERT every few seconds.
-    # Started only when supabase is configured (otherwise enqueued rows
-    # would accumulate forever in tests/local dev without a backing DB).
-    supabase_for_buffer = get_supabase_pool()
+    # buffer drains them in a single bulk INSERT every few seconds, awaited
+    # on the pooled async service client (#57). Started only when supabase is
+    # configured (otherwise enqueued rows would accumulate forever in
+    # tests/local dev without a backing DB).
+    supabase_for_buffer = get_async_supabase()
     if supabase_for_buffer is not None:
         cost_log_buffer.start(supabase_for_buffer)
         # Search-funnel metrics ride the same buffered-INSERT machinery
@@ -534,29 +543,25 @@ async def ready() -> JSONResponse:
     alerting but leave liveness as the thing that decides "kill and
     restart". See railway.toml and the Dockerfile HEALTHCHECK.
 
-    Prefers the async service-role client: ``asyncio.wait_for`` actually cancels
+    Uses the async service-role client: ``asyncio.wait_for`` actually cancels
     an in-flight async httpx request on timeout, so a slow Supabase can't strand
     a threadpool worker for the full 120s postgrest client timeout — which, at LB
     probe cadence, would starve the shared executor every ``to_thread`` handler
-    depends on (Perf-F4). Falls back to a ``to_thread``-wrapped sync ping (repo
-    #107 convention) when the async client isn't configured; a bare on-loop
-    ``.execute()`` would block the event loop.
+    depends on (Perf-F4). An absent async client means the dependency is
+    unconfigured → 503 (the sync + async service clients share one configuration
+    guard, so if one is absent both are).
     """
     async_supabase = get_async_supabase()
-    if async_supabase is not None:
-        ping = async_supabase.table("sources").select("id").limit(1).execute()
-    else:
-        supabase = get_supabase_pool()
-        if supabase is None:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "not_ready",
-                    "dependency": "supabase",
-                    "reason": "unconfigured",
-                },
-            )
-        ping = asyncio.to_thread(lambda: supabase.table("sources").select("id").limit(1).execute())
+    if async_supabase is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "dependency": "supabase",
+                "reason": "unconfigured",
+            },
+        )
+    ping = async_supabase.table("sources").select("id").limit(1).execute()
     try:
         await asyncio.wait_for(ping, timeout=_READY_PING_TIMEOUT_S)
     except Exception as exc:
