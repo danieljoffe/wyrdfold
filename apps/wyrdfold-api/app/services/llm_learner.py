@@ -23,7 +23,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.feedback import FeedbackRow
 from app.models.learning import (
@@ -38,7 +38,7 @@ from app.services.feedback import _MIN_FEEDBACK_FOR_LEARN, _parse_row
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
-from app.services.targets import crud as targets_crud
+from app.services.targets.crud import REF_JDS_TABLE, _parse_ref_jd
 
 # Imported under the historical private name so existing test patch points
 # (``app.services.llm_learner._project_patch_impact``) keep working.
@@ -47,8 +47,8 @@ from app.services.targets.learning_projection import (
 )
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
-    apply_profile_merge_rpc,
-    apply_profile_patch_rpc,
+    apply_profile_merge_rpc_async,
+    apply_profile_patch_rpc_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,11 +147,11 @@ def _build_user_message(
     )
 
 
-def _fetch_unapplied_feedback(
-    supabase: Client, user_id: str, target_id: str, limit: int = 50
+async def _fetch_unapplied_feedback(
+    supabase: AsyncClient, user_id: str, target_id: str, limit: int = 50
 ) -> list[FeedbackRow]:
     resp = (
-        supabase.table("job_feedback")
+        await supabase.table("job_feedback")
         .select("*")
         .eq("user_id", user_id)
         .eq("target_id", target_id)
@@ -164,12 +164,12 @@ def _fetch_unapplied_feedback(
     return [_parse_row(r) for r in rows]
 
 
-def _fetch_job_titles(supabase: Client, job_ids: list[str]) -> dict[str, str]:
+async def _fetch_job_titles(supabase: AsyncClient, job_ids: list[str]) -> dict[str, str]:
     if not job_ids:
         return {}
     # Deduplicate to keep the in_() filter sensible at scale.
     unique = list({jid for jid in job_ids if jid})
-    resp = supabase.table("jobs").select("id, title").in_("id", unique).execute()
+    resp = await supabase.table("jobs").select("id, title").in_("id", unique).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["id"]: r.get("title", "?") for r in rows}
 
@@ -261,8 +261,8 @@ def _apply_patch_to_profile(profile: dict[str, Any], patch: ProfilePatch) -> dic
     return cast(dict[str, Any], next_profile)
 
 
-def _insert_log(
-    supabase: Client,
+async def _insert_log(
+    supabase: AsyncClient,
     *,
     user_id: str,
     target_id: str,
@@ -287,17 +287,19 @@ def _insert_log(
         "applied_run_id": applied_run_id,
         "projection": projection,
     }
-    resp = supabase.table(LEARNING_LOG_TABLE).insert(payload).execute()
+    resp = await supabase.table(LEARNING_LOG_TABLE).insert(payload).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to insert target_learning_log row")
     return TargetLearningLogRow.model_validate(rows[0])
 
 
-def _stamp_consumed_feedback(supabase: Client, feedback_ids: list[str], run_id: str) -> None:
+async def _stamp_consumed_feedback(
+    supabase: AsyncClient, feedback_ids: list[str], run_id: str
+) -> None:
     if not feedback_ids:
         return
-    supabase.table("job_feedback").update(
+    await supabase.table("job_feedback").update(
         {
             "applied_at": datetime.now(UTC).isoformat(),
             "applied_run_id": run_id,
@@ -315,11 +317,12 @@ def _is_empty_patch(patch: ProfilePatch) -> bool:
 
 
 async def run_llm_learner(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     user_id: str,
     target_id: str,
+    sync_supabase: Client,
 ) -> LearningRunResult | None:
     """Run one LLM learn pass for (user, target).
 
@@ -328,20 +331,26 @@ async def run_llm_learner(
     or staged depending on confidence. An "empty patch high confidence"
     response is treated as a no-op apply: feedback rows are stamped
     consumed so we don't keep re-asking the LLM about the same noise.
+
+    Async on the pooled service client (#57 PR-G2e-2): the DB reads/writes are
+    awaited and the shared-profile write goes through the #191 patch RPC's async
+    twin. ``sync_supabase`` is a sync service client used ONLY to drive the
+    poller-shared re-score projection (``_project_patch_impact``) off the loop
+    via ``asyncio.to_thread`` — it has no async twin (poller-owned, out of scope).
     """
-    feedback = _fetch_unapplied_feedback(supabase, user_id, target_id)
+    feedback = await _fetch_unapplied_feedback(supabase, user_id, target_id)
     if len(feedback) < _MIN_FEEDBACK_FOR_LEARN:
         return None
 
-    target_resp = await asyncio.to_thread(
-        lambda: supabase.table("targets").select("*").eq("id", target_id).single().execute()
+    target_resp = (
+        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
     )
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
     prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
 
-    job_titles = _fetch_job_titles(supabase, [r.job_posting_id for r in feedback])
+    job_titles = await _fetch_job_titles(supabase, [r.job_posting_id for r in feedback])
 
     patch, llm_result = await complete_json(
         llm,
@@ -387,7 +396,7 @@ async def run_llm_learner(
     # Empty patch with high confidence: nothing to apply, but stamp the
     # feedback rows so we don't keep paying for the same Sonnet round-trip.
     if _is_empty_patch(patch):
-        log = _insert_log(
+        log = await _insert_log(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -398,7 +407,7 @@ async def run_llm_learner(
             signals_consumed=len(feedback_ids),
             applied_run_id=run_id,
         )
-        _stamp_consumed_feedback(supabase, feedback_ids, run_id)
+        await _stamp_consumed_feedback(supabase, feedback_ids, run_id)
         return LearningRunResult(
             log=log,
             applied=True,
@@ -409,7 +418,7 @@ async def run_llm_learner(
 
     if patch.confidence < CONFIDENCE_AUTO_APPLY:
         # Stage for review — do NOT mutate the target or stamp feedback.
-        log = _insert_log(
+        log = await _insert_log(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -429,7 +438,7 @@ async def run_llm_learner(
     # (``search_keywords`` was resolved above for the negative-collision guard.)
     projection = await asyncio.to_thread(
         _project_patch_impact,
-        supabase,
+        sync_supabase,
         target_id,
         prev_profile,
         next_profile,
@@ -445,7 +454,7 @@ async def run_llm_learner(
             f"{projection.max_moved_fraction:.0%} cap] "
         )
         staged_patch = patch.model_copy(update={"rationale": note + patch.rationale})
-        log = _insert_log(
+        log = await _insert_log(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -474,14 +483,12 @@ async def run_llm_learner(
     # follower link and that the profile hasn't moved since we computed the
     # patch, under a row lock.
     expected_version = cast(int, target_row.get("profile_version") or 1)
-    outcome, rpc_version = await asyncio.to_thread(
-        lambda: apply_profile_patch_rpc(
-            supabase,
-            user_id=user_id,
-            target_id=target_id,
-            next_profile=next_profile,
-            expected_version=expected_version,
-        )
+    outcome, rpc_version = await apply_profile_patch_rpc_async(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        next_profile=next_profile,
+        expected_version=expected_version,
     )
     if outcome == "version_conflict":
         # Another write (reference-JD merge, concurrent learn) landed after
@@ -493,7 +500,7 @@ async def run_llm_learner(
             f"(expected v{expected_version}, found v{rpc_version})] "
         )
         staged_patch = patch.model_copy(update={"rationale": note + patch.rationale})
-        log = _insert_log(
+        log = await _insert_log(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -527,7 +534,7 @@ async def run_llm_learner(
         return None
     new_version = cast(int, rpc_version)
 
-    log = _insert_log(
+    log = await _insert_log(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -539,7 +546,7 @@ async def run_llm_learner(
         applied_run_id=run_id,
         projection=projection_json,
     )
-    _stamp_consumed_feedback(supabase, feedback_ids, run_id)
+    await _stamp_consumed_feedback(supabase, feedback_ids, run_id)
 
     logger.info(
         "LLM learner applied for (user=%s, target=%s): +%d neg, +%d sec, "
@@ -555,8 +562,8 @@ async def run_llm_learner(
     return LearningRunResult(log=log, applied=True, profile_version_after=new_version)
 
 
-def _apply_staged_merge(
-    supabase: Client,
+async def _apply_staged_merge(
+    supabase: AsyncClient,
     *,
     user_id: str,
     log_row: dict[str, Any],
@@ -576,7 +583,16 @@ def _apply_staged_merge(
     payload = cast(dict[str, Any], log_row.get("merge_payload") or {})
     ref_jd_id = payload.get("ref_jd_id")
 
-    ref_jds = targets_crud.list_reference_jds(supabase, target_id)
+    # ``crud.list_reference_jds`` is poller-shared + sync; inline the read on the
+    # async client (reusing crud's row parser) rather than twin the crud helper.
+    ref_jds_resp = (
+        await supabase.table(REF_JDS_TABLE)
+        .select("*")
+        .eq("target_id", target_id)
+        .order("created_at")
+        .execute()
+    )
+    ref_jds = [_parse_ref_jd(cast(dict[str, Any], r)) for r in (ref_jds_resp.data or [])]
     if ref_jd_id is not None and not any(j.id == ref_jd_id for j in ref_jds):
         # The quarantined contribution was deleted while staged — nothing
         # to approve. Surfaced as the router's 404.
@@ -590,7 +606,7 @@ def _apply_staged_merge(
     next_profile = merge_reference_jds(unquarantined).model_dump()
 
     expected_version = cast(int, target_row.get("profile_version") or 1)
-    outcome, rpc_version = apply_profile_merge_rpc(
+    outcome, rpc_version = await apply_profile_merge_rpc_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -616,13 +632,13 @@ def _apply_staged_merge(
     new_version = cast(int, rpc_version)
 
     if ref_jd_id is not None:
-        supabase.table("reference_jds").update({"suppressed": False}).eq("id", ref_jd_id).eq(
-            "target_id", target_id
-        ).execute()
+        await supabase.table("reference_jds").update({"suppressed": False}).eq(
+            "id", ref_jd_id
+        ).eq("target_id", target_id).execute()
 
     new_run_id = str(uuid.uuid4())
     update_resp = (
-        supabase.table(LEARNING_LOG_TABLE)
+        await supabase.table(LEARNING_LOG_TABLE)
         .update(
             {
                 "status": "applied",
@@ -645,10 +661,12 @@ def _apply_staged_merge(
     )
 
 
-def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> LearningRunResult | None:
+async def apply_staged_patch(
+    supabase: AsyncClient, *, user_id: str, run_id: str
+) -> LearningRunResult | None:
     """Take a staged patch + apply it. Returns None if no staged row matches."""
     log_resp = (
-        supabase.table(LEARNING_LOG_TABLE)
+        await supabase.table(LEARNING_LOG_TABLE)
         .select("*")
         .eq("id", run_id)
         .eq("user_id", user_id)
@@ -661,7 +679,9 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
         return None
 
     target_id = log_row["target_id"]
-    target_resp = supabase.table("targets").select("*").eq("id", target_id).single().execute()
+    target_resp = (
+        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
+    )
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
@@ -669,7 +689,7 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     if log_row.get("kind") == "merge":
         # A quarantined reference-JD merge (#191 slice 1b) — approving it
         # lifts the contribution's suppression and re-merges fresh.
-        return _apply_staged_merge(
+        return await _apply_staged_merge(
             supabase,
             user_id=user_id,
             log_row=log_row,
@@ -718,7 +738,7 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     # fully covered — a conflict means a genuinely concurrent write landed
     # mid-apply, and retrying (the router's 409) recomputes from fresh state.
     expected_version = cast(int, target_row.get("profile_version") or 1)
-    outcome, rpc_version = apply_profile_patch_rpc(
+    outcome, rpc_version = await apply_profile_patch_rpc_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -750,7 +770,7 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     # stay a truthful one-row revert (Copilot on #203).
     new_run_id = str(uuid.uuid4())
     update_resp = (
-        supabase.table(LEARNING_LOG_TABLE)
+        await supabase.table(LEARNING_LOG_TABLE)
         .update(
             {
                 "status": "applied",
@@ -773,7 +793,7 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     # arrived since the stage, it gets consumed here too, which is the
     # correct behavior (the staged patch was the user's last decision).
     pending_resp = (
-        supabase.table("job_feedback")
+        await supabase.table("job_feedback")
         .select("id")
         .eq("user_id", user_id)
         .eq("target_id", target_id)
@@ -782,7 +802,7 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     )
     pending_rows = cast(list[dict[str, Any]], pending_resp.data or [])
     pending_ids = [r["id"] for r in pending_rows]
-    _stamp_consumed_feedback(supabase, pending_ids, new_run_id)
+    await _stamp_consumed_feedback(supabase, pending_ids, new_run_id)
 
     return LearningRunResult(
         log=TargetLearningLogRow.model_validate(rows[0]),
@@ -791,7 +811,9 @@ def apply_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learni
     )
 
 
-def reject_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> LearningRunResult | None:
+async def reject_staged_patch(
+    supabase: AsyncClient, *, user_id: str, run_id: str
+) -> LearningRunResult | None:
     """Mark a staged patch as rejected. Does NOT stamp feedback as
     consumed — those rows stay unapplied so a future learn run can
     revisit them (the user said "no" to this *interpretation*, not to
@@ -802,7 +824,7 @@ def reject_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learn
     excluded from every merge — though the vote quorum can still rescue
     it later through the normal suppression machinery."""
     resp = (
-        supabase.table(LEARNING_LOG_TABLE)
+        await supabase.table(LEARNING_LOG_TABLE)
         .update({"status": "rejected"})
         .eq("id", run_id)
         .eq("user_id", user_id)
@@ -818,50 +840,59 @@ def reject_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learn
     )
 
 
-# ---- Async router drivers (#57 PR-G2d-a) ----------------------------------
+# ---- Async router drivers (#57 PR-G2d-a → PR-G2e-2) -----------------------
 # The LLM-learner router handlers are ``async def`` on the pooled async service
-# client, but this whole chain stays SYNC (shared #191 profile-write RPCs + the
-# sync re-score projection, poller-shared). These seams acquire the pooled sync
-# service client in the service layer and drive the sync work off the event loop,
-# so the router body never holds ``get_supabase``.
+# client, and since PR-G2e-2 this whole chain runs async on it too (via the #191
+# profile-write RPCs' async twins). The ONLY sync dependency left is the
+# poller-shared re-score projection (``_project_patch_impact``): it has no async
+# twin (poller-owned, out of scope), so it runs off the loop via
+# ``asyncio.to_thread`` on a sync service client passed to :func:`run_llm_learner`
+# as ``sync_supabase`` — the same two-client seam jobs.py/targets.py use for the
+# poller-owned scorers. These seams acquire the client(s) in the service layer so
+# the router body never holds one.
 
 
 async def run_llm_learner_off_loop(
     llm: LLMClient, *, user_id: str, target_id: str
 ) -> LearningRunResult | None:
-    """Router driver for ``POST /targets/{id}/learn-llm`` (#57 PR-G2d-a).
+    """Router driver for ``POST /targets/{id}/learn-llm`` (#57 PR-G2d-a →
+    PR-G2e-2).
 
-    :func:`run_llm_learner` is itself ``async`` (it awaits the LLM) but its DB
-    work leans on the shared sync #191 RPC + the sync re-score projection, which
-    it manages off-loop internally — so the handler awaits it here on the pooled
-    sync service client without holding one itself."""
-    from app.dependencies import get_supabase
+    :func:`run_llm_learner` is async on the pooled async service client; it also
+    takes a sync service client (``sync_supabase``) used only to drive the
+    poller-shared re-score projection off the loop (no async twin — poller-owned,
+    out of scope). The lone sync service client acquired here is that client."""
+    from app.dependencies import get_async_service_supabase, get_supabase
 
-    return await run_llm_learner(get_supabase(), llm, user_id=user_id, target_id=target_id)
+    return await run_llm_learner(
+        get_async_service_supabase(),
+        llm,
+        user_id=user_id,
+        target_id=target_id,
+        sync_supabase=get_supabase(),
+    )
 
 
 async def apply_staged_patch_off_loop(
     *, user_id: str, run_id: str
 ) -> LearningRunResult | None:
-    """Drive :func:`apply_staged_patch` off the event loop on the pooled sync
-    service client (#57 PR-G2d-a). Propagates :class:`StagedPatchConflictError`
-    so the router maps a lost version race to 409."""
-    from app.dependencies import get_supabase
+    """Drive :func:`apply_staged_patch` on the pooled async service client (#57
+    PR-G2d-a → PR-G2e-2). Propagates :class:`StagedPatchConflictError` so the
+    router maps a lost version race to 409."""
+    from app.dependencies import get_async_service_supabase
 
-    supabase = get_supabase()
-    return await asyncio.to_thread(
-        apply_staged_patch, supabase, user_id=user_id, run_id=run_id
+    return await apply_staged_patch(
+        get_async_service_supabase(), user_id=user_id, run_id=run_id
     )
 
 
 async def reject_staged_patch_off_loop(
     *, user_id: str, run_id: str
 ) -> LearningRunResult | None:
-    """Drive :func:`reject_staged_patch` off the event loop on the pooled sync
-    service client (#57 PR-G2d-a)."""
-    from app.dependencies import get_supabase
+    """Drive :func:`reject_staged_patch` on the pooled async service client (#57
+    PR-G2d-a → PR-G2e-2)."""
+    from app.dependencies import get_async_service_supabase
 
-    supabase = get_supabase()
-    return await asyncio.to_thread(
-        reject_staged_patch, supabase, user_id=user_id, run_id=run_id
+    return await reject_staged_patch(
+        get_async_service_supabase(), user_id=user_id, run_id=run_id
     )

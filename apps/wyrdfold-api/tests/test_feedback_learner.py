@@ -182,7 +182,9 @@ class _FakeQuery:
         self._single = True
         return self
 
-    def execute(self) -> Any:
+    async def execute(self) -> Any:
+        # `async def` mirrors supabase-py's AsyncClient: ``maybe_run_learner`` is
+        # async since #57 PR-G2e-2 and ``await``s every ``.execute()``.
         self._fake.log.append(
             {
                 "table": self._table,
@@ -236,17 +238,17 @@ def fake() -> _FakeSupabase:
 
 
 class TestMaybeRunLearner:
-    def test_no_op_below_threshold(self, fake: _FakeSupabase) -> None:
+    async def test_no_op_below_threshold(self, fake: _FakeSupabase) -> None:
         # 2 unapplied rows < threshold (3).
         fake.push_response(
             "job_feedback",
             "select",
             [_row("sales rep").model_dump(mode="json") for _ in range(2)],
         )
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         assert result is None
 
-    def test_no_op_when_no_token_repeats(self, fake: _FakeSupabase) -> None:
+    async def test_no_op_when_no_token_repeats(self, fake: _FakeSupabase) -> None:
         # 3 rows but no shared token after stopword filtering.
         fake.push_response(
             "job_feedback",
@@ -257,9 +259,9 @@ class TestMaybeRunLearner:
                 _row("consulting").model_dump(mode="json"),
             ],
         )
-        assert maybe_run_learner(fake, user_id="u", target_id="t") is None  # type: ignore[arg-type]
+        assert await maybe_run_learner(fake, user_id="u", target_id="t") is None  # type: ignore[arg-type]
 
-    def test_skips_token_already_in_negative_list(self, fake: _FakeSupabase) -> None:
+    async def test_skips_token_already_in_negative_list(self, fake: _FakeSupabase) -> None:
         # Reasons where only "sales" passes both the token + frequency
         # filters — picking a single-word reason avoids accidentally
         # promoting a stopword-adjacent helper into the negative list.
@@ -281,11 +283,11 @@ class TestMaybeRunLearner:
                 }
             ],
         )
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         # "sales" is already a negative — nothing new to apply.
         assert result is None
 
-    def test_applies_new_negative_and_bumps_version(self, fake: _FakeSupabase) -> None:
+    async def test_applies_new_negative_and_bumps_version(self, fake: _FakeSupabase) -> None:
         # 3 unapplied rows, all share "sales".
         fake.push_response(
             "job_feedback",
@@ -313,7 +315,7 @@ class TestMaybeRunLearner:
         )
         fake.push_response("job_feedback", "update", [])
 
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         assert result is not None
         assert "sales" in result.added_negative_keywords
         # The "wrong" token shows up in all 3 rows too — also frequent.
@@ -336,7 +338,7 @@ class TestMaybeRunLearner:
         assert "junior" in new_negatives
         assert "sales" in new_negatives
 
-    def test_version_conflict_does_not_consume_signals(self, fake: _FakeSupabase) -> None:
+    async def test_version_conflict_does_not_consume_signals(self, fake: _FakeSupabase) -> None:
         # A concurrent writer bumped the profile: the patch RPC returns
         # version_conflict, so the learner applies nothing AND leaves the
         # pending signals unconsumed for a later run to retry (SEC-2).
@@ -356,7 +358,7 @@ class TestMaybeRunLearner:
             [{"outcome": "version_conflict", "new_version": None}],
         )
 
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         assert result is None
         # No job_feedback update means the signals stay pending for a retry.
         assert not [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"]

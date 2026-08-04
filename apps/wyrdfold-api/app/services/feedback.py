@@ -30,7 +30,7 @@ from app.models.feedback import (
     FeedbackSignal,
     LearnerPatchSummary,
 )
-from app.services.targets.profile_writes import apply_profile_patch_rpc
+from app.services.targets.profile_writes import apply_profile_patch_rpc_async
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +121,11 @@ def _parse_row(row: dict[str, Any]) -> FeedbackRow:
 
 # `async def` on the async user client (#57 slice 4): the interactive
 # job_feedback CRUD runs natively on the event loop, off the threadpool. The
-# deterministic learner below stays sync — it leans on the shared #191
-# profile-write RPC + ``bulk_score_for_target`` (service-role, poller-shared),
-# so an async fork would twin those; the async handlers drive it via
-# ``asyncio.to_thread`` on the pooled sync client instead.
+# deterministic learner below is async too since PR-G2e-2 — it runs on the
+# pooled async SERVICE client through the shared #191 profile-write RPC's async
+# twin; only the poller-shared ``bulk_score_for_target`` re-score stays sync
+# (no async twin, poller-owned), driven off the loop via ``asyncio.to_thread``
+# on a sync service client.
 async def upsert_feedback(
     supabase: AsyncClient,
     *,
@@ -226,17 +227,21 @@ def _frequent_tokens(rows: list[FeedbackRow], threshold: int) -> list[str]:
     return [tok for tok, n in seen_in.most_common() if n >= threshold]
 
 
-def maybe_run_learner(
-    supabase: Client, *, user_id: str, target_id: str
+async def maybe_run_learner(
+    supabase: AsyncClient, *, user_id: str, target_id: str
 ) -> LearnerPatchSummary | None:
     """Run the deterministic learner for one (user, target) pair.
 
     Returns a summary when something was applied, None when the trip
     threshold wasn't reached (so the caller can keep the API response
     cheap and skip the diff render).
+
+    Async on the pooled service client (#57 PR-G2e-2): every read/write is
+    awaited and the shared-profile write goes through the #191 patch RPC's
+    async twin (``apply_profile_patch_rpc_async``).
     """
     pending_resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .select("*")
         .eq("user_id", user_id)
         .eq("target_id", target_id)
@@ -256,7 +261,9 @@ def maybe_run_learner(
         # learn from. v2's LLM step is what handles this case.
         return None
 
-    target_resp = supabase.table("targets").select("*").eq("id", target_id).single().execute()
+    target_resp = (
+        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
+    )
     target_row = cast(dict[str, Any] | None, target_resp.data)
     if target_row is None:
         return None
@@ -284,7 +291,7 @@ def maybe_run_learner(
     # concurrent learner runs (or a learner racing an LLM-learner / ref-JD
     # merge) can't lose an update (hardening review 2026-07-21, SEC-2).
     expected_version = int(target_row.get("profile_version") or 1)
-    outcome, new_version = apply_profile_patch_rpc(
+    outcome, new_version = await apply_profile_patch_rpc_async(
         supabase,
         user_id=user_id,
         target_id=target_id,
@@ -306,7 +313,7 @@ def maybe_run_learner(
 
     run_id = str(uuid.uuid4())
     consumed_ids = [r.id for r in pending]
-    supabase.table(TABLE).update(
+    await supabase.table(TABLE).update(
         {
             "applied_at": datetime.now(UTC).isoformat(),
             "applied_run_id": run_id,
@@ -333,29 +340,33 @@ def maybe_run_learner(
     )
 
 
-# ---- Async router drivers (#57 PR-G2d-a) ----------------------------------
+# ---- Async router drivers (#57 PR-G2d-a → PR-G2e-2) -----------------------
 # The interactive feedback router is ``async def`` on the pooled async clients,
-# but the learner chain stays SYNC — it leans on the shared #191 profile-write
-# RPC + ``bulk_score_for_target`` (service-role, poller-shared), which an async
-# fork would twin. So the router drives the sync learner through these seams
-# instead of holding a sync service client itself (``get_supabase`` acquired here,
-# in the service layer, never in the router body).
+# and since PR-G2e-2 the learner chain runs async on the pooled async SERVICE
+# client too (via the #191 profile-write RPC's async twin). The ONE piece that
+# stays sync is the poller-shared ``bulk_score_for_target`` bulk re-score — it
+# has no async twin and the poller owns it (out of scope), so it runs off the
+# loop via ``asyncio.to_thread`` on a sync service client, exactly like the
+# ``rescore_for_target`` operator handler (jobs.py). These seams acquire the
+# clients in the service layer so the router body holds none.
 
 
 async def run_learner_off_loop(*, user_id: str, target_id: str) -> LearnerPatchSummary | None:
-    """Drive the deterministic learner off the event loop on the pooled sync
-    service client, for the ``POST /targets/{id}/learn`` handler (#57 PR-G2d-a)."""
-    from app.dependencies import get_supabase
+    """Drive the deterministic learner for the ``POST /targets/{id}/learn``
+    handler (#57 PR-G2d-a → PR-G2e-2): fully async on the pooled async service
+    client now — no sync client, no thread hop."""
+    from app.dependencies import get_async_service_supabase
 
-    supabase = get_supabase()
-    return await asyncio.to_thread(
-        maybe_run_learner, supabase, user_id=user_id, target_id=target_id
+    return await maybe_run_learner(
+        get_async_service_supabase(), user_id=user_id, target_id=target_id
     )
 
 
-def run_learner_and_rescore(supabase: Client, *, user_id: str, target_id: str) -> None:
+async def run_learner_and_rescore(
+    supabase: AsyncClient, sync_supabase: Client, *, user_id: str, target_id: str
+) -> None:
     """The post-feedback background learner chain (moved from the router's
-    ``_safe_run_learner``, #57 PR-G2d-a).
+    ``_safe_run_learner``, #57 PR-G2d-a; async since PR-G2e-2).
 
     Run the deterministic learner and, when it actually mutated the profile
     (returned a ``LearnerPatchSummary``), follow with a ``bulk_score_for_target``
@@ -364,22 +375,27 @@ def run_learner_and_rescore(supabase: Client, *, user_id: str, target_id: str) -
     ``profile_version`` already, so ``bulk_score_for_target`` only touches rows
     whose ``scored_profile_version`` is now stale.
 
-    Sync + poller-shared; the router drives it off the loop via ``spawn_detached``
-    (never a starlette ``BackgroundTask`` — uvloop pool deadlock). Swallows its
-    own exceptions (a background failure must not surface as an opaque 500 on a
-    later request) while still emitting a usable traceback.
+    ``maybe_run_learner`` runs async on ``supabase`` (the pooled async service
+    client); the poller-shared bulk re-score has no async twin, so it runs on
+    ``sync_supabase`` via ``asyncio.to_thread`` (the jobs.py ``rescore_for_target``
+    seam). Swallows its own exceptions (a detached background failure must not
+    surface as an opaque 500 on a later request) while still emitting a usable
+    traceback.
     """
     from app.services.target_scoring import bulk_score_for_target
     from app.services.targets.crud import get as get_target
 
     try:
-        patch = maybe_run_learner(supabase, user_id=user_id, target_id=target_id)
+        patch = await maybe_run_learner(supabase, user_id=user_id, target_id=target_id)
         if patch is None:
             return
-        target = get_target(supabase, target_id)
+        # Poller-shared sync scorer (no async twin, poller-owned): fetch the
+        # target + re-score off the loop on the sync service client, like
+        # ``rescore_for_target`` (jobs.py).
+        target = await asyncio.to_thread(get_target, sync_supabase, target_id)
         if target is None:
             return
-        n = bulk_score_for_target(supabase, target)
+        n = await asyncio.to_thread(bulk_score_for_target, sync_supabase, target)
         logger.info(
             "Feedback learner triggered re-score for target=%s: "
             "+%d negatives %s, %d rows re-scored",
@@ -397,13 +413,21 @@ def run_learner_and_rescore(supabase: Client, *, user_id: str, target_id: str) -
 
 
 async def run_learner_and_rescore_off_loop(*, user_id: str, target_id: str) -> None:
-    """Async entry for the background learner chain: acquire the pooled sync
-    service client and run :func:`run_learner_and_rescore` off the event loop.
-    The coroutine the ``create_feedback`` handler hands to ``spawn_detached``
-    (#57 PR-G2d-a)."""
-    from app.dependencies import get_supabase
+    """Async entry for the background learner chain (the coroutine the
+    ``create_feedback`` handler hands to ``spawn_detached``, #57 PR-G2d-a →
+    PR-G2e-2).
 
-    supabase = get_supabase()
-    await asyncio.to_thread(
-        run_learner_and_rescore, supabase, user_id=user_id, target_id=target_id
+    Acquires the pooled async service client for the learner + #191 RPC and a
+    sync service client for the poller-shared bulk re-score, then runs
+    :func:`run_learner_and_rescore`. The lone sync service client acquired here
+    feeds the poller-owned ``bulk_score_for_target`` (no async twin) via
+    ``to_thread`` — the same two-client seam the router-side ``rescore_for_target``
+    handler uses."""
+    from app.dependencies import get_async_service_supabase, get_supabase
+
+    await run_learner_and_rescore(
+        get_async_service_supabase(),
+        get_supabase(),
+        user_id=user_id,
+        target_id=target_id,
     )
