@@ -40,11 +40,10 @@ from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrust
 from app.services.targets.crud import REF_JDS_TABLE, _parse_ref_jd
 
 # Imported under the historical private name so existing test patch points
-# (``app.services.llm_learner._project_patch_impact``) keep working — now the
-# async twin (#57 PR-G2e-3), awaited directly rather than threaded on a sync
-# client.
+# (``app.services.llm_learner._project_patch_impact``) keep working. Awaited
+# directly on the pooled async service client (#57 PR-G2e-3).
 from app.services.targets.learning_projection import (
-    project_profile_impact_async as _project_patch_impact,
+    project_profile_impact as _project_patch_impact,
 )
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
@@ -334,8 +333,8 @@ async def run_llm_learner(
 
     Fully async on the pooled service client (#57 PR-G2e-3): the DB reads/writes
     are awaited, the shared-profile write goes through the #191 patch RPC's async
-    twin, and the re-score projection (``_project_patch_impact``) is now the async
-    twin ``project_profile_impact_async`` — its DB reads awaited, its deterministic
+    twin, and the re-score projection (``_project_patch_impact`` →
+    :func:`project_profile_impact`) has its DB reads awaited, its deterministic
     re-score off-loaded to a thread internally (#107).
     """
     feedback = await _fetch_unapplied_feedback(supabase, user_id, target_id)
@@ -843,8 +842,8 @@ async def reject_staged_patch(
 # ---- Async router drivers (#57 PR-G2d-a → PR-G2e-2) -----------------------
 # The LLM-learner router handlers are ``async def`` on the pooled async service
 # client, and since PR-G2e-3 this whole chain runs async on it end-to-end: the
-# #191 profile-write RPCs and the poller-shared re-score projection both gained
-# async twins (``project_profile_impact_async``), so no sync service client is
+# #191 profile-write RPCs and the poller-shared re-score projection
+# (``project_profile_impact``) are async, so no sync service client is
 # threaded anymore. This seam acquires the client in the service layer so the
 # router body never holds one.
 

@@ -123,7 +123,7 @@ def _parse_row(row: dict[str, Any]) -> FeedbackRow:
 # deterministic learner below is async too since PR-G2e-2 — it runs on the
 # pooled async SERVICE client through the shared #191 profile-write RPC's async
 # twin, and since PR-G2e-3 the follow-on re-score is async as well
-# (``bulk_score_for_target_async``), so the whole chain is on the async client.
+# (``bulk_score_for_target``), so the whole chain is on the async client.
 async def upsert_feedback(
     supabase: AsyncClient,
     *,
@@ -342,10 +342,10 @@ async def maybe_run_learner(
 # The interactive feedback router is ``async def`` on the pooled async clients,
 # and since PR-G2e-2 the learner chain runs async on the pooled async SERVICE
 # client too (via the #191 profile-write RPC's async twin). Since PR-G2e-3 the
-# follow-on bulk re-score is async as well (``bulk_score_for_target_async``), so
+# follow-on bulk re-score is async as well (``bulk_score_for_target``), so
 # the whole chain is on the async service client — no sync client, no thread hop.
-# The operator ``rescore_for_target`` handler (jobs.py) keeps the sync
-# ``bulk_score_for_target`` (its own two-client seam). This seam acquires the
+# The operator ``rescore_for_target`` handler (jobs.py) shares that same
+# ``bulk_score_for_target`` on the async service client. This seam acquires the
 # client in the service layer so the router body holds none.
 
 
@@ -372,13 +372,13 @@ async def run_learner_and_rescore(
     the next poll cycle. The patch bumped ``profile_version`` already, so the
     re-score only touches rows whose ``scored_profile_version`` is now stale.
 
-    Both the learner and the re-score (``bulk_score_for_target_async``) run on
+    Both the learner and the re-score (``bulk_score_for_target``) run on
     ``supabase`` (the pooled async service client); the re-score's heavy per-page
     keyword compute stays off the loop in a thread internally (#107). Swallows its
     own exceptions (a detached background failure must not surface as an opaque
     500 on a later request) while still emitting a usable traceback.
     """
-    from app.services.target_scoring import bulk_score_for_target_async
+    from app.services.target_scoring import bulk_score_for_target
     from app.services.targets import crud
 
     try:
@@ -395,7 +395,7 @@ async def run_learner_and_rescore(
         if not target_rows:
             return
         target = crud._parse_target(target_rows[0])
-        n = await bulk_score_for_target_async(supabase, target)
+        n = await bulk_score_for_target(supabase, target)
         logger.info(
             "Feedback learner triggered re-score for target=%s: "
             "+%d negatives %s, %d rows re-scored",

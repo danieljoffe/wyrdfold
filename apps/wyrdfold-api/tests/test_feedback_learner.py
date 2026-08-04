@@ -366,8 +366,8 @@ class TestMaybeRunLearner:
 
 # ---------------------------------------------------------------------------
 # run_learner_and_rescore (#57 PR-G2e-3): the post-feedback chain now runs the
-# follow-on re-score on the async twin — no sync client, no thread hop. Prove it
-# re-reads the (version-bumped) target async and re-scores via the async twin.
+# follow-on re-score async — no sync client, no thread hop. Prove it re-reads the
+# (version-bumped) target async and re-scores via ``bulk_score_for_target``.
 # ---------------------------------------------------------------------------
 
 
@@ -410,8 +410,8 @@ class _RescoreSupabase:
 async def test_run_learner_and_rescore_rerescores_on_applied_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Learner applied a patch → re-read the target async + re-score via the
-    async twin (``bulk_score_for_target_async``) on the same client."""
+    """Learner applied a patch → re-read the target async + re-score via
+    ``bulk_score_for_target`` on the same client."""
     from app.models.feedback import LearnerPatchSummary
     from app.services.feedback import run_learner_and_rescore
 
@@ -432,7 +432,7 @@ async def test_run_learner_and_rescore_rerescores_on_applied_patch(
         rescored.append(target.id)
         return 7
 
-    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target_async", _fake_bulk)
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target", _fake_bulk)
 
     await run_learner_and_rescore(_RescoreSupabase(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
 
@@ -457,7 +457,7 @@ async def test_run_learner_and_rescore_noop_when_no_patch(
         called.append(target)
         return 0
 
-    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target_async", _fake_bulk)
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target", _fake_bulk)
 
     await run_learner_and_rescore(object(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
     assert called == []

@@ -133,7 +133,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr("app.routers.targets.derive_profile_from_jd", _derive)
     monkeypatch.setattr("app.routers.targets.cost_log.record_async", AsyncMock())
     # #57 PR-G2e-4: the handler runs derive (async cache path) + the projection
-    # (``project_profile_impact_async``) on the injected async service client, so
+    # (``project_profile_impact``) on the injected async service client, so
     # ``sb`` is supplied via the ``get_async_service_supabase`` override below.
 
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: None
@@ -156,7 +156,7 @@ def test_capped_contribution_is_quarantined_not_applied(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = AsyncMock(name="project", return_value=_capped_projection())
-    monkeypatch.setattr("app.routers.targets.project_profile_impact_async", project)
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", project)
     rpc = AsyncMock(name="merge_rpc")
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
@@ -187,7 +187,7 @@ def test_uncapped_contribution_writes_through_merge_rpc(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact_async", AsyncMock(return_value=None)
+        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
     )
     rpc = AsyncMock(name="merge_rpc", return_value=("applied", 4))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
@@ -209,7 +209,7 @@ def test_unresolvable_version_conflict_is_409(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact_async", AsyncMock(return_value=None)
+        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
     )
     rpc = AsyncMock(name="merge_rpc", return_value=("version_conflict", 9))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)

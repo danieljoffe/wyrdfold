@@ -82,7 +82,7 @@ from app.services.source_discovery import (
     DiscoveryRunStats,
     run_discovery_for_target,
 )
-from app.services.target_scoring import bulk_title_score_for_target_async
+from app.services.target_scoring import bulk_title_score_for_target
 from app.services.targets import crud, fit_refresh, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
@@ -104,7 +104,7 @@ from app.services.targets.lateral_discovery import (
     LateralSuggestions,
     suggest_lateral_targets,
 )
-from app.services.targets.learning_projection import project_profile_impact_async
+from app.services.targets.learning_projection import project_profile_impact
 from app.services.targets.match import (
     suggest_and_match,
     suggest_and_match_from_query,
@@ -846,7 +846,7 @@ async def _activate_pipeline(
     Genuinely async (awaits the LLM derive + the poller). Reads/writes ride the
     pooled async service client via the router-inline helpers + async twins
     (``_update_target_async`` / ``_optimized_latest`` / ``cost_log.record_async``
-    / ``poll_sources_for_target`` / ``bulk_title_score_for_target_async``), all
+    / ``poll_sources_for_target`` / ``bulk_title_score_for_target``), all
     awaited on the loop (#57 PR-G2e-4).
     """
     target_id = target.id
@@ -915,7 +915,7 @@ async def _activate_pipeline(
         # database. ``score_title_and_upsert`` returns ``None`` (no row
         # written) when no keywords match, so this only creates rows where
         # the title actually scores against the new profile.
-        retro_scored = await bulk_title_score_for_target_async(supabase, target)
+        retro_scored = await bulk_title_score_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: retro-scored %d existing jobs",
             target_id,
@@ -1781,8 +1781,8 @@ async def poll_jobs_for_target(
     unauthenticated caller can't trigger a fan-out poll across all
     configured ATS sources. Not reachable from the wyrdfold FE.
 
-    The target read runs natively on the async service client; the poller accepts
-    it (``PollClient = Client | AsyncClient``, #57 PR-G2d-b/G2e-4).
+    The target read and the poll fan-out both run natively on the async service
+    client (#57).
     """
     target = await _target_get(supabase, target_id)
     if target is None:
@@ -2105,7 +2105,7 @@ async def add_reference_jd(
     Genuinely async (awaits URL validation, the JD fetch, and the LLM
     derive). The shared-catalog reads/writes ride the async service client via
     the router-inline helpers + the #191 merge RPC's async twin; the
-    ``derive_profile_from_jd`` content cache + ``project_profile_impact_async``
+    ``derive_profile_from_jd`` content cache + ``project_profile_impact``
     now run on that same async client too (#57 PR-G2e-4).
     """
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
@@ -2231,7 +2231,7 @@ async def add_reference_jd(
         # scoring — evaluating the new profile under the OLD keywords would
         # misjudge outliers (Copilot on #204). Runs on the async service client
         # via the G2e-3 twin (#57 PR-G2e-4).
-        projection = await project_profile_impact_async(
+        projection = await project_profile_impact(
             supabase,
             target_id,
             prev_profile,

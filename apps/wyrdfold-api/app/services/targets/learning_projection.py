@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.learning import RescoreProjection
@@ -30,38 +30,16 @@ from app.services.scoring import score_job_with_profile
 ScoredJobText = tuple[str, str]
 
 
-def fetch_recent_scored_jobs(supabase: Client, target_id: str, limit: int) -> list[ScoredJobText]:
-    """The (title, description_html) of a target's most recently scored jobs.
-
-    Bounded by ``limit`` to keep the deterministic re-score projection cheap.
-    Returns [] when the target has no scores yet (a brand-new target), which
-    the caller treats as "nothing to project against".
-    """
-    score_resp = (
-        supabase.table("scores")
-        .select("job_posting_id")
-        .eq("target_id", target_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
-    job_ids = [r["job_posting_id"] for r in score_rows if r.get("job_posting_id")]
-    if not job_ids:
-        return []
-    jobs_resp = (
-        supabase.table("jobs").select("id, title, description_html").in_("id", job_ids).execute()
-    )
-    job_rows = cast(list[dict[str, Any]], jobs_resp.data or [])
-    return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
-
-
-async def fetch_recent_scored_jobs_async(
+async def fetch_recent_scored_jobs(
     supabase: AsyncClient, target_id: str, limit: int
 ) -> list[ScoredJobText]:
-    """Async twin of :func:`fetch_recent_scored_jobs` (#57 PR-G2e-3): the same
+    """The (title, description_html) of a target's most recently scored jobs —
     two bounded reads (recent scores → their jobs), awaited on the pooled async
-    service client."""
+    service client.
+
+    Bounded by ``limit`` to keep the deterministic re-score projection cheap.
+    Returns [] when the target has no scores yet (a brand-new target), which the
+    caller treats as "nothing to project against"."""
     score_resp = await (
         supabase.table("scores")
         .select("job_posting_id")
@@ -81,38 +59,7 @@ async def fetch_recent_scored_jobs_async(
     return [(r.get("title") or "", r.get("description_html") or "") for r in job_rows]
 
 
-def project_profile_impact(
-    supabase: Client,
-    target_id: str,
-    prev_profile: dict[str, Any],
-    next_profile: dict[str, Any],
-    search_keywords: list[str] | None,
-    next_search_keywords: list[str] | None = None,
-) -> RescoreProjection | None:
-    """Project how much a profile change would move the target's scores.
-
-    Works for any prev→next profile transition — a learner ProfilePatch or
-    a reference-JD merge (#191 slice 1b) — since it just re-scores recent
-    jobs under both profiles. Returns None when there are no scored jobs to
-    project against — the caller then applies without a learning-rate check
-    (nothing to over-churn yet).
-    """
-    jobs = fetch_recent_scored_jobs(supabase, target_id, settings.learning_rescore_sample_size)
-    if not jobs:
-        return None
-    return project_rescore(
-        ScoringProfile.model_validate(prev_profile or {}),
-        ScoringProfile.model_validate(next_profile or {}),
-        jobs,
-        search_keywords=search_keywords,
-        next_search_keywords=next_search_keywords,
-        move_threshold=settings.learning_rescore_move_threshold,
-        max_moved_fraction=settings.learning_rescore_max_moved_fraction,
-        min_jobs=settings.learning_rescore_min_jobs,
-    )
-
-
-async def project_profile_impact_async(
+async def project_profile_impact(
     supabase: AsyncClient,
     target_id: str,
     prev_profile: dict[str, Any],
@@ -120,15 +67,20 @@ async def project_profile_impact_async(
     search_keywords: list[str] | None,
     next_search_keywords: list[str] | None = None,
 ) -> RescoreProjection | None:
-    """Async twin of :func:`project_profile_impact` (#57 PR-G2e-3) for the LLM
-    learner on the pooled async service client — the sync version stays for the
-    reference-JD merge path in ``routers/targets.py`` (threaded).
+    """Project how much a profile change would move the target's scores, on the
+    pooled async service client.
 
-    Fetches the recent scored jobs asynchronously, then runs the identical
-    deterministic :func:`project_rescore` — the scoring is pure CPU over up to N
-    JDs, so it is off-loaded to a thread (#107) rather than run on the loop the
-    detached learner chain shares with interactive requests."""
-    jobs = await fetch_recent_scored_jobs_async(
+    Works for any prev→next profile transition — a learner ProfilePatch or a
+    reference-JD merge (#191 slice 1b) — since it just re-scores recent jobs under
+    both profiles. Returns ``None`` when there are no scored jobs to project
+    against (the caller then applies without a learning-rate check — nothing to
+    over-churn yet).
+
+    Fetches the recent scored jobs asynchronously, then runs the deterministic
+    :func:`project_rescore` — pure CPU over up to N JDs, so it is off-loaded to a
+    thread (#107) rather than run on the loop the detached learner chain shares
+    with interactive requests."""
+    jobs = await fetch_recent_scored_jobs(
         supabase, target_id, settings.learning_rescore_sample_size
     )
     if not jobs:

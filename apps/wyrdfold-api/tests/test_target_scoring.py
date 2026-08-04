@@ -23,9 +23,7 @@ from app.models.targets import (
 )
 from app.services.target_scoring import (
     bulk_score_for_target,
-    bulk_score_for_target_async,
     bulk_title_score_for_target,
-    bulk_title_score_for_target_async,
     get_target_scores,
     score_and_upsert,
 )
@@ -210,281 +208,9 @@ async def test_score_and_upsert_excluded_by_prefilter_false_preserves_scorer(
 
 
 # ---------------------------------------------------------------------------
-# bulk_score_for_target
-# ---------------------------------------------------------------------------
-
-
-def test_bulk_score_for_target_scores_stage1_jobs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """bulk_score_for_target only scores jobs with existing target score rows."""
-
-    # Stage 1 score rows (existing matches for this target)
-    jts_rows = [
-        {"job_posting_id": "job-1"},
-        {"job_posting_id": "job-2"},
-    ]
-    jobs = [
-        {"id": "job-1", "title": "Senior FE", "description_html": "<p>React</p>"},
-        {"id": "job-2", "title": "Staff FE", "description_html": "<p>TypeScript</p>"},
-    ]
-    upsert_rows = [
-        _upserted_score_row(job_posting_id="job-1"),
-        _upserted_score_row(job_posting_id="job-2"),
-    ]
-
-    supabase = MagicMock()
-
-    range_calls = {"n": 0}
-
-    def range_side_effect(*args: Any, **kwargs: Any) -> MagicMock:
-        range_calls["n"] += 1
-        mock = MagicMock()
-        if range_calls["n"] == 1:
-            mock.execute.return_value.data = jts_rows
-        else:
-            mock.execute.return_value.data = []
-        return mock
-
-    # Chain: .select().eq().lt().range()
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
-    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = (
-        jobs
-    )
-    supabase.table.return_value.upsert.return_value.execute.return_value.data = upsert_rows
-
-    target = _target(core={"React": 3, "TypeScript": 3})
-    count = bulk_score_for_target(supabase, target)
-
-    assert count == 2
-
-
-def test_bulk_score_for_target_preserves_phase1_promising_verdict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bulk re-score must preserve the Phase 1 verdict on every
-    ``scores`` row. Without this, a target's ``profile_version`` bump
-    (feedback learner, manual /rescore, deploy-triggered poll) would
-    re-admit jobs Phase 1 previously dropped — exactly the regression
-    we hit after the post-PR-#782 Railway deploy, just now with the
-    Phase 1 verdict instead of cosine.
-
-    Mechanism: bulk_score_for_target selects ``scores.promising`` inline in
-    the stale-row paging query and uses it as the ``excluded_by_prefilter``
-    floor on each rescore. promising=False -> excluded stays True even if
-    the keyword scorer would admit; promising=True/None -> scorer decides.
-    """
-
-    # The stale-row page carries the ``promising`` verdict inline (selected
-    # in the same paging query), so the Phase 1 floor is preserved without a
-    # separate per-batch ``scores`` lookup. Phase 1 previously admitted
-    # "good", rejected "bad".
-    jts_rows = [
-        {"job_posting_id": "good", "promising": True},
-        {"job_posting_id": "bad", "promising": False},
-    ]
-    jobs = [
-        {
-            "id": "good",
-            "title": "Senior Frontend Engineer",
-            "description_html": "<p>React.</p>",
-        },
-        {
-            "id": "bad",
-            "title": "Sales Development Representative",
-            "description_html": "<p>Outbound sales.</p>",
-        },
-    ]
-    upsert_rows = [
-        _upserted_score_row(job_posting_id="good"),
-        _upserted_score_row(job_posting_id="bad"),
-    ]
-
-    supabase = MagicMock()
-    range_calls = {"n": 0}
-
-    def range_side_effect(*args: Any, **kwargs: Any) -> MagicMock:
-        range_calls["n"] += 1
-        mock = MagicMock()
-        mock.execute.return_value.data = jts_rows if range_calls["n"] == 1 else []
-        return mock
-
-    # Stale-row paging carries ``promising`` inline: ``.select().eq().lt().range()``.
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
-    # The jobs fetch is ``.select().in_()`` — returns the backing job rows.
-    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = (
-        jobs
-    )
-    supabase.table.return_value.upsert.return_value.execute.return_value.data = upsert_rows
-
-    target = _target(core={"React": 3})
-    count = bulk_score_for_target(supabase, target)
-
-    assert count == 2
-    payload = supabase.table.return_value.upsert.call_args.args[0]
-    by_id = {row["job_posting_id"]: row for row in payload}
-    assert by_id["good"]["excluded"] is False, "Phase 1 promising row kept"
-    assert by_id["bad"]["excluded"] is True, "Phase 1 not-promising row excluded"
-    # And ``promising`` carries through on the upsert so a future re-read
-    # still finds the verdict.
-    assert by_id["good"]["promising"] is True
-    assert by_id["bad"]["promising"] is False
-
-
-def test_bulk_score_for_target_streams_multiple_pages_without_holding_all_ids(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Audit #29: stale rows spanning several pages are all rescored, and the
-    function never accumulates every stale id into one in-memory list.
-
-    The streaming contract: each loop iteration re-reads the FIRST page of
-    still-stale ``scores`` rows (the prior page's upsert bumps
-    ``scored_profile_version`` so those rows drop out of the ``.lt()``
-    predicate), fetches just that page's jobs, scores+upserts them, then
-    recomputes global scores — before touching the next page. We prove:
-      1. every job across all pages is scored exactly once (no skips), and
-      2. no single jobs-fetch (``.in_()``) ever receives more than one
-         page's worth of ids (peak memory is O(page), not O(catalog)).
-    """
-    import app.services.target_scoring as ts
-
-    # Shrink the page so a small catalog spans multiple pages cheaply.
-    page = 2
-    monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", page)
-
-    # A 5-row catalog → 3 pages at page size 2 (2, 2, 1).
-    catalog = [f"job-{i}" for i in range(5)]
-    # ``remaining`` models the DB: ids still stale (not yet rescored). Each
-    # upsert removes its ids, so the next "first page" is the next slice.
-    remaining = list(catalog)
-    jobs_in_calls: list[list[str]] = []
-
-    supabase = MagicMock()
-
-    # Stale-row paging: ``.select().eq().lt().range()`` → first ``page`` of
-    # whatever is still stale right now.
-    def range_side_effect(*_args: Any, **_kwargs: Any) -> MagicMock:
-        m = MagicMock()
-        m.execute.return_value.data = [
-            {"job_posting_id": jid, "promising": None} for jid in remaining[:page]
-        ]
-        return m
-
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
-
-    # Jobs fetch: ``.select().in_(ids)`` → record the width, return job rows
-    # for exactly those ids.
-    def in_side_effect(_col: str, ids: list[str]) -> MagicMock:
-        jobs_in_calls.append(list(ids))
-        m = MagicMock()
-        m.execute.return_value.data = [
-            {"id": jid, "title": "Senior FE", "description_html": "<p>React</p>"} for jid in ids
-        ]
-        return m
-
-    supabase.table.return_value.select.return_value.in_.side_effect = in_side_effect
-
-    # Upsert: mark those ids no-longer-stale (drop from ``remaining``) and echo
-    # them back as the upsert result.
-    def upsert_side_effect(rows: list[dict[str, Any]], **_kwargs: Any) -> MagicMock:
-        for r in rows:
-            if r["job_posting_id"] in remaining:
-                remaining.remove(r["job_posting_id"])
-        m = MagicMock()
-        m.execute.return_value.data = rows
-        return m
-
-    supabase.table.return_value.upsert.side_effect = upsert_side_effect
-
-    target = _target(core={"React": 3})
-    count = bulk_score_for_target(supabase, target)
-
-    # 1. Every job scored exactly once.
-    assert count == len(catalog)
-    scored_ids = [jid for call in jobs_in_calls for jid in call]
-    assert sorted(scored_ids) == sorted(catalog), "every stale job rescored once"
-    # 2. Multiple pages were processed (not one giant batch)...
-    assert len(jobs_in_calls) == 3, jobs_in_calls
-    # ...and no single jobs fetch held more than one page of ids.
-    assert all(len(call) <= page for call in jobs_in_calls), jobs_in_calls
-
-
-def test_bulk_score_for_target_terminates_when_page_has_no_backing_jobs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Negative control for the streaming loop: if a page of stale ``scores``
-    rows has no backing ``jobs`` rows (all deleted), the first-page re-read
-    must NOT spin forever. The loop breaks instead of looping on rows it can
-    never upsert away.
-    """
-    import app.services.target_scoring as ts
-
-    monkeypatch.setattr(ts, "_RESCORE_BATCH_SIZE", 2)
-
-    range_calls = {"n": 0}
-
-    def range_side_effect(*_args: Any, **_kwargs: Any) -> MagicMock:
-        # Always returns stale rows — if the loop didn't break on the empty
-        # jobs fetch, it would call this unboundedly.
-        range_calls["n"] += 1
-        assert range_calls["n"] < 50, "first-page re-read looped without progress"
-        m = MagicMock()
-        m.execute.return_value.data = [
-            {"job_posting_id": "ghost-1", "promising": None},
-            {"job_posting_id": "ghost-2", "promising": None},
-        ]
-        return m
-
-    supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.side_effect = range_side_effect
-    # No backing jobs for these ids.
-    supabase.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
-
-    target = _target(core={"React": 3})
-    count = bulk_score_for_target(supabase, target)
-
-    assert count == 0
-    # Upsert never fired — nothing was scorable.
-    supabase.table.return_value.upsert.assert_not_called()
-
-
-def test_bulk_score_for_target_handles_no_stale_jobs() -> None:
-    """Returns 0 when no jobs have stale scores for this target."""
-    supabase = MagicMock()
-    # No stale score rows (chain: .select().eq().lt().range())
-    supabase.table.return_value.select.return_value.eq.return_value.lt.return_value.range.return_value.execute.return_value.data = []
-
-    target = _target(core={"React": 3})
-    count = bulk_score_for_target(supabase, target)
-
-    assert count == 0
-
-
-def test_bulk_score_for_target_skips_inactive_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Non-pipeline-active targets short-circuit before any DB read.
-
-    Pipeline-active = ``app_active`` (instance floor) OR any active
-    membership — the derived predicate (``crud.is_pipeline_active``, P0
-    re-semantics). When neither arm holds, re-scoring would just burn
-    LLM/CPU on rows nobody will see in the list view.
-    """
-    monkeypatch.setattr(
-        "app.services.targets.crud.is_pipeline_active", lambda sb, tid: False
-    )
-    supabase = MagicMock()
-    target = _target(core={"React": 3}, app_active=False)
-
-    count = bulk_score_for_target(supabase, target)
-
-    assert count == 0
-    # And critically: zero DB traffic — no select, no upsert.
-    supabase.table.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# bulk_score_for_target_async (#57 PR-G2e-3) — the async twin. Same streaming
-# re-score contract + shared ``_rescore_page_rows`` scoring math as the sync
-# version, on the pooled async service client (the feedback-learner path).
+# bulk_score_for_target — streaming re-score (shared ``_rescore_page_rows``
+# scoring math) on the pooled async service client (feedback-learner + operator
+# /rescore paths).
 # ---------------------------------------------------------------------------
 
 
@@ -549,10 +275,10 @@ class _AsyncBulkSupabase:
 
 
 @pytest.mark.asyncio
-async def test_bulk_score_for_target_async_scores_and_preserves_promising() -> None:
-    """The async twin re-scores a stale page and upserts, preserving the Phase 1
-    ``promising`` floor exactly like the sync version: promising=False keeps
-    ``excluded`` True, promising=True lets the keyword scorer decide."""
+async def test_bulk_score_for_target_scores_and_preserves_promising() -> None:
+    """Re-scores a stale page and upserts, preserving the Phase 1 ``promising``
+    floor: promising=False keeps ``excluded`` True, promising=True lets the
+    keyword scorer decide."""
     sb = _AsyncBulkSupabase()
     sb.push("targets", "select", [{"app_active": True}])  # pipeline-active
     sb.push(
@@ -570,7 +296,7 @@ async def test_bulk_score_for_target_async_scores_and_preserves_promising() -> N
     )
 
     target = _target(core={"React": 3, "TypeScript": 3})
-    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+    count = await bulk_score_for_target(sb, target)  # type: ignore[arg-type]
 
     assert count == 2
     assert len(sb.upserts) == 1
@@ -582,7 +308,7 @@ async def test_bulk_score_for_target_async_scores_and_preserves_promising() -> N
 
 
 @pytest.mark.asyncio
-async def test_bulk_score_for_target_async_streams_multiple_pages() -> None:
+async def test_bulk_score_for_target_streams_multiple_pages() -> None:
     """Re-reads the first page each iteration (an upsert bumps the version out of
     the stale predicate) until a page comes back empty — one upsert per page."""
     sb = _AsyncBulkSupabase()
@@ -594,14 +320,14 @@ async def test_bulk_score_for_target_async_streams_multiple_pages() -> None:
     sb.push("scores", "select", [])  # empty page → terminate
 
     target = _target(core={"React": 3, "TypeScript": 3})
-    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+    count = await bulk_score_for_target(sb, target)  # type: ignore[arg-type]
 
     assert count == 2
     assert len(sb.upserts) == 2
 
 
 @pytest.mark.asyncio
-async def test_bulk_score_for_target_async_skips_inactive_target() -> None:
+async def test_bulk_score_for_target_skips_inactive_target() -> None:
     """Non-pipeline-active target (not ``app_active`` AND no active membership)
     short-circuits before any ``scores`` read — no re-score writes."""
     sb = _AsyncBulkSupabase()
@@ -609,7 +335,7 @@ async def test_bulk_score_for_target_async_skips_inactive_target() -> None:
     sb.push("user_targets", "select", [])  # count exact → 0 active memberships
 
     target = _target(core={"React": 3}, app_active=False)
-    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+    count = await bulk_score_for_target(sb, target)  # type: ignore[arg-type]
 
     assert count == 0
     assert sb.upserts == []
@@ -851,10 +577,10 @@ def test_rescore_endpoint_returns_count(
 
     target = _target()
     # #57 PR-G2e-4: /rescore runs on the async service client via the router-inline
-    # ``_get_target_async`` + the ``bulk_score_for_target_async`` twin.
+    # ``_get_target_async`` + the ``bulk_score_for_target`` twin.
     monkeypatch.setattr(jobs_router, "_get_target_async", AsyncMock(return_value=target))
     monkeypatch.setattr(
-        jobs_router, "bulk_score_for_target_async", AsyncMock(return_value=42)
+        jobs_router, "bulk_score_for_target", AsyncMock(return_value=42)
     )
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     # /rescore now requires the operator-only ``verify_api_key`` dep —
@@ -1267,7 +993,7 @@ class _RetroSupabase:
 class _AsyncRetroSupabase(_RetroSupabase):
     """Async twin of ``_RetroSupabase`` — the keyset ``jobs`` read and the
     per-page ``scores`` upsert are both awaited on the loop, so ``execute`` is a
-    coroutine (the ``bulk_title_score_for_target_async`` contract, #57 PR-G2e-4)."""
+    coroutine (the ``bulk_title_score_for_target`` contract, #57 PR-G2e-4)."""
 
     async def execute(self) -> MagicMock:  # type: ignore[override]
         return self._read_resp()
@@ -1294,72 +1020,12 @@ def _retro_jobs() -> list[dict[str, str]]:
     ]
 
 
-def test_bulk_title_score_batches_upserts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One bulk upsert PER PAGE (not per row), only for pages that produced
-    matches — the correctness fix for the retro N+1. (The per-page global
-    jobs.score recompute that used to follow was retired with the column,
-    R2 schema audit Group A.)"""
-    import app.services.target_scoring as ts
-
-    monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)  # force multi-page
-
-    supabase = _RetroSupabase(_retro_jobs())
-    target = _target(core={"React": 3})
-
-    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
-
-    # 3 matches: j01, j05 (excluded), j06.
-    assert written == 3
-    # Bulk, not N+1: one upsert per page-with-matches. Page1 -> [j01],
-    # page2 (j03,j04) -> no matches -> NO upsert, page3 -> [j05, j06].
-    assert len(supabase.upsert_calls) == 2
-    assert [len(c) for c in supabase.upsert_calls] == [1, 2]  # 2nd call is a real batch
-    upserted = [r for call in supabase.upsert_calls for r in call]
-    assert {r["job_posting_id"] for r in upserted} == {"j01", "j05", "j06"}
-    assert all(r["scoring_status"] == "stage1" for r in upserted)
-    assert all(r["target_id"] == "target-1" for r in upserted)
-    # The negative-keyword job is written but excluded; the plain matches aren't.
-    by_id = {r["job_posting_id"]: r for r in upserted}
-    assert by_id["j05"]["excluded"] is True
-    assert by_id["j01"]["excluded"] is False
-    assert by_id["j06"]["excluded"] is False
-
-
-def test_bulk_title_score_empty_catalog_writes_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    supabase = _RetroSupabase([])
-    target = _target(core={"React": 3})
-
-    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
-
-    assert written == 0
-    assert supabase.upsert_calls == []
-
-
-def test_bulk_title_score_no_matches_writes_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Jobs exist but none match the target -> no upsert, no global recompute
-    (and the keyset loop still terminates)."""
-    supabase = _RetroSupabase([{"id": "j01", "title": "Plumber"}, {"id": "j02", "title": "Chef"}])
-    target = _target(core={"React": 3})
-
-    written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
-
-    assert written == 0
-    assert supabase.upsert_calls == []
-
-
 @pytest.mark.asyncio
 async def test_bulk_title_score_async_matches_sync_batching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The async twin (activation pipeline path) produces the identical
-    per-page batching + row set as the sync version — both build rows via the
-    shared ``_title_score_page_rows`` (#57 PR-G2e-4)."""
+    """The activation-pipeline path produces the expected per-page batching + row
+    set, building rows via the shared ``_title_score_page_rows`` (#57 PR-G2e-4)."""
     import app.services.target_scoring as ts
 
     monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)  # force multi-page
@@ -1367,7 +1033,7 @@ async def test_bulk_title_score_async_matches_sync_batching(
     supabase = _AsyncRetroSupabase(_retro_jobs())
     target = _target(core={"React": 3})
 
-    written = await bulk_title_score_for_target_async(supabase, target)  # type: ignore[arg-type]
+    written = await bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
 
     assert written == 3
     assert [len(c) for c in supabase.upsert_calls] == [1, 2]
@@ -1384,7 +1050,7 @@ async def test_bulk_title_score_async_empty_catalog_writes_nothing() -> None:
     supabase = _AsyncRetroSupabase([])
     target = _target(core={"React": 3})
 
-    written = await bulk_title_score_for_target_async(supabase, target)  # type: ignore[arg-type]
+    written = await bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
 
     assert written == 0
     assert supabase.upsert_calls == []
