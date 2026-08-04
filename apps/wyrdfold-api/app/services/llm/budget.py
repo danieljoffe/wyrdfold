@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple, cast
 
 from fastapi import HTTPException
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.services.llm import cost_log
 
@@ -58,6 +58,27 @@ def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
         .data
         or [],
     )
+    override = rows[0].get("llm_monthly_budget_usd") if rows else None
+    enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
+    plan = cast("str | None", rows[0].get("plan")) if rows else None
+    return LlmAccount(
+        monthly_override_usd=(float(cast(float, override)) if override is not None else None),
+        llm_enabled=enabled,
+        plan=plan,
+    )
+
+
+async def get_llm_account_async(supabase: AsyncClient, *, user_id: str) -> LlmAccount:
+    """Async mirror of :func:`get_llm_account` (#57 PR-G2c) for ``async def``
+    callers on the pooled async service client (billing + the quota resolver).
+    Identical shape + defaults; the sync version stays for the sync resolver."""
+    resp = await (
+        supabase.table("user_profiles")
+        .select("llm_monthly_budget_usd,llm_enabled,plan")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
     override = rows[0].get("llm_monthly_budget_usd") if rows else None
     enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
     plan = cast("str | None", rows[0].get("plan")) if rows else None
@@ -114,6 +135,48 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
     # that exists AND decrypts routes spend to the user; a broken row
     # falls back to the host key and must stay metered.
     if keys_store.has_usable_key(supabase, user_id=user_id, provider="openrouter"):
+        return ResolvedQuota(0.0, account.llm_enabled, None)
+
+    entitlement = ent.entitlements_for(account.plan)
+    if entitlement.llm_key_source == "host":
+        cap = (
+            account.monthly_override_usd
+            if account.monthly_override_usd is not None
+            else cast(float, entitlement.monthly_billable_budget_usd)
+        )
+        return ResolvedQuota(cap, account.llm_enabled, ent.NON_BILLABLE_PURPOSES)
+
+    cap = (
+        account.monthly_override_usd
+        if account.monthly_override_usd is not None
+        else s.user_llm_monthly_budget_usd
+    )
+    return ResolvedQuota(cap, account.llm_enabled, None)
+
+
+async def resolve_llm_quota_async(supabase: AsyncClient, *, user_id: str) -> ResolvedQuota:
+    """Async mirror of :func:`resolve_llm_quota` (#57 PR-G2c).
+
+    Byte-identical tier resolution to the sync version, awaited on the pooled
+    async service client — the profile read (:func:`get_llm_account_async`) and
+    the BYOK "who pays" check (:func:`keys_store.has_usable_key_async`) both run
+    on the event loop instead of a threadpool. The sync :func:`resolve_llm_quota`
+    stays for the sync ``enforce_llm_budget`` dependency."""
+    from app.config import settings as s
+    from app.services import entitlements as ent
+    from app.services.keys import store as keys_store
+
+    account = await get_llm_account_async(supabase, user_id=user_id)
+
+    if s.deployment_mode != "saas":
+        cap = (
+            account.monthly_override_usd
+            if account.monthly_override_usd is not None
+            else s.user_llm_monthly_budget_usd
+        )
+        return ResolvedQuota(cap, account.llm_enabled, None)
+
+    if await keys_store.has_usable_key_async(supabase, user_id=user_id, provider="openrouter"):
         return ResolvedQuota(0.0, account.llm_enabled, None)
 
     entitlement = ent.entitlements_for(account.plan)

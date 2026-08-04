@@ -15,7 +15,7 @@ Pins the tier model's behavioral contract:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -206,6 +206,85 @@ def test_quota_saas_free_without_key_keeps_default_cap(
     )
     assert q.monthly_cap_usd == settings.user_llm_monthly_budget_usd
     assert q.monthly_excluded_purposes is None
+
+
+# ---- resolve_llm_quota_async / get_llm_account_async (#57 PR-G2c) ------------
+# Async twins on the pooled async service client. Mirror the sync resolution
+# contract; the profile read is awaited, so ``.execute()`` is an AsyncMock.
+
+
+def _profile_supabase_async(rows: list[dict[str, Any]]) -> MagicMock:
+    """Async supabase fake whose user_profiles select awaits to ``rows``."""
+    sb = MagicMock(name="async_supabase")
+    sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=rows)
+    )
+    return sb
+
+
+async def _quota_async(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: str,
+    has_key: bool,
+    rows: list[dict[str, Any]],
+) -> budget.ResolvedQuota:
+    from app.services.keys import store as keys_store
+
+    monkeypatch.setattr(settings, "deployment_mode", mode)
+    monkeypatch.setattr(keys_store, "has_usable_key_async", AsyncMock(return_value=has_key))
+    return await budget.resolve_llm_quota_async(_profile_supabase_async(rows), user_id=_UID)
+
+
+@pytest.mark.asyncio
+async def test_quota_async_self_host_matches_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """self_host ignores plan AND key presence — same as the sync resolver."""
+    q = await _quota_async(
+        monkeypatch,
+        mode="self_host",
+        has_key=True,  # ignored in self_host
+        rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}],
+    )
+    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None)
+
+
+@pytest.mark.asyncio
+async def test_quota_async_saas_byok_payer_has_no_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usable key (async check) disables the managed monthly quota (0)."""
+    q = await _quota_async(
+        monkeypatch,
+        mode="saas",
+        has_key=True,
+        rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}],
+    )
+    assert q == budget.ResolvedQuota(0.0, True, None)
+
+
+@pytest.mark.asyncio
+async def test_quota_async_saas_managed_tier_interactive_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = await _quota_async(
+        monkeypatch,
+        mode="saas",
+        has_key=False,
+        rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}],
+    )
+    assert q.monthly_cap_usd == settings.pro_monthly_billable_budget_usd
+    assert q.monthly_excluded_purposes == ent.NON_BILLABLE_PURPOSES
+
+
+async def test_get_llm_account_async_reads_profile_row() -> None:
+    sb = _profile_supabase_async(
+        [{"llm_monthly_budget_usd": 25.0, "llm_enabled": False, "plan": "starter"}]
+    )
+    account = await budget.get_llm_account_async(sb, user_id=_UID)
+    assert account == budget.LlmAccount(25.0, False, "starter")
+
+
+async def test_get_llm_account_async_defaults_on_missing_row() -> None:
+    account = await budget.get_llm_account_async(_profile_supabase_async([]), user_id=_UID)
+    assert account == budget.LlmAccount(None, True, None)
 
 
 # ---- check_user_budget monthly accounting ----------------------------------

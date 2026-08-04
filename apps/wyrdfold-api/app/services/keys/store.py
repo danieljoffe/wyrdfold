@@ -125,6 +125,38 @@ def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> boo
         return False
 
 
+async def has_usable_key_async(
+    supabase: AsyncClient, *, user_id: str, provider: Provider
+) -> bool:
+    """Async mirror of :func:`has_usable_key` (#57 PR-G2c) for ``async def``
+    callers on the pooled async service client (billing + the async quota
+    resolver).
+
+    Same "who pays" semantics as the sync version: an unconfigured master key
+    or a stored row that can't be decrypted (rotated/wrong master key) means the
+    HOST key would pay, so the user must stay metered → False. Mirrors
+    ``_user_byok_key``'s fallbacks exactly (Copilot on #205). The read of the
+    ciphertext is awaited inline (``get_key`` stays sync for its other callers)."""
+    if not crypto.is_configured():
+        return False
+    _validate_provider(provider)
+    resp = await (
+        supabase.table(TABLE)
+        .select("ciphertext")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return False
+    try:
+        return crypto.decrypt(rows[0]["ciphertext"]) is not None
+    except crypto.BYOKDecryptError:
+        return False
+
+
 async def list_key_meta(supabase: AsyncClient, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""

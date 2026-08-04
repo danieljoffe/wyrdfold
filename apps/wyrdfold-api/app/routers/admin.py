@@ -8,17 +8,16 @@ investigate a warning.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
-from app.dependencies import get_async_service_supabase, get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.services.llm import cost_log
 from app.services.retention import purge_expired_records
 from app.supabase_pool import get_async_supabase
@@ -101,16 +100,16 @@ class CostSummaryResponse(BaseModel):
     )
 
 
-# `async def` (#57 PR-G2a): the ``cost_log.*_all`` aggregates stay synchronous
-# because the poller imports ``total_spend_all`` — giving them async twins would
-# ripple into the poller (out of scope for this chunk). They take a sync
-# ``Client`` and have no async twin, so this handler keeps the sync service client
-# and drives each blocking round-trip off the loop via ``asyncio.to_thread``
-# (#107). It has no async-native DB work of its own, so it does not bind the async
-# service client.
+# `async def` (#57 PR-G2c): the three ``cost_log.*_all`` aggregates now have async
+# twins (``total_spend_all_async`` / ``spend_by_purpose_all_async`` /
+# ``cache_metrics_all_async``), so every read runs natively on the pooled async
+# service client — no ``asyncio.to_thread`` offload, no sync service client. The
+# sync ``total_spend_all`` stays for the poller/ingestion-health callers (it
+# imports the sync form); the sync by-purpose/cache aggregates stay for their unit
+# tests.
 @router.get("/cost-summary", response_model=CostSummaryResponse)
 async def get_cost_summary(
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> CostSummaryResponse:
     """Operator drill-in for the LLM cost-alert breadcrumbs (#26 F4).
 
@@ -122,31 +121,23 @@ async def get_cost_summary(
     now = datetime.now(UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    today_usd = await asyncio.to_thread(cost_log.total_spend_all, supabase, since=midnight)
-    last_24h = await asyncio.to_thread(
-        cost_log.total_spend_all, supabase, since=now - timedelta(hours=24)
-    )
-    last_7d = await asyncio.to_thread(
-        cost_log.total_spend_all, supabase, since=now - timedelta(days=7)
-    )
-    last_30d = await asyncio.to_thread(
-        cost_log.total_spend_all, supabase, since=now - timedelta(days=30)
-    )
+    today_usd = await cost_log.total_spend_all_async(supabase, since=midnight)
+    last_24h = await cost_log.total_spend_all_async(supabase, since=now - timedelta(hours=24))
+    last_7d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=7))
+    last_30d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=30))
 
-    by_purpose_today: dict[str, float] = await asyncio.to_thread(
-        cost_log.spend_by_purpose_all, supabase, since=midnight
+    by_purpose_today: dict[str, float] = await cost_log.spend_by_purpose_all_async(
+        supabase, since=midnight
     )
-    by_purpose_30d: dict[str, float] = await asyncio.to_thread(
-        cost_log.spend_by_purpose_all, supabase, since=now - timedelta(days=30)
+    by_purpose_30d: dict[str, float] = await cost_log.spend_by_purpose_all_async(
+        supabase, since=now - timedelta(days=30)
     )
 
     cache_today = CacheStats.from_buckets(
-        await asyncio.to_thread(cost_log.cache_metrics_all, supabase, since=midnight)
+        await cost_log.cache_metrics_all_async(supabase, since=midnight)
     )
     cache_30d = CacheStats.from_buckets(
-        await asyncio.to_thread(
-            cost_log.cache_metrics_all, supabase, since=now - timedelta(days=30)
-        )
+        await cost_log.cache_metrics_all_async(supabase, since=now - timedelta(days=30))
     )
 
     cap = settings.global_llm_daily_budget_usd

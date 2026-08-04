@@ -33,6 +33,7 @@ from app.services.diagnostics.funnel import (
     _hours_since,
     _stage_counts,
     compute_target_funnel,
+    compute_target_funnel_async,
 )
 
 # ---- Pure helpers ----------------------------------------------------
@@ -414,3 +415,57 @@ def test_compute_target_funnel_assembles_full_report(monkeypatch: Any) -> None:
     assert report.sources[0].company_name == "Acme"
     # Pre-DB hint is present and mentions the grep token.
     assert "poll_funnel" in report.pre_db_hint
+
+
+# ---- Async twin smoke (#57 PR-G2c) -----------------------------------------
+# ``compute_target_funnel_async`` awaits its reads on the pooled async service
+# client. It inlines the target read (crud.get stays sync), so — unlike the sync
+# smoke above — the fake serves the ``targets`` row rather than a patched crud.get.
+
+
+class _AsyncFakeQuery(_FakeQuery):
+    async def execute(self) -> Any:  # type: ignore[override]
+        return self._scripted(self._table, self._filters, self._count)
+
+
+class _AsyncFakeSupabase:
+    def __init__(self, script: Any) -> None:
+        self._script = script
+
+    def table(self, name: str) -> _AsyncFakeQuery:
+        return _AsyncFakeQuery(name, self._script)
+
+
+@pytest.mark.asyncio
+async def test_compute_target_funnel_async_assembles_full_report() -> None:
+    """The async twin assembles the same report as the sync version, awaited on
+    an async fake supabase — including the inlined ``targets`` read."""
+    target = _make_target()
+    sb = _AsyncFakeSupabase(_scripted_response(target))
+    report = await compute_target_funnel_async(sb, target.id)
+
+    assert report.nomenclature.label == "Director of CX Ops"
+    assert report.nomenclature.example_promising_titles == ["Director, CX Operations"]
+    # Histogram bins reflect the scripted scores [45,55,65,75,85,95].
+    assert report.scores_histogram.total == 6
+    assert report.scores_histogram.max_score == 95
+    # floor=60 from user_profiles → 4 scores ≥60 (65,75,85,95).
+    assert report.scores_histogram.floor == 60
+    assert report.scores_histogram.above_floor == 4
+    assert [u.user_id for u in report.users] == ["u-1"]
+    assert report.users[0].list_min_score == 60
+    assert len(report.sources) == 1
+    assert report.sources[0].company_name == "Acme"
+
+
+@pytest.mark.asyncio
+async def test_compute_target_funnel_async_raises_for_missing_target() -> None:
+    """A missing target row raises ValueError (the handler maps it to 404) —
+    same contract as the sync version."""
+
+    def _no_target(_table: str, _filters: Any, _count: Any) -> Any:
+        return SimpleNamespace(data=[], count=0)
+
+    sb = _AsyncFakeSupabase(_no_target)
+    with pytest.raises(ValueError, match="not found"):
+        await compute_target_funnel_async(sb, "missing-id")

@@ -450,6 +450,46 @@ def total_spend_all(
     return round(float(cast(Any, raw)), 6)
 
 
+async def _total_spend_all_python_async(
+    supabase: AsyncClient,
+    since: datetime | None,
+) -> float:
+    """Async mirror of :func:`_total_spend_all_python` (#57 PR-G2c). Same
+    all-users select+sum fallback, awaited on the pooled async service client."""
+    query = supabase.table(TABLE).select("cost_usd")
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = await query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return round(sum(float(r["cost_usd"]) for r in rows), 6)
+
+
+async def total_spend_all_async(
+    supabase: AsyncClient,
+    since: datetime | None = None,
+) -> float:
+    """Async mirror of :func:`total_spend_all` (#57 PR-G2c).
+
+    The all-users spend read for an ``async def`` handler (the operator
+    cost-summary) on the pooled async service client — same
+    ``total_spend_all_since`` RPC-first / client-side-sum fallback and rounding
+    as the sync version, awaited instead of threadpooled. The sync
+    :func:`total_spend_all` stays for the poller/ingestion-health callers."""
+    try:
+        resp = await supabase.rpc(
+            "total_spend_all_since",
+            {"p_since": since.isoformat() if since is not None else None},
+        ).execute()
+    except Exception:
+        _log.debug("total_spend_all_since RPC unavailable, falling back to client-side sum")
+        return await _total_spend_all_python_async(supabase, since)
+
+    raw = resp.data
+    if raw is None:
+        return 0.0
+    return round(float(cast(Any, raw)), 6)
+
+
 def _spend_by_purpose_python(
     supabase: Client,
     user_id: str | None,
@@ -488,6 +528,26 @@ def spend_by_purpose_all(
     return {k: round(v, 6) for k, v in totals.items()}
 
 
+async def spend_by_purpose_all_async(
+    supabase: AsyncClient,
+    since: datetime | None = None,
+) -> dict[str, float]:
+    """Async mirror of :func:`spend_by_purpose_all` (#57 PR-G2c).
+
+    Per-purpose spend across ALL users, awaited on the async service client for
+    the operator cost-summary handler. No RPC variant — same client-side group
+    as the sync version (the operator surface is queried infrequently)."""
+    query = supabase.table(TABLE).select("purpose, cost_usd")
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = await query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    totals: dict[str, float] = {}
+    for r in rows:
+        totals[r["purpose"]] = totals.get(r["purpose"], 0.0) + float(r["cost_usd"])
+    return {k: round(v, 6) for k, v in totals.items()}
+
+
 def cache_metrics_all(
     supabase: Client,
     since: datetime | None = None,
@@ -507,6 +567,29 @@ def cache_metrics_all(
     if since is not None:
         query = query.gte("created_at", since.isoformat())
     resp = query.execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {
+        "cache_read": sum(int(r["cache_read_input_tokens"]) for r in rows),
+        "cache_creation": sum(int(r["cache_creation_input_tokens"]) for r in rows),
+        "uncached_input": sum(int(r["input_tokens"]) for r in rows),
+    }
+
+
+async def cache_metrics_all_async(
+    supabase: AsyncClient,
+    since: datetime | None = None,
+) -> dict[str, int]:
+    """Async mirror of :func:`cache_metrics_all` (#57 PR-G2c).
+
+    Prompt-cache token buckets across ALL users, awaited on the async service
+    client for the operator cost-summary handler. No RPC variant — same
+    client-side sum as the sync version."""
+    query = supabase.table(TABLE).select(
+        "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
+    )
+    if since is not None:
+        query = query.gte("created_at", since.isoformat())
+    resp = await query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {
         "cache_read": sum(int(r["cache_read_input_tokens"]) for r in rows),

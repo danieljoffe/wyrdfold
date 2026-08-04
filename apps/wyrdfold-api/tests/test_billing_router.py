@@ -27,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.dependencies import get_async_service_supabase, get_current_user_id, get_supabase
+from app.dependencies import get_async_service_supabase, get_current_user_id
 from app.main import app
 from app.routers import billing
 
@@ -65,10 +65,8 @@ def sb() -> MagicMock:
 
 
 def _client(sb: MagicMock) -> TestClient:
-    # ``get_billing_account`` reads plan/byok on the SYNC service client (the
-    # budget + keys_store holdouts) and the customer id on the ASYNC one; the
-    # remaining handlers are fully async. Override both to the same mock.
-    app.dependency_overrides[get_supabase] = lambda: sb
+    # Every billing route (incl. ``get_billing_account`` since #57 PR-G2c) now
+    # runs on the async service client — override it + the current-user dep.
     app.dependency_overrides[get_async_service_supabase] = lambda: sb
     app.dependency_overrides[get_current_user_id] = lambda: _UID
     return TestClient(app)
@@ -297,12 +295,14 @@ def test_billing_account_reports_plan_and_state(
     from app.services.keys import store as keys_store
     from app.services.llm import budget as budget_mod
 
+    # The handler now awaits the async twins (#57 PR-G2c) on the async service
+    # client — patch those, not the sync holdouts.
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, "starter"),
+        "get_llm_account_async",
+        AsyncMock(return_value=budget_mod.LlmAccount(None, True, "starter")),
     )
-    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: True)
+    monkeypatch.setattr(keys_store, "has_usable_key_async", AsyncMock(return_value=True))
     sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
         return_value=MagicMock(data=[{"stripe_customer_id": "cus_x"}])
     )
@@ -325,10 +325,10 @@ def test_billing_account_defaults_free_no_account(
 
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, None),
+        "get_llm_account_async",
+        AsyncMock(return_value=budget_mod.LlmAccount(None, True, None)),
     )
-    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: False)
+    monkeypatch.setattr(keys_store, "has_usable_key_async", AsyncMock(return_value=False))
 
     r = _client(sb).get("/billing/account")
 

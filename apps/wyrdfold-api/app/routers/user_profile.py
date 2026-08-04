@@ -19,7 +19,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.dependencies import (
@@ -27,7 +27,6 @@ from app.dependencies import (
     get_async_user_supabase,
     get_current_user_email,
     get_current_user_id,
-    get_supabase,
     verify_supabase_jwt,
 )
 from app.models.user_profile import (
@@ -453,11 +452,11 @@ async def get_llm_usage(
     # fan-out.
     user_supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
-    # Dual-client (the analysis.py pattern): the quota RESOLUTION needs the
-    # SYNC service client — it reads user_api_keys ("who pays"), which has no
-    # authenticated grant by design, so it stays service-role and runs via
-    # `asyncio.to_thread` (PR-G2 retires the sync service client, not this PR).
-    service_supabase: Client = Depends(get_supabase),
+    # The quota RESOLUTION reads user_api_keys ("who pays"), which has no
+    # authenticated grant by design, so it stays SERVICE-ROLE — now on the async
+    # service client via ``resolve_llm_quota_async`` (#57 PR-G2c), awaited natively
+    # instead of the old ``asyncio.to_thread`` offload of the sync client.
+    service_supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> LlmUsageResponse:
     """The user's allowance state across all budget windows.
 
@@ -472,10 +471,9 @@ async def get_llm_usage(
 
     now = datetime.now(UTC)
 
-    # Quota resolution reads user_api_keys ("who pays") on the sync service
-    # client (no authenticated grant by design); offloaded to a worker thread so
-    # its blocking round-trip never touches the loop.
-    quota = await asyncio.to_thread(budget.resolve_llm_quota, service_supabase, user_id=user_id)
+    # Quota resolution reads user_api_keys ("who pays") on the async service
+    # client (no authenticated grant by design), awaited natively on the loop.
+    quota = await budget.resolve_llm_quota_async(service_supabase, user_id=user_id)
     monthly_cap = quota.monthly_cap_usd
     month_since = now - timedelta(days=budget.MONTHLY_WINDOW_DAYS)
     day_since = now - timedelta(hours=24)
