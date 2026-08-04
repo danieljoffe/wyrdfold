@@ -923,8 +923,7 @@ def _score_row(
 # ---------------------------------------------------------------------------
 # Async DB seam (#57)
 #
-# ``score_and_upsert`` / ``score_title_and_upsert`` (and the surviving
-# ``mark_complete_poll`` twin) route their DB hop through
+# ``score_and_upsert`` / ``score_title_and_upsert`` route their DB hop through
 # ``app.services.db_write.poll_db_write`` — async-on-loop with a
 # sync-in-thread fallback when the async client is absent. These tests mirror
 # tests/test_db_write.py's recorder pattern — a chainable query-builder
@@ -1188,46 +1187,6 @@ async def test_score_and_upsert_flag_on_uses_async_client(
     assert payload["promising"] is False
     assert payload["phase1_confidence"] == 91
     assert async_client.op("upsert")[2] == {"on_conflict": "job_posting_id,target_id"}
-
-
-# ---- mark_complete_poll ------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_mark_complete_poll_flag_off_uses_sync_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.services.target_scoring import mark_complete_poll
-
-    lookups = _seam_sync_fallback(monkeypatch)
-    sync_client = _SyncSeamClient()
-
-    await mark_complete_poll(sync_client, "job-9")  # type: ignore[arg-type]
-
-    assert sync_client.executed == 1
-    assert lookups == [1]
-    assert ("table", "scores") in sync_client.ops
-    assert ("update", {"scoring_status": "complete"}) in sync_client.ops
-    assert ("eq", "job_posting_id", "job-9") in sync_client.ops
-
-
-@pytest.mark.asyncio
-async def test_mark_complete_poll_flag_on_uses_async_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.services.target_scoring import mark_complete_poll
-
-    async_client = _AsyncSeamClient()
-    _seam_flag_on(monkeypatch, async_client)
-    sync_client = _SyncSeamClient()
-
-    await mark_complete_poll(sync_client, "job-9")  # type: ignore[arg-type]
-
-    assert async_client.executed == 1
-    assert sync_client.executed == 0
-    assert ("table", "scores") in async_client.ops
-    assert ("update", {"scoring_status": "complete"}) in async_client.ops
-    assert ("eq", "job_posting_id", "job-9") in async_client.ops
 
 
 # ---- batch_update_global_scores_poll ----------------------------------------
