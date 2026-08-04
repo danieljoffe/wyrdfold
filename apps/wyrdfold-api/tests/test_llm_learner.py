@@ -182,16 +182,14 @@ class TestApplyPatchToProfile:
 
 
 class _Resp:
-    """Dual-mode fake response (#57 PR-G2e-2).
+    """Awaitable fake response (#57 PR-G2e-3).
 
-    ``run_llm_learner`` is async on the pooled service client, so its DB reads
-    ``await query.execute()`` — hence ``_Resp`` is awaitable (yields itself). But
-    the poller-shared re-score projection (``project_profile_impact``) is still
-    SYNC and runs in a worker thread via ``asyncio.to_thread``: there it calls
-    ``query.execute()`` and reads ``.data`` WITHOUT awaiting. Exposing ``.data``
-    directly (not behind a coroutine) serves both call styles from one fake, so
-    the apply-path tests keep exercising the real projection over empty scores
-    (→ ``None``) exactly as before."""
+    Every DB read in ``run_llm_learner`` and its now-async projection twin
+    ``project_profile_impact_async`` does ``await query.execute()``, so ``_Resp``
+    is awaitable (yields itself) and also exposes ``.data`` / ``.count`` directly
+    for the caller to read after the await. The apply-path tests leave the
+    projection real: it awaits over empty ``scores`` (→ ``None``) exactly as
+    before."""
 
     def __init__(self, data: Any) -> None:
         self.data = data
@@ -327,7 +325,6 @@ async def test_below_threshold_returns_none(fake: _FakeSupabase) -> None:
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
     assert result is None
     mock_complete.assert_not_called()
@@ -383,7 +380,6 @@ async def test_high_confidence_patch_auto_applies(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -451,7 +447,6 @@ async def test_auto_apply_version_conflict_stages_instead(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -492,7 +487,6 @@ async def test_auto_apply_refused_for_non_follower_writes_nothing(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is None
@@ -559,7 +553,6 @@ async def test_high_confidence_outlier_patch_is_staged_by_learning_rate_cap(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -619,7 +612,6 @@ async def test_low_confidence_patch_stages_without_mutating_target(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -673,7 +665,6 @@ async def test_empty_patch_consumes_feedback_without_mutating_profile(
             object(),
             user_id="u",
             target_id="t",
-            sync_supabase=fake,  # type: ignore[arg-type]
         )
 
     assert result is not None

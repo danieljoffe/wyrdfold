@@ -23,7 +23,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.experience import OptimizedPayload
@@ -31,22 +31,22 @@ from app.models.targets import JobTarget
 from app.services.db_write import poll_db_write
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
-from app.services.llm.cost_log import record as record_llm_cost
+from app.services.llm.cost_log import record_async as record_llm_cost_async
 
 logger = logging.getLogger(__name__)
 
 
 async def _apply_scores_update(
-    supabase: Client,
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     target_id: str,
     payload: dict[str, Any],
 ) -> None:
     """Persist a ``scores`` UPDATE for one (job, target) via the poll-write
-    seam (#57): async on the event loop when ``POLLER_ASYNC_DB`` is on, else
-    the sync client in a thread — with transient-blip retry and cycle-wide
-    herd bounding either way. See ``app.services.db_write.poll_db_write``."""
+    seam (#57): awaited on the pooled ``AsyncClient`` (the poll cycle is
+    unconditionally async now), with transient-blip retry and cycle-wide herd
+    bounding. See ``app.services.db_write.poll_db_write``."""
     await poll_db_write(
         supabase,
         lambda c: (
@@ -60,7 +60,7 @@ async def _apply_scores_update(
 
 
 async def score_with_phase2_and_persist(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     payload: OptimizedPayload,
@@ -131,9 +131,12 @@ async def score_with_phase2_and_persist(
         return None
 
     # Log cost BEFORE the DB update so quota counting stays accurate
-    # even if the persistence step fails (we did spend the tokens).
+    # even if the persistence step fails (we did spend the tokens). Awaited on
+    # the pooled async client (#57 PR-G2e-3) — the interactive cost write lands
+    # on the loop rather than a threadpool worker, same immediate-INSERT
+    # semantics as the sync ``record`` so ``phase2_quota_remaining`` sees it.
     try:
-        record_llm_cost(
+        await record_llm_cost_async(
             supabase,
             user_id=user_id,
             purpose=JOB_FIT_PURPOSE,

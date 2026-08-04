@@ -15,7 +15,6 @@ is cacheable so repeated runs on the same target only pay variable-tokens.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -23,7 +22,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.models.feedback import FeedbackRow
 from app.models.learning import (
@@ -41,9 +40,11 @@ from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrust
 from app.services.targets.crud import REF_JDS_TABLE, _parse_ref_jd
 
 # Imported under the historical private name so existing test patch points
-# (``app.services.llm_learner._project_patch_impact``) keep working.
+# (``app.services.llm_learner._project_patch_impact``) keep working — now the
+# async twin (#57 PR-G2e-3), awaited directly rather than threaded on a sync
+# client.
 from app.services.targets.learning_projection import (
-    project_profile_impact as _project_patch_impact,
+    project_profile_impact_async as _project_patch_impact,
 )
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
@@ -322,7 +323,6 @@ async def run_llm_learner(
     *,
     user_id: str,
     target_id: str,
-    sync_supabase: Client,
 ) -> LearningRunResult | None:
     """Run one LLM learn pass for (user, target).
 
@@ -332,11 +332,11 @@ async def run_llm_learner(
     response is treated as a no-op apply: feedback rows are stamped
     consumed so we don't keep re-asking the LLM about the same noise.
 
-    Async on the pooled service client (#57 PR-G2e-2): the DB reads/writes are
-    awaited and the shared-profile write goes through the #191 patch RPC's async
-    twin. ``sync_supabase`` is a sync service client used ONLY to drive the
-    poller-shared re-score projection (``_project_patch_impact``) off the loop
-    via ``asyncio.to_thread`` — it has no async twin (poller-owned, out of scope).
+    Fully async on the pooled service client (#57 PR-G2e-3): the DB reads/writes
+    are awaited, the shared-profile write goes through the #191 patch RPC's async
+    twin, and the re-score projection (``_project_patch_impact``) is now the async
+    twin ``project_profile_impact_async`` — its DB reads awaited, its deterministic
+    re-score off-loaded to a thread internally (#107).
     """
     feedback = await _fetch_unapplied_feedback(supabase, user_id, target_id)
     if len(feedback) < _MIN_FEEDBACK_FOR_LEARN:
@@ -433,12 +433,12 @@ async def run_llm_learner(
 
     # High confidence — but before auto-applying, project the patch over the
     # target's recent scored jobs and stage it instead if it would churn an
-    # outlier share of the list (the learning-rate cap, #5 P4). Off-loaded to
-    # a thread: it fetches + deterministically re-scores up to N jobs.
-    # (``search_keywords`` was resolved above for the negative-collision guard.)
-    projection = await asyncio.to_thread(
-        _project_patch_impact,
-        sync_supabase,
+    # outlier share of the list (the learning-rate cap, #5 P4). The async twin
+    # awaits its reads and off-loads the deterministic re-score of up to N jobs to
+    # a thread internally (#107). (``search_keywords`` was resolved above for the
+    # negative-collision guard.)
+    projection = await _project_patch_impact(
+        supabase,
         target_id,
         prev_profile,
         next_profile,
@@ -842,34 +842,29 @@ async def reject_staged_patch(
 
 # ---- Async router drivers (#57 PR-G2d-a → PR-G2e-2) -----------------------
 # The LLM-learner router handlers are ``async def`` on the pooled async service
-# client, and since PR-G2e-2 this whole chain runs async on it too (via the #191
-# profile-write RPCs' async twins). The ONLY sync dependency left is the
-# poller-shared re-score projection (``_project_patch_impact``): it has no async
-# twin (poller-owned, out of scope), so it runs off the loop via
-# ``asyncio.to_thread`` on a sync service client passed to :func:`run_llm_learner`
-# as ``sync_supabase`` — the same two-client seam jobs.py/targets.py use for the
-# poller-owned scorers. These seams acquire the client(s) in the service layer so
-# the router body never holds one.
+# client, and since PR-G2e-3 this whole chain runs async on it end-to-end: the
+# #191 profile-write RPCs and the poller-shared re-score projection both gained
+# async twins (``project_profile_impact_async``), so no sync service client is
+# threaded anymore. This seam acquires the client in the service layer so the
+# router body never holds one.
 
 
 async def run_llm_learner_off_loop(
     llm: LLMClient, *, user_id: str, target_id: str
 ) -> LearningRunResult | None:
     """Router driver for ``POST /targets/{id}/learn-llm`` (#57 PR-G2d-a →
-    PR-G2e-2).
+    PR-G2e-3).
 
-    :func:`run_llm_learner` is async on the pooled async service client; it also
-    takes a sync service client (``sync_supabase``) used only to drive the
-    poller-shared re-score projection off the loop (no async twin — poller-owned,
-    out of scope). The lone sync service client acquired here is that client."""
-    from app.dependencies import get_async_service_supabase, get_supabase
+    :func:`run_llm_learner` is fully async on the pooled async service client —
+    the re-score projection gained an async twin in PR-G2e-3, so no sync service
+    client is threaded here anymore."""
+    from app.dependencies import get_async_service_supabase
 
     return await run_llm_learner(
         get_async_service_supabase(),
         llm,
         user_id=user_id,
         target_id=target_id,
-        sync_supabase=get_supabase(),
     )
 
 

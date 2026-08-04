@@ -23,11 +23,12 @@ import ast
 import asyncio
 import hashlib
 import logging
+from collections.abc import Callable
 from typing import Any, Literal, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
-from app.models.embeddings import EmbeddingModelId
+from app.models.embeddings import EmbeddingModelId, EmbeddingResult
 from app.services.embeddings.client import EmbeddingsClient
 from app.services.llm import cost_log
 from app.services.qualification.heuristics import clean_description
@@ -35,6 +36,43 @@ from app.services.qualification.heuristics import clean_description
 logger = logging.getLogger(__name__)
 
 TABLE = "job_embeddings"
+
+
+async def _run_embed_query(supabase: Client | AsyncClient, build: Callable[..., Any]) -> Any:
+    """Execute a built ``job_embeddings`` query on either client type.
+
+    Awaited natively on the pooled ``AsyncClient`` (the poller's lazy grade-time
+    ``ensure_job_vectors`` path, #57 PR-G2e-3) or run in a thread on a sync
+    ``Client`` (the ``backfill_job_embeddings`` operational script). The sync and
+    async postgrest builders share the same chainable API, so one ``build(client)``
+    closure serves both — mirrors ``app.services.db_write.poll_db_write``. The
+    embedding *provider* calls stay off this seam (they're HTTP, not DB)."""
+    query = build(supabase)
+    if isinstance(supabase, AsyncClient):
+        return await query.execute()
+    return await asyncio.to_thread(query.execute)
+
+
+async def _record_embedding_cost(
+    supabase: Client | AsyncClient,
+    *,
+    purpose: str,
+    result: EmbeddingResult,
+    metadata: dict[str, str | int | float | bool],
+) -> None:
+    """Write the embedding cost row on either client type — system-driven spend,
+    so the instance key (``user_id=None``). Async twin on the ``AsyncClient``; the
+    sync writer in a thread on a sync ``Client`` (mirrors :func:`_run_embed_query`)."""
+    if isinstance(supabase, AsyncClient):
+        await cost_log.record_embedding_async(
+            supabase, user_id=None, purpose=purpose, result=result, metadata=metadata
+        )
+    else:
+        await asyncio.to_thread(
+            lambda: cost_log.record_embedding(
+                supabase, user_id=None, purpose=purpose, result=result, metadata=metadata
+            )
+        )
 
 # Cost-log grouping label — sliceable alongside "qualification.tagger",
 # "experience.chunks", etc. on the spend dashboard.
@@ -88,17 +126,17 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-async def _existing_hash(supabase: Client, *, job_id: str, model: str) -> str | None:
+async def _existing_hash(supabase: Client | AsyncClient, *, job_id: str, model: str) -> str | None:
     """Return the stored content_hash for (job, model), or None if no row."""
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(TABLE)
+    resp = await _run_embed_query(
+        supabase,
+        lambda c: (
+            c.table(TABLE)
             .select("content_hash")
             .eq("job_posting_id", job_id)
             .eq("model", model)
             .limit(1)
-            .execute()
-        )
+        ),
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -107,7 +145,7 @@ async def _existing_hash(supabase: Client, *, job_id: str, model: str) -> str | 
 
 
 async def upsert_job_embedding(
-    supabase: Client,
+    supabase: Client | AsyncClient,
     embeddings_client: EmbeddingsClient,
     *,
     job_id: str,
@@ -149,9 +187,8 @@ async def upsert_job_embedding(
 
         # System-driven spend → instance key (user_id=None), like the rest of
         # the poller's target-INDEPENDENT work.
-        cost_log.record_embedding(
+        await _record_embedding_cost(
             supabase,
-            user_id=None,
             purpose=JOB_EMBED_PURPOSE,
             result=result,
             metadata={"job_posting_id": job_id, "model": model},
@@ -163,8 +200,8 @@ async def upsert_job_embedding(
             "content_hash": new_hash,
             "embedding": result.embeddings[0],
         }
-        await asyncio.to_thread(
-            lambda: supabase.table(TABLE).upsert(row, on_conflict="job_posting_id,model").execute()
+        await _run_embed_query(
+            supabase, lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,model")
         )
         return "embedded"
     except Exception:
@@ -214,7 +251,7 @@ _ENSURE_FETCH_CHUNK = 100
 
 
 async def ensure_job_vectors(
-    supabase: Client,
+    supabase: Client | AsyncClient,
     embeddings_client: EmbeddingsClient,
     jobs: list[dict[str, Any]],
     *,
@@ -237,18 +274,19 @@ async def ensure_job_vectors(
     wanted = [j for j in jobs if j.get("id")]
     if not wanted:
         return out
-    def _read_chunk(ids_chunk: list[str]) -> Any:
-        return (
-            supabase.table(TABLE)
-            .select("job_posting_id, embedding")
-            .eq("model", model)
-            .in_("job_posting_id", ids_chunk)
-            .execute()
-        )
 
     async def _collect(ids_to_fetch: list[str]) -> None:
         for i in range(0, len(ids_to_fetch), _ENSURE_FETCH_CHUNK):
-            resp = await asyncio.to_thread(_read_chunk, ids_to_fetch[i : i + _ENSURE_FETCH_CHUNK])
+            chunk = ids_to_fetch[i : i + _ENSURE_FETCH_CHUNK]
+            resp = await _run_embed_query(
+                supabase,
+                lambda c, ids=chunk: (
+                    c.table(TABLE)
+                    .select("job_posting_id, embedding")
+                    .eq("model", model)
+                    .in_("job_posting_id", ids)
+                ),
+            )
             for row in cast(list[dict[str, Any]], resp.data or []):
                 vec = _parse_vector(row.get("embedding"))
                 if vec is not None:
@@ -267,7 +305,7 @@ async def ensure_job_vectors(
 
 
 async def embed_jobs_batch(
-    supabase: Client,
+    supabase: Client | AsyncClient,
     embeddings_client: EmbeddingsClient,
     rows: list[dict[str, Any]],
     *,
@@ -316,9 +354,8 @@ async def embed_jobs_batch(
                 input_type="document",
                 output_dimension=EMBED_DIMENSIONS,
             )
-            cost_log.record_embedding(
+            await _record_embedding_cost(
                 supabase,
-                user_id=None,
                 purpose=JOB_EMBED_PURPOSE,
                 result=result,
                 metadata={"batched": len(texts), "model": model},
@@ -333,13 +370,15 @@ async def embed_jobs_batch(
                 for (row, text), vec in zip(texts, result.embeddings, strict=True)
             ]
 
-            def _write(c: list[dict[str, Any]]) -> Any:
-                return supabase.table(TABLE).upsert(c, on_conflict="job_posting_id,model").execute()
-
             for w in range(0, len(to_write), _BATCH_WRITE_CHUNK):
                 chunk = to_write[w : w + _BATCH_WRITE_CHUNK]
                 try:
-                    await asyncio.to_thread(_write, chunk)
+                    await _run_embed_query(
+                        supabase,
+                        lambda c, rows=chunk: c.table(TABLE).upsert(
+                            rows, on_conflict="job_posting_id,model"
+                        ),
+                    )
                     counts["embedded"] += len(chunk)
                     consecutive_write_failures = 0
                 except Exception:

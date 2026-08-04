@@ -362,3 +362,102 @@ class TestMaybeRunLearner:
         assert result is None
         # No job_feedback update means the signals stay pending for a retry.
         assert not [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"]
+
+
+# ---------------------------------------------------------------------------
+# run_learner_and_rescore (#57 PR-G2e-3): the post-feedback chain now runs the
+# follow-on re-score on the async twin — no sync client, no thread hop. Prove it
+# re-reads the (version-bumped) target async and re-scores via the async twin.
+# ---------------------------------------------------------------------------
+
+
+class _RescoreResp:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+
+class _RescoreQuery:
+    def select(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    def eq(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    def limit(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    async def execute(self) -> _RescoreResp:
+        return _RescoreResp(
+            [
+                {
+                    "id": "t-1",
+                    "label": "Senior FE",
+                    "app_active": True,
+                    "scoring_profile": {},
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            ]
+        )
+
+
+class _RescoreSupabase:
+    def table(self, _name: str) -> _RescoreQuery:
+        return _RescoreQuery()
+
+
+@pytest.mark.asyncio
+async def test_run_learner_and_rescore_rerescores_on_applied_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Learner applied a patch → re-read the target async + re-score via the
+    async twin (``bulk_score_for_target_async``) on the same client."""
+    from app.models.feedback import LearnerPatchSummary
+    from app.services.feedback import run_learner_and_rescore
+
+    async def _fake_learner(_sb: Any, *, user_id: str, target_id: str) -> LearnerPatchSummary:
+        return LearnerPatchSummary(
+            target_id=target_id,
+            applied_run_id="run-1",
+            added_negative_keywords=["sales"],
+            signals_consumed=3,
+            profile_version_after=2,
+        )
+
+    monkeypatch.setattr("app.services.feedback.maybe_run_learner", _fake_learner)
+
+    rescored: list[str] = []
+
+    async def _fake_bulk(_sb: Any, target: Any) -> int:
+        rescored.append(target.id)
+        return 7
+
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target_async", _fake_bulk)
+
+    await run_learner_and_rescore(_RescoreSupabase(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
+
+    assert rescored == ["t-1"]  # parsed the re-read target and re-scored it
+
+
+@pytest.mark.asyncio
+async def test_run_learner_and_rescore_noop_when_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No patch applied → no target re-read, no re-score."""
+    from app.services.feedback import run_learner_and_rescore
+
+    async def _no_patch(_sb: Any, *, user_id: str, target_id: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.feedback.maybe_run_learner", _no_patch)
+
+    called: list[Any] = []
+
+    async def _fake_bulk(_sb: Any, target: Any) -> int:
+        called.append(target)
+        return 0
+
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target_async", _fake_bulk)
+
+    await run_learner_and_rescore(object(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
+    assert called == []

@@ -388,6 +388,57 @@ async def score_and_upsert_async(
 _RESCORE_BATCH_SIZE = 500
 
 
+def _rescore_page_rows(
+    jobs: list[dict[str, Any]],
+    target: JobTarget,
+    existing_promising_by_job: dict[str, bool | None],
+) -> list[dict[str, Any]]:
+    """Deterministically re-score one page of ``jobs`` for ``target`` and build
+    the ``scores`` upsert rows.
+
+    The shared pure compute of :func:`bulk_score_for_target` and its async twin
+    :func:`bulk_score_for_target_async`, so the scoring math + the promising /
+    prefilter-exclusion carry-over can never drift between the two. No IO — the
+    caller owns the read/write round-trips (and the async twin off-loads this to
+    a thread, #107)."""
+    rows_to_upsert: list[dict[str, Any]] = []
+    now = datetime.now(UTC).isoformat()
+    for job in jobs:
+        description_html = job.get("description_html") or ""
+        parsed = parse_jd(description_html)
+        result = score_job_with_profile(
+            job["title"],
+            description_html,
+            target.scoring_profile,
+            parsed_jd=parsed,
+            search_keywords=target.search_keywords,
+        )
+        existing_promising = existing_promising_by_job.get(job["id"])
+        excluded_by_prefilter = existing_promising is False
+        row: dict[str, Any] = {
+            "job_posting_id": job["id"],
+            "target_id": target.id,
+            "score": result.score,
+            "score_breakdown": result.breakdown.model_dump(),
+            "matched_keywords": result.matched_keywords,
+            "excluded": result.excluded or excluded_by_prefilter,
+            "scoring_status": "stage2",
+            "scored_profile_version": target.profile_version,
+            # Reset recency_score to the new raw score; the next poll
+            # cycle's refresh pass re-applies age decay (see
+            # ``_upsert_score`` and ``app/services/recency.py``).
+            "recency_score": result.score,
+            "updated_at": now,
+        }
+        # Pass-through ``promising`` only when it's set on the
+        # existing row; ``None`` leaves the column unchanged on
+        # this upsert (preserving the legacy/null state).
+        if existing_promising is not None:
+            row["promising"] = existing_promising
+        rows_to_upsert.append(row)
+    return rows_to_upsert
+
+
 def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
     """Re-score stale jobs for this target. Returns count scored.
 
@@ -473,48 +524,104 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
             # They aren't scorable, so stop.
             break
 
-        rows_to_upsert: list[dict[str, Any]] = []
-        now = datetime.now(UTC).isoformat()
-        for job in jobs:
-            description_html = job.get("description_html") or ""
-            parsed = parse_jd(description_html)
-            result = score_job_with_profile(
-                job["title"],
-                description_html,
-                target.scoring_profile,
-                parsed_jd=parsed,
-                search_keywords=target.search_keywords,
-            )
-            existing_promising = existing_promising_by_job.get(job["id"])
-            excluded_by_prefilter = existing_promising is False
-            row: dict[str, Any] = {
-                "job_posting_id": job["id"],
-                "target_id": target.id,
-                "score": result.score,
-                "score_breakdown": result.breakdown.model_dump(),
-                "matched_keywords": result.matched_keywords,
-                "excluded": result.excluded or excluded_by_prefilter,
-                "scoring_status": "stage2",
-                "scored_profile_version": target.profile_version,
-                # Reset recency_score to the new raw score; the next poll
-                # cycle's refresh pass re-applies age decay (see
-                # ``_upsert_score`` and ``app/services/recency.py``).
-                "recency_score": result.score,
-                "updated_at": now,
-            }
-            # Pass-through ``promising`` only when it's set on the
-            # existing row; ``None`` leaves the column unchanged on
-            # this upsert (preserving the legacy/null state).
-            if existing_promising is not None:
-                row["promising"] = existing_promising
-            rows_to_upsert.append(row)
-
+        rows_to_upsert = _rescore_page_rows(jobs, target, existing_promising_by_job)
         if not rows_to_upsert:
             break
 
         supabase.table(TABLE).upsert(
             rows_to_upsert, on_conflict="job_posting_id,target_id"
         ).execute()
+        total_scored += len(rows_to_upsert)
+
+    return total_scored
+
+
+async def _is_pipeline_active_async(supabase: AsyncClient, target_id: str) -> bool:
+    """Async inline of ``crud.is_pipeline_active`` (#57 PR-G2e-3 — crud stays
+    sync for its non-poll callers). Same two-arm rule: the ``app_active``
+    instance floor OR any active membership, awaited on the loop."""
+    t_resp = await (
+        supabase.table("targets").select("app_active").eq("id", target_id).limit(1).execute()
+    )
+    t_rows = cast(list[dict[str, Any]], t_resp.data or [])
+    if not t_rows:
+        return False
+    if bool(t_rows[0].get("app_active")):
+        return True
+    m_resp = await (
+        supabase.table("user_targets")
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("target_id", target_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return bool(m_resp.count or 0)
+
+
+async def bulk_score_for_target_async(supabase: AsyncClient, target: JobTarget) -> int:
+    """Async twin of :func:`bulk_score_for_target` (#57 PR-G2e-3).
+
+    For the interactive feedback learner's re-score on the pooled async service
+    client — the sync version stays for the operator ``/rescore`` handler and the
+    CLI/backfill paths. Identical streaming re-score contract (see
+    :func:`bulk_score_for_target` for why each iteration re-reads the first page)
+    and identical scoring math (both build rows via :func:`_rescore_page_rows`);
+    the ``scores`` / ``jobs`` reads and the upsert are awaited on the loop, and
+    the heavy per-page keyword compute is off-loaded to a thread (#107) rather
+    than run inline."""
+    if not await _is_pipeline_active_async(supabase, target.id):
+        logger.info(
+            "bulk_score_for_target_async: skipping non-pipeline-active target %s (%s)",
+            target.id,
+            target.label,
+        )
+        return 0
+
+    batch_size = _RESCORE_BATCH_SIZE
+    total_scored = 0
+    while True:
+        resp = await (
+            supabase.table(TABLE)
+            .select("job_posting_id, promising")
+            .eq("target_id", target.id)
+            .lt("scored_profile_version", target.profile_version)
+            .range(0, batch_size - 1)
+            .execute()
+        )
+        stale_rows = cast(list[dict[str, Any]], resp.data or [])
+        if not stale_rows:
+            break
+
+        existing_promising_by_job: dict[str, bool | None] = {
+            r["job_posting_id"]: r.get("promising") for r in stale_rows
+        }
+        batch_ids = list(existing_promising_by_job.keys())
+
+        # Chunk the id filter (414-guard) — same bound the sync path uses.
+        jobs: list[dict[str, Any]] = []
+        for i in range(0, len(batch_ids), _BATCH_CHUNK_SIZE):
+            resp = await (
+                supabase.table("jobs")
+                .select("id, title, description_html")
+                .in_("id", batch_ids[i : i + _BATCH_CHUNK_SIZE])
+                .execute()
+            )
+            jobs.extend(cast(list[dict[str, Any]], resp.data or []))
+        if not jobs:
+            break
+
+        # Heavy per-page keyword scoring stays off the event loop (#107).
+        rows_to_upsert = await asyncio.to_thread(
+            _rescore_page_rows, jobs, target, existing_promising_by_job
+        )
+        if not rows_to_upsert:
+            break
+
+        await (
+            supabase.table(TABLE)
+            .upsert(rows_to_upsert, on_conflict="job_posting_id,target_id")
+            .execute()
+        )
         total_scored += len(rows_to_upsert)
 
     return total_scored
