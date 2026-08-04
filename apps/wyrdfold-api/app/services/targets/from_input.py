@@ -27,14 +27,13 @@ poller/learner — see the ``_link`` etc. helpers below), the cost ledger via
 same async pool, so they are spawned as DETACHED loop tasks
 (``spawn_detached``) rather than starlette ``BackgroundTasks`` — the latter
 deadlocks the pooled async client under uvloop (see ``app/background.py``).
-The derive → contribute → fit → materialize chain now rides the async service
-client end to end (#57 PR-G2e-4: ``derive_profile_from_jd`` async cache path,
-async ``materialize_and_score_job``, the ``_upsert_user_job_async`` inline). Two
-deep services stay on a locally-obtained SYNC ``get_supabase()`` client, offloaded
-with ``asyncio.to_thread`` — they belong to out-of-slice verticals:
-``resolve_current_payload`` (experience/prose: ``prose.get_latest`` +
-``optimized.get_latest``) in ``_apply_fit_score``, and ``register_source_from_url``
-(source registration) in ``from_url``.
+The derive → contribute → fit → materialize chain rides the async service client
+end to end (#57 PR-G2e-4: ``derive_profile_from_jd`` async cache path, async
+``materialize_and_score_job``, the ``_upsert_user_job_async`` inline). #57 PR-G2e-5
+closed the last two deep services: ``resolve_current_payload`` (experience/prose:
+``prose.get_latest`` + ``optimized.get_latest``) in ``_apply_fit_score`` and
+``register_source_from_url`` (source registration) in ``from_url`` are async now,
+so this module holds no locally-obtained SYNC service client at all.
 """
 
 from __future__ import annotations
@@ -47,11 +46,10 @@ from typing import Any, cast
 
 import pydantic
 from fastapi import HTTPException
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.background import spawn_detached
 from app.config import settings
-from app.dependencies import get_supabase
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult
 from app.models.targets import (
@@ -320,12 +318,11 @@ async def _apply_fit_score(
     the stale-payload seam). ``payload`` (captured inline) is kept only as a
     fallback for the rare case the live resolve yields nothing.
     """
-    # ``resolve_current_payload`` is not-yet-async and threads a SYNC service
-    # client for its cost ledger; obtain one locally (jobs.py materialize
-    # pattern). The fit-score link + cost write ride the async client.
-    svc = get_supabase()
+    # ``resolve_current_payload`` now rides the pooled async service client
+    # (#57 PR-G2e-5), so it takes ``supabase`` directly — the fit-score link + cost
+    # write already ride it too.
     fresh, prose_doc_id = await resolve_current_payload(
-        svc, llm, cost_supabase=svc, user_id=user_id
+        supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     payload = fresh if fresh is not None else payload
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
@@ -773,7 +770,6 @@ async def from_suggestion(
 
 def _schedule_url_bg_tasks(
     supabase: AsyncClient,
-    svc: Client,
     llm: LLMClient,
     *,
     user_id: str,
@@ -792,7 +788,7 @@ def _schedule_url_bg_tasks(
        fit score, and job materialization (async client).
     2. ``register_source_from_url`` — register the company's board as a pollable
        source (best-effort, capped) so we pull MORE jobs from it going forward.
-       Not-yet-async and takes the SYNC service client ``svc``.
+       Now async (#57 PR-G2e-5), so it rides the same pooled ``supabase`` client.
 
     Both are spawned DETACHED (never starlette ``BackgroundTasks`` — the derive
     task fans out on the pooled async client, which deadlocks under uvloop
@@ -817,7 +813,7 @@ def _schedule_url_bg_tasks(
         name=f"derive-url-{target_id}",
     )
     spawn_detached(
-        register_source_from_url(svc, user_id=user_id, final_url=final_url),
+        register_source_from_url(supabase, user_id=user_id, final_url=final_url),
         name=f"register-source-{target_id}",
     )
 
@@ -844,16 +840,12 @@ async def from_url(
     + fit score + job materialization are all deferred to a detached task.
     """
     label = ((extracted_title or "").strip() or "Untitled Target")[:200]
-    # SYNC service client for the not-yet-async ``register_source_from_url`` half
-    # of the deferred fan-out (see ``_schedule_url_bg_tasks``).
-    svc = get_supabase()
 
     matched = await find_matching_target(supabase, label)
     if matched is not None:
         link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
         _schedule_url_bg_tasks(
             supabase,
-            svc,
             llm,
             user_id=user_id,
             target_id=matched.id,
@@ -874,7 +866,6 @@ async def from_url(
     link = await _link(supabase, user_id=user_id, target_id=target.id, is_active=False)
     _schedule_url_bg_tasks(
         supabase,
-        svc,
         llm,
         user_id=user_id,
         target_id=target.id,
