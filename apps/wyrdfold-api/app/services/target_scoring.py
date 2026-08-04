@@ -774,36 +774,3 @@ async def get_target_scores(
     return {
         r["job_posting_id"]: _parse_score(r) for r in cast(list[dict[str, Any]], resp.data or [])
     }
-
-
-# ---- Global score aggregation ----------------------------------------------
-
-# A row is a real (LLM) fit grade only once its scoring_status is "complete";
-# stage1/stage2 rows carry a cheap keyword *placeholder* on a different scale.
-# Mirrors the read-side split in routers/jobs.py (`_is_pending`).
-def mark_complete(supabase: Client, job_posting_id: str) -> None:
-    """Mark all target scores for a job as scoring_status='complete'.
-
-    Called after stage 3 (LLM scoring) finishes for a job.
-    """
-    supabase.table(TABLE).update({"scoring_status": "complete"}).eq(
-        "job_posting_id", job_posting_id
-    ).execute()
-
-
-async def mark_complete_poll(supabase: Client, job_posting_id: str) -> None:
-    """The poller's seam twin of :func:`mark_complete` (#57 slice 2): the
-    same stable-WHERE UPDATE, routed through
-    :func:`app.services.db_write.poll_db_write` — see that docstring for
-    backend selection. Slice 4 (#57) collapses the pair once the sync
-    callers migrate.
-    """
-    await poll_db_write(
-        supabase,
-        lambda c: (
-            c.table(TABLE)
-            .update({"scoring_status": "complete"})
-            .eq("job_posting_id", job_posting_id)
-        ),
-        label="scores mark-complete",
-    )
