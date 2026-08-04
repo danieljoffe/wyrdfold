@@ -70,12 +70,12 @@ async def test_success_updates_scores_row_with_full_phase2_payload(
 
     cost_calls: list[dict[str, object]] = []
 
-    def fake_cost(supabase, *, user_id, purpose, result, metadata=None) -> object:
+    async def fake_cost(supabase, *, user_id, purpose, result, metadata=None) -> object:
         cost_calls.append({"purpose": purpose, "metadata": metadata, "user_id": user_id})
         return MagicMock()
 
     monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
-    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost", fake_cost)
+    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost_async", fake_cost)
 
     result = await score_with_phase2_and_persist(
         supabase,
@@ -130,13 +130,13 @@ async def test_empty_jd_drops_job_without_grading(
 
     cost_calls = 0
 
-    def fake_cost(*args: object, **kwargs: object) -> object:
+    async def fake_cost(*args: object, **kwargs: object) -> object:
         nonlocal cost_calls
         cost_calls += 1
         return MagicMock()
 
     monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
-    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost", fake_cost)
+    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost_async", fake_cost)
 
     result = await score_with_phase2_and_persist(
         supabase,
@@ -172,10 +172,15 @@ async def test_llm_failure_returns_none_and_skips_db_and_cost(
         raise RuntimeError("anthropic-503")
 
     cost_calls: list[object] = []
+
+    async def _rec(*a: object, **k: object) -> object:
+        cost_calls.append(1)
+        return MagicMock()
+
     monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", boom)
     monkeypatch.setattr(
-        "app.services.fit.score_persistence.record_llm_cost",
-        lambda *a, **k: cost_calls.append(1),
+        "app.services.fit.score_persistence.record_llm_cost_async",
+        _rec,
     )
 
     result = await score_with_phase2_and_persist(
@@ -211,10 +216,15 @@ async def test_persist_failure_still_records_cost(
         return (_fake_fit(), MagicMock())
 
     cost_calls: list[int] = []
+
+    async def _rec(*a: object, **k: object) -> object:
+        cost_calls.append(1)
+        return MagicMock()
+
     monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
     monkeypatch.setattr(
-        "app.services.fit.score_persistence.record_llm_cost",
-        lambda *a, **k: cost_calls.append(1),
+        "app.services.fit.score_persistence.record_llm_cost_async",
+        _rec,
     )
 
     result = await score_with_phase2_and_persist(
@@ -283,8 +293,11 @@ async def test_persist_routes_scores_update_through_seam(
     async def fake_derive(*a: object, **k: object) -> object:
         return (_fake_fit(), MagicMock())
 
+    async def _rec_ok(*a: object, **k: object) -> object:
+        return MagicMock()
+
     monkeypatch.setattr(f"{_SP}.derive_job_fit", fake_derive)
-    monkeypatch.setattr(f"{_SP}.record_llm_cost", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(f"{_SP}.record_llm_cost_async", _rec_ok)
     captured = _spy_seam(monkeypatch)
 
     target = _target()

@@ -654,10 +654,11 @@ def _async_service_client() -> AsyncClient:
     ``cast`` covers the unconfigured/test path, where every caller's collaborator
     is stubbed and the client is never dereferenced.
 
-    NOTE: ``run_phase2_for_jobs`` and the lifecycle/archival sweeps are NOT fed by
-    this — their transitive DB (the embeddings vector reads / the sweeps' own
-    ``to_thread`` queries) is still sync-client-only, so they keep taking
-    ``get_supabase_pool()`` until those subsystems migrate (later #57 chunks).
+    NOTE: ``run_phase2_for_jobs`` now takes this async client too (#57 PR-G2e-3 —
+    its scoring/embeddings vertical, incl. the Phase-2 grader, quota counter, and
+    the lazy vector reads/writes, migrated). The lifecycle/archival sweeps are
+    still NOT fed by this — their ``to_thread`` queries stay sync-client-only, so
+    they keep taking ``get_supabase_pool()`` until those subsystems migrate.
     """
     return cast(AsyncClient, get_async_supabase())
 
@@ -1352,7 +1353,7 @@ async def _backfill_grade_stale(supabase: PollClient, limit: int) -> None:
         )
         try:
             await run_phase2_for_jobs(
-                cast(Client, get_supabase_pool()),
+                _async_service_client(),
                 llm,
                 target=target,
                 payload=user_optimized[uid].payload,
@@ -2024,7 +2025,7 @@ async def _poll_one_source(
                         continue
                     try:
                         await run_phase2_for_jobs(
-                            cast(Client, get_supabase_pool()),
+                            _async_service_client(),
                             llm,
                             target=p2_target,
                             payload=user_optimized[uid].payload,
@@ -3114,7 +3115,7 @@ async def _poll_one_source_for_target(
                     for uid in primary_by_user:
                         try:
                             await run_phase2_for_jobs(
-                                cast(Client, get_supabase_pool()),
+                                _async_service_client(),
                                 llm,
                                 target=target,
                                 payload=user_optimized[uid].payload,

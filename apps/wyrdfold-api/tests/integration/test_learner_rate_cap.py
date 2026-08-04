@@ -169,9 +169,6 @@ async def test_outlier_patch_is_staged_not_applied(
             object(),
             user_id=uid,
             target_id=target_id,
-            # The re-score projection is poller-shared + sync, driven off the loop
-            # on the sync service client (#57 PR-G2e-2) — exercised for real here.
-            sync_supabase=service_client,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -214,9 +211,6 @@ async def test_self_colliding_negative_is_dropped_before_apply(
             object(),
             user_id=uid,
             target_id=target_id,
-            # The re-score projection is poller-shared + sync, driven off the loop
-            # on the sync service client (#57 PR-G2e-2) — exercised for real here.
-            sync_supabase=service_client,  # type: ignore[arg-type]
         )
 
     assert result is not None
@@ -252,9 +246,6 @@ async def test_irrelevant_patch_auto_applies(
             object(),
             user_id=uid,
             target_id=target_id,
-            # The re-score projection is poller-shared + sync, driven off the loop
-            # on the sync service client (#57 PR-G2e-2) — exercised for real here.
-            sync_supabase=service_client,  # type: ignore[arg-type]
         )
 
     assert result is not None

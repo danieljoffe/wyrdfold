@@ -23,6 +23,7 @@ from app.models.targets import (
 )
 from app.services.target_scoring import (
     bulk_score_for_target,
+    bulk_score_for_target_async,
     bulk_title_score_for_target,
     get_target_scores,
     score_and_upsert,
@@ -477,6 +478,140 @@ def test_bulk_score_for_target_skips_inactive_target(monkeypatch: pytest.MonkeyP
     assert count == 0
     # And critically: zero DB traffic — no select, no upsert.
     supabase.table.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# bulk_score_for_target_async (#57 PR-G2e-3) — the async twin. Same streaming
+# re-score contract + shared ``_rescore_page_rows`` scoring math as the sync
+# version, on the pooled async service client (the feedback-learner path).
+# ---------------------------------------------------------------------------
+
+
+class _AsyncBulkResp:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+        self.count = len(data) if isinstance(data, list) else (1 if data else 0)
+
+
+class _AsyncBulkQuery:
+    def __init__(self, fake: _AsyncBulkSupabase, table: str) -> None:
+        self._fake = fake
+        self._table = table
+        self._op = "select"
+
+    def select(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        self._op = "select"
+        return self
+
+    def eq(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        return self
+
+    def lt(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        return self
+
+    def limit(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        return self
+
+    def range(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        return self
+
+    def in_(self, *_a: Any, **_k: Any) -> _AsyncBulkQuery:
+        return self
+
+    def upsert(self, payload: Any, **_k: Any) -> _AsyncBulkQuery:
+        self._op = "upsert"
+        self._fake.upserts.append(payload)
+        return self
+
+    async def execute(self) -> _AsyncBulkResp:
+        return _AsyncBulkResp(self._fake.next(self._table, self._op))
+
+
+class _AsyncBulkSupabase:
+    """Scripts ``(table, op) -> response`` for the async bulk re-scorer and
+    captures each ``scores`` upsert payload. ``execute`` is awaitable, so this
+    stands in for the pooled ``AsyncClient``."""
+
+    def __init__(self) -> None:
+        self.script: dict[tuple[str, str], list[Any]] = {}
+        self.upserts: list[list[dict[str, Any]]] = []
+
+    def push(self, table: str, op: str, data: Any) -> None:
+        self.script.setdefault((table, op), []).append(data)
+
+    def next(self, table: str, op: str) -> Any:
+        queued = self.script.get((table, op))
+        return queued.pop(0) if queued else []
+
+    def table(self, name: str) -> _AsyncBulkQuery:
+        return _AsyncBulkQuery(self, name)
+
+
+@pytest.mark.asyncio
+async def test_bulk_score_for_target_async_scores_and_preserves_promising() -> None:
+    """The async twin re-scores a stale page and upserts, preserving the Phase 1
+    ``promising`` floor exactly like the sync version: promising=False keeps
+    ``excluded`` True, promising=True lets the keyword scorer decide."""
+    sb = _AsyncBulkSupabase()
+    sb.push("targets", "select", [{"app_active": True}])  # pipeline-active
+    sb.push(
+        "scores",
+        "select",
+        [{"job_posting_id": "good", "promising": True},
+         {"job_posting_id": "bad", "promising": False}],
+    )
+    sb.push("scores", "select", [])  # second page drained → terminate
+    sb.push(
+        "jobs",
+        "select",
+        [{"id": "good", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"},
+         {"id": "bad", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"}],
+    )
+
+    target = _target(core={"React": 3, "TypeScript": 3})
+    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+
+    assert count == 2
+    assert len(sb.upserts) == 1
+    rows = {r["job_posting_id"]: r for r in sb.upserts[0]}
+    assert rows["bad"]["excluded"] is True
+    assert rows["bad"]["promising"] is False
+    assert rows["good"]["promising"] is True
+    assert rows["good"]["scoring_status"] == "stage2"
+
+
+@pytest.mark.asyncio
+async def test_bulk_score_for_target_async_streams_multiple_pages() -> None:
+    """Re-reads the first page each iteration (an upsert bumps the version out of
+    the stale predicate) until a page comes back empty — one upsert per page."""
+    sb = _AsyncBulkSupabase()
+    sb.push("targets", "select", [{"app_active": True}])
+    sb.push("scores", "select", [{"job_posting_id": "j1", "promising": True}])
+    sb.push("jobs", "select", [{"id": "j1", "title": "Senior FE", "description_html": "<p>React</p>"}])
+    sb.push("scores", "select", [{"job_posting_id": "j2", "promising": True}])
+    sb.push("jobs", "select", [{"id": "j2", "title": "Staff FE", "description_html": "<p>TypeScript</p>"}])
+    sb.push("scores", "select", [])  # empty page → terminate
+
+    target = _target(core={"React": 3, "TypeScript": 3})
+    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+
+    assert count == 2
+    assert len(sb.upserts) == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_score_for_target_async_skips_inactive_target() -> None:
+    """Non-pipeline-active target (not ``app_active`` AND no active membership)
+    short-circuits before any ``scores`` read — no re-score writes."""
+    sb = _AsyncBulkSupabase()
+    sb.push("targets", "select", [{"app_active": False}])  # instance floor off
+    sb.push("user_targets", "select", [])  # count exact → 0 active memberships
+
+    target = _target(core={"React": 3}, app_active=False)
+    count = await bulk_score_for_target_async(sb, target)  # type: ignore[arg-type]
+
+    assert count == 0
+    assert sb.upserts == []
 
 
 # ---------------------------------------------------------------------------

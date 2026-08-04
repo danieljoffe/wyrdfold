@@ -119,7 +119,7 @@ class _StateChain:
     def in_(self, *_a: Any, **_kw: Any) -> _StateChain:
         return self
 
-    def execute(self) -> Any:
+    async def execute(self) -> Any:
         return MagicMock(data=self._rows)
 
 
@@ -141,7 +141,10 @@ def _patch_grader(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _patch_quota(monkeypatch: pytest.MonkeyPatch, quota: int) -> None:
-    monkeypatch.setattr(f"{_RUNNER}.phase2_quota_remaining", lambda *_a, **_kw: quota)
+    async def _quota(*_a: Any, **_kw: Any) -> int:
+        return quota
+
+    monkeypatch.setattr(f"{_RUNNER}.phase2_quota_remaining_async", _quota)
 
 
 @pytest.mark.asyncio
@@ -266,11 +269,12 @@ async def test_empty_jobs_short_circuits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graded = _patch_grader(monkeypatch)
+
     # Quota counter must not even be consulted on empty input.
-    monkeypatch.setattr(
-        f"{_RUNNER}.phase2_quota_remaining",
-        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("called")),
-    )
+    async def _boom(*_a: Any, **_kw: Any) -> int:
+        raise AssertionError("called")
+
+    monkeypatch.setattr(f"{_RUNNER}.phase2_quota_remaining_async", _boom)
     n = await run_phase2_for_jobs(
         MagicMock(), MagicMock(), target=_target(1), payload=_payload(), jobs=[]
     )
