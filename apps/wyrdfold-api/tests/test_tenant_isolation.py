@@ -23,7 +23,6 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.services.llm.mock import MockLLMClient
@@ -148,10 +147,10 @@ async def test_learn_llm_blocked_when_budget_exhausted() -> None:
 
     tc = _client_with_overrides(
         {
-            # learn-llm is now async on the service client (#57 slice 4); override
-            # it too so dependency resolution doesn't 503 before the budget gate.
+            # learn-llm is async on the service client (#57 slice 4), and
+            # enforce_llm_budget resolves it too (#57 PR-G2e-8) — override it so
+            # dependency resolution doesn't 503 before the budget gate.
             get_async_service_supabase: lambda: MagicMock(),
-            get_supabase: lambda: MagicMock(),
             get_llm_client: lambda: MockLLMClient(),
             get_current_user_id: lambda: "user-a",
             enforce_llm_budget: _over_budget,

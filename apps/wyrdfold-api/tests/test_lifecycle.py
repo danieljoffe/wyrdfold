@@ -142,7 +142,25 @@ async def test_reaper_fails_stuck_processing_batches(monkeypatch):
 # ---- activity stamp (dependencies) ----------------------------------------------
 
 
-def test_touch_last_seen_throttles_and_respects_flag(monkeypatch):
+def test_should_stamp_last_seen_throttles_and_respects_flag(monkeypatch):
+    """The sync throttle gate: True at most once per user per hour, and never
+    when the flag is off. The auth deps use it to decide *without awaiting*
+    whether to spawn the detached write (#57 PR-G2e-8)."""
+    from app import dependencies as deps
+
+    monkeypatch.setattr(deps, "_LAST_SEEN_STAMPED", {})
+    s_enabled = MagicMock(activity_tracking_enabled=True)
+    assert deps._should_stamp_last_seen("u-1", s_enabled) is True
+    assert deps._should_stamp_last_seen("u-1", s_enabled) is False  # within the hour
+
+    monkeypatch.setattr(deps, "_LAST_SEEN_STAMPED", {})
+    s_disabled = MagicMock(activity_tracking_enabled=False)
+    assert deps._should_stamp_last_seen("u-2", s_disabled) is False  # flag off
+
+
+async def test_write_last_seen_updates_via_async_service_client(monkeypatch):
+    """The detached write lands on the pooled async service client."""
+    import app.supabase_pool as pool
     from app import dependencies as deps
 
     writes: list[str] = []
@@ -154,36 +172,36 @@ def test_touch_last_seen_throttles_and_respects_flag(monkeypatch):
         def eq(self, *_a):
             return self
 
-        def execute(self):
+        async def execute(self):
             writes.append("write")
             return MagicMock()
 
     fake_sb = MagicMock()
     fake_sb.table.return_value = _FakeTable()
-    monkeypatch.setattr(deps, "get_supabase", lambda: fake_sb)
-    monkeypatch.setattr(deps, "_LAST_SEEN_STAMPED", {})
-
-    s_enabled = MagicMock(activity_tracking_enabled=True)
-    deps._touch_last_seen("u-1", s_enabled)
-    deps._touch_last_seen("u-1", s_enabled)  # within the hour → throttled
+    monkeypatch.setattr(pool, "get_async_supabase", lambda: fake_sb)
+    await deps._write_last_seen("u-1")
     assert writes == ["write"]
 
-    s_disabled = MagicMock(activity_tracking_enabled=False)
-    monkeypatch.setattr(deps, "_LAST_SEEN_STAMPED", {})
-    deps._touch_last_seen("u-2", s_disabled)
-    assert writes == ["write"]  # flag off → no new write
+
+async def test_write_last_seen_noops_without_client(monkeypatch):
+    """No configured async client → no-op, never a raise."""
+    import app.supabase_pool as pool
+    from app import dependencies as deps
+
+    monkeypatch.setattr(pool, "get_async_supabase", lambda: None)
+    await deps._write_last_seen("u-1")  # must not raise
 
 
-def test_touch_last_seen_swallows_failures(monkeypatch):
+async def test_write_last_seen_swallows_failures(monkeypatch):
+    """Any failure is swallowed — activity tracking must never surface an error."""
+    import app.supabase_pool as pool
     from app import dependencies as deps
 
     def _boom():
         raise RuntimeError("supabase down")
 
-    monkeypatch.setattr(deps, "get_supabase", _boom)
-    monkeypatch.setattr(deps, "_LAST_SEEN_STAMPED", {})
-    s = MagicMock(activity_tracking_enabled=True)
-    deps._touch_last_seen("u-1", s)  # must not raise
+    monkeypatch.setattr(pool, "get_async_supabase", _boom)
+    await deps._write_last_seen("u-1")  # must not raise
 
 
 # ---- gate idle blocking ----------------------------------------------------------

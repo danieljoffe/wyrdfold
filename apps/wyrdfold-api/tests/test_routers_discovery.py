@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
 from app.services.source_discovery import (
     DiscoveryRunStats,
@@ -45,7 +45,7 @@ def _stats(target_id: str, *, inserted: int = 0) -> DiscoveryRunStats:
 
 
 def _client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key] = lambda: None
     return TestClient(app, raise_server_exceptions=False)
 
@@ -100,7 +100,7 @@ def test_run_handler_does_not_walk_targets_inline() -> None:
 
 
 def test_run_requires_api_key() -> None:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     # No verify_api_key override — the real dependency must reject.
     resp = TestClient(app).post("/discovery/run")
     assert resp.status_code in (401, 403)

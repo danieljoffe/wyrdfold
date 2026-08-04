@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.dependencies import get_settings, get_supabase
+from app.dependencies import get_async_service_supabase, get_settings
 from app.main import app
 
 _SETTINGS = Settings(
@@ -28,7 +28,7 @@ _SETTINGS = Settings(
 
 def _client() -> TestClient:
     app.dependency_overrides[get_settings] = lambda: _SETTINGS
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     return TestClient(app, raise_server_exceptions=False)
 
 

@@ -370,6 +370,84 @@ def check_user_budget(
         )
 
 
+async def check_user_budget_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    daily_limit_usd: float,
+    hourly_limit_usd: float,
+    monthly_limit_usd: float = 0.0,
+    monthly_excluded_purposes: tuple[str, ...] | None = None,
+    rail_excluded_purposes: tuple[str, ...] | None = None,
+) -> None:
+    """Async mirror of :func:`check_user_budget` (#57 PR-G2e-8).
+
+    Byte-identical to the sync version — same hourly-then-daily-then-monthly
+    ordering, the same ``0``-disables-a-window rule, the same billable-only rails
+    when ``rail_excluded_purposes`` is set, and the same 429 / approaching-cap
+    telemetry (``_raise_budget_429`` / ``_maybe_warn_approaching`` are pure and
+    reused unchanged) — with every spend read AWAITED on the pooled async client
+    (:func:`cost_log.total_spend_async` / :func:`cost_log.total_billable_spend_async`)
+    instead of issued synchronously. The sync :func:`check_user_budget` stays for
+    the poller / other sync callers.
+    """
+    now = datetime.now(UTC)
+
+    async def _window_spend(since: datetime) -> float:
+        if rail_excluded_purposes:
+            return await cost_log.total_billable_spend_async(
+                supabase,
+                user_id=user_id,
+                since=since,
+                excluded_purposes=rail_excluded_purposes,
+            )
+        return await cost_log.total_spend_async(supabase, user_id=user_id, since=since)
+
+    if hourly_limit_usd > 0:
+        spent_hour = await _window_spend(now - timedelta(hours=1))
+        if spent_hour >= hourly_limit_usd:
+            _raise_budget_429("hourly", hourly_limit_usd, spent_hour, user_id=user_id)
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="hourly",
+            limit_usd=hourly_limit_usd,
+            spent_usd=spent_hour,
+        )
+
+    if daily_limit_usd > 0:
+        spent_day = await _window_spend(now - timedelta(hours=24))
+        if spent_day >= daily_limit_usd:
+            _raise_budget_429("daily", daily_limit_usd, spent_day, user_id=user_id)
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="daily",
+            limit_usd=daily_limit_usd,
+            spent_usd=spent_day,
+        )
+
+    if monthly_limit_usd > 0:
+        month_since = now - timedelta(days=MONTHLY_WINDOW_DAYS)
+        if monthly_excluded_purposes:
+            spent_month = await cost_log.total_billable_spend_async(
+                supabase,
+                user_id=user_id,
+                since=month_since,
+                excluded_purposes=monthly_excluded_purposes,
+            )
+        else:
+            spent_month = await cost_log.total_spend_async(
+                supabase, user_id=user_id, since=month_since
+            )
+        if spent_month >= monthly_limit_usd:
+            _raise_budget_429("monthly", monthly_limit_usd, spent_month, user_id=user_id)
+        _maybe_warn_approaching(
+            user_id=user_id,
+            scope="monthly",
+            limit_usd=monthly_limit_usd,
+            spent_usd=spent_month,
+        )
+
+
 def check_daily_count(
     supabase: Client,
     *,

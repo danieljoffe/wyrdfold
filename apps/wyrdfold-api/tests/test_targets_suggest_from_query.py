@@ -30,7 +30,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -201,7 +200,7 @@ def _clear_overrides():
 
 
 def _client(llm: MockLLMClient, user_id: str = "u1") -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: object()
+    app.dependency_overrides[get_async_service_supabase] = lambda: object()
     app.dependency_overrides[get_async_service_supabase] = lambda: object()
     app.dependency_overrides[get_current_user_id] = lambda: user_id
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: user_id

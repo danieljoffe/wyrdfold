@@ -88,6 +88,142 @@ def test_hourly_trips_before_monthly(monkeypatch):
     assert exc.value.detail["scope"] == "hourly"
 
 
+# ---- check_user_budget_async: async mirror (#57 PR-G2e-8) -------------------
+
+
+def _spend_by_window_async(hour: float, day: float, month: float):
+    """Async fake for cost_log.total_spend_async, keyed like _spend_by_window."""
+    from datetime import UTC, datetime, timedelta
+
+    async def _fake(supabase, user_id, since=None):
+        now = datetime.now(UTC)
+        if since is None:
+            return month
+        if since >= now - timedelta(hours=2):
+            return hour
+        if since >= now - timedelta(hours=25):
+            return day
+        return month
+
+    return _fake
+
+
+async def test_async_monthly_breach_raises_429(monkeypatch):
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 0.0, 5.0)
+    )
+    with pytest.raises(HTTPException) as exc:
+        await budget.check_user_budget_async(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=0,
+            hourly_limit_usd=0,
+            monthly_limit_usd=5.0,
+        )
+    assert exc.value.status_code == 429
+    assert exc.value.detail["scope"] == "monthly"
+    assert exc.value.detail["code"] == "llm_budget_exceeded"
+
+
+async def test_async_monthly_zero_disables(monkeypatch):
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 0.0, 999.0)
+    )
+    await budget.check_user_budget_async(
+        MagicMock(),
+        user_id="u-1",
+        daily_limit_usd=0,
+        hourly_limit_usd=0,
+        monthly_limit_usd=0,
+    )  # must not raise
+
+
+async def test_async_under_monthly_cap_passes(monkeypatch):
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 0.0, 4.99)
+    )
+    await budget.check_user_budget_async(
+        MagicMock(),
+        user_id="u-1",
+        daily_limit_usd=0,
+        hourly_limit_usd=0,
+        monthly_limit_usd=5.0,
+    )  # must not raise
+
+
+async def test_async_hourly_trips_before_monthly(monkeypatch):
+    """Same burst-protection ordering as the sync gate: hourly first."""
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend_async", _spend_by_window_async(1.0, 1.0, 5.0)
+    )
+    with pytest.raises(HTTPException) as exc:
+        await budget.check_user_budget_async(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=5.0,
+            hourly_limit_usd=1.0,
+            monthly_limit_usd=5.0,
+        )
+    assert exc.value.detail["scope"] == "hourly"
+
+
+async def test_async_rails_use_billable_spend_when_excluded(monkeypatch):
+    """rail_excluded_purposes routes the hourly/daily rails through
+    total_billable_spend_async (interactive-only), mirroring the sync gate's
+    2026-07-13 owner-lockout fix — the plain total_spend_async is not touched."""
+    total_spend_called = False
+
+    async def _plain(supabase, user_id, since=None):
+        nonlocal total_spend_called
+        total_spend_called = True
+        return 0.0
+
+    seen: list[tuple[str, ...]] = []
+
+    async def _billable(supabase, user_id, since=None, *, excluded_purposes):
+        seen.append(excluded_purposes)
+        return 2.0  # over the hourly cap
+
+    monkeypatch.setattr(budget.cost_log, "total_spend_async", _plain)
+    monkeypatch.setattr(budget.cost_log, "total_billable_spend_async", _billable)
+
+    with pytest.raises(HTTPException) as exc:
+        await budget.check_user_budget_async(
+            MagicMock(),
+            user_id="u-1",
+            daily_limit_usd=0,
+            hourly_limit_usd=1.0,
+            monthly_limit_usd=0,
+            rail_excluded_purposes=("poll_scoring",),
+        )
+    assert exc.value.detail["scope"] == "hourly"
+    assert total_spend_called is False  # rails read the billable path only
+    assert seen and seen[0] == ("poll_scoring",)
+
+
+async def test_async_gate_mirrors_sync_gate(monkeypatch):
+    """Parity guard against the twins drifting: identical spend + limits →
+    identical verdict from both gates."""
+    monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 3.0, 3.0))
+    monkeypatch.setattr(
+        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 3.0, 3.0)
+    )
+    kwargs = {
+        "user_id": "u-1",
+        "daily_limit_usd": 3.0,
+        "hourly_limit_usd": 0,
+        "monthly_limit_usd": 0,
+    }
+
+    with pytest.raises(HTTPException) as sync_exc:
+        budget.check_user_budget(MagicMock(), **kwargs)
+    with pytest.raises(HTTPException) as async_exc:
+        await budget.check_user_budget_async(MagicMock(), **kwargs)
+
+    assert sync_exc.value.status_code == async_exc.value.status_code == 429
+    assert sync_exc.value.detail["scope"] == async_exc.value.detail["scope"] == "daily"
+
+
 # ---- get_llm_account ---------------------------------------------------------
 
 

@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -47,7 +46,7 @@ def test_jwt_caller_gets_only_their_active_targets(
     monkeypatch.setattr(router_mod, "_active_targets", global_spy)
     monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
@@ -72,7 +71,7 @@ def test_api_key_caller_gets_instance_wide_view(
     monkeypatch.setattr(router_mod, "_active_targets", global_spy)
     monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "api-key"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None

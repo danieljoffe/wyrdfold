@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("score_ceiling")
@@ -181,8 +181,7 @@ def _emit_target(sb: Any, target: Any, fh: Any) -> None:
 
 
 def main() -> None:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise RuntimeError("Supabase not configured — check .env")
 

@@ -52,10 +52,8 @@ from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
     close_async_supabase,
     close_async_user_client,
-    close_supabase,
     get_async_supabase,
     init_async_supabase,
-    init_supabase,
 )
 
 _log = logging.getLogger("app")
@@ -214,17 +212,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # so a future `with TestClient(app)` test can't hit the network).
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         await _probe_supabase_keys(settings)
-    # The SYNC service-role client is retained ONLY to back the sync FastAPI
-    # dependency layer that FastAPI runs in its threadpool — ``enforce_llm_budget``,
-    # ``get_llm_client``, and ``get_current_user_id`` → ``_touch_last_seen`` (the
-    # latter deliberately sync so its JWKS decode stays off the event loop, Perf-F1).
-    # Every OTHER service-role user (owner provisioning, the cost/search-event
-    # buffers, the scheduler discovery-catchup, and ``/ready`` below) now runs on
-    # the pooled ASYNC client. Retiring the sync client entirely is a follow-up
-    # chunk that converts those three deps to async (#57).
-    init_supabase()
-    # Async service-role client (#57): the pooled client every migrated hot path
-    # awaits. No-op when Supabase isn't configured.
+    # Async service-role client (#57): the single pooled service-role client
+    # every service-role path awaits — background work, owner provisioning, the
+    # cost/search-event buffers, the scheduler discovery-catchup, ``/ready``
+    # below, and (since PR-G2e-8) the last interactive deps too:
+    # ``enforce_llm_budget``, ``get_llm_client``, and ``get_current_user_id`` →
+    # the detached last-seen stamp. There is no sync service-role client anymore
+    # (its JWKS decode stays off the loop via ``asyncio.to_thread`` instead,
+    # Perf-F1). No-op when Supabase isn't configured.
     await init_async_supabase()
     # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
     # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
@@ -266,7 +261,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if supabase_for_buffer is not None:
             await cost_log_buffer.stop(supabase_for_buffer)
             await search_events_buffer.stop(supabase_for_buffer)
-        close_supabase()
         await close_async_supabase()
         await close_async_user_client()
         await close_http_client()

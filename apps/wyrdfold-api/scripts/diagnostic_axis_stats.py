@@ -30,7 +30,7 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 AXES = ("title_fit", "skills_fit", "seniority_fit", "domain_fit")
 _PAGE = 1000
@@ -174,8 +174,7 @@ def _summarize_target(sb: Any, target: Any) -> None:
 
 
 def main() -> None:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise RuntimeError("Supabase not configured — check .env")
     targets = get_active_targets(sb)

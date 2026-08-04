@@ -9,7 +9,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -104,7 +103,7 @@ class TestGapGateResume:
     @pytest.fixture(autouse=True)
     def _overrides(self):
         app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-        app.dependency_overrides[get_supabase] = lambda: MagicMock()
+        app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
         app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
         app.dependency_overrides[get_current_user_id_optional] = lambda: None
         app.dependency_overrides[get_current_user_id] = lambda: "test-user"

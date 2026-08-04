@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.models.experience import OptimizedPayload, Outcome, Role, Skill
 from app.models.targets import CategoryProfile, ScoringProfile, TargetCreate
 from app.services.targets import crud
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 # Titles overlap mock_board._TITLE_STEMS so the LIVE poll path scores the
 # synthetic feed instead of excluding it.
@@ -67,8 +67,7 @@ _TARGET_LABEL = "Customer Experience Leadership (loadtest)"
 
 
 def _client() -> Client:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit(
             "Supabase not configured — set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY"
