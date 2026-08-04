@@ -213,10 +213,10 @@ def _client(llm: MockLLMClient, user_id: str = "u1") -> TestClient:
 def _stub_endpoint_deps(monkeypatch: pytest.MonkeyPatch, *, doc: object | None) -> None:
     from app.routers import targets as mod
 
-    # ``optimized.get_latest`` reads a locally-obtained sync client via a DIRECT
-    # ``get_supabase()`` call (not Depends), so patch the module-level name.
-    monkeypatch.setattr(mod, "get_supabase", lambda: object())
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: doc)
+    # #57 PR-G2e-5: the handler reads the optimized doc on the async client via the
+    # ``_optimized_latest`` inline (the sync ``optimized.get_latest`` twin is no
+    # longer on this path).
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=doc))
     monkeypatch.setattr(mod.cost_log, "record_async", AsyncMock())
     monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value=set()))
     monkeypatch.setattr(match_module, "find_matching_target", AsyncMock(return_value=None))
@@ -344,10 +344,9 @@ def _create_or_link_result() -> CreateOrLinkResult:
 def _stub_from_suggestion_spy(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
     """Spy on from_input.from_suggestion; return the list that captures kwargs.
 
-    #57 PR-G2b: from_suggestion no longer takes ``background_tasks`` (it
-    self-schedules the deferred derive via ``spawn_detached``), and the handler
-    reads ``optimized.get_latest`` on a locally-obtained sync client via a DIRECT
-    ``get_supabase()`` call — patch the module-level name so it doesn't 503.
+    #57 PR-G2b/G2e-5: from_suggestion self-schedules the deferred derive via
+    ``spawn_detached``, and the handler reads the optimized doc on the async client
+    via the ``_optimized_latest`` inline (patched by the per-test stubs below).
     """
     from app.routers import targets as mod
 
@@ -357,7 +356,6 @@ def _stub_from_suggestion_spy(monkeypatch: pytest.MonkeyPatch) -> list[dict[str,
         captured.append(kwargs)
         return _create_or_link_result()
 
-    monkeypatch.setattr(mod, "get_supabase", lambda: object())
     monkeypatch.setattr(mod.from_input, "from_suggestion", _spy)
     return captured
 
@@ -369,7 +367,7 @@ def test_from_suggestion_endpoint_works_without_a_profile(
     handed to the service."""
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=None))
     captured = _stub_from_suggestion_spy(monkeypatch)
     llm = MockLLMClient()
 
@@ -390,7 +388,7 @@ def test_from_suggestion_endpoint_passes_profile_when_present(
 
     payload = OptimizedPayload(summary="Senior FE")
     monkeypatch.setattr(
-        mod.optimized, "get_latest", lambda *_a, **_k: SimpleNamespace(payload=payload)
+        mod, "_optimized_latest", AsyncMock(return_value=SimpleNamespace(payload=payload))
     )
     captured = _stub_from_suggestion_spy(monkeypatch)
 
@@ -409,7 +407,7 @@ def test_from_suggestion_endpoint_validates_label_422(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=None))
     spy = _stub_from_suggestion_spy(monkeypatch)
 
     resp = _client(MockLLMClient()).post("/targets/from-suggestion", json=body)

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.types import CountMethod
 from pydantic import ValidationError
 from supabase import AsyncClient, Client
@@ -769,13 +769,22 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
 
 
 async def _link_user_to_target_async(
-    supabase: AsyncClient, *, user_id: str, target_id: str, is_active: bool = True
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    is_active: bool = True,
+    fit_score: int | None = None,
+    fit_score_reasoning: str | None = None,
+    fit_score_prose_doc_id: str | None = None,
 ) -> UserTarget:
     """Async inline of ``crud.link_user_to_target`` (crud stays sync for its
-    poller/operator callers, #57 PR-G2e-4). Same active-cap contract: raises
+    poller/operator callers, #57 PR-G2e-4/5). Same active-cap contract: raises
     ``crud.ActiveTargetLimitError`` only when this upsert introduces a NEW active
     link that would push the user over the cap (re-activating an already-active
-    link is exempt so idempotent refreshes stay free)."""
+    link is exempt so idempotent refreshes stay free). The optional fit-score
+    columns follow crud's conditional shape (written only when non-None) so the
+    link route can stamp a freshly-derived score + its E2 version marker."""
     if is_active:
         existing_resp = await (
             supabase.table(crud.USER_TARGETS_TABLE)
@@ -799,6 +808,12 @@ async def _link_user_to_target_async(
         "is_active": is_active,
         "updated_at": datetime.now(UTC).isoformat(),
     }
+    if fit_score is not None:
+        row["fit_score"] = fit_score
+    if fit_score_reasoning is not None:
+        row["fit_score_reasoning"] = fit_score_reasoning
+    if fit_score_prose_doc_id is not None:
+        row["fit_score_prose_doc_id"] = fit_score_prose_doc_id
     resp = await (
         supabase.table(crud.USER_TARGETS_TABLE)
         .upsert(row, on_conflict="user_id,target_id")
@@ -808,6 +823,20 @@ async def _link_user_to_target_async(
     if not rows:
         raise RuntimeError("Failed to upsert user_targets row")
     return crud._parse_user_target(rows[0])
+
+
+async def _set_app_active_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.set_app_active`` — raise the instance-sponsorship
+    floor (``app_active = True``) for api-key/system callers with no user identity
+    to link. crud stays sync for its seed-script/operator callers (#57 PR-G2e-5)."""
+    resp = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .update({"app_active": True, "updated_at": datetime.now(UTC).isoformat()})
+        .eq("id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
 
 
 async def _activate_pipeline(
@@ -941,9 +970,9 @@ async def create_target_from_manual(
     task (new targets start in ``deriving`` status). The user always ends up
     with a ``user_targets`` row.
     """
-    # ``optimized.get_latest`` is poller-shared + not-yet-async — read it on a
-    # locally-obtained sync service client (jobs.py materialize pattern).
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    # ``optimized.get_latest`` reads on the pooled async service client via the
+    # ``_optimized_latest`` inline (the sync twin stays for the poller/suggest chain).
+    doc = await _optimized_latest(supabase, user_id)
     if doc is None:
         # 422 (Unprocessable Entity): the route exists and the request is
         # well-formed, but a business precondition (an experience profile
@@ -992,7 +1021,7 @@ async def create_target_from_suggestion(
     profile can still create a target from a role search — the query is the
     signal. Only the per-user fit score is deferred-and-skipped when absent.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id)
     payload = doc.payload if doc is not None else None
     return await from_input.from_suggestion(
         supabase,
@@ -1027,7 +1056,7 @@ async def create_target_from_url(
     score all run in a detached task (new targets start in ``deriving``
     status). The user is always linked.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(
@@ -1076,7 +1105,7 @@ async def suggest(
     Returns each suggestion paired with its matched target (if one exists)
     or flagged as new. Excludes targets the user already has.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id)
     if doc is None:
         # Precondition (profile exists) not met — see /from-manual for rationale.
         raise HTTPException(status_code=422, detail="No experience profile found")
@@ -1115,7 +1144,7 @@ async def suggest_lateral(
     confidence; the activation flow plugs them into
     ``derive_profile_from_label`` to materialise the full target.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id)
     if doc is None:
         raise HTTPException(status_code=422, detail="No experience profile found")
 
@@ -1178,7 +1207,7 @@ async def suggest_from_query(
     requires a profile. Rate-limited a touch higher than ``/suggest`` (6/min)
     since it's an interactive search affordance, and LLM-budget-gated.
     """
-    doc = await asyncio.to_thread(optimized.get_latest, get_supabase(), user_id=user_id)
+    doc = await _optimized_latest(supabase, user_id)
     payload = doc.payload if doc is not None else None
     try:
         matched, result = await suggest_and_match_from_query(
@@ -1227,7 +1256,6 @@ async def get_active_targets(
 
 @router.get("/mine", response_model=MyTargetsSummaryListResponse)
 async def get_my_targets(
-    background_tasks: BackgroundTasks,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
@@ -1249,12 +1277,13 @@ async def get_my_targets(
     # queries of its own to the response path. Only schedule when the user has
     # targets (nothing to refresh otherwise); the task itself no-ops immediately
     # if the LLM provider is fatal (credits out), so an outage can't make this
-    # churn the DB on every view. ``refresh_stale_for_user`` is not-yet-async and
-    # takes the sync service client (obtained locally); it does no async-pool
-    # fan-out, so it stays a safe starlette ``BackgroundTask``.
+    # churn the DB on every view. ``refresh_stale_for_user`` rides the pooled async
+    # service client now (#57 PR-G2e-5), so it's spawned DETACHED (never a starlette
+    # ``BackgroundTask`` — the async pool deadlocks under uvloop there).
     if items:
-        background_tasks.add_task(
-            fit_refresh.refresh_stale_for_user, get_supabase(), llm, user_id=user_id
+        spawn_detached(
+            fit_refresh.refresh_stale_for_user(supabase, llm, user_id=user_id),
+            name=f"fit-refresh-{user_id}",
         )
     return MyTargetsSummaryListResponse(targets=items)
 
@@ -1689,19 +1718,16 @@ async def link_target(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    # ``resolve_current_payload`` and ``crud.link_user_to_target`` (active-cap
-    # read path) are not-yet-async and take the sync service client — obtain one
-    # locally (jobs.py materialize pattern); the fit-score cost write rides the
-    # async client.
-    svc = get_supabase()
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
     # Fresh vs. the current master document, not a possibly-stale persisted
     # optimized doc (BUG 2, the stale-payload seam) — a profile edited just
-    # before this link must affect the fit.
+    # before this link must affect the fit. ``resolve_current_payload`` and the
+    # active-cap link write both ride the pooled async service client now
+    # (#57 PR-G2e-5), so no local sync client is needed.
     payload, prose_doc_id = await resolve_current_payload(
-        svc, llm, cost_supabase=svc, user_id=user_id
+        supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     if payload is not None:
         fit_result, result = await derive_fit_score(llm, payload=payload, target=target)
@@ -1716,9 +1742,8 @@ async def link_target(
         fit_reasoning = fit_result.reasoning
 
     try:
-        return await asyncio.to_thread(
-            crud.link_user_to_target,
-            svc,
+        return await _link_user_to_target_async(
+            supabase,
             user_id=user_id,
             target_id=target_id,
             fit_score=fit_score,
@@ -1867,12 +1892,10 @@ async def create_target_from_posting(
     scoring profile from the description via LLM, stores the JD as a
     reference, and activates the target.
     """
-    # ``derive_profile_from_jd`` (content-hash cache) and the active-cap
-    # ``crud.link_user_to_target`` / ``crud.set_app_active`` writes are
-    # not-yet-async and take the sync service client — obtain one locally
-    # (jobs.py materialize pattern). The catalog reads/writes ride the async
-    # client via the router-inline helpers.
-    svc = get_supabase()
+    # ``derive_profile_from_jd`` (content-hash cache) takes the async client on its
+    # async cache path, and the active-cap link / ``app_active`` writes ride the
+    # async client via the router-inline helpers (#57 PR-G2e-5) — no local sync
+    # client needed.
     posting = await _get_job_posting_row(supabase, posting_id)
     if posting is None:
         raise HTTPException(status_code=404, detail="Job posting not found")
@@ -1888,7 +1911,7 @@ async def create_target_from_posting(
     jd_text = strip_html(description_html)
     if len(jd_text) >= 50:
         try:
-            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=svc)
+            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
             await cost_log.record_async(
                 supabase,
                 user_id=user_id,
@@ -1936,9 +1959,8 @@ async def create_target_from_posting(
     # enters the pipeline.
     if user_id is not None:
         try:
-            await asyncio.to_thread(
-                crud.link_user_to_target,
-                svc,
+            await _link_user_to_target_async(
+                supabase,
                 user_id=user_id,
                 target_id=target.id,
                 is_active=True,
@@ -1960,7 +1982,7 @@ async def create_target_from_posting(
         # linking flow made.
         refreshed = await _target_get(supabase, target.id)
         return refreshed or target
-    activated = await asyncio.to_thread(crud.set_app_active, svc, target_id=target.id)
+    activated = await _set_app_active_async(supabase, target.id)
     return activated or target
 
 
@@ -2391,13 +2413,11 @@ async def delete_reference_jd(
     )
 
 
-# `async def` (#57 PR-G2b): the caller's vote write rides the ASYNC RLS user
-# client and the shared-catalog reads + #191 re-merge ride the ASYNC service
-# client (all awaited). Only the service-role vote-tally RPC
-# (``recompute_suppression``) is not-yet-async — offloaded via ``asyncio.to_thread``
-# on a locally-obtained sync client, so no blocking `.execute()` hits the loop
-# (#107). slowapi's @limiter.limit works on async handlers too (it reads the
-# `request` arg).
+# `async def` (#57 PR-G2b/G2e-5): the caller's vote write rides the ASYNC RLS user
+# client and the shared-catalog reads + #191 re-merge + the service-role vote-tally
+# RPC (``recompute_suppression``) ride the ASYNC service client — all awaited, so no
+# blocking `.execute()` hits the loop (#107). slowapi's @limiter.limit works on
+# async handlers too (it reads the `request` arg).
 @router.post(
     "/{target_id}/reference-jds/{ref_jd_id}/vote",
     response_model=ContributionVoteResult,
@@ -2433,11 +2453,11 @@ async def vote_on_reference_jd(
         user_supabase, reference_jd_id=ref_jd_id, user_id=user_id, value=body.value
     )
 
-    # Tally every vote (service-role RPC, not-yet-async) and reconcile the
-    # suppression flag on a locally-obtained sync client, offloaded off the loop.
-    suppressed, changed = await asyncio.to_thread(
-        votes.recompute_suppression,
-        get_supabase(),
+    # Tally every vote + reconcile the suppression flag via the service-role RPC,
+    # awaited on the pooled async SERVICE client (the vote WRITE above stays on the
+    # async USER client, so RLS is preserved) (#57 PR-G2e-5).
+    suppressed, changed = await votes.recompute_suppression(
+        supabase,
         reference_jd_id=ref_jd_id,
         quorum=settings.contribution_downvote_quorum,
     )

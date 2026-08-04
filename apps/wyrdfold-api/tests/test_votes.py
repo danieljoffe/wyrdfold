@@ -11,16 +11,26 @@ read-modify-write) and parses its single-row result.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from app.services.targets import votes
 
 
-def test_recompute_suppression_calls_the_atomic_rpc() -> None:
+def _rpc_client(data: object) -> MagicMock:
+    """A service client whose ``recompute_contribution_suppression`` RPC awaits to
+    ``data`` (#57 PR-G2e-5: the tally RPC rides the async service client now)."""
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value.data = [{"suppressed": True, "changed": True}]
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
+    return sb
 
-    result = votes.recompute_suppression(sb, reference_jd_id="ref-1", quorum=2)
+
+@pytest.mark.asyncio
+async def test_recompute_suppression_calls_the_atomic_rpc() -> None:
+    sb = _rpc_client([{"suppressed": True, "changed": True}])
+
+    result = await votes.recompute_suppression(sb, reference_jd_id="ref-1", quorum=2)
 
     assert result == (True, True)
     # Delegated to the DB function (atomic under a row lock), not the old
@@ -32,23 +42,23 @@ def test_recompute_suppression_calls_the_atomic_rpc() -> None:
     sb.table.assert_not_called()
 
 
-def test_recompute_suppression_missing_row_is_noop() -> None:
+@pytest.mark.asyncio
+async def test_recompute_suppression_missing_row_is_noop() -> None:
     """Contribution deleted between vote and recompute → (False, False), no crash."""
-    sb = MagicMock()
-    sb.rpc.return_value.execute.return_value.data = []
+    sb = _rpc_client([])
 
-    assert votes.recompute_suppression(sb, reference_jd_id="gone", quorum=2) == (
+    assert await votes.recompute_suppression(sb, reference_jd_id="gone", quorum=2) == (
         False,
         False,
     )
 
 
-def test_recompute_suppression_coerces_rpc_booleans() -> None:
+@pytest.mark.asyncio
+async def test_recompute_suppression_coerces_rpc_booleans() -> None:
     """The RPC returns real booleans; make sure they pass through as a tuple."""
-    sb = MagicMock()
-    sb.rpc.return_value.execute.return_value.data = [{"suppressed": False, "changed": False}]
+    sb = _rpc_client([{"suppressed": False, "changed": False}])
 
-    assert votes.recompute_suppression(sb, reference_jd_id="ref-9", quorum=3) == (
+    assert await votes.recompute_suppression(sb, reference_jd_id="ref-9", quorum=3) == (
         False,
         False,
     )

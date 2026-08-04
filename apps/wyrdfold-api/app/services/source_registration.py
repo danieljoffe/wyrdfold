@@ -23,7 +23,7 @@ import asyncio
 import logging
 from typing import Any
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services.ats_detect import detect_ats, is_ats_url
@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 _DETECT_TIMEOUT_S = 20.0
 
 
-def _call_register_rpc(
-    supabase: Client,
+async def _call_register_rpc(
+    supabase: AsyncClient,
     *,
     user_id: str,
     provider: str,
@@ -47,7 +47,7 @@ def _call_register_rpc(
     postgrest wraps a scalar-returning function as ``resp.data == "<status>"`` or
     a single-row list depending on schema-cache state, so accept both shapes.
     """
-    resp = supabase.rpc(
+    resp = await supabase.rpc(
         "register_source_from_url",
         {
             "p_user_id": user_id,
@@ -72,7 +72,7 @@ def _call_register_rpc(
     return "error"
 
 
-async def register_source_from_url(supabase: Client, *, user_id: str, final_url: str) -> str:
+async def register_source_from_url(supabase: AsyncClient, *, user_id: str, final_url: str) -> str:
     """Best-effort: if ``final_url`` is a supported, live ATS board, register it
     as a pollable source owned by ``user_id`` (capped). Returns an outcome string
     (for logging + tests) and NEVER raises — a registration failure must not
@@ -106,8 +106,7 @@ async def register_source_from_url(supabase: Client, *, user_id: str, final_url:
         return "dead_board"
 
     try:
-        outcome = await asyncio.to_thread(
-            _call_register_rpc,
+        outcome = await _call_register_rpc(
             supabase,
             user_id=user_id,
             provider=detect.provider,

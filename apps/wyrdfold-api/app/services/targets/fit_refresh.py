@@ -11,17 +11,25 @@ background — capped per view so one page load can't fire a burst of LLM calls,
 and only paid for targets the user actually looks at (vs eagerly rescoring every
 target on every profile edit). The view returns the cached scores immediately;
 fresh ones land by the next view.
+
+#57 PR-G2e-5: this module runs on the pooled async service client. ``/mine``
+spawns ``refresh_stale_for_user`` as a DETACHED loop task (``spawn_detached``, not
+a starlette ``BackgroundTask`` — the async pool deadlocks under uvloop there), and
+the crud reads/writes it needs run through thin async inlines here (crud stays
+SYNC for its poller/learner/operator callers).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
+from app.constants import resolve_owner
+from app.models.targets import JobTarget
 from app.services.experience import prose
 from app.services.experience.resolve import resolve_current_payload
 from app.services.llm import cost_log, provider_breaker
@@ -34,15 +42,83 @@ from app.services.targets.fit_score import derive_fit_score
 logger = logging.getLogger(__name__)
 
 
-def current_prose_doc_id(supabase: Client, user_id: str) -> str | None:
+# ── Async inlines of the crud reads/writes this module needs (#57 PR-G2e-5) ──
+# crud stays SYNC for its poller/learner/operator callers; a sync helper can't
+# take the async client and converting crud would ripple into all of them. So the
+# queries this module needs run here on the async client, reusing crud's row
+# parser so the persisted shape stays byte-identical.
+
+
+async def _target_get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get``."""
+    resp = await supabase.table(crud.TARGETS_TABLE).select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return crud._parse_target(rows[0]) if rows else None
+
+
+async def _fit_score_marker(
+    supabase: AsyncClient, *, user_id: str, target_id: str
+) -> str | None:
+    """Async inline of ``crud.get_fit_score_prose_doc_id`` — the version marker on
+    the user's link, re-read right before a lazy refresh recomputes so a concurrent
+    refresh (two quick views) doesn't double-spend the LLM."""
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("fit_score_prose_doc_id")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0].get("fit_score_prose_doc_id") if rows else None
+
+
+async def _update_fit_score(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    fit_score: int,
+    fit_score_reasoning: str | None,
+    fit_score_prose_doc_id: str | None,
+) -> None:
+    """Async inline of ``crud.update_fit_score`` — a targeted UPDATE of ONLY the
+    fit columns (never ``is_active``, so a background rescore can't flip the active
+    flag or trip the active-target cap)."""
+    await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(
+            {
+                "fit_score": fit_score,
+                "fit_score_reasoning": fit_score_reasoning,
+                "fit_score_prose_doc_id": fit_score_prose_doc_id,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+
+
+async def current_prose_doc_id(supabase: AsyncClient, user_id: str) -> str | None:
     """The id of the user's current experience master doc (the version a fresh
     fit score is stamped with), or None when they have no prose profile."""
-    doc = prose.get_latest(supabase, user_id)
-    return doc.id if doc is not None else None
+    resp = await (
+        supabase.table(prose.TABLE)
+        .select("id")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0].get("id") if rows else None
 
 
-def stale_target_ids(
-    supabase: Client, *, user_id: str, current_prose_doc_id: str, limit: int
+async def stale_target_ids(
+    supabase: AsyncClient, *, user_id: str, current_prose_doc_id: str, limit: int
 ) -> list[str]:
     """Up to ``limit`` target ids whose cached fit_score is stale vs the current
     profile version.
@@ -55,7 +131,7 @@ def stale_target_ids(
     """
     if limit <= 0:
         return []
-    resp = (
+    resp = await (
         supabase.table("user_targets")
         .select("target_id, fit_score, fit_score_prose_doc_id")
         .eq("user_id", user_id)
@@ -73,7 +149,7 @@ def stale_target_ids(
 
 
 async def refresh_stale_fit_scores(
-    supabase: Client, llm: LLMClient, *, user_id: str, target_ids: list[str]
+    supabase: AsyncClient, llm: LLMClient, *, user_id: str, target_ids: list[str]
 ) -> int:
     """Recompute + re-stamp the fit score for each (stale) target. Best-effort;
     returns the number actually refreshed.
@@ -84,8 +160,8 @@ async def refresh_stale_fit_scores(
     only the fit columns (never ``is_active``, so a background rescore can't flip
     the active flag or trip the cap). One target's failure never aborts the rest.
 
-    Runs as a FastAPI ``BackgroundTask`` (an async fn awaited on the event loop),
-    so every blocking supabase round-trip is off-loaded to the threadpool (#107).
+    Rides the pooled async service client end to end (#57 PR-G2e-5): every read /
+    write is awaited on the loop through the async inlines above, so nothing blocks.
     """
     try:
         payload, prose_doc_id = await resolve_current_payload(
@@ -104,26 +180,22 @@ async def refresh_stale_fit_scores(
         try:
             # Re-check staleness against the freshly-resolved version before
             # paying for the LLM — cheap guard against double-spend on rapid views.
-            marker = await asyncio.to_thread(
-                crud.get_fit_score_prose_doc_id, supabase, user_id=user_id, target_id=target_id
-            )
+            marker = await _fit_score_marker(supabase, user_id=user_id, target_id=target_id)
             if marker == prose_doc_id:
                 continue
-            target = await asyncio.to_thread(crud.get, supabase, target_id)
+            target = await _target_get(supabase, target_id)
             if target is None:
                 continue
 
             fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
-            await asyncio.to_thread(
-                cost_log.record,
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=FIT_SCORE_PURPOSE,
                 result=llm_result,
                 metadata={"target_id": target_id, "user_id": user_id, "reason": "lazy_refresh"},
             )
-            await asyncio.to_thread(
-                crud.update_fit_score,
+            await _update_fit_score(
                 supabase,
                 user_id=user_id,
                 target_id=target_id,
@@ -148,11 +220,11 @@ async def refresh_stale_fit_scores(
     return refreshed
 
 
-async def refresh_stale_for_user(supabase: Client, llm: LLMClient, *, user_id: str) -> None:
+async def refresh_stale_for_user(supabase: AsyncClient, llm: LLMClient, *, user_id: str) -> None:
     """Background entrypoint for the lazy refresh (E2): compute the user's current
     profile version + which of their targets are stale, then refresh them —
-    ENTIRELY off the ``/targets/mine`` response path (the caller just schedules
-    this and returns the cached scores immediately).
+    ENTIRELY off the ``/targets/mine`` response path (the caller just spawns this
+    detached and returns the cached scores immediately).
 
     Skips at the door when the provider-fatal breaker is latched (a credits
     outage / sustained 429), so a down provider can't make every ``/mine`` view
@@ -162,11 +234,10 @@ async def refresh_stale_for_user(supabase: Client, llm: LLMClient, *, user_id: s
     """
     if provider_breaker.provider_fatal_active():
         return
-    prose_doc_id = await asyncio.to_thread(current_prose_doc_id, supabase, user_id)
+    prose_doc_id = await current_prose_doc_id(supabase, user_id)
     if prose_doc_id is None:
         return
-    stale = await asyncio.to_thread(
-        stale_target_ids,
+    stale = await stale_target_ids(
         supabase,
         user_id=user_id,
         current_prose_doc_id=prose_doc_id,

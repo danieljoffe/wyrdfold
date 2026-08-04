@@ -87,25 +87,31 @@ def test_mine_schedules_lazy_refresh_when_user_has_targets(
 ) -> None:
     """GET /targets/mine returns the cached summaries immediately AND schedules a
     SINGLE background refresh task (E2) — the whole staleness scan runs in the
-    background, off the response path. TestClient runs background tasks after the
-    response, so the spy is invoked with the user id."""
+    background, off the response path.
+
+    #57 PR-G2e-5: the refresh rides the async pool now, so /mine spawns it DETACHED
+    (``spawn_detached``, not a starlette ``BackgroundTask``). Patch spawn_detached to
+    capture the scheduled coroutine synchronously — the recording stub sets the
+    scheduled marker when the router builds the coro to hand off."""
     from app.routers import targets as router_mod
 
-    # #57 PR-G2b: /mine reads summaries on the async client via the router inline
-    # helper, and acquires the sync client for the bg fit-refresh via a DIRECT
-    # get_supabase() call (not Depends) — patch both.
     monkeypatch.setattr(
         router_mod,
         "_list_user_targets_with_summary_async",
         AsyncMock(return_value=[_summary_item()]),
     )
-    monkeypatch.setattr(router_mod, "get_supabase", lambda: MagicMock())
     scheduled: dict[str, object] = {}
 
-    async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
+    def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
         scheduled["user_id"] = user_id
 
+        async def _noop() -> None:
+            return None
+
+        return _noop()
+
     monkeypatch.setattr(fit_refresh, "refresh_stale_for_user", spy_refresh)
+    monkeypatch.setattr(router_mod, "spawn_detached", lambda coro, *, name: coro.close())
 
     resp = client.get("/targets/mine")
 

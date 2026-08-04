@@ -112,6 +112,7 @@ def test_recompute_rpc_is_service_role_only(
 
 async def test_quorum_suppresses_and_upvote_rescues(
     service_client: Client,
+    async_service_client: AsyncClient,
     async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
     two_seeded_users: tuple[str, str],
     target_with_contribution: tuple[str, str],
@@ -123,14 +124,18 @@ async def test_quorum_suppresses_and_upvote_rescues(
 
     # One down-vote: net 1 < quorum 2 -> not suppressed.
     await votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=-1)
-    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+    assert await votes.recompute_suppression(
+        async_service_client, reference_jd_id=ref_id, quorum=2
+    ) == (
         False,
         False,
     )
 
     # Second down-vote: net 2 >= quorum 2 -> suppressed (and it CHANGED).
     await votes.set_user_vote(b, reference_jd_id=ref_id, user_id=uid_b, value=-1)
-    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+    assert await votes.recompute_suppression(
+        async_service_client, reference_jd_id=ref_id, quorum=2
+    ) == (
         True,
         True,
     )
@@ -142,7 +147,9 @@ async def test_quorum_suppresses_and_upvote_rescues(
 
     # A switches to an up-vote: net 0 < quorum -> rescued (un-suppressed).
     await votes.set_user_vote(a, reference_jd_id=ref_id, user_id=uid_a, value=1)
-    assert votes.recompute_suppression(service_client, reference_jd_id=ref_id, quorum=2) == (
+    assert await votes.recompute_suppression(
+        async_service_client, reference_jd_id=ref_id, quorum=2
+    ) == (
         False,
         True,
     )

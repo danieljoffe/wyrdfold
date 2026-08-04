@@ -16,13 +16,12 @@ reads/writes are module-inline async helpers (``_create`` / ``_update`` /
 ``_link`` / ``_get`` / ``_add_reference_jd`` / ``_list_reference_jds`` /
 ``_count_user_reference_jds``), the cost ledger is ``cost_log.record_async``,
 the #191 merge is ``apply_profile_merge_rpc_async``, and the deferred work is
-spawned via ``spawn_detached`` (not starlette ``BackgroundTasks``). #57 PR-G2e-4:
-``derive_profile_from_jd`` (async cache path), ``materialize_and_score_job``, and
-the ``_upsert_user_job_async`` inline now ride that same async client; only two
-residual services (``resolve_current_payload`` in ``_apply_fit_score`` and
-``register_source_from_url`` in ``from_url``) still take a SYNC client from a
-direct ``get_supabase()`` call. All are monkeypatched so the focus stays on
-orchestration.
+spawned via ``spawn_detached`` (not starlette ``BackgroundTasks``). #57 PR-G2e-4/5:
+``derive_profile_from_jd`` (async cache path), ``materialize_and_score_job``, the
+``_upsert_user_job_async`` inline, and now ``resolve_current_payload`` (in
+``_apply_fit_score``) + ``register_source_from_url`` (in ``from_url``) all ride the
+async service client — the module holds no sync client. All are monkeypatched so
+the focus stays on orchestration.
 """
 
 from __future__ import annotations
@@ -216,10 +215,6 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
     # inline now (``persistence.upsert_user_job`` no longer imported here).
     monkeypatch.setattr(from_input, "_upsert_user_job_async", fake_upsert_user_job)
     monkeypatch.setattr(cost_log, "record_async", fake_cost_record_async)
-    # The two residual sync services (``resolve_current_payload`` in
-    # ``_apply_fit_score``, ``register_source_from_url`` in ``from_url``) still take
-    # a client from a DIRECT get_supabase() call.
-    monkeypatch.setattr(from_input, "get_supabase", lambda: MagicMock())
     return recorder
 
 
