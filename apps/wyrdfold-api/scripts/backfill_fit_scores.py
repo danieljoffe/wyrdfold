@@ -27,15 +27,14 @@ from app.services.targets.crud import (
     _parse_target,
 )
 from app.services.targets.fit_score import DEFAULT_PURPOSE, derive_fit_score
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill")
 
 
 async def backfill() -> int:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
 

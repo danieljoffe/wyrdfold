@@ -18,12 +18,11 @@ import traceback
 from app.config import settings
 from app.services.source_discovery import run_discovery_for_target
 from app.services.targets import crud
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 
 async def _run(target_id: str) -> None:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit("Supabase not configured — check .env / SUPABASE_URL")
 

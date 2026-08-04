@@ -45,7 +45,7 @@ from app.services.relevance.title_triage import (
     triage_titles,
 )
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("audit_phase1_fn")
@@ -137,8 +137,7 @@ async def _audit_target(
 
 
 async def main_async(*, sample_per_target: int, dry_run: bool, seed: int) -> int:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise RuntimeError("Supabase not configured — check .env")
     targets = get_active_targets(sb)

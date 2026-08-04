@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.dependencies import get_settings, get_supabase, require_bff_secret
+from app.dependencies import get_async_service_supabase, get_settings, require_bff_secret
 from app.main import app
 from app.rate_limit import limiter
 
@@ -68,7 +68,7 @@ def test_guard_accepts_correct_header() -> None:
 
 
 def _client(secret: str) -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret=secret)
     return TestClient(app)
 

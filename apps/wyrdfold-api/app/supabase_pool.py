@@ -2,9 +2,12 @@
 
 Two trust levels:
 
-- The **service-role** singleton (`get_supabase_pool`, sync / `get_async_supabase`,
-  async) — created once at startup, reused across requests, **bypasses RLS**.
-  Used by background work, shared-catalog writes, and the api-key/cron path.
+- The **service-role** singleton (`get_async_supabase`) — created once at
+  startup, reused across requests, **bypasses RLS**. Used by background work,
+  shared-catalog writes, the api-key/cron path, and every interactive dependency
+  since #57 PR-G2e-8 retired the sync service singleton. Standalone scripts that
+  run outside the app lifespan (no event loop, no singleton) build a one-off sync
+  service client via `create_service_client`.
 - The **per-request user client** (`get_async_user_client`) — built per request
   bound to the caller's JWT so Postgres RLS enforces per-user access (#79). Each
   call returns a fresh `AsyncClient` whose Authorization header carries that
@@ -23,14 +26,11 @@ from supabase.lib.client_options import AsyncClientOptions
 
 from app.config import settings
 
-_client: Client | None = None
-
-# Async service-role client (#57). Stood up alongside the sync ``_client`` so the
-# poller's hot DB paths can migrate off ``asyncio.to_thread`` onto native
-# coroutines one module at a time. Created in the app lifespan (``acreate_client``
-# is async) and reused across requests within the single event loop. Not wired
-# into any call path yet — this is the foundation slice; the migration is
-# incremental + load-tested (see #57).
+# Async service-role client (#57). Created in the app lifespan (``acreate_client``
+# is async) and reused across requests within the single event loop. Since
+# PR-G2e-8 this is the ONLY long-lived service-role client — the sync ``_client``
+# singleton it was stood up alongside is gone, and the last interactive deps
+# (auth / LLM-budget / LLM-client) now run on this one.
 _async_client: AsyncClient | None = None
 _async_httpx: httpx.AsyncClient | None = None
 
@@ -122,8 +122,8 @@ def _build_async_http2_client() -> httpx.AsyncClient:
 async def init_async_supabase() -> None:
     """Create the async service-role client (#57). Await in the app lifespan.
 
-    No-op when Supabase isn't configured (same guard as ``init_supabase``), so
-    local/test runs without a service-role key simply have no async client.
+    No-op when Supabase isn't configured, so local/test runs without a
+    service-role key simply have no async client.
     """
     global _async_client, _async_httpx
     if settings.supabase_url and settings.supabase_service_role_key:
@@ -195,24 +195,26 @@ async def close_async_user_client() -> None:
         _async_user_httpx = None
 
 
-def init_supabase() -> None:
-    global _client
-    if settings.supabase_url and settings.supabase_service_role_key:
-        # Force HTTP/1.1 on the service-role transport (see
-        # _build_http1_client) — the shared singleton must survive the
-        # poller's concurrent to_thread write burst.
-        options = ClientOptions(httpx_client=_build_http1_client())
-        _client = create_client(
-            settings.supabase_url,
-            settings.supabase_service_role_key,
-            options,
-        )
+def create_service_client() -> Client:
+    """Build a one-off sync service-role ``Client`` for standalone scripts.
 
+    Backfills / diagnostics / seeders under ``scripts/`` run as short-lived
+    processes OUTSIDE the app lifespan — no running event loop, no lifespan to
+    create the pooled async singleton — so they can't use ``get_async_supabase``.
+    This returns a freshly-built sync client on demand (NOT a reused singleton),
+    which is what lets the API request path carry no sync service client at all:
+    #57 PR-G2e-8 deleted the sync service-role singleton (and its lifespan
+    init/close) once the last three sync deps moved onto the async client.
 
-def get_supabase_pool() -> Client | None:
-    return _client
-
-
-def close_supabase() -> None:
-    global _client
-    _client = None
+    HTTP/1.1-pinned via ``_build_http1_client`` (see it for why) so a script that
+    fans work out across threads stays safe. Raises when the service-role
+    credentials aren't configured — a script has no meaningful fallback.
+    """
+    if not (settings.supabase_url and settings.supabase_service_role_key):
+        raise RuntimeError("Supabase service-role client not configured")
+    options = ClientOptions(httpx_client=_build_http1_client())
+    return create_client(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        options,
+    )

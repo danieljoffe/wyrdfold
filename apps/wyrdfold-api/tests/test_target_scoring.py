@@ -697,9 +697,9 @@ def test_list_jobs_without_target_returns_global_view(
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_service_supabase,
         get_async_supabase_for_caller,
         get_current_user_id_optional,
-        get_supabase,
         verify_api_key_or_jwt,
     )
     from app.main import app
@@ -729,7 +729,7 @@ def test_list_jobs_without_target_returns_global_view(
     supabase = MagicMock()
     supabase.table.return_value = jp_mock
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     # api-key caller (user_id None): dual-auth resolves the caller client to
     # the (async) service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
@@ -754,9 +754,9 @@ def test_list_jobs_with_target_overlays_target_score(
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_service_supabase,
         get_async_supabase_for_caller,
         get_current_user_id_optional,
-        get_supabase,
         verify_api_key_or_jwt,
     )
     from app.main import app
@@ -813,7 +813,7 @@ def test_list_jobs_with_target_overlays_target_score(
     # exactly as before — the await just needs an awaitable .execute().
     supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=None))
 
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     # api-key caller (user_id None): dual-auth resolves the caller client to
     # the (async) service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase

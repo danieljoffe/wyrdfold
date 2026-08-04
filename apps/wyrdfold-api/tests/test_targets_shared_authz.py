@@ -34,7 +34,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -62,7 +61,7 @@ def _clear_overrides():
 def _client(user_id: str | None) -> TestClient:
     # #57 slice 4: delete/deactivate/update handlers now hold the async service
     # client and inline their reads/writes; override both providers.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
     # get_current_user_id is JWT-required; the deactivate route uses it. When a

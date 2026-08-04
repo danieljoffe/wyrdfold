@@ -37,7 +37,7 @@ from app.services.fit import run_phase2_for_jobs
 from app.services.fit.phase2_runner import _fetch_phase2_state, _needs_phase2
 from app.services.llm import get_default_client as get_llm_client
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_phase2")
@@ -116,8 +116,7 @@ def _resolve_target_user(supabase: Any, target: JobTarget) -> tuple[str, Any] | 
 
 
 async def backfill(*, dry_run: bool, cap: int, target_id: str | None) -> int:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
 

@@ -72,7 +72,7 @@ import os
 from typing import Any
 
 from app.services.embeddings.job_embeddings import DEFAULT_MODEL
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 _PAGE = 1000
 
@@ -150,8 +150,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 def main() -> None:
     args = _parse_args()
 
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
 

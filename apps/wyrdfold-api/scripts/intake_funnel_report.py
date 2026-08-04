@@ -48,7 +48,7 @@ from supabase import Client
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("intake_funnel")
@@ -91,8 +91,7 @@ async def main() -> None:
     parser.add_argument("--days", type=int, default=35, help="Intake window (default 35).")
     args = parser.parse_args()
 
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit(
             "ERROR: Supabase not configured — check SUPABASE_URL + "

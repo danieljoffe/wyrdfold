@@ -186,19 +186,29 @@ async def test_end_to_end_stored_key_threads_through(
 # ---- DI layer: MissingUserKeyError → HTTP 402 -------------------------
 
 
-def test_get_llm_client_translates_missing_key_to_402(
+async def test_get_llm_client_translates_missing_key_to_402(
     monkeypatch: pytest.MonkeyPatch, openrouter_mode: None
 ) -> None:
     """The route-facing contract: a required-but-absent key surfaces as a
-    402 'add your key', not the raw domain error or a 500."""
+    402 'add your key', not the raw domain error or a 500. The dep is async
+    now (#57 PR-G2e-8): the JWT sub resolves off-loop and the BYOK read runs on
+    the async service client."""
     monkeypatch.setattr(settings, "byok_require_user_keys", True)
     monkeypatch.setattr(keys, "is_configured", lambda: True)
-    monkeypatch.setattr(keys, "get_key", lambda *a, **k: None)
-    # Force a resolved user + a configured pool without real JWT/Supabase.
-    monkeypatch.setattr(dependencies, "_try_decode_jwt_sub", lambda *a, **k: "user-1")
-    monkeypatch.setattr("app.supabase_pool.get_supabase_pool", lambda: object())
+
+    async def _no_key(*a: object, **k: object) -> None:
+        return None
+
+    monkeypatch.setattr(keys, "get_key_async", _no_key)
+
+    # Force a resolved user + a configured async pool without real JWT/Supabase.
+    async def _sub(*a: object, **k: object) -> str:
+        return "user-1"
+
+    monkeypatch.setattr(dependencies, "_try_decode_jwt_sub_async", _sub)
+    monkeypatch.setattr("app.supabase_pool.get_async_supabase", lambda: object())
     with pytest.raises(HTTPException) as exc:
-        dependencies.get_llm_client(SimpleNamespace(), settings)
+        await dependencies.get_llm_client(SimpleNamespace(), settings)
     assert exc.value.status_code == 402
     assert "key" in exc.value.detail.lower()
 

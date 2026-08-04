@@ -47,7 +47,7 @@ from app.services.embeddings.target_embeddings import (
 )
 from app.services.targets.crud import get_active as get_active_targets
 from app.services.targets.crud import get_all as get_all_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 
 def _parse_args() -> argparse.Namespace:
@@ -74,8 +74,7 @@ def _parse_args() -> argparse.Namespace:
 async def main() -> None:
     args = _parse_args()
 
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
 

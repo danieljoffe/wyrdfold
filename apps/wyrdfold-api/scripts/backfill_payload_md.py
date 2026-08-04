@@ -25,7 +25,7 @@ from app.services.tailor.markdown_render import (
     to_markdown,
     to_markdown_cover_letter,
 )
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_payload_md")
@@ -43,8 +43,7 @@ def _serialize(row: dict[str, Any]) -> str:
 
 def backfill(*, dry_run: bool) -> tuple[int, int]:
     """Returns (updated, failed)."""
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
 

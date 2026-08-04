@@ -20,7 +20,6 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -60,7 +59,7 @@ def _user_target() -> UserTarget:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     # GET /targets/{id} now resolves the caller via the optional dep and
