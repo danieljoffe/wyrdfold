@@ -25,6 +25,7 @@ from app.services.target_scoring import (
     bulk_score_for_target,
     bulk_score_for_target_async,
     bulk_title_score_for_target,
+    bulk_title_score_for_target_async,
     get_target_scores,
     score_and_upsert,
 )
@@ -840,21 +841,26 @@ def test_rescore_endpoint_returns_count(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import verify_api_key, verify_api_key_or_jwt
+    from app.dependencies import (
+        get_async_service_supabase,
+        verify_api_key,
+        verify_api_key_or_jwt,
+    )
     from app.main import app
     from app.routers import jobs as jobs_router
 
     target = _target()
-    monkeypatch.setattr(jobs_router, "get_target", lambda *_a, **_kw: target)
-    monkeypatch.setattr(jobs_router, "bulk_score_for_target", lambda *_a, **_kw: 42)
-
-    supabase = MagicMock()
-    # #57 slice 4: the sync service client is fetched in-body, not a Depends.
-    monkeypatch.setattr(jobs_router, "get_supabase", lambda: supabase)
+    # #57 PR-G2e-4: /rescore runs on the async service client via the router-inline
+    # ``_get_target_async`` + the ``bulk_score_for_target_async`` twin.
+    monkeypatch.setattr(jobs_router, "_get_target_async", AsyncMock(return_value=target))
+    monkeypatch.setattr(
+        jobs_router, "bulk_score_for_target_async", AsyncMock(return_value=42)
+    )
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     # /rescore now requires the operator-only ``verify_api_key`` dep —
     # not callable from the FE, so the route's auth model is api-key.
     app.dependency_overrides[verify_api_key] = lambda: "test"
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -872,16 +878,18 @@ def test_rescore_endpoint_missing_target_returns_404(
 ) -> None:
     from fastapi.testclient import TestClient
 
-    from app.dependencies import verify_api_key, verify_api_key_or_jwt
+    from app.dependencies import (
+        get_async_service_supabase,
+        verify_api_key,
+        verify_api_key_or_jwt,
+    )
     from app.main import app
     from app.routers import jobs as jobs_router
 
-    monkeypatch.setattr(jobs_router, "get_target", lambda *_a, **_kw: None)
-
-    supabase = MagicMock()
-    monkeypatch.setattr(jobs_router, "get_supabase", lambda: supabase)
+    monkeypatch.setattr(jobs_router, "_get_target_async", AsyncMock(return_value=None))
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[verify_api_key] = lambda: "test"
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
 
     try:
         tc = TestClient(app)
@@ -1284,13 +1292,32 @@ class _RetroSupabase:
         resp.data = rows
         return resp
 
-    def execute(self) -> MagicMock:
+    def _read_resp(self) -> MagicMock:
         rows = self._jobs
         if self._after is not None:
             rows = [j for j in rows if j["id"] > self._after]
         rows = rows[: (self._limit or len(rows))]
         resp = MagicMock()
         resp.data = rows
+        return resp
+
+    def execute(self) -> MagicMock:
+        return self._read_resp()
+
+
+class _AsyncRetroSupabase(_RetroSupabase):
+    """Async twin of ``_RetroSupabase`` — the keyset ``jobs`` read and the
+    per-page ``scores`` upsert are both awaited on the loop, so ``execute`` is a
+    coroutine (the ``bulk_title_score_for_target_async`` contract, #57 PR-G2e-4)."""
+
+    async def execute(self) -> MagicMock:  # type: ignore[override]
+        return self._read_resp()
+
+    def upsert(self, rows: list[dict[str, Any]], **_k: object) -> MagicMock:
+        self.upsert_calls.append(rows)
+        resp = MagicMock()
+        resp.data = rows
+        resp.execute = AsyncMock(return_value=MagicMock(data=rows))
         return resp
 
 
@@ -1362,6 +1389,43 @@ def test_bulk_title_score_no_matches_writes_nothing(
     target = _target(core={"React": 3})
 
     written = bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
+
+    assert written == 0
+    assert supabase.upsert_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_title_score_async_matches_sync_batching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async twin (activation pipeline path) produces the identical
+    per-page batching + row set as the sync version — both build rows via the
+    shared ``_title_score_page_rows`` (#57 PR-G2e-4)."""
+    import app.services.target_scoring as ts
+
+    monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)  # force multi-page
+
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+    target = _target(core={"React": 3})
+
+    written = await bulk_title_score_for_target_async(supabase, target)  # type: ignore[arg-type]
+
+    assert written == 3
+    assert [len(c) for c in supabase.upsert_calls] == [1, 2]
+    upserted = [r for call in supabase.upsert_calls for r in call]
+    assert {r["job_posting_id"] for r in upserted} == {"j01", "j05", "j06"}
+    assert all(r["scoring_status"] == "stage1" for r in upserted)
+    by_id = {r["job_posting_id"]: r for r in upserted}
+    assert by_id["j05"]["excluded"] is True
+    assert by_id["j01"]["excluded"] is False
+
+
+@pytest.mark.asyncio
+async def test_bulk_title_score_async_empty_catalog_writes_nothing() -> None:
+    supabase = _AsyncRetroSupabase([])
+    target = _target(core={"React": 3})
+
+    written = await bulk_title_score_for_target_async(supabase, target)  # type: ignore[arg-type]
 
     assert written == 0
     assert supabase.upsert_calls == []

@@ -634,6 +634,33 @@ _BATCH_CHUNK_SIZE = 100  # chunk bound for .in_() reads (414-guard)
 _RETRO_TITLE_BATCH_SIZE = 500
 
 
+def _title_score_page_rows(rows: list[dict[str, Any]], target: JobTarget) -> list[dict[str, Any]]:
+    """Stage-1 title-score one page of ``jobs`` rows for ``target`` and build the
+    ``scores`` upsert rows. The shared pure compute of
+    :func:`bulk_title_score_for_target` and its async twin
+    :func:`bulk_title_score_for_target_async`, so the title-scoring math can never
+    drift between them. No IO — the caller owns the read/write round-trips (and
+    the async twin off-loads this to a thread, #107)."""
+    rows_to_upsert: list[dict[str, Any]] = []
+    for row in rows:
+        result = _title_score_result(row["title"], target)
+        if result is None:
+            continue
+        rows_to_upsert.append(
+            _score_row_payload(
+                job_posting_id=row["id"],
+                target_id=target.id,
+                score=result.score,
+                breakdown=result.breakdown,
+                matched_keywords=result.matched_keywords,
+                excluded=result.excluded,
+                scoring_status="stage1",
+                scored_profile_version=target.profile_version,
+            )
+        )
+    return rows_to_upsert
+
+
 def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
     """Stage-1 title-score every posting in ``jobs`` against ``target``,
     writing matches in bulk. Returns the number of score rows written.
@@ -663,28 +690,49 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
         if not rows:
             break
 
-        rows_to_upsert: list[dict[str, Any]] = []
-        for row in rows:
-            result = _title_score_result(row["title"], target)
-            if result is None:
-                continue
-            rows_to_upsert.append(
-                _score_row_payload(
-                    job_posting_id=row["id"],
-                    target_id=target.id,
-                    score=result.score,
-                    breakdown=result.breakdown,
-                    matched_keywords=result.matched_keywords,
-                    excluded=result.excluded,
-                    scoring_status="stage1",
-                    scored_profile_version=target.profile_version,
-                )
-            )
-
+        rows_to_upsert = _title_score_page_rows(rows, target)
         if rows_to_upsert:
             supabase.table(TABLE).upsert(
                 rows_to_upsert, on_conflict="job_posting_id,target_id"
             ).execute()
+            written += len(rows_to_upsert)
+
+        if len(rows) < _RETRO_TITLE_BATCH_SIZE:
+            break
+        after_id = rows[-1]["id"]
+
+    return written
+
+
+async def bulk_title_score_for_target_async(supabase: AsyncClient, target: JobTarget) -> int:
+    """Async twin of :func:`bulk_title_score_for_target` (#57 PR-G2e-4).
+
+    For the target-activation pipeline on the pooled async service client — the
+    sync version stays for its tests / any not-yet-async caller. Identical
+    keyset-paged retro-score contract and identical scoring math (both build rows
+    via :func:`_title_score_page_rows`); the ``jobs`` read and the ``scores``
+    upsert are awaited on the loop, and the per-page keyword compute is off-loaded
+    to a thread (#107)."""
+    written = 0
+    after_id: str | None = None
+    while True:
+        query = (
+            supabase.table("jobs").select("id, title").order("id").limit(_RETRO_TITLE_BATCH_SIZE)
+        )
+        if after_id is not None:
+            query = query.gt("id", after_id)
+        resp = await query.execute()
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if not rows:
+            break
+
+        rows_to_upsert = await asyncio.to_thread(_title_score_page_rows, rows, target)
+        if rows_to_upsert:
+            await (
+                supabase.table(TABLE)
+                .upsert(rows_to_upsert, on_conflict="job_posting_id,target_id")
+                .execute()
+            )
             written += len(rows_to_upsert)
 
         if len(rows) < _RETRO_TITLE_BATCH_SIZE:

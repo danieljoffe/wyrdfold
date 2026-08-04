@@ -19,6 +19,7 @@ from supabase import AsyncClient, Client
 from app.background import spawn_detached
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.config import settings
+from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
     get_async_service_supabase,
@@ -32,6 +33,7 @@ from app.dependencies import (
 )
 from app.http_client import ResponseTooLargeError, UnsafeURLError, get_with_size_cap
 from app.models.diagnostics import TargetFunnelResponse
+from app.models.experience import OptimizedDoc
 from app.models.learning import ProfilePatch
 from app.models.schemas import PollResult
 from app.models.targets import (
@@ -66,6 +68,7 @@ from app.models.targets import (
 )
 from app.rate_limit import limiter
 from app.services.diagnostics.funnel import compute_target_funnel_async
+from app.services.entitlements import entitlements_for
 from app.services.experience import optimized
 from app.services.experience.resolve import resolve_current_payload
 from app.services.extract import (
@@ -81,7 +84,7 @@ from app.services.source_discovery import (
     DiscoveryRunStats,
     run_discovery_for_target,
 )
-from app.services.target_scoring import bulk_title_score_for_target
+from app.services.target_scoring import bulk_title_score_for_target_async
 from app.services.targets import crud, fit_refresh, from_input, votes
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
@@ -103,7 +106,7 @@ from app.services.targets.lateral_discovery import (
     LateralSuggestions,
     suggest_lateral_targets,
 )
-from app.services.targets.learning_projection import project_profile_impact
+from app.services.targets.learning_projection import project_profile_impact_async
 from app.services.targets.match import (
     suggest_and_match,
     suggest_and_match_from_query,
@@ -715,15 +718,109 @@ async def _set_preferences_async(
     return crud.preferences_from_user_target(crud._parse_user_target(rows[0]))
 
 
-async def _activate_pipeline(
-    supabase: Client, llm: LLMClient, target: JobTarget, user_id: str
-) -> None:
-    """Derive profile (if needed) then poll jobs for a target. Runs as BackgroundTask.
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (the sync twin stays for the
+    poller / suggestion chain). Reads fresh: the module TTL cache is populated
+    only by those sync callers and every write invalidates it. Mirrors
+    ``analysis._optimized_latest``."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
 
-    Genuinely async (awaits the LLM derive + the poller), so it stays
-    ``async def`` and runs on the event loop. supabase-py is synchronous, so
-    each blocking ``crud``/``optimized`` round-trip is offloaded via
-    ``asyncio.to_thread`` to keep it off the loop. See #107.
+
+async def _count_active_for_user_async(supabase: AsyncClient, user_id: str) -> int:
+    """Async inline of ``crud.count_active_for_user`` — the user's active-link count."""
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("id", count=CountMethod.exact)
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    return resp.count or 0
+
+
+async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str) -> int:
+    """Async inline of ``crud.effective_active_target_cap`` — per-user override →
+    plan tier (saas) → global default. Reuses the same ``entitlements_for``
+    resolution so the cap can't drift from the sync path."""
+    resp = await (
+        supabase.table("user_profiles")
+        .select("max_active_targets,plan")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    override = rows[0].get("max_active_targets") if rows else None
+    if override is not None:
+        return int(override)
+    if settings.deployment_mode == "saas":
+        plan = cast("str | None", rows[0].get("plan")) if rows else None
+        return entitlements_for(plan).max_active_targets
+    return crud.MAX_ACTIVE_TARGETS_PER_USER
+
+
+async def _link_user_to_target_async(
+    supabase: AsyncClient, *, user_id: str, target_id: str, is_active: bool = True
+) -> UserTarget:
+    """Async inline of ``crud.link_user_to_target`` (crud stays sync for its
+    poller/operator callers, #57 PR-G2e-4). Same active-cap contract: raises
+    ``crud.ActiveTargetLimitError`` only when this upsert introduces a NEW active
+    link that would push the user over the cap (re-activating an already-active
+    link is exempt so idempotent refreshes stay free)."""
+    if is_active:
+        existing_resp = await (
+            supabase.table(crud.USER_TARGETS_TABLE)
+            .select("is_active")
+            .eq("user_id", user_id)
+            .eq("target_id", target_id)
+            .limit(1)
+            .execute()
+        )
+        existing = cast(list[dict[str, Any]], existing_resp.data or [])
+        already_active = bool(existing and existing[0].get("is_active"))
+        if not already_active:
+            current = await _count_active_for_user_async(supabase, user_id)
+            cap = await _effective_active_target_cap_async(supabase, user_id)
+            if current >= cap:
+                raise crud.ActiveTargetLimitError(current, cap)
+
+    row: dict[str, Any] = {
+        "user_id": user_id,
+        "target_id": target_id,
+        "is_active": is_active,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .upsert(row, on_conflict="user_id,target_id")
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError("Failed to upsert user_targets row")
+    return crud._parse_user_target(rows[0])
+
+
+async def _activate_pipeline(
+    supabase: AsyncClient, llm: LLMClient, target: JobTarget, user_id: str
+) -> None:
+    """Derive profile (if needed) then poll jobs for a target. Runs as a detached
+    loop task.
+
+    Genuinely async (awaits the LLM derive + the poller). Reads/writes ride the
+    pooled async service client via the router-inline helpers + async twins
+    (``_update_target_async`` / ``_optimized_latest`` / ``cost_log.record_async``
+    / ``poll_sources_for_target`` / ``bulk_title_score_for_target_async``), all
+    awaited on the loop (#57 PR-G2e-4).
     """
     target_id = target.id
     needs_derive = not target.search_keywords or not target.scoring_profile.categories
@@ -731,34 +828,26 @@ async def _activate_pipeline(
     try:
         if needs_derive:
             # Step 1: derive profile + search keywords from label
-            await asyncio.to_thread(
-                crud.update,
-                supabase,
-                target_id,
-                TargetUpdate(activation_status="deriving"),
+            await _update_target_async(
+                supabase, target_id, TargetUpdate(activation_status="deriving")
             )
-            doc = await asyncio.to_thread(optimized.get_latest, supabase, user_id=user_id)
+            doc = await _optimized_latest(supabase, user_id)
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
-                await asyncio.to_thread(
-                    crud.update,
-                    supabase,
-                    target_id,
-                    TargetUpdate(activation_status="error"),
+                await _update_target_async(
+                    supabase, target_id, TargetUpdate(activation_status="error")
                 )
                 return
 
             derived, result = await derive_profile_from_label(llm, label=target.label)
-            await asyncio.to_thread(
-                cost_log.record,
+            await cost_log.record_async(
                 supabase,
                 user_id=user_id,
                 purpose=DERIVE_LABEL_PURPOSE,
                 result=result,
                 metadata={"target_id": target_id, "trigger": "activation"},
             )
-            updated = await asyncio.to_thread(
-                crud.update,
+            updated = await _update_target_async(
                 supabase,
                 target_id,
                 TargetUpdate(
@@ -780,11 +869,8 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        await asyncio.to_thread(
-            crud.update,
-            supabase,
-            target_id,
-            TargetUpdate(activation_status="polling"),
+        await _update_target_async(
+            supabase, target_id, TargetUpdate(activation_status="polling")
         )
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
@@ -802,26 +888,20 @@ async def _activate_pipeline(
         # database. ``score_title_and_upsert`` returns ``None`` (no row
         # written) when no keywords match, so this only creates rows where
         # the title actually scores against the new profile.
-        retro_scored = await asyncio.to_thread(bulk_title_score_for_target, supabase, target)
+        retro_scored = await bulk_title_score_for_target_async(supabase, target)
         logger.info(
             "Activation pipeline for target %s: retro-scored %d existing jobs",
             target_id,
             retro_scored,
         )
 
-        await asyncio.to_thread(
-            crud.update,
-            supabase,
-            target_id,
-            TargetUpdate(activation_status="ready"),
+        await _update_target_async(
+            supabase, target_id, TargetUpdate(activation_status="ready")
         )
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
-        await asyncio.to_thread(
-            crud.update,
-            supabase,
-            target_id,
-            TargetUpdate(activation_status="error"),
+        await _update_target_async(
+            supabase, target_id, TargetUpdate(activation_status="error")
         )
 
 
@@ -1272,11 +1352,11 @@ async def update_target(
     return target
 
 
-# Async: the blocking supabase reads/link are offloaded via ``to_thread``
-# (#107), and the LLM/poll pipeline is spawned as a DETACHED task on the
-# loop — not a starlette BackgroundTask, whose machinery deadlocks the
-# pooled async DB client under uvloop once POLLER_ASYNC_DB routes the
-# pipeline's poll fan-out through it (see ``app/background.py``).
+# Async: the target read + the active-cap link run natively on the pooled async
+# service client via the router-inline helpers (#57 PR-G2e-4), and the LLM/poll
+# pipeline is spawned as a DETACHED task on the loop — not a starlette
+# BackgroundTask, whose machinery deadlocks the pooled async DB client under
+# uvloop once the pipeline's poll fan-out routes through it (``app/background.py``).
 @router.post(
     "/{target_id}/activate",
     response_model=JobTarget,
@@ -1284,17 +1364,16 @@ async def update_target(
 )
 async def activate_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
-    target = await asyncio.to_thread(crud.get, supabase, target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
     try:
-        await asyncio.to_thread(
-            crud.link_user_to_target,
+        await _link_user_to_target_async(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -1317,7 +1396,7 @@ async def activate_target(
                 ),
             },
         ) from e
-    refreshed = await asyncio.to_thread(crud.get, supabase, target_id) or target
+    refreshed = await _target_get(supabase, target_id) or target
 
     spawn_detached(
         _activate_pipeline(supabase, llm, refreshed, user_id),
@@ -1668,15 +1747,18 @@ async def link_target(
 )
 async def poll_jobs_for_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> PollResult:
     """Poll all job sources, filtering for jobs matching this target's search keywords.
 
     Admin / operator-only: gated by ``verify_api_key`` so an
     unauthenticated caller can't trigger a fan-out poll across all
     configured ATS sources. Not reachable from the wyrdfold FE.
+
+    The target read runs natively on the async service client; the poller accepts
+    it (``PollClient = Client | AsyncClient``, #57 PR-G2d-b/G2e-4).
     """
-    target = await asyncio.to_thread(crud.get, supabase, target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
     if not target.search_keywords:
@@ -2000,18 +2082,14 @@ async def add_reference_jd(
     Genuinely async (awaits URL validation, the JD fetch, and the LLM
     derive). The shared-catalog reads/writes ride the async service client via
     the router-inline helpers + the #191 merge RPC's async twin; the
-    not-yet-async ``derive_profile_from_jd`` content cache + ``project_profile_impact``
-    take a locally-obtained sync client, offloaded via ``asyncio.to_thread``. See #107.
+    ``derive_profile_from_jd`` content cache + ``project_profile_impact_async``
+    now run on that same async client too (#57 PR-G2e-4).
     """
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     # Verify target exists
     target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
-
-    # ``derive_profile_from_jd`` (content-hash cache) + ``project_profile_impact``
-    # are not-yet-async and take the sync service client (jobs.py pattern).
-    svc = get_supabase()
 
     # Cap reference-JD contributions per user per target (#47): bounds a single
     # (possibly rogue) contributor's footprint on the shared profile, on top of
@@ -2066,7 +2144,7 @@ async def add_reference_jd(
     # An empty/garbage JD (failed fetch, paywall) is rejected before it can
     # poison the shared target's cached profile (#47).
     try:
-        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=svc)
+        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     await cost_log.record_async(
@@ -2128,11 +2206,10 @@ async def add_reference_jd(
         # Project the full "after" state: the merge installs the new JD's
         # derived search_keywords alongside the profile, and keywords feed
         # scoring — evaluating the new profile under the OLD keywords would
-        # misjudge outliers (Copilot on #204). ``project_profile_impact`` is
-        # not-yet-async → sync client, offloaded via ``to_thread``.
-        projection = await asyncio.to_thread(
-            project_profile_impact,
-            svc,
+        # misjudge outliers (Copilot on #204). Runs on the async service client
+        # via the G2e-3 twin (#57 PR-G2e-4).
+        projection = await project_profile_impact_async(
+            supabase,
             target_id,
             prev_profile,
             composite.model_dump(),

@@ -23,7 +23,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -133,13 +132,11 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     monkeypatch.setattr("app.routers.targets.derive_profile_from_jd", _derive)
     monkeypatch.setattr("app.routers.targets.cost_log.record_async", AsyncMock())
-    # The handler acquires the sync client for derive/project via a DIRECT
-    # ``get_supabase()`` call (not Depends), so dependency_overrides can't reach
-    # it — patch the module-level name.
-    monkeypatch.setattr("app.routers.targets.get_supabase", lambda: sb)
+    # #57 PR-G2e-4: the handler runs derive (async cache path) + the projection
+    # (``project_profile_impact_async``) on the injected async service client, so
+    # ``sb`` is supplied via the ``get_async_service_supabase`` override below.
 
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: None
-    app.dependency_overrides[get_supabase] = lambda: sb
     app.dependency_overrides[get_async_service_supabase] = lambda: sb
     app.dependency_overrides[get_llm_client] = lambda: object()
     app.dependency_overrides[get_current_user_id_optional] = lambda: _USER
@@ -158,8 +155,8 @@ def _post(client_body: dict[str, Any] | None = None) -> Any:
 def test_capped_contribution_is_quarantined_not_applied(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = MagicMock(name="project", return_value=_capped_projection())
-    monkeypatch.setattr("app.routers.targets.project_profile_impact", project)
+    project = AsyncMock(name="project", return_value=_capped_projection())
+    monkeypatch.setattr("app.routers.targets.project_profile_impact_async", project)
     rpc = AsyncMock(name="merge_rpc")
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
@@ -189,7 +186,9 @@ def test_capped_contribution_is_quarantined_not_applied(
 def test_uncapped_contribution_writes_through_merge_rpc(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "app.routers.targets.project_profile_impact_async", AsyncMock(return_value=None)
+    )
     rpc = AsyncMock(name="merge_rpc", return_value=("applied", 4))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
@@ -209,7 +208,9 @@ def test_uncapped_contribution_writes_through_merge_rpc(
 def test_unresolvable_version_conflict_is_409(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "app.routers.targets.project_profile_impact_async", AsyncMock(return_value=None)
+    )
     rpc = AsyncMock(name="merge_rpc", return_value=("version_conflict", 9))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 

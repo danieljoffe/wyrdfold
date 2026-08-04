@@ -85,13 +85,16 @@ def test_manual_job_ssrf_rejection_is_generic(monkeypatch) -> None:  # type: ign
     monkeypatch.setattr(validate_mod, "_resolve_addresses", _internal)
 
     from app.dependencies import (
+        get_async_service_supabase,
         get_async_supabase_for_caller,
         get_current_user_id_optional,
-        get_supabase,
         verify_api_key_or_jwt,
     )
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    # #57 PR-G2e-4: /jobs/manual acquires the service client via
+    # ``get_async_service_supabase``; provide it so the handler body runs and the
+    # SSRF check (not a 503 for an unconfigured client) is what rejects the URL.
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-a"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-a"

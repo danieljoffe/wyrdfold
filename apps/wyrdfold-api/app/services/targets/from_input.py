@@ -27,11 +27,14 @@ poller/learner — see the ``_link`` etc. helpers below), the cost ledger via
 same async pool, so they are spawned as DETACHED loop tasks
 (``spawn_detached``) rather than starlette ``BackgroundTasks`` — the latter
 deadlocks the pooled async client under uvloop (see ``app/background.py``).
-The few genuinely-not-yet-async deep services (``resolve_current_payload``,
-``derive_profile_from_jd`` content-cache, ``materialize_and_score_job``,
-``persistence.upsert_user_job``, ``register_source_from_url``) still want a
-SYNC service client, obtained locally via ``get_supabase()`` and offloaded
-with ``asyncio.to_thread`` — the ``routers/jobs.py`` materialize pattern.
+The derive → contribute → fit → materialize chain now rides the async service
+client end to end (#57 PR-G2e-4: ``derive_profile_from_jd`` async cache path,
+async ``materialize_and_score_job``, the ``_upsert_user_job_async`` inline). Two
+deep services stay on a locally-obtained SYNC ``get_supabase()`` client, offloaded
+with ``asyncio.to_thread`` — they belong to out-of-slice verticals:
+``resolve_current_payload`` (experience/prose: ``prose.get_latest`` +
+``optimized.get_latest``) in ``_apply_fit_score``, and ``register_source_from_url``
+(source registration) in ``from_url``.
 """
 
 from __future__ import annotations
@@ -66,7 +69,6 @@ from app.services.job_ingest import materialize_and_score_job
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.source_registration import register_source_from_url
-from app.services.tailor import persistence
 from app.services.targets import crud
 from app.services.targets.derive_profile import (
     DEFAULT_PURPOSE as DERIVE_JD_PURPOSE,
@@ -276,6 +278,25 @@ async def _count_user_reference_jds(
 
 
 # ---- Deferred fit-score helper ---------------------------------------------
+
+
+async def _upsert_user_job_async(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Async inline of ``persistence.upsert_user_job`` — the per-user pipeline
+    status write (``user_jobs``). ``persistence.upsert_user_job`` stays sync for
+    the not-yet-converted callers, so the deferred URL derive inlines the same
+    upsert rather than fork a twin (#57 PR-G2e-4 — mirrors
+    ``jobs._upsert_user_job_async``)."""
+    await supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
 
 
 async def _apply_fit_score(
@@ -500,16 +521,14 @@ async def derive_url_target_bg(
     ``POST /targets/{id}/reference-jds`` (SEC-1). On failure (or timeout) the
     target flips to ``error``.
     """
-    # ``derive_profile_from_jd`` (content-hash cache), ``materialize_and_score_job``
-    # and ``persistence.upsert_user_job`` are not-yet-async and take a SYNC
-    # service client; obtain one locally and offload their blocking round-trips
-    # with ``to_thread`` (jobs.py materialize pattern). Everything else rides the
-    # async client.
-    svc = get_supabase()
+    # The whole derive → contribute → fit → materialize chain now rides the async
+    # service client: ``derive_profile_from_jd`` takes it (async cache path),
+    # ``materialize_and_score_job`` is async, and the ``user_jobs`` write goes
+    # through the ``_upsert_user_job_async`` inline (#57 PR-G2e-4).
     try:
         async with asyncio.timeout(DERIVATION_TIMEOUT_S):
             derived, derive_result = await derive_profile_from_jd(
-                llm, jd_text=jd_text, supabase=svc
+                llm, jd_text=jd_text, supabase=supabase
             )
             await cost_log.record_async(
                 supabase,
@@ -545,7 +564,7 @@ async def derive_url_target_bg(
             # via materialize_and_score_job. Without this the URL was dissolved
             # into the target profile as a reference JD and never became a job.
             posting_id = await materialize_and_score_job(
-                svc,
+                supabase,
                 final_url=final_url,
                 title=extracted_title,
                 company_name=company_name,
@@ -555,9 +574,8 @@ async def derive_url_target_bg(
                 targets=[target],
             )
             if posting_id is not None:
-                await asyncio.to_thread(
-                    persistence.upsert_user_job,
-                    svc,
+                await _upsert_user_job_async(
+                    supabase,
                     user_id=user_id,
                     job_posting_id=posting_id,
                     status="saved",
