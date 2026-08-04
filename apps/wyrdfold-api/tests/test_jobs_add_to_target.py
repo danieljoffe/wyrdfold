@@ -29,6 +29,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
     verify_api_key_or_jwt,
@@ -83,12 +84,15 @@ def _wire(
 ) -> None:
     """Patch the router's collaborators and capture which client each receives.
 
-    Post-#57 the handler is ``async``: the ownership reads are awaited on the
-    async user client (``_load_live_job`` / ``_get_user_target_async``), and the
-    service-role writes run on a sync service client fetched in-body via
-    ``get_supabase()``. ``score_and_upsert`` is now awaited directly (so its stub
-    is ``async``); ``get_target`` / ``upsert_user_job`` are still sync, driven
-    off-loop via ``to_thread``."""
+    Post-#57 PR-G2d-a the handler is fully ``async``: the ownership reads are
+    awaited on the async user client (``_load_live_job`` / ``_get_user_target_
+    async``), and ALL service-role writes ride the pooled async service client
+    injected via ``get_async_service_supabase``. The target read is now the async
+    inline ``_get_target_async``; the score write is the always-gated async twin
+    ``score_and_upsert_async``; the pipeline 'saved' write is ``_upsert_user_job_
+    async`` — every collaborator stub is ``async`` and receives the service
+    client. The force-include still runs the real ``_user_set_scores_included_
+    async``, so ``service_sb.rpc(...).execute`` is made awaitable below."""
 
     async def fake_load_live_job(sb, jid):
         return job
@@ -97,7 +101,8 @@ def _wire(
         captured["ownership_client"] = sb
         return object() if follows_target else None
 
-    def fake_get_target(sb, tid):
+    async def fake_get_target(sb, tid):
+        captured["target_client"] = sb
         return target
 
     async def fake_score_and_upsert(sb, **kwargs):
@@ -105,7 +110,7 @@ def _wire(
         captured["score_kwargs"] = kwargs
         return _fake_score()
 
-    def fake_upsert_user_job(sb, **kwargs):
+    async def fake_upsert_user_job(sb, **kwargs):
         captured["userjob_client"] = sb
         captured["userjob_kwargs"] = kwargs
 
@@ -114,14 +119,17 @@ def _wire(
 
     monkeypatch.setattr("app.routers.jobs._load_live_job", fake_load_live_job)
     monkeypatch.setattr("app.routers.jobs._get_user_target_async", fake_get_user_target)
-    monkeypatch.setattr("app.routers.jobs.get_target", fake_get_target)
-    monkeypatch.setattr("app.routers.jobs.score_and_upsert", fake_score_and_upsert)
+    monkeypatch.setattr("app.routers.jobs._get_target_async", fake_get_target)
+    monkeypatch.setattr("app.routers.jobs.score_and_upsert_async", fake_score_and_upsert)
     monkeypatch.setattr("app.routers.jobs.materialize_and_score_job", _boom)
-    monkeypatch.setattr("app.routers.jobs.persistence.upsert_user_job", fake_upsert_user_job)
-    # The service-role client is now fetched in-body (not injected as a Depends).
-    monkeypatch.setattr("app.routers.jobs.get_supabase", lambda: service_sb)
+    monkeypatch.setattr("app.routers.jobs._upsert_user_job_async", fake_upsert_user_job)
+    # The force-include runs the real ``_user_set_scores_included_async``, which
+    # awaits ``service_sb.rpc(...).execute()`` — make that terminal call awaitable
+    # so the assertion on ``service_sb.rpc`` still holds.
+    service_sb.rpc.return_value.execute = AsyncMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
     app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: service_sb
     app.dependency_overrides[get_current_user_id] = lambda: _USER_ID
 
 
@@ -154,8 +162,10 @@ def test_add_to_target_writes_via_service_role_ownership_checked_on_caller(
     # aren't authenticated-executable); ownership was checked on the caller's
     # client. This is the regression the prod 502 exposed.
     assert captured["ownership_client"] is user_sb  # get_user_target on caller
+    assert captured["target_client"] is service_sb  # target read on service client
     assert captured["score_client"] is service_sb
-    assert captured["score_kwargs"]["gated"] is True
+    # ``score_and_upsert_async`` is the always-gated twin (routes through the
+    # user_upsert_score ownership RPC) — using it IS the gated write path.
     assert captured["score_kwargs"]["job_posting_id"] == _JOB_ID
     assert captured["userjob_client"] is service_sb
     assert captured["userjob_kwargs"]["status"] == "saved"

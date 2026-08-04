@@ -332,6 +332,56 @@ async def score_and_upsert(
     )
 
 
+async def score_and_upsert_async(
+    supabase: AsyncClient,
+    *,
+    job_posting_id: str,
+    title: str,
+    description_html: str,
+    target: JobTarget,
+    parsed_jd: ParsedJD | None = None,
+    excluded_by_prefilter: bool = False,
+    promising: bool | None = None,
+    phase1_confidence: int | None = None,
+) -> JobTargetScore:
+    """Async-client twin of :func:`score_and_upsert` for the interactive
+    manual-add path on the pooled async service client (#57 PR-G2d-a).
+
+    Always **gated** — the write goes through the ``user_upsert_score`` ownership
+    RPC (SEC-H2; with a service-role client ``auth.uid()`` is NULL so it takes the
+    function's service-role-exempt branch). The heavy full-JD scoring stays off
+    the loop in the executor; only the single RPC round-trip lands on it, natively
+    on the passed async client. The sync :func:`score_and_upsert` stays for the
+    poller/rescore bulk paths (non-gated, write-herd-bounded), which this twin
+    deliberately does not cover.
+    """
+    result = await asyncio.to_thread(
+        _stage2_score_result,
+        title,
+        description_html,
+        target,
+        parsed_jd=parsed_jd,
+        excluded_by_prefilter=excluded_by_prefilter,
+    )
+    row = _score_row_payload(
+        job_posting_id=job_posting_id,
+        target_id=target.id,
+        score=result.score,
+        breakdown=result.breakdown,
+        matched_keywords=result.matched_keywords,
+        excluded=result.excluded,
+        scoring_status="stage2",
+        scored_profile_version=target.profile_version,
+        promising=promising,
+        phase1_confidence=phase1_confidence,
+    )
+    resp = await execute_with_retry(
+        supabase.rpc("user_upsert_score", {"p_row": row}).execute,
+        label="scores upsert (gated)",
+    )
+    return _parse_upsert_response(resp)
+
+
 # Page size for streaming stale ``scores`` rows in ``bulk_score_for_target``.
 # Kept as a module constant so peak memory is bounded to one page and so tests
 # can shrink it to exercise the multi-page streaming path cheaply.

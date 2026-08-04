@@ -816,3 +816,52 @@ def reject_staged_patch(supabase: Client, *, user_id: str, run_id: str) -> Learn
         log=TargetLearningLogRow.model_validate(rows[0]),
         applied=False,
     )
+
+
+# ---- Async router drivers (#57 PR-G2d-a) ----------------------------------
+# The LLM-learner router handlers are ``async def`` on the pooled async service
+# client, but this whole chain stays SYNC (shared #191 profile-write RPCs + the
+# sync re-score projection, poller-shared). These seams acquire the pooled sync
+# service client in the service layer and drive the sync work off the event loop,
+# so the router body never holds ``get_supabase``.
+
+
+async def run_llm_learner_off_loop(
+    llm: LLMClient, *, user_id: str, target_id: str
+) -> LearningRunResult | None:
+    """Router driver for ``POST /targets/{id}/learn-llm`` (#57 PR-G2d-a).
+
+    :func:`run_llm_learner` is itself ``async`` (it awaits the LLM) but its DB
+    work leans on the shared sync #191 RPC + the sync re-score projection, which
+    it manages off-loop internally — so the handler awaits it here on the pooled
+    sync service client without holding one itself."""
+    from app.dependencies import get_supabase
+
+    return await run_llm_learner(get_supabase(), llm, user_id=user_id, target_id=target_id)
+
+
+async def apply_staged_patch_off_loop(
+    *, user_id: str, run_id: str
+) -> LearningRunResult | None:
+    """Drive :func:`apply_staged_patch` off the event loop on the pooled sync
+    service client (#57 PR-G2d-a). Propagates :class:`StagedPatchConflictError`
+    so the router maps a lost version race to 409."""
+    from app.dependencies import get_supabase
+
+    supabase = get_supabase()
+    return await asyncio.to_thread(
+        apply_staged_patch, supabase, user_id=user_id, run_id=run_id
+    )
+
+
+async def reject_staged_patch_off_loop(
+    *, user_id: str, run_id: str
+) -> LearningRunResult | None:
+    """Drive :func:`reject_staged_patch` off the event loop on the pooled sync
+    service client (#57 PR-G2d-a)."""
+    from app.dependencies import get_supabase
+
+    supabase = get_supabase()
+    return await asyncio.to_thread(
+        reject_staged_patch, supabase, user_id=user_id, run_id=run_id
+    )

@@ -5,11 +5,12 @@ JWT-bound user client (``get_async_user_supabase``), not the service-role
 client, so Postgres RLS is the backstop. The cross-tenant RLS proof itself
 lives in ``tests/integration/test_rls_feedback.py`` (needs a live stack).
 
-Since #57 slice 4 the handlers are ``async def`` on the pooled async clients:
+Since #57 PR-G2d-a the handlers are ``async def`` on the pooled async clients:
 the user-path reads/writes run on ``get_async_user_supabase``; the shared-catalog
 learner + staged-patch writes stay sync (service-role, #191 RPC) and are driven
-off the loop via ``asyncio.to_thread`` / ``BackgroundTasks`` on the sync client
-resolved by the ``_service_client`` seam.
+off the loop by the ``*_off_loop`` service seams (which acquire the pooled sync
+service client themselves), so the router body holds no sync client. The
+post-feedback learner is scheduled as a detached task, never a BackgroundTask.
 """
 
 from __future__ import annotations
@@ -86,14 +87,15 @@ def _make_row() -> FeedbackRow:
     )
 
 
-def test_create_feedback_upsert_via_user_client_learner_via_service(
+def test_create_feedback_upsert_via_user_client_queues_detached_learner(
     overrides: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#79 R1: the job_feedback upsert runs through the RLS-bound user client,
-    but the background learner (which writes the shared `targets` catalog)
-    stays on the service-role client."""
+    """#79 R1 + #57 PR-G2d-a: the job_feedback upsert runs through the RLS-bound
+    user client, and an ``irrelevant`` signal schedules the background learner as
+    a DETACHED task (never a starlette BackgroundTask — uvloop pool deadlock). The
+    learner's service-role client is acquired inside the off-loop driver now, so
+    this asserts the router queued it for the right (user, target)."""
     user_sb = MagicMock(name="user_client")
-    service_sb = MagicMock(name="service_client")
     captured: dict[str, object] = {}
 
     monkeypatch.setattr("app.routers.feedback._job_exists", _atrue)
@@ -103,14 +105,21 @@ def test_create_feedback_upsert_via_user_client_learner_via_service(
         captured["upsert_client"] = supabase
         return _make_row()
 
-    # The learner is a sync BackgroundTask (threadpooled) handed the sync client
-    # the ``_service_client`` seam resolves — patch the seam to capture it.
-    def fake_safe_run(supabase, user_id, target_id):
-        captured["learner_client"] = supabase
+    async def _learner_coro() -> None:
+        return None
+
+    def fake_driver(*, user_id, target_id):
+        captured["driver_args"] = (user_id, target_id)
+        return _learner_coro()
+
+    def fake_spawn(coro, *, name):
+        captured["spawn_name"] = name
+        coro.close()  # discard without scheduling — avoids "coroutine never awaited"
+        return MagicMock()
 
     monkeypatch.setattr("app.routers.feedback.upsert_feedback", fake_upsert)
-    monkeypatch.setattr("app.routers.feedback._safe_run_learner", fake_safe_run)
-    monkeypatch.setattr("app.routers.feedback._service_client", lambda: service_sb)
+    monkeypatch.setattr("app.routers.feedback.run_learner_and_rescore_off_loop", fake_driver)
+    monkeypatch.setattr("app.routers.feedback.spawn_detached", fake_spawn)
     app.dependency_overrides[get_async_user_supabase] = lambda: user_sb
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
@@ -122,7 +131,9 @@ def test_create_feedback_upsert_via_user_client_learner_via_service(
     assert r.status_code == 200
     assert r.json()["queued_learn_run"] is True
     assert captured["upsert_client"] is user_sb
-    assert captured["learner_client"] is service_sb
+    # The learner was scheduled off-loop for this (user, target), via spawn_detached.
+    assert captured["driver_args"] == (_TEST_USER_ID, _TARGET_ID)
+    assert captured["spawn_name"] == f"feedback-learner:{_TARGET_ID}"
 
 
 def test_remove_feedback_deletes_via_user_client(
@@ -182,13 +193,11 @@ def test_staged_apply_conflict_maps_to_409(
 
     monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
 
-    def _raise(*_a: object, **_k: object) -> None:
+    async def _raise(*_a: object, **_k: object) -> None:
         raise StagedPatchConflictError("profile moved")
 
-    # ``apply_staged_patch`` runs (sync) inside ``asyncio.to_thread`` on the
-    # ``_service_client`` seam — patch both so no real pool is hit.
-    monkeypatch.setattr("app.routers.feedback.apply_staged_patch", _raise)
-    monkeypatch.setattr("app.routers.feedback._service_client", lambda: MagicMock())
+    # The apply runs through the async off-loop driver now; patch it to raise.
+    monkeypatch.setattr("app.routers.feedback.apply_staged_patch_off_loop", _raise)
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
@@ -207,9 +216,12 @@ def test_learner_trigger_rate_limited_at_10_per_minute(
     from app.rate_limit import limiter
 
     monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
-    # Sync learner driven via ``asyncio.to_thread`` on the ``_service_client`` seam.
-    monkeypatch.setattr("app.routers.feedback.maybe_run_learner", lambda *a, **k: None)
-    monkeypatch.setattr("app.routers.feedback._service_client", lambda: MagicMock())
+
+    # The learner runs through the async off-loop driver now; stub it to a no-op.
+    async def _none(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr("app.routers.feedback.run_learner_off_loop", _none)
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
 
