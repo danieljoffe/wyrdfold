@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 from app.models.targets import JobTarget
@@ -32,7 +32,7 @@ from app.models.targets import JobTarget
 from app.services.ats_detect import DetectResult, _parse_input, detect_ats
 from app.services.poll_lock import poll_advisory_lock
 from app.services.targets import crud
-from app.supabase_pool import get_supabase_pool
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ def _backoff_with_jitter(attempt: int) -> float:
     return sleep
 
 
-def _existing_board_tokens(supabase: Client) -> set[str]:
+async def _existing_board_tokens(supabase: AsyncClient) -> set[str]:
     """Snapshot every ``board_token`` currently in ``sources``.
 
     Loaded once at the start of a run so we don't re-query Supabase per URL.
@@ -217,13 +217,13 @@ def _existing_board_tokens(supabase: Client) -> set[str]:
     by the ``board_token`` unique constraint — this is just to skip the
     expensive Brave + detect_ats roundtrip for already-known tokens.
     """
-    resp = supabase.table("sources").select("board_token").execute()
+    resp = await supabase.table("sources").select("board_token").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["board_token"] for r in rows if r.get("board_token")}
 
 
-def _log_discovery(
-    supabase: Client,
+async def _log_discovery(
+    supabase: AsyncClient,
     *,
     target_id: str,
     hit: _SearchHit,
@@ -249,13 +249,13 @@ def _log_discovery(
         payload["detected_company_name"] = detect.company_name
         payload["detected_job_count"] = detect.job_count
     try:
-        supabase.table("source_discoveries").insert(payload).execute()
+        await supabase.table("source_discoveries").insert(payload).execute()
     except Exception as exc:
         # Never fail discovery for an audit-row write — log and move on.
         logger.warning("source_discoveries insert failed: %s", exc)
 
 
-def _insert_source(supabase: Client, *, detect: DetectResult) -> bool:
+async def _insert_source(supabase: AsyncClient, *, detect: DetectResult) -> bool:
     """Atomically upsert ``detect.board_token`` into ``sources``. Return True
     if a new row was inserted, False if a row already existed.
 
@@ -267,7 +267,7 @@ def _insert_source(supabase: Client, *, detect: DetectResult) -> bool:
     on columns added later — as "duplicate", masking real write failures.
     """
     try:
-        resp = supabase.rpc(
+        resp = await supabase.rpc(
             "insert_source_if_not_exists",
             {
                 "p_provider": detect.provider,
@@ -306,7 +306,7 @@ def _insert_source(supabase: Client, *, detect: DetectResult) -> bool:
 
 
 async def run_discovery_for_target(
-    supabase: Client,
+    supabase: AsyncClient,
     target: JobTarget,
     *,
     max_queries: int | None = None,
@@ -353,7 +353,7 @@ async def run_discovery_for_target(
             filtered=0,
         )
 
-    existing_tokens = _existing_board_tokens(supabase)
+    existing_tokens = await _existing_board_tokens(supabase)
     queries_issued = 0
     urls_examined = 0
     inserted = 0
@@ -457,7 +457,7 @@ async def run_discovery_for_target(
         provider_hint, slug = parse_key
         if provider_hint is not None and slug in existing_tokens:
             duplicates += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -479,7 +479,7 @@ async def run_discovery_for_target(
             detect = None
         if detect is None:
             unclassified += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -492,7 +492,7 @@ async def run_discovery_for_target(
             # Polling it would just burn requests on a dead board — skip but
             # log so we can revisit if we change our mind later.
             filtered += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -502,7 +502,7 @@ async def run_discovery_for_target(
             continue
         if detect.board_token in existing_tokens:
             duplicates += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -510,10 +510,10 @@ async def run_discovery_for_target(
                 outcome="duplicate",
             )
             continue
-        if _insert_source(supabase, detect=detect):
+        if await _insert_source(supabase, detect=detect):
             existing_tokens.add(detect.board_token)
             inserted += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -525,7 +525,7 @@ async def run_discovery_for_target(
             # the RPC returned a shape we couldn't interpret). Treat as
             # duplicate for stats; the RPC itself logs the underlying cause.
             duplicates += 1
-            _log_discovery(
+            await _log_discovery(
                 supabase,
                 target_id=target.id,
                 hit=hit,
@@ -567,7 +567,7 @@ class BulkDiscoveryStats:
 
 
 async def run_discovery_all_targets(
-    supabase: Client, targets: list[JobTarget]
+    supabase: AsyncClient, targets: list[JobTarget]
 ) -> BulkDiscoveryStats:
     """Run source discovery for the given targets, sequentially.
 
@@ -647,6 +647,16 @@ async def run_discovery_all_targets(
     return result
 
 
+async def _all_targets(client: AsyncClient) -> list[JobTarget]:
+    """Async inline of ``crud.get_all`` for the bulk bg task (the sync twin
+    stays for its interactive callers): reads EVERY target — active or not —
+    so an inactive target a user re-activates later already has fresh ATS
+    boards. Awaits on the pooled async client instead of blocking the loop.
+    """
+    resp = await client.table(crud.TARGETS_TABLE).select("*").execute()
+    return [crud._parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
 async def run_discovery_all_targets_locked() -> None:
     """Background body for bulk discovery (``POST /discovery/run`` + scheduler).
 
@@ -664,10 +674,11 @@ async def run_discovery_all_targets_locked() -> None:
     cleanly. Overlapping runs would otherwise multiply the burst against
     Brave's monthly quota.
 
-    Self-contained on purpose: it pulls the service-role singleton via
-    ``get_supabase_pool()`` (the same client the scheduler uses) rather than a
+    Self-contained on purpose: it pulls the pooled async service client via
+    ``get_async_supabase()`` (the same client the scheduler uses) rather than a
     request-scoped client, so it keeps running correctly after the request
-    that scheduled it has returned.
+    that scheduled it has returned. Skips cleanly when the pool isn't up yet
+    (startup race), exactly as the sync path did.
 
     The Brave-key gate is preserved: with an empty ``brave_search_api_key``
     every per-target run is a clean no-op (it returns zeroed stats and logs a
@@ -677,11 +688,16 @@ async def run_discovery_all_targets_locked() -> None:
     than silently swallowed by the event loop.
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
             logger.warning("bulk discovery skipped — supabase client not initialized")
             return
-        async with poll_advisory_lock(client, settings.discovery_advisory_lock_key) as acquired:
+        # ``poll_advisory_lock`` acquires on the pooled async client via the
+        # seam-aware ``_lock_rpc`` but is annotated ``Client``; the cast
+        # satisfies mypy (mirrors ``app.scheduler``).
+        async with poll_advisory_lock(
+            cast(Client, client), settings.discovery_advisory_lock_key
+        ) as acquired:
             if not acquired:
                 logger.info(
                     "bulk discovery skipped — another discovery run holds the "
@@ -689,7 +705,7 @@ async def run_discovery_all_targets_locked() -> None:
                     settings.discovery_advisory_lock_key,
                 )
                 return
-            targets = crud.get_all(client)
+            targets = await _all_targets(client)
             await run_discovery_all_targets(client, targets)
     except Exception:
         logger.exception("bulk discovery raised")

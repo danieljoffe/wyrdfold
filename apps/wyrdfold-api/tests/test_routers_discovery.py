@@ -141,8 +141,10 @@ def _fake_lock_supabase() -> tuple[MagicMock, dict[str, bool]]:
 
 @pytest.mark.asyncio
 async def test_locked_walks_all_targets_when_lock_acquired() -> None:
-    """Happy path: lock acquired → discovery walks EVERY target (via
-    ``crud.get_all``, NOT ``get_active``) and the lock is released after."""
+    """Happy path: lock acquired → discovery walks EVERY target (via the async
+    ``_all_targets`` inline — active AND inactive) and the lock is released
+    after. ``_all_targets`` reads all targets, so the active-only path is
+    structurally impossible on this bulk route."""
     sb, state = _fake_lock_supabase()
     t_active, t_inactive = MagicMock(id="t-active"), MagicMock(id="t-inactive")
 
@@ -150,21 +152,16 @@ async def test_locked_walks_all_targets_when_lock_acquired() -> None:
         side_effect=[_stats("t-active", inserted=2), _stats("t-inactive", inserted=1)]
     )
     with (
-        patch("app.services.source_discovery.get_supabase_pool", return_value=sb),
+        patch("app.services.source_discovery.get_async_supabase", return_value=sb),
         patch(
-            "app.services.source_discovery.crud.get_all",
-            return_value=[t_active, t_inactive],
-        ) as mock_get_all,
-        patch(
-            "app.services.source_discovery.crud.get_active",
-            return_value=[t_active],
-        ) as mock_get_active,
+            "app.services.source_discovery._all_targets",
+            new=AsyncMock(return_value=[t_active, t_inactive]),
+        ) as mock_all_targets,
         patch("app.services.source_discovery.run_discovery_for_target", fake_per_target),
     ):
         await run_discovery_all_targets_locked()
 
-    mock_get_all.assert_called_once_with(sb)
-    mock_get_active.assert_not_called()  # bulk path must NOT use active-only
+    mock_all_targets.assert_awaited_once_with(sb)
     # Both targets — active AND inactive — were processed.
     assert fake_per_target.await_count == 2
     assert {c.args[1].id for c in fake_per_target.await_args_list} == {
@@ -182,13 +179,13 @@ async def test_locked_skips_when_lock_held() -> None:
     state["held"] = True  # another discovery run holds it
 
     with (
-        patch("app.services.source_discovery.get_supabase_pool", return_value=sb),
-        patch("app.services.source_discovery.crud.get_all") as mock_get_all,
+        patch("app.services.source_discovery.get_async_supabase", return_value=sb),
+        patch("app.services.source_discovery._all_targets") as mock_all_targets,
         patch("app.services.source_discovery.run_discovery_for_target") as mock_per_target,
     ):
         await run_discovery_all_targets_locked()
 
-    mock_get_all.assert_not_called()
+    mock_all_targets.assert_not_called()
     mock_per_target.assert_not_called()
     assert state["held"] is True  # didn't steal/release a lock it never held
 
@@ -197,11 +194,11 @@ async def test_locked_skips_when_lock_held() -> None:
 async def test_locked_skips_when_client_uninitialized() -> None:
     """No supabase singleton (startup race) → skip cleanly, no walk, no crash."""
     with (
-        patch("app.services.source_discovery.get_supabase_pool", return_value=None),
-        patch("app.services.source_discovery.crud.get_all") as mock_get_all,
+        patch("app.services.source_discovery.get_async_supabase", return_value=None),
+        patch("app.services.source_discovery._all_targets") as mock_all_targets,
     ):
         await run_discovery_all_targets_locked()
-    mock_get_all.assert_not_called()
+    mock_all_targets.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -210,10 +207,10 @@ async def test_locked_swallows_and_logs_exceptions() -> None:
     it and never propagate."""
     sb, _ = _fake_lock_supabase()
     with (
-        patch("app.services.source_discovery.get_supabase_pool", return_value=sb),
+        patch("app.services.source_discovery.get_async_supabase", return_value=sb),
         patch(
-            "app.services.source_discovery.crud.get_all",
-            side_effect=RuntimeError("db boom"),
+            "app.services.source_discovery._all_targets",
+            new=AsyncMock(side_effect=RuntimeError("db boom")),
         ),
         patch("app.services.source_discovery.logger") as mock_logger,
     ):

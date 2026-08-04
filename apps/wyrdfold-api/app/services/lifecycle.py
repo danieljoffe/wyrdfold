@@ -25,16 +25,15 @@ Idempotent by construction: all steps only transition rows, so re-runs
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services import notify
-from app.services.db_write import poll_db_write
+from app.services.db_write import poll_db_read, poll_db_write
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ SOURCE_COLD_INTERVAL_MINUTES = 1440
 SOURCE_WARM_INTERVAL_MINUTES = 240
 
 
-async def run_lifecycle_sweep(supabase: Client) -> dict[str, int]:
+async def run_lifecycle_sweep(supabase: AsyncClient) -> dict[str, int]:
     """Run all cleanups; returns counts for logging/tests."""
     deactivated = await _deactivate_idle_targets(supabase)
     reaped = await _reap_stuck_batches(supabase)
@@ -68,15 +67,15 @@ async def run_lifecycle_sweep(supabase: Client) -> dict[str, int]:
     }
 
 
-async def _deactivate_idle_targets(supabase: Client) -> int:
+async def _deactivate_idle_targets(supabase: AsyncClient) -> int:
     if settings.idle_deactivate_days <= 0:
         return 0
     cutoff = (datetime.now(UTC) - timedelta(days=settings.idle_deactivate_days)).isoformat()
 
-    idle_resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table("user_profiles").select("user_id").lt("last_seen_at", cutoff).execute()
-        )
+    idle_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("user_profiles").select("user_id").lt("last_seen_at", cutoff),
+        label="lifecycle idle profiles",
     )
     idle_ids = [
         r["user_id"] for r in cast(list[dict[str, Any]], idle_resp.data or []) if r.get("user_id")
@@ -121,16 +120,18 @@ async def _deactivate_idle_targets(supabase: Client) -> int:
     return total
 
 
-async def _target_labels(supabase: Client, target_ids: list[str]) -> list[str]:
+async def _target_labels(supabase: AsyncClient, target_ids: list[str]) -> list[str]:
     if not target_ids:
         return []
-    resp = await asyncio.to_thread(
-        lambda: supabase.table("targets").select("label").in_("id", target_ids).execute()
+    resp = await poll_db_read(
+        supabase,
+        lambda c: c.table("targets").select("label").in_("id", target_ids),
+        label="lifecycle target labels",
     )
     return [str(r.get("label") or "") for r in cast(list[dict[str, Any]], resp.data or [])]
 
 
-async def _adjust_source_cadence(supabase: Client) -> tuple[int, int]:
+async def _adjust_source_cadence(supabase: AsyncClient) -> tuple[int, int]:
     """Stretch cold sources to daily polling; restore productive ones.
 
     Cold = enabled source whose ``last_candidate_at`` is older than
@@ -182,7 +183,7 @@ async def _adjust_source_cadence(supabase: Client) -> tuple[int, int]:
     return stretched, restored
 
 
-async def _reap_stuck_batches(supabase: Client) -> int:
+async def _reap_stuck_batches(supabase: AsyncClient) -> int:
     cutoff = (datetime.now(UTC) - timedelta(hours=BATCH_STUCK_HOURS)).isoformat()
     resp = await poll_db_write(
         supabase,

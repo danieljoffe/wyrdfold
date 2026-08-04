@@ -5,7 +5,6 @@ triggers LLM-powered profile derivation and merges the result into the
 target's composite scoring profile.
 """
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -27,7 +26,6 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -1442,7 +1440,12 @@ async def activate_target(
 async def discover_sources_for_target_endpoint(
     request: Request,
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    # Service-role async client (#57 PR-G2e-6): discovery reads the global
+    # ``sources`` catalog and upserts via a SECURITY DEFINER RPC — a cross-user
+    # pool operation. The ownership gate below is the sole authorization for
+    # this JWT caller (no RLS backstop on the service client), exactly as the
+    # sibling ``deactivate``/axis routes do.
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str = Depends(get_current_user_id),
 ) -> DiscoveryRunStats:
     """Trigger Brave-Search-driven source discovery for one target.
@@ -1462,10 +1465,8 @@ async def discover_sources_for_target_endpoint(
     # so it's only meaningful for the user's own targets — and we don't want
     # to let a JWT caller burn the global Brave quota on someone else's
     # search keywords.
-    await asyncio.to_thread(
-        _require_user_owns_target, supabase, user_id=user_id, target_id=target_id
-    )
-    target = await asyncio.to_thread(crud.get, supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 

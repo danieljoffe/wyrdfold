@@ -38,14 +38,14 @@ run resumes where the data says to.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
+from app.services.db_write import poll_db_read, poll_db_write
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +62,20 @@ def _iso_days_ago(days: int) -> str:
     return (datetime.now(UTC) - timedelta(days=days)).isoformat()
 
 
-async def _engaged_ids(supabase: Client, job_ids: list[str]) -> set[str]:
+async def _engaged_ids(supabase: AsyncClient, job_ids: list[str]) -> set[str]:
     """The subset of ``job_ids`` that ANY user has engaged with."""
     out: set[str] = set()
     for i in range(0, len(job_ids), _WRITE_CHUNK):
         chunk = job_ids[i : i + _WRITE_CHUNK]
-        resp = await asyncio.to_thread(
-            supabase.table("user_jobs")
-            .select("job_posting_id")
-            .in_("job_posting_id", chunk)
-            .not_.in_("status", list(_UNENGAGED_STATUSES))
-            .execute
+        resp = await poll_db_read(
+            supabase,
+            lambda c, _chunk=chunk: (
+                c.table("user_jobs")
+                .select("job_posting_id")
+                .in_("job_posting_id", _chunk)
+                .not_.in_("status", list(_UNENGAGED_STATUSES))
+            ),
+            label="archival engaged ids",
         )
         out.update(
             cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], resp.data or [])
@@ -80,18 +83,21 @@ async def _engaged_ids(supabase: Client, job_ids: list[str]) -> set[str]:
     return out
 
 
-async def _graded_ids(supabase: Client, job_ids: list[str]) -> set[str]:
+async def _graded_ids(supabase: AsyncClient, job_ids: list[str]) -> set[str]:
     """The subset of ``job_ids`` with real graded history (fit_reasoning)."""
     out: set[str] = set()
     for i in range(0, len(job_ids), _WRITE_CHUNK):
         chunk = job_ids[i : i + _WRITE_CHUNK]
-        resp = await asyncio.to_thread(
-            supabase.table("scores")
-            .select("job_posting_id")
-            .in_("job_posting_id", chunk)
-            .neq("fit_reasoning", "")
-            .not_.is_("fit_reasoning", "null")
-            .execute
+        resp = await poll_db_read(
+            supabase,
+            lambda c, _chunk=chunk: (
+                c.table("scores")
+                .select("job_posting_id")
+                .in_("job_posting_id", _chunk)
+                .neq("fit_reasoning", "")
+                .not_.is_("fit_reasoning", "null")
+            ),
+            label="archival graded ids",
         )
         out.update(
             cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], resp.data or [])
@@ -99,17 +105,20 @@ async def _graded_ids(supabase: Client, job_ids: list[str]) -> set[str]:
     return out
 
 
-async def _archive_stale(supabase: Client, *, batch: int) -> int:
+async def _archive_stale(supabase: AsyncClient, *, batch: int) -> int:
     """Stage 1: stamp ``archived_at`` on old, untouched, live jobs."""
     cutoff = _iso_days_ago(settings.archival_archive_after_days)
-    resp = await asyncio.to_thread(
-        supabase.table("jobs")
-        .select("id")
-        .is_("archived_at", "null")
-        .lt("cataloged_at", cutoff)
-        .order("cataloged_at", desc=False)
-        .limit(batch)
-        .execute
+    resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table("jobs")
+            .select("id")
+            .is_("archived_at", "null")
+            .lt("cataloged_at", cutoff)
+            .order("cataloged_at", desc=False)
+            .limit(batch)
+        ),
+        label="archival stale scan",
     )
     ids = [cast(str, r["id"]) for r in cast(list[dict[str, Any]], resp.data or [])]
     if not ids:
@@ -120,8 +129,10 @@ async def _archive_stale(supabase: Client, *, batch: int) -> int:
     now = datetime.now(UTC).isoformat()
     for i in range(0, len(to_archive), _WRITE_CHUNK):
         chunk = to_archive[i : i + _WRITE_CHUNK]
-        await asyncio.to_thread(
-            supabase.table("jobs").update({"archived_at": now}).in_("id", chunk).execute
+        await poll_db_write(
+            supabase,
+            lambda c, _chunk=chunk: c.table("jobs").update({"archived_at": now}).in_("id", _chunk),
+            label="archival stamp archived_at",
         )
     if engaged:
         logger.info(
@@ -132,20 +143,23 @@ async def _archive_stale(supabase: Client, *, batch: int) -> int:
     return len(to_archive)
 
 
-async def _purge_old(supabase: Client, *, batch: int) -> tuple[int, int]:
+async def _purge_old(supabase: AsyncClient, *, batch: int) -> tuple[int, int]:
     """Stage 2: hard-delete (A) or tombstone (B) long-archived rows.
 
     Returns ``(deleted, tombstoned)``.
     """
     cutoff = _iso_days_ago(settings.archival_purge_after_days)
-    resp = await asyncio.to_thread(
-        supabase.table("jobs")
-        .select("id, updated_at")
-        .is_("purged_at", "null")
-        .lt("archived_at", cutoff)
-        .order("archived_at", desc=False)
-        .limit(batch)
-        .execute
+    resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table("jobs")
+            .select("id, updated_at")
+            .is_("purged_at", "null")
+            .lt("archived_at", cutoff)
+            .order("archived_at", desc=False)
+            .limit(batch)
+        ),
+        label="archival purge scan",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -176,21 +190,28 @@ async def _purge_old(supabase: Client, *, batch: int) -> tuple[int, int]:
 
     for i in range(0, len(delete_ids), _WRITE_CHUNK):
         chunk = delete_ids[i : i + _WRITE_CHUNK]
-        await asyncio.to_thread(supabase.table("jobs").delete().in_("id", chunk).execute)
+        await poll_db_write(
+            supabase,
+            lambda c, _chunk=chunk: c.table("jobs").delete().in_("id", _chunk),
+            label="archival hard-delete",
+        )
 
     now = datetime.now(UTC).isoformat()
     for i in range(0, len(tombstone_ids), _WRITE_CHUNK):
         chunk = tombstone_ids[i : i + _WRITE_CHUNK]
-        await asyncio.to_thread(
-            supabase.table("jobs")
-            .update({"purged_at": now, "description_html": None})
-            .in_("id", chunk)
-            .execute
+        await poll_db_write(
+            supabase,
+            lambda c, _chunk=chunk: (
+                c.table("jobs")
+                .update({"purged_at": now, "description_html": None})
+                .in_("id", _chunk)
+            ),
+            label="archival tombstone",
         )
     return len(delete_ids), len(tombstone_ids)
 
 
-async def run_archival_sweep(supabase: Client) -> dict[str, int]:
+async def run_archival_sweep(supabase: AsyncClient) -> dict[str, int]:
     """One bounded archive + purge pass. Never raises into the caller."""
     counts = {"archived": 0, "deleted": 0, "tombstoned": 0}
     batch = settings.archival_sweep_batch
