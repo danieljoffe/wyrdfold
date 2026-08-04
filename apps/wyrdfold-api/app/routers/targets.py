@@ -65,7 +65,7 @@ from app.models.targets import (
     UserTargetWithTarget,
 )
 from app.rate_limit import limiter
-from app.services.diagnostics.funnel import compute_target_funnel
+from app.services.diagnostics.funnel import compute_target_funnel_async
 from app.services.experience import optimized
 from app.services.experience.resolve import resolve_current_payload
 from app.services.extract import (
@@ -111,7 +111,6 @@ from app.services.targets.match import (
 from app.services.targets.merge import merge_reference_jds
 from app.services.targets.profile_writes import (
     apply_profile_merge_rpc_async,
-    apply_profile_patch_rpc,
     apply_profile_patch_rpc_async,
 )
 from app.services.targets.suggest import DEFAULT_PURPOSE as SUGGEST_PURPOSE
@@ -355,6 +354,22 @@ async def _count_user_reference_jds_async(
         .execute()
     )
     return resp.count or 0
+
+
+async def _delete_reference_jd_async(
+    supabase: AsyncClient, ref_jd_id: str, *, target_id: str, user_id: str | None = None
+) -> bool:
+    """Async inline of ``crud.delete_reference_jd`` (crud stays sync for its
+    poller/learner callers). ``target_id`` scopes the delete to the already-
+    ownership-checked target (IDOR guard, audit #24 F1); a non-None ``user_id``
+    further constrains it to the caller's OWN contribution (regular JWT path)."""
+    query = (
+        supabase.table(crud.REF_JDS_TABLE).delete().eq("id", ref_jd_id).eq("target_id", target_id)
+    )
+    if user_id is not None:
+        query = query.eq("user_id", user_id)
+    resp = await query.execute()
+    return bool(resp.data)
 
 
 async def _list_for_user_async(supabase: AsyncClient, user_id: str) -> list[JobTarget]:
@@ -1695,16 +1710,17 @@ async def get_target_status(
     )
 
 
-# Sync `def`: the funnel report is blocking supabase work; the threadpool
-# keeps it off the event loop (#107).
+# Async `def` (#57 PR-G2c): the read-only funnel report runs natively on the
+# pooled async service client via ``compute_target_funnel_async``. The sync
+# ``compute_target_funnel`` stays for the diagnostic script + unit test.
 @router.get(
     "/{target_id}/funnel",
     response_model=TargetFunnelResponse,
     dependencies=[Depends(verify_api_key)],
 )
-def get_target_funnel(
+async def get_target_funnel(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> TargetFunnelResponse:
     """Diagnostic funnel report for one target (#845).
 
@@ -1713,7 +1729,7 @@ def get_target_funnel(
     surface. Read-only.
     """
     try:
-        return compute_target_funnel(supabase, target_id)
+        return await compute_target_funnel_async(supabase, target_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -2217,38 +2233,42 @@ async def list_reference_jds(
     return ReferenceJDsListResponse(reference_jds=anonymized)
 
 
-# Sync `def` (not `async def`): the whole body is blocking supabase work
-# (ownership check, delete, re-merge read, update), so FastAPI runs it in its
-# threadpool and keeps it off the event loop. See #107.
+# Async `def` (#57 PR-G2c): ownership check, delete, the re-merge reads + write,
+# and the #191 patch RPC all run natively on the pooled async service client via
+# the router-inline helpers + ``apply_profile_patch_rpc_async`` (crud + the sync
+# patch RPC stay for the poller/learner callers). ``merge_reference_jds`` is pure.
+# No blocking ``.execute()`` touches the loop (#107).
 @router.delete(
     "/{target_id}/reference-jds/{ref_jd_id}",
     response_model=JobTarget,
 )
-def delete_reference_jd(
+async def delete_reference_jd(
     target_id: str,
     ref_jd_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     user_id: str | None = Depends(get_current_user_id_optional),
 ) -> JobTarget:
     """Delete a reference JD and re-merge the remaining profiles."""
-    _require_user_owns_target(supabase, user_id=user_id, target_id=target_id)
-    target = crud.get(supabase, target_id)
+    await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
+    target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
     # A regular caller may only remove their OWN contribution; operators
     # (user_id None) may remove any. A non-owner's delete matches no rows and
     # returns 404 — without enumerating who contributed it.
-    deleted = crud.delete_reference_jd(supabase, ref_jd_id, target_id=target_id, user_id=user_id)
+    deleted = await _delete_reference_jd_async(
+        supabase, ref_jd_id, target_id=target_id, user_id=user_id
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
 
     # Operator path (api-key caller): no follower identity to RPC-gate on —
     # trusted direct write, the documented #191 exception.
     if user_id is None:
-        remaining = crud.list_reference_jds(supabase, target_id)
+        remaining = await _list_reference_jds_async(supabase, target_id)
         composite = merge_reference_jds(remaining) if remaining else ScoringProfile()
-        updated = crud.update(
+        updated = await _update_target_async(
             supabase,
             target_id,
             TargetUpdate(
@@ -2266,9 +2286,9 @@ def delete_reference_jd(
     # cap. Retried once on a concurrent-write conflict.
     current = target
     for _attempt in range(2):
-        remaining = crud.list_reference_jds(supabase, target_id)
+        remaining = await _list_reference_jds_async(supabase, target_id)
         composite = merge_reference_jds(remaining) if remaining else ScoringProfile()
-        outcome, _new_version = apply_profile_patch_rpc(
+        outcome, _new_version = await apply_profile_patch_rpc_async(
             supabase,
             user_id=user_id,
             target_id=target_id,
@@ -2276,12 +2296,12 @@ def delete_reference_jd(
             expected_version=current.profile_version,
         )
         if outcome == "applied":
-            updated = crud.get(supabase, target_id)
+            updated = await _target_get(supabase, target_id)
             if updated is None:
                 raise HTTPException(status_code=404, detail="Target not found")
             return updated
         if outcome == "version_conflict":
-            refreshed = crud.get(supabase, target_id)
+            refreshed = await _target_get(supabase, target_id)
             if refreshed is None:
                 raise HTTPException(status_code=404, detail="Target not found")
             current = refreshed

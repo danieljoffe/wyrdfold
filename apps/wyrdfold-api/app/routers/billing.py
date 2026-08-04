@@ -30,10 +30,10 @@ from typing import Any, Literal, cast
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
-from app.dependencies import get_async_service_supabase, get_current_user_id, get_supabase
+from app.dependencies import get_async_service_supabase, get_current_user_id
 from app.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -144,11 +144,12 @@ class BillingAccountResponse(BaseModel):
     byok: bool
 
 
-# `async def` (#57 PR-G2a): the billing-local ``_get_stripe_customer_id`` read
-# runs on the async service client. The cross-service ``budget.get_llm_account``
-# and ``keys_store.has_usable_key`` reads stay synchronous for their other callers
-# (the sync budget resolver + LLM-client factory, both out of scope), so they run
-# on the sync service client, driven off the loop via ``asyncio.to_thread`` (#107).
+# `async def` (#57 PR-G2c): every read runs on the pooled async service client —
+# the billing-local ``_get_stripe_customer_id`` plus the cross-service
+# ``budget.get_llm_account_async`` and ``keys_store.has_usable_key_async`` twins
+# (added in G2c). The sync ``get_llm_account`` / ``has_usable_key`` stay for their
+# other callers (the sync budget resolver + LLM-client factory); this handler no
+# longer touches the sync service client.
 @router.get(
     "/account",
     response_model=BillingAccountResponse,
@@ -157,17 +158,14 @@ class BillingAccountResponse(BaseModel):
 async def get_billing_account(
     user_id: str = Depends(get_current_user_id),
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    sync_supabase: Client = Depends(get_supabase),
 ) -> BillingAccountResponse:
     """The settings card's read: plan + billing/BYOK state in one call."""
     from app.services.keys import store as keys_store
     from app.services.llm import budget
 
-    account = await asyncio.to_thread(budget.get_llm_account, sync_supabase, user_id=user_id)
+    account = await budget.get_llm_account_async(supabase, user_id=user_id)
     has_billing_account = (await _get_stripe_customer_id(supabase, user_id)) is not None
-    byok = await asyncio.to_thread(
-        keys_store.has_usable_key, sync_supabase, user_id=user_id, provider="openrouter"
-    )
+    byok = await keys_store.has_usable_key_async(supabase, user_id=user_id, provider="openrouter")
     return BillingAccountResponse(
         plan=account.plan or "free",
         has_billing_account=has_billing_account,

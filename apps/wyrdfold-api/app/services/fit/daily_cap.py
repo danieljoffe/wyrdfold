@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, time
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 from app.services.fit.job_fit import JOB_FIT_PURPOSE
@@ -69,6 +69,35 @@ def phase2_quota_remaining(
     except Exception:
         logger.exception(
             "phase2_quota_remaining: count failed for target %s; refusing to spend",
+            target_id,
+        )
+        return 0
+    used = resp.count or 0
+    return max(0, cap - used)
+
+
+async def phase2_quota_remaining_async(
+    supabase: AsyncClient,
+    target_id: str,
+    cap: int = DEFAULT_DAILY_CAP,
+) -> int:
+    """Async mirror of :func:`phase2_quota_remaining` (#57 PR-G2c) for
+    ``async def`` callers on the pooled async service client (the funnel
+    diagnostic). Same count query, same fail-closed-to-0 posture; the sync
+    version stays for the poller/fit pipeline callers."""
+    try:
+        resp = await (
+            supabase.table("llm_costs")
+            .select("id", count="exact")  # type: ignore[arg-type]
+            .eq("purpose", JOB_FIT_PURPOSE)
+            .eq("metadata->>target_id", target_id)
+            .gte("created_at", _utc_day_start())
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        logger.exception(
+            "phase2_quota_remaining_async: count failed for target %s; refusing to spend",
             target_id,
         )
         return 0

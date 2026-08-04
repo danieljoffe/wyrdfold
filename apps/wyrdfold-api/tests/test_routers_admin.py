@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings as live_settings
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
 from app.services.llm import cost_log
 
@@ -21,7 +21,8 @@ def client() -> TestClient:
 
 
 def _override(supabase: Any) -> None:
-    app.dependency_overrides[get_supabase] = lambda: supabase
+    # get_cost_summary runs on the async service client since #57 PR-G2c.
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     # Skip the constant-time API-key check — the dep tests in
     # test_dependencies cover it; here we're testing the route shape.
     app.dependency_overrides[verify_api_key] = lambda: "test-api-key"
@@ -36,9 +37,10 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
     sb = MagicMock()
     _override(sb)
 
-    # Stub the cost_log helpers. Each call's `since` lets us return a
-    # scope-appropriate amount so the response shape is verifiable.
-    def _fake_total_spend_all(_sb: Any, *, since: datetime | None = None) -> float:
+    # Stub the async cost_log twins (#57 PR-G2c) the handler now awaits. Each
+    # call's `since` lets us return a scope-appropriate amount so the response
+    # shape is verifiable.
+    async def _fake_total_spend_all(_sb: Any, *, since: datetime | None = None) -> float:
         assert since is not None  # endpoint always sets a window
         now = datetime.now(UTC)
         # Approximate which window we're in by inspecting `since`.
@@ -48,7 +50,9 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
             return 4.0
         return 12.0
 
-    def _fake_spend_by_purpose_all(_sb: Any, *, since: datetime | None = None) -> dict[str, float]:
+    async def _fake_spend_by_purpose_all(
+        _sb: Any, *, since: datetime | None = None
+    ) -> dict[str, float]:
         if since is None:
             return {}
         # Approximate window
@@ -56,7 +60,7 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
             return {"phase1_triage": 1.0, "phase2_fit": 0.5}
         return {"phase1_triage": 8.0, "phase2_fit": 4.0}
 
-    def _fake_cache_metrics_all(_sb: Any, *, since: datetime | None = None) -> dict[str, int]:
+    async def _fake_cache_metrics_all(_sb: Any, *, since: datetime | None = None) -> dict[str, int]:
         assert since is not None  # endpoint always sets a window
         if since >= datetime.now(UTC) - timedelta(hours=25):
             # today: 800 read of 1000 total input tokens → 80% hit rate
@@ -64,9 +68,9 @@ def test_cost_summary_returns_rollup_and_per_purpose_breakdown(
         # 30d: 8000 read of 10000 total → 80%
         return {"cache_read": 8000, "cache_creation": 1000, "uncached_input": 1000}
 
-    monkeypatch.setattr(cost_log, "total_spend_all", _fake_total_spend_all)
-    monkeypatch.setattr(cost_log, "spend_by_purpose_all", _fake_spend_by_purpose_all)
-    monkeypatch.setattr(cost_log, "cache_metrics_all", _fake_cache_metrics_all)
+    monkeypatch.setattr(cost_log, "total_spend_all_async", _fake_total_spend_all)
+    monkeypatch.setattr(cost_log, "spend_by_purpose_all_async", _fake_spend_by_purpose_all)
+    monkeypatch.setattr(cost_log, "cache_metrics_all_async", _fake_cache_metrics_all)
     monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
 
     try:
@@ -99,12 +103,12 @@ def test_cost_summary_usage_pct_none_when_cap_disabled(
     sb = MagicMock()
     _override(sb)
 
-    monkeypatch.setattr(cost_log, "total_spend_all", lambda _s, **_kw: 5.0)
-    monkeypatch.setattr(cost_log, "spend_by_purpose_all", lambda _s, **_kw: {})
+    monkeypatch.setattr(cost_log, "total_spend_all_async", AsyncMock(return_value=5.0))
+    monkeypatch.setattr(cost_log, "spend_by_purpose_all_async", AsyncMock(return_value={}))
     monkeypatch.setattr(
         cost_log,
-        "cache_metrics_all",
-        lambda _s, **_kw: {"cache_read": 0, "cache_creation": 0, "uncached_input": 0},
+        "cache_metrics_all_async",
+        AsyncMock(return_value={"cache_read": 0, "cache_creation": 0, "uncached_input": 0}),
     )
     monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
 

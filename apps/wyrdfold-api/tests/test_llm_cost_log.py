@@ -411,3 +411,93 @@ async def test_total_billable_spend_async_falls_back_when_rpc_unavailable() -> N
     )
     # 0.10 + 0.05 (poll_scoring excluded).
     assert result == pytest.approx(0.15)
+
+
+# ---- async ALL-users twins (total_spend_all_async / spend_by_purpose_all_async /
+# ---- cache_metrics_all_async, PR-G2c). These power the operator cost-summary on
+# ---- the async service client; ``.execute()`` is awaited → AsyncMock. total_spend_all
+# ---- keeps the RPC-first / client-fallback shape; the other two are client-side only.
+
+
+@pytest.mark.asyncio
+async def test_total_spend_all_async_uses_rpc_when_available() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp(3.75))
+
+    result = await cost_log.total_spend_all_async(sb, since=datetime.now(UTC))
+
+    assert result == 3.75
+    args, _ = sb.rpc.call_args
+    assert args[0] == "total_spend_all_since"
+    assert "p_since" in args[1]
+    # The all-users RPC carries no per-user id, and must not touch the table API.
+    assert "p_user_id" not in args[1]
+    sb.table.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_total_spend_all_async_zero_when_rpc_returns_none() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=_Resp(None))
+    assert await cost_log.total_spend_all_async(sb) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_total_spend_all_async_falls_back_to_python_when_rpc_unavailable() -> None:
+    sb = MagicMock()
+    sb.rpc.side_effect = Exception("function does not exist")
+
+    # Fallback: select cost_usd across ALL users (no user filter), sum in Python.
+    sel = sb.table.return_value.select.return_value
+    sel.gte.return_value.execute = AsyncMock(
+        return_value=_Resp([{"cost_usd": 1.00}, {"cost_usd": 0.50}, {"cost_usd": 0.25}])
+    )
+
+    result = await cost_log.total_spend_all_async(sb, since=datetime.now(UTC) - timedelta(days=1))
+    assert result == pytest.approx(1.75)
+
+
+@pytest.mark.asyncio
+async def test_spend_by_purpose_all_async_groups_client_side() -> None:
+    # No RPC variant — the async twin awaits the select and groups in Python.
+    sb = MagicMock()
+    sel = sb.table.return_value.select.return_value
+    sel.gte.return_value.execute = AsyncMock(
+        return_value=_Resp(
+            [
+                {"purpose": "phase1_triage", "cost_usd": 1.0},
+                {"purpose": "phase1_triage", "cost_usd": 0.5},
+                {"purpose": "fit.job", "cost_usd": 2.0},
+            ]
+        )
+    )
+
+    result = await cost_log.spend_by_purpose_all_async(sb, since=datetime.now(UTC))
+    assert result == {"phase1_triage": pytest.approx(1.5), "fit.job": pytest.approx(2.0)}
+    sb.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cache_metrics_all_async_sums_token_buckets() -> None:
+    sb = MagicMock()
+    sel = sb.table.return_value.select.return_value
+    sel.gte.return_value.execute = AsyncMock(
+        return_value=_Resp(
+            [
+                {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 100,
+                },
+                {
+                    "input_tokens": 0,
+                    "cache_read_input_tokens": 200,
+                    "cache_creation_input_tokens": 0,
+                },
+            ]
+        )
+    )
+
+    result = await cost_log.cache_metrics_all_async(sb, since=datetime.now(UTC))
+    assert result == {"cache_read": 1000, "cache_creation": 100, "uncached_input": 100}
+    sb.rpc.assert_not_called()

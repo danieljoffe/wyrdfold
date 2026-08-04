@@ -272,3 +272,46 @@ async def test_set_rejects_empty_key() -> None:
     sb = _FakeSupabase()
     with pytest.raises(ValueError, match="must not be empty"):
         await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="   ")
+
+
+# ---- has_usable_key_async (#57 PR-G2c) --------------------------------------
+# The async "who pays" check for billing + the async quota resolver. Mirrors the
+# sync ``has_usable_key`` fallbacks: unconfigured master key or an undecryptable
+# row → False (host key would pay → stay metered).
+
+
+async def test_has_usable_key_async_true_for_stored_key() -> None:
+    sb = _FakeSupabase()
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-usable")
+    assert await keys.store.has_usable_key_async(sb, user_id="u1", provider="openrouter") is True
+
+
+async def test_has_usable_key_async_false_when_missing() -> None:
+    sb = _FakeSupabase()
+    assert (
+        await keys.store.has_usable_key_async(sb, user_id="nobody", provider="openrouter") is False
+    )
+
+
+async def test_has_usable_key_async_false_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unconfigured master key short-circuits to False WITHOUT a DB read.
+    sb = _FakeSupabase()
+    monkeypatch.setattr(crypto, "is_configured", lambda: False)
+    assert await keys.store.has_usable_key_async(sb, user_id="u1", provider="openrouter") is False
+
+
+async def test_has_usable_key_async_false_for_undecryptable_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stored row that can't be decrypted (rotated/wrong master key) means the
+    # host key would pay → NOT usable (mirrors _user_byok_key; Copilot on #205).
+    sb = _FakeSupabase()
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-v1-rotated")
+
+    def _broken(_ciphertext: str) -> str:
+        raise crypto.BYOKDecryptError("wrong master key")
+
+    monkeypatch.setattr(crypto, "decrypt", _broken)
+    assert await keys.store.has_usable_key_async(sb, user_id="u1", provider="openrouter") is False
