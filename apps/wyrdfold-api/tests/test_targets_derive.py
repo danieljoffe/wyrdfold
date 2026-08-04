@@ -1,9 +1,10 @@
 """Tests for LLM-powered profile derivation (#495)."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from supabase import AsyncClient
 
 from app.models.targets import DerivedTarget
 from app.services.llm.mock import MockLLMClient
@@ -146,3 +147,75 @@ async def test_derive_short_jd_never_touches_the_cache() -> None:
         await derive_profile_from_jd(client, jd_text="too short", supabase=supabase)
     supabase.table.assert_not_called()  # no cache read or write
     assert client.calls == []
+
+
+# --- Content-hash cache: both client shapes (#57 PR-G2e-4). ``derive_profile_from_jd``
+# now accepts an async OR a sync service client — an AsyncClient round-trip is
+# awaited, a sync Client is off-loaded to a thread. Prove both branches read/write
+# the cache correctly (the interactive callers pass async; the corpus-builder still
+# passes sync).
+
+
+def _cached_payload() -> dict:
+    """A valid DerivedTarget dict as it lives in the cache's ``derived_payload``."""
+    return DerivedTarget.model_validate(json.loads(_sample_derived_json())).model_dump(mode="json")
+
+
+def _async_cache_client(*, cached: dict | None) -> MagicMock:
+    """An async service client whose cache-table chain is awaitable. ``cached``
+    None → the read misses (empty ``data``); a dict → the read hits."""
+    client = MagicMock(spec=AsyncClient)
+    builder = MagicMock()
+    for method in ("select", "eq", "limit", "single", "update", "upsert"):
+        getattr(builder, method).return_value = builder
+    data = [{"derived_payload": cached}] if cached is not None else []
+    builder.execute = AsyncMock(return_value=MagicMock(data=data))
+    client.table.return_value = builder
+    return client
+
+
+def _sync_cache_client(*, cached: dict | None) -> MagicMock:
+    """A sync service client (isinstance AsyncClient False → the to_thread branch)."""
+    client = MagicMock()
+    builder = MagicMock()
+    for method in ("select", "eq", "limit", "single", "update", "upsert"):
+        getattr(builder, method).return_value = builder
+    data = [{"derived_payload": cached}] if cached is not None else []
+    builder.execute = MagicMock(return_value=MagicMock(data=data))
+    client.table.return_value = builder
+    return client
+
+
+@pytest.mark.asyncio
+async def test_derive_cache_hit_async_client_skips_llm(llm: MockLLMClient) -> None:
+    supabase = _async_cache_client(cached=_cached_payload())
+    derived, result = await derive_profile_from_jd(llm, jd_text=_VALID_JD, supabase=supabase)
+
+    # Cache hit → the LLM is never called and a zero-cost result is returned.
+    assert llm.calls == []
+    assert result.cost_usd == 0
+    assert derived.scoring_profile.categories["core_skills"].keywords["React"] == 3
+
+
+@pytest.mark.asyncio
+async def test_derive_cache_miss_async_client_runs_llm_and_persists(llm: MockLLMClient) -> None:
+    supabase = _async_cache_client(cached=None)
+    derived, result = await derive_profile_from_jd(llm, jd_text=_VALID_JD, supabase=supabase)
+
+    # Miss → the LLM runs, and the result is written back via an awaited upsert.
+    assert len(llm.calls) == 1
+    assert result.cost_usd > 0
+    assert isinstance(derived, DerivedTarget)
+    supabase.table.return_value.upsert.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_derive_cache_hit_sync_client_offloaded_skips_llm(llm: MockLLMClient) -> None:
+    # The corpus-builder still passes a sync Client; the cache read is off-loaded
+    # to a thread (isinstance AsyncClient is False) but still hits.
+    supabase = _sync_cache_client(cached=_cached_payload())
+    derived, result = await derive_profile_from_jd(llm, jd_text=_VALID_JD, supabase=supabase)
+
+    assert llm.calls == []
+    assert result.cost_usd == 0
+    assert derived.scoring_profile.seniority.level == "senior"

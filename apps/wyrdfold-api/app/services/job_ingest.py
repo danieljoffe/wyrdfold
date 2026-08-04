@@ -23,7 +23,7 @@ import logging
 from collections.abc import Sequence
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache
 from app.models.targets import JobTarget
@@ -36,7 +36,7 @@ from app.services.extract import (
 from app.services.jd_parser import parse_jd
 from app.services.location_parse import parse_location
 from app.services.sanitize import sanitize_html
-from app.services.target_scoring import score_and_upsert
+from app.services.target_scoring import score_and_upsert_async
 
 logger = logging.getLogger(__name__)
 
@@ -52,21 +52,8 @@ def job_external_id(final_url: str) -> str:
     return str(int(hashlib.sha256(final_url.encode()).hexdigest()[:15], 16))
 
 
-def ensure_manual_source(supabase: Client) -> None:
-    """Idempotently ensure the ``manual`` pseudo-source row exists.
-
-    Jobs added by URL are filed under a fixed pseudo-source (``MANUAL_SOURCE_ID``)
-    to satisfy the NOT-NULL ``jobs.source_id`` FK. A seed migration creates it;
-    this self-heals if it's ever missing (fresh DB, manual wipe). ``on_conflict=
-    "id"`` + ignore_duplicates makes it a no-op in the common case.
-    """
-    supabase.table("sources").upsert(
-        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
-    ).execute()
-
-
 async def materialize_and_score_job(
-    supabase: Client,
+    supabase: AsyncClient,
     *,
     final_url: str,
     title: str | None,
@@ -83,9 +70,9 @@ async def materialize_and_score_job(
     Returns the ``jobs.id`` (None only if the upsert returned no row). Scoring +
     force-include are skipped when there is no ``title`` or no ``targets`` (the
     posting still materializes so it can be scored later). All writes go through
-    the service-role ``supabase`` client and the gated ``score_and_upsert`` /
-    ``user_set_scores_included`` RPCs (SEC-H2). Every blocking round-trip is
-    off-loaded to the threadpool (#107).
+    the async service-role ``supabase`` client and the gated
+    ``score_and_upsert_async`` / ``user_set_scores_included`` RPCs (SEC-H2) —
+    awaited on the loop; the CPU-bound JD parse is off-loaded to a thread (#57).
     """
     salary = salary_text
     if not salary and description_html:
@@ -113,11 +100,14 @@ async def materialize_and_score_job(
         **salary_columns(salary),
     }
 
-    def _persist() -> Any:
-        ensure_manual_source(supabase)
-        return supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
-
-    resp = await asyncio.to_thread(_persist)
+    # Idempotently ensure the ``manual`` pseudo-source (NOT-NULL FK target) then
+    # upsert the posting — both awaited on the async service client.
+    await supabase.table("sources").upsert(
+        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
+    ).execute()
+    resp = await (
+        supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
+    )
     posting_id: str | None = None
     if resp.data:
         posting_id = cast(dict[str, Any], resp.data[0]).get("id")
@@ -138,14 +128,13 @@ async def materialize_and_score_job(
     parsed = await asyncio.to_thread(parse_jd, desc)
     results = await asyncio.gather(
         *[
-            score_and_upsert(
+            score_and_upsert_async(
                 supabase,
                 job_posting_id=posting_id,
                 title=title,
                 description_html=desc,
                 target=t,
                 parsed_jd=parsed,
-                gated=True,
             )
             for t in targets
         ],
@@ -164,12 +153,10 @@ async def materialize_and_score_job(
     if set_included:
         target_ids = [t.id for t in targets]
         try:
-            await asyncio.to_thread(
-                lambda: supabase.rpc(
-                    "user_set_scores_included",
-                    {"p_job_posting_id": posting_id, "p_target_ids": target_ids},
-                ).execute()
-            )
+            await supabase.rpc(
+                "user_set_scores_included",
+                {"p_job_posting_id": posting_id, "p_target_ids": target_ids},
+            ).execute()
         except Exception:
             logger.exception("Force-include update failed for job %s", posting_id)
 

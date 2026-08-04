@@ -39,10 +39,16 @@ def _target(id: str = "tgt-1") -> JobTarget:
 
 
 def _supabase(*, job_id: str | None = "job-1") -> MagicMock:
-    """A service-role client whose jobs upsert returns one row (or none)."""
+    """An async service-role client whose jobs upsert returns one row (or none).
+
+    The sources + jobs upserts and the force-include RPC are all awaited on the
+    loop now (#57 PR-G2e-4), so their ``execute`` is an ``AsyncMock``."""
     supabase = MagicMock()
     data = [{"id": job_id}] if job_id is not None else []
-    supabase.table.return_value.upsert.return_value.execute.return_value = MagicMock(data=data)
+    supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=data)
+    )
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     return supabase
 
 
@@ -87,7 +93,7 @@ async def test_no_title_materializes_but_skips_scoring(
     later) but scoring + force-include are skipped."""
     supabase = _supabase()
     score = MagicMock()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", score)
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", score)
 
     posting_id = await _materialize(supabase, title=None)
 
@@ -107,7 +113,7 @@ async def test_no_targets_materializes_but_skips_scoring(
 ) -> None:
     supabase = _supabase()
     score = MagicMock()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", score)
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", score)
 
     posting_id = await _materialize(supabase, targets=[])
 
@@ -125,7 +131,7 @@ async def test_scores_each_target_and_force_includes(
     scored: list[str] = []
     monkeypatch.setattr(
         job_ingest,
-        "score_and_upsert",
+        "score_and_upsert_async",
         AsyncMock(side_effect=lambda _c, **kw: scored.append(kw["target"].id)),
     )
     posting_id = await _materialize(supabase, targets=[_target("tgt-1"), _target("tgt-2")])
@@ -154,7 +160,7 @@ async def test_per_target_score_failure_is_isolated(
             raise RuntimeError("scoring exploded")
         scored.append(target.id)  # type: ignore[attr-defined]
 
-    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(side_effect=flaky))
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", AsyncMock(side_effect=flaky))
 
     posting_id = await _materialize(supabase, targets=[_target("tgt-bad"), _target("tgt-ok")])
 
@@ -168,7 +174,7 @@ async def test_set_included_false_skips_force_include(
     monkeypatch: pytest.MonkeyPatch, invalidations: list[int]
 ) -> None:
     supabase = _supabase()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(return_value=None))
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", AsyncMock(return_value=None))
 
     await _materialize(supabase, set_included=False)
 
@@ -183,7 +189,7 @@ async def test_force_include_failure_is_swallowed(
     visibility is nice-to-have and must never fail the materialize."""
     supabase = _supabase()
     supabase.rpc.return_value.execute.side_effect = RuntimeError("rpc down")
-    monkeypatch.setattr(job_ingest, "score_and_upsert", AsyncMock(return_value=None))
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", AsyncMock(return_value=None))
 
     posting_id = await _materialize(supabase)
 
@@ -197,7 +203,7 @@ async def test_upsert_no_row_returns_none(
 ) -> None:
     supabase = _supabase(job_id=None)  # upsert returned no row
     score = MagicMock()
-    monkeypatch.setattr(job_ingest, "score_and_upsert", score)
+    monkeypatch.setattr(job_ingest, "score_and_upsert_async", score)
 
     posting_id = await _materialize(supabase)
 

@@ -16,12 +16,13 @@ reads/writes are module-inline async helpers (``_create`` / ``_update`` /
 ``_link`` / ``_get`` / ``_add_reference_jd`` / ``_list_reference_jds`` /
 ``_count_user_reference_jds``), the cost ledger is ``cost_log.record_async``,
 the #191 merge is ``apply_profile_merge_rpc_async``, and the deferred work is
-spawned via ``spawn_detached`` (not starlette ``BackgroundTasks``). The
-not-yet-async deep services (``resolve_current_payload`` /
-``materialize_and_score_job`` / ``persistence.upsert_user_job`` /
-``register_source_from_url``) take a SYNC client from a direct
-``get_supabase()`` call — patched here. All are monkeypatched so the focus stays
-on orchestration.
+spawned via ``spawn_detached`` (not starlette ``BackgroundTasks``). #57 PR-G2e-4:
+``derive_profile_from_jd`` (async cache path), ``materialize_and_score_job``, and
+the ``_upsert_user_job_async`` inline now ride that same async client; only two
+residual services (``resolve_current_payload`` in ``_apply_fit_score`` and
+``register_source_from_url`` in ``from_url``) still take a SYNC client from a
+direct ``get_supabase()`` call. All are monkeypatched so the focus stays on
+orchestration.
 """
 
 from __future__ import annotations
@@ -202,7 +203,7 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
         )
         return "posting-1"
 
-    def fake_upsert_user_job(supabase, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_upsert_user_job(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("user_job", **kwargs)
 
     monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
@@ -211,9 +212,13 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
     monkeypatch.setattr(from_input, "derive_fit_score", fake_fit_score)
     monkeypatch.setattr(from_input, "resolve_current_payload", fake_resolve)
     monkeypatch.setattr(from_input, "materialize_and_score_job", fake_materialize)
-    monkeypatch.setattr(from_input.persistence, "upsert_user_job", fake_upsert_user_job)
+    # #57 PR-G2e-4: the ``user_jobs`` write is the async ``_upsert_user_job_async``
+    # inline now (``persistence.upsert_user_job`` no longer imported here).
+    monkeypatch.setattr(from_input, "_upsert_user_job_async", fake_upsert_user_job)
     monkeypatch.setattr(cost_log, "record_async", fake_cost_record_async)
-    # The deep sync services take a client from a DIRECT get_supabase() call.
+    # The two residual sync services (``resolve_current_payload`` in
+    # ``_apply_fit_score``, ``register_source_from_url`` in ``from_url``) still take
+    # a client from a DIRECT get_supabase() call.
     monkeypatch.setattr(from_input, "get_supabase", lambda: MagicMock())
     return recorder
 
