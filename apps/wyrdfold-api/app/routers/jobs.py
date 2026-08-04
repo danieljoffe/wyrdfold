@@ -41,7 +41,13 @@ from app.models.schemas import (
     UrlValidateRequest,
     UrlValidateResponse,
 )
-from app.models.targets import SENIORITY_ORDER, AxisWeights, TargetPreferences, UserTarget
+from app.models.targets import (
+    SENIORITY_ORDER,
+    AxisWeights,
+    JobTarget,
+    TargetPreferences,
+    UserTarget,
+)
 from app.rate_limit import limiter
 from app.services.extract import (
     ExtractionResult,
@@ -54,12 +60,12 @@ from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
-from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
-    score_and_upsert,
+    score_and_upsert_async,
 )
 from app.services.targets.crud import (
+    _parse_target,
     _parse_user_target,
     get_active_for_user,
     preferences_from_user_target,
@@ -2485,6 +2491,32 @@ async def add_manual_job(
     )
 
 
+async def _get_target_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get`` — one shared-catalog target row by id.
+
+    ``crud.get`` stays sync for the poller / from-url / operator paths, so the
+    ``async def`` add-to-target handler reads the row natively on the pooled async
+    service client here rather than tie up a threadpool worker (#57 PR-G2d-a). The
+    row→model parse is reused from crud so the shape stays identical.
+    """
+    resp = await supabase.table("targets").select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_target(rows[0]) if rows else None
+
+
+async def _user_set_scores_included_async(
+    supabase: AsyncClient, job_posting_id: str, target_ids: list[str]
+) -> None:
+    """Force-include a posting's scores under specific targets via the
+    ``user_set_scores_included`` RPC, natively on the async service client
+    (#57 PR-G2d-a). Extracted from the handler body so no bare ``.execute()``
+    sits on the loop there (the #107 guard scans handler bodies)."""
+    await supabase.rpc(
+        "user_set_scores_included",
+        {"p_job_posting_id": job_posting_id, "p_target_ids": target_ids},
+    ).execute()
+
+
 async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
     """Load a LIVE, US posting's scoring inputs (title + JD body) by id, or None.
 
@@ -2517,9 +2549,10 @@ async def add_job_to_target(
     body: AddToTargetRequest,
     user_id: str = Depends(get_current_user_id),
     # The RLS-backstopped reads (job load + ownership check) ride the caller's
-    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes use a
-    # sync service client obtained in-body (see below).
+    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes ride
+    # the pooled async service client (#57 PR-G2d-a).
     caller_supabase: AsyncClient = Depends(get_async_user_supabase),
+    service_supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> AddToTargetResponse:
     """Score an EXISTING posting (a search result's ``jobs.id``) against one of
     the caller's own targets and save it to their pipeline (#467 power-action).
@@ -2547,28 +2580,27 @@ async def add_job_to_target(
     # target, which is insufficient for a SHARED, ownerless target catalog (a
     # follower could tamper with co-followers' scores). So all score writes go on
     # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
-    # branch), and OWNERSHIP is enforced in the API above. ``score_and_upsert``
-    # is the shared async scorer (#57 — the same one the poller and job_ingest
-    # use), so it's awaited directly; the remaining sync service-role calls here
-    # (``get_target`` and the follow-up ``user_set_scores_included`` / 'saved'
-    # writes) stay off the loop via ``to_thread``.
-    service_supabase = get_supabase()
-    target = await asyncio.to_thread(get_target, service_supabase, body.target_id)
+    # branch), and OWNERSHIP is enforced in the API above. Every service-role
+    # round-trip here runs natively on the pooled async service client (#57
+    # PR-G2d-a): the target read inlines ``crud.get`` async, and
+    # ``score_and_upsert_async`` is the always-gated async twin of the shared
+    # scorer.
+    target = await _get_target_async(service_supabase, body.target_id)
     if target is None:  # catalog row vanished between the two reads — defensive
         raise HTTPException(status_code=404, detail="Target not found")
 
     # Stage-2 score the existing posting against the chosen target on the
-    # SERVICE-ROLE client. ``gated=True`` still routes through user_upsert_score,
-    # but with auth.uid() NULL it takes the function's service-role-exempt branch
-    # (the RPC isn't authenticated-executable post-lockdown — see above).
+    # SERVICE-ROLE client. The async twin is always gated — it routes through
+    # user_upsert_score, but with auth.uid() NULL it takes the function's
+    # service-role-exempt branch (the RPC isn't authenticated-executable
+    # post-lockdown — see above).
     try:
-        result = await score_and_upsert(
+        result = await score_and_upsert_async(
             service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",
             description_html=job["description_html"] or "",
             target=target,
-            gated=True,
         )
     except APIError as exc:
         logger.error(
@@ -2592,20 +2624,14 @@ async def add_job_to_target(
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
     try:
-        await asyncio.to_thread(
-            lambda: service_supabase.rpc(
-                "user_set_scores_included",
-                {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
-            ).execute()
-        )
+        await _user_set_scores_included_async(service_supabase, job_id, [body.target_id])
     except Exception:
         logger.exception("add-to-target force-include failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
     #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
     try:
-        await asyncio.to_thread(
-            persistence.upsert_user_job,
+        await _upsert_user_job_async(
             service_supabase,
             user_id=user_id,
             job_posting_id=job_id,

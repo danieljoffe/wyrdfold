@@ -15,6 +15,7 @@ audit trail before v2 ships.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -329,4 +330,80 @@ def maybe_run_learner(
         added_negative_keywords=truly_new,
         signals_consumed=len(consumed_ids),
         profile_version_after=next_version,
+    )
+
+
+# ---- Async router drivers (#57 PR-G2d-a) ----------------------------------
+# The interactive feedback router is ``async def`` on the pooled async clients,
+# but the learner chain stays SYNC — it leans on the shared #191 profile-write
+# RPC + ``bulk_score_for_target`` (service-role, poller-shared), which an async
+# fork would twin. So the router drives the sync learner through these seams
+# instead of holding a sync service client itself (``get_supabase`` acquired here,
+# in the service layer, never in the router body).
+
+
+async def run_learner_off_loop(*, user_id: str, target_id: str) -> LearnerPatchSummary | None:
+    """Drive the deterministic learner off the event loop on the pooled sync
+    service client, for the ``POST /targets/{id}/learn`` handler (#57 PR-G2d-a)."""
+    from app.dependencies import get_supabase
+
+    supabase = get_supabase()
+    return await asyncio.to_thread(
+        maybe_run_learner, supabase, user_id=user_id, target_id=target_id
+    )
+
+
+def run_learner_and_rescore(supabase: Client, *, user_id: str, target_id: str) -> None:
+    """The post-feedback background learner chain (moved from the router's
+    ``_safe_run_learner``, #57 PR-G2d-a).
+
+    Run the deterministic learner and, when it actually mutated the profile
+    (returned a ``LearnerPatchSummary``), follow with a ``bulk_score_for_target``
+    pass so the user sees the lifted/lowered scores on their next page load
+    instead of waiting for the next poll cycle. The patch bumped
+    ``profile_version`` already, so ``bulk_score_for_target`` only touches rows
+    whose ``scored_profile_version`` is now stale.
+
+    Sync + poller-shared; the router drives it off the loop via ``spawn_detached``
+    (never a starlette ``BackgroundTask`` — uvloop pool deadlock). Swallows its
+    own exceptions (a background failure must not surface as an opaque 500 on a
+    later request) while still emitting a usable traceback.
+    """
+    from app.services.target_scoring import bulk_score_for_target
+    from app.services.targets.crud import get as get_target
+
+    try:
+        patch = maybe_run_learner(supabase, user_id=user_id, target_id=target_id)
+        if patch is None:
+            return
+        target = get_target(supabase, target_id)
+        if target is None:
+            return
+        n = bulk_score_for_target(supabase, target)
+        logger.info(
+            "Feedback learner triggered re-score for target=%s: "
+            "+%d negatives %s, %d rows re-scored",
+            target_id,
+            len(patch.added_negative_keywords),
+            patch.added_negative_keywords,
+            n,
+        )
+    except Exception:
+        logger.exception(
+            "Feedback learner failed for (user=%s, target=%s)",
+            user_id,
+            target_id,
+        )
+
+
+async def run_learner_and_rescore_off_loop(*, user_id: str, target_id: str) -> None:
+    """Async entry for the background learner chain: acquire the pooled sync
+    service client and run :func:`run_learner_and_rescore` off the event loop.
+    The coroutine the ``create_feedback`` handler hands to ``spawn_detached``
+    (#57 PR-G2d-a)."""
+    from app.dependencies import get_supabase
+
+    supabase = get_supabase()
+    await asyncio.to_thread(
+        run_learner_and_rescore, supabase, user_id=user_id, target_id=target_id
     )

@@ -251,10 +251,11 @@ def test_no_blocking_supabase_execute_in_async_handlers() -> None:
 # ---- of scanned functions differs.
 #
 # Scoped, for now, to the target-derivation module's bg functions (the ones the
-# 2026-07-21 hardening review threaded). Broadening to the poll / discovery /
-# learner bg tasks (run_force_poll_locked, run_discovery_all_targets_locked,
-# _safe_run_learner) needs each audited/threaded first, so it's a follow-up —
-# adding them here before that would just flip this guard red.
+# 2026-07-21 hardening review threaded). The post-feedback learner chain is now
+# threaded too (``services.feedback.run_learner_and_rescore_off_loop``, #57
+# PR-G2d-a). Broadening to the poll / discovery bg tasks (run_force_poll_locked,
+# run_discovery_all_targets_locked) needs each audited/threaded first, so it's a
+# follow-up — adding them here before that would just flip this guard red.
 _BG_TASK_MODULES: dict[Path, frozenset[str]] = {
     APP_DIR
     / "services"

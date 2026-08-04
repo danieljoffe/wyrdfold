@@ -5,8 +5,9 @@ private beta. This is the one PUBLIC (unauthenticated) write endpoint — anyone
 can join the waitlist.
 
 SECURITY POSTURE (audit #29):
-  - Writes go through the service-role Supabase client (``get_supabase``) into
-    ``waitlist_signups``, an RLS deny-all table. Service-role lives ONLY in
+  - Writes go through the service-role Supabase client
+    (``get_async_service_supabase``) into ``waitlist_signups``, an RLS deny-all
+    table. Service-role lives ONLY in
     this backend's env — the Next.js frontend never holds it. The browser can
     neither read nor write the table directly; it POSTs to the BFF
     (``/api/waitlist``) which forwards here.

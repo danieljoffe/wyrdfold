@@ -16,26 +16,24 @@ expected here — feedback is fundamentally per-user.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, cast
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     HTTPException,
     Query,
     Request,
 )
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
+from app.background import spawn_detached
 from app.dependencies import (
     enforce_llm_budget,
     get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
     get_llm_client,
-    get_supabase,
 )
 from app.models.feedback import (
     FeedbackCreate,
@@ -48,31 +46,19 @@ from app.rate_limit import limiter
 from app.services.feedback import (
     delete_feedback,
     list_for_target,
-    maybe_run_learner,
+    run_learner_and_rescore_off_loop,
+    run_learner_off_loop,
     upsert_feedback,
 )
 from app.services.llm.client import LLMClient
 from app.services.llm_learner import (
     StagedPatchConflictError,
-    apply_staged_patch,
-    reject_staged_patch,
-    run_llm_learner,
+    apply_staged_patch_off_loop,
+    reject_staged_patch_off_loop,
+    run_llm_learner_off_loop,
 )
 
 router = APIRouter(tags=["feedback"])
-
-
-def _service_client() -> Client:
-    """Sync service-role client for the background/shared-catalog write paths
-    (#57 slice 4). The learner + staged-patch service functions stay synchronous
-    — they lean on shared sync helpers (the #191 profile-write RPCs,
-    ``bulk_score_for_target``, the re-score projection) that other sync callers
-    and the poller share, so converting them would fork those into async twins.
-    The async handlers drive them off the event loop via ``asyncio.to_thread`` /
-    ``BackgroundTasks`` on this pooled sync client. A module-level seam so tests
-    can inject a double without a sync-client route dependency (which slice 4
-    retires)."""
-    return get_supabase()
 
 
 async def _job_exists(supabase: AsyncClient, job_id: str) -> bool:
@@ -126,7 +112,6 @@ async def _learning_log_rows(
 async def create_feedback(
     job_id: str,
     body: FeedbackCreate,
-    background: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
     # #79 R1: the foreground reads + the job_feedback upsert run through the
     # caller's JWT so RLS is the backstop (job_feedback self-CRUD, user_targets
@@ -153,11 +138,15 @@ async def create_feedback(
     # Only ``irrelevant`` signals feed the v1 learner — positive feedback
     # routes to ``secondary_skills`` in v2 (LLM only, since the heuristic
     # for "which positive token to weight" is harder). The learner writes the
-    # shared `targets` catalog + re-scores under service-role; it runs as a
-    # threadpooled sync BackgroundTask on the sync pool client (off the loop).
+    # shared `targets` catalog + re-scores under service-role, so it runs off
+    # the event loop as a detached task — NEVER a starlette BackgroundTask,
+    # which deadlocks the pooled async client under uvloop (app/background.py).
     queued = body.signal == "irrelevant"
     if queued:
-        background.add_task(_safe_run_learner, _service_client(), user_id, body.target_id)
+        spawn_detached(
+            run_learner_and_rescore_off_loop(user_id=user_id, target_id=body.target_id),
+            name=f"feedback-learner:{body.target_id}",
+        )
 
     return FeedbackCreateResponse(feedback=row, queued_learn_run=queued)
 
@@ -221,9 +210,7 @@ async def run_learner_now(
 ) -> Any:
     if not await _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
-    return await asyncio.to_thread(
-        maybe_run_learner, _service_client(), user_id=user_id, target_id=target_id
-    )
+    return await run_learner_off_loop(user_id=user_id, target_id=target_id)
 
 
 @router.post(
@@ -246,13 +233,13 @@ async def run_llm_learner_now(
     Returns a result with ``applied=True`` when the patch was auto-applied
     (confidence ≥ 0.6), or ``applied=False`` when it was staged for review.
     """
-    # The ownership precheck runs on the async service client. ``run_llm_learner``
+    # The ownership precheck runs on the async service client; the learner chain
     # itself stays sync-client (it awaits the LLM but its DB work leans on the
-    # shared #191 RPC + the sync re-score projection, so it manages its own
-    # off-loop threading internally on the pooled sync client).
+    # shared #191 RPC + the sync re-score projection), driven off the loop by the
+    # ``run_llm_learner_off_loop`` seam on the pooled sync service client.
     if not await _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
-    return await run_llm_learner(_service_client(), llm, user_id=user_id, target_id=target_id)
+    return await run_llm_learner_off_loop(llm, user_id=user_id, target_id=target_id)
 
 
 # `async def` (#57 slice 4): the read runs natively on the async user client
@@ -296,9 +283,7 @@ async def apply_learning_run(
     if not await _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
     try:
-        result = await asyncio.to_thread(
-            apply_staged_patch, _service_client(), user_id=user_id, run_id=run_id
-        )
+        result = await apply_staged_patch_off_loop(user_id=user_id, run_id=run_id)
     except StagedPatchConflictError as e:
         raise HTTPException(
             status_code=409,
@@ -331,57 +316,10 @@ async def reject_learning_run(
 ) -> Any:
     if not await _target_exists_for_user(supabase, user_id, target_id):
         raise HTTPException(status_code=404, detail="Target not found for user")
-    result = await asyncio.to_thread(
-        reject_staged_patch, _service_client(), user_id=user_id, run_id=run_id
-    )
+    result = await reject_staged_patch_off_loop(user_id=user_id, run_id=run_id)
     if result is None:
         raise HTTPException(
             status_code=404,
             detail="No staged patch with that run_id for this user",
         )
     return result
-
-
-# ---- BackgroundTasks wrapper ----------------------------------------------
-
-
-def _safe_run_learner(supabase: Client, user_id: str, target_id: str) -> None:
-    """BackgroundTasks consumes exceptions but logs them poorly. Wrap so
-    a learner failure can't surface as an opaque 500 on a subsequent
-    request, while still emitting a usable traceback in logs.
-
-    When the deterministic learner actually mutated the profile (returned
-    a ``LearnerPatchSummary``), follow up with a ``bulk_score_for_target``
-    pass so the user sees the lifted/lowered scores on their next page
-    load instead of having to wait for the next poll cycle. The patch
-    bumped ``profile_version`` already, so ``bulk_score_for_target`` only
-    touches rows whose ``scored_profile_version`` is now stale.
-    """
-    import logging
-
-    from app.services.target_scoring import bulk_score_for_target
-    from app.services.targets.crud import get as get_target
-
-    logger = logging.getLogger("app.routers.feedback")
-    try:
-        patch = maybe_run_learner(supabase, user_id=user_id, target_id=target_id)
-        if patch is None:
-            return
-        target = get_target(supabase, target_id)
-        if target is None:
-            return
-        n = bulk_score_for_target(supabase, target)
-        logger.info(
-            "Feedback learner triggered re-score for target=%s: "
-            "+%d negatives %s, %d rows re-scored",
-            target_id,
-            len(patch.added_negative_keywords),
-            patch.added_negative_keywords,
-            n,
-        )
-    except Exception:
-        logger.exception(
-            "Feedback learner failed for (user=%s, target=%s)",
-            user_id,
-            target_id,
-        )
