@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import Link from 'next/link';
 import { ArrowRight, ArrowUpRight, Check } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
@@ -75,7 +76,9 @@ export default function ListingDetailBody({
   const [creating, setCreating] = useState(false);
   const bound = inTargets.length > 0;
   const locationDisplay = formatLocation(job);
-  const meta = [job.company_name, locationDisplay].filter(Boolean).join(' · ');
+  const meta = [formatCompanyName(job.company_name), locationDisplay]
+    .filter(Boolean)
+    .join(' · ');
   const chips: string[] = [
     job.salary_text || 'Salary not listed',
     `Posted ${timeAgo(job.source_posted_at ?? job.cataloged_at)}`,
@@ -121,7 +124,7 @@ export default function ListingDetailBody({
           clears the Modal's absolute ✕ (top-4 right-4) when framed as a modal;
           on the full page it's harmless breathing room. */}
       <div className='flex items-start gap-3 pr-8'>
-        <CompanyAvatar name={job.company_name} size='lg' />
+        <CompanyAvatar name={formatCompanyName(job.company_name)} size='lg' />
         <div className='min-w-0 flex-1'>
           <Heading variant='component' as='h2' className='text-balance'>
             {job.title}

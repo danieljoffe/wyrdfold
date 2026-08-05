@@ -1,6 +1,7 @@
 // Pure presentational component — no hooks, no event handlers, no browser APIs.
 // Renders as a server component to keep the dashboard shell streaming.
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import {
   ArrowRight,
   Award,
@@ -235,7 +236,7 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                     variant='caption'
                     className='truncate text-text-secondary'
                   >
-                    {posting.company_name}
+                    {formatCompanyName(posting.company_name)}
                     {formatLocation(posting)
                       ? ` · ${formatLocation(posting)}`
                       : ''}
