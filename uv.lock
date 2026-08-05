@@ -703,7 +703,7 @@ wheels = [
 
 [[package]]
 name = "fastapi"
-version = "0.140.0"
+version = "0.141.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -712,9 +712,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0d/fb/fd7671137d9fa3df1d93a2f5111eb982709201724b29f211e4beb2d58688/fastapi-0.140.0.tar.gz", hash = "sha256:f338951b82fd74ca8f843163aec43ea1a1ce84d515415a50fa98fa25572a5544", size = 420968, upload-time = "2026-07-24T21:16:41.187Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/02/91e3416a8fdd715abb903a952a6bec7cdd8d14eed55d415fc8595524c319/fastapi-0.141.1.tar.gz", hash = "sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1", size = 425799, upload-time = "2026-07-29T17:18:05.568Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/76/6d9e25ad88da9d3ff744bcdbec4736e38c2288611d43f673a5d9bfa27c07/fastapi-0.140.0-py3-none-any.whl", hash = "sha256:e951c0a0d9540bf5d9a2a9e078fd415da2ab7e312d435139e7d9e2e7fe9f0b23", size = 130863, upload-time = "2026-07-24T21:16:42.89Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl", hash = "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3", size = 131954, upload-time = "2026-07-29T17:18:04.364Z" },
 ]
 
 [[package]]
@@ -2689,14 +2689,14 @@ wheels = [
 
 [[package]]
 name = "types-bleach"
-version = "6.4.0.20260607"
+version = "6.4.0.20260728"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "types-html5lib" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/39/e7/07438d4d0bd58c69e79d0d8aa0320a2005b08d10cac209dd812b3609227c/types_bleach-6.4.0.20260607.tar.gz", hash = "sha256:62ff099b9d25fbcccb1402651c14a465a5f54a24138be987442d2eed38aca91c", size = 11686, upload-time = "2026-06-07T06:11:40.035Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/58/b9f2678dd538de3aa8613825986dab68608447a25bd32aa336e65a6e2cdc/types_bleach-6.4.0.20260728.tar.gz", hash = "sha256:526a4fec997514bf3fe989ef59b86ec694bbb2ed70db22c59b622eb5a9b80fae", size = 11785, upload-time = "2026-07-28T04:52:17.359Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/93/44da16cfa99a3f47fcb35e6b7396c94c3530e2028d2b1027cc4ce6d95d8d/types_bleach-6.4.0.20260607-py3-none-any.whl", hash = "sha256:fc07e2fd0ef9bc0a22026e8abe589d76c5d06ea885d70357263a4ff8c3dc8516", size = 11985, upload-time = "2026-06-07T06:11:38.996Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/3d/ac2809b7afe8ac7c907faacdd60bd3d194de0802d809b82327e969bc05da/types_bleach-6.4.0.20260728-py3-none-any.whl", hash = "sha256:ea9feed53196b24a6d9f0cb471c1cfbb0788b3194e8335dc8da1b951b4965d7f", size = 12012, upload-time = "2026-07-28T04:52:16.344Z" },
 ]
 
 [[package]]
@@ -2873,15 +2873,15 @@ wheels = [
 
 [[package]]
 name = "uvicorn"
-version = "0.51.0"
+version = "0.52.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "h11" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a2/65/b7c6c443ccc58678c91e1e973bbe2a878591538655d6e1d47f24ba1c51f3/uvicorn-0.51.0.tar.gz", hash = "sha256:f6f4b69b657c312f516dd2d268ab9ae6f254b11e4bac504f37b2ab58b24dd0b0", size = 94412, upload-time = "2026-07-08T10:59:05.962Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/18/ccce41535dee1be77735592bd19965f3972c82e07ee703d324709496b716/uvicorn-0.52.1.tar.gz", hash = "sha256:112ec661814189acbccd3f7b86460147cc065fc92c0821afa78918780e4354dd", size = 100571, upload-time = "2026-08-01T18:19:30.732Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/ec/dbb7e5a6b91f86bfb9eb7d2988a2730907b6a729875b949c7f022e8b88fa/uvicorn-0.51.0-py3-none-any.whl", hash = "sha256:5d38af6cd620f2ae3849fb44fd4879e0890aa1febe8d47eb355fb45d93fe6a5b", size = 73219, upload-time = "2026-07-08T10:59:04.44Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/d5/68e6e9bca63c0badf67002890a46d3784c958de45b65e1275ec583ca1f06/uvicorn-0.52.1-py3-none-any.whl", hash = "sha256:e4403f9d93188cf9d1088e9f40e3acd12630e2df8675316704379a7fc20fff6a", size = 79859, upload-time = "2026-08-01T18:19:29.294Z" },
 ]
 
 [package.optional-dependencies]
@@ -3228,7 +3228,7 @@ requires-dist = [
     { name = "apscheduler", specifier = ">=3.11" },
     { name = "beautifulsoup4", specifier = ">=4.13" },
     { name = "bleach", specifier = ">=6.2" },
-    { name = "fastapi", specifier = ">=0.140.0" },
+    { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pdfplumber", specifier = ">=0.11" },
     { name = "pydantic-settings", specifier = ">=2.7" },
@@ -3240,7 +3240,7 @@ requires-dist = [
     { name = "stripe", specifier = ">=15.3.0" },
     { name = "supabase", specifier = ">=2.13" },
     { name = "twilio", specifier = ">=9.0" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.0" },
     { name = "voyageai", specifier = ">=0.5.0" },
 ]
 
@@ -3251,7 +3251,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.11" },
-    { name = "types-bleach", specifier = ">=6.2" },
+    { name = "types-bleach", specifier = ">=6.4.0.20260728" },
 ]
 
 [[package]]
