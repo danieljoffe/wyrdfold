@@ -48,6 +48,9 @@ const STATUS_POLL_FAST_ATTEMPTS = 10;
 const STATUS_POLL_FAST_MS = 3_000;
 const STATUS_POLL_SLOW_MS = 15_000;
 
+/** Last-picked jobs tab ('' = All Jobs) — replayed on bare entry (#607). */
+const LAST_TAB_STORAGE_KEY = 'wyrdfold.jobs.lastTab';
+
 interface JobsListProps {
   targetId: string | undefined;
   initialStatus?: string;
@@ -119,6 +122,39 @@ export default function JobsList({
   );
 
   const activeTargetId = urlState.targetId;
+
+  // Last-picked tab memory (#607). A bare sidebar entry to /jobs restores
+  // whichever tab the user last chose — including "All Jobs" (stored as
+  // ''). This deliberately does NOT resurrect the removed first-active-
+  // target default above: only an explicit prior choice is replayed, and
+  // only when the URL carries no target of its own (deep links win).
+  const restoredLastTabRef = useRef(false);
+  useEffect(() => {
+    if (restoredLastTabRef.current) return;
+    restoredLastTabRef.current = true;
+    if (urlState.targetId !== undefined) return;
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem(LAST_TAB_STORAGE_KEY);
+    } catch {
+      return;
+    }
+    if (!stored) return;
+    if (!targets.some(t => t.id === stored)) return;
+    setUrlState({ targetId: stored });
+    // Mount-only restore by design — later target changes are user choices.
+  }, []);
+
+  // Record every explicit tab choice once the restore pass has run (the
+  // guard keeps the pre-restore undefined from clobbering the stored id).
+  useEffect(() => {
+    if (!restoredLastTabRef.current) return;
+    try {
+      localStorage.setItem(LAST_TAB_STORAGE_KEY, activeTargetId ?? '');
+    } catch {
+      // Storage unavailable (private mode) — memory is best-effort.
+    }
+  }, [activeTargetId]);
 
   // Per-target filter persistence. localStorage-backed; survives reloads
   // and out-of-page navigation but not browser-data clears. Writes happen
