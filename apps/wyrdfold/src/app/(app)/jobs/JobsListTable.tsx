@@ -200,6 +200,7 @@ export default function JobsListTable({
                     <ScoreBadge
                       score={job.score}
                       scoringStatus={job.scoring_status}
+                      pending={job.pending}
                     />
                   </td>
                   <td className='px-3 py-2 font-medium'>

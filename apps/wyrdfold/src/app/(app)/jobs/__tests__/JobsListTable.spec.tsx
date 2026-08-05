@@ -281,3 +281,47 @@ describe('JobsListTable', () => {
     expect(within(row).getByText(/discovered/i)).toBeInTheDocument();
   });
 });
+
+describe('JobsListTable score cell (issue #603)', () => {
+  // Prod regression 2026-08-05: the API marks fully-graded rows
+  // `pending: false` but stamps scoring_status values like 'stage2';
+  // the table omitted the authoritative `pending` prop, so ScoreBadge's
+  // status heuristic classified every graded row as still scoring —
+  // "·" placeholder + infinite spinner across the whole grid.
+  it('renders the numeric score for a fit-graded row whose scoring_status is not "complete"', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({ score: 100, scoring_status: 'stage2', pending: false }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByLabelText('Match score 100')).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/scoring in progress/i)
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/fit score pending/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps the pending placeholder for a row the API marks pending', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({ score: 61, scoring_status: 'stage2', pending: true }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Match score 61')).not.toBeInTheDocument();
+  });
+});
