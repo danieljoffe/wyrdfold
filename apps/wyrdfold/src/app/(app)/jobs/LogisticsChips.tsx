@@ -1,3 +1,4 @@
+import { formatSalaryRange } from '@/lib/formatSalary';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import type { ComponentProps } from 'react';
 
@@ -21,29 +22,16 @@ const REMOTE_VARIANT: Record<'remote' | 'hybrid' | 'onsite', BadgeVariant> = {
   onsite: 'default',
 };
 
-function formatMoney(
-  n: number,
-  currency: string | null,
-  unit: 'year' | 'hour' | null
-): string {
-  const sym = !currency || currency === 'USD' ? '$' : `${currency} `;
-  // Hourly figures are small; annual figures render compactly as "$150k".
-  return unit === 'hour' ? `${sym}${n}` : `${sym}${Math.round(n / 1000)}k`;
-}
-
-/** Explicit disclosed salary only (the grader nulls "competitive"/DOE). */
+/** Explicit disclosed salary only (the grader nulls "competitive"/DOE).
+ *  Delegates to the shared formatter (#606) — logistics grades use
+ *  'year'|'hour' where the catalog columns use 'yearly'|'hourly'. */
 function formatSalary(f: LogisticsFilters): string | null {
-  const { salary_min, salary_max, salary_currency, salary_unit } = f;
-  if (salary_min == null && salary_max == null) return null;
-  const suffix = salary_unit === 'hour' ? '/hr' : '';
-  const money = (n: number) => formatMoney(n, salary_currency, salary_unit);
-  if (salary_min != null && salary_max != null) {
-    return salary_min === salary_max
-      ? `${money(salary_min)}${suffix}`
-      : `${money(salary_min)}–${money(salary_max)}${suffix}`;
-  }
-  if (salary_min != null) return `${money(salary_min)}+${suffix}`;
-  return `Up to ${money(salary_max as number)}${suffix}`;
+  return formatSalaryRange({
+    min: f.salary_min ?? null,
+    max: f.salary_max ?? null,
+    currency: f.salary_currency ?? null,
+    period: f.salary_unit === 'hour' ? 'hourly' : 'yearly',
+  });
 }
 
 function formatLocation(f: LogisticsFilters): string | null {

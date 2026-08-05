@@ -44,7 +44,8 @@ export interface LogisticsFilters {
   salary_min: number | null;
   salary_max: number | null;
   salary_currency: string | null;
-  salary_unit: 'year' | 'hour' | null;
+  /** API vocabulary (services/job_search.py): never guessed. */
+  salary_period: 'yearly' | 'hourly' | null;
   location_city: string | null;
   location_country: string | null;
 }

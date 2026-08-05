@@ -1,6 +1,8 @@
 'use client';
 
 import { Fragment, useEffect, useState } from 'react';
+import { formatJobSalary } from '@/lib/formatSalary';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
 import Button from '@/components/kit/Button';
@@ -278,12 +280,14 @@ export default function JobsListTable({
                       <LogisticsChips filters={job.logistics_filters} />
                     </div>
                   </td>
-                  <td className='px-3 py-2'>{job.company_name}</td>
+                  <td className='px-3 py-2'>
+                    {formatCompanyName(job.company_name)}
+                  </td>
                   <td className='px-3 py-2 text-text-tertiary'>
                     {timeAgo(postedAt(job))}
                   </td>
                   <td className='px-3 py-2 text-text-tertiary'>
-                    {job.salary_text ?? '—'}
+                    {formatJobSalary(job) ?? '—'}
                   </td>
                   <td className='px-3 py-2 text-text-tertiary truncate max-w-[150px]'>
                     {formatLocation(job) || '—'}

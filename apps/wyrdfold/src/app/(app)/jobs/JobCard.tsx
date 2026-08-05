@@ -1,6 +1,8 @@
 'use client';
 
 import { useState } from 'react';
+import { formatJobSalary } from '@/lib/formatSalary';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { useRouter } from 'next/navigation';
 import { ExternalLink, Maximize2, MoreVertical, Trash2 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
@@ -126,7 +128,9 @@ export default function JobCard({
       <dl className='grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs'>
         <dt className='text-text-tertiary'>Company</dt>
         <dd className='flex min-w-0 items-center justify-end gap-2 text-text-secondary'>
-          <span className='truncate font-medium'>{job.company_name}</span>
+          <span className='truncate font-medium'>
+            {formatCompanyName(job.company_name)}
+          </span>
           {job.source_id === MANUAL_SOURCE_ID && (
             <Badge variant='info' size='sm'>
               Discovered
@@ -139,7 +143,7 @@ export default function JobCard({
         </dd>
         <dt className='text-text-tertiary'>Salary</dt>
         <dd className='truncate text-right text-text-secondary'>
-          {job.salary_text ?? '—'}
+          {formatJobSalary(job) ?? '—'}
         </dd>
         <dt className='text-text-tertiary'>Posted</dt>
         <dd className='text-right text-text-secondary'>
