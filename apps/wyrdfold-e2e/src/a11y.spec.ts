@@ -1,5 +1,5 @@
 import AxeBuilder from '@axe-core/playwright';
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // Integration-level accessibility checks (#25 F6). Unit-level jest-axe
 // (see test-utils/axe.ts) catches violations on isolated components;
