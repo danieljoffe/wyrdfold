@@ -251,3 +251,25 @@ async def test_dev_default_query_suggest_survives_blank_query() -> None:
     )
     assert parsed.suggestions
     assert all(s.label for s in parsed.suggestions)
+
+
+def test_dev_default_job_analysis_is_schema_valid() -> None:
+    """The dev-default analysis verdict must validate as ``JobAnalysis``.
+
+    The 2026-08-05 e2e drive found the generic echo failing validation, so
+    every mock-env analysis surfaced "Analysis failed" — local dev and CI
+    could not drive the panel's flagship flow (#608). This pins the canned
+    verdict to the real schema so model drift breaks the test, not the
+    mock environments.
+    """
+    import json
+
+    from app.models.analysis import JobAnalysis
+    from app.services.llm.mock import JOB_ANALYSIS_PURPOSE, dev_default_responses
+
+    source = dev_default_responses()[JOB_ANALYSIS_PURPOSE]
+    assert callable(source)
+    payload = json.loads(source("ignored", []))
+    analysis = JobAnalysis.model_validate(payload)
+    assert analysis.recommendation
+    assert analysis.scorecard.skills_matched

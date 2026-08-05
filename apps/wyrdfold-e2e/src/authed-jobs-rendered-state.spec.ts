@@ -26,6 +26,7 @@ const TARGET_ID = '00000000-0000-4000-8000-0000000f1177';
 const SOURCE_ID = '00000000-0000-4000-8000-0000000f1180';
 const JOB_GRADED_ID = '00000000-0000-4000-8000-0000000f1178';
 const JOB_PENDING_ID = '00000000-0000-4000-8000-0000000f1179';
+const OPTIMIZED_DOC_ID = '00000000-0000-4000-8000-0000000f1181';
 
 test.beforeAll(async () => {
   const url = process.env['NEXT_PUBLIC_SUPABASE_URL'];
@@ -54,6 +55,27 @@ test.beforeAll(async () => {
   );
   if (profErr)
     throw new Error(`user_profiles upsert failed: ${profErr.message}`);
+
+  // The analysis flow refuses to run without an optimized experience doc
+  // (the ``no_profile`` gate, #105) — the first draft of this spec passed
+  // on that gate branch without ever exercising an analysis. A minimal
+  // valid payload unlocks the real flow.
+  const { error: optErr } = await admin
+    .from('experience_optimized_docs')
+    .upsert({
+      id: OPTIMIZED_DOC_ID,
+      user_id: user.id,
+      version: 1,
+      payload: {
+        summary: 'Full-stack engineer: TypeScript, React, Node.js, PostgreSQL.',
+        roles: [],
+        skills: [],
+        outcomes: [],
+        annotations: [],
+      },
+      source: 'llm',
+    });
+  if (optErr) throw new Error(`optimized doc upsert failed: ${optErr.message}`);
 
   const { error: targetErr } = await admin.from('targets').upsert({
     id: TARGET_ID,
@@ -168,7 +190,13 @@ test('graded rows render their fit score; ungraded rows render the pending badge
   const gradedRow = page
     .getByRole('row')
     .filter({ hasText: 'E2E Graded Platform Role' });
-  await expect(gradedRow.getByLabel('Match score 87')).toBeVisible();
+  // Generous first-paint timeout: the /jobs first render sits behind a
+  // serial auth-refresh → targets → status → jobs chain, and under full
+  // parallel workers on one shared local stack that chain can exceed 30s.
+  // Later asserts keep tight defaults.
+  await expect(gradedRow.getByLabel('Match score 87')).toBeVisible({
+    timeout: 60_000,
+  });
   await expect(gradedRow.getByLabel(/scoring in progress/i)).toHaveCount(0);
 
   // The ungraded row shows the pending badge — never its keyword
@@ -192,6 +220,7 @@ test('the analysis panel survives verdict completion and its refetch (#602)', as
   const gradedRow = page
     .getByRole('row')
     .filter({ hasText: 'E2E Graded Platform Role' });
+  await expect(gradedRow).toBeVisible({ timeout: 60_000 });
   await gradedRow.click();
 
   // Panel opens and the (mock-LLM) analysis auto-runs.
@@ -233,19 +262,21 @@ test('a failed jobs fetch renders the load-error state with a working retry — 
 
   // Next's route announcer also carries role=alert — scope by copy.
   const alert = page.getByRole('alert').filter({ hasText: /loading problem/i });
-  await expect(alert).toBeVisible();
+  await expect(alert).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText(/no jobs found/i)).toHaveCount(0);
 
   // Heal the network; Retry must recover to real rows without a reload.
   failing = false;
   await page.getByRole('button', { name: /retry/i }).click();
-  await expect(page.getByText('E2E Graded Platform Role')).toBeVisible();
+  await expect(page.getByText('E2E Graded Platform Role')).toBeVisible({
+    timeout: 30_000,
+  });
 });
 
 test('/onboarding redirects completed profiles to the dashboard (#607)', async ({
   page,
 }) => {
   await page.goto('/onboarding');
-  await expect(page).toHaveURL(/\/dashboard/);
+  await expect(page).toHaveURL(/\/dashboard/, { timeout: 15_000 });
   await expect(page.getByText('Welcome to WyrdFold')).toHaveCount(0);
 });
