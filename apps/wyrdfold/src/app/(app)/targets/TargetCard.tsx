@@ -112,7 +112,7 @@ export default function TargetCard({
               <ScoreBadge
                 score={fitScore}
                 size='sm'
-                title={fitScoreReasoning ?? undefined}
+                title={fitScoreReasoning ?? 'Fit score'}
               />
             )}
             <span className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary'>

@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // Public-facing smoke. The login form is the only un-authed surface
 // today, so verifying it renders + submits cleanly catches the most

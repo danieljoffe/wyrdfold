@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // Auth middleware regression coverage. Every (app) route should bounce
 // signed-out visitors to ``/login`` — when the middleware breaks (e.g.

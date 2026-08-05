@@ -6,6 +6,7 @@ import { cn } from '@/lib/cn';
 import JobCard from './JobCard';
 import { useJobDelete } from './useJobDelete';
 import JobsEmptyState from './JobsEmptyState';
+import JobsLoadError from './JobsLoadError';
 import type { JobPosting } from './types';
 
 interface JobsListMobileProps {
@@ -17,6 +18,9 @@ interface JobsListMobileProps {
   selectedIds: Set<string>;
   onSelectionChange: (ids: Set<string>) => void;
   onRefetch: () => void;
+  /** Set when the list fetch itself failed — renders the load-error state
+   *  instead of the misleading "No jobs found" empty state (#604). */
+  loadError?: string | undefined;
 }
 
 export default function JobsListMobile({
@@ -28,6 +32,7 @@ export default function JobsListMobile({
   selectedIds,
   onSelectionChange,
   onRefetch,
+  loadError,
 }: JobsListMobileProps) {
   const { deleteJob } = useJobDelete();
 
@@ -69,6 +74,10 @@ export default function JobsListMobile({
         ))}
       </div>
     );
+  }
+
+  if (postings.length === 0 && loadError) {
+    return <JobsLoadError onRetry={onRefetch} />;
   }
 
   if (postings.length === 0) {

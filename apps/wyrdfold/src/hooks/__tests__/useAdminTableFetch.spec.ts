@@ -53,7 +53,7 @@ describe('useAdminTableFetch', () => {
     );
   });
 
-  it('sends pageSize/sort/order and no cursor on the first page', async () => {
+  it('sends page_size/sort/order and no cursor on the first page', async () => {
     const { result } = renderHook(() => useAdminTableFetch(defaultOptions));
 
     await waitFor(() => {
@@ -62,7 +62,9 @@ describe('useAdminTableFetch', () => {
 
     const url = mockFetch.mock.calls[0][0] as string;
     const params = new URLSearchParams(url.split('?')[1]);
-    expect(params.get('pageSize')).toBe('20');
+    // snake_case per the wyrdfold-api contract — camelCase was
+    // silently ignored (#607).
+    expect(params.get('page_size')).toBe('20');
     expect(params.get('sort')).toBe('created_at');
     expect(params.get('order')).toBe('desc');
     expect(params.has('cursor')).toBe(false);

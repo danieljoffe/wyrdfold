@@ -1,6 +1,8 @@
 'use client';
 
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
+import { formatJobSalary } from '@/lib/formatSalary';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
 import Button from '@/components/kit/Button';
@@ -10,6 +12,7 @@ import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
+import JobsLoadError from './JobsLoadError';
 import LogisticsChips from './LogisticsChips';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import StatusIndicator from './StatusIndicator';
@@ -34,6 +37,9 @@ interface JobsListTableProps {
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
   onRefetch: () => void;
+  /** Set when the list fetch itself failed — renders the load-error state
+   *  instead of the misleading "No jobs found" empty state (#604). */
+  loadError?: string | undefined;
 }
 
 const COLUMNS: { key: JobsSortColumn; label: string }[] = [
@@ -57,8 +63,50 @@ export default function JobsListTable({
   onSelectionChange,
   analysisTargetId,
   onRefetch,
+  loadError,
 }: JobsListTableProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // Snapshot of the expanded posting so the open panel survives a refetch
+  // that re-ranks the job out of the current page (#602). The panel's own
+  // ``onAnalysisComplete`` triggers that refetch, and a fit grade landing
+  // is exactly when the row is most likely to drop out of the top-N — so
+  // without the snapshot the user's in-flight analysis/tailoring panel
+  // unmounts mid-read.
+  const [expandedSnapshot, setExpandedSnapshot] = useState<JobPosting | null>(
+    null
+  );
+
+  function toggleExpand(job: JobPosting) {
+    if (expandedId === job.id) {
+      setExpandedId(null);
+      setExpandedSnapshot(null);
+    } else {
+      setExpandedId(job.id);
+      setExpandedSnapshot(job);
+    }
+  }
+
+  // While the expanded job is still on the page, track its freshest copy so
+  // a later pin shows updated fields (score, status) rather than the values
+  // from expansion time.
+  useEffect(() => {
+    if (!expandedId) return;
+    const fresh = postings.find(p => p.id === expandedId);
+    if (fresh) setExpandedSnapshot(fresh);
+  }, [postings, expandedId]);
+
+  // Pin the snapshot into the rendered list when the expanded job has left
+  // the page. (If the whole list empties — e.g. the user changes filters —
+  // the empty state below still wins; the pin only augments a rendered
+  // table.)
+  const pinnedJob =
+    expandedId &&
+    expandedSnapshot &&
+    expandedSnapshot.id === expandedId &&
+    !postings.some(p => p.id === expandedId)
+      ? expandedSnapshot
+      : null;
+  const displayPostings = pinnedJob ? [pinnedJob, ...postings] : postings;
 
   const allOnPageSelected =
     postings.length > 0 && postings.every(p => selectedIds.has(p.id));
@@ -85,6 +133,10 @@ export default function JobsListTable({
 
   if (loading && postings.length === 0) {
     return <JobsTableSkeleton />;
+  }
+
+  if (postings.length === 0 && loadError) {
+    return <JobsLoadError onRetry={onRefetch} />;
   }
 
   if (postings.length === 0) {
@@ -159,20 +211,18 @@ export default function JobsListTable({
             </tr>
           </thead>
           <tbody>
-            {postings.map(job => (
+            {displayPostings.map(job => (
               <Fragment key={job.id}>
                 <tr
                   className={cn(
                     'border-b border-border hover:bg-surface-secondary cursor-pointer transition-colors',
                     expandedId === job.id && 'bg-surface-secondary'
                   )}
-                  onClick={() =>
-                    setExpandedId(expandedId === job.id ? null : job.id)
-                  }
+                  onClick={() => toggleExpand(job)}
                   onKeyDown={e => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
-                      setExpandedId(expandedId === job.id ? null : job.id);
+                      toggleExpand(job);
                     }
                   }}
                   tabIndex={0}
@@ -200,6 +250,7 @@ export default function JobsListTable({
                     <ScoreBadge
                       score={job.score}
                       scoringStatus={job.scoring_status}
+                      pending={job.pending}
                     />
                   </td>
                   <td className='px-3 py-2 font-medium'>
@@ -229,26 +280,41 @@ export default function JobsListTable({
                       <LogisticsChips filters={job.logistics_filters} />
                     </div>
                   </td>
-                  <td className='px-3 py-2'>{job.company_name}</td>
+                  <td className='px-3 py-2'>
+                    {formatCompanyName(job.company_name)}
+                  </td>
                   <td className='px-3 py-2 text-text-tertiary'>
                     {timeAgo(postedAt(job))}
                   </td>
                   <td className='px-3 py-2 text-text-tertiary'>
-                    {job.salary_text ?? '—'}
+                    {formatJobSalary(job) ?? '—'}
                   </td>
-                  <td className='px-3 py-2 text-text-tertiary truncate max-w-[150px]'>
+                  <td
+                    className='px-3 py-2 text-text-tertiary truncate max-w-[150px]'
+                    title={formatLocation(job) || undefined}
+                  >
                     {formatLocation(job) || '—'}
                   </td>
                 </tr>
                 {expandedId === job.id && (
                   <tr>
                     <td colSpan={8} className='p-0' id={`job-detail-${job.id}`}>
+                      {pinnedJob?.id === job.id && (
+                        <div
+                          role='status'
+                          className='border-b border-border bg-surface-tertiary px-4 py-2 text-xs text-text-secondary'
+                        >
+                          Score updated — this job re-ranked out of the current
+                          list. It stays open here until you close it.
+                        </div>
+                      )}
                       <JobDetailPanel
                         posting={job}
                         targetId={analysisTargetId}
                         viewFullHref={`/jobs/${job.id}`}
                         onDelete={() => {
                           setExpandedId(null);
+                          setExpandedSnapshot(null);
                           onRefetch();
                         }}
                         onStatusChange={() => onRefetch()}

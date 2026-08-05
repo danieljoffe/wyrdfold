@@ -206,42 +206,65 @@ export async function proxyToWyrdfoldAPI(
   const qs = searchParams ? `?${searchParams.toString()}` : '';
   const url = `${apiBaseUrl()}${path}${qs}`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Transient-failure retry for idempotent reads only (#604). Railway
+  // connection drops surface here as fetch rejections while the upstream
+  // finishes the request and logs 200 into a dead socket — the 2026-08-05
+  // drive correlated every browser-visible /api/jobs 503 with a slow-but-OK
+  // Railway response. One re-issue absorbs those, mirroring
+  // ``fetchJsonFromWyrdfoldAPI``. Writes are never re-issued: they aren't
+  // idempotent, and a duplicated POST (analysis, tailor) double-spends.
+  const attempts = method === 'GET' ? 1 + _DEFAULT_RETRIES : 1;
+  let lastErr: unknown;
 
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : null,
-      signal: controller.signal,
-    });
-
-    if (binary) {
-      const buffer = await res.arrayBuffer();
-      const headers: Record<string, string> = {
-        'Content-Type':
-          res.headers.get('Content-Type') ?? 'application/octet-stream',
-      };
-      const disposition = res.headers.get('Content-Disposition');
-      if (disposition) headers['Content-Disposition'] = disposition;
-      return new NextResponse(buffer, { status: res.status, headers });
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, _RETRY_BACKOFF_MS));
     }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    const rawBody = await res.text();
     try {
-      return NextResponse.json(JSON.parse(rawBody), { status: res.status });
-    } catch {
-      return nonJsonUpstream(rawBody, res.status);
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : null,
+        signal: controller.signal,
+      });
+
+      // Retry an intermediate upstream 5xx the same as a network drop; the
+      // final attempt's response is forwarded as-is either way.
+      if (res.status >= 500 && attempt < attempts - 1) {
+        continue;
+      }
+
+      if (binary) {
+        const buffer = await res.arrayBuffer();
+        const headers: Record<string, string> = {
+          'Content-Type':
+            res.headers.get('Content-Type') ?? 'application/octet-stream',
+        };
+        const disposition = res.headers.get('Content-Disposition');
+        if (disposition) headers['Content-Disposition'] = disposition;
+        return new NextResponse(buffer, { status: res.status, headers });
+      }
+
+      const rawBody = await res.text();
+      try {
+        return NextResponse.json(JSON.parse(rawBody), { status: res.status });
+      } catch {
+        return nonJsonUpstream(rawBody, res.status);
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts - 1) return unavailable(err);
+    } finally {
+      clearTimeout(timer);
     }
-  } catch (err) {
-    return unavailable(err);
-  } finally {
-    clearTimeout(timer);
   }
+  return unavailable(lastErr);
 }
 
 /**

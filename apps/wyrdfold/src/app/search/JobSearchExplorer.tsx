@@ -9,6 +9,8 @@ import {
   useState,
 } from 'react';
 import Link from 'next/link';
+import { formatJobSalary } from '@/lib/formatSalary';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { Check, ChevronDown, Plus } from 'lucide-react';
 import { Avatar } from '@danieljoffe/shared-ui/Avatar';
@@ -289,7 +291,7 @@ function JobSearchCard({
    *  (#467 §11.1). The soft signup allusion lives only in the detail (§11.5). */
   isAuthenticated: boolean;
 }) {
-  const meta = [job.company_name, formatLocation(job)]
+  const meta = [formatCompanyName(job.company_name), formatLocation(job)]
     .filter(Boolean)
     .join(' · ');
   const bound = inTargets.length > 0;
@@ -312,7 +314,7 @@ function JobSearchCard({
     >
       {/* header: company avatar, then role over company · location */}
       <div className='flex items-start gap-3'>
-        <CompanyAvatar name={job.company_name} />
+        <CompanyAvatar name={formatCompanyName(job.company_name)} />
         <div className='min-w-0 flex-1'>
           <span className='font-semibold transition-colors group-hover:text-text-brand'>
             {job.title}
@@ -338,12 +340,12 @@ function JobSearchCard({
         <Text
           variant='meta'
           className={
-            job.salary_text
+            formatJobSalary(job)
               ? 'font-medium text-text-primary'
               : 'text-text-tertiary'
           }
         >
-          {job.salary_text || 'Salary not listed'}
+          {formatJobSalary(job) || 'Salary not listed'}
         </Text>
         <Text variant='meta' className='shrink-0 text-text-tertiary'>
           {timeAgo(job.source_posted_at ?? job.cataloged_at)}
