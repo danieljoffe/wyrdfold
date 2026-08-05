@@ -118,3 +118,29 @@ def test_get_job_malformed_uuid_returns_404_not_500() -> None:
         assert res.json()["detail"] == "Not found"
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# 57014 statement timeout -> 503 with Retry-After (#604). The database
+# refusing work under load is not a server bug: an unhandled 500 dumped a
+# full ExceptionGroup traceback per occurrence and told the retry layers the
+# request itself was broken. 503 is the honest, retryable contract.
+# ---------------------------------------------------------------------------
+
+
+async def _raise_57014() -> None:
+    raise _api_error("57014", "canceling statement due to statement timeout")
+
+
+app.add_api_route("/__test/pg-57014", _raise_57014, methods=["GET"])
+
+
+def test_57014_maps_to_503_with_retry_after() -> None:
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get("/__test/pg-57014")
+    assert res.status_code == 503
+    assert res.headers.get("Retry-After") == "5"
+    assert res.json()["detail"] == "Temporarily overloaded — please retry."
+    # No PostgREST internals leak.
+    assert "canceling statement" not in res.text
+    assert "57014" not in res.text

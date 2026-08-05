@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 import httpx
+from postgrest.exceptions import APIError
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,19 @@ _TRANSIENT_HTTP: tuple[type[Exception], ...] = (
     httpx.ConnectError,
     httpx.TimeoutException,
 )
+
+# Postgres "canceling statement due to statement timeout", surfaced by
+# PostgREST as an APIError with this SQLSTATE. Retryable ONLY on opt-in:
+# under a contention spike a re-run after backoff often succeeds (the
+# 2026-08-05 drive saw the same insights read fail then pass 23s later,
+# #604), but a retry re-burns the full statement budget — hot write paths
+# must not double their load silently.
+_STATEMENT_TIMEOUT_CODE = "57014"
+
+
+def is_statement_timeout(exc: BaseException) -> bool:
+    """True when *exc* is PostgREST's surfacing of Postgres 57014."""
+    return isinstance(exc, APIError) and getattr(exc, "code", None) == _STATEMENT_TIMEOUT_CODE
 
 
 def _backoff_delay(attempt: int, base: float, cap: float) -> float:
@@ -93,6 +107,7 @@ async def execute_with_retry(
     retries: int = 2,
     backoff_base: float = 0.4,
     backoff_cap: float = 4.0,
+    retry_statement_timeout: bool = False,
 ) -> T:
     """Await an async supabase-py call, retrying transient transport blips
     natively on the event loop (no executor thread). ``fn`` is the bound
@@ -104,12 +119,21 @@ async def execute_with_retry(
     To retry a *sync* call from async code, wrap ``execute_with_retry_sync``
     in ``db_to_thread`` instead — that path keeps the blocking call in a
     thread. Same transient/permanent split as the sync variant.
+
+    ``retry_statement_timeout=True`` additionally retries Postgres 57014
+    (statement timeout) with the same backoff — opt-in per call site; see
+    ``is_statement_timeout`` for why it is not on by default.
     """
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except _TRANSIENT_HTTP as exc:
+        except Exception as exc:
+            retryable = isinstance(exc, _TRANSIENT_HTTP) or (
+                retry_statement_timeout and is_statement_timeout(exc)
+            )
+            if not retryable:
+                raise
             last_exc = exc
             if attempt == retries:
                 logger.warning("supabase %s exhausted %d retries: %s", label, retries, exc)
