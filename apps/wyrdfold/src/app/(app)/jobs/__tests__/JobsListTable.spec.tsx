@@ -412,3 +412,41 @@ describe('JobsListTable expanded-row pinning (issue #602)', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 });
+
+describe('JobsListTable load-error state (issue #604)', () => {
+  it('renders the load-error state, not "No jobs found", when the fetch failed', async () => {
+    const user = userEvent.setup();
+    const onRefetch = jest.fn();
+    render(
+      <JobsListTable
+        {...baseProps}
+        onRefetch={onRefetch}
+        postings={[]}
+        loading={false}
+        loadError='Failed to load. Please try again.'
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/loading problem/i);
+    expect(screen.queryByText(/no jobs found/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(onRefetch).toHaveBeenCalled();
+  });
+
+  it('still renders the empty state for a genuinely empty result', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByText(/no jobs found/i)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});

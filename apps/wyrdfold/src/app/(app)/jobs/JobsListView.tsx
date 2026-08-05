@@ -178,6 +178,7 @@ export default function JobsListView({
             onSelectionChange={onSelectionChange}
             analysisTargetId={analysisTargetId}
             onRefetch={handleRefetch}
+            loadError={error}
           />
         ) : (
           <JobsListMobile
@@ -189,6 +190,7 @@ export default function JobsListView({
             selectedIds={selectedIds}
             onSelectionChange={onSelectionChange}
             onRefetch={handleRefetch}
+            loadError={error}
           />
         )}
       </div>
