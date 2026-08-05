@@ -43,6 +43,10 @@ ResponseSource = str | Callable[[str, list[Message]], str]
 # imported) to keep the mock free of service-layer imports.
 QUERY_SUGGEST_PURPOSE = "target.suggest_from_query"
 
+# Kept in sync with ``analysis.analyze.DEFAULT_PURPOSE``. Duplicated (not
+# imported) — same service-layer-free rule as above.
+JOB_ANALYSIS_PURPOSE = "job_analysis"
+
 
 # Seniority words we strip off the front of a query so we can rebuild a small
 # ladder of adjacent-seniority neighbours around the role's "core".
@@ -96,6 +100,53 @@ def _dev_suggest_from_query(latest_user: str, _messages: list[Message]) -> str:
     return json.dumps({"suggestions": suggestions})
 
 
+def _dev_job_analysis(_latest_user: str, _messages: list[Message]) -> str:
+    """Schema-valid ``JobAnalysis`` verdict for mock environments.
+
+    The 2026-08-05 e2e UX drive (#608/#610) found the generic echo response
+    failing ``JobAnalysis`` validation (missing scorecard/recommendation),
+    so every mock-env analysis surfaced "Analysis failed. Please retry." —
+    local dev and CI could never drive the panel's flagship flow. A
+    deterministic moderate verdict keeps the full journey (auto-fire →
+    poll → verdict render → completion refetch) drivable with no provider
+    key. Grown per .claude/rules/llm-surfaces.md.
+    """
+    return json.dumps(
+        {
+            "scorecard": {
+                "skills_matched": [
+                    {
+                        "name": "TypeScript",
+                        "matched": True,
+                        "confidence": "high",
+                        "evidence": "Named in the posting's core stack.",
+                    },
+                    {
+                        "name": "React",
+                        "matched": True,
+                        "confidence": "medium",
+                        "evidence": None,
+                    },
+                ],
+                "skills_missing": ["Kubernetes"],
+                "nice_to_haves": ["GraphQL"],
+                "seniority_fit": "moderate",
+                "seniority_rationale": (
+                    "Scope reads mid-to-senior individual contributor."
+                ),
+                "domain_fit": "moderate",
+                "domain_rationale": (
+                    "Adjacent product domain with core stack overlap."
+                ),
+            },
+            "recommendation": (
+                "Solid match on the core stack; close the missing "
+                "infrastructure skills before applying. (Mock verdict.)"
+            ),
+        }
+    )
+
+
 def dev_default_responses() -> dict[str, ResponseSource]:
     """Scripted responses seeded into the mock for LOCAL DEV / integration only
     (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data
@@ -105,7 +156,10 @@ def dev_default_responses() -> dict[str, ResponseSource]:
     their own responses, so this never changes test behavior. A fresh dict is
     returned each call so callers can mutate their own copy.
     """
-    return {QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query}
+    return {
+        QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query,
+        JOB_ANALYSIS_PURPOSE: _dev_job_analysis,
+    }
 
 
 class MockLLMClient:
