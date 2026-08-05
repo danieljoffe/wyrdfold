@@ -2521,7 +2521,39 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
-async def poll_all_sources(supabase: AsyncClient) -> PollResult:
+def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> None:
+    """Fold one source's poll summary into the cycle result.
+
+    Runs inside each worker as it finishes (single-threaded on the event
+    loop, so no synchronization needed) rather than after the gather — a
+    watchdog-cancelled cycle then still exposes the completed sources'
+    counts through the caller-owned ``progress`` accumulator instead of
+    losing them with the cancelled gather.
+    """
+    if summary["polled"]:
+        result.sources_polled += 1
+    result.new_jobs += summary["new"]
+    result.updated_jobs += summary["updated"]
+    result.archived_jobs += summary["archived"]
+    if summary["error"]:
+        result.errors.append(summary["error"])
+
+
+async def poll_all_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
+    """Force-poll every enabled source (ignores ``poll_interval_minutes``).
+
+    ``progress``: optional caller-owned accumulator. Per-source counts fold
+    into it as each source finishes, so a cycle the caller cancels (the
+    scheduler's watchdog) still exposes partial progress. When provided, the
+    return value is that same object.
+    """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    )
     sources_resp = await poll_db_read(
         supabase,
         lambda c: c.table("sources").select("*").eq("enabled", True),
@@ -2540,28 +2572,20 @@ async def poll_all_sources(supabase: AsyncClient) -> PollResult:
     sources = _drop_paid_sources_if_unconsumed(all_sources, has_active_targets=has_active)
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(raw_source: Any) -> dict[str, Any]:
+    async def _worker(raw_source: Any) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source(
                 cast(dict[str, Any], raw_source),
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in sources))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in sources))
     return result
 
 
@@ -2604,14 +2628,25 @@ def filter_due_sources(
     return [s for s in sources if _is_due(s, moment)]
 
 
-async def poll_due_sources(supabase: AsyncClient) -> PollResult:
+async def poll_due_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
     """Poll only the sources whose interval has elapsed.
 
     Same shape as ``poll_all_sources`` but skips sources that were
     polled recently. Designed to be called from a frequent cron tick
     (e.g. every 30 min) without re-hammering boards that have a longer
     configured cadence.
+
+    ``progress``: optional caller-owned accumulator — per-source counts fold
+    in as each source finishes, so the scheduler's watchdog abort still sees
+    partial progress. When provided, the return value is that same object.
     """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    )
     # Auto-recovery first, so a source whose cooldown just elapsed is
     # re-enabled and picked up in THIS cycle rather than waiting a tick.
     # A transient ATS-wide outage that tripped every source can't keep
@@ -2658,7 +2693,7 @@ async def poll_due_sources(supabase: AsyncClient) -> PollResult:
         await _backfill_grade_stale(supabase, settings.phase2_backfill_batch)
 
     if not due:
-        return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+        return result
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
@@ -2690,28 +2725,20 @@ async def poll_due_sources(supabase: AsyncClient) -> PollResult:
         )
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(source: dict[str, Any]) -> dict[str, Any]:
+    async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source(
                 source,
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in due))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in due))
     return result
 
 

@@ -7,6 +7,7 @@ import pytest
 from app.models.llm import Message
 from app.models.targets import TargetSuggestions
 from app.services.llm.client import complete_json
+from app.services.llm.errors import MissingToolCallError
 from app.services.llm.mock import (
     QUERY_SUGGEST_PURPOSE,
     MockLLMClient,
@@ -164,6 +165,26 @@ async def test_complete_tool_use_returns_dict_from_scripted_json() -> None:
     )
     assert tool_input == {"a": 1, "b": "two"}
     assert result.content == '{"a": 1, "b": "two"}'
+
+
+async def test_complete_tool_use_prose_script_raises_missing_tool_call() -> None:
+    """Prose scripted output models the deepseek 2026-08-05 flake — the model
+    ignoring ``tool_choice`` and answering in plain text. The mock must raise
+    the same typed ``MissingToolCallError`` the real parser does, so surface
+    tests inherit the exact failure shape from the bug corpus."""
+    client = MockLLMClient(
+        scripted={"tool": "This title is clearly unrelated to DevOps/SRE engineering."}
+    )
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
+        await client.complete_tool_use(
+            model="deepseek-v3-2",
+            system="",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_TitleTriageResponse",
+            tool_description="d",
+            tool_input_schema={"type": "object"},
+            purpose="tool",
+        )
 
 
 async def test_complete_tool_use_records_tool_name_in_call_log() -> None:

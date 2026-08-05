@@ -12,7 +12,11 @@ import httpx
 import pytest
 
 from app.models.llm import LLMUsage, Message
-from app.services.llm.errors import LLMRateLimitedError, LLMUpstreamUnavailableError
+from app.services.llm.errors import (
+    LLMRateLimitedError,
+    LLMUpstreamUnavailableError,
+    MissingToolCallError,
+)
 from app.services.llm.openrouter_client import (
     _OPENAI_SHAPED_MODELS,
     _OPENROUTER_OPENAI_URL,
@@ -418,3 +422,71 @@ async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
     # NOT a confusing "no choices" — a clear error-body message with the code.
     with pytest.raises(ValueError, match=r"error body.*code=400"):
         await _call(client)
+
+
+# ---- prose-instead-of-tool-call retry (prod 2026-08-05) ---------------------
+# DeepSeek intermittently ignores ``tool_choice`` and answers in prose with
+# finish_reason='stop'. The flake is stochastic, so complete_tool_use retries
+# exactly this shape ONCE; every other parse failure still fails immediately.
+
+
+class _FakeHttpSeq:
+    """Returns canned responses in sequence, recording every posted body."""
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = list(responses)
+        self.posted: list[dict] = []
+
+    async def post(self, url: str, json: dict) -> httpx.Response:
+        self.posted.append({"url": url, "body": json})
+        return self._responses.pop(0)
+
+
+def _http_resp(payload: dict) -> httpx.Response:
+    return httpx.Response(200, request=httpx.Request("POST", _OPENROUTER_OPENAI_URL), json=payload)
+
+
+_PROSE = _resp([], finish="stop", content="This title is clearly unrelated to DevOps/SRE...")
+_GOOD = {
+    "choices": [
+        {"finish_reason": "tool_calls", "message": {"tool_calls": _tool_calls('{"ok": true}')}}
+    ],
+    "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+}
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_call_retries_once_and_succeeds(monkeypatch) -> None:
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttpSeq([_http_resp(_PROSE), _http_resp(_GOOD)])
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+
+    out, _ = await _call(client)
+
+    assert out == {"ok": True}
+    assert len(fake.posted) == 2  # first attempt prose, one retry, done
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_call_twice_fails_loud_after_one_retry(monkeypatch) -> None:
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttpSeq([_http_resp(_PROSE), _http_resp(_PROSE)])
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
+        await _call(client)
+    assert len(fake.posted) == 2  # exactly one retry, never a loop
+
+
+@pytest.mark.asyncio
+async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
+    # Malformed tool arguments are a DIFFERENT contract break (not the prose
+    # flake) — they must fail on the first attempt, no retry spend.
+    bad_args = _resp(_tool_calls("{not valid json"))
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttpSeq([_http_resp(bad_args), _http_resp(_GOOD)])
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        await _call(client)
+    assert len(fake.posted) == 1

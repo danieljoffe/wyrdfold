@@ -34,6 +34,7 @@ from supabase import Client
 
 from app.cache import job_list_cache
 from app.config import settings
+from app.models.schemas import PollResult
 from app.services.ingestion_health import _newest_discovery_at, check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import poll_all_sources, poll_due_sources
@@ -80,7 +81,11 @@ async def _run_scheduled_poll() -> None:
         lock_client = cast(Client, client)
         async with poll_advisory_lock(lock_client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
-                logger.info(
+                # WARNING, not INFO: prod's log level hides INFO, and this
+                # line is the only direct evidence of a leaked advisory lock
+                # silently no-oping ALL polling (the ingestion-health alarm
+                # is the pager; this makes the state diagnosable from logs).
+                logger.warning(
                     "scheduled poll skipped — another poll holds the advisory lock (key=%s)",
                     settings.poll_advisory_lock_key,
                 )
@@ -93,18 +98,28 @@ async def _run_scheduled_poll() -> None:
                 # 2026-07-06). On timeout the cycle is cancelled, the advisory
                 # lock unwinds, and the next tick recovers. 0 disables.
                 timeout = settings.poll_cycle_timeout_seconds or None
+                progress = PollResult(
+                    sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
+                )
                 try:
-                    result = await asyncio.wait_for(poll_due_sources(client), timeout=timeout)
+                    result = await asyncio.wait_for(
+                        poll_due_sources(client, progress=progress), timeout=timeout
+                    )
                 except TimeoutError:
                     logger.error(
                         "scheduled poll: cycle exceeded the %ds watchdog and was "
                         "aborted so the next tick can recover (a hung cycle "
-                        "otherwise wedges the scheduler until a restart)",
+                        "otherwise wedges the scheduler until a restart); "
+                        "partial progress before abort: polled=%d new=%d "
+                        "updated=%d archived=%d errors=%d",
                         settings.poll_cycle_timeout_seconds,
+                        progress.sources_polled,
+                        progress.new_jobs,
+                        progress.updated_jobs,
+                        progress.archived_jobs,
+                        len(progress.errors),
                     )
                 else:
-                    if result.sources_polled > 0:
-                        job_list_cache.invalidate()
                     logger.info(
                         "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
                         result.sources_polled,
@@ -113,6 +128,14 @@ async def _run_scheduled_poll() -> None:
                         result.archived_jobs,
                         len(result.errors),
                     )
+                finally:
+                    # An aborted cycle has still ingested rows for every
+                    # source that finished — the list cache must not serve
+                    # them stale until TTL. Found live 2026-08-05: every
+                    # overnight cycle hit the watchdog, so the invalidate in
+                    # the success branch never ran.
+                    if progress.sources_polled > 0:
+                        job_list_cache.invalidate()
         # Outside the lock on purpose (see docstring); running after our own
         # release also means the leaked-lock check never sees a healthy hold
         # from this very tick.
@@ -153,7 +176,12 @@ async def run_force_poll_locked() -> None:
         lock_client = cast(Client, client)
         async with poll_advisory_lock(lock_client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
-                logger.info(
+                # WARNING, not INFO: prod's log level hides INFO, and this is
+                # the only direct evidence of a leaked advisory lock silently
+                # no-oping the manual trigger (root-caused 2026-08-04: a
+                # mid-cycle kill leaves the lock on a PostgREST backend and
+                # the skip was invisible in prod logs).
+                logger.warning(
                     "force poll: poll already running, skipping (another poll "
                     "holds the advisory lock, key=%s)",
                     settings.poll_advisory_lock_key,
@@ -163,27 +191,46 @@ async def run_force_poll_locked() -> None:
             # force poll holds the SAME advisory lock, so a hang here also
             # blocks scheduled polls until a restart. 0 disables.
             timeout = settings.poll_cycle_timeout_seconds or None
+            progress = PollResult(
+                sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[]
+            )
             try:
-                result = await asyncio.wait_for(poll_all_sources(client), timeout=timeout)
+                result = await asyncio.wait_for(
+                    poll_all_sources(client, progress=progress), timeout=timeout
+                )
             except TimeoutError:
                 logger.error(
                     "force poll: cycle exceeded the %ds watchdog and was "
                     "aborted (a hung cycle otherwise holds the advisory lock "
-                    "and blocks scheduled polls until a restart)",
+                    "and blocks scheduled polls until a restart); partial "
+                    "progress before abort: polled=%d new=%d updated=%d "
+                    "archived=%d errors=%d",
                     settings.poll_cycle_timeout_seconds,
+                    progress.sources_polled,
+                    progress.new_jobs,
+                    progress.updated_jobs,
+                    progress.archived_jobs,
+                    len(progress.errors),
                 )
-                return
-            job_list_cache.invalidate()
-            logger.info(
-                "force poll: polled=%d new=%d updated=%d archived=%d errors=%d",
-                result.sources_polled,
-                result.new_jobs,
-                result.updated_jobs,
-                result.archived_jobs,
-                len(result.errors),
-            )
+            else:
+                logger.info(
+                    "force poll: polled=%d new=%d updated=%d archived=%d errors=%d",
+                    result.sources_polled,
+                    result.new_jobs,
+                    result.updated_jobs,
+                    result.archived_jobs,
+                    len(result.errors),
+                )
+            finally:
+                # An aborted force poll has still ingested rows for every
+                # source that finished — keep the list cache honest (same
+                # rationale as the scheduled tick).
+                if progress.sources_polled > 0:
+                    job_list_cache.invalidate()
             # Health check piggybacks the locked poll so it can't race a
-            # concurrent poll, mirroring the scheduled tick.
+            # concurrent poll, mirroring the scheduled tick. Runs after an
+            # aborted cycle too — a struggling cycle is exactly when the
+            # alarms must fire (#350).
             await check_ingestion_health(client)
     except Exception:
         logger.exception("force poll raised")
