@@ -2521,6 +2521,53 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
+# Page size for the enabled-sources read. Deliberately UNDER PostgREST's
+# max-rows clamp (hosted default 1,000): a full page unambiguously means
+# "there may be more", a short page means "done" — if the page size equaled
+# the server clamp, a server-truncated page would be indistinguishable from
+# the final page and the loop would silently stop early (the exact bug this
+# helper exists to fix).
+_SOURCES_PAGE_SIZE = 500
+
+
+async def _read_enabled_sources(supabase: AsyncClient) -> list[dict[str, Any]]:
+    """Every enabled source row, paginated past PostgREST's max-rows clamp.
+
+    The hosted PostgREST silently truncates ANY un-ranged select at
+    ``db-max-rows`` (~1,000). Found live 2026-08-05: 3,676 enabled sources,
+    the cycle's read returned exactly 1,000 — the 1,144 never-polled catalog
+    rows (physically newest, outside the drifting heap-order window) never
+    entered a cycle, so the backlog froze while the visible cohort re-polled
+    on cadence. Pages are ordered by primary key: heap-order pagination can
+    skip or duplicate rows across pages when concurrent updates relocate
+    tuples mid-read.
+    """
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        resp = await poll_db_read(
+            supabase,
+            lambda c, _o=offset: (
+                c.table("sources")
+                .select("*")
+                .eq("enabled", True)
+                .order("id")
+                .range(_o, _o + _SOURCES_PAGE_SIZE - 1)
+            ),
+            label=f"poll sources read (offset {offset})",
+        )
+        page = cast(list[dict[str, Any]], resp.data or [])
+        out.extend(page)
+        if len(page) < _SOURCES_PAGE_SIZE:
+            logger.debug(
+                "enabled-sources read: %d rows over %d page(s)",
+                len(out),
+                offset // _SOURCES_PAGE_SIZE + 1,
+            )
+            return out
+        offset += _SOURCES_PAGE_SIZE
+
+
 async def _poll_one_source_budgeted(
     source: dict[str, Any],
     supabase: AsyncClient,
@@ -2632,12 +2679,7 @@ async def poll_all_sources(
         if progress is not None
         else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     )
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    all_sources = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_sources = await _read_enabled_sources(supabase)
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
@@ -2731,12 +2773,7 @@ async def poll_due_sources(
     # ingestion down forever (the Sept-2026 failure mode).
     await recover_stale_sources(supabase)
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_enabled = await _read_enabled_sources(supabase)
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
     # ~6h inside; never blocks or fails the poll). Runs on the pooled async
@@ -3291,12 +3328,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
             errors=["Target has no search keywords"],
         )
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    sources = sources_resp.data or []
+    sources: list[dict[str, Any]] = await _read_enabled_sources(supabase)
 
     # Optimized doc is fetched per-user inside
     # ``_poll_one_source_for_target`` now — the previous shared-doc fetch

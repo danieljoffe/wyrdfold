@@ -39,15 +39,18 @@ def _src(*, company: str, last_polled_at: str | None = None) -> dict[str, Any]:
 def _supabase_returning(rows: list[dict[str, Any]]) -> MagicMock:
     """Same shape as test_poll_due's harness: ``poll_db_read`` falls back to
     the sync-in-thread path in tests (no async pool), so ``execute`` must be
-    a SYNC mock returning the response object."""
+    a SYNC mock returning the response object. Self-chaining so the paginated
+    .eq().order().range() read resolves to the same response (keep rows under
+    the 500-row page size)."""
     table = MagicMock()
-    select = MagicMock()
-    eq = MagicMock()
+    chain = MagicMock()
     response = MagicMock()
     response.data = rows
-    eq.execute.return_value = response
-    select.eq.return_value = eq
-    table.select.return_value = select
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+    chain.range.return_value = chain
+    chain.execute.return_value = response
+    table.select.return_value = chain
     supabase = MagicMock()
     supabase.table.return_value = table
     return supabase
@@ -226,3 +229,71 @@ async def test_fast_source_passes_through_unbudgeted_shape(
 
     assert summary == _FAST_SUMMARY
     stamp.assert_not_awaited()
+
+
+# ---- enabled-sources pagination (2026-08-05) --------------------------------
+# PostgREST silently clamps un-ranged selects at db-max-rows (~1,000 hosted).
+# Found live: 3,676 enabled sources, the cycle read returned exactly 1,000 —
+# 1,144 never-polled catalog rows sat outside the window and the backlog
+# froze. The read must page past the clamp, ordered by PK for stability.
+
+
+@pytest.mark.asyncio
+async def test_read_enabled_sources_stitches_pages_past_the_clamp() -> None:
+    """1,050 enabled rows must come back complete (500+500+50), not clamped
+    at the first page — the exact silent-truncation failure from prod."""
+    from app.services.poller import _read_enabled_sources
+
+    rows = [{"id": f"src-{i:04d}"} for i in range(1050)]
+    calls: list[tuple[int, int]] = []
+
+    def _rpc_chain(offset: int, end: int) -> MagicMock:
+        resp = MagicMock()
+        resp.data = rows[offset : end + 1]
+        chain = MagicMock()
+        chain.execute.return_value = resp
+        return chain
+
+    table = MagicMock()
+    chain = MagicMock()
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+
+    def _range(start: int, end: int) -> MagicMock:
+        calls.append((start, end))
+        return _rpc_chain(start, end)
+
+    chain.range.side_effect = _range
+    table.select.return_value = chain
+    supabase = MagicMock()
+    supabase.table.return_value = table
+
+    out = await _read_enabled_sources(supabase)
+
+    assert len(out) == 1050
+    assert [r["id"] for r in out] == [f"src-{i:04d}" for i in range(1050)]
+    assert calls == [(0, 499), (500, 999), (1000, 1499)]
+
+
+@pytest.mark.asyncio
+async def test_read_enabled_sources_orders_by_pk_for_stable_pages() -> None:
+    """Pages must be ordered by primary key — heap-order pagination can skip
+    or duplicate rows across pages when updates relocate tuples mid-read."""
+    from app.services.poller import _read_enabled_sources
+
+    table = MagicMock()
+    chain = MagicMock()
+    resp = MagicMock()
+    resp.data = [{"id": "only"}]
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+    chain.range.return_value = chain
+    chain.execute.return_value = resp
+    table.select.return_value = chain
+    supabase = MagicMock()
+    supabase.table.return_value = table
+
+    out = await _read_enabled_sources(supabase)
+
+    assert out == [{"id": "only"}]
+    chain.order.assert_called_with("id")

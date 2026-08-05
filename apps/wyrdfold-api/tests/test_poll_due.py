@@ -94,17 +94,21 @@ def test_z_suffix_iso_timestamp_parses() -> None:
 
 
 def _supabase_returning(rows: list[dict[str, Any]]) -> MagicMock:
-    """Build a Supabase-table-builder mock that returns ``rows`` from
-    .select(...).eq(...).execute(). Only the chain used by
-    poll_due_sources is stubbed — everything else stays a MagicMock."""
+    """Build a Supabase-table-builder mock that returns ``rows`` from the
+    paginated .select(...).eq(...).order(...).range(...).execute() chain
+    (self-chaining, so filter/order/range in any arrangement resolve to the
+    same terminal response). Keep rows under the 500-row page size or the
+    pagination loop in ``_read_enabled_sources`` would request page 2 of the
+    same canned response forever."""
     table = MagicMock()
-    select = MagicMock()
-    eq = MagicMock()
+    chain = MagicMock()
     response = MagicMock()
     response.data = rows
-    eq.execute.return_value = response
-    select.eq.return_value = eq
-    table.select.return_value = select
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+    chain.range.return_value = chain
+    chain.execute.return_value = response
+    table.select.return_value = chain
 
     supabase = MagicMock()
     supabase.table.return_value = table
