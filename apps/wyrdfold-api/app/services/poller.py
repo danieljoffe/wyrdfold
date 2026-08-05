@@ -2521,13 +2521,165 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
-async def poll_all_sources(supabase: AsyncClient) -> PollResult:
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
+# Page size for the enabled-sources read. Deliberately UNDER PostgREST's
+# max-rows clamp (hosted default 1,000): a full page unambiguously means
+# "there may be more", a short page means "done" — if the page size equaled
+# the server clamp, a server-truncated page would be indistinguishable from
+# the final page and the loop would silently stop early (the exact bug this
+# helper exists to fix).
+_SOURCES_PAGE_SIZE = 500
+
+
+async def _read_enabled_sources(supabase: AsyncClient) -> list[dict[str, Any]]:
+    """Every enabled source row, paginated past PostgREST's max-rows clamp.
+
+    The hosted PostgREST silently truncates ANY un-ranged select at
+    ``db-max-rows`` (~1,000). Found live 2026-08-05: 3,676 enabled sources,
+    the cycle's read returned exactly 1,000 — the 1,144 never-polled catalog
+    rows (physically newest, outside the drifting heap-order window) never
+    entered a cycle, so the backlog froze while the visible cohort re-polled
+    on cadence. Pages are ordered by primary key: heap-order pagination can
+    skip or duplicate rows across pages when concurrent updates relocate
+    tuples mid-read.
+    """
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        resp = await poll_db_read(
+            supabase,
+            lambda c, _o=offset: (
+                c.table("sources")
+                .select("*")
+                .eq("enabled", True)
+                .order("id")
+                .range(_o, _o + _SOURCES_PAGE_SIZE - 1)
+            ),
+            label=f"poll sources read (offset {offset})",
+        )
+        page = cast(list[dict[str, Any]], resp.data or [])
+        out.extend(page)
+        if len(page) < _SOURCES_PAGE_SIZE:
+            logger.debug(
+                "enabled-sources read: %d rows over %d page(s)",
+                len(out),
+                offset // _SOURCES_PAGE_SIZE + 1,
+            )
+            return out
+        offset += _SOURCES_PAGE_SIZE
+
+
+async def _poll_one_source_budgeted(
+    source: dict[str, Any],
+    supabase: AsyncClient,
+    budget_gate: PayerBudgetGate | None,
+    *,
+    active_targets: list[JobTarget] | None,
+    stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
+) -> dict[str, Any]:
+    """``_poll_one_source`` bounded by the per-source wall-time budget.
+
+    One giant board (a workday tenant with hundreds of 429-throttled detail
+    fetches) must not occupy a concurrency slot until the CYCLE watchdog
+    kills everything. On expiry the source's coroutine is cancelled — safe
+    by construction: the stale-archive pass sits after the full fetch, so a
+    cancel can never archive against a partial board list, and completed
+    ingest stages persist (idempotent upserts). The board's row is stamped
+    ``last_polled_at`` so it rotates to the BACK of the most-overdue-first
+    queue instead of re-hogging a slot next tick; the stamp deliberately
+    touches nothing else (no ``job_count``/failure-counter reset — this was
+    not a clean poll). Returns a not-polled summary with no error string so
+    ingestion-health error alarms don't fire on a bounded, expected event.
+    """
+    budget = settings.poll_source_budget_seconds
+    if not budget:
+        return await _poll_one_source(
+            source,
+            supabase,
+            budget_gate,
+            active_targets=active_targets,
+            stage3_users=stage3_users,
+        )
+    try:
+        return await asyncio.wait_for(
+            _poll_one_source(
+                source,
+                supabase,
+                budget_gate,
+                active_targets=active_targets,
+                stage3_users=stage3_users,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        company_name = source.get("company_name", "?")
+        logger.warning(
+            "poll %s exceeded the %ds per-source budget and was cancelled — "
+            "stamped last_polled_at so it rotates to the back of the due queue; "
+            "nothing archived. A chronically over-budget board is a "
+            "catalog-hygiene candidate.",
+            company_name,
+            budget,
+        )
+        try:
+            source_id = source.get("id")
+            if source_id:
+                await poll_db_write(
+                    supabase,
+                    lambda c: (
+                        c.table("sources")
+                        .update({"last_polled_at": datetime.now(UTC).isoformat()})
+                        .eq("id", source_id)
+                    ),
+                    label=f"poll budget stamp {company_name}",
+                )
+        except Exception:
+            # Non-fatal: an unstamped board just stays at the queue front —
+            # the next cycle re-attempts it (today's behavior).
+            logger.exception("budget stamp failed for %s", company_name)
+        return {
+            "polled": False,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+            "budget_exhausted": True,
+        }
+
+
+def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> None:
+    """Fold one source's poll summary into the cycle result.
+
+    Runs inside each worker as it finishes (single-threaded on the event
+    loop, so no synchronization needed) rather than after the gather — a
+    watchdog-cancelled cycle then still exposes the completed sources'
+    counts through the caller-owned ``progress`` accumulator instead of
+    losing them with the cancelled gather.
+    """
+    if summary["polled"]:
+        result.sources_polled += 1
+    result.new_jobs += summary["new"]
+    result.updated_jobs += summary["updated"]
+    result.archived_jobs += summary["archived"]
+    if summary["error"]:
+        result.errors.append(summary["error"])
+
+
+async def poll_all_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
+    """Force-poll every enabled source (ignores ``poll_interval_minutes``).
+
+    ``progress``: optional caller-owned accumulator. Per-source counts fold
+    into it as each source finishes, so a cycle the caller cancels (the
+    scheduler's watchdog) still exposes partial progress. When provided, the
+    return value is that same object.
+    """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     )
-    all_sources = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_sources = await _read_enabled_sources(supabase)
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
@@ -2540,28 +2692,20 @@ async def poll_all_sources(supabase: AsyncClient) -> PollResult:
     sources = _drop_paid_sources_if_unconsumed(all_sources, has_active_targets=has_active)
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(raw_source: Any) -> dict[str, Any]:
+    async def _worker(raw_source: Any) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 cast(dict[str, Any], raw_source),
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in sources))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in sources))
     return result
 
 
@@ -2604,26 +2748,32 @@ def filter_due_sources(
     return [s for s in sources if _is_due(s, moment)]
 
 
-async def poll_due_sources(supabase: AsyncClient) -> PollResult:
+async def poll_due_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
     """Poll only the sources whose interval has elapsed.
 
     Same shape as ``poll_all_sources`` but skips sources that were
     polled recently. Designed to be called from a frequent cron tick
     (e.g. every 30 min) without re-hammering boards that have a longer
     configured cadence.
+
+    ``progress``: optional caller-owned accumulator — per-source counts fold
+    in as each source finishes, so the scheduler's watchdog abort still sees
+    partial progress. When provided, the return value is that same object.
     """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    )
     # Auto-recovery first, so a source whose cooldown just elapsed is
     # re-enabled and picked up in THIS cycle rather than waiting a tick.
     # A transient ATS-wide outage that tripped every source can't keep
     # ingestion down forever (the Sept-2026 failure mode).
     await recover_stale_sources(supabase)
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_enabled = await _read_enabled_sources(supabase)
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
     # ~6h inside; never blocks or fails the poll). Runs on the pooled async
@@ -2658,7 +2808,7 @@ async def poll_due_sources(supabase: AsyncClient) -> PollResult:
         await _backfill_grade_stale(supabase, settings.phase2_backfill_batch)
 
     if not due:
-        return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+        return result
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
@@ -2690,28 +2840,20 @@ async def poll_due_sources(supabase: AsyncClient) -> PollResult:
         )
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(source: dict[str, Any]) -> dict[str, Any]:
+    async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 source,
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in due))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in due))
     return result
 
 
@@ -3186,12 +3328,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
             errors=["Target has no search keywords"],
         )
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    sources = sources_resp.data or []
+    sources: list[dict[str, Any]] = await _read_enabled_sources(supabase)
 
     # Optimized doc is fetched per-user inside
     # ``_poll_one_source_for_target`` now — the previous shared-doc fetch

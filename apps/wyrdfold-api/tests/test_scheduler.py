@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -30,6 +31,17 @@ def _patch_lock_acquired() -> contextlib.AbstractContextManager[object]:
         yield True
 
     return patch("app.scheduler.poll_advisory_lock", _granted)
+
+
+def _patch_lock_denied() -> contextlib.AbstractContextManager[object]:
+    """Patch the scheduler's advisory lock to always DENY (another holder),
+    for the skip-path tests."""
+
+    @contextlib.asynccontextmanager
+    async def _denied(*_a: object, **_k: object) -> AsyncIterator[bool]:
+        yield False
+
+    return patch("app.scheduler.poll_advisory_lock", _denied)
 
 
 def _patch_health() -> contextlib.AbstractContextManager[object]:
@@ -428,7 +440,12 @@ async def test_run_scheduled_poll_invokes_due_poller_with_pool_client() -> None:
         mock_poll.return_value = fake_result
         await _run_scheduled_poll()
 
-    mock_poll.assert_awaited_once_with(fake_client)
+    # The tick also injects its caller-owned ``progress`` accumulator so a
+    # watchdog abort can report partial counts.
+    mock_poll.assert_awaited_once()
+    args, kwargs = mock_poll.await_args
+    assert args == (fake_client,)
+    assert isinstance(kwargs["progress"], PollResult)
 
 
 @pytest.mark.asyncio
@@ -465,19 +482,27 @@ async def test_run_scheduled_poll_swallows_exceptions() -> None:
 @pytest.mark.asyncio
 async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A HUNG poll cycle must be aborted by the watchdog so the next tick can
     run. Without it, ``max_instances=1`` wedges the scheduler until a restart
     (the 2026-07-06 402-storm incident: 68 min of no polls while the API stayed
     up). The tick returns cleanly (no raise) after the timeout; the health
     checks still run (#350 — a broken cycle is exactly when the alarms must
-    fire), only the cache-invalidate/log post-poll steps are skipped."""
+    fire). Sources that FINISHED before the abort must still count: the abort
+    log carries their partial totals and the list cache is invalidated (found
+    live 2026-08-05 — every overnight cycle aborted and the cache never
+    invalidated, so /jobs served the night's ingest stale)."""
     import app.scheduler as sched
     from app.scheduler import _run_scheduled_poll
 
     monkeypatch.setattr(sched.settings, "poll_cycle_timeout_seconds", 0.05)
 
-    async def _hang(*_a: object, **_k: object) -> None:
+    async def _one_source_then_hang(*_a: object, progress: object = None, **_k: object) -> None:
+        # Model a cycle that lands one source, then wedges on a slow board.
+        assert progress is not None
+        progress.sources_polled += 1  # type: ignore[attr-defined]
+        progress.new_jobs += 7  # type: ignore[attr-defined]
         await asyncio.Event().wait()  # never completes
 
     health_calls = {"n": 0}
@@ -487,9 +512,11 @@ async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
 
     with (
         patch("app.scheduler.get_async_supabase", return_value=object()),
-        patch("app.scheduler.poll_due_sources", _hang),
+        patch("app.scheduler.poll_due_sources", _one_source_then_hang),
         _patch_lock_acquired(),
         patch("app.scheduler.check_ingestion_health", _count_health),
+        patch("app.scheduler.job_list_cache") as mock_cache,
+        caplog.at_level(logging.ERROR, logger="app.scheduler"),
     ):
         # Bound the test so a regression that drops the watchdog fails loudly
         # (outer timeout) instead of hanging the suite forever.
@@ -498,6 +525,60 @@ async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
     # The health pass runs even after a timed-out cycle (#350): the alarms
     # must not be silenced by the very breakage they exist to report.
     assert health_calls["n"] == 1
+    # The finished source's rows are live — the cache must not serve stale.
+    mock_cache.invalidate.assert_called_once()
+    # The abort log reports the partial progress, not a bare timeout.
+    abort_lines = [r.getMessage() for r in caplog.records if "watchdog" in r.getMessage()]
+    assert abort_lines and "polled=1" in abort_lines[0] and "new=7" in abort_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_poll_watchdog_abort_with_no_progress_skips_invalidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aborted cycle that finished ZERO sources ingested nothing — the
+    cache invalidate must not fire (pins the ``sources_polled > 0`` guard)."""
+    import app.scheduler as sched
+    from app.scheduler import _run_scheduled_poll
+
+    monkeypatch.setattr(sched.settings, "poll_cycle_timeout_seconds", 0.05)
+
+    async def _hang(*_a: object, **_k: object) -> None:
+        await asyncio.Event().wait()
+
+    with (
+        patch("app.scheduler.get_async_supabase", return_value=object()),
+        patch("app.scheduler.poll_due_sources", _hang),
+        _patch_lock_acquired(),
+        _patch_health(),
+        patch("app.scheduler.job_list_cache") as mock_cache,
+    ):
+        await asyncio.wait_for(_run_scheduled_poll(), timeout=5)
+
+    mock_cache.invalidate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_scheduled_poll_lock_skip_logs_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The lock-skip line is the only direct evidence of a leaked advisory
+    lock silently no-oping ALL polling; prod's log level hides INFO, so it
+    must log at WARNING (root-caused 2026-08-04)."""
+    from app.scheduler import _run_scheduled_poll
+
+    with (
+        patch("app.scheduler.get_async_supabase", return_value=object()),
+        patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
+        _patch_lock_denied(),
+        _patch_health(),
+        caplog.at_level(logging.WARNING, logger="app.scheduler"),
+    ):
+        await _run_scheduled_poll()
+
+    mock_poll.assert_not_called()
+    skip = [r for r in caplog.records if "advisory lock" in r.getMessage()]
+    assert skip and skip[0].levelno == logging.WARNING
 
 
 @pytest.mark.asyncio

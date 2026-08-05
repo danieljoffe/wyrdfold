@@ -152,7 +152,11 @@ async def test_scheduled_poll_runs_when_lock_acquired() -> None:
     ):
         await _run_scheduled_poll()
 
-    mock_poll.assert_awaited_once_with(sb)
+    # The client positionally, plus the caller-owned ``progress`` accumulator
+    # (partial counts for the watchdog-abort log).
+    mock_poll.assert_awaited_once()
+    assert mock_poll.await_args.args == (sb,)
+    assert "progress" in mock_poll.await_args.kwargs
     mock_health.assert_awaited_once_with(sb)
 
 

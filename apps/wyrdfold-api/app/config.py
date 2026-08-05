@@ -568,9 +568,25 @@ class Settings(BaseSettings):
     # 1,110 of 3,231 enabled sources >2x overdue, 1,077 unpolled for 24h+.
     # Capping the batch to what a cycle can actually finish (and taking the
     # most-overdue first) drains the backlog cap-sized-chunk by chunk.
-    # ~250 sources comfortably fits the 20-min watchdog at concurrency 5.
-    # 0 = legacy unbounded.
+    # 0 = legacy unbounded. (The original sizing note said 250 comfortably
+    # fits the watchdog; live 2026-08-05 showed it does NOT when the batch
+    # holds giant boards — ~75/cycle landed and every tick aborted. The
+    # per-source budget below is the fix; the cap stays as the batch bound.)
     poll_max_sources_per_cycle: int = Field(default=250, ge=0)
+    # Per-source wall-time budget inside a cycle (2026-08-05). The watchdog
+    # + cap bound the CYCLE, but one giant board (a workday tenant with
+    # hundreds of detail fetches behind 429 backoff) can occupy one of the
+    # POLL_CONCURRENCY slots for many minutes — observed live: every
+    # overnight tick blew the 1200s watchdog, cancelling every in-flight
+    # source, while only ~75 of the 250-source batch finished. The budget
+    # cancels ONE source, not the cycle: the worker stamps last_polled_at
+    # (so the board rotates to the back of the due queue instead of
+    # re-hogging a slot next tick), the stale-archive pass is skipped by
+    # construction (the cancel lands before it — a partial fetch must never
+    # mass-archive live rows), and the cycle keeps polling. Chronically
+    # over-budget boards surface via the WARNING log = catalog-hygiene
+    # candidates. Keep it well under poll_cycle_timeout_seconds. 0 disables.
+    poll_source_budget_seconds: int = Field(default=300, ge=0)
     # In-process TTL cache for Phase-1 REJECTED titles (#514 residual). A
     # rejected candidate never ingests, so the same title re-enters triage
     # every poll cycle and re-pays the LLM verdict at the source's cadence

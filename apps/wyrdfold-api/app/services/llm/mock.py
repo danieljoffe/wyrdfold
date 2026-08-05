@@ -27,6 +27,7 @@ from app.models.llm import (
     Message,
     ModelId,
 )
+from app.services.llm.errors import MissingToolCallError
 from app.services.llm.pricing import calculate_cost
 
 
@@ -201,9 +202,17 @@ class MockLLMClient:
             messages[-1].content,
         )
         response_text = self._render_response(purpose, latest_user, messages)
-        # Will raise json.JSONDecodeError if scripted text is not valid JSON
-        # — mirrors the real client failing when the model emits no tool_use.
-        tool_input = json.loads(response_text)
+        # A non-JSON script models the model answering in PROSE instead of
+        # emitting the forced tool call (the deepseek 2026-08-05 flake) —
+        # raise the same typed error the real parser does so downstream
+        # surfaces inherit the exact failure shape from the bug corpus.
+        try:
+            tool_input = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise MissingToolCallError(
+                f"Expected a forced tool_call for {tool_name!r}, got prose "
+                f"content={response_text[:200]!r}"
+            ) from exc
         if not isinstance(tool_input, dict):
             raise ValueError(
                 f"Scripted response for {purpose!r} must decode to a JSON object, "

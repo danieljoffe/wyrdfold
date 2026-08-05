@@ -38,6 +38,21 @@ class MissingUserKeyError(Exception):
         super().__init__(f"no {provider} API key on file for this user")
 
 
+class MissingToolCallError(ValueError):
+    """The model answered in PROSE instead of emitting the forced tool call.
+
+    DeepSeek intermittently ignores ``tool_choice`` and returns its reasoning
+    as plain content with ``finish_reason='stop'`` (prod 2026-08-05: several
+    triage batches/night deferred this way, each a full re-spend next cycle).
+    Distinct from the other structured-output parse failures so
+    ``complete_tool_use`` can retry exactly this shape once — the flake is
+    stochastic, so a second attempt usually lands. Subclasses ``ValueError``
+    so existing broad handlers (triage's defer-not-admit, ``complete_json``
+    fallbacks) are unchanged. The mock client raises it for prose scripts,
+    mirroring the real parser (llm-surfaces bug corpus).
+    """
+
+
 class LLMServiceError(Exception):
     """Base class for all LLM-provider failures we expose to callers.
 

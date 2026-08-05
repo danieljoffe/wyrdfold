@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.dependencies import get_async_service_supabase, get_settings
 from app.main import app
+from app.models.schemas import PollResult
 from app.scheduler import run_force_poll_locked
 
 _SETTINGS = Settings(
@@ -159,7 +160,11 @@ async def test_force_poll_runs_when_lock_acquired() -> None:
     ):
         await run_force_poll_locked()
 
-    mock_poll.assert_awaited_once_with(sb)
+    # The client positionally, plus the caller-owned ``progress`` accumulator
+    # (partial counts for the watchdog-abort log).
+    mock_poll.assert_awaited_once()
+    assert mock_poll.await_args.args == (sb,)
+    assert isinstance(mock_poll.await_args.kwargs["progress"], PollResult)
     mock_health.assert_awaited_once_with(sb)
     assert state["held"] is False  # lock released
 

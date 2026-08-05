@@ -94,17 +94,21 @@ def test_z_suffix_iso_timestamp_parses() -> None:
 
 
 def _supabase_returning(rows: list[dict[str, Any]]) -> MagicMock:
-    """Build a Supabase-table-builder mock that returns ``rows`` from
-    .select(...).eq(...).execute(). Only the chain used by
-    poll_due_sources is stubbed — everything else stays a MagicMock."""
+    """Build a Supabase-table-builder mock that returns ``rows`` from the
+    paginated .select(...).eq(...).order(...).range(...).execute() chain
+    (self-chaining, so filter/order/range in any arrangement resolve to the
+    same terminal response). Keep rows under the 500-row page size or the
+    pagination loop in ``_read_enabled_sources`` would request page 2 of the
+    same canned response forever."""
     table = MagicMock()
-    select = MagicMock()
-    eq = MagicMock()
+    chain = MagicMock()
     response = MagicMock()
     response.data = rows
-    eq.execute.return_value = response
-    select.eq.return_value = eq
-    table.select.return_value = select
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+    chain.range.return_value = chain
+    chain.execute.return_value = response
+    table.select.return_value = chain
 
     supabase = MagicMock()
     supabase.table.return_value = table
@@ -191,6 +195,46 @@ async def test_poll_due_sources_aggregates_errors() -> None:
 
     assert result.sources_polled == 1
     assert result.errors == ["B: poll failed"]
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_partial_progress_survives_cancellation() -> None:
+    """The caller-owned ``progress`` accumulator must hold every FINISHED
+    source's counts when the cycle is cancelled mid-gather (the scheduler's
+    watchdog abort) — accumulation happens per-worker as each source lands,
+    not after the gather (which a cancel would wipe). Found live 2026-08-05:
+    overnight watchdog aborts reported nothing and never invalidated the
+    list cache despite ~75 sources/cycle finishing."""
+    import asyncio
+
+    from app.models.schemas import PollResult
+
+    long_ago = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    supabase = _supabase_returning(
+        [
+            _src(last_polled_at=long_ago, company="Fast"),
+            _src(last_polled_at=long_ago, company="Wedged"),
+        ]
+    )
+
+    async def _fast_then_hang(source: dict, *a: object, **k: object) -> dict:
+        if source["company_name"] == "Fast":
+            return {"polled": True, "new": 3, "updated": 1, "archived": 0, "error": None}
+        await asyncio.Event().wait()  # the 429-storm board that never returns
+        raise AssertionError("unreachable")
+
+    progress = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", _fast_then_hang),
+    ):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(poll_due_sources(supabase, progress=progress), timeout=0.3)
+
+    assert progress.sources_polled == 1
+    assert progress.new_jobs == 3
+    assert progress.updated_jobs == 1
 
 
 @pytest.mark.asyncio
