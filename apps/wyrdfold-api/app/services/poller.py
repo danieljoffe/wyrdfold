@@ -2521,6 +2521,84 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
+async def _poll_one_source_budgeted(
+    source: dict[str, Any],
+    supabase: AsyncClient,
+    budget_gate: PayerBudgetGate | None,
+    *,
+    active_targets: list[JobTarget] | None,
+    stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
+) -> dict[str, Any]:
+    """``_poll_one_source`` bounded by the per-source wall-time budget.
+
+    One giant board (a workday tenant with hundreds of 429-throttled detail
+    fetches) must not occupy a concurrency slot until the CYCLE watchdog
+    kills everything. On expiry the source's coroutine is cancelled — safe
+    by construction: the stale-archive pass sits after the full fetch, so a
+    cancel can never archive against a partial board list, and completed
+    ingest stages persist (idempotent upserts). The board's row is stamped
+    ``last_polled_at`` so it rotates to the BACK of the most-overdue-first
+    queue instead of re-hogging a slot next tick; the stamp deliberately
+    touches nothing else (no ``job_count``/failure-counter reset — this was
+    not a clean poll). Returns a not-polled summary with no error string so
+    ingestion-health error alarms don't fire on a bounded, expected event.
+    """
+    budget = settings.poll_source_budget_seconds
+    if not budget:
+        return await _poll_one_source(
+            source,
+            supabase,
+            budget_gate,
+            active_targets=active_targets,
+            stage3_users=stage3_users,
+        )
+    try:
+        return await asyncio.wait_for(
+            _poll_one_source(
+                source,
+                supabase,
+                budget_gate,
+                active_targets=active_targets,
+                stage3_users=stage3_users,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        company_name = source.get("company_name", "?")
+        logger.warning(
+            "poll %s exceeded the %ds per-source budget and was cancelled — "
+            "stamped last_polled_at so it rotates to the back of the due queue; "
+            "nothing archived. A chronically over-budget board is a "
+            "catalog-hygiene candidate.",
+            company_name,
+            budget,
+        )
+        try:
+            source_id = source.get("id")
+            if source_id:
+                await poll_db_write(
+                    supabase,
+                    lambda c: (
+                        c.table("sources")
+                        .update({"last_polled_at": datetime.now(UTC).isoformat()})
+                        .eq("id", source_id)
+                    ),
+                    label=f"poll budget stamp {company_name}",
+                )
+        except Exception:
+            # Non-fatal: an unstamped board just stays at the queue front —
+            # the next cycle re-attempts it (today's behavior).
+            logger.exception("budget stamp failed for %s", company_name)
+        return {
+            "polled": False,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+            "budget_exhausted": True,
+        }
+
+
 def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> None:
     """Fold one source's poll summary into the cycle result.
 
@@ -2574,7 +2652,7 @@ async def poll_all_sources(
 
     async def _worker(raw_source: Any) -> None:
         async with semaphore:
-            summary = await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 cast(dict[str, Any], raw_source),
                 supabase,
                 budget_gate,
@@ -2727,7 +2805,7 @@ async def poll_due_sources(
 
     async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
-            summary = await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 source,
                 supabase,
                 budget_gate,
