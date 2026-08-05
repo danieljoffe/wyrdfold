@@ -143,3 +143,83 @@ async def test_async_retry_does_not_retry_unrelated_exception() -> None:
     with pytest.raises(ValueError):
         await execute_with_retry(fn, label="async-test", retries=2)
     assert fn.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Statement-timeout (57014) opt-in retry — #604. The 2026-08-05 drive caught
+# /insights/targets and the cross-target jobs fallback dying unhandled on a
+# single 57014 while the identical read succeeded moments later.
+# ---------------------------------------------------------------------------
+
+
+def _statement_timeout() -> Exception:
+    from postgrest.exceptions import APIError
+
+    return APIError(
+        {
+            "message": "canceling statement due to statement timeout",
+            "code": "57014",
+            "hint": None,
+            "details": None,
+        }
+    )
+
+
+def test_is_statement_timeout_predicate() -> None:
+    from postgrest.exceptions import APIError
+
+    from app.services.supabase_retry import is_statement_timeout
+
+    assert is_statement_timeout(_statement_timeout()) is True
+    assert (
+        is_statement_timeout(
+            APIError({"message": "dup", "code": "23505", "hint": None, "details": None})
+        )
+        is False
+    )
+    assert is_statement_timeout(RuntimeError("57014")) is False
+
+
+@pytest.mark.asyncio
+async def test_async_statement_timeout_not_retried_by_default() -> None:
+    from postgrest.exceptions import APIError
+
+    counter = _AsyncCounter(fail_times=1, exc=_statement_timeout())
+    with pytest.raises(APIError):
+        await execute_with_retry(counter, label="t")
+    assert counter.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_statement_timeout_retried_when_opted_in() -> None:
+    counter = _AsyncCounter(fail_times=1, exc=_statement_timeout())
+    result = await execute_with_retry(
+        counter, label="t", retry_statement_timeout=True
+    )
+    assert result == "ok"
+    assert counter.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_async_statement_timeout_exhaust_reraises() -> None:
+    from postgrest.exceptions import APIError
+
+    counter = _AsyncCounter(fail_times=99, exc=_statement_timeout())
+    with pytest.raises(APIError):
+        await execute_with_retry(
+            counter, label="t", retries=2, retry_statement_timeout=True
+        )
+    assert counter.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_async_opt_in_still_ignores_other_apierrors() -> None:
+    from postgrest.exceptions import APIError
+
+    counter = _AsyncCounter(
+        fail_times=1,
+        exc=APIError({"message": "dup", "code": "23505", "hint": None, "details": None}),
+    )
+    with pytest.raises(APIError):
+        await execute_with_retry(counter, label="t", retry_statement_timeout=True)
+    assert counter.calls == 1

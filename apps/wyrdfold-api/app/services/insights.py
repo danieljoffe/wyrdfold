@@ -101,7 +101,12 @@ async def _rows(query: Any, label: str) -> list[Row]:
     crashes the chart on the dashboard. Wrap each query so a transient
     failure is absorbed by one retry instead of bubbling.
     """
-    resp = await execute_with_retry(query.execute, label=label)
+    # ``retry_statement_timeout``: the 2026-08-05 drive caught
+    # /insights/targets 500ing on a single 57014 while the identical read
+    # succeeded 23s later (#604) — one backoff retry absorbs that class.
+    resp = await execute_with_retry(
+        query.execute, label=label, retry_statement_timeout=True
+    )
     return cast(list[Row], resp.data or [])
 
 
