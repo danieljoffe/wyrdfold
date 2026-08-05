@@ -10,6 +10,7 @@ import { cn } from '@/lib/cn';
 import { timeAgo } from '@/lib/timeAgo';
 import JobDetailPanel from './JobDetailPanel';
 import JobsEmptyState from './JobsEmptyState';
+import JobsLoadError from './JobsLoadError';
 import LogisticsChips from './LogisticsChips';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import StatusIndicator from './StatusIndicator';
@@ -34,6 +35,9 @@ interface JobsListTableProps {
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
   onRefetch: () => void;
+  /** Set when the list fetch itself failed — renders the load-error state
+   *  instead of the misleading "No jobs found" empty state (#604). */
+  loadError?: string | undefined;
 }
 
 const COLUMNS: { key: JobsSortColumn; label: string }[] = [
@@ -57,6 +61,7 @@ export default function JobsListTable({
   onSelectionChange,
   analysisTargetId,
   onRefetch,
+  loadError,
 }: JobsListTableProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // Snapshot of the expanded posting so the open panel survives a refetch
@@ -126,6 +131,10 @@ export default function JobsListTable({
 
   if (loading && postings.length === 0) {
     return <JobsTableSkeleton />;
+  }
+
+  if (postings.length === 0 && loadError) {
+    return <JobsLoadError onRetry={onRefetch} />;
   }
 
   if (postings.length === 0) {
