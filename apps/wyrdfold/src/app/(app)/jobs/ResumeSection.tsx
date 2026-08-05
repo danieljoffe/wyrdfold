@@ -153,7 +153,13 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
 
   if (loading) {
     return (
-      <Button name='resume-loading' variant='secondary' size='sm' disabled>
+      <Button
+        name='resume-loading'
+        variant='secondary'
+        size='sm'
+        disabled
+        title='Checking for an existing draft…'
+      >
         Resume…
       </Button>
     );
@@ -166,7 +172,13 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
   // does; "View Resume" once approved).
   if (generating) {
     return (
-      <Button name='resume-generating' variant='secondary' size='sm' disabled>
+      <Button
+        name='resume-generating'
+        variant='secondary'
+        size='sm'
+        disabled
+        title='Tailoring in progress — usually 30–60 seconds'
+      >
         <Spinner size='sm' aria-label='Generating resume' />
         <span>Generating…</span>
       </Button>

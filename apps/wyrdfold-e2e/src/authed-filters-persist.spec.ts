@@ -112,3 +112,32 @@ test('filters — logistics included — survive a bare re-entry to /jobs', asyn
     page.getByLabel('Active filters').getByText('Remote only')
   ).toBeVisible();
 });
+
+test('fully bare /jobs — the real sidebar shape — restores the last-picked tab and its filters', async ({
+  page,
+}) => {
+  // The original spec's "bare re-entry" still carried ?target=<id>, which
+  // is not what the sidebar link sends — the 2026-08-05 drive showed the
+  // genuine journey landing on All Jobs with every filter apparently gone
+  // (#607/#608). Prime a target tab with filters…
+  await page.goto(
+    `/jobs?target=${TARGET_ID}&s=new&remote_only=true&min_salary=150000`
+  );
+  await expect(
+    page.getByLabel('Active filters').getByText('Remote only')
+  ).toBeVisible();
+
+  // …leave through normal navigation…
+  await page.goto('/dashboard');
+  await expect(page.locator('h1').first()).toBeVisible();
+
+  // …and come back with NO query string at all. The last-picked tab
+  // replays from storage, which in turn replays its filter snapshot.
+  await page.goto('/jobs');
+  await expect(page).toHaveURL(new RegExp(`target=${TARGET_ID}`));
+  await expect(page).toHaveURL(/remote_only=true/);
+  await expect(page).toHaveURL(/min_salary=150000/);
+  await expect(
+    page.getByLabel('Active filters').getByText('Remote only')
+  ).toBeVisible();
+});

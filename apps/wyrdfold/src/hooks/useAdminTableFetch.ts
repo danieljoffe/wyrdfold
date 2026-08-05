@@ -83,7 +83,10 @@ export function useAdminTableFetch<T, S extends string>({
   const buildUrl = useCallback(
     (cursor: string | null) => {
       const params = new URLSearchParams({
-        pageSize: String(pageSize),
+        // wyrdfold-api reads ``page_size`` (snake_case); the old camelCase
+        // ``pageSize`` was silently ignored, so requested page sizes never
+        // applied and every list quietly got the server default (#607).
+        page_size: String(pageSize),
         sort,
         order,
         ...extraParams,
