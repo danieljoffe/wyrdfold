@@ -44,8 +44,7 @@ export interface LogisticsFilters {
   salary_min: number | null;
   salary_max: number | null;
   salary_currency: string | null;
-  /** API vocabulary (services/job_search.py): never guessed. */
-  salary_period: 'yearly' | 'hourly' | null;
+  salary_unit: 'year' | 'hour' | null;
   location_city: string | null;
   location_country: string | null;
 }
@@ -84,6 +83,16 @@ export interface JobPosting {
   logistics_filters?: LogisticsFilters | null;
   status: string;
   salary_text: string | null;
+  /**
+   * Structured salary parsed at ingest (#528) — the display path
+   * (formatJobSalary) prefers these over ``salary_text``. Optional:
+   * older cached payloads may omit them. Vocabulary per
+   * services/job_search.py: 'yearly' | 'hourly', never guessed.
+   */
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency?: string | null;
+  salary_period?: 'yearly' | 'hourly' | null;
   /** Provider's posted/created date (normalized), null when the source gave
    * none — e.g. manual adds. Renamed from greenhouse_updated_at (R2). */
   source_posted_at: string | null;
