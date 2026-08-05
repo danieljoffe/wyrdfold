@@ -17,9 +17,10 @@ class _ExecuteStub:
 
 
 class _Chain:
-    """A query chain whose builder methods all return self and whose
+    """A query chain whose builder methods all return self and whose awaited
     `.execute()` yields a fixed stub. Covers select/eq/is_/or_/in_/gte/
-    order/limit/upsert/update used across notify's queries."""
+    order/limit/upsert/update used across notify's queries. ``execute`` is a
+    coroutine since notify moved onto the pooled async client (#57 PR-G2e-1)."""
 
     def __init__(self, stub: _ExecuteStub):
         self._stub = stub
@@ -30,7 +31,7 @@ class _Chain:
 
         return _return_self
 
-    def execute(self) -> _ExecuteStub:
+    async def execute(self) -> _ExecuteStub:
         return self._stub
 
 

@@ -8,7 +8,7 @@ RPC delegation (args, status passthrough, response-shape normalization, and
 never-raise resilience).
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -27,8 +27,10 @@ _URL = "https://jobs.ashbyhq.com/hadrian-automation/68286f52"
 
 
 def _supabase(status: str = "registered") -> MagicMock:
+    # #57 PR-G2e-5: register_source_from_url + _call_register_rpc await the RPC on
+    # the async service client, so ``.execute()`` must be awaitable.
     supabase = MagicMock()
-    supabase.rpc.return_value.execute.return_value = MagicMock(data=status)
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=status))
     return supabase
 
 
@@ -151,7 +153,7 @@ async def test_rpc_failure_returns_error(monkeypatch: pytest.MonkeyPatch) -> Non
     """An RPC failure is swallowed too — the target the user created is unaffected."""
     _patch_detect(monkeypatch, LIVE)
     supabase = MagicMock()
-    supabase.rpc.return_value.execute.side_effect = RuntimeError("rpc down")
+    supabase.rpc.return_value.execute = AsyncMock(side_effect=RuntimeError("rpc down"))
 
     outcome = await source_registration.register_source_from_url(
         supabase, user_id="u1", final_url=_URL
@@ -165,8 +167,8 @@ async def test_rpc_list_of_dict_shape_normalized(monkeypatch: pytest.MonkeyPatch
     """postgrest may wrap the scalar as ``[{"register_source_from_url": "..."}]``."""
     _patch_detect(monkeypatch, LIVE)
     supabase = _supabase()
-    supabase.rpc.return_value.execute.return_value = MagicMock(
-        data=[{"register_source_from_url": "linked"}]
+    supabase.rpc.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"register_source_from_url": "linked"}])
     )
 
     outcome = await source_registration.register_source_from_url(
@@ -180,7 +182,7 @@ async def test_rpc_list_of_dict_shape_normalized(monkeypatch: pytest.MonkeyPatch
 async def test_rpc_unexpected_shape_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_detect(monkeypatch, LIVE)
     supabase = _supabase()
-    supabase.rpc.return_value.execute.return_value = MagicMock(data={"weird": 1})
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data={"weird": 1}))
 
     outcome = await source_registration.register_source_from_url(
         supabase, user_id="u1", final_url=_URL

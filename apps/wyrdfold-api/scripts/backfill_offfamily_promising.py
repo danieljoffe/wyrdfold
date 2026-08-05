@@ -47,7 +47,7 @@ from supabase import Client
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.services.qualification.family_gate import passes_family_gate
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_offfamily_promising")
@@ -97,8 +97,7 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit(
             "ERROR: Supabase not configured — check SUPABASE_URL + "

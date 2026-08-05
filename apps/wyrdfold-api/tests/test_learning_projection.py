@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.models.targets import CategoryProfile, NegativeProfile, ScoringProfile
 from app.services.targets.learning_projection import project_rescore
 
@@ -112,3 +114,84 @@ def test_after_side_scores_with_next_search_keywords() -> None:
     )
     assert swapped.jobs_moved == 12
     assert swapped.capped is True
+
+
+# ---------------------------------------------------------------------------
+# project_profile_impact (#57 PR-G2e-3): fetch the recent scored jobs on the
+# pooled async client, then run the (pure) ``project_rescore``. Used by the LLM
+# learner and the reference-JD merge path.
+# ---------------------------------------------------------------------------
+
+
+class _ProjResp:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+
+class _ProjQuery:
+    def __init__(self, fake: _ProjSupabase, table: str) -> None:
+        self._fake = fake
+        self._table = table
+
+    def select(self, *_a: Any, **_k: Any) -> _ProjQuery:
+        return self
+
+    def eq(self, *_a: Any, **_k: Any) -> _ProjQuery:
+        return self
+
+    def order(self, *_a: Any, **_k: Any) -> _ProjQuery:
+        return self
+
+    def limit(self, *_a: Any, **_k: Any) -> _ProjQuery:
+        return self
+
+    def in_(self, *_a: Any, **_k: Any) -> _ProjQuery:
+        return self
+
+    async def execute(self) -> _ProjResp:
+        return _ProjResp(self._fake.rows.get(self._table, []))
+
+
+class _ProjSupabase:
+    """Awaitable-``execute`` fake standing in for the pooled ``AsyncClient``."""
+
+    def __init__(self, *, scores: list[dict[str, Any]], jobs: list[dict[str, Any]]) -> None:
+        self.rows = {"scores": scores, "jobs": jobs}
+
+    def table(self, name: str) -> _ProjQuery:
+        return _ProjQuery(self, name)
+
+
+@pytest.mark.asyncio
+async def test_project_profile_impact_fetches_and_projects() -> None:
+    """End to end: awaits the recent-scored-jobs reads, then runs the
+    deterministic ``project_rescore``. Adding a ``python`` negative that
+    hard-excludes both scored jobs must register real score movement."""
+    from app.services.targets.learning_projection import project_profile_impact
+
+    sb = _ProjSupabase(
+        scores=[{"job_posting_id": "j1"}, {"job_posting_id": "j2"}],
+        jobs=[
+            {"id": "j1", "title": "Python Engineer", "description_html": "<p>python</p>"},
+            {"id": "j2", "title": "Python Engineer", "description_html": "<p>python</p>"},
+        ],
+    )
+    prev = _profile({"python": 3}).model_dump()
+    nxt = _profile({"python": 3}, negative=["python"]).model_dump()
+
+    proj = await project_profile_impact(sb, "t", prev, nxt, ["python"])  # type: ignore[arg-type]
+
+    assert proj is not None
+    assert proj.jobs_considered == 2
+    assert proj.max_abs_delta > 0  # the new negative moved both jobs' scores
+
+
+@pytest.mark.asyncio
+async def test_project_profile_impact_returns_none_without_scored_jobs() -> None:
+    """No scored jobs to project against → None (the caller then applies the
+    patch without a learning-rate check — nothing to over-churn yet)."""
+    from app.services.targets.learning_projection import project_profile_impact
+
+    sb = _ProjSupabase(scores=[], jobs=[])
+    proj = await project_profile_impact(sb, "t", {}, {}, None)  # type: ignore[arg-type]
+    assert proj is None

@@ -20,7 +20,6 @@ from app.dependencies import (
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -60,7 +59,7 @@ def _user_target() -> UserTarget:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     # GET /targets/{id} now resolves the caller via the optional dep and
@@ -87,17 +86,31 @@ def test_mine_schedules_lazy_refresh_when_user_has_targets(
 ) -> None:
     """GET /targets/mine returns the cached summaries immediately AND schedules a
     SINGLE background refresh task (E2) — the whole staleness scan runs in the
-    background, off the response path. TestClient runs background tasks after the
-    response, so the spy is invoked with the user id."""
+    background, off the response path.
+
+    #57 PR-G2e-5: the refresh rides the async pool now, so /mine spawns it DETACHED
+    (``spawn_detached``, not a starlette ``BackgroundTask``). Patch spawn_detached to
+    capture the scheduled coroutine synchronously — the recording stub sets the
+    scheduled marker when the router builds the coro to hand off."""
+    from app.routers import targets as router_mod
+
     monkeypatch.setattr(
-        fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [_summary_item()]
+        router_mod,
+        "_list_user_targets_with_summary_async",
+        AsyncMock(return_value=[_summary_item()]),
     )
     scheduled: dict[str, object] = {}
 
-    async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
+    def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]
         scheduled["user_id"] = user_id
 
+        async def _noop() -> None:
+            return None
+
+        return _noop()
+
     monkeypatch.setattr(fit_refresh, "refresh_stale_for_user", spy_refresh)
+    monkeypatch.setattr(router_mod, "spawn_detached", lambda coro, *, name: coro.close())
 
     resp = client.get("/targets/mine")
 
@@ -110,7 +123,11 @@ def test_mine_skips_refresh_when_no_targets(
 ) -> None:
     """No linked targets → nothing to refresh → no background task scheduled at
     all (the staleness/no-profile short-circuits now live inside the task)."""
-    monkeypatch.setattr(fit_refresh.crud, "list_user_targets_with_summary", lambda _s, _u: [])
+    from app.routers import targets as router_mod
+
+    monkeypatch.setattr(
+        router_mod, "_list_user_targets_with_summary_async", AsyncMock(return_value=[])
+    )
     called = {"n": 0}
 
     async def spy_refresh(_s, _llm, *, user_id):  # type: ignore[no-untyped-def]

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, cast
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
+from supabase import Client
 
 from app.cache import job_list_cache
 from app.config import settings
@@ -40,7 +41,7 @@ from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
 from app.services.url_health import run_url_health_check
-from app.supabase_pool import get_async_supabase, get_supabase_pool
+from app.supabase_pool import get_async_supabase
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -70,11 +71,14 @@ async def _run_scheduled_poll() -> None:
     suppress and we'd lose the trace.
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("scheduled poll skipped — supabase client not initialized")
+            logger.warning("scheduled poll skipped — async supabase client not initialized")
             return
-        async with poll_advisory_lock(client, settings.poll_advisory_lock_key) as acquired:
+        # ``poll_advisory_lock`` is seam-aware (acquires on the pooled async
+        # client internally) but is annotated ``Client``; the cast satisfies mypy.
+        lock_client = cast(Client, client)
+        async with poll_advisory_lock(lock_client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
                 logger.info(
                     "scheduled poll skipped — another poll holds the advisory lock (key=%s)",
@@ -131,20 +135,23 @@ async def run_force_poll_locked() -> None:
     scheduled due-poll can never run concurrently: whichever gets the lock
     polls, the other logs "poll already running, skipping" and exits cleanly.
 
-    Self-contained on purpose: it pulls the service-role singleton via
-    ``get_supabase_pool()`` (the same client the scheduler uses) rather than
-    a request-scoped client, so it keeps running correctly after the request
-    that scheduled it has returned.
+    Self-contained on purpose: it pulls the async service-role singleton via
+    ``get_async_supabase()`` (the same pooled client the scheduler uses) rather
+    than a request-scoped client, so it keeps running correctly after the
+    request that scheduled it has returned.
 
     Wrapped in try/except so a backgrounded task's exception is logged
     rather than silently swallowed by the event loop.
     """
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("force poll skipped — supabase client not initialized")
+            logger.warning("force poll skipped — async supabase client not initialized")
             return
-        async with poll_advisory_lock(client, settings.poll_advisory_lock_key) as acquired:
+        # ``poll_advisory_lock`` is seam-aware (acquires on the pooled async
+        # client internally) but is annotated ``Client``; the cast satisfies mypy.
+        lock_client = cast(Client, client)
+        async with poll_advisory_lock(lock_client, settings.poll_advisory_lock_key) as acquired:
             if not acquired:
                 logger.info(
                     "force poll: poll already running, skipping (another poll "
@@ -368,9 +375,9 @@ async def _anchor_discovery_schedule(
     """
     moment = now or datetime.now(UTC)
     try:
-        client = get_supabase_pool()
+        client = get_async_supabase()
         if client is None:
-            logger.warning("discovery catch-up skipped — supabase client not initialized")
+            logger.warning("discovery catch-up skipped — async supabase client not initialized")
             return
         last = await _newest_discovery_at(client)
         tick = timedelta(hours=settings.discovery_tick_hours)

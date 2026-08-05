@@ -61,7 +61,7 @@ from app.services.llm import get_default_client as get_llm
 from app.services.llm.client import complete_json
 from app.services.scoring import strip_html
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("eval_prompts")
@@ -510,8 +510,7 @@ def format_report(metrics: dict[str, Any], model: ModelId, prompt_label: str) ->
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise RuntimeError("Supabase not configured — check .env")
 

@@ -76,11 +76,12 @@ async def set_key(
     return UserApiKeyMeta.model_validate(rows[0])
 
 
-# ``get_key`` / ``has_usable_key`` stay SYNC on ``Client`` (#57 slice 4): their
-# callers are the synchronous LLM-client factory (``services.llm.get_client``)
-# and the synchronous budget resolver (``services.llm.budget``) — both out of
-# this slice's scope. The write-path helpers the keys router owns (``set_key`` /
-# ``delete_key`` / ``list_key_meta``) are async on ``AsyncClient``.
+# ``get_key`` / ``has_usable_key`` stay SYNC on ``Client``: their callers are the
+# synchronous LLM-client factory (``services.llm.get_client``) and the
+# synchronous budget resolver (``services.llm.budget``). ``get_key_async`` (below)
+# is the async twin for the poller's async BYOK payer resolver (#57 PR-G2e-1); the
+# write-path helpers the keys router owns (``set_key`` / ``delete_key`` /
+# ``list_key_meta``) are async on ``AsyncClient``.
 def get_key(
     supabase: Client,
     *,
@@ -94,6 +95,34 @@ def get_key(
     misconfigured master key is loud."""
     _validate_provider(provider)
     resp = (
+        supabase.table(TABLE)
+        .select("ciphertext")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return crypto.decrypt(rows[0]["ciphertext"])
+
+
+async def get_key_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    provider: Provider,
+) -> str | None:
+    """Async mirror of :func:`get_key` (#57 PR-G2e-1) for ``async def`` callers on
+    the pooled async service client (the poller's async BYOK payer resolver).
+
+    Same decrypt-or-None contract and same ``BYOKDecryptError`` surfacing (rotated
+    / wrong master key) as the sync version, awaited on the loop instead of run in
+    a threadpool. The sync :func:`get_key` stays for the interactive LLM-client
+    factory."""
+    _validate_provider(provider)
+    resp = await (
         supabase.table(TABLE)
         .select("ciphertext")
         .eq("user_id", user_id)
@@ -121,6 +150,38 @@ def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> boo
         return False
     try:
         return get_key(supabase, user_id=user_id, provider=provider) is not None
+    except crypto.BYOKDecryptError:
+        return False
+
+
+async def has_usable_key_async(
+    supabase: AsyncClient, *, user_id: str, provider: Provider
+) -> bool:
+    """Async mirror of :func:`has_usable_key` (#57 PR-G2c) for ``async def``
+    callers on the pooled async service client (billing + the async quota
+    resolver).
+
+    Same "who pays" semantics as the sync version: an unconfigured master key
+    or a stored row that can't be decrypted (rotated/wrong master key) means the
+    HOST key would pay, so the user must stay metered → False. Mirrors
+    ``_user_byok_key``'s fallbacks exactly (Copilot on #205). The read of the
+    ciphertext is awaited inline (``get_key`` stays sync for its other callers)."""
+    if not crypto.is_configured():
+        return False
+    _validate_provider(provider)
+    resp = await (
+        supabase.table(TABLE)
+        .select("ciphertext")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return False
+    try:
+        return crypto.decrypt(rows[0]["ciphertext"]) is not None
     except crypto.BYOKDecryptError:
         return False
 

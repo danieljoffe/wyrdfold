@@ -52,7 +52,7 @@ from app.services.relevance.title_triage import (
     triage_titles,
 )
 from app.services.targets import crud
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_phase1")
@@ -254,8 +254,7 @@ async def main() -> None:
             "writing mock verdicts to the DB. Use --dry-run for a count-only run."
         )
 
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit(
             "ERROR: Supabase not configured — check SUPABASE_URL + "

@@ -20,15 +20,16 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
     get_current_user_id,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -154,10 +155,10 @@ async def test_suggest_and_match_from_query_excludes_existing(
         updated_at=now,
     )
 
-    def _fake_match(_supabase, label: str):
+    async def _fake_match(_supabase, label: str):
         return owned if label == "Senior Frontend Engineer" else None
 
-    monkeypatch.setattr(match_module, "get_user_target_ids", lambda *_a: {"t-owned"})
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value={"t-owned"}))
     monkeypatch.setattr(match_module, "find_matching_target", _fake_match)
 
     llm = MockLLMClient(
@@ -176,8 +177,8 @@ async def test_suggest_and_match_from_query_excludes_existing(
 async def test_suggest_and_match_from_query_without_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(match_module, "get_user_target_ids", lambda *_a: set())
-    monkeypatch.setattr(match_module, "find_matching_target", lambda *_a: None)
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(match_module, "find_matching_target", AsyncMock(return_value=None))
 
     llm = MockLLMClient(scripted={QUERY_DEFAULT_PURPOSE: _suggestions_json("Data Scientist")})
     matched, _ = await suggest_and_match_from_query(
@@ -199,7 +200,8 @@ def _clear_overrides():
 
 
 def _client(llm: MockLLMClient, user_id: str = "u1") -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: object()
+    app.dependency_overrides[get_async_service_supabase] = lambda: object()
+    app.dependency_overrides[get_async_service_supabase] = lambda: object()
     app.dependency_overrides[get_current_user_id] = lambda: user_id
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: user_id
     app.dependency_overrides[get_llm_client] = lambda: llm
@@ -210,10 +212,13 @@ def _client(llm: MockLLMClient, user_id: str = "u1") -> TestClient:
 def _stub_endpoint_deps(monkeypatch: pytest.MonkeyPatch, *, doc: object | None) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: doc)
-    monkeypatch.setattr(mod.cost_log, "record", lambda *_a, **_k: None)
-    monkeypatch.setattr(match_module, "get_user_target_ids", lambda *_a: set())
-    monkeypatch.setattr(match_module, "find_matching_target", lambda *_a: None)
+    # #57 PR-G2e-5: the handler reads the optimized doc on the async client via the
+    # ``_optimized_latest`` inline (the sync ``optimized.get_latest`` twin is no
+    # longer on this path).
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=doc))
+    monkeypatch.setattr(mod.cost_log, "record_async", AsyncMock())
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(match_module, "find_matching_target", AsyncMock(return_value=None))
 
 
 def test_endpoint_happy_path_without_a_profile(
@@ -336,12 +341,17 @@ def _create_or_link_result() -> CreateOrLinkResult:
 
 
 def _stub_from_suggestion_spy(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
-    """Spy on from_input.from_suggestion; return the list that captures kwargs."""
+    """Spy on from_input.from_suggestion; return the list that captures kwargs.
+
+    #57 PR-G2b/G2e-5: from_suggestion self-schedules the deferred derive via
+    ``spawn_detached``, and the handler reads the optimized doc on the async client
+    via the ``_optimized_latest`` inline (patched by the per-test stubs below).
+    """
     from app.routers import targets as mod
 
     captured: list[dict[str, object]] = []
 
-    async def _spy(supabase, llm, background_tasks, **kwargs):  # type: ignore[no-untyped-def]
+    async def _spy(supabase, llm, **kwargs):  # type: ignore[no-untyped-def]
         captured.append(kwargs)
         return _create_or_link_result()
 
@@ -356,7 +366,7 @@ def test_from_suggestion_endpoint_works_without_a_profile(
     handed to the service."""
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=None))
     captured = _stub_from_suggestion_spy(monkeypatch)
     llm = MockLLMClient()
 
@@ -377,7 +387,7 @@ def test_from_suggestion_endpoint_passes_profile_when_present(
 
     payload = OptimizedPayload(summary="Senior FE")
     monkeypatch.setattr(
-        mod.optimized, "get_latest", lambda *_a, **_k: SimpleNamespace(payload=payload)
+        mod, "_optimized_latest", AsyncMock(return_value=SimpleNamespace(payload=payload))
     )
     captured = _stub_from_suggestion_spy(monkeypatch)
 
@@ -396,7 +406,7 @@ def test_from_suggestion_endpoint_validates_label_422(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.optimized, "get_latest", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "_optimized_latest", AsyncMock(return_value=None))
     spy = _stub_from_suggestion_spy(monkeypatch)
 
     resp = _client(MockLLMClient()).post("/targets/from-suggestion", json=body)

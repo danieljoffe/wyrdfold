@@ -4,8 +4,8 @@ Write-only: the plaintext key is accepted on PUT and never returned; reads
 expose only non-secret metadata (provider, ``last4``, timestamps). All
 endpoints scope to the JWT subject.
 
-These routes use the **service-role** client (``get_supabase``) on purpose:
-``user_api_keys`` is service-role-only (RLS enabled, no authenticated
+These routes use the **service-role** client (``get_async_service_supabase``) on
+purpose: ``user_api_keys`` is service-role-only (RLS enabled, no authenticated
 grants — the browser never touches the table), so the explicit ``user_id``
 filter inside ``services.keys.store`` is the access control and is never
 omitted. The router-level ``verify_supabase_jwt`` blocks the api-key

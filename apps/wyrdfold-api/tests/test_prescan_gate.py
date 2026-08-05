@@ -142,7 +142,7 @@ async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
         def eq(self, *_a, **_k):
             return self
 
-        def execute(self):
+        async def execute(self):
             return MagicMock(data=[])
 
     sb = MagicMock()
@@ -178,7 +178,7 @@ def _vec_supabase(target_vec: object, job_rows: list[dict]) -> object:
         def limit(self, *_a, **_k):
             return self
 
-        def execute(self):
+        async def execute(self):
             return MagicMock(
                 data=[{"embedding": target_vec}] if target_vec is not None else []
             )
@@ -193,7 +193,7 @@ def _vec_supabase(target_vec: object, job_rows: list[dict]) -> object:
         def eq(self, *_a, **_k):
             return self
 
-        def execute(self):
+        async def execute(self):
             return MagicMock(data=job_rows)
 
     def _table(name: str):

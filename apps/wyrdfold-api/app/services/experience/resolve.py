@@ -24,21 +24,54 @@ the ``/derive`` endpoint. This is a transient, read-only freshening for scoring.
 
 from __future__ import annotations
 
-import asyncio
+from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
-from app.models.experience import OptimizedPayload
+from app.constants import resolve_owner
+from app.models.experience import OptimizedDoc, OptimizedPayload, ProseDoc
 from app.services.experience import derive, optimized, prose
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 
 
+async def _prose_latest(supabase: AsyncClient, user_id: str | None) -> ProseDoc | None:
+    """Async inline of ``prose.get_latest`` (#57 PR-G2e-5). The sync twin stays for
+    the poller/tailor/orchestrator callers; this module now rides the pooled async
+    service client (its callers — link/fit-score/lazy-refresh — are all async)."""
+    resp = await (
+        supabase.table(prose.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return ProseDoc.model_validate(rows[0]) if rows else None
+
+
+async def _optimized_latest(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (#57 PR-G2e-5). Reads fresh — the
+    module TTL cache is populated only by the sync path and every write invalidates
+    it, so a fresh read can't return stale (mirrors ``targets._optimized_latest``)."""
+    resp = await (
+        supabase.table(optimized.TABLE)
+        .select("*")
+        .order("version", desc=True)
+        .limit(1)
+        .eq("user_id", resolve_owner(user_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return OptimizedDoc.model_validate(rows[0]) if rows else None
+
+
 async def resolve_current_payload(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
-    cost_supabase: Client,
+    cost_supabase: AsyncClient,
     user_id: str | None,
 ) -> tuple[OptimizedPayload | None, str | None]:
     """An ``OptimizedPayload`` fresh vs. the user's latest master document, paired
@@ -54,8 +87,8 @@ async def resolve_current_payload(
     ledger (``llm_costs`` has no ``authenticated`` INSERT policy); it may be the
     same client as ``supabase`` in service-role contexts.
     """
-    prose_doc = await asyncio.to_thread(prose.get_latest, supabase, user_id)
-    latest = await asyncio.to_thread(optimized.get_latest, supabase, user_id)
+    prose_doc = await _prose_latest(supabase, user_id)
+    latest = await _optimized_latest(supabase, user_id)
 
     # Nothing to derive from → fall back to whatever optimized doc exists. No
     # prose master ⇒ no version marker.
@@ -70,8 +103,7 @@ async def resolve_current_payload(
     # Stale (prose advanced past the derived doc) or never derived → freshen
     # transiently from the current prose so scoring reflects the live profile.
     payload, result = await derive.derive_from_prose(llm, prose_text=prose_doc.content)
-    await asyncio.to_thread(
-        cost_log.record,
+    await cost_log.record_async(
         cost_supabase,
         user_id=user_id,
         purpose=derive.DEFAULT_PURPOSE,

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, status
-from supabase import Client
+from supabase import AsyncClient
 
 from app.background import spawn_detached
 from app.cache import job_list_cache
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.models.schemas import PollResult
 from app.scheduler import run_force_poll_locked
 from app.services.poller import poll_due_sources
@@ -42,7 +42,9 @@ async def trigger_poll() -> dict[str, str]:
 
 
 @router.post("/poll/due", response_model=PollResult)
-async def trigger_poll_due(supabase: Client = Depends(get_supabase)) -> PollResult:
+async def trigger_poll_due(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> PollResult:
     """Poll only sources whose interval has elapsed.
 
     Same authentication as ``/poll`` but cheap to call frequently —

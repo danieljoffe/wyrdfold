@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -82,10 +82,13 @@ def _wire(
             raise graded
         return graded
 
+    async def fake_resolve(_c: Any, _sb: Any, _uid: Any) -> object | None:
+        return llm
+
     monkeypatch.setattr(poller_mod, "_cycle_budget_gate", fake_gate)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
     monkeypatch.setattr(poller_mod, "_resolve_user_targets_for_stage3", fake_stage3)
-    monkeypatch.setattr(poller_mod, "_resolve_payer_client", lambda _c, _sb, _uid: llm)
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", fake_resolve)
     monkeypatch.setattr(poller_mod, "poll_db_read", fake_read)
     monkeypatch.setattr(poller_mod, "run_phase2_for_jobs", fake_phase2)
     return rec

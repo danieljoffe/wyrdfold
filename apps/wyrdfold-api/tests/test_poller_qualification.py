@@ -11,7 +11,7 @@ Covers ``poller._qualify_one_job`` / ``_qualify_jobs``:
 - A changed row (content differs from the stored hash) is re-tagged.
 - The step is best-effort: a tagger failure (tags=None) writes nothing and
   never raises; a write failure is swallowed.
-- It bills the instance key (``get_llm_client(supabase, None)``), never a
+- It bills the instance key (``get_llm_client_async(service_client, None)``), never a
   per-target payer.
 """
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -67,7 +67,7 @@ def _patch_common(
         "client_user_id": "UNSET",
     }
 
-    def fake_get_client(supabase: object, user_id: str | None) -> object:
+    async def fake_get_client(supabase: object, user_id: str | None) -> object:
         rec["client_user_id"] = user_id
         return MagicMock(name="instance-client")
 
@@ -85,9 +85,18 @@ def _patch_common(
     # the flag off it builds + executes the update on the MagicMock supabase
     # directly (the ``update`` side_effect below records the payload), so no
     # retry-helper patch is needed anymore.
-    monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
+    # The qualification budget re-check reads the global spend meter on the ASYNC
+    # service client (``_async_service_client`` → ``get_async_supabase``, #57
+    # PR-G2e-1) rather than the client threaded into the cycle. Hand it a client
+    # whose meter RPC resolves under cap so the default (non-budget) path tags
+    # normally; budget-specific tests patch ``total_llm_spend_all_async`` (the
+    # meter fn), which short-circuits this client entirely.
+    meter_client = MagicMock()
+    meter_client.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=1.0))
+    monkeypatch.setattr(poller_mod, "_async_service_client", lambda: meter_client)
     return rec
 
 
@@ -195,10 +204,10 @@ class TestQualifyOneJob:
     async def test_client_resolution_failure_skips_silently(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def boom(_sb: object, _uid: str | None) -> object:
+        async def boom(_sb: object, _uid: str | None) -> object:
             raise RuntimeError("no client")
 
-        monkeypatch.setattr(poller_mod, "get_llm_client", boom)
+        monkeypatch.setattr(poller_mod, "get_llm_client_async", boom)
         # tag_job should never be reached.
         called = {"n": 0}
 
@@ -378,7 +387,7 @@ class TestQualifyBudgetGate:
         not a stubbed predicate. Spend over cap → zero tagger calls."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         # Today's spend already over the cap.
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=12.5))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=12.5))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -396,7 +405,7 @@ class TestQualifyBudgetGate:
         """The gate must not break the happy path: under the cap, every
         cache-missing row is tagged."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=1.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=1.0))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -411,8 +420,8 @@ class TestQualifyBudgetGate:
         """cap=0 disables the breaker; even a huge spend reading tags
         everything (operator opt-out)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
-        spend = MagicMock(return_value=999.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
+        spend = AsyncMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -430,7 +439,7 @@ class TestQualifyBudgetGate:
         # Gate: under budget for the first check, over for the second.
         calls = {"n": 0}
 
-        def fake_exhausted(_sb: object, *, reserve_usd: float = 0.0) -> bool:
+        async def fake_exhausted(_sb: object, *, reserve_usd: float = 0.0) -> bool:
             calls["n"] += 1
             return calls["n"] > 1  # first chunk allowed, then deferred
 
@@ -453,8 +462,8 @@ class TestQualifyBudgetGate:
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         monkeypatch.setattr(
             poller_mod,
-            "total_llm_spend_all",
-            MagicMock(side_effect=RuntimeError("db down")),
+            "total_llm_spend_all_async",
+            AsyncMock(side_effect=RuntimeError("db down")),
         )
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
@@ -472,36 +481,36 @@ class TestGradingReserve:
     tagger — the recurring drain that left new jobs stuck at ``stage2`` (#60).
     The tagger stops at ``cap - reserve`` while grading reads the full cap."""
 
-    def test_reserve_lowers_the_taggers_effective_cap(
+    async def test_reserve_lowers_the_taggers_effective_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Spend sits in the reserved slice (between cap-reserve and cap):
         exhausted for the tagger (it yields), NOT for grading (full cap)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=8.0))
         sb = MagicMock()
         # $8 spent of $10: the tagger's $3 reserve makes it done ($8 >= $7)...
-        assert poller_mod._global_budget_exhausted(sb, reserve_usd=3.0) is True
+        assert await poller_mod._global_budget_exhausted(sb, reserve_usd=3.0) is True
         # ...but grading (no reserve) still has room ($8 < $10).
-        assert poller_mod._global_budget_exhausted(sb) is False
+        assert await poller_mod._global_budget_exhausted(sb) is False
 
-    def test_reserve_at_or_above_cap_makes_tagger_yield_entirely(
+    async def test_reserve_at_or_above_cap_makes_tagger_yield_entirely(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """reserve >= cap → effective cap 0 → the tagger always yields, without
         even reading the meter (a valid grading-only config)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        spend = MagicMock(return_value=0.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
-        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=10.0) is True
+        spend = AsyncMock(return_value=0.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
+        assert await poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=10.0) is True
         spend.assert_not_called()
 
-    def test_disabled_cap_ignores_reserve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_disabled_cap_ignores_reserve(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """cap<=0 disables the breaker entirely — reserve is moot, meter unread."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
-        spend = MagicMock(return_value=999.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
-        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=5.0) is False
+        spend = AsyncMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
+        assert await poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=5.0) is False
         spend.assert_not_called()
 
     @pytest.mark.asyncio
@@ -513,7 +522,7 @@ class TestGradingReserve:
         (With reserve=0 the same spend would let the tagger run.)"""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         monkeypatch.setattr(live_settings, "grading_budget_reserve_usd", 3.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=8.0))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -709,7 +718,7 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     contradict persisted promising rows."""
     calls: list[str] = []
 
-    def _raise(*_a: Any, **_kw: Any) -> Any:
+    async def _raise(*_a: Any, **_kw: Any) -> Any:
         raise RuntimeError("no client")
 
     async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
@@ -718,7 +727,7 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
         calls.append(f"reconcile:{','.join(job_ids)}")
 
-    monkeypatch.setattr(poller_mod, "get_llm_client", _raise)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _raise)
     monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
     monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
 

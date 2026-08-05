@@ -33,7 +33,7 @@ import asyncio
 import logging
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.experience import OptimizedPayload
@@ -41,7 +41,7 @@ from app.models.targets import JobTarget
 from app.services.embeddings import get_default_client as get_embeddings_client
 from app.services.embeddings.job_embeddings import ensure_job_vectors
 from app.services.embeddings.prescan_gate import cosine_scores_batch
-from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
+from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining_async
 from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
 from app.services.llm.client import LLMClient
@@ -87,8 +87,8 @@ def _needs_phase2(
     return not already_current
 
 
-def _fetch_phase2_state(
-    supabase: Client, target_id: str, job_ids: list[str]
+async def _fetch_phase2_state(
+    supabase: AsyncClient, target_id: str, job_ids: list[str]
 ) -> dict[str, tuple[bool | None, str | None, int | None, int | None]]:
     """Read (promising, scoring_status, scored_profile_version, phase1_confidence) per job.
 
@@ -98,11 +98,14 @@ def _fetch_phase2_state(
     for rows triaged before the confidence column existed — the runner's
     ordering treats None as "lowest priority" so legacy rows still grade
     but newer high-confidence rows go first.
+
+    Awaited on the pooled async service client (#57 PR-G2e-3); the chunked
+    ``.in_()`` reads yield the loop rather than blocking it.
     """
     state: dict[str, tuple[bool | None, str | None, int | None, int | None]] = {}
     for i in range(0, len(job_ids), _STATE_CHUNK_SIZE):
         chunk = job_ids[i : i + _STATE_CHUNK_SIZE]
-        resp = (
+        resp = await (
             supabase.table("scores")
             .select(
                 "job_posting_id, promising, scoring_status, "
@@ -135,7 +138,7 @@ def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[s
 
 
 async def run_phase2_for_jobs(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     target: JobTarget,
@@ -213,7 +216,7 @@ async def run_phase2_for_jobs(
     if not job_ids:
         return 0
 
-    state = _fetch_phase2_state(supabase, target.id, job_ids)
+    state = await _fetch_phase2_state(supabase, target.id, job_ids)
     candidates = [
         jid
         for jid in job_ids
@@ -306,7 +309,7 @@ async def run_phase2_for_jobs(
     # is a soft, best-effort budget — concurrent poll cycles for the same
     # target can each read the same remaining count and slightly overshoot;
     # the cap exists to bound runaway spend, not to be exact.
-    quota = phase2_quota_remaining(supabase, target.id, cap)
+    quota = await phase2_quota_remaining_async(supabase, target.id, cap)
     if quota <= 0:
         logger.info(
             "Phase 2: target %s at daily cap; deferring %d promising job(s)",

@@ -56,7 +56,7 @@ from app.services.embeddings.job_embeddings import (
     embed_jobs_batch,
     upsert_job_embedding,
 )
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 # Progress-reporting granularity for the batched path (embed_jobs_batch does
 # its own Voyage batching + chunked writes internally).
@@ -198,8 +198,7 @@ def _iter_jobs(
 async def main() -> None:
     args = _parse_args()
 
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
 

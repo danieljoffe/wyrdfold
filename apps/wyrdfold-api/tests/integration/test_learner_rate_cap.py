@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from unittest.mock import patch
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.learning import ProfilePatch
 from app.models.llm import LLMResult, LLMUsage
@@ -151,7 +151,9 @@ def _unapplied_feedback_count(client: Client, target_id: str) -> int:
 
 @pytest.mark.asyncio
 async def test_outlier_patch_is_staged_not_applied(
-    service_client: Client, seeded_target: tuple[str, str]
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_target: tuple[str, str],
 ) -> None:
     uid, target_id = seeded_target
     # "contract" hard-excludes every seeded job (it's in each title) WITHOUT
@@ -163,10 +165,10 @@ async def test_outlier_patch_is_staged_not_applied(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client,
+            async_service_client,
             object(),
             user_id=uid,
-            target_id=target_id,  # type: ignore[arg-type]
+            target_id=target_id,
         )
 
     assert result is not None
@@ -190,7 +192,9 @@ async def test_outlier_patch_is_staged_not_applied(
 
 @pytest.mark.asyncio
 async def test_self_colliding_negative_is_dropped_before_apply(
-    service_client: Client, seeded_target: tuple[str, str]
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_target: tuple[str, str],
 ) -> None:
     uid, target_id = seeded_target
     # "python" is the target's own core skill AND a token of its "python
@@ -203,10 +207,10 @@ async def test_self_colliding_negative_is_dropped_before_apply(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client,
+            async_service_client,
             object(),
             user_id=uid,
-            target_id=target_id,  # type: ignore[arg-type]
+            target_id=target_id,
         )
 
     assert result is not None
@@ -224,7 +228,9 @@ async def test_self_colliding_negative_is_dropped_before_apply(
 
 @pytest.mark.asyncio
 async def test_irrelevant_patch_auto_applies(
-    service_client: Client, seeded_target: tuple[str, str]
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_target: tuple[str, str],
 ) -> None:
     uid, target_id = seeded_target
     # "blockchain" matches none of the python jobs -> no churn -> applies.
@@ -236,10 +242,10 @@ async def test_irrelevant_patch_auto_applies(
         return_value=(patch_obj, _llm_result()),
     ):
         result = await run_llm_learner(
-            service_client,
+            async_service_client,
             object(),
             user_id=uid,
-            target_id=target_id,  # type: ignore[arg-type]
+            target_id=target_id,
         )
 
     assert result is not None

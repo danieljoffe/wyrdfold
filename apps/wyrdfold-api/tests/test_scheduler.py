@@ -420,7 +420,7 @@ async def test_run_scheduled_poll_invokes_due_poller_with_pool_client() -> None:
     )
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=fake_client),
+        patch("app.scheduler.get_async_supabase", return_value=fake_client),
         patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
         _patch_lock_acquired(),
         _patch_health(),
@@ -433,12 +433,12 @@ async def test_run_scheduled_poll_invokes_due_poller_with_pool_client() -> None:
 
 @pytest.mark.asyncio
 async def test_run_scheduled_poll_skips_when_supabase_uninitialized() -> None:
-    """If Supabase env isn't configured, ``get_supabase_pool`` returns
+    """If Supabase env isn't configured, ``get_async_supabase`` returns
     None — the tick should log+skip instead of crashing."""
     from app.scheduler import _run_scheduled_poll
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch("app.scheduler.get_async_supabase", return_value=None),
         patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
     ):
         await _run_scheduled_poll()
@@ -453,7 +453,7 @@ async def test_run_scheduled_poll_swallows_exceptions() -> None:
     from app.scheduler import _run_scheduled_poll
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch("app.scheduler.poll_due_sources", side_effect=RuntimeError("kaboom")),
         _patch_lock_acquired(),
         _patch_health(),
@@ -486,7 +486,7 @@ async def test_run_scheduled_poll_aborts_hung_cycle_via_watchdog(
         health_calls["n"] += 1
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch("app.scheduler.poll_due_sources", _hang),
         _patch_lock_acquired(),
         patch("app.scheduler.check_ingestion_health", _count_health),
@@ -514,7 +514,7 @@ async def test_run_scheduled_poll_watchdog_disabled_when_zero(
     result = PollResult(sources_polled=1, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=object()),
+        patch("app.scheduler.get_async_supabase", return_value=object()),
         patch("app.scheduler.poll_due_sources", autospec=True) as mock_poll,
         _patch_lock_acquired(),
         _patch_health(),
@@ -551,7 +551,7 @@ def _patch_discovery_deps(
     ``_newest_discovery_at``, and a spy on the discovery run body."""
     runs: list[int] = []
 
-    monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: object())
+    monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: object())
 
     async def fake_newest(_client: object) -> "datetime | None":
         if isinstance(last_run, Exception):
@@ -618,7 +618,7 @@ class TestDiscoveryCatchup:
 
     @pytest.mark.asyncio
     async def test_missing_pool_client_skips_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.scheduler.get_supabase_pool", lambda: None)
+        monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: None)
         sched = _RecordingScheduler()
 
         await _anchor_discovery_schedule(sched, now=_CATCHUP_NOW)  # must not raise

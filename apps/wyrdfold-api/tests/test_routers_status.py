@@ -5,9 +5,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
-    get_supabase,
     verify_api_key_or_jwt,
     verify_supabase_jwt,
 )
@@ -121,7 +121,7 @@ def client_factory():
         # client deps with the same mock so a route resolves regardless of which
         # it declares.
         app.dependency_overrides[get_async_user_supabase] = lambda: supabase
-        app.dependency_overrides[get_supabase] = lambda: supabase
+        app.dependency_overrides[get_async_service_supabase] = lambda: supabase
         if authed:
             app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
             app.dependency_overrides[verify_supabase_jwt] = lambda: _TEST_USER_ID

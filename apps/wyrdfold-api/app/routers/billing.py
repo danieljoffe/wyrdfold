@@ -30,10 +30,10 @@ from typing import Any, Literal, cast
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
-from app.dependencies import get_current_user_id, get_supabase
+from app.dependencies import get_async_service_supabase, get_current_user_id
 from app.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -88,41 +88,41 @@ def _plan_for_price(price_id: str) -> str | None:
     return None
 
 
-def _get_stripe_customer_id(supabase: Client, user_id: str) -> str | None:
-    rows = cast(
-        list[dict[str, Any]],
+async def _get_stripe_customer_id(supabase: AsyncClient, user_id: str) -> str | None:
+    resp = await (
         supabase.table("user_profiles")
         .select("stripe_customer_id")
         .eq("user_id", user_id)
         .execute()
-        .data
-        or [],
     )
+    rows = cast(list[dict[str, Any]], resp.data or [])
     return cast("str | None", rows[0].get("stripe_customer_id")) if rows else None
 
 
-def _save_stripe_customer_id(supabase: Client, user_id: str, customer_id: str) -> None:
-    supabase.table("user_profiles").update({"stripe_customer_id": customer_id}).eq(
+async def _save_stripe_customer_id(supabase: AsyncClient, user_id: str, customer_id: str) -> None:
+    await supabase.table("user_profiles").update({"stripe_customer_id": customer_id}).eq(
         "user_id", user_id
     ).execute()
 
 
-def _ensure_customer(supabase: Client, user_id: str) -> str:
+async def _ensure_customer(supabase: AsyncClient, user_id: str) -> str:
     """The user's Stripe customer id, creating the customer on first use."""
-    existing = _get_stripe_customer_id(supabase, user_id)
+    existing = await _get_stripe_customer_id(supabase, user_id)
     if existing:
         return existing
     email: str | None = None
     try:
-        resp = supabase.auth.admin.get_user_by_id(user_id)
+        # Async auth-admin (the installed gotrue ships it as ``async def``).
+        resp = await supabase.auth.admin.get_user_by_id(user_id)
         email = getattr(resp.user, "email", None)
     except Exception:  # pragma: no cover — email is a nice-to-have
         logger.warning("could not resolve email for user=%s", user_id)
     params: dict[str, Any] = {"metadata": {"user_id": user_id}}
     if email:
         params["email"] = email
-    customer = _client().customers.create(params=cast(Any, params))
-    _save_stripe_customer_id(supabase, user_id, customer.id)
+    # Stripe SDK is synchronous — keep the blocking round-trip off the loop.
+    customer = await asyncio.to_thread(lambda: _client().customers.create(params=cast(Any, params)))
+    await _save_stripe_customer_id(supabase, user_id, customer.id)
     return customer.id
 
 
@@ -144,119 +144,126 @@ class BillingAccountResponse(BaseModel):
     byok: bool
 
 
-# Sync `def` (residual, #57 slice 4): reads go through ``budget.get_llm_account``
-# and ``keys_store.has_usable_key``, which stay synchronous for their other
-# callers — the sync budget resolver + LLM-client factory, both out of scope.
-# FastAPI threadpools this handler, keeping the blocking reads off the loop (#107).
+# `async def` (#57 PR-G2c): every read runs on the pooled async service client —
+# the billing-local ``_get_stripe_customer_id`` plus the cross-service
+# ``budget.get_llm_account_async`` and ``keys_store.has_usable_key_async`` twins
+# (added in G2c). The sync ``get_llm_account`` / ``has_usable_key`` stay for their
+# other callers (the sync budget resolver + LLM-client factory); this handler no
+# longer touches the sync service client.
 @router.get(
     "/account",
     response_model=BillingAccountResponse,
     dependencies=[Depends(require_billing)],
 )
-def get_billing_account(
+async def get_billing_account(
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> BillingAccountResponse:
     """The settings card's read: plan + billing/BYOK state in one call."""
     from app.services.keys import store as keys_store
     from app.services.llm import budget
 
-    account = budget.get_llm_account(supabase, user_id=user_id)
+    account = await budget.get_llm_account_async(supabase, user_id=user_id)
+    has_billing_account = (await _get_stripe_customer_id(supabase, user_id)) is not None
+    byok = await keys_store.has_usable_key_async(supabase, user_id=user_id, provider="openrouter")
     return BillingAccountResponse(
         plan=account.plan or "free",
-        has_billing_account=_get_stripe_customer_id(supabase, user_id) is not None,
-        byok=keys_store.has_usable_key(supabase, user_id=user_id, provider="openrouter"),
+        has_billing_account=has_billing_account,
+        byok=byok,
     )
 
 
-# Sync `def` (documented holdout, #57 slice 4): ``_ensure_customer`` calls
-# ``auth.admin.get_user_by_id`` (async auth-admin coverage is uncertain), plus
-# the blocking Stripe SDK. FastAPI's threadpool keeps them off the loop (#107).
+# `async def` (#57 PR-G2a): ``_ensure_customer``'s read/write + ``auth.admin``
+# call run on the async service client; the blocking Stripe SDK calls are driven
+# off the loop via ``asyncio.to_thread`` (#107).
 @router.post(
     "/checkout-session",
     response_model=BillingUrlResponse,
     dependencies=[Depends(require_billing)],
 )
 @limiter.limit("10/minute")
-def create_checkout_session(
+async def create_checkout_session(
     request: Request,
     body: CheckoutRequest,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> BillingUrlResponse:
     """Hosted-Checkout URL for subscribing to a managed tier."""
     price = _price_for_plan(body.plan)
     app_url = _app_url()
-    customer_id = _ensure_customer(supabase, user_id)
-    session = _client().checkout.sessions.create(
-        params={
-            "mode": "subscription",
-            "customer": customer_id,
-            "line_items": [{"price": price, "quantity": 1}],
-            "success_url": f"{app_url}/settings?billing=success",
-            "cancel_url": f"{app_url}/settings?billing=cancelled",
-            "client_reference_id": user_id,
-            # Stamped onto the subscription so every webhook event carries
-            # the user id — no reverse lookup needed on the hot path.
-            "subscription_data": {"metadata": {"user_id": user_id}},
-        }
+    customer_id = await _ensure_customer(supabase, user_id)
+    session = await asyncio.to_thread(
+        lambda: _client().checkout.sessions.create(
+            params={
+                "mode": "subscription",
+                "customer": customer_id,
+                "line_items": [{"price": price, "quantity": 1}],
+                "success_url": f"{app_url}/settings?billing=success",
+                "cancel_url": f"{app_url}/settings?billing=cancelled",
+                "client_reference_id": user_id,
+                # Stamped onto the subscription so every webhook event carries
+                # the user id — no reverse lookup needed on the hot path.
+                "subscription_data": {"metadata": {"user_id": user_id}},
+            }
+        )
     )
     if not session.url:  # pragma: no cover — Stripe always returns one
         raise HTTPException(status_code=502, detail="Stripe returned no URL")
     return BillingUrlResponse(url=session.url)
 
 
-# Sync `def` (residual, #57 slice 4): dominated by the blocking Stripe SDK
-# (no real await), so #107 keeps it a plain threadpooled handler.
+# `async def` (#57 PR-G2a): the billing-local ``_get_stripe_customer_id`` read
+# runs on the async service client; the blocking Stripe SDK call is driven off
+# the loop via ``asyncio.to_thread`` (#107).
 @router.post(
     "/portal-session",
     response_model=BillingUrlResponse,
     dependencies=[Depends(require_billing)],
 )
 @limiter.limit("10/minute")
-def create_portal_session(
+async def create_portal_session(
     request: Request,
     user_id: str = Depends(get_current_user_id),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> BillingUrlResponse:
     """Hosted Customer-Portal URL (manage plan / card / cancel)."""
-    customer_id = _get_stripe_customer_id(supabase, user_id)
+    customer_id = await _get_stripe_customer_id(supabase, user_id)
     if not customer_id:
         raise HTTPException(
             status_code=409,
             detail="No billing account yet — subscribe to a plan first.",
         )
-    session = _client().billing_portal.sessions.create(
-        params={
-            "customer": customer_id,
-            "return_url": f"{_app_url()}/settings",
-        }
+    session = await asyncio.to_thread(
+        lambda: _client().billing_portal.sessions.create(
+            params={
+                "customer": customer_id,
+                "return_url": f"{_app_url()}/settings",
+            }
+        )
     )
     return BillingUrlResponse(url=session.url)
 
 
-def _resolve_user_id(
-    supabase: Client, *, metadata_user_id: str | None, customer_id: str | None
+async def _resolve_user_id(
+    supabase: AsyncClient, *, metadata_user_id: str | None, customer_id: str | None
 ) -> str | None:
     """Subscription metadata first (we stamp it), customer lookup second."""
     if metadata_user_id:
         return metadata_user_id
     if not customer_id:
         return None
-    rows = cast(
-        list[dict[str, Any]],
+    resp = await (
         supabase.table("user_profiles")
         .select("user_id")
         .eq("stripe_customer_id", customer_id)
         .execute()
-        .data
-        or [],
     )
+    rows = cast(list[dict[str, Any]], resp.data or [])
     return cast(str, rows[0]["user_id"]) if rows else None
 
 
-def _set_plan(supabase: Client, user_id: str, plan: str) -> None:
-    supabase.table("user_profiles").update({"plan": plan}).eq("user_id", user_id).execute()
+async def _set_plan(supabase: AsyncClient, user_id: str, plan: str) -> None:
+    await supabase.table("user_profiles").update({"plan": plan}).eq("user_id", user_id).execute()
     logger.info("billing: plan=%s user=%s", plan, user_id)
 
 
@@ -267,7 +274,7 @@ def _set_plan(supabase: Client, user_id: str, plan: str) -> None:
 _ENTITLED_STATUSES = ("active", "trialing")
 
 
-def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
+async def _handle_event(supabase: AsyncClient, event: dict[str, Any]) -> None:
     etype = cast(str, event.get("type") or "")
     obj = cast(dict[str, Any], (event.get("data") or {}).get("object") or {})
 
@@ -278,7 +285,7 @@ def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
         user_id = cast("str | None", obj.get("client_reference_id"))
         customer_id = cast("str | None", obj.get("customer"))
         if user_id and customer_id:
-            _save_stripe_customer_id(supabase, user_id, customer_id)
+            await _save_stripe_customer_id(supabase, user_id, customer_id)
         return
 
     if etype in (
@@ -290,7 +297,7 @@ def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
         first = (cast(list[Any], items.get("data") or []) or [{}])[0]
         price_id = cast(str, (cast(dict[str, Any], first).get("price") or {}).get("id") or "")
         metadata = cast(dict[str, Any], obj.get("metadata") or {})
-        user_id = _resolve_user_id(
+        user_id = await _resolve_user_id(
             supabase,
             metadata_user_id=cast("str | None", metadata.get("user_id")),
             customer_id=cast("str | None", obj.get("customer")),
@@ -304,12 +311,12 @@ def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
             return
 
         if etype == "customer.subscription.deleted":
-            _set_plan(supabase, user_id, "free")
+            await _set_plan(supabase, user_id, "free")
             return
 
         status = cast(str, obj.get("status") or "")
         if status not in _ENTITLED_STATUSES:
-            _set_plan(supabase, user_id, "free")
+            await _set_plan(supabase, user_id, "free")
             return
 
         plan = _plan_for_price(price_id)
@@ -323,20 +330,23 @@ def _handle_event(supabase: Client, event: dict[str, Any]) -> None:
                 user_id,
             )
             return
-        _set_plan(supabase, user_id, plan)
+        await _set_plan(supabase, user_id, plan)
         return
 
     logger.debug("billing: ignored event type=%s", etype)
 
 
-# Async `def`: needs the raw request body for signature verification; the
-# blocking handler work is offloaded to the threadpool (#107). NO auth
-# dependency — Stripe is the caller; the HMAC signature IS the auth.
+# Async `def`: needs the raw request body for signature verification. NO auth
+# dependency — Stripe is the caller; the HMAC signature IS the auth. The DB work
+# runs on the async service client (#57 PR-G2a): ``_handle_event`` is now an async
+# coroutine awaited on the loop (its per-row writes yield), replacing the prior
+# ``asyncio.to_thread`` offload of the sync client. ``construct_event`` is local
+# HMAC verification (no I/O), so it stays inline exactly as before.
 @router.post("/webhook", dependencies=[Depends(require_billing)])
 @limiter.limit("120/minute")
 async def stripe_webhook(
     request: Request,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, bool]:
     if not settings.stripe_webhook_secret:
         # Refuse everything rather than process unsigned events.
@@ -353,5 +363,5 @@ async def stripe_webhook(
         raise HTTPException(status_code=400, detail="Invalid signature") from exc
 
     event = cast("dict[str, Any]", json.loads(payload))
-    await asyncio.to_thread(_handle_event, supabase, event)
+    await _handle_event(supabase, event)
     return {"received": True}

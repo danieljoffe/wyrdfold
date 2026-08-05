@@ -24,7 +24,6 @@ from app.dependencies import (
     get_async_user_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -41,7 +40,13 @@ from app.models.schemas import (
     UrlValidateRequest,
     UrlValidateResponse,
 )
-from app.models.targets import SENIORITY_ORDER, AxisWeights, TargetPreferences, UserTarget
+from app.models.targets import (
+    SENIORITY_ORDER,
+    AxisWeights,
+    JobTarget,
+    TargetPreferences,
+    UserTarget,
+)
 from app.rate_limit import limiter
 from app.services.extract import (
     ExtractionResult,
@@ -54,18 +59,15 @@ from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
-from app.services.tailor import persistence
 from app.services.target_scoring import (
     bulk_score_for_target,
-    score_and_upsert,
+    score_and_upsert_async,
 )
 from app.services.targets.crud import (
+    _parse_target,
     _parse_user_target,
-    get_active_for_user,
     preferences_from_user_target,
 )
-from app.services.targets.crud import get as get_target
-from app.services.targets.crud import get_active as get_active_target
 from app.services.validate import (
     assert_safe_host,
     is_banned_domain,
@@ -2316,15 +2318,16 @@ async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
     user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> ManualJobResponse:
     """Add a job posting by URL. Extracts metadata via cascade.
 
     The materialize + gated-score path (``materialize_and_score_job`` /
-    ``score_and_upsert``) is the SYNC service-role scorer shared with the
-    poller-adjacent from-url flow (``targets.from_input``), so it runs on the
-    sync service client — awaited (``materialize_and_score_job`` threads its
-    own blocking work) / off-loaded via ``to_thread`` here (#57 slice 4). The
-    handler itself is ``async`` only for the genuine ``httpx`` fetch below.
+    ``score_and_upsert_async``) is the service-role scorer shared with the
+    poller-adjacent from-url flow (``targets.from_input``); it now runs on the
+    pooled async service client, awaited on the loop (#57 PR-G2e-4). The
+    caller's active targets are read via async inlines rather than a threadpool
+    hop.
     """
     warnings: list[str] = []
 
@@ -2447,15 +2450,12 @@ async def add_manual_job(
     # surfacing one user's pasted URL in every other user's /jobs list via the
     # scores→user_targets join. Operator/api-key callers (user_id None) keep the
     # global fan-out for cron/admin back-compat. Shared with the from-url target
-    # flow via materialize_and_score_job (upsert + score + global + force-include).
-    # Sync service-role client for the shared materialize/score path (see the
-    # handler docstring). Obtained here rather than injected as a sync `Depends`
-    # so the retired sync-user-client deps stay off this router (#57 slice 4).
-    supabase = get_supabase()
+    # flow via materialize_and_score_job (upsert + score + global + force-include),
+    # all on the async service client injected above.
     if user_id is not None:
-        active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
+        active_targets = await _active_targets_for_user_async(supabase, user_id)
     else:
-        active_targets = await asyncio.to_thread(get_active_target, supabase)
+        active_targets = await _all_active_targets_async(supabase)
     try:
         posting_id = await materialize_and_score_job(
             supabase,
@@ -2483,6 +2483,78 @@ async def add_manual_job(
         warnings=warnings,
         needs_manual_fields=False,
     )
+
+
+async def _get_target_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get`` — one shared-catalog target row by id.
+
+    ``crud.get`` stays sync for the poller / from-url / operator paths, so the
+    ``async def`` add-to-target handler reads the row natively on the pooled async
+    service client here rather than tie up a threadpool worker (#57 PR-G2d-a). The
+    row→model parse is reused from crud so the shape stays identical.
+    """
+    resp = await supabase.table("targets").select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_target(rows[0]) if rows else None
+
+
+async def _active_targets_for_user_async(
+    supabase: AsyncClient, user_id: str
+) -> list[JobTarget]:
+    """Async inline of ``crud.get_active_for_user`` — the caller's active
+    memberships as full target rows (``crud`` stays sync for its poller callers,
+    #57 PR-G2e-4). Mirrors ``targets._active_targets_for_user``."""
+    ut_resp = await (
+        supabase.table("user_targets")
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    target_ids = [r["target_id"] for r in cast(list[dict[str, Any]], ut_resp.data or [])]
+    if not target_ids:
+        return []
+    resp = await supabase.table("targets").select("*").in_("id", target_ids).execute()
+    return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _all_active_targets_async(supabase: AsyncClient) -> list[JobTarget]:
+    """Async inline of ``crud.get_active`` — the derived ``app_active OR
+    EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
+    Python (the operator/api-key manual-add fan-out, #57 PR-G2e-4). Mirrors
+    ``targets._active_targets``."""
+    floor_resp = await (
+        supabase.table("targets").select("*").eq("app_active", True).execute()
+    )
+    member_ids_resp = await (
+        supabase.table("user_targets").select("target_id").eq("is_active", True).execute()
+    )
+    member_ids = {
+        cast(str, r["target_id"])
+        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+    }
+    rows = cast(list[dict[str, Any]], floor_resp.data or [])
+    seen = {cast(str, r["id"]) for r in rows}
+    missing = sorted(member_ids - seen)
+    if missing:
+        member_resp = await (
+            supabase.table("targets").select("*").in_("id", missing).execute()
+        )
+        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
+    return [_parse_target(r) for r in rows]
+
+
+async def _user_set_scores_included_async(
+    supabase: AsyncClient, job_posting_id: str, target_ids: list[str]
+) -> None:
+    """Force-include a posting's scores under specific targets via the
+    ``user_set_scores_included`` RPC, natively on the async service client
+    (#57 PR-G2d-a). Extracted from the handler body so no bare ``.execute()``
+    sits on the loop there (the #107 guard scans handler bodies)."""
+    await supabase.rpc(
+        "user_set_scores_included",
+        {"p_job_posting_id": job_posting_id, "p_target_ids": target_ids},
+    ).execute()
 
 
 async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
@@ -2517,9 +2589,10 @@ async def add_job_to_target(
     body: AddToTargetRequest,
     user_id: str = Depends(get_current_user_id),
     # The RLS-backstopped reads (job load + ownership check) ride the caller's
-    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes use a
-    # sync service client obtained in-body (see below).
+    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes ride
+    # the pooled async service client (#57 PR-G2d-a).
     caller_supabase: AsyncClient = Depends(get_async_user_supabase),
+    service_supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> AddToTargetResponse:
     """Score an EXISTING posting (a search result's ``jobs.id``) against one of
     the caller's own targets and save it to their pipeline (#467 power-action).
@@ -2547,28 +2620,27 @@ async def add_job_to_target(
     # target, which is insufficient for a SHARED, ownerless target catalog (a
     # follower could tamper with co-followers' scores). So all score writes go on
     # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
-    # branch), and OWNERSHIP is enforced in the API above. ``score_and_upsert``
-    # is the shared async scorer (#57 — the same one the poller and job_ingest
-    # use), so it's awaited directly; the remaining sync service-role calls here
-    # (``get_target`` and the follow-up ``user_set_scores_included`` / 'saved'
-    # writes) stay off the loop via ``to_thread``.
-    service_supabase = get_supabase()
-    target = await asyncio.to_thread(get_target, service_supabase, body.target_id)
+    # branch), and OWNERSHIP is enforced in the API above. Every service-role
+    # round-trip here runs natively on the pooled async service client (#57
+    # PR-G2d-a): the target read inlines ``crud.get`` async, and
+    # ``score_and_upsert_async`` is the always-gated async twin of the shared
+    # scorer.
+    target = await _get_target_async(service_supabase, body.target_id)
     if target is None:  # catalog row vanished between the two reads — defensive
         raise HTTPException(status_code=404, detail="Target not found")
 
     # Stage-2 score the existing posting against the chosen target on the
-    # SERVICE-ROLE client. ``gated=True`` still routes through user_upsert_score,
-    # but with auth.uid() NULL it takes the function's service-role-exempt branch
-    # (the RPC isn't authenticated-executable post-lockdown — see above).
+    # SERVICE-ROLE client. The async twin is always gated — it routes through
+    # user_upsert_score, but with auth.uid() NULL it takes the function's
+    # service-role-exempt branch (the RPC isn't authenticated-executable
+    # post-lockdown — see above).
     try:
-        result = await score_and_upsert(
+        result = await score_and_upsert_async(
             service_supabase,
             job_posting_id=job_id,
             title=job["title"] or "",
             description_html=job["description_html"] or "",
             target=target,
-            gated=True,
         )
     except APIError as exc:
         logger.error(
@@ -2592,20 +2664,14 @@ async def add_job_to_target(
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
     try:
-        await asyncio.to_thread(
-            lambda: service_supabase.rpc(
-                "user_set_scores_included",
-                {"p_job_posting_id": job_id, "p_target_ids": [body.target_id]},
-            ).execute()
-        )
+        await _user_set_scores_included_async(service_supabase, job_id, [body.target_id])
     except Exception:
         logger.exception("add-to-target force-include failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
     #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
     try:
-        await asyncio.to_thread(
-            persistence.upsert_user_job,
+        await _upsert_user_job_async(
             service_supabase,
             user_id=user_id,
             job_posting_id=job_id,
@@ -2624,7 +2690,10 @@ async def add_job_to_target(
 
 
 @router.post("/rescore/{target_id}", dependencies=[Depends(verify_api_key)])
-async def rescore_for_target(target_id: str) -> dict[str, Any]:
+async def rescore_for_target(
+    target_id: str,
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> dict[str, Any]:
     """Re-score all jobs against a target's scoring profile.
 
     Admin / operator-only: gated by ``verify_api_key`` so an
@@ -2633,16 +2702,14 @@ async def rescore_for_target(target_id: str) -> dict[str, Any]:
     the wyrdfold FE — only invoked manually from the operator console
     or from CLI scripts that supply the api key.
 
-    ``bulk_score_for_target`` is the shared SYNC bulk scorer (also the feedback
-    learner's re-score path), so it runs on a sync service client obtained
-    in-body and driven off the event loop via ``to_thread`` (#57 slice 4).
+    Runs ``bulk_score_for_target`` on the pooled async service client, awaited on
+    the loop (#57 PR-G2e-4) — the same re-scorer the feedback learner uses.
     """
-    supabase = get_supabase()
-    target = await asyncio.to_thread(get_target, supabase, target_id)
+    target = await _get_target_async(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    scored = await asyncio.to_thread(bulk_score_for_target, supabase, target)
+    scored = await bulk_score_for_target(supabase, target)
     job_list_cache.invalidate()
     return {"target_id": target_id, "jobs_scored": scored}
 

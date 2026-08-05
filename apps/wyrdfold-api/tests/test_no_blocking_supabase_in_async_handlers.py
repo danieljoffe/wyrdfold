@@ -28,17 +28,28 @@ PERF-M): FastAPI threadpools a *sync def* handler, but a sync helper called
 from an ``async def`` runs on the event loop — it is NOT threadpooled just for
 being a plain ``def``. Both forms are caught here.
 
-A call is treated as safe when it is **awaited** (an async call yields the loop)
-or **lexically offloaded** inside ``asyncio.to_thread`` / ``spawn_detached`` /
-``create_task`` / ``ensure_future`` / ``BackgroundTasks.add_task``. So these do
-not false-positive:
+A call is treated as safe when it is **awaited** (an async call — or a single
+``await asyncio.to_thread(...)`` — yields the loop) or handed to a **detached-async**
+scheduler (``spawn_detached`` / ``create_task`` / ``ensure_future`` /
+``BackgroundTasks.add_task``), which runs a coroutine on the async client off the
+request's critical path. So these do not false-positive:
 
 - plain ``def`` handlers (FastAPI threadpools them — only ``async def`` handlers
   are scanned), or
-- ``await asyncio.to_thread(lambda: ...execute())`` /
-  ``await asyncio.to_thread(crud.get, supabase, …)`` wrapped calls, or
-- ``await some_async_helper(supabase, …)`` (async, yields the loop), or
+- ``await asyncio.to_thread(lambda: ...execute())`` (a bare ``.execute()`` offloaded
+  to a thread — form 1), or
+- ``await some_async_helper(supabase, …)`` / ``await asyncio.to_thread(crud.get,
+  supabase, …)`` (awaited → yields the loop), or
 - a coroutine handed to ``spawn_detached(...)`` / ``add_task(...)``.
+
+**#57 PR-H (fully-async posture).** Now that every DB path has an async client, a
+*non-awaited threaded fan-out* of a client-passing helper is no longer waved
+through: ``asyncio.gather(asyncio.to_thread(crud.get, supabase), …)``,
+``pool.submit(fn, supabase)``, ``loop.run_in_executor(None, fn, supabase)``. Sync
+helpers on the thread pool are the thread-pool-bound blocking the migration
+removed — parallelism is ``asyncio.gather`` over async calls. (The bare-``.execute()``
+``to_thread`` offload in form 1 is unchanged; the single ``await asyncio.to_thread``
+escape hatch stays, permitted by the awaited check.)
 """
 
 from __future__ import annotations
@@ -129,18 +140,25 @@ _CLIENT_ARG_NAMES = {
     "caller_supabase",
     "cost_supabase",
     "service_supabase",
+    "sync_supabase",
     "user_supabase",
 }
+# Only the **detached-async** schedulers wave a client-passing call through: each
+# runs a *coroutine* (on the async client) off the request's critical path. The
+# **threaded** wrappers — ``to_thread`` / ``submit`` / ``run_in_executor`` — were
+# removed in #57 PR-H: a sync helper on the thread pool is exactly the
+# thread-pool-bound DB the async migration eliminated. The one legitimate
+# ``await asyncio.to_thread(crud.get, supabase, …)`` escape hatch is still allowed,
+# but by the *awaited* check in ``_blocking_client_call_lines`` (an await yields the
+# loop), not by wrapper name — so a *non-awaited* threaded fan-out
+# (``gather(asyncio.to_thread(fn, supabase), …)``, ``pool.submit(fn, supabase)``)
+# is now flagged. Every DB path has an async client; parallelism is
+# ``asyncio.gather`` over async calls, not a sync helper on the thread pool.
 _OFFLOAD_WRAPPERS = {
-    "to_thread",
     "spawn_detached",
     "create_task",
     "ensure_future",
     "add_task",
-    # ThreadPoolExecutor.submit(fn, supabase, …) / loop.run_in_executor(...) also
-    # run the callable off the loop — a deliberate parallel-DB-fan-out pattern.
-    "submit",
-    "run_in_executor",
 }
 
 
@@ -250,15 +268,13 @@ def test_no_blocking_supabase_execute_in_async_handlers() -> None:
 # ---- of scanned functions differs.
 #
 # Scoped, for now, to the target-derivation module's bg functions (the ones the
-# 2026-07-21 hardening review threaded). Broadening to the poll / discovery /
-# learner bg tasks (run_force_poll_locked, run_discovery_all_targets_locked,
-# _safe_run_learner) needs each audited/threaded first, so it's a follow-up —
-# adding them here before that would just flip this guard red.
+# 2026-07-21 hardening review threaded). The post-feedback learner chain is now
+# threaded too (``services.feedback.run_learner_and_rescore_off_loop``, #57
+# PR-G2d-a). Broadening to the poll / discovery bg tasks (run_force_poll_locked,
+# run_discovery_all_targets_locked) needs each audited/threaded first, so it's a
+# follow-up — adding them here before that would just flip this guard red.
 _BG_TASK_MODULES: dict[Path, frozenset[str]] = {
-    APP_DIR
-    / "services"
-    / "targets"
-    / "from_input.py": frozenset(
+    APP_DIR / "services" / "targets" / "from_input.py": frozenset(
         {"derive_url_target_bg", "derive_manual_target_bg", "_apply_fit_score"}
     ),
 }
@@ -473,7 +489,9 @@ def test_bg_scan_flags_blocking_call_only_in_tracked_functions() -> None:
     assert offenders == {"worker_bg"}
 
 
-_THREADPOOL_SUBMIT_OK = """
+# #57 PR-H: a non-awaited threaded fan-out of a client-passing helper via
+# ``ThreadPoolExecutor.submit`` is thread-pool-bound DB — no longer waved through.
+_THREADPOOL_SUBMIT_FLAGGED = """
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter
 router = APIRouter()
@@ -482,13 +500,48 @@ router = APIRouter()
 async def usage(supabase, llm):
     await llm.call()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f = pool.submit(cost_log.total_spend, supabase, user_id="u")   # off-loop
+        f = pool.submit(cost_log.total_spend, supabase, user_id="u")   # thread-pool DB
         return f.result()
 """
 
 
-def test_scanner_passes_threadpool_submit() -> None:
-    assert _scan_source(_THREADPOOL_SUBMIT_OK) == []
+def test_scanner_flags_nonawaited_threadpool_submit() -> None:
+    offenders = _scan_source(_THREADPOOL_SUBMIT_FLAGGED)
+    assert len(offenders) == 1
+    name, _def_line, lines = offenders[0]
+    assert name == "usage"
+    assert lines  # the pool.submit(..., supabase, ...) line was reported
+
+
+# #57 PR-H: a ``gather`` of ``asyncio.to_thread(helper, supabase)`` — the individual
+# to_thread calls are NOT awaited (only the gather is), so they run the sync helper
+# on the thread pool. Flagged: use ``asyncio.gather`` over *async* helpers instead.
+_GATHER_TO_THREAD_DB_FLAGGED = """
+import asyncio
+from fastapi import APIRouter
+router = APIRouter()
+
+@router.get("/x")
+async def fanout(supabase):
+    a, b = await asyncio.gather(
+        asyncio.to_thread(crud.get, supabase, "a"),
+        asyncio.to_thread(crud.get, supabase, "b"),
+    )
+    return [a, b]
+"""
+
+
+def test_scanner_flags_gather_of_to_thread_db() -> None:
+    offenders = _scan_source(_GATHER_TO_THREAD_DB_FLAGGED)
+    assert len(offenders) == 1
+    assert offenders[0][0] == "fanout"
+    assert len(offenders[0][2]) == 2  # both to_thread(crud.get, supabase, …) lines
+
+
+# The single ``await asyncio.to_thread(crud.get, supabase, …)`` escape hatch is
+# STILL permitted — the awaited check yields the loop (see _FIXED_HELPER_TO_THREAD /
+# test_scanner_passes_to_thread_wrapped_helper above). PR-H only tightens the
+# *non-awaited* threaded fan-out, not the awaited single-call offload.
 
 
 _NESTED_DEF_VIA_TO_THREAD_OK = """

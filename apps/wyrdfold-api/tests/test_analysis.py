@@ -427,12 +427,12 @@ async def test_router_cache_hit_skips_llm(
 
     from app.main import app
 
+    # The handler's service client AND enforce_llm_budget's sub-dep are both
+    # get_async_service_supabase now (#57 PR-G2e-8) — one override serves both.
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
@@ -473,12 +473,12 @@ def _analysis_client(
 
     from app.main import app
 
+    # The handler's service client AND enforce_llm_budget's sub-dep are both
+    # get_async_service_supabase now (#57 PR-G2e-8) — one override serves both.
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_async_supabase_for_caller] = (
         (lambda: caller) if caller is not None else (lambda: supabase)
     )
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: (llm if llm is not None else MockLLMClient())
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
@@ -776,8 +776,6 @@ async def test_end_to_end_kick_poll_persists_via_real_async_task(
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -847,8 +845,6 @@ async def test_router_missing_optimized_doc_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
@@ -892,8 +888,6 @@ async def test_router_empty_description_returns_422(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
@@ -929,8 +923,6 @@ async def test_router_missing_job_posting_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
@@ -962,8 +954,6 @@ async def test_router_missing_target_returns_404(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
@@ -1007,8 +997,6 @@ async def test_router_blend_writes_score_via_service_rpc(
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # enforce_llm_budget (route dep) still resolves the SYNC service client.
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
 
     try:
         resp = TestClient(app).post("/analysis/job-1?target_id=tgt-1")
@@ -1032,6 +1020,5 @@ from app.dependencies import (
     get_async_supabase_for_caller,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )

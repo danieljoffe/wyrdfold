@@ -14,11 +14,10 @@ degrades priority order — it can never change what gets admitted or spent.
 from __future__ import annotations
 
 import ast
-import asyncio
 import logging
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.embeddings import EmbeddingModelId
 from app.models.targets import JobTarget
@@ -58,17 +57,17 @@ def parse_vector(raw: Any) -> list[float] | None:
     return None
 
 
-async def _fetch_job_vector(supabase: Client, *, job_id: str, model: str) -> list[float] | None:
+async def _fetch_job_vector(
+    supabase: AsyncClient, *, job_id: str, model: str
+) -> list[float] | None:
     """The cached vector for (job, model) from ``job_embeddings``, or None."""
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(JOB_EMBEDDINGS_TABLE)
-            .select("embedding")
-            .eq("job_posting_id", job_id)
-            .eq("model", model)
-            .limit(1)
-            .execute()
-        )
+    resp = await (
+        supabase.table(JOB_EMBEDDINGS_TABLE)
+        .select("embedding")
+        .eq("job_posting_id", job_id)
+        .eq("model", model)
+        .limit(1)
+        .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -76,20 +75,14 @@ async def _fetch_job_vector(supabase: Client, *, job_id: str, model: str) -> lis
     return parse_vector(rows[0].get("embedding"))
 
 
-async def _fetch_target_vector(supabase: Client, *, target_id: str) -> list[float] | None:
+async def _fetch_target_vector(supabase: AsyncClient, *, target_id: str) -> list[float] | None:
     """The target's query ``embedding`` from ``targets`` (None = not embedded).
 
     Read from the DB rather than the :class:`JobTarget` model because the
     model does not carry the embedding column.
     """
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(TARGETS_TABLE)
-            .select("embedding")
-            .eq("id", target_id)
-            .limit(1)
-            .execute()
-        )
+    resp = await (
+        supabase.table(TARGETS_TABLE).select("embedding").eq("id", target_id).limit(1).execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -106,7 +99,7 @@ _VECTOR_READ_CHUNK_SIZE = 150
 
 
 async def _fetch_job_vectors_batch(
-    supabase: Client, *, job_ids: list[str], model: str
+    supabase: AsyncClient, *, job_ids: list[str], model: str
 ) -> dict[str, list[float]]:
     """Cached vectors for many jobs, keyed by id (missing omitted).
 
@@ -118,17 +111,13 @@ async def _fetch_job_vectors_batch(
     out: dict[str, list[float]] = {}
     for i in range(0, len(job_ids), _VECTOR_READ_CHUNK_SIZE):
         chunk = job_ids[i : i + _VECTOR_READ_CHUNK_SIZE]
-
-        def _read(ids: list[str] = chunk) -> Any:
-            return (
-                supabase.table(JOB_EMBEDDINGS_TABLE)
-                .select("job_posting_id, embedding")
-                .in_("job_posting_id", ids)
-                .eq("model", model)
-                .execute()
-            )
-
-        resp = await asyncio.to_thread(_read)
+        resp = await (
+            supabase.table(JOB_EMBEDDINGS_TABLE)
+            .select("job_posting_id, embedding")
+            .in_("job_posting_id", chunk)
+            .eq("model", model)
+            .execute()
+        )
         for r in cast(list[dict[str, Any]], resp.data or []):
             vec = parse_vector(r.get("embedding"))
             if vec is not None:
@@ -137,7 +126,7 @@ async def _fetch_job_vectors_batch(
 
 
 async def cosine_scores_batch(
-    supabase: Client,
+    supabase: AsyncClient,
     target: JobTarget,
     job_ids: list[str],
     *,

@@ -50,7 +50,7 @@ from app.services.llm import cost_log
 from app.services.llm import get_default_client as get_llm_client
 from app.services.scoring import strip_html
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("bootstrap_clean_labels")
@@ -262,8 +262,7 @@ async def bootstrap(
     seed: int,
     top_band_fraction: float = _DEFAULT_TOP_BAND_FRACTION,
 ) -> int:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
 

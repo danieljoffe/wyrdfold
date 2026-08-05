@@ -57,7 +57,7 @@ from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE,
     derive_profile_from_label,
 )
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("seed_catalog_targets")
@@ -167,8 +167,7 @@ async def main() -> None:
             "DB. Run with a real provider (prod uses openrouter)."
         )
 
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit(
             "ERROR: Supabase not configured — check SUPABASE_URL + "

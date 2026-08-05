@@ -19,17 +19,21 @@ from __future__ import annotations
 
 import logging
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import Settings
 
 logger = logging.getLogger("app")
 
 
-def provision_owner(supabase: Client, s: Settings) -> None:
+async def provision_owner(supabase: AsyncClient, s: Settings) -> None:
     """Idempotently ensure the self-host owner's auth user exists.
 
     No-op unless ``deployment_mode == "self_host"`` AND ``owner_email`` is set.
+
+    Runs on the pooled async service client (#57): the GoTrue admin
+    ``create_user`` call is awaited natively on the event loop rather than
+    hopped to a threadpool worker.
     """
     if s.deployment_mode != "self_host":
         return
@@ -47,7 +51,7 @@ def provision_owner(supabase: Client, s: Settings) -> None:
         return
 
     try:
-        supabase.auth.admin.create_user({"email": email, "email_confirm": True})
+        await supabase.auth.admin.create_user({"email": email, "email_confirm": True})
     except Exception as exc:
         message = str(exc)
         if "already" in message.lower() and (

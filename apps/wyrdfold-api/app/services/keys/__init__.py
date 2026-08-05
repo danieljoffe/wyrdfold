@@ -18,6 +18,7 @@ from app.services.keys.crypto import (
 from app.services.keys.store import (
     delete_key,
     get_key,
+    get_key_async,
     has_usable_key,
     list_key_meta,
     set_key,
@@ -30,6 +31,7 @@ __all__ = [
     "delete_key",
     "encrypt",
     "get_key",
+    "get_key_async",
     "has_usable_key",
     "is_configured",
     "last4",

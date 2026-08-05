@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -47,7 +46,7 @@ def _clear_overrides():
 def _client(user_id: str = "user-1") -> TestClient:
     # #57 slice 3: the handler now holds the async service client + inlines the
     # crud reads, so override the async dep (the sync one is kept harmlessly).
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: user_id
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: user_id

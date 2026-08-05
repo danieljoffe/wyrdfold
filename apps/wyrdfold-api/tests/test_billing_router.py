@@ -21,13 +21,13 @@ import hmac
 import json
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.dependencies import get_current_user_id, get_supabase
+from app.dependencies import get_async_service_supabase, get_current_user_id
 from app.main import app
 from app.routers import billing
 
@@ -50,13 +50,24 @@ def saas_billing(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def sb() -> MagicMock:
     fake = MagicMock(name="supabase")
-    fake.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
+    # The billing-local helpers now run on the async service client and await
+    # ``.execute()`` — make the terminal calls awaitable (AsyncMock).
+    fake.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    fake.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    # auth-admin is async now (awaited in ``_ensure_customer``).
+    fake.auth.admin.get_user_by_id = AsyncMock(return_value=MagicMock(user=MagicMock(email=None)))
     yield fake
     app.dependency_overrides.clear()
 
 
 def _client(sb: MagicMock) -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: sb
+    # Every billing route (incl. ``get_billing_account`` since #57 PR-G2c) now
+    # runs on the async service client — override it + the current-user dep.
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
     app.dependency_overrides[get_current_user_id] = lambda: _UID
     return TestClient(app)
 
@@ -145,9 +156,9 @@ def test_checkout_creates_customer_and_returns_url(
 def test_checkout_reuses_existing_customer(
     saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
-        {"stripe_customer_id": "cus_old"}
-    ]
+    sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"stripe_customer_id": "cus_old"}])
+    )
     stripe_client = MagicMock()
     stripe_client.checkout.sessions.create.return_value = MagicMock(url="https://x")
     monkeypatch.setattr(billing, "_client", lambda: stripe_client)
@@ -284,15 +295,17 @@ def test_billing_account_reports_plan_and_state(
     from app.services.keys import store as keys_store
     from app.services.llm import budget as budget_mod
 
+    # The handler now awaits the async twins (#57 PR-G2c) on the async service
+    # client — patch those, not the sync holdouts.
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, "starter"),
+        "get_llm_account_async",
+        AsyncMock(return_value=budget_mod.LlmAccount(None, True, "starter")),
     )
-    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: True)
-    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
-        {"stripe_customer_id": "cus_x"}
-    ]
+    monkeypatch.setattr(keys_store, "has_usable_key_async", AsyncMock(return_value=True))
+    sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"stripe_customer_id": "cus_x"}])
+    )
 
     r = _client(sb).get("/billing/account")
 
@@ -312,10 +325,10 @@ def test_billing_account_defaults_free_no_account(
 
     monkeypatch.setattr(
         budget_mod,
-        "get_llm_account",
-        lambda supabase, *, user_id: budget_mod.LlmAccount(None, True, None),
+        "get_llm_account_async",
+        AsyncMock(return_value=budget_mod.LlmAccount(None, True, None)),
     )
-    monkeypatch.setattr(keys_store, "has_usable_key", lambda s, *, user_id, provider: False)
+    monkeypatch.setattr(keys_store, "has_usable_key_async", AsyncMock(return_value=False))
 
     r = _client(sb).get("/billing/account")
 
@@ -343,9 +356,9 @@ def test_unset_app_url_is_503_not_stripe_500(
     stripe_client.checkout.sessions.create.assert_not_called()
 
     # Portal has the same dependency (return_url).
-    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
-        {"stripe_customer_id": "cus_x"}
-    ]
+    sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"stripe_customer_id": "cus_x"}])
+    )
     r2 = _client(sb).post("/billing/portal-session")
     assert r2.status_code == 503
     stripe_client.billing_portal.sessions.create.assert_not_called()
