@@ -17,6 +17,7 @@ import Button from '@/components/kit/Button';
 import { useInsights, type InsightsInitial } from '@/hooks/useInsights';
 import { cn } from '@/lib/cn';
 import { downloadInsightsCsv } from './exportCsv';
+import { foldMissingSkills, foldSkillFrequencies } from './foldSkills';
 import type { Period } from './types';
 
 // Pass ``ChartSkeleton`` (declared below) as the dynamic-import
@@ -207,12 +208,15 @@ export default function InsightsDashboard({
     [targets]
   );
   const targetComparisonData = useMemo(() => targets?.targets ?? [], [targets]);
+  // Folded at the display boundary until the API aggregation normalizes
+  // skill labels at write time (#605): case-variant duplicates merge and
+  // grader evidence clauses come off the labels.
   const topSkillsData = useMemo(
-    () => skillsCost?.top_skills ?? [],
+    () => foldSkillFrequencies(skillsCost?.top_skills ?? []),
     [skillsCost]
   );
   const topMissingData = useMemo(
-    () => skillsCost?.top_missing ?? [],
+    () => foldMissingSkills(skillsCost?.top_missing ?? []),
     [skillsCost]
   );
 

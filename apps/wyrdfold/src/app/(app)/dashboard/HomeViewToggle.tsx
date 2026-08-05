@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState, useTransition } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 
 import { cn } from '@/lib/cn';
@@ -25,16 +25,32 @@ export default function HomeViewToggle({ value }: { value: HomeView }) {
   const router = useRouter();
   const searchParams = useSearchParams();
 
+  // Optimistic selected state (#605, evidence in #601): deriving the
+  // active button purely from the committed URL made the control lag the
+  // click by the full server round-trip — measured at ~4s during the
+  // 2026-08-05 drive, which reads as a dead button and invites
+  // rage-clicks. The highlight flips on click; the effect reconciles it
+  // whenever the server-committed value changes underneath (back/forward,
+  // external navigation).
+  const [isPending, startTransition] = useTransition();
+  const [optimisticValue, setOptimisticValue] = useState(value);
+  useEffect(() => {
+    setOptimisticValue(value);
+  }, [value]);
+
   const handleChange = useCallback(
     (next: HomeView) => {
-      const params = new URLSearchParams(searchParams.toString());
-      if (next === 'today') {
-        params.delete('view');
-      } else {
-        params.set('view', next);
-      }
-      const qs = params.toString();
-      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+      setOptimisticValue(next);
+      startTransition(() => {
+        const params = new URLSearchParams(searchParams.toString());
+        if (next === 'today') {
+          params.delete('view');
+        } else {
+          params.set('view', next);
+        }
+        const qs = params.toString();
+        router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+      });
     },
     [pathname, router, searchParams]
   );
@@ -43,6 +59,7 @@ export default function HomeViewToggle({ value }: { value: HomeView }) {
     <div
       role='group'
       aria-label='Home view'
+      aria-busy={isPending || undefined}
       className='flex w-fit gap-1 p-1 bg-surface-tertiary rounded-lg'
     >
       {VIEWS.map(v => (
@@ -50,11 +67,11 @@ export default function HomeViewToggle({ value }: { value: HomeView }) {
           key={v.id}
           type='button'
           onClick={() => handleChange(v.id)}
-          aria-pressed={value === v.id}
+          aria-pressed={optimisticValue === v.id}
           className={cn(
             'px-4 py-1.5 rounded-md text-sm font-medium transition-colors',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2',
-            value === v.id
+            optimisticValue === v.id
               ? 'bg-surface text-text-primary shadow-sm'
               : 'text-text-secondary hover:text-text-primary'
           )}
