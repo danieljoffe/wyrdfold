@@ -440,6 +440,24 @@ async def _postgrest_error_handler(request: Request, exc: APIError) -> JSONRespo
             request.url.path,
         )
         return JSONResponse(status_code=404, content={"detail": "Not found"})
+    if exc.code == "57014":
+        # Statement timeout: the database refused the work under load, the
+        # request itself was fine. An unhandled 500 here used to dump a full
+        # ExceptionGroup traceback per occurrence (two during the 2026-08-05
+        # verification drive, #604) and read as a server bug to every retry
+        # layer. 503 + Retry-After is the honest contract — the BFF/RSC
+        # fetch helpers already retry 5xx once, and both masked exactly this
+        # failure in prod.
+        _log.warning(
+            "postgrest 57014 (statement timeout) -> 503 on %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Temporarily overloaded — please retry."},
+            headers={"Retry-After": "5"},
+        )
     # Not a malformed-input error — hand off to the generic 500 handler, which
     # logs the traceback and applies the fail-closed body posture.
     raise exc

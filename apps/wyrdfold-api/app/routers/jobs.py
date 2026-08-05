@@ -59,6 +59,7 @@ from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
+from app.services.supabase_retry import execute_with_retry
 from app.services.target_scoring import (
     bulk_score_for_target,
     score_and_upsert_async,
@@ -1428,7 +1429,17 @@ async def _list_jobs_across_user_targets_two_query(
     )
     score_query = _scores_live_join(score_query, archived_view=archived_view)
     score_query = _apply_score_floor(score_query, min_score)
-    score_resp = await score_query.execute()
+    # This fallback exists because the cross-target RPC hit a statement
+    # timeout — under the same contention its own scores read dies of the
+    # identical 57014 (observed unhandled on the dashboard top-matches read,
+    # 2026-08-05 #604). One backoff retry lets the fallback actually absorb
+    # the failure it was built for; if it still times out, the app-wide
+    # APIError handler turns 57014 into a clean 503.
+    score_resp = await execute_with_retry(
+        score_query.execute,
+        label="jobs/cross_target_two_query_scores",
+        retry_statement_timeout=True,
+    )
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
 
     if not score_rows:
