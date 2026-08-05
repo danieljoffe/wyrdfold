@@ -5,23 +5,38 @@ import CircleBadge, {
 } from '@/components/CircleBadge';
 import { fitScoreVariant } from '@/lib/fitScore';
 
-interface ScoreBadgeProps {
+interface ScoreBadgeBaseProps {
   score: number;
   /** Override the default score→colour mapping (e.g. the dashboard's). */
   variant?: CircleBadgeVariant;
   size?: CircleBadgeSize;
-  /** When scoring is in flight, render a spinner beside the chip. */
-  scoringStatus?: string | null | undefined;
-  /**
-   * True when the row has no real Sonnet fit grade — `score` is only a keyword
-   * placeholder. Authoritative from the API (derived from `fit_reasoning`); when
-   * omitted, falls back to `scoring_status !== 'complete'`.
-   */
-  pending?: boolean | undefined;
   /** Native tooltip on the chip (e.g. the fit-score reasoning). */
   title?: string | undefined;
   className?: string;
 }
+
+/**
+ * `scoringStatus` may only be passed together with the API's `pending` flag.
+ * The status-string fallback misreads terminal statuses (prod stamps
+ * 'stage2' on fully-graded rows — issue #603, every /jobs row rendered as
+ * an endless spinner), so a call site that has the status but drops the
+ * flag is a bug this union makes unrepresentable.
+ */
+type ScoreBadgeProps = ScoreBadgeBaseProps &
+  (
+    | {
+        /** When scoring is in flight, render a spinner beside the chip. */
+        scoringStatus: string | null | undefined;
+        /**
+         * True when the row has no real Sonnet fit grade — `score` is only a
+         * keyword placeholder. Authoritative from the API (derived from
+         * `fit_reasoning`); when undefined, falls back to
+         * `scoring_status !== 'complete'`.
+         */
+        pending: boolean | undefined;
+      }
+    | { scoringStatus?: undefined; pending?: boolean | undefined }
+  );
 
 /**
  * Circular match/fit score chip — a `CircleBadge` with the score-specific
