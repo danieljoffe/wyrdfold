@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -34,6 +35,7 @@ from app.models.llm import LLMResult, LLMStreamEvent, LLMUsage, Message, ModelId
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
     LLMUpstreamUnavailableError,
+    MissingToolCallError,
     translate_api_status_error,
 )
 from app.services.llm.pricing import calculate_cost
@@ -58,6 +60,8 @@ _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
+
+logger = logging.getLogger(__name__)
 _BACKOFF_BASE_SECONDS = 0.5
 
 
@@ -112,7 +116,7 @@ def _parse_openai_tool_response(
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
-        raise ValueError(
+        raise MissingToolCallError(
             f"Expected a forced tool_call for {tool_name!r}, got finish_reason="
             f"{finish!r}, content={str(message.get('content'))[:200]!r}"
         )
@@ -217,16 +221,36 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         temperature: float | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         if model in _OPENAI_SHAPED_MODELS:
-            return await self._openai_tool_use(
-                model=model,
-                system=system,
-                messages=messages,
-                tool_name=tool_name,
-                tool_description=tool_description,
-                tool_input_schema=tool_input_schema,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+            try:
+                return await self._openai_tool_use(
+                    model=model,
+                    system=system,
+                    messages=messages,
+                    tool_name=tool_name,
+                    tool_description=tool_description,
+                    tool_input_schema=tool_input_schema,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except MissingToolCallError:
+                # Stochastic prose-instead-of-tool-call flake: one fresh
+                # attempt, then fail loud as before (the caller's fallback —
+                # triage defers, grading skips — engages on the second miss).
+                logger.warning(
+                    "forced tool_call missing for %s (model answered in prose) — "
+                    "retrying once",
+                    tool_name,
+                )
+                return await self._openai_tool_use(
+                    model=model,
+                    system=system,
+                    messages=messages,
+                    tool_name=tool_name,
+                    tool_description=tool_description,
+                    tool_input_schema=tool_input_schema,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
         return await super().complete_tool_use(
             model=model,
             system=system,
