@@ -155,6 +155,16 @@ export default function ResumeReviewPage({
   const inflightRef = useRef(false);
   const persistMarkdown = useCallback(async (): Promise<boolean> => {
     if (!record) return false;
+    // Never PATCH a locked record: an edit or version-restore landing
+    // around the approve flight re-arms the debounce, and its timer used
+    // to outlive the lock — PATCH → 409 "already approved" + an error
+    // toast right after the green "Resume locked" one (observed live
+    // 2026-08-06, twice). Approval also sets saveStatus 'saved' to disarm
+    // the timer; this guard is the invariant if any other path re-arms it.
+    if (record.approved_at !== null) {
+      setSaveStatus('saved');
+      return true;
+    }
     // Single-flight: a slow PATCH overlapping the next debounce tick would
     // race to overwrite the row. Skip; the next keystroke or explicit
     // flushPendingSave will retry.
@@ -294,6 +304,11 @@ export default function ResumeReviewPage({
       }
       const approved = (await res.json()) as TailoredResumeRecord;
       setRecord(approved);
+      // Disarm any auto-save re-armed by an edit/restore that landed during
+      // the flush→approve flight — its debounce timer would PATCH the
+      // now-locked record into a 409. (persistMarkdown also guards on
+      // approved_at; this stops the timer from even firing.)
+      setSaveStatus('saved');
       toast({ variant: 'success', title: 'Resume locked' });
     } catch {
       toast({ variant: 'error', title: 'Network error locking resume' });
