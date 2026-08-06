@@ -5,8 +5,10 @@ Three-stage scoring pipeline:
   Stage 2: Full JD match (async, after stage 1 passes)
   Stage 3: LLM analysis (async, for top stage-2 scores)
 
-Stores target-specific scores in `scores`. The global score
-on `jobs` = average across active targets (updated after each stage).
+Stores target-specific scores in `scores` — the ONLY score store. (The
+"global score on jobs" this header used to describe was dropped in R2;
+writing jobs.score PGRST204s, as the from-url flow proved live on
+2026-08-06.)
 
 Consumers:
 - Poller: stage 1 title scoring during poll, stage 2+3 async after
@@ -29,8 +31,7 @@ from app.models.targets import JobTarget
 from app.services.db_write import poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
 from app.services.scoring import score_job_with_profile, score_title_against_profile
-from app.services.supabase_retry import execute_with_retry, execute_with_retry_sync
-from app.supabase_pool import get_async_supabase
+from app.services.supabase_retry import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,6 @@ async def _upsert_score(
     scored_profile_version: int = 1,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
-    gated: bool = False,
 ) -> JobTargetScore:
     """Upsert a score row and return the parsed result.
 
@@ -137,22 +137,16 @@ async def _upsert_score(
     the daily Sonnet cap goes to highest-likelihood-promising jobs first.
 
     Idempotent upsert (``on_conflict`` matches the unique constraint), so
-    retrying a Supabase HTTP/2 stream drop is safe. Two write paths, unified
-    here from the #57 poll/interactive twins:
-
-    - ``gated`` (the user-facing manual-add path, #6 R2) routes through the
-      ``user_upsert_score`` SECURITY DEFINER RPC so Postgres enforces target
-      ownership. Interactive + single-call, so it runs a bare async retry on
-      the pooled async client — deliberately NOT the poll write-herd
-      semaphore, which would head-of-line-block an interactive write behind a
-      mid-cycle poll burst.
-    - non-gated (poller / service-role rescore) takes the direct upsert
-      through :func:`app.services.db_write.poll_db_write`, bounded by the
-      cycle's write-herd semaphore.
-
-    Both pick the pooled async client with a sync-in-thread fallback;
-    ``supabase`` is that fallback client (in prod the async client always
-    serves the write).
+    retrying a Supabase HTTP/2 stream drop is safe. This is the
+    poller/rescore write path: a direct upsert through
+    :func:`app.services.db_write.poll_db_write`, bounded by the cycle's
+    write-herd semaphore. The user-facing manual-add path never comes
+    through here — it takes :func:`score_and_upsert_async`, whose write
+    rides the ``user_upsert_score`` ownership RPC (SEC-H2) with a bare
+    async retry instead (an interactive write must not head-of-line-block
+    behind a mid-cycle poll burst). A ``gated`` flag used to switch the
+    two inside this function; every gated caller migrated to the async
+    twin in #57 and the flag died (removed 2026-08-06).
     """
     row = _score_row_payload(
         job_posting_id=job_posting_id,
@@ -166,27 +160,11 @@ async def _upsert_score(
         promising=promising,
         phase1_confidence=phase1_confidence,
     )
-    resp: Any
-    if gated:
-        async_sb = get_async_supabase()
-        if async_sb is not None:
-            resp = await execute_with_retry(
-                async_sb.rpc("user_upsert_score", {"p_row": row}).execute,
-                label="scores upsert (gated)",
-            )
-        else:
-            resp = await asyncio.to_thread(
-                lambda: execute_with_retry_sync(
-                    supabase.rpc("user_upsert_score", {"p_row": row}).execute,
-                    label="scores upsert (gated)",
-                )
-            )
-    else:
-        resp = await poll_db_write(
-            supabase,
-            lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
-            label="scores upsert",
-        )
+    resp = await poll_db_write(
+        supabase,
+        lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
+        label="scores upsert",
+    )
     return _parse_upsert_response(resp)
 
 
@@ -279,7 +257,6 @@ async def score_and_upsert(
     excluded_by_prefilter: bool = False,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
-    gated: bool = False,
 ) -> JobTargetScore:
     """Stage 2: score one job's full JD against one target and upsert.
 
@@ -299,9 +276,9 @@ async def score_and_upsert(
     upserts (the default — keyword-only callers don't need to know about
     Phase 1).
 
-    ``gated`` routes the write through the ``user_upsert_score`` ownership
-    RPC (the manual-add path, #6 R2); the poller / rescore paths leave it
-    False. See :func:`_upsert_score` for the write-path split.
+    This is the poller/rescore seam (write-herd-bounded direct upsert);
+    the interactive manual-add path uses :func:`score_and_upsert_async`
+    (ownership-RPC write). See :func:`_upsert_score` for why the split.
 
     Compute in the executor, IO on the loop: full-JD scoring is the heaviest
     per-row compute in the cycle and the poll fans it out per (row x target),
@@ -328,7 +305,6 @@ async def score_and_upsert(
         scored_profile_version=target.profile_version,
         promising=promising,
         phase1_confidence=phase1_confidence,
-        gated=gated,
     )
 
 
