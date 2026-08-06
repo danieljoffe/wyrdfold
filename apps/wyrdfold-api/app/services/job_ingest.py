@@ -4,9 +4,9 @@ Shared by ``POST /jobs/manual`` (a user pastes a job URL → scored against the
 caller's active targets) and the from-url target flow (a user creates a target
 from a JD URL → the same posting is materialized and scored against the
 just-created target). Both need the identical sequence — upsert a manual-source
-``jobs`` row keyed by the URL, score it against a set of targets, recompute its
-global score, and force-include it so a deliberately-added posting is never
-buried by the negative-keyword pass — so it lives here once.
+``jobs`` row keyed by the URL, score it against a set of targets, and
+force-include it so a deliberately-added posting is never buried by the
+negative-keyword pass — so it lives here once.
 
 Materializing the posting is what makes it a first-class job: a ``scores`` row
 under a target the user follows is what puts it in the ``/jobs`` list and gives
@@ -64,8 +64,8 @@ async def materialize_and_score_job(
     targets: Sequence[JobTarget],
     set_included: bool = True,
 ) -> str | None:
-    """Upsert the posting, score it against ``targets``, recompute its global
-    score, and (when ``set_included``) force-include it under those targets.
+    """Upsert the posting, score it against ``targets`` (per-target scores
+    rows), and (when ``set_included``) force-include it under those targets.
 
     Returns the ``jobs.id`` (None only if the upsert returned no row). Scoring +
     force-include are skipped when there is no ``title`` or no ``targets`` (the
@@ -91,8 +91,10 @@ async def materialize_and_score_job(
         "location_remote": loc.remote,
         "description_html": sanitize_html(description_html) if description_html else "",
         "absolute_url": final_url,
-        "score": 0,
-        "score_breakdown": {},
+        # Per-(job, target) scores live in the scores table; the vestigial
+        # global jobs.score/score_breakdown were dropped in R2 — writing them
+        # here PGRST204s the whole upsert (caught live 2026-08-06 when the
+        # from-url flow's deferred derivation died on it).
         # No provider date for a manual add — NULL, so "Posted" falls back to
         # cataloged_at instead of masquerading as posted-today (R2).
         "source_posted_at": None,
