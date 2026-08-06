@@ -130,6 +130,54 @@ def _load_target(supabase: Any, target_id: str, cache: dict[str, Any]) -> Any:
     return cache[target_id]
 
 
+def _iter_recomputed(supabase: Any, rows: list[dict[str, Any]], targets: dict[str, Any]):
+    """Yield ``(row, keyword ScoreResult)`` for one page of scores rows.
+
+    Shared by the ungraded rescore and the graded breakdown refresh: fetches
+    the page's jobs in chunks, caches parsed JDs per unique job, and skips
+    rows whose target/job is gone or whose target has no ScoringProfile.
+    """
+    job_ids = sorted({r["job_posting_id"] for r in rows})
+    jobs: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(job_ids), JOB_CHUNK):
+        chunk = job_ids[i : i + JOB_CHUNK]
+        resp = execute_with_retry_sync(
+            supabase.table("jobs")
+            .select("id, title, description_html")
+            .in_("id", chunk)
+            .execute,
+            label="rescore609/jobs",
+            retry_statement_timeout=True,
+        )
+        for j in cast(list[dict[str, Any]], resp.data or []):
+            jobs[j["id"]] = j
+
+    parsed_cache: dict[str, Any] = {}
+    for r in rows:
+        target = _load_target(supabase, r["target_id"], targets)
+        job = jobs.get(r["job_posting_id"])
+        if target is None or job is None:
+            yield r, None
+            continue
+        profile = target.scoring_profile
+        if not isinstance(profile, ScoringProfile):
+            yield r, None
+            continue
+        jid = job["id"]
+        if jid not in parsed_cache:
+            parsed_cache[jid] = parse_jd(job.get("description_html") or "")
+        yield (
+            r,
+            score_job_with_profile(
+                job.get("title") or "",
+                job.get("description_html") or "",
+                profile,
+                parsed_jd=parsed_cache[jid],
+                search_keywords=target.search_keywords,
+            ),
+        )
+
+
 def rescore_ungraded(supabase: Any, *, apply: bool, sleep_ms: int) -> tuple[int, int]:
     before: Counter[str] = Counter()
     after_hist: Counter[str] = Counter()
@@ -138,43 +186,11 @@ def rescore_ungraded(supabase: Any, *, apply: bool, sleep_ms: int) -> tuple[int,
     for rows in _pages(
         supabase, "id, job_posting_id, target_id, score", graded=False
     ):
-        job_ids = sorted({r["job_posting_id"] for r in rows})
-        jobs: dict[str, dict[str, Any]] = {}
-        for i in range(0, len(job_ids), JOB_CHUNK):
-            chunk = job_ids[i : i + JOB_CHUNK]
-            resp = execute_with_retry_sync(
-                supabase.table("jobs")
-                .select("id, title, description_html")
-                .in_("id", chunk)
-                .execute,
-                label="rescore609/jobs",
-                retry_statement_timeout=True,
-            )
-            for j in cast(list[dict[str, Any]], resp.data or []):
-                jobs[j["id"]] = j
-
-        parsed_cache: dict[str, Any] = {}
-        for r in rows:
+        for r, result in _iter_recomputed(supabase, rows, targets):
             seen += 1
-            target = _load_target(supabase, r["target_id"], targets)
-            job = jobs.get(r["job_posting_id"])
-            if target is None or job is None:
+            if result is None:
                 skipped += 1
                 continue
-            profile = target.scoring_profile
-            if not isinstance(profile, ScoringProfile):
-                skipped += 1
-                continue
-            jid = job["id"]
-            if jid not in parsed_cache:
-                parsed_cache[jid] = parse_jd(job.get("description_html") or "")
-            result = score_job_with_profile(
-                job.get("title") or "",
-                job.get("description_html") or "",
-                profile,
-                parsed_jd=parsed_cache[jid],
-                search_keywords=target.search_keywords,
-            )
             old = int(r["score"])
             before[_bucket(old)] += 1
             after_hist[_bucket(result.score)] += 1
@@ -197,11 +213,51 @@ def rescore_ungraded(supabase: Any, *, apply: bool, sleep_ms: int) -> tuple[int,
     return seen, changed
 
 
+def refresh_graded_breakdowns(
+    supabase: Any, *, apply: bool, sleep_ms: int
+) -> tuple[int, int]:
+    """Rewrite ONLY ``score_breakdown`` for graded rows, on the normalized scale.
+
+    The graded rescore replaces ``score`` with the axis blend but the stored
+    keyword ``score_breakdown`` predates #609 — raw internal sums ("+124.2")
+    that no longer relate to anything on screen. Recompute them under the
+    capped-credit formula so the keyword components are percentage points
+    (they sum to the row's keyword percentage — the axis-blend ``score``
+    itself is untouched here). The panel showing fit AXES for graded rows
+    instead of keyword components is the display follow-up tracked on #609.
+    """
+    targets: dict[str, Any] = {}
+    seen = changed = skipped = 0
+    for rows in _pages(supabase, "id, job_posting_id, target_id, score", graded=True):
+        for r, result in _iter_recomputed(supabase, rows, targets):
+            seen += 1
+            if result is None:
+                skipped += 1
+                continue
+            changed += 1
+            if apply:
+                _apply_update(
+                    supabase,
+                    r["id"],
+                    {"score_breakdown": result.breakdown.model_dump()},
+                    sleep_ms,
+                )
+        log.info(
+            "graded-breakdowns: seen=%d rewritten=%d skipped=%d", seen, changed, skipped
+        )
+    return seen, changed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
     ap.add_argument("--graded-only", action="store_true")
     ap.add_argument("--ungraded-only", action="store_true")
+    ap.add_argument(
+        "--graded-breakdowns",
+        action="store_true",
+        help="ONLY refresh graded rows' score_breakdown to the normalized scale",
+    )
     ap.add_argument("--sleep-ms", type=int, default=120, help="pause between row updates")
     args = ap.parse_args()
 
@@ -211,6 +267,10 @@ def main() -> None:
 
     mode = "APPLY" if args.apply else "DRY-RUN"
     log.info("rescore-609 %s", mode)
+    if args.graded_breakdowns:
+        refresh_graded_breakdowns(supabase, apply=args.apply, sleep_ms=args.sleep_ms)
+        log.info("done (%s)", mode)
+        return
     if not args.ungraded_only:
         rescore_graded(supabase, apply=args.apply, sleep_ms=args.sleep_ms)
     if not args.graded_only:
