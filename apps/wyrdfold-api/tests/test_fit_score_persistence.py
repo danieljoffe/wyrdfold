@@ -49,7 +49,11 @@ def _payload() -> OptimizedPayload:
 
 def _fake_fit() -> JobFitResult:
     return JobFitResult(
-        fit_score=82,
+        # #609: fit_score deliberately DIFFERS from the axis mean (82) so
+        # these tests discriminate — the persisted score must be the
+        # deterministic default-weight axis blend, never the model's
+        # holistic fit_score (which band-compresses upward in prod).
+        fit_score=100,
         axes=AxisScores(title_fit=95, skills_fit=80, seniority_fit=85, domain_fit=70),
         reasoning="Strong title + skills match; missing e-commerce domain.",
     )
@@ -88,7 +92,9 @@ async def test_success_updates_scores_row_with_full_phase2_payload(
     )
 
     assert result is not None
-    assert result.fit_score == 82
+    # The returned FitResult still carries the model's holistic number
+    # untouched (100 here); only the PERSISTED score is the axis blend.
+    assert result.fit_score == 100
 
     # Cost log fired exactly once with the right scoping.
     assert len(cost_calls) == 1

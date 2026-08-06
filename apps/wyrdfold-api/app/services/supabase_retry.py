@@ -68,16 +68,25 @@ def execute_with_retry_sync(
     retries: int = 2,
     backoff_base: float = 0.4,
     backoff_cap: float = 4.0,
+    retry_statement_timeout: bool = False,
 ) -> T:
     """Synchronous retry wrapper — call from inside an ``asyncio.to_thread``
     or any sync context. Retries on transient httpx failures with
     exponential backoff + jitter.
+
+    ``retry_statement_timeout=True`` additionally retries Postgres 57014,
+    same opt-in contract as the async wrapper (see ``is_statement_timeout``).
     """
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
             return fn()
-        except _TRANSIENT_HTTP as exc:
+        except Exception as exc:
+            retryable = isinstance(exc, _TRANSIENT_HTTP) or (
+                retry_statement_timeout and is_statement_timeout(exc)
+            )
+            if not retryable:
+                raise
             last_exc = exc
             if attempt == retries:
                 logger.warning("supabase %s exhausted %d retries: %s", label, retries, exc)

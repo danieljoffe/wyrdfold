@@ -1,5 +1,7 @@
 """Tests for target-based scoring (#495)."""
 
+import pytest
+
 from app.models.targets import (
     CategoryProfile,
     DomainProfile,
@@ -37,20 +39,29 @@ def _profile(
 
 
 def test_high_score_for_ideal_match():
-    profile = _profile(
-        core={"React": 3, "TypeScript": 3, "Next.js": 3},
-        seniority_signals=["5+ years", "lead"],
-        domain_signals=["fintech"],
-    )
-    result = score_job_with_profile(
-        "Senior Frontend Engineer",
-        "<p>We need a senior engineer with 5+ years of React and TypeScript "
-        "experience. Next.js required. Fintech domain. Must lead a team.</p>",
+    """Full credit per item = named in the title AND a requirements-grade
+    section (#609). A genuinely ideal match saturates honestly at 100; a
+    body-only mention lands mid-band instead of clamping to 100 like the
+    pre-#609 formula did."""
+    profile = _profile(core={"React": 3})
+    ideal = score_job_with_profile(
+        "Senior React Engineer",
+        "<h3>Requirements</h3><p>Deep React experience is required.</p>",
         profile,
     )
-    assert result.score > 50
-    assert not result.excluded
-    assert len(result.matched_keywords) > 0
+    assert ideal.score == 100
+    assert not ideal.excluded
+
+    body_only = score_job_with_profile(
+        "Senior Frontend Engineer",
+        "<p>We use React on the team.</p>",
+        profile,
+    )
+    # One default-section mention = 2 of the item's 12-point ceiling
+    # (3kw x 2cat x [title 2 + requirements 2]) -> ~17.
+    assert 0 < body_only.score < 50
+    assert body_only.score < ideal.score
+
 
 
 def test_low_score_for_poor_match():
@@ -121,9 +132,11 @@ def test_body_negative_penalizes_but_does_not_exclude():
     )
     # The body negative ("agent") must NOT exclude the posting...
     assert penalized.excluded is False
-    # ...but it must apply the score penalty...
-    assert penalized.breakdown.negative == -10.0
+    # ...but it must apply the score penalty (breakdown components are
+    # percentage points on the score scale since #609)...
+    assert penalized.breakdown.negative < 0
     assert base.breakdown.negative == 0.0
+    assert penalized.score < base.score
     # ...which lowers the score versus the no-negative baseline.
     assert penalized.score < base.score
     assert penalized.score > 0
@@ -309,8 +322,17 @@ def test_role_title_credit_is_capped_per_match():
     # but the role_titles bucket is a single fixed credit.
     matched_role_keywords = [m for m in result.matched_keywords if m in keywords]
     assert len(matched_role_keywords) == 3
-    # Fixed credit is _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT = 40 * 2 = 80.0
-    assert result.breakdown.role_titles == 80.0
+    # Same single fixed credit as a lone matching keyword — stacking three
+    # near-synonyms must not multiply it. (Components are normalized
+    # percentage points since #609, so compare runs, not raw constants.)
+    single = score_job_with_profile(
+        "Director of Customer Experience Operations",
+        "<p>React.</p>",
+        profile,
+        search_keywords=["customer experience"],
+    )
+    assert result.breakdown.role_titles == single.breakdown.role_titles
+    assert result.breakdown.role_titles > 0
 
 
 def test_role_title_does_not_override_negative_keyword():
@@ -347,8 +369,17 @@ def test_off_role_jd_boilerplate_is_discounted():
     unguarded = score_job_with_profile(title, body, profile)  # no keywords ⇒ guard off
     assert guarded.breakdown.role_titles == 0
     assert unguarded.breakdown.technologies > 0
-    # JD-content axis halved by the guard
-    assert guarded.breakdown.technologies == unguarded.breakdown.technologies * 0.5
+    # JD-content axis halved by the guard. Breakdown components are
+    # normalized percentage points since #609 and the two runs have
+    # different normalizers (search_keywords add the role-title ceiling),
+    # so compare de-normalized raw contributions.
+    from app.services.scoring import _calc_max_possible
+
+    guarded_raw = guarded.breakdown.technologies * _calc_max_possible(
+        profile, ["frontend engineer", "ui engineer"]
+    )
+    unguarded_raw = unguarded.breakdown.technologies * _calc_max_possible(profile)
+    assert guarded_raw == pytest.approx(unguarded_raw * 0.5, rel=0.02)
 
 
 def test_genuine_role_match_not_discounted():
@@ -363,8 +394,15 @@ def test_genuine_role_match_not_discounted():
     )
     base = score_job_with_profile("Senior Frontend Engineer", body, profile)
     assert guarded.breakdown.role_titles > 0
-    # full credit, identical to the no-keyword baseline's technologies axis
-    assert guarded.breakdown.technologies == base.breakdown.technologies
+    # Full credit, identical to the no-keyword baseline's technologies axis
+    # once de-normalized (#609: different normalizers across the two runs).
+    from app.services.scoring import _calc_max_possible
+
+    guarded_raw = guarded.breakdown.technologies * _calc_max_possible(
+        profile, ["frontend engineer", "front-end engineer"]
+    )
+    base_raw = base.breakdown.technologies * _calc_max_possible(profile)
+    assert guarded_raw == pytest.approx(base_raw, rel=0.02)
 
 
 def test_title_scorer_applies_role_match_guard():
@@ -379,3 +417,78 @@ def test_title_scorer_applies_role_match_guard():
     assert guarded.breakdown.role_titles == 0
     assert unguarded.breakdown.technologies > 0
     assert guarded.breakdown.technologies == unguarded.breakdown.technologies * 0.5
+
+
+# ---------------------------------------------------------------------------
+# #609 anti-saturation properties. Prod evidence 2026-08-05: ~2,600 of
+# ~9,300 rows clamped to exactly 100 because per-item awards could reach
+# ~16x the per-item weight the normalizer assumed (title 2x + per-section
+# frequency credit), so min(100, raw/max) carried no signal at the top.
+# ---------------------------------------------------------------------------
+
+
+def test_frequency_spam_does_not_inflate_past_full_credit():
+    """Repeat mentions beyond the per-item ceiling add nothing: a keyword
+    spammed across sections scores no higher than title + requirements
+    once (the definition of full credit)."""
+    profile = _profile(core={"React": 3})
+    full_credit = score_job_with_profile(
+        "React Engineer",
+        "<h3>Requirements</h3><p>React required.</p>",
+        profile,
+    )
+    spammed = score_job_with_profile(
+        "React Engineer",
+        "<h3>Requirements</h3><p>React React React.</p>"
+        "<h3>About us</h3><p>React React React.</p>"
+        "<p>React React React and more React.</p>",
+        profile,
+    )
+    assert spammed.score <= full_credit.score
+    assert full_credit.score == 100
+
+
+def test_broad_profile_body_mentions_cannot_saturate():
+    """The wall-of-100s regression pin: a broad web-stack profile whose
+    keywords appear only as body mentions must land mid-band, not clamp
+    to 100 (pre-#609 this exact shape scored 100 across ~2,600 prod
+    rows)."""
+    profile = _profile(
+        core={"React": 3, "TypeScript": 3, "Python": 3, "Next.js": 2},
+        seniority_signals=["ship weekly"],
+    )
+    result = score_job_with_profile(
+        "Senior Software Engineer",
+        "<p>Our platform uses React, TypeScript, Python and Next.js. "
+        "React and TypeScript power the frontend; Python runs the "
+        "backend. We ship weekly.</p>",
+        profile,
+    )
+    assert result.score < 60
+    assert result.score > 0
+
+
+def test_breakdown_components_sum_to_score():
+    """Since #609 the breakdown axes are percentage points on the score
+    scale — they must sum to the score within rounding, so the panel's
+    bars finally reconcile with the number beside them."""
+    profile = _profile(
+        core={"React": 3, "GraphQL": 2},
+        seniority_signals=["lead"],
+        domain_signals=["fintech"],
+    )
+    result = score_job_with_profile(
+        "Lead React Engineer",
+        "<h3>Requirements</h3><p>React, GraphQL, fintech background, "
+        "lead experience.</p>",
+        profile,
+    )
+    axes_sum = (
+        result.breakdown.role_titles
+        + result.breakdown.technologies
+        + result.breakdown.domain_skills
+        + result.breakdown.seniority_signals
+        + result.breakdown.negative
+    )
+    assert not result.excluded
+    assert axes_sum == pytest.approx(result.score, abs=1.5)

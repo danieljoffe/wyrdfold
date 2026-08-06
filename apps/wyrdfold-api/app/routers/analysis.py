@@ -36,7 +36,7 @@ from app.models.experience import OptimizedDoc
 from app.models.targets import JobTarget
 from app.services.analysis import persistence, run_registry
 from app.services.analysis.analyze import DEFAULT_PURPOSE, analyze_job
-from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
+from app.services.analysis.scoring import scorecard_to_numeric
 from app.services.experience import optimized
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
@@ -498,18 +498,12 @@ async def _apply_llm_blend(
     blend hiccup doesn't fail the user's request.
     """
     try:
-        cur_resp = await (
-            supabase.table("scores")
-            .select("score")
-            .eq("job_posting_id", job_posting_id)
-            .eq("target_id", target_id)
-            .limit(1)
-            .execute()
-        )
-        rows = cast(list[dict[str, Any]], cur_resp.data or [])
-        keyword_score = int(rows[0]["score"]) if rows else 0
-        llm_score = scorecard_to_numeric(scorecard)
-        blended = blend_scores(keyword_score, llm_score)
+        # #609: the fit verdict IS the score. The old 60/40 keyword/LLM mix
+        # let a saturated keyword placeholder drag every verdict toward 100
+        # (and with the #609 keyword rescale it would have dragged every
+        # verdict toward ~20 instead) — the keyword score is a retrieval
+        # signal, not a component of the user-facing grade.
+        blended = round(scorecard_to_numeric(scorecard))
         # Gated write: updates the shared (job, target) scores row + stamps
         # jobs.llm_analysis_id behind an ownership check enforced in Postgres.
         await supabase.rpc(
