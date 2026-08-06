@@ -130,7 +130,11 @@ class TestManualJobEndpoint:
         assert row["source_id"] == MANUAL_SOURCE_ID
         assert row["title"] == "Senior Engineer"
         assert row["company_name"] == "Acme Corp"
-        assert row["score"] >= 0
+        # R2 dropped the vestigial global jobs.score/score_breakdown; writing
+        # them PGRST204s the whole upsert (prod, 2026-08-06). This test used
+        # to ASSERT the dead column — the mock happily pinned the bug.
+        assert "score" not in row
+        assert "score_breakdown" not in row
 
     @pytest.mark.asyncio
     async def test_manual_add_scores_through_gated_service_client(self, monkeypatch):

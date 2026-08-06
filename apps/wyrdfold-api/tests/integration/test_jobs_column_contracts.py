@@ -59,3 +59,34 @@ def test_url_health_due_rpc_shape(service_client: Client) -> None:
         {"p_cutoff": "2100-01-01T00:00:00+00:00", "p_batch_size": 1},
     ).execute()
     assert isinstance(resp.data, list)
+
+
+@pytest.mark.asyncio
+async def test_manual_add_upsert_row_columns(async_service_client) -> None:
+    """The manual-add WRITER's actual upsert row lands against real Postgres.
+
+    The R2 column drops broke this path invisibly: ``materialize_and_score_job``
+    kept writing the dropped ``jobs.score``/``score_breakdown`` keys, unit
+    mocks accepted them, and the failure surfaced only in prod (2026-08-06)
+    when the from-url flow's deferred derivation died on PGRST204. Readers got
+    contract tests in #556 — this is the writer's. Runs the REAL function
+    (``targets=[]`` skips scoring) so any future drop of a column it writes
+    fails HERE.
+    """
+    from app.services.job_ingest import materialize_and_score_job
+
+    url = "https://example.com/e2e-column-contract-manual-add"
+    posting_id = await materialize_and_score_job(
+        async_service_client,
+        final_url=url,
+        title="Column Contract Probe",
+        company_name="Contract Probe Co",
+        location="Remote, US",
+        description_html="<p>Writer column-contract probe row.</p>",
+        salary_text=None,
+        targets=[],
+    )
+    assert posting_id, "manual-add upsert returned no row — column contract broken"
+    await (
+        async_service_client.table("jobs").delete().eq("id", posting_id).execute()
+    )
