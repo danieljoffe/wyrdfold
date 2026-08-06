@@ -116,6 +116,12 @@ FETCHERS: dict[str, Fetcher] = {
 # ``DB_WRITE_CONCURRENCY`` (see ``app.services.db_write``), but a lower
 # source fan-out also keeps the per-source detail/JD fetches civil.
 POLL_CONCURRENCY = 6
+
+# How often the target-activation fan-out re-checks that its target is
+# still pipeline-active (#638). One cheap read a minute against a
+# multi-hour full-catalog grind; deactivation drains the fan-out within
+# roughly one interval.
+_ACTIVE_RECHECK_S = 60
 LLM_CONCURRENCY = 3
 
 # Cycle-wide caps for the two fan-outs that otherwise had none. Both
@@ -3357,8 +3363,52 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
 
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
+    # Cooperative cancellation (#638): the active check above runs ONCE at
+    # entry, but this fan-out grinds the full catalog for HOURS on a big
+    # source set — and deactivating the target used to change nothing (the
+    # 2026-08-06 incident: a sweep-activated target was deactivated 26 min
+    # in; the fan-out ran 3+ more hours, saturated Supabase into gateway
+    # 504s, and 500'd the owner's /search). A watcher re-checks
+    # pipeline-active every ``_ACTIVE_RECHECK_S``; on deactivation the
+    # remaining workers drain as no-ops within one interval.
+    abort = asyncio.Event()
+    deactivated_mid_run = False
+
+    async def _watch_active() -> None:
+        nonlocal deactivated_mid_run
+        while not abort.is_set():
+            try:
+                await asyncio.wait_for(abort.wait(), timeout=_ACTIVE_RECHECK_S)
+                return
+            except TimeoutError:
+                pass
+            try:
+                still_active = await _is_pipeline_active(supabase, target.id)
+            except Exception:
+                # Transient read failure must not kill the fan-out — keep
+                # polling on the next interval; the entry check already
+                # proved the target active once.
+                logger.debug("activation watcher re-check failed; retrying", exc_info=True)
+                continue
+            if not still_active:
+                logger.warning(
+                    "poll_sources_for_target: target %s (%s) deactivated "
+                    "mid-fan-out — aborting remaining sources",
+                    target.id,
+                    target.label,
+                )
+                deactivated_mid_run = True
+                abort.set()
+                return
+
+    watcher = asyncio.create_task(_watch_active())
+
     async def _worker(raw_source: Any) -> dict[str, Any]:
+        if abort.is_set():
+            return {"polled": False, "new": 0, "updated": 0, "error": None}
         async with semaphore:
+            if abort.is_set():
+                return {"polled": False, "new": 0, "updated": 0, "error": None}
             return await _poll_one_source_for_target(
                 cast(dict[str, Any], raw_source),
                 supabase,
@@ -3367,7 +3417,11 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 payer_over_budget=over,
             )
 
-    summaries = await asyncio.gather(*(_worker(s) for s in sources))
+    try:
+        summaries = await asyncio.gather(*(_worker(s) for s in sources))
+    finally:
+        abort.set()
+        watcher.cancel()
 
     result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     for s in summaries:
@@ -3377,5 +3431,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
         result.updated_jobs += s["updated"]
         if s.get("error"):
             result.errors.append(s["error"])
+    if deactivated_mid_run:
+        result.errors.append("activation fan-out aborted: target deactivated mid-run")
 
     return result
