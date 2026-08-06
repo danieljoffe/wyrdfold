@@ -28,6 +28,12 @@ const AUTH_ENABLED =
   !!process.env['SUPABASE_SERVICE_ROLE_KEY'] &&
   !!process.env['E2E_TEST_USER_EMAIL'];
 
+// The prod stress sweep (src/stress/, its own playwright.stress.config.ts)
+// must never run under this config: its specs target wyrdfold.com with a
+// pre-minted owner session and spend real LLM budget. testDir './src'
+// would otherwise pick them up — every project ignores the directory.
+const PUBLIC_IGNORE = /(auth\.setup|onboarding|authed-.*)\.spec\.ts|\/stress\//;
+
 export default defineConfig({
   ...nxE2EPreset(__filename, { testDir: './src' }),
   use: {
@@ -82,7 +88,7 @@ export default defineConfig({
   projects: [
     {
       name: 'public-chromium',
-      testIgnore: /(auth\.setup|onboarding|authed-.*)\.spec\.ts/,
+      testIgnore: PUBLIC_IGNORE,
       use: { ...devices['Desktop Chrome'] },
     },
     // Setup + authed projects only register when the auth env is
@@ -103,6 +109,7 @@ export default defineConfig({
             // projects' ``testIgnore`` glob picks them up
             // automatically.
             testMatch: /(onboarding|authed-.*)\.spec\.ts/,
+            testIgnore: /\/stress\//,
             use: {
               ...devices['Desktop Chrome'],
               storageState: AUTH_STORAGE,
@@ -116,12 +123,12 @@ export default defineConfig({
       : [
           {
             name: 'public-firefox',
-            testIgnore: /(auth\.setup|onboarding|authed-.*)\.spec\.ts/,
+            testIgnore: PUBLIC_IGNORE,
             use: { ...devices['Desktop Firefox'] },
           },
           {
             name: 'public-webkit',
-            testIgnore: /(auth\.setup|onboarding|authed-.*)\.spec\.ts/,
+            testIgnore: PUBLIC_IGNORE,
             use: { ...devices['Desktop Safari'] },
           },
         ]),

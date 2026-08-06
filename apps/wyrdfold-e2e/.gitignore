@@ -1,0 +1,3 @@
+
+# Stress-sweep artifacts: auth.json holds a live owner session; ledgers are per-run output.
+stress-results/
