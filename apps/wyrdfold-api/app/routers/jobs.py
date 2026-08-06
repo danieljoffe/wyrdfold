@@ -941,6 +941,13 @@ async def _assemble_jobs_page(
             )
             p["raw_score"] = raw_score
             p["score_breakdown"] = ts.get("score_breakdown")
+            # Graded rows explain their score with the fit AXES, not the
+            # keyword components (#609 follow-up): ship them so the panel
+            # can render the breakdown that actually averages to the score.
+            # The RPC list paths can't carry this column until R3 touches
+            # their RETURNS TABLE — the panel lazily falls back to the
+            # detail GET there.
+            p["axis_scores"] = ts.get("axis_scores")
             p["scoring_status"] = ts.get("scoring_status", "stage1")
             p["pending"] = _is_pending(ts)
             # Filter-only logistics (remote/salary/location) — never affects
@@ -2825,7 +2832,7 @@ async def _assert_user_owns_posting_async(
     # detail overlay (the ``jobs.score*`` columns are stale). See the sync twin.
     score_resp = (
         await supabase.table("scores")
-        .select("target_id, score, score_breakdown")
+        .select("target_id, score, score_breakdown, axis_scores")
         .eq("job_posting_id", posting_id)
         .in_("target_id", list(user_target_ids))
         .order("score", desc=True)
@@ -2839,6 +2846,7 @@ async def _assert_user_owns_posting_async(
     row["target_id"] = best["target_id"]
     row["_target_score"] = best.get("score")
     row["_target_score_breakdown"] = best.get("score_breakdown")
+    row["_target_axis_scores"] = best.get("axis_scores")
     return row
 
 
@@ -2901,10 +2909,16 @@ async def get_job(
     # per-job aggregation).
     target_score = row.pop("_target_score", None)
     target_breakdown = row.pop("_target_score_breakdown", None)
+    target_axes = row.pop("_target_axis_scores", None)
     if target_score is not None:
         row["score"] = target_score
     if target_breakdown is not None:
         row["score_breakdown"] = target_breakdown
+    # Fit axes for graded rows (#609 follow-up): the detail GET is the
+    # panel's fallback source when a list path (the RPC ones) couldn't
+    # carry them. None for ungraded rows — the panel keeps the keyword
+    # components there.
+    row["axis_scores"] = target_axes
     # Decay the displayed score by posting age so the detail view matches
     # the (now age-decayed) list score; raw_score keeps the undecayed fit.
     # No-op when the recency flag is off.

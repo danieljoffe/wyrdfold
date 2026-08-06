@@ -138,6 +138,56 @@ async def test_target_two_query_restores_score_desc_order() -> None:
     assert result["total"] == 3
 
 
+@pytest.mark.asyncio
+async def test_two_query_emits_axis_scores_for_graded_rows() -> None:
+    """#609 follow-up: graded rows ship their fit axes on the wire so the
+    detail panel can render the breakdown that actually averages to the
+    score; pending rows ship ``axis_scores: None`` (keyword components stay
+    their explanation). A missing key would silently starve the panel back
+    onto its detail-GET fallback for every row."""
+    axes = {"title_fit": 95, "skills_fit": 85, "seniority_fit": 90, "domain_fit": 95}
+    ts_rows = [
+        {
+            "job_posting_id": "j-graded",
+            "score": 91,
+            "score_breakdown": {"role_titles": 24.4},
+            "scoring_status": "complete",
+            "axis_scores": axes,
+            "fit_reasoning": "graded match",
+        },
+        {
+            "job_posting_id": "j-pending",
+            "score": 42,
+            "score_breakdown": {"role_titles": 30.0},
+            "scoring_status": "stage2",
+            "axis_scores": None,
+        },
+    ]
+    postings = [{"id": "j-graded", "title": "a"}, {"id": "j-pending", "title": "b"}]
+    sb = _supabase_with({"scores": _Resp(ts_rows, count=2), "jobs": _Resp(postings)})
+
+    result = await _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        cursor={},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+    )
+
+    by_id = {p["id"]: p for p in result["postings"]}
+    assert by_id["j-graded"]["axis_scores"] == axes
+    assert by_id["j-graded"]["pending"] is False
+    assert by_id["j-pending"]["axis_scores"] is None
+    assert by_id["j-pending"]["pending"] is True
+
+
 async def test_across_user_targets_restores_score_desc_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

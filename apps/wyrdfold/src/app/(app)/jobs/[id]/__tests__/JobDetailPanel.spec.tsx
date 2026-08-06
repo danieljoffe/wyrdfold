@@ -83,10 +83,15 @@ describe('JobDetailPanel', () => {
     expect(screen.getByText(/score breakdown/i)).toBeInTheDocument();
   });
 
-  it('renders one row per non-zero factor in the score breakdown', () => {
+  it('renders one row per non-zero factor in the score breakdown (pending rows — graded rows show fit axes, #609)', () => {
     render(
       <JobDetailPanel
         posting={makeJob({
+          // Keyword components are the PENDING band's breakdown; graded rows
+          // render their fit axes instead (JobDetailPanelBreakdown.spec.tsx).
+          pending: true,
+          scoring_status: 'stage2',
+          axis_scores: null,
           score_breakdown: {
             role_titles: 30,
             technologies: 20,
