@@ -150,6 +150,13 @@ export default function CoverLetterReviewPage({
   const inflightRef = useRef(false);
   const persistMarkdown = useCallback(async (): Promise<boolean> => {
     if (!record) return false;
+    // Never PATCH a locked record — same approve-vs-debounce race as the
+    // resume page (a keystroke during the flush→approve flight re-arms the
+    // timer, which then 409s against the lock; observed live 2026-08-06).
+    if (record.approved_at !== null) {
+      setSaveStatus('saved');
+      return true;
+    }
     if (inflightRef.current) return false;
     inflightRef.current = true;
     const sentMarkdown = markdown;
@@ -275,6 +282,9 @@ export default function CoverLetterReviewPage({
       }
       const approved = (await res.json()) as TailoredResumeRecord;
       setRecord(approved);
+      // Disarm any auto-save re-armed mid-approve (see persistMarkdown's
+      // approved_at guard — this stops the debounce timer from firing).
+      setSaveStatus('saved');
       toast({ variant: 'success', title: 'Cover letter locked' });
     } catch {
       toast({
