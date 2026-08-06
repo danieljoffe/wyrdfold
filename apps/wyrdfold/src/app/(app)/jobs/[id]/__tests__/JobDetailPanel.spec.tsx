@@ -36,9 +36,9 @@ function makeJob(overrides: Partial<JobPosting> = {}): JobPosting {
     scoring_status: 'complete',
     status: 'new',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-01',
-    created_at: '2026-01-01',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-01',
     ...overrides,
   };
 }
@@ -83,10 +83,15 @@ describe('JobDetailPanel', () => {
     expect(screen.getByText(/score breakdown/i)).toBeInTheDocument();
   });
 
-  it('renders one row per non-zero factor in the score breakdown', () => {
+  it('renders one row per non-zero factor in the score breakdown (pending rows — graded rows show fit axes, #609)', () => {
     render(
       <JobDetailPanel
         posting={makeJob({
+          // Keyword components are the PENDING band's breakdown; graded rows
+          // render their fit axes instead (JobDetailPanelBreakdown.spec.tsx).
+          pending: true,
+          scoring_status: 'stage2',
+          axis_scores: null,
           score_breakdown: {
             role_titles: 30,
             technologies: 20,

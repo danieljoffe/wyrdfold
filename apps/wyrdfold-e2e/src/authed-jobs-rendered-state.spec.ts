@@ -163,7 +163,16 @@ test.beforeAll(async () => {
         target_id: TARGET_ID,
         score: 87,
         scoring_status: 'stage2',
-        axis_scores: { technologies: 80, role_titles: 60 },
+        // Real fit-axis keys (title/skills/seniority/domain) — the graded
+        // signal for _is_pending AND what the panel's axis breakdown
+        // renders (#609). Keyword keys here would render the empty-axes
+        // fallback and hide a broken FitAxisList from the suite.
+        axis_scores: {
+          title_fit: 90,
+          skills_fit: 85,
+          seniority_fit: 88,
+          domain_fit: 85,
+        },
         excluded: false,
       },
       {

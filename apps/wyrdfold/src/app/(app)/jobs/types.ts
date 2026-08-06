@@ -67,6 +67,14 @@ export interface JobPosting {
   absolute_url: string | null;
   score: number;
   score_breakdown: Record<string, number> | null;
+  /**
+   * The fit grade's four axes (title/skills/seniority/domain, 0–100) for
+   * graded rows — the breakdown that actually averages to ``score`` (#609).
+   * ``null`` = graded signal absent (pending row); ``undefined`` = the
+   * serving path couldn't carry the column (the RPC list paths, until R3) —
+   * the detail panel lazily fetches ``/api/jobs/{id}`` to fill it in.
+   */
+  axis_scores?: Record<string, number> | null;
   scoring_status: ScoringStatus | undefined;
   /**
    * True when the row is not yet Sonnet-graded — ``score`` is a keyword
