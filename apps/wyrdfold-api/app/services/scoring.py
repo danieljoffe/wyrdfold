@@ -214,6 +214,20 @@ _CATEGORY_TO_FIELD: dict[str, str] = {
 
 _SENIORITY_SIGNAL_WEIGHT = 2.0
 _TITLE_WEIGHT = 2.0
+
+# Per-item credit ceiling for stage-2 scoring (#609). "Full credit" for a
+# keyword/signal = named in the TITLE and in a requirements-grade section
+# once (title 2.0 + requirements 2.0). Anything beyond — repeat mentions,
+# extra sections — adds nothing past the ceiling. Before this cap, one
+# keyword could earn ~16x the weight `_calc_max_possible` assumed for it
+# (title 2 + requirements 2x3occ + default 1x3 + ...), so `raw` routinely
+# hit 200-800%% of "max possible" and `min(100, ...)` clamped ~2,600 of
+# ~9,300 prod rows to exactly 100 — the score column carried no signal at
+# the top and every fit grade re-shuffled the list. With per-item awards
+# capped at the SAME ceiling the normalizer sums, the score is a true
+# percentage of the target's own maximum and saturation is structurally
+# impossible rather than merely clamped.
+_FULL_CREDIT_MULTIPLIER = 4.0  # _TITLE_WEIGHT + SECTION_WEIGHTS["requirements"]
 _DEFAULT_NORMALIZER = 30.0
 # Per-target ``search_keywords`` are the user's role-title intent (e.g.
 # "director of customer experience"). A title that hits any of them is
@@ -423,9 +437,15 @@ def _calc_max_possible(profile: ScoringProfile, search_keywords: list[str] | Non
     total = 0.0
     for cat_profile in profile.categories.values():
         for kw_weight in cat_profile.keywords.values():
-            total += kw_weight * cat_profile.weight
-    total += len(profile.seniority.signals) * _SENIORITY_SIGNAL_WEIGHT
-    total += len(profile.domain.signals) * profile.domain.weight
+            total += kw_weight * cat_profile.weight * _FULL_CREDIT_MULTIPLIER
+    total += (
+        len(profile.seniority.signals)
+        * _SENIORITY_SIGNAL_WEIGHT
+        * _FULL_CREDIT_MULTIPLIER
+    )
+    total += (
+        len(profile.domain.signals) * profile.domain.weight * _FULL_CREDIT_MULTIPLIER
+    )
     if search_keywords:
         total += _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT
     return total
@@ -488,6 +508,10 @@ def score_job_with_profile(
                     matched = True
 
             if matched:
+                keyword_points = min(
+                    keyword_points,
+                    kw_weight * cat_profile.weight * _FULL_CREDIT_MULTIPLIER,
+                )
                 current = getattr(breakdown, field_name)
                 setattr(breakdown, field_name, current + keyword_points)
                 all_matched.append(keyword)
@@ -507,7 +531,9 @@ def score_job_with_profile(
                 matched = True
 
         if matched:
-            breakdown.seniority_signals += signal_points
+            breakdown.seniority_signals += min(
+                signal_points, _SENIORITY_SIGNAL_WEIGHT * _FULL_CREDIT_MULTIPLIER
+            )
             all_matched.append(signal)
 
     # ---- Domain signals ----
@@ -525,7 +551,9 @@ def score_job_with_profile(
                 matched = True
 
         if matched:
-            breakdown.domain_skills += signal_points
+            breakdown.domain_skills += min(
+                signal_points, profile.domain.weight * _FULL_CREDIT_MULTIPLIER
+            )
             all_matched.append(signal)
 
     # ---- Role-title intent (search_keywords) ----
@@ -592,6 +620,21 @@ def score_job_with_profile(
     score = max(0, min(100, round((raw / normalizer) * 100)))
     if excluded:
         score = 0
+
+    # Store breakdown components as percentage-point contributions on the
+    # same 0-100 scale as the score (#609): the axes now sum to the score
+    # (before the negative deduction and rounding) instead of surfacing raw
+    # internal sums like "+124.2" beside a 0-100 number.
+    for axis in (
+        "role_titles",
+        "technologies",
+        "domain_skills",
+        "seniority_signals",
+        "negative",
+    ):
+        setattr(
+            breakdown, axis, round(getattr(breakdown, axis) / normalizer * 100, 1)
+        )
 
     return ScoreResult(
         score=score,

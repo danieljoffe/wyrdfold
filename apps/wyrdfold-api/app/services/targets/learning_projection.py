@@ -18,11 +18,6 @@ from supabase import AsyncClient
 from app.config import settings
 from app.models.learning import RescoreProjection
 from app.models.targets import ScoringProfile
-
-# The keyword half of the blended score is the only part a profile patch can
-# change (the LLM half needs a re-grade), so the projected displayed-score
-# delta is the keyword-score delta scaled by the blend's keyword weight.
-from app.services.analysis.scoring import _KEYWORD_WEIGHT
 from app.services.jd_parser import parse_jd
 from app.services.scoring import score_job_with_profile
 
@@ -143,7 +138,11 @@ def project_rescore(
             parsed_jd=parsed,
             search_keywords=after_keywords,
         ).score
-        delta = abs(round(_KEYWORD_WEIGHT * (after - before)))
+        # #609: the keyword score IS the whole score for not-yet-graded rows
+        # (the retired 60/40 blend no longer dilutes it), and a profile bump
+        # resets graded rows to stage2 for re-grading — so the keyword delta
+        # counts at full weight as the movement signal.
+        delta = abs(round(after - before))
         max_abs_delta = max(max_abs_delta, delta)
         if delta >= move_threshold:
             moved += 1

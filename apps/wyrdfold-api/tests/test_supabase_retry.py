@@ -223,3 +223,18 @@ async def test_async_opt_in_still_ignores_other_apierrors() -> None:
     with pytest.raises(APIError):
         await execute_with_retry(counter, label="t", retry_statement_timeout=True)
     assert counter.calls == 1
+
+
+def test_sync_statement_timeout_retried_only_when_opted_in() -> None:
+    from postgrest.exceptions import APIError
+
+    from app.services.supabase_retry import execute_with_retry_sync
+
+    default = _Counter(fail_times=1, exc=_statement_timeout())
+    with pytest.raises(APIError):
+        execute_with_retry_sync(default, label="t")
+    assert default.calls == 1
+
+    opted = _Counter(fail_times=1, exc=_statement_timeout())
+    assert execute_with_retry_sync(opted, label="t", retry_statement_timeout=True) == "ok"
+    assert opted.calls == 2
