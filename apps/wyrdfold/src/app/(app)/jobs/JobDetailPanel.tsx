@@ -76,6 +76,50 @@ function formatFactor(key: string): string {
   return SCORE_FACTOR_LABEL[key] ?? key.replace(/_/g, ' ');
 }
 
+/** Fixed render order — the four fit axes whose average IS the score (#609). */
+const FIT_AXES: ReadonlyArray<[key: string, label: string]> = [
+  ['title_fit', 'Title fit'],
+  ['skills_fit', 'Skills fit'],
+  ['seniority_fit', 'Seniority fit'],
+  ['domain_fit', 'Domain fit'],
+];
+
+/**
+ * Breakdown for GRADED rows: the fit grade's axes on the same 0–100 scale
+ * as the score, so the section finally explains the number beside it. The
+ * keyword components (ScoreBreakdownList) stay for pending rows — there the
+ * keyword score IS the whole story (#47).
+ */
+function FitAxisList({ axes }: { axes: Record<string, number> }) {
+  const known = FIT_AXES.filter(([key]) => typeof axes[key] === 'number');
+  if (known.length === 0) {
+    return <Text variant='meta'>No fit axes recorded for this grade</Text>;
+  }
+  return (
+    <ul className='flex flex-col gap-2'>
+      {known.map(([key, label]) => {
+        const value = axes[key] as number;
+        return (
+          <li key={key} className='flex flex-col gap-1'>
+            <div className='flex items-baseline justify-between gap-3'>
+              <span className='text-sm text-text-primary'>{label}</span>
+              <span className='text-xs font-medium tabular-nums shrink-0 text-text-secondary'>
+                {Math.round(value)}
+              </span>
+            </div>
+            <div className='h-1.5 w-full overflow-hidden rounded-full bg-surface-elevated'>
+              <div
+                className='h-full rounded-full bg-success'
+                style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
+              />
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function ScoreBreakdownList({
   breakdown,
 }: {
@@ -386,6 +430,39 @@ export default function JobDetailPanel({
 
   const breakdown = posting.score_breakdown;
 
+  // Fit axes for the breakdown section (#609). List rows served by the RPC
+  // paths can't carry ``axis_scores`` (undefined) until R3 adds the column
+  // to their RETURNS TABLE — for a graded row, lazily pull the detail GET
+  // (same pattern as ResumeSection/CoverLetterSection fetching the JD). A
+  // failed fetch falls back to the keyword components rather than a hole.
+  const [fetchedAxes, setFetchedAxes] = useState<Record<string, number> | null>(
+    null
+  );
+  const [axesFetchDone, setAxesFetchDone] = useState(false);
+  const needsAxesFetch =
+    !posting.pending && posting.axis_scores === undefined && !axesFetchDone;
+  useEffect(() => {
+    if (!needsAxesFetch) return;
+    let cancelled = false;
+    void fetch(`/api/jobs/${posting.id}`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(
+        (detail: { axis_scores?: Record<string, number> | null } | null) => {
+          if (cancelled) return;
+          setFetchedAxes(detail?.axis_scores ?? null);
+          setAxesFetchDone(true);
+        }
+      )
+      .catch(() => {
+        if (!cancelled) setAxesFetchDone(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsAxesFetch, posting.id]);
+  const axes = posting.axis_scores ?? fetchedAxes;
+  const axesPending = needsAxesFetch && !axesFetchDone;
+
   // Sanitize the upstream JD HTML once per posting. The body is THIRD-PARTY
   // (Greenhouse et al.) and merely passes through our poller, so it must be
   // treated as attacker-controlled at render time. ``sanitizeJobDescription``
@@ -547,12 +624,19 @@ export default function JobDetailPanel({
           keeps both visible without scrolling and reads as "here's why we
           score it, here's what the model thinks". */}
       <div className='grid grid-cols-1 gap-6 md:grid-cols-2'>
-        {/* Score breakdown */}
+        {/* Score breakdown — graded rows show the fit axes (their average IS
+            the score); pending rows show the keyword components (their score
+            IS the keyword sum). Mixing the two was the #609 credibility bug:
+            keyword components can never explain an axis-blend number. */}
         <div>
           <Text variant='caption' className='mb-2'>
             Score Breakdown
           </Text>
-          {breakdown ? (
+          {axes && Object.keys(axes).length > 0 ? (
+            <FitAxisList axes={axes} />
+          ) : axesPending ? (
+            <Skeleton variant='text' lines={3} />
+          ) : breakdown ? (
             <ScoreBreakdownList breakdown={breakdown} />
           ) : (
             <Skeleton variant='text' lines={3} />
