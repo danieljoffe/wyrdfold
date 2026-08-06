@@ -162,9 +162,9 @@ const POSTINGS: JobPosting[] = [
     scoring_status: 'complete',
     status: 'new',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-01T00:00:00Z',
-    created_at: '2026-01-01T00:00:00Z',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-01T00:00:00Z',
   },
   {
     id: 'job-2',
@@ -179,9 +179,9 @@ const POSTINGS: JobPosting[] = [
     scoring_status: 'complete',
     status: 'saved',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-02T00:00:00Z',
-    created_at: '2026-01-02T00:00:00Z',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-02T00:00:00Z',
   },
 ];
 
