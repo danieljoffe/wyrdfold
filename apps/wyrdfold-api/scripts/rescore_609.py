@@ -59,11 +59,21 @@ def _hist(counter: Counter[str]) -> str:
 
 
 def _pages(supabase: Any, select: str, graded: bool):
-    """Keyset-paginate scores rows by id, split by gradedness."""
+    """Keyset-paginate scores rows by id, split by gradedness.
+
+    The graded side filters CLIENT-side (``select`` must include
+    ``axis_scores``): graded rows are ~6%% of the table, so the server-side
+    ``axis_scores not is null`` walk reads ~15x rows per page and 57014'd
+    under the apply pass's own update churn (2026-08-06). Unfiltered
+    PK-range pages are immune — we ship 500 rows to keep ~30, which is the
+    right trade for a one-off. The ungraded side is ~94%% dense, so its
+    server-side filter stays (near-full pages, no pathological walk).
+    """
     after: str | None = None
     while True:
         query = supabase.table("scores").select(select).order("id").limit(PAGE)
-        query = query.not_.is_("axis_scores", "null") if graded else query.is_("axis_scores", "null")
+        if not graded:
+            query = query.is_("axis_scores", "null")
         if after is not None:
             query = query.gt("id", after)
         resp = execute_with_retry_sync(
@@ -72,7 +82,9 @@ def _pages(supabase: Any, select: str, graded: bool):
         rows = cast(list[dict[str, Any]], resp.data or [])
         if not rows:
             return
-        yield rows
+        page = [r for r in rows if r.get("axis_scores") is not None] if graded else rows
+        if page:
+            yield page
         if len(rows) < PAGE:
             return
         after = rows[-1]["id"]
@@ -228,7 +240,9 @@ def refresh_graded_breakdowns(
     """
     targets: dict[str, Any] = {}
     seen = changed = skipped = 0
-    for rows in _pages(supabase, "id, job_posting_id, target_id, score", graded=True):
+    for rows in _pages(
+        supabase, "id, job_posting_id, target_id, score, axis_scores", graded=True
+    ):
         for r, result in _iter_recomputed(supabase, rows, targets):
             seen += 1
             if result is None:
