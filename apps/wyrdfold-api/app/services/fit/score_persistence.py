@@ -27,8 +27,9 @@ from supabase import AsyncClient
 
 from app.config import settings
 from app.models.experience import OptimizedPayload
-from app.models.targets import JobTarget
+from app.models.targets import AxisWeights, JobTarget
 from app.services.db_write import poll_db_write
+from app.services.fit.axis_weights import display_score_from_axes
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import record_async as record_llm_cost_async
@@ -154,8 +155,16 @@ async def score_with_phase2_and_persist(
         )
 
     try:
+        # #609: persist the deterministic default-weight axis blend, not the
+        # model's holistic ``fit_score``. The holistic number band-compresses
+        # upward (prod 2026-08-05: axes {title 85, skills 88, seniority 80,
+        # domain 55} stored as score=100; 326 rows >=90), which walled the
+        # graded band at ~100 and stripped the score column of signal. The
+        # quartile blend is what the per-user weighted display reproduces at
+        # read time, so stored and displayed scores now share one definition.
+        persisted_score = display_score_from_axes(fit.axes.model_dump(), AxisWeights())
         update_payload: dict[str, Any] = {
-            "score": fit.fit_score,
+            "score": persisted_score,
             "axis_scores": fit.axes.model_dump(),
             "fit_reasoning": fit.reasoning,
             "scoring_status": "complete",
@@ -170,7 +179,7 @@ async def score_with_phase2_and_persist(
             # decay is off). When decay is on the poller's
             # refresh_recency_scores_poll pass overwrites this with the
             # age-decayed value later in the same cycle.
-            "recency_score": fit.fit_score,
+            "recency_score": persisted_score,
             "updated_at": datetime.now(UTC).isoformat(),
         }
         # Only write logistics when the grader emitted it (flag was on

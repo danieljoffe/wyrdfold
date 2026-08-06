@@ -1022,3 +1022,47 @@ from app.dependencies import (
     get_llm_client,
     verify_api_key_or_jwt,
 )
+
+
+@pytest.mark.asyncio
+async def test_blend_writes_pure_scorecard_numeric_not_keyword_mix() -> None:
+    """#609: the fit verdict IS the score. The retired 60/40 keyword/LLM
+    mix let a saturated keyword placeholder drag every verdict toward it;
+    ``user_apply_score_blend`` must now receive exactly
+    ``scorecard_to_numeric(scorecard)`` regardless of the stored keyword
+    score."""
+    from app.routers.analysis import _apply_llm_blend
+    from app.services.analysis.scoring import scorecard_to_numeric
+
+    scorecard = Scorecard(
+        skills_matched=[
+            SkillMatch(name="React", matched=True, confidence="high", evidence=None),
+            SkillMatch(name="SQL", matched=True, confidence="medium", evidence=None),
+        ],
+        skills_missing=["Go"],
+        nice_to_haves=[],
+        seniority_fit="moderate",
+        domain_fit="weak",
+        seniority_rationale="mid",
+        domain_rationale="adjacent",
+    )
+    supabase = MagicMock()
+    # A stored keyword score of 100 — under the old 60/40 mix this would
+    # have pulled the write toward 100; it must be ignored entirely.
+    supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"score": 100}])
+    )
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+
+    await _apply_llm_blend(
+        supabase,
+        job_posting_id="job-b",
+        target_id="tgt-b",
+        scorecard=scorecard,
+        analysis_id="an-b",
+    )
+
+    rpc_args = supabase.rpc.call_args[0][1]
+    expected = round(scorecard_to_numeric(scorecard))
+    assert rpc_args["p_score"] == expected
+    assert expected != 100  # the fixture keyword score must not leak through

@@ -1,16 +1,13 @@
 """Numeric scoring helpers for LLM analysis output.
 
-Converts a Scorecard (from LLM analysis) to a 0-100 numeric score,
-and blends it with the keyword score for a final composite score.
+Converts a Scorecard (from LLM analysis) to a 0-100 numeric score. This
+IS the analysis score — the old 60/40 keyword blend was retired in #609
+(keyword scores are a retrieval signal, not part of the graded number).
 """
 
 from __future__ import annotations
 
 from app.models.analysis import Scorecard
-
-# Blend weights: 60% keyword, 40% LLM
-_KEYWORD_WEIGHT = 0.6
-_LLM_WEIGHT = 0.4
 
 
 def scorecard_to_numeric(scorecard: Scorecard) -> float:
@@ -36,7 +33,3 @@ def scorecard_to_numeric(scorecard: Scorecard) -> float:
 
     return max(0, min(100, score))
 
-
-def blend_scores(keyword_score: int, llm_score: float) -> int:
-    """Blend keyword and LLM scores. 60% keyword, 40% LLM."""
-    return round(_KEYWORD_WEIGHT * keyword_score + _LLM_WEIGHT * llm_score)
