@@ -62,8 +62,7 @@ const LISTING: JobSearchResult = {
   department: null,
   salary_text: '$150k',
   absolute_url: 'https://ext.example/1',
-  first_seen_at: null,
-  created_at: null,
+  cataloged_at: null,
   snippet: 'Build fast UIs.',
 };
 

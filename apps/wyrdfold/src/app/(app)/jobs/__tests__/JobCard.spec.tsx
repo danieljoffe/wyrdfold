@@ -24,9 +24,9 @@ function makeJob(overrides: Partial<JobPosting> = {}): JobPosting {
     scoring_status: 'complete',
     status: 'new',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: new Date(Date.now() - 86_400_000).toISOString(),
-    created_at: new Date(Date.now() - 86_400_000).toISOString(),
+    source_posted_at: null,
+
+    cataloged_at: new Date(Date.now() - 86_400_000).toISOString(),
     ...overrides,
   };
 }
