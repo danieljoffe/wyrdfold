@@ -11,6 +11,7 @@ at beta scale, so a byte-identical SQL rewrite is risk without payoff (#101).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
@@ -188,6 +189,12 @@ def _parse_dt(value: str) -> datetime:
 # whole (page size == max_rows).
 _SCORES_PAGE_SIZE = 1000
 
+# Wall-clock budget for the fallback-only scores-membership walk (#635):
+# many small statements evade the per-statement timeout, so the LOOP needs
+# its own ceiling — a degraded DB must fail fast and visibly, never hold a
+# connection for the 25 minutes observed in #634 F1.
+_MEMBERSHIP_BUDGET_S = 30
+
 
 async def _posting_target_map(
     supabase: AsyncClient, target_ids: set[str] | None
@@ -298,7 +305,10 @@ async def _pipeline_status_counts_python(
     Counter did: postings under the caller's targets (``excluded = false``)
     within the window, deduplicated by posting id, grouped by the caller's
     per-user status (``user_jobs`` row; absent → ``'new'``)."""
-    posting_ids = _flatten_posting_ids(await _posting_target_map(supabase, target_ids))
+    # Budgeted like the targets fallback (#635): the membership walk is many
+    # small statements — a degraded DB must fail fast, not hold the line.
+    async with asyncio.timeout(_MEMBERSHIP_BUDGET_S):
+        posting_ids = _flatten_posting_ids(await _posting_target_map(supabase, target_ids))
     if posting_ids is not None and not posting_ids:
         return Counter()
 
@@ -697,8 +707,6 @@ async def _targets_groupby(
     since: datetime | None,
     target_ids: set[str],
     target_labels: dict[str, str],
-    membership: dict[str, set[str]],
-    posting_ids: set[str],
     user_id: str | None,
 ) -> _TargetGroupBy:
     """Per-target metrics + score distribution + score trend + unscored count
@@ -710,7 +718,17 @@ async def _targets_groupby(
     identity contract: Postgres ``round()`` is half-away-from-zero while
     Python ``round()`` is banker's, so all rounding stays in
     ``_assemble_target_insights``. Falls back to the client-side aggregate
-    when the RPC isn't deployed yet (mirrors ``_pipeline_status_counts``)."""
+    when the RPC isn't deployed yet (mirrors ``_pipeline_status_counts``).
+
+    The scores-membership pre-pass (``_posting_target_map``) lives INSIDE
+    the fallback branch, budgeted (#635): it keyset-walks every scores row
+    under the user's targets in ~1k pages, and computing it eagerly for a
+    result only the fallback consumes is what let one /insights/targets
+    call issue 25 MINUTES of sequential statements under DB contention
+    (2026-08-06 stress sweep, #634 F1) — each page under the statement
+    timeout, the sum unbounded, the loop feeding the very contention that
+    slowed it. The happy path is now labels + one RPC statement, which the
+    statement timeout genuinely governs."""
     try:
         resp = await execute_with_retry(
             supabase.rpc(
@@ -724,13 +742,18 @@ async def _targets_groupby(
             label="insights/targets_groupby",
         )
     except Exception:
+        # Wall-clock budget on the fallback's membership walk: a degraded DB
+        # must produce a fast, visible failure (the FE's load-error state),
+        # never a half-hour connection hostage.
+        async with asyncio.timeout(_MEMBERSHIP_BUDGET_S):
+            membership = await _posting_target_map(supabase, target_ids) or {}
         return await _targets_groupby_python(
             supabase,
             since,
             target_ids,
             target_labels,
             membership,
-            posting_ids,
+            set(membership.keys()),
             user_id,
         )
 
@@ -825,41 +848,22 @@ async def compute_targets(
     targets_data = await _rows(tq, label="insights/targets_labels")
     target_labels = {t["id"]: t["label"] for t in targets_data}
 
-    # Resolve target membership via the ``scores`` table. ``jobs.target_id``
-    # is vestigial — the poller never writes it, so the previous filter
-    # collapsed every per-target bucket to empty. Same architectural
-    # fix as ownership checks in #676 / #678.
-    membership = await _posting_target_map(supabase, target_ids)
-    posting_ids = _flatten_posting_ids(membership)
-    if target_ids is not None and not posting_ids:
-        return TargetInsights(
-            targets=[],
-            score_distribution=[
-                ScoreBucket(bucket=f"{lo}-{lo + 10 if lo < 90 else 100}", count=0)
-                for lo in range(0, 100, 10)
-            ],
-            score_trend=[],
-            unscored_count=0,
-        )
-
     # --- Scoped path (the only path the /insights/targets router takes) ---
     # The per-target metrics + score distribution + score trend + unscored
     # count are computed in one server-side GROUP BY pass (#101) — the ~11k
     # posting / ~11k user_jobs / two ~11k scores reads never leave Postgres.
     # The RPC returns RAW aggregates; all rounding stays in Python (banker's
     # vs Postgres half-away-from-zero) so the output is byte-identical.
+    #
+    # #635: no membership pre-pass here. The old code walked EVERY scores
+    # row under the user's targets (keyset pages of 1k) before this branch,
+    # purely to feed the RPC-unavailable fallback and an empty-set early
+    # return the RPC reproduces anyway (empty aggregates assemble to the
+    # identical zero-bucket shape). Under DB contention that walk ran 25
+    # minutes (#634 F1). Membership now resolves lazily inside
+    # ``_targets_groupby``'s fallback branch, budgeted.
     if target_ids is not None:
-        # membership / posting_ids are non-None here (target_ids is not None
-        # and the empty case returned above).
-        agg = await _targets_groupby(
-            supabase,
-            since,
-            target_ids,
-            target_labels,
-            membership or {},
-            posting_ids or set(),
-            user_id,
-        )
+        agg = await _targets_groupby(supabase, since, target_ids, target_labels, user_id)
         return _assemble_target_insights(target_labels, agg)
 
     # --- Global / admin path (target_ids is None — tests only) ---
