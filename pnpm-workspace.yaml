@@ -14,6 +14,10 @@ overrides:
   js-yaml: ^4.3.0 # GHSA-52cp-r559-cp3m (was ^4.2.0, which still allowed the vuln)
   body-parser: '>=1.20.6' # GHSA-v422-hmwv-36x6 DoS
   brace-expansion: 5.0.9 # GHSA-mh99-v99m-4gvg + GHSA-3jxr-9vmj-r5cp + GHSA-rgw5-rvv9-x895 ReDoS. Broad (all majors) — 1.x/2.x shipped NO in-line fix (latest 1.1.16/2.1.2 are the flagged versions), so the 5.0.x line is the only patched track; bumped 5.0.8→5.0.9 for the new GHSA-rgw5-rvv9-x895 advisory. Live-DB OSV gate moving target, independent of any single PR.
+  # image-size: intentionally NOT pinned — every version through the latest
+  # (2.0.2) is flagged with no fix published. Suppressed in osv-scanner.toml
+  # with justification instead. See GHSA-5p2g-fcmc-qvqq.
+  nanoid: ^3.3.17 # GHSA-2v37-7h3g-55p8 (was 3.3.16)
   '@opentelemetry/core': 2.8.0
   '@opentelemetry/resources': 2.8.0
   '@opentelemetry/sdk-trace-base': 2.8.0
