@@ -66,12 +66,14 @@ def _clear_caches():
     """Prevent cross-test cache pollution from in-memory state."""
     from app.services.analysis import run_registry
     from app.services.poller import _PHASE1_REJECTIONS
+    from app.services.tailor import run_registry as tailor_run_registry
 
     job_list_cache.invalidate()
-    # The in-flight analysis registry (#459) is a module-level dict; a leaked
-    # "running" entry would make the next test's kick dedup to 202 without
-    # spawning (LLM never called).
+    # The in-flight analysis (#459) and tailor (#656) registries are
+    # module-level dicts; a leaked "running" entry would make the next test's
+    # kick dedup to 202 without spawning (LLM never called).
     run_registry.clear_all()
+    tailor_run_registry.clear_all()
     # Phase-1 negative-verdict cache (#514) is a module-level TTL dict; a
     # rejection leaked from one poller test would silently skip the LLM in
     # the next one.
@@ -79,6 +81,7 @@ def _clear_caches():
     yield
     job_list_cache.invalidate()
     run_registry.clear_all()
+    tailor_run_registry.clear_all()
     _PHASE1_REJECTIONS.clear()
 
 

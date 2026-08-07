@@ -254,6 +254,56 @@ export interface TailoredResumeRecord {
   updated_at: string | null;
   approved_at: string | null;
   source_resume_id: string | null;
+  /**
+   * ATS lint state (#656). `null` = never linted (rows predating the column,
+   * and every cover letter — it's resume-scoped); `[]` = linted with nothing
+   * to report; a list with any `severity: 'error'` entry = **flagged draft**,
+   * persisted despite failing lint so the generation spend isn't thrown away.
+   * A warnings-only list is clean-with-advisories, NOT flagged — use
+   * `isFlaggedDraft()` rather than a length check.
+   */
+  lint_violations?: LintViolation[] | null;
+}
+
+/** True when a record's lint state marks it a flagged draft — i.e. it carries
+ *  at least one blocking violation. Warnings alone don't flag a draft. */
+export function isFlaggedDraft(
+  record: Pick<TailoredResumeRecord, 'lint_violations'> | null | undefined
+): boolean {
+  return (record?.lint_violations ?? []).some(v => v.severity === 'error');
+}
+
+/**
+ * Poll marker for the non-blocking tailor flow (#656), mirroring
+ * `AnalysisStatus` for #459.
+ *  - `running` — a detached generation is in flight; keep polling.
+ *  - `error`   — the run failed; offer a retry (POST again).
+ *  - `idle`    — nothing in flight. With a record that means "settled"; with
+ *    a null record it's the "Generate" empty state.
+ */
+export type TailorRunStatus = 'running' | 'error' | 'idle';
+
+/** Response shape of `GET /api/jobs/tailor/by-job/{id}` (and its cover-letter
+ *  sibling). Replaced the bare `TailoredResumeRecord | null` those routes used
+ *  to return: a client that kicked off a background run needs to tell "nothing
+ *  here yet, keep polling" from "nothing here, and nothing coming". */
+export interface TailoredDocumentState {
+  record: TailoredResumeRecord | null;
+  status: TailorRunStatus;
+  message?: string | null;
+}
+
+/** 202 body from POST /api/jobs/tailor/resume | /cover-letter. */
+export interface TailorStatusResponse {
+  status: TailorRunStatus;
+  message?: string | null;
+}
+
+/** Response shape of `POST /api/jobs/tailor/{id}/ats-recheck`. */
+export interface AtsRecheckResponse {
+  ok: boolean;
+  violations: LintViolation[];
+  record: TailoredResumeRecord;
 }
 
 interface CoverLetterParagraph {

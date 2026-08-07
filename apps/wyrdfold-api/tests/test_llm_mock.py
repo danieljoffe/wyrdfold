@@ -273,3 +273,25 @@ def test_dev_default_job_analysis_is_schema_valid() -> None:
     analysis = JobAnalysis.model_validate(payload)
     assert analysis.recommendation
     assert analysis.scorecard.skills_matched
+
+
+def test_ats_hostile_resume_is_schema_valid_but_fails_the_real_linter() -> None:
+    """Bug-corpus entry for #656: a resume the model got *right* by its own
+    contract and wrong by the ATS linter's.
+
+    Both halves are load-bearing. Schema-valid, or the flagged-draft path
+    would never be reached (trace validation would reject it first). Actually
+    lint-failing under the REAL linter, or a surface scripting it would think
+    it was exercising the flagged path while quietly taking the success
+    branch. A stubbed linter can't catch either mistake.
+    """
+    from app.models.tailor import TailoredResume
+    from app.services.ats_lint import lint_markdown
+    from app.services.llm.mock import ats_hostile_resume_json
+    from app.services.tailor.markdown_render import to_markdown
+
+    resume = TailoredResume.model_validate_json(ats_hostile_resume_json())
+    result = lint_markdown(to_markdown(resume), document_type="resume")
+
+    assert result.ok is False
+    assert any(v.code == "no_tables" and v.severity == "error" for v in result.errors)

@@ -147,6 +147,64 @@ def _dev_job_analysis(_latest_user: str, _messages: list[Message]) -> str:
     )
 
 
+def ats_hostile_resume_json(contact_name: str = "Daniel Joffe") -> str:
+    """A schema-VALID ``TailoredResume`` whose rendered markdown fails ATS lint.
+
+    Bug-corpus entry for #656. Every other failure in this module is the model
+    breaking its contract — prose instead of a tool call, truncated JSON,
+    malformed payloads. This one is the opposite and easier to miss: the model
+    returns a perfectly well-formed object that only becomes a problem once
+    ``to_markdown`` renders it and the linter reads the result. A pipe table
+    smuggled into bullet text is the canonical case (Greenhouse's parser reads
+    tables inconsistently, so ``no_tables`` is a blocking violation).
+
+    Scripting this is what lets a surface exercise the flagged-draft path
+    through the REAL linter instead of monkeypatching ``lint_docx`` — the stub
+    would happily "fail" on markdown the production linter accepts. Verified
+    the hard way while writing this: the obvious version, with the pipes
+    inlined into one bullet, lints CLEAN. ``_TABLE_PIPE_RE`` anchors per line
+    (``^\\s*\\|.*\\|\\s*$``), so the table only trips it once the model emits
+    real newlines — which is exactly the detail a stubbed linter would hide.
+
+    Deliberately returns a JSON string, not a model instance: the mock's
+    contract is text in, text out, and importing ``app.models.tailor`` here
+    would drag service-layer types into a module that stays free of them (same
+    rule as the duplicated purpose constants above).
+    """
+    return json.dumps(
+        {
+            "summary": "Senior frontend engineer with a decade of shipped work.",
+            "contact": {"name": contact_name, "email": "d@example.com"},
+            "experience": [
+                {
+                    "company": "FightCamp",
+                    "title": "Senior Frontend Engineer",
+                    "start": "2021-11",
+                    "end": "2024-04",
+                    "bullets": [
+                        {
+                            # The payload under test: a markdown table the
+                            # renderer passes straight through onto its own
+                            # lines, which is what the linter keys on.
+                            "text": (
+                                "Owned delivery metrics:\n"
+                                "| Metric | Before | After |\n"
+                                "|---|---|---|\n"
+                                "| LCP | 10s | 2s |"
+                            ),
+                            "source_outcome_ref": "Cut mobile load times from 10s to 2s",
+                        }
+                    ],
+                    "source_role_ref": "fc",
+                }
+            ],
+            "skills": ["React", "TypeScript"],
+            "education": [{"school": "UCLA", "degree": "BA"}],
+            "jd_snippet": "Senior FE role",
+        }
+    )
+
+
 def dev_default_responses() -> dict[str, ResponseSource]:
     """Scripted responses seeded into the mock for LOCAL DEV / integration only
     (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data

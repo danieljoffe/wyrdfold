@@ -215,6 +215,14 @@ class TailoredResumeRecord(BaseModel):
     source_resume_id: str | None = None
     """Points to the original resume when this was cloned via reuse (#504)."""
 
+    lint_violations: list[LintViolation] | None = None
+    """ATS lint state (#656). ``None`` = never linted (every row predating the
+    migration, and every cover letter — the column is resume-scoped);
+    ``[]`` = linted clean; a populated list = **flagged draft**, persisted
+    despite failing lint so the generation spend isn't thrown away. Refreshed
+    by ``POST /tailor/resumes/{id}/ats-recheck``, which is free (lint is
+    deterministic — no LLM)."""
+
     model_config = {"extra": "ignore"}
 
     def as_resume(self) -> TailoredResume:
@@ -236,10 +244,70 @@ class TailorResponse(BaseModel):
 
 
 class TailorLintFailureResponse(BaseModel):
-    """Router output when the linter finds blocking errors."""
+    """Router output when the linter finds blocking errors.
+
+    Still the shape of the PATCH/checkpoint 422s (a user edit that fails lint
+    is rejected outright — nothing was spent producing it). Post-#656 it is no
+    longer the shape of a *generation* lint failure: that persists a flagged
+    draft instead, and surfaces the same violations on the record.
+    """
 
     ok: Literal[False] = False
     violations: list[LintViolation]
+
+
+TailorRunStatus = Literal["running", "error", "idle"]
+
+
+class TailorStatusResponse(BaseModel):
+    """202 kick-off marker for the non-blocking tailor flow (#656).
+
+    * ``running`` — the pipeline is in flight in a detached task. It persists
+      regardless of the client, so the caller may navigate away and poll later.
+    * ``error`` — a previous run for this key failed; the client should retry.
+      (Only ever returned by the poll surface, not the kick-off.)
+    """
+
+    status: TailorRunStatus
+    message: str | None = None
+
+
+class TailoredDocumentState(BaseModel):
+    """Poll shape for ``GET /tailor/resumes/by-job/{id}`` and its cover-letter
+    sibling (#656).
+
+    Supersedes the bare ``TailoredResumeRecord | null`` those routes used to
+    return: a client that kicked off a background generation needs to tell
+    "nothing here yet, keep polling" from "nothing here, and nothing coming".
+
+    * ``record`` — the persisted document, or ``null`` when none exists yet.
+      A record whose ``lint_violations`` is non-empty is a **flagged draft**.
+    * ``status`` — ``running`` while a detached generation is in flight for
+      this (user, type, posting); ``error`` when the last one failed;
+      ``idle`` otherwise. ``idle`` with a ``null`` record is the "generate"
+      empty state; ``idle`` with a record is a settled document.
+    * ``message`` — the failure text when ``status == "error"``.
+
+    Violations deliberately live on the record rather than being mirrored at
+    this level: the ``documents.lint_violations`` column is the single source
+    of truth, and a copy here would go stale against an ats-recheck.
+    """
+
+    record: TailoredResumeRecord | None = None
+    status: TailorRunStatus = "idle"
+    message: str | None = None
+
+
+class AtsRecheckResponse(BaseModel):
+    """Router output for ``POST /tailor/resumes/{id}/ats-recheck``.
+
+    ``ok`` mirrors ``LintResult.ok`` — true when nothing blocking remains, at
+    which point ``violations`` holds only warnings (or is empty).
+    """
+
+    ok: bool
+    violations: list[LintViolation]
+    record: TailoredResumeRecord
 
 
 class GapGateFailureResponse(BaseModel):
