@@ -135,3 +135,28 @@ def test_missing_embed_is_not_silently_treated_as_no_salary() -> None:
     f = _LogisticsFilter(min_salary=150_000)
     bare = {"job_posting_id": "j1", "logistics_filters": {}}
     assert _score_row_passes_logistics(bare, f, include_unknown_salary=False) is False
+
+
+def test_mixed_embed_shapes_must_not_engage_the_prefilter() -> None:
+    """Guard on the guard (found in self-review of #655).
+
+    If a result set ever mixes rows that carry the jobs embed with rows that
+    don't, the pre-filter must NOT engage: an embed-less row has no
+    deterministic salary columns, so evaluating it at the scores layer reads
+    as 'unknown salary' and the strict default would silently drop a job the
+    post-fetch path would have kept. The engage-condition is therefore ALL,
+    not ANY — the cost of being wrong is a slower request, not a lost row.
+    """
+    from app.routers.jobs import _embedded_jobs_field
+
+    with_embed = {"job_posting_id": "a", "jobs": {"id": "a"}, "logistics_filters": {}}
+    without_embed = {"job_posting_id": "b", "logistics_filters": {}}
+    rows = [with_embed, without_embed]
+
+    engages = all(_embedded_jobs_field(r, "id") is not None for r in rows)
+    assert engages is False, "mixed shapes must fall back to post-fetch"
+
+    # And the reason it matters: read at the scores layer, the embed-less row
+    # would be dropped under the strict default.
+    f = _LogisticsFilter(min_salary=150_000)
+    assert _score_row_passes_logistics(without_embed, f, include_unknown_salary=False) is False

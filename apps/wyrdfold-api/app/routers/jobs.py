@@ -891,7 +891,14 @@ async def _assemble_jobs_page(
         logistics is not None
         and logistics.active
         and by_id
-        and any(_embedded_jobs_field(r, "id") is not None for r in by_id.values())
+        # ALL, not any: the pre-filter may only engage when EVERY row can be
+        # evaluated correctly. A row without the embed has no deterministic
+        # salary columns, so read here it looks like "unknown salary" and the
+        # strict default would silently DROP it. Shapes are uniform per query
+        # today (the select is chosen once), so this is latent — but the
+        # failure mode is silent data loss, and the fallback is merely the
+        # slower post-fetch path. Fail safe, not fast.
+        and all(_embedded_jobs_field(r, "id") is not None for r in by_id.values())
     ):
         by_id = {
             pid: row
