@@ -2186,3 +2186,53 @@ def test_phase1_rejection_cache_size_bound(monkeypatch):
     assert list(poller_mod._PHASE1_REJECTIONS) == [
         poller_mod._phase1_rejection_key(target, "another title")
     ]
+
+
+def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#638 regression (2026-08-06 incident): the fan-out checked
+    pipeline-active ONCE at entry, so deactivating the target mid-run
+    changed nothing — a sweep-activated target ground the full catalog
+    for 3+ hours after deactivation and saturated Supabase into gateway
+    504s. The watcher must abort remaining sources within one re-check
+    interval; drained workers report unpolled."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    import app.services.poller as poller_mod
+    from app.services.poller import poll_sources_for_target
+
+    # Active at entry, inactive on every re-check.
+    checks = {"n": 0}
+
+    async def _active(_sb, _tid):
+        checks["n"] += 1
+        return checks["n"] == 1
+
+    monkeypatch.setattr(poller_mod, "_is_pipeline_active", _active)
+    monkeypatch.setattr(poller_mod, "_ACTIVE_RECHECK_S", 0.02)
+    monkeypatch.setattr(
+        poller_mod, "_read_enabled_sources", AsyncMock(return_value=[{"id": f"s-{i}"} for i in range(40)])
+    )
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=MagicMock(
+        payer_for=lambda _tid: None, target_blocked=lambda _tid: False,
+    )))
+
+    polled: list[str] = []
+
+    async def _slow_source(source, _sb, _target, **_kw):
+        polled.append(source["id"])
+        await asyncio.sleep(0.05)
+        return {"polled": True, "new": 0, "updated": 0, "error": None}
+
+    monkeypatch.setattr(poller_mod, "_poll_one_source_for_target", _slow_source)
+
+    target = _full_target(app_active=True, search_keywords=["frontend"])
+    result = asyncio.run(poll_sources_for_target(MagicMock(), target))
+
+    # The watcher fired within ~one interval — most of the 40 sources were
+    # drained as no-ops rather than polled.
+    assert result.sources_polled < 40, "fan-out never aborted"
+    assert len(polled) < 40
+    assert any("deactivated mid-run" in e for e in result.errors)

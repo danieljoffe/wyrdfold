@@ -1775,3 +1775,91 @@ class TestPostingTargetMapPagination:
         client = MagicMock()
         assert await _posting_target_map(client, None) is None
         client.table.assert_not_called()
+
+
+class TestTargetsHappyPathSkipsMembershipWalk:
+    """#635 regression (from the #634 F1 incident): when the GROUP BY RPC
+    succeeds, compute_targets must issue ZERO scores-table reads. The old
+    code keyset-walked the user's ENTIRE scores membership (pages of 1k)
+    before the RPC branch — data only the RPC-unavailable fallback consumes
+    — and under DB contention that walk ran 25 minutes of sequential
+    statements, each under the statement timeout, the total unbounded."""
+
+    async def test_rpc_success_issues_no_scores_reads(self):
+        tables_read: list[str] = []
+
+        client = MagicMock()
+
+        def table_side_effect(name: str) -> MagicMock:
+            tables_read.append(name)
+            tbl = MagicMock()
+            result = MagicMock()
+            result.data = (
+                [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
+            )
+            for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq", "in_"):
+                getattr(tbl, method).return_value = tbl
+            tbl.execute = AsyncMock(return_value=result)
+            return tbl
+
+        client.table.side_effect = table_side_effect
+
+        rpc_result = MagicMock()
+        rpc_result.data = {
+            "targets": [
+                {
+                    "target_id": "t1",
+                    "job_count": 2,
+                    "score_sum": 150,
+                    "score_n": 2,
+                    "applied_count": 1,
+                    "interview_count": 0,
+                }
+            ],
+            "distribution": [{"bucket_idx": 7, "count": 2}],
+            "trend": [],
+            "unscored": 0,
+        }
+        rpc_chain = MagicMock()
+        rpc_chain.execute = AsyncMock(return_value=rpc_result)
+        client.rpc.return_value = rpc_chain
+
+        result = await compute_targets(client, since=None, target_ids={"t1"}, user_id=_USER)
+
+        assert "scores" not in tables_read, (
+            f"happy path must not walk scores membership; tables read: {tables_read}"
+        )
+        assert result.targets[0].job_count == 2
+        assert result.targets[0].avg_score == 75.0
+
+    async def test_empty_rpc_aggregates_assemble_to_zero_shape(self):
+        """The old pre-pass also powered an empty-set early return; the RPC
+        path must reproduce that exact shape from empty aggregates."""
+        client = MagicMock()
+
+        def table_side_effect(name: str) -> MagicMock:
+            tbl = MagicMock()
+            result = MagicMock()
+            result.data = [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
+            for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq", "in_"):
+                getattr(tbl, method).return_value = tbl
+            tbl.execute = AsyncMock(return_value=result)
+            return tbl
+
+        client.table.side_effect = table_side_effect
+        rpc_result = MagicMock()
+        rpc_result.data = {"targets": [], "distribution": [], "trend": [], "unscored": 0}
+        rpc_chain = MagicMock()
+        rpc_chain.execute = AsyncMock(return_value=rpc_result)
+        client.rpc.return_value = rpc_chain
+
+        result = await compute_targets(client, since=None, target_ids={"t1"}, user_id=_USER)
+
+        assert result.targets == []
+        assert result.score_trend == []
+        assert result.unscored_count == 0
+        assert [b.bucket for b in result.score_distribution] == [
+            "0-10", "10-20", "20-30", "30-40", "40-50",
+            "50-60", "60-70", "70-80", "80-90", "90-100",
+        ]
+        assert all(b.count == 0 for b in result.score_distribution)
