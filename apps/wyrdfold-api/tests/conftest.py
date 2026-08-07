@@ -174,3 +174,15 @@ def mock_http_client():
     http_mod._client = client
     yield client
     http_mod._client = original
+
+
+@pytest.fixture(autouse=True)
+def _reset_spend_memo():
+    """#642: the day-spend TTL memo is module-global state — reset per test
+    so each test's mocked meter value is actually read (a stale cached value
+    otherwise leaks across tests and breaks budget-gate assertions)."""
+    from app.services import poller as _poller_mod
+
+    _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)
+    yield
+    _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)
