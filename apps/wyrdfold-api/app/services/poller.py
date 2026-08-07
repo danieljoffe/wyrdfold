@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Coroutine
@@ -468,6 +469,65 @@ def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, st
     co = " ".join((company or "").lower().split())
     ti = " ".join((title or "").lower().split())
     return (co, ti)
+
+
+# The refreshable payload fields the per-cycle content hash covers (#642).
+# Derived columns (city/state/country/location_remote from ``location``;
+# salary_min/max/currency/period from ``salary_text``) are deliberately
+# absent: they are pure functions of hashed inputs, so hashing the inputs
+# suffices — and code changes to the derivations are healed by backfills,
+# not by rewriting every row every cycle.
+_CONTENT_HASH_FIELDS = (
+    "title",
+    "location",
+    "description_html",
+    "absolute_url",
+    "source_posted_at",
+    "salary_text",
+)
+
+
+def _content_hash(row: dict[str, Any]) -> str:
+    """sha256 over the poller-refreshable payload of a built jobs row.
+
+    Change-detection for the per-cycle content refresh (#642): the poller
+    used to rewrite every KNOWN row's full payload every cycle (~63
+    rewrites per row measured; description_html TOAST included) and then
+    re-run stage-2 scoring on it — the dominant write load behind the
+    2026-08-06/07 disk-IO exhaustion incidents. Rows whose hash matches
+    the stored ``jobs.content_hash`` skip both.
+    """
+    h = hashlib.sha256()
+    for field in _CONTENT_HASH_FIELDS:
+        value = row.get(field)
+        h.update(b"\x1f")
+        h.update(("" if value is None else str(value)).encode())
+    return h.hexdigest()
+
+
+def _partition_unchanged(
+    rows: list[dict[str, Any]],
+    known_hashes: dict[str | None, str | None],
+) -> tuple[list[dict[str, Any]], int]:
+    """Split built rows into (to_write, skipped_unchanged_count).
+
+    A row skips iff its external_id is KNOWN and the stored hash equals its
+    freshly computed hash. Fresh rows and NULL-stored-hash rows (pre-#642
+    ingests) always write — the write stamps ``content_hash``, so each
+    legacy row pays exactly one more rewrite and then skips forever.
+    Every written row carries its hash in the payload.
+    """
+    to_write: list[dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        digest = _content_hash(row)
+        ext = row.get("external_id")
+        if ext in known_hashes and known_hashes[ext] == digest:
+            skipped += 1
+            continue
+        row["content_hash"] = digest
+        to_write.append(row)
+    return to_write, skipped
 
 
 def _dedupe_by_content(
@@ -1494,12 +1554,19 @@ async def _poll_one_source(
         # deliberately out of bounds.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs").select("external_id").eq("source_id", source_id),
+            lambda c: c.table("jobs")
+            .select("external_id, content_hash")
+            .eq("source_id", source_id),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
-        known_external_ids = {
-            r.get("external_id") for r in cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_rows_read = cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_external_ids = {r.get("external_id") for r in known_rows_read}
+        # external_id → stored content hash (#642): drives the unchanged-row
+        # skip before the upsert. NULL for pre-migration rows (always write
+        # once, stamping the hash).
+        known_hashes: dict[str | None, str | None] = {
+            r.get("external_id"): r.get("content_hash") for r in known_rows_read
         }
 
         # Payer/allowance snapshot: who pays for each target's LLM work,
@@ -1806,6 +1873,20 @@ async def _poll_one_source(
         # conflict-update (archival Stage 2).
         if rows_to_upsert:
             rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
+
+        # #642: drop KNOWN rows whose refreshable payload is byte-identical
+        # to what's stored — no jobs rewrite (TOAST included), and because
+        # the scoring stages below iterate the UPSERT RESULT, no redundant
+        # stage-1/2 rescore either. Content or salary changes alter the
+        # hash and flow through unchanged-path-free. Profile-version bumps
+        # rescore via bulk_score_for_target at bump time, not here.
+        unchanged_skipped = 0
+        if rows_to_upsert:
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(
+                rows_to_upsert, known_hashes
+            )
+            if unchanged_skipped:
+                summary["unchanged"] = unchanged_skipped
 
         # Re-check after dedupe: it can remove EVERY row (a source whose
         # postings are all cross-posting dupes of existing rows). Calling
@@ -2338,7 +2419,30 @@ async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float 
         # spender yields entirely, leaving the budget for grading.
         return True
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    return await total_llm_spend_all_async(supabase, since=midnight) >= effective_cap
+    return await _memoized_total_spend(supabase, midnight) >= effective_cap
+
+
+# #642: TTL memo for the day-spend aggregate. The mid-loop budget re-checks
+# (per qualify chunk, per triage batch) each re-aggregated today's llm_costs
+# — pg_stat showed the spend read among the top time consumers (236k calls).
+# One chunk of LLM work takes minutes, so a 60s-stale meter changes nothing
+# operationally: worst case one extra ~15-job chunk (~cents) before the next
+# fresh read trips the breaker. Cache keys on the midnight boundary so the
+# UTC-day rollover naturally invalidates.
+_SPEND_MEMO_TTL_S = 60.0
+_spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0}
+
+
+async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> float:
+    now = time.monotonic()
+    if (
+        _spend_memo["midnight"] == midnight
+        and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S
+    ):
+        return cast(float, _spend_memo["value"])
+    value = await total_llm_spend_all_async(supabase, since=midnight)
+    _spend_memo.update(at=now, midnight=midnight, value=value)
+    return value
 
 
 async def _triage_budget_blocks(supabase: AsyncClient) -> bool:
@@ -2665,6 +2769,12 @@ def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> Non
         result.sources_polled += 1
     result.new_jobs += summary["new"]
     result.updated_jobs += summary["updated"]
+    # #642 visibility: unchanged-row skips ride the log, not PollResult
+    # (API model stability). Grep 'poll cycle unchanged' for the cycle sum.
+    if summary.get("unchanged"):
+        logger.debug(
+            "poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"]
+        )
     result.archived_jobs += summary["archived"]
     if summary["error"]:
         result.errors.append(summary["error"])
@@ -2906,12 +3016,19 @@ async def _poll_one_source_for_target(
         # refresh. Same full-set admission scoping as ``_poll_one_source``.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs").select("external_id").eq("source_id", source_id),
+            lambda c: c.table("jobs")
+            .select("external_id, content_hash")
+            .eq("source_id", source_id),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
-        known_external_ids = {
-            r.get("external_id") for r in cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_rows_read = cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_external_ids = {r.get("external_id") for r in known_rows_read}
+        # external_id → stored content hash (#642): drives the unchanged-row
+        # skip before the upsert. NULL for pre-migration rows (always write
+        # once, stamping the hash).
+        known_hashes: dict[str | None, str | None] = {
+            r.get("external_id"): r.get("content_hash") for r in known_rows_read
         }
 
         # Phase 1 per-target triage (single target). Same semantics as
@@ -3090,6 +3207,20 @@ async def _poll_one_source_for_target(
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
         if rows_to_upsert:
             rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
+
+        # #642: drop KNOWN rows whose refreshable payload is byte-identical
+        # to what's stored — no jobs rewrite (TOAST included), and because
+        # the scoring stages below iterate the UPSERT RESULT, no redundant
+        # stage-1/2 rescore either. Content or salary changes alter the
+        # hash and flow through unchanged-path-free. Profile-version bumps
+        # rescore via bulk_score_for_target at bump time, not here.
+        unchanged_skipped = 0
+        if rows_to_upsert:
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(
+                rows_to_upsert, known_hashes
+            )
+            if unchanged_skipped:
+                summary["unchanged"] = unchanged_skipped
 
         if rows_to_upsert:
             # Routing through the seam also gives this upsert the transient-
