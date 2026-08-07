@@ -484,11 +484,25 @@ async def test_live_view_applies_jobs_inner_join() -> None:
         cursor={},
     )
     # The embed also rides the gate + recency columns (perf: kills the
-    # per-request chunked role_family/posted-date reads).
-    assert any(
-            "jobs!inner(id, role_family, source_posted_at, cataloged_at)" in s
-            for s in rec.selects
-        )
+    # per-request chunked role_family/posted-date reads), and since #654 the
+    # deterministic salary columns too, so the logistics filter can run at
+    # the scores layer instead of forcing a full hydration.
+    #
+    # Asserted per-column rather than as one literal: the column ORDER is not
+    # the invariant — the join type and the ride-along set are.
+    embed_selects = [s for s in rec.selects if "jobs!inner(" in s]
+    assert embed_selects, "live view must inner-join jobs at the scores layer"
+    for col in (
+        "id",
+        "role_family",
+        "source_posted_at",
+        "cataloged_at",
+        "salary_min",
+        "salary_max",
+        "salary_currency",
+        "salary_period",
+    ):
+        assert any(col in s for s in embed_selects), "embed lost " + col
     assert ("jobs.archived_at", "null") in rec.is_calls
     assert ("jobs.purged_at", "null") in rec.is_calls
     assert ("not.jobs.is_us", "false") in rec.is_calls
