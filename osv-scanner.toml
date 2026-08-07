@@ -1,0 +1,36 @@
+# osv-scanner suppressions. EXCEPTIONAL — the default and near-universal fix
+# for an advisory in this repo is a version pin in pnpm-workspace.yaml
+# `overrides`. An entry belongs here ONLY when no fixed version exists at any
+# version AND the package is unreachable in our usage. Each entry carries a
+# review date; revisit rather than letting a suppression calcify.
+
+[[IgnoredVulns]]
+id = "GHSA-5p2g-fcmc-qvqq"
+ignoreUntil = 2026-09-07
+reason = """
+image-size DoS via infinite loop in the JXL/HEIF parsers.
+
+NO FIXED VERSION EXISTS. OSV's affected range is {introduced: 0,
+last_affected: 2.0.2} and 2.0.2 is also the LATEST published release — the
+maintainer has shipped no patch on any line, so an override cannot clear this
+(0.5.5 -> 1.2.1 was tried and is equally flagged).
+
+Unreachable here: image-size arrives only via less@4, a PEER of vite deep in
+the @nx toolchain. It is devDependencies-only, never enters a production
+bundle, and this repo ships no Less stylesheets at all. Exploitation requires
+feeding attacker-controlled JXL/HEIF images to the parser, which nothing in
+our build does.
+
+Re-check 2026-09-07: drop this the moment a patched release lands.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-w3rx-r6r6-pgpr"
+ignoreUntil = 2026-09-07
+reason = """
+Second advisory against the same unpatched image-size parsers; identical
+reasoning to GHSA-5p2g-fcmc-qvqq above — no fixed version at any version,
+dev-only transitive via less@4 (vite peer), no Less in this repo.
+
+Re-check 2026-09-07.
+"""
