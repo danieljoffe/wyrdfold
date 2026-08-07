@@ -6,7 +6,7 @@
 
 [[IgnoredVulns]]
 id = "GHSA-5p2g-fcmc-qvqq"
-reviewUntil = 2026-09-07
+ignoreUntil = 2026-09-07
 reason = """
 image-size DoS via infinite loop in the JXL/HEIF parsers.
 
@@ -26,7 +26,7 @@ Re-check 2026-09-07: drop this the moment a patched release lands.
 
 [[IgnoredVulns]]
 id = "GHSA-w3rx-r6r6-pgpr"
-reviewUntil = 2026-09-07
+ignoreUntil = 2026-09-07
 reason = """
 Second advisory against the same unpatched image-size parsers; identical
 reasoning to GHSA-5p2g-fcmc-qvqq above — no fixed version at any version,
