@@ -635,7 +635,10 @@ _SCORE_ROW_COLS = (
 # columns these paths used to re-fetch in up to ~20 sequential chunked reads
 # per request (the 4-8s /jobs + dashboard latencies, 2026-07-16). One join,
 # zero extra round-trips.
-_JOBS_EMBED = ", jobs!inner(id, role_family, source_posted_at, cataloged_at)"
+_JOBS_EMBED = (
+    ", jobs!inner(id, role_family, source_posted_at, cataloged_at, "
+    "salary_min, salary_max, salary_currency, salary_period)"
+)
 
 
 def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
@@ -858,7 +861,52 @@ async def _assemble_jobs_page(
     # pre-filter total and render short. The score cutoff is NOT here — it's
     # already folded into min_score at the query layer.
     has_pref_filter = _preferences_have_post_fetch_filter(preferences)
-    has_logistics_filter = logistics is not None and logistics.active
+    def _include_unknown_salary_for_row(row: dict[str, Any]) -> bool:
+        """``_include_unknown_salary`` for a scores row (no hydrated posting
+        exists yet at pre-filter time). Same precedence: explicit per-target
+        preferences win; the cross-target path falls back to the row's winning
+        target's pref; api-key/global paths stay strict."""
+        if preferences is not None:
+            return preferences.pref_include_unknown_salary
+        if include_unknown_salary_by_target is None:
+            return False
+        tid = row.get("target_id")
+        return include_unknown_salary_by_target.get(str(tid), True) if tid else True
+
+    # ---- #654: logistics filtering moves BEFORE pagination ----------------
+    # remote/salary/country used to be post-fetch, which forced
+    # ``page_ids = list(by_id.keys())`` — every candidate hydrated through
+    # chunked IN() reads just to return one page. Measured on prod: ~11,966
+    # rows fetched over dozens of round-trips to serve 20, i.e. the 2.1-2.7s
+    # ``/jobs?...&min_salary=`` requests (a plain score sort never tripped the
+    # slow-request threshold at all).
+    #
+    # Both inputs are already on the scores row — ``logistics_filters`` is in
+    # _SCORE_ROW_COLS and the deterministic salary columns ride the EXISTING
+    # jobs!inner join — so evaluating here costs no extra reads and lets the
+    # scores layer paginate again. The archived view fetches without the embed
+    # (no salary columns), so it keeps the post-fetch path unchanged.
+    logistics_prefiltered = False
+    if (
+        logistics is not None
+        and logistics.active
+        and by_id
+        and any(_embedded_jobs_field(r, "id") is not None for r in by_id.values())
+    ):
+        by_id = {
+            pid: row
+            for pid, row in by_id.items()
+            if _score_row_passes_logistics(
+                row,
+                logistics,
+                include_unknown_salary=_include_unknown_salary_for_row(row),
+            )
+        }
+        logistics_prefiltered = True
+
+    has_logistics_filter = (
+        logistics is not None and logistics.active and not logistics_prefiltered
+    )
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
@@ -1615,12 +1663,36 @@ def _logistics_passes(
       (case-insensitive) OR is absent (a remote role with no country anchor
       still passes).
     """
-    log = posting.get("logistics_filters") or {}
+    return _logistics_core(
+        f,
+        log=posting.get("logistics_filters") or {},
+        salary_currency=posting.get("salary_currency"),
+        salary_period=posting.get("salary_period"),
+        salary_max=posting.get("salary_max"),
+        salary_min=posting.get("salary_min"),
+        include_unknown_salary=include_unknown_salary,
+    )
+
+
+def _logistics_core(
+    f: _LogisticsFilter,
+    *,
+    log: dict[str, Any],
+    salary_currency: Any,
+    salary_period: Any,
+    salary_max: Any,
+    salary_min: Any,
+    include_unknown_salary: bool,
+) -> bool:
+    """The one logistics predicate. Both callers — the posting-level filter
+    and the scores-row pre-filter (#654) — route through here so the two
+    layers cannot drift; a divergence would silently change which jobs a
+    filter returns depending on which path a request happened to take."""
     if f.remote_only and log.get("remote_status") != "remote":
         return False
     if f.min_salary is not None:
-        if posting.get("salary_currency") == "USD" and posting.get("salary_period") == "yearly":
-            bound = posting.get("salary_max") or posting.get("salary_min")
+        if salary_currency == "USD" and salary_period == "yearly":
+            bound = salary_max or salary_min
         else:
             bound = log.get("salary_max")
         if bound is None:
@@ -1633,6 +1705,28 @@ def _logistics_passes(
         if country is not None and str(country).upper() != f.country.upper():
             return False
     return True
+
+
+def _score_row_passes_logistics(
+    row: dict[str, Any], f: _LogisticsFilter, *, include_unknown_salary: bool
+) -> bool:
+    """The same predicate, evaluated against a SCORES row instead of a
+    hydrated posting — the whole point of #654.
+
+    Both inputs are already in hand at that layer: ``logistics_filters`` is
+    part of ``_SCORE_ROW_COLS``, and the deterministic salary columns ride
+    the existing ``jobs!inner`` join. Filtering here lets pagination stay at
+    the scores layer, so hydration costs one page instead of the entire
+    candidate set."""
+    return _logistics_core(
+        f,
+        log=row.get("logistics_filters") or {},
+        salary_currency=_embedded_jobs_field(row, "salary_currency"),
+        salary_period=_embedded_jobs_field(row, "salary_period"),
+        salary_max=_embedded_jobs_field(row, "salary_max"),
+        salary_min=_embedded_jobs_field(row, "salary_min"),
+        include_unknown_salary=include_unknown_salary,
+    )
 
 
 def _apply_logistics_filter(
