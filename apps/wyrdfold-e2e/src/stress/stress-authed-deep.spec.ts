@@ -361,10 +361,72 @@ test('deep: jobs filter + sort gaps', async ({ page }) => {
       );
       expect(
         offenders.map(o => o.score),
-        'min_score=70 returned non-pending rows scored below 70 — the floor ' +
-          'exempts every row whose scoring_status !== "complete", but those ' +
-          'rows come back pending:false with a real numeric score, so the UI ' +
-          'renders them as ordinary results under a "Score 70+" chip'
+        'min_score=70 returned non-pending rows whose DISPLAYED score is ' +
+          'below 70. Two distinct defects can cause this; check raw_score to ' +
+          'tell them apart. (a) raw_score also < 70 => the floor predicate is ' +
+          'broken (fixed for get_cross_target_jobs by migration ' +
+          '20260808120000). (b) raw_score >= 70 but shown < 70 => the floor ' +
+          'filters the RAW score while the API returns a read-time DECAYED ' +
+          'score (RECENCY_DECAY_ENABLED=true in prod), so a "Score 70+" chip ' +
+          'renders a card reading 56. (b) is a KNOWN OPEN DEFECT — see the ' +
+          'linked issue. Do not weaken this guard to get green; it encodes ' +
+          'the promise the chip makes to the user.'
+      ).toEqual([]);
+    },
+    async () => {
+      /* assertion above */
+    }
+  );
+
+  // The floor invariant the RPC fix actually establishes: whatever the display
+  // layer then does to the number, no genuinely-graded row may enter a floored
+  // list with a raw fit score under the bar. Split out from the guard above so
+  // the two defects fail independently — before migration 20260808120000 this
+  // returned 858 graded rows under the floor on the owner's target set.
+  await timedAction(
+    page,
+    'jobs.filter.min-score.raw-floor-holds',
+    'jobs',
+    async () => {
+      const res = await page.request.get(
+        '/api/jobs?page_size=25&sort=score&order=desc&min_score=70'
+      );
+      const body = (await res.json()) as {
+        postings?: {
+          score: number | null;
+          raw_score?: number | null;
+          pending?: boolean;
+        }[];
+      };
+      const rows = body.postings ?? [];
+      // Guard the guard: a page of all-pending rows would satisfy the
+      // assertion vacuously, having tested nothing.
+      const graded = rows.filter(p => !p.pending);
+      expect(
+        graded.length,
+        'no non-pending rows came back, so the floor assertion below would ' +
+          'pass without exercising anything — the fixture or the account has ' +
+          'no graded rows above the floor'
+      ).toBeGreaterThan(0);
+      // ...and guard the guard again: if raw_score were absent the offender
+      // filter below could never match, so the assertion would certify the
+      // floor while testing nothing.
+      expect(
+        graded.filter(p => typeof p.raw_score !== 'number'),
+        'graded rows came back without a numeric raw_score, so the floor ' +
+          'assertion below cannot fail — the API stopped surfacing the ' +
+          'undecayed fit score this guard reads'
+      ).toHaveLength(0);
+      const offenders = graded.filter(
+        p => typeof p.raw_score === 'number' && p.raw_score < 70
+      );
+      expect(
+        offenders.map(o => o.raw_score),
+        'min_score=70 admitted graded rows whose RAW fit score is below 70. ' +
+          'The floor must judge every row carrying a real grade and exempt ' +
+          'only not-yet-graded (Pending) rows. Keying the exemption on ' +
+          'scoring_status instead of the graded signal is what caused this ' +
+          'in prod on 2026-08-08.'
       ).toEqual([]);
     },
     async () => {

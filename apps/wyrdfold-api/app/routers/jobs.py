@@ -2381,8 +2381,10 @@ async def _pipeline_counts_grouped(
     to the client-side chunked variant if the RPC isn't deployed yet.
 
     Floored counts ride the RPC too: since 20260716050000 it mirrors
-    ``_apply_score_floor`` exactly (the floor applies only to rows with
-    ``scoring_status = 'complete'``; Pending rows always pass, #47).
+    ``_apply_score_floor`` exactly — the floor judges only genuinely graded
+    rows (``axis_scores IS NOT NULL``); Pending rows always pass (#47).
+    That exemption keyed on ``scoring_status`` until 20260808040000; see
+    ``_apply_score_floor`` for why that column is not the graded signal.
     Floored users previously forced the Python path — ~1.6–2.6s of chunked
     round-trips inside the dashboard's hottest projection."""
     try:
