@@ -45,6 +45,10 @@ let manualJobId: string | null = null;
 let draftJobId: string | null = null;
 let promisedSaved = -1;
 let locationQuery = '';
+/** The target's activation state before this project touched anything, so the
+ *  teardown restores it instead of forcing it off. Captured on first use. */
+let wasActiveBeforeSweep = false;
+let capturedOriginalState = false;
 
 /**
  * `stress-authed.spec.ts` ends with `targets.deactivate-restore`, so by the
@@ -53,8 +57,39 @@ let locationQuery = '';
  * never appear, and serial mode then skipped five whole tests. Re-activate
  * here and hand the state back at the end.
  */
+async function targetIsActive(
+  page: import('@playwright/test').Page
+): Promise<boolean> {
+  const res = await page.request.get(
+    `/api/targets/${REAL_TARGET_ID}/user-target`
+  );
+  if (!res.ok()) return false;
+  const body = (await res.json()) as {
+    is_active?: boolean;
+    user_target?: { is_active?: boolean };
+  };
+  return Boolean(body.is_active ?? body.user_target?.is_active);
+}
+
 async function ensureJobsPopulated(page: import('@playwright/test').Page) {
-  await page.request.post(`/api/targets/${REAL_TARGET_ID}/activate`);
+  // IDEMPOTENT ON PURPOSE. Activation is not a free read: it spawns a poll
+  // fan-out across the target's sources. This helper used to POST /activate
+  // unconditionally at all three call sites, and the teardown deactivated
+  // unconditionally on top of the base spec's own deactivate — so one sweep
+  // cycled the target ~6 times and the API logged
+  // `poll_sources_for_target: … deactivated mid-fan-out — aborting remaining
+  // sources` ten times (prod, 2026-08-08). The sweep was measuring an app it
+  // was actively destabilising, and it left real poll work half-done.
+  //
+  // Ask first; only mutate when the state is actually wrong.
+  const active = await targetIsActive(page);
+  if (!capturedOriginalState) {
+    wasActiveBeforeSweep = active;
+    capturedOriginalState = true;
+  }
+  if (!active) {
+    await page.request.post(`/api/targets/${REAL_TARGET_ID}/activate`);
+  }
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     const res = await page.request.get(
@@ -1551,13 +1586,21 @@ test('deep: teardown — restore target activation state', async ({ page }) => {
     'targets.deactivate-restore',
     'targets',
     async () => {
-      const res = await page.request.post(
-        `/api/targets/${REAL_TARGET_ID}/deactivate`
-      );
-      expect(res.status()).toBeLessThan(500);
+      // Restore, don't blanket-deactivate. Deactivating a target that was
+      // already active before the sweep would (a) change state the sweep
+      // doesn't own and (b) abort whatever poll fan-out is in flight. If the
+      // owner had it active, leave it active.
+      if (capturedOriginalState && !wasActiveBeforeSweep) {
+        const res = await page.request.post(
+          `/api/targets/${REAL_TARGET_ID}/deactivate`
+        );
+        expect(res.status()).toBeLessThan(500);
+      }
     },
     async () => {
-      /* the owner had no active target before this sweep */
+      if (capturedOriginalState) {
+        expect(await targetIsActive(page)).toBe(wasActiveBeforeSweep);
+      }
     }
   );
 });

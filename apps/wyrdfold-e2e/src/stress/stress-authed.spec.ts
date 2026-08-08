@@ -29,8 +29,25 @@ test('setup: activate target for jobs coverage', async ({ page }) => {
     'targets.activate',
     'targets',
     async () => {
-      const res = await page.request.post(`/api/targets/${TARGET_ID}/activate`);
-      if (!res.ok()) throw new Error(`activate ${res.status()}`);
+      // Only activate when it isn't already. Activation spawns a poll fan-out,
+      // and a redundant one just races the previous cycle — the sweep logged
+      // ten `deactivated mid-fan-out — aborting remaining sources` lines in
+      // prod on 2026-08-08 by cycling this target ~6 times per run.
+      const current = await page.request.get(
+        `/api/targets/${TARGET_ID}/user-target`
+      );
+      const body = current.ok()
+        ? ((await current.json()) as {
+            is_active?: boolean;
+            user_target?: { is_active?: boolean };
+          })
+        : {};
+      if (!(body.is_active ?? body.user_target?.is_active)) {
+        const res = await page.request.post(
+          `/api/targets/${TARGET_ID}/activate`
+        );
+        if (!res.ok()) throw new Error(`activate ${res.status()}`);
+      }
     },
     async () => {
       const res = await page.request.get(
