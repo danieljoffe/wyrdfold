@@ -785,6 +785,7 @@ export default function CoverLetterReviewPage({
                   title='More actions'
                 >
                   <MoreVertical className='h-4 w-4' aria-hidden='true' />
+                  <span className='sr-only'>More actions</span>
                 </span>
               }
               items={[
