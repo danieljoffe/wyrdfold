@@ -9,6 +9,9 @@ import { defineConfig } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './src/stress',
+  // Truncate the ledger once per sweep — without this the gate reads rows
+  // written by PREVIOUS runs and reports coverage the run never achieved.
+  globalSetup: require.resolve('./src/stress/global-setup'),
   timeout: 900_000,
   retries: 0,
   workers: 1,
@@ -39,9 +42,21 @@ export default defineConfig({
       },
     },
     {
+      // Everything the earlier sweeps excluded as destructive/spend-heavy,
+      // plus the gaps the 2026-08-08 prod drive found. Runs after `authed`
+      // so the shared target is already activated and a resume draft exists.
+      name: 'deep',
+      testMatch: /stress-authed-deep\.spec\.ts/,
+      dependencies: ['authed'],
+      use: {
+        storageState:
+          process.env['STRESS_STORAGE_STATE'] ?? './stress-results/auth.json',
+      },
+    },
+    {
       name: 'gate',
       testMatch: /zz-coverage-gate\.spec\.ts/,
-      dependencies: ['authed'],
+      dependencies: ['deep'],
     },
   ],
 });

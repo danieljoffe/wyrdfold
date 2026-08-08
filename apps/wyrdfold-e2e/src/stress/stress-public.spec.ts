@@ -232,4 +232,39 @@ test('public pages + search journey', async ({ page }) => {
       /* asserted in act */
     }
   );
+
+  // A shared /search URL must restore its own filter state on a cold load —
+  // the whole point of putting the query in the URL.
+  await timedAction(
+    page,
+    'search.share-url.restore',
+    'search',
+    async () => {
+      await page.goto('/search?q=frontend&salary_floor=150000', {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.waitForLoadState('networkidle', { timeout: 60_000 });
+    },
+    async () => {
+      await expect(
+        page.getByLabel(/search jobs by title or keyword/i)
+      ).toHaveValue(/frontend/i, { timeout: 40_000 });
+    }
+  );
+
+  await timedAction(
+    page,
+    'public.404',
+    'public',
+    async () => {
+      await page.goto('/definitely-not-a-real-public-route', {
+        waitUntil: 'domcontentloaded',
+      });
+    },
+    async () => {
+      await expect(
+        page.getByText(/not found|404|doesn’t exist|does not exist/i).first()
+      ).toBeVisible({ timeout: 30_000 });
+    }
+  );
 });
