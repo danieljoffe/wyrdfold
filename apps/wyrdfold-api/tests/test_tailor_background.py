@@ -601,13 +601,14 @@ def test_cover_letter_post_returns_202(monkeypatch: pytest.MonkeyPatch) -> None:
             coro.close()
 
 
-async def test_backgrounded_cover_letter_lint_failure_surfaces_as_a_poll_error(
+async def test_backgrounded_cover_letter_lint_failure_finishes_flagged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cover letters have no flagged-draft column (``documents.lint_violations``
-    is resume-scoped), so a lint failure becomes a registry error the poll
-    reports — rather than persisting a letter that silently fails lint, or
-    leaving the client polling a run that will never produce a row."""
+    """Cover letters now match resumes exactly: a lint failure is a RESULT, not
+    a failure. The pipeline persisted a flagged draft, so the task finishes and
+    the poll finds a real record — it must NOT mark the run ``error``, which
+    would hide the very draft the flagged-persist decision exists to preserve.
+    """
     captured = _capture_spawned(monkeypatch)
     key = run_registry.key_for(
         user_id=_USER, document_type="cover_letter", job_posting_id=_JOB
@@ -622,6 +623,13 @@ async def test_backgrounded_cover_letter_lint_failure_surfaces_as_a_poll_error(
         letter=_LETTER,
         warnings=[],
         llm_result=_LLM_RESULT,
+        record=_record(
+            document_type="cover_letter",
+            lint_violations=[
+                LintViolation(code="no_tables", message="Contains a table", severity="error")
+            ],
+        ),
+        payload_md="# Flagged letter",
     )
     try:
         with _pipeline(failure, cover_letter=True), _client() as tc:
@@ -635,9 +643,8 @@ async def test_backgrounded_cover_letter_lint_failure_surfaces_as_a_poll_error(
             )
             await captured[0]
 
-        st = run_registry.get(key)
-        assert st is not None and st.status == "error"
-        assert "Contains a table" in (st.error or "")
+        # Cleared, not failed — the poll reads the flagged record.
+        assert run_registry.get(key) is None
     finally:
         for coro in captured:
             coro.close()
@@ -807,21 +814,32 @@ async def test_ats_recheck_404s_for_someone_elses_document() -> None:
     assert exc.value.status_code == 404
 
 
-async def test_ats_recheck_422s_for_a_cover_letter() -> None:
-    """``documents.lint_violations`` is resume-scoped; accepting a letter here
-    would write a column nothing on that path reads or maintains."""
-    from fastapi import HTTPException
-
-    with patch(
-        "app.services.tailor.persistence.get",
-        new_callable=AsyncMock,
-        return_value=_record(document_type="cover_letter"),
+async def test_ats_recheck_works_for_a_cover_letter() -> None:
+    """Letters persist flagged like resumes, so they need the same free way to
+    confirm a fix. The lint runs under the row's OWN document_type — the
+    cover-letter rule set differs from the resume one."""
+    letter = _record(document_type="cover_letter", payload_md=_CLEAN_MD)
+    with (
+        patch(
+            "app.services.tailor.persistence.get",
+            new_callable=AsyncMock,
+            return_value=letter,
+        ),
+        patch(
+            "app.services.tailor.persistence.update_lint_violations",
+            new_callable=AsyncMock,
+            return_value=letter,
+        ) as mock_update,
+        patch("app.routers.tailor.lint_markdown") as mock_lint,
     ):
-        with pytest.raises(HTTPException) as exc:
-            await tailor_router.recheck_tailored_resume(
-                resume_id="cl-1", supabase=MagicMock(), user_id=_USER
-            )
-    assert exc.value.status_code == 422
+        mock_lint.return_value = LintResult(ok=True, violations=[])
+        resp = await tailor_router.recheck_tailored_resume(
+            resume_id="cl-1", supabase=MagicMock(), user_id=_USER
+        )
+
+    assert resp.ok is True
+    assert mock_lint.call_args.kwargs["document_type"] == "cover_letter"
+    assert mock_update.call_args.args[2] == []
 
 
 async def test_ats_recheck_422s_when_there_is_no_markdown() -> None:

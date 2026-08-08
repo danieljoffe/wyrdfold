@@ -95,7 +95,10 @@ describe('CoverLetterReviewPage', () => {
         return Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => RECORD,
+          // #656 envelope — the route returns {record, status}, NOT a bare
+          // record. Mocking the bare shape is why this spec kept passing
+          // while the page was actually inert in production.
+          json: async () => ({ record: RECORD, status: 'idle' }),
         } as Response);
       }
       return Promise.resolve({
@@ -130,5 +133,87 @@ describe('CoverLetterReviewPage', () => {
         })
       );
     });
+  });
+});
+
+/**
+ * Regression + parity for #656's cover-letter flagged drafts.
+ *
+ * The first test here is the one that was missing: the by-job cover-letter
+ * route returns a `{record, status}` envelope, and this page was reading it as
+ * a bare record — so `record.id` was undefined and the editor loaded empty.
+ * It shipped because the spec above mocked the bare shape, which the real
+ * route never returns. Reading `payload_md` through the envelope is what pins
+ * it: against the old code the editor renders empty and this fails.
+ */
+describe('CoverLetterReviewPage — #656 envelope + flagged drafts', () => {
+  function mockPage(
+    state: unknown,
+    extra?: (url: string, init?: { method?: string }) => unknown
+  ) {
+    global.fetch = jest
+      .fn()
+      .mockImplementation((url: string, init?: { method?: string }) => {
+        const custom = extra?.(url, init);
+        if (custom) return Promise.resolve(custom as Response);
+        if (url === '/api/jobs/j-1') {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => POSTING,
+          } as Response);
+        }
+        if (url.includes('/cover-letter')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => state,
+          } as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ entries: [], versions: [], cap: 5 }),
+        } as Response);
+      }) as unknown as typeof fetch;
+  }
+
+  it('reads the document out of the envelope, not the envelope itself', async () => {
+    mockPage({ record: RECORD, status: 'idle' });
+    render(<CoverLetterReviewPage jobPostingId='j-1' />);
+    const surface = await screen.findByLabelText('Cover letter markdown');
+    // The fixture's markdown — proves the record was read THROUGH the
+    // envelope; the old code produced an empty editor here.
+    expect(surface.textContent).toContain('Cover letter draft');
+  });
+
+  it('shows the flagged banner and a free re-check for a failing letter', async () => {
+    mockPage({
+      record: {
+        ...RECORD,
+        lint_violations: [
+          {
+            code: 'no_tables',
+            message: 'Markdown contains a table.',
+            severity: 'error',
+          },
+        ],
+      },
+      status: 'idle',
+    });
+    render(<CoverLetterReviewPage jobPostingId='j-1' />);
+    expect(await screen.findByText(/Failed ATS checks/i)).toBeInTheDocument();
+    expect(screen.getByText(/Markdown contains a table/i)).toBeInTheDocument();
+    expect(screen.getByText(/no AI credits/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /re-run ATS checks/i })
+    ).toBeInTheDocument();
+  });
+
+  it('treats a clean letter as unflagged', async () => {
+    mockPage({ record: { ...RECORD, lint_violations: [] }, status: 'idle' });
+    render(<CoverLetterReviewPage jobPostingId='j-1' />);
+    await screen.findByLabelText('Cover letter markdown');
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
   });
 });

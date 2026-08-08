@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   ArrowLeft,
+  ShieldCheck,
   Download,
   Lock,
   MoreVertical,
@@ -15,6 +16,7 @@ import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
+import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
@@ -22,11 +24,14 @@ import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
+import { isFlaggedDraft } from '../../types';
 import type {
   JobPosting,
   LintViolation,
   ResumeVersion,
   ResumeVersionsResponse,
+  AtsRecheckResponse,
+  TailoredDocumentState,
   TailoredResumeRecord,
   TailorResponse,
 } from '../../types';
@@ -103,10 +108,17 @@ export default function CoverLetterReviewPage({
         return;
       }
       const job = (await jobRes.json()) as JobPosting;
-      const letter = (await letterRes.json()) as TailoredResumeRecord;
+      // #656 envelope: this route returns {record, status, message}, not a
+      // bare record. Reading it as a record silently yielded an undefined id
+      // and empty markdown — the page rendered but was inert.
+      const state = (await letterRes.json()) as TailoredDocumentState;
       setPosting(job);
-      setRecord(letter);
-      setMarkdown(letter.payload_md ?? '');
+      if (!state.record) {
+        setNotFound(true);
+        return;
+      }
+      setRecord(state.record);
+      setMarkdown(state.record.payload_md ?? '');
       setSaveStatus('idle');
     } catch {
       toast({ variant: 'error', title: 'Network error loading cover letter' });
@@ -118,6 +130,43 @@ export default function CoverLetterReviewPage({
   useEffect(() => {
     load();
   }, [load]);
+
+  const [rechecking, setRechecking] = useState(false);
+
+  async function handleRecheck() {
+    if (!record) return;
+    setRechecking(true);
+    try {
+      const flushed = await flushPendingSave();
+      if (!flushed) return;
+      const res = await fetch(`/api/jobs/tailor/${record.id}/ats-recheck`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        toast({
+          variant: 'error',
+          title: await extractApiError(res, 'ATS re-check failed'),
+        });
+        return;
+      }
+      const data = (await res.json()) as AtsRecheckResponse;
+      setRecord(data.record);
+      setLintWarnings(data.violations.filter(v => v.severity === 'warning'));
+      toast({
+        variant: data.ok ? 'success' : 'error',
+        title: data.ok
+          ? 'Passes ATS checks'
+          : `${data.violations.filter(v => v.severity === 'error').length} ATS issue(s) remain`,
+      });
+    } catch {
+      toast({
+        variant: 'error',
+        title: 'Network error re-checking cover letter',
+      });
+    } finally {
+      setRechecking(false);
+    }
+  }
 
   const loadVersions = useCallback(async () => {
     if (!record) return;
@@ -493,6 +542,12 @@ export default function CoverLetterReviewPage({
 
   const isApproved = record.approved_at !== null;
 
+  const flagged = isFlaggedDraft(record);
+
+  const lintErrors = (record.lint_violations ?? []).filter(
+    v => v.severity === 'error'
+  );
+
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
@@ -518,6 +573,52 @@ export default function CoverLetterReviewPage({
           {posting.title} &mdash; {posting.company_name}
         </Text>
       </div>
+
+      {/* Flagged draft (#656): this letter was generated and KEPT despite
+          failing ATS lint — same treatment as a resume, since it runs the
+          same linter and costs the same daily-cap slot. */}
+      {flagged && (
+        <div className='space-y-2 rounded-md border border-error/30 bg-error/10 p-3'>
+          <div className='flex items-center justify-between gap-2'>
+            <Text variant='caption' className='text-error'>
+              Failed ATS checks
+            </Text>
+            <Button
+              name='ats-recheck'
+              variant='secondary'
+              size='sm'
+              onClick={handleRecheck}
+              disabled={rechecking || saveStatus === 'saving'}
+            >
+              {rechecking ? (
+                <>
+                  <Spinner size='sm' aria-label='Re-running ATS checks' />
+                  <span>Checking…</span>
+                </>
+              ) : (
+                <>
+                  <ShieldCheck className='size-4' aria-hidden='true' />
+                  <span>Re-run ATS checks</span>
+                </>
+              )}
+            </Button>
+          </div>
+          <Text variant='meta' className='text-text-secondary'>
+            This draft was saved so you don&rsquo;t lose the generation. Fix the
+            issues below, then re-run the checks &mdash; it&rsquo;s free and
+            instant, no AI credits.
+          </Text>
+          <ul className='list-inside list-disc space-y-1'>
+            {lintErrors.map((v, i) => (
+              <li key={i}>
+                <Text variant='meta' as='span'>
+                  [{v.code}] {v.message}
+                </Text>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {lintWarnings.length > 0 && (
         <div className='rounded-md border border-warning/30 bg-warning/10 p-3'>

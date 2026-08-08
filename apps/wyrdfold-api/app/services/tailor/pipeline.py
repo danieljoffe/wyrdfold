@@ -7,12 +7,12 @@ Splits cleanly between "LLM synthesis" (can fail on hallucination
 trace-check with ValueError) and "format check" (returns LintResult).
 
 Lint errors short-circuit the *rendering* pipeline but no longer discard the
-work (#656): a resume that fails ATS lint is persisted as a flagged draft
-carrying its violations, so the ~39s of generation — now backgrounded, and
-charged against the user's daily cap — isn't lost when nobody is watching.
-The user edits the draft and re-checks (free; lint is deterministic) instead
-of paying to regenerate. Cover letters keep the discard-on-failure behavior;
-`documents.lint_violations` is resume-scoped by design.
+work (#656): a document that fails ATS lint is persisted as a flagged draft
+carrying its violations, so the generation — now backgrounded, and charged
+against the user's daily cap — isn't lost when nobody is watching. The user
+edits the draft and re-checks (free; lint is deterministic) instead of paying
+to regenerate. **Resumes and cover letters behave identically here**: letters
+run the same linter, so the resume-only carve-out was dropped.
 
 The router layer just calls `run_tailor_pipeline(...)` and converts the
 result into an HTTP response.
@@ -280,22 +280,20 @@ class CoverLetterPipelineSuccess:
 
 @dataclass
 class CoverLetterPipelineLintFailure:
-    """A generated cover letter that failed ATS lint — nothing persisted.
+    """A generated cover letter that failed ATS lint — persisted FLAGGED.
 
-    Deliberately NOT the resume's flagged-draft treatment (#656):
-    ``documents.lint_violations`` is resume-scoped, so there is nowhere to
-    record why a letter is flagged and a persisted-but-unmarked letter would
-    silently serve a document that fails lint. The backgrounded caller marks
-    the run ``error`` instead, so the user's poll surfaces a retry rather than
-    hanging. Prose trips the ATS rules far less often than a structured
-    resume, so this path is rare — but it does re-spend on retry, which is the
-    asymmetry to revisit if it ever shows up in practice.
+    Mirrors ``PipelineLintFailure``: ``record`` is a real ``documents`` row
+    with ``lint_violations`` populated, not a discarded result. The letter runs
+    the same linter as a resume and costs the same daily-cap slot, so it gets
+    the same treatment (the earlier resume-only carve-out is gone).
     """
 
     lint: LintResult
     letter: TailoredCoverLetter
     warnings: list[str]
     llm_result: LLMResult
+    record: TailoredResumeRecord
+    payload_md: str
 
 
 CoverLetterPipelineResult = CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure
@@ -358,13 +356,35 @@ async def run_cover_letter_pipeline(
     )
 
     payload_md = to_markdown_cover_letter(letter)
+
+    async def _persist(lint_result: LintResult) -> TailoredResumeRecord:
+        """Insert the row carrying this run's lint state — see the resume
+        pipeline's ``_persist`` for why the WHOLE violation list is stored,
+        warnings included, rather than just the blocking errors."""
+        return await persistence.persist_cover_letter(
+            supabase,
+            user_id=user_id,
+            job_posting_id=job_posting_id,
+            letter=letter,
+            payload_md=payload_md,
+            job_description=job_description,
+            warnings=trace_warnings,
+            llm_result=llm_result,
+            storage_path=None,
+            lint_violations=[v.model_dump() for v in lint_result.violations],
+        )
+
     md_lint = lint_markdown(payload_md, document_type="cover_letter")
     if not md_lint.ok:
+        # Flagged, not discarded. No .docx is rendered for a flagged draft —
+        # the download route re-renders lazily from payload_md.
         return CoverLetterPipelineLintFailure(
             lint=md_lint,
             letter=letter,
             warnings=trace_warnings,
             llm_result=llm_result,
+            record=await _persist(md_lint),
+            payload_md=payload_md,
         )
     docx_bytes = await asyncio.to_thread(md_to_docx, payload_md)
     lint = lint_docx(docx_bytes, document_type="cover_letter")
@@ -374,19 +394,11 @@ async def run_cover_letter_pipeline(
             letter=letter,
             warnings=trace_warnings,
             llm_result=llm_result,
+            record=await _persist(lint),
+            payload_md=payload_md,
         )
 
-    record = await persistence.persist_cover_letter(
-        supabase,
-        user_id=user_id,
-        job_posting_id=job_posting_id,
-        letter=letter,
-        payload_md=payload_md,
-        job_description=job_description,
-        warnings=trace_warnings,
-        llm_result=llm_result,
-        storage_path=None,
-    )
+    record = await _persist(lint)
     try:
         storage_path = await persistence.upload_docx(
             supabase,

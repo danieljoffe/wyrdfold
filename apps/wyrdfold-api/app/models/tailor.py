@@ -217,11 +217,12 @@ class TailoredResumeRecord(BaseModel):
 
     lint_violations: list[LintViolation] | None = None
     """ATS lint state (#656). ``None`` = never linted (every row predating the
-    migration, and every cover letter — the column is resume-scoped);
-    ``[]`` = linted clean; a populated list = **flagged draft**, persisted
-    despite failing lint so the generation spend isn't thrown away. Refreshed
-    by ``POST /tailor/resumes/{id}/ats-recheck``, which is free (lint is
-    deterministic — no LLM)."""
+    migration); ``[]`` = linted with nothing to report; a list containing any
+    ``severity == "error"`` entry = **flagged draft**, persisted despite
+    failing lint so the generation spend isn't thrown away. A warnings-only
+    list is clean-with-advisories, NOT flagged. Applies to resumes AND cover
+    letters alike. Refreshed by ``POST /tailor/resumes/{id}/ats-recheck``,
+    which is free (lint is deterministic — no LLM)."""
 
     model_config = {"extra": "ignore"}
 

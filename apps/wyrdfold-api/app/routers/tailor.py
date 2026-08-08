@@ -33,9 +33,10 @@ api-key drives against a bare JD): that id IS the poll surface, so there is
 nothing to poll without it.
 
 422 responses carry the LintFailureResponse shape — but as of #656 a
-generation lint failure is no longer one of them: the resume is persisted as
-a flagged draft carrying its violations (regenerating burns the daily cap,
-and with the run backgrounded nobody may be watching to retry).
+generation lint failure is no longer one of them: the document (resume OR
+cover letter) is persisted as a flagged draft carrying its violations
+(regenerating burns the daily cap, and with the run backgrounded nobody may
+be watching to retry).
 """
 
 import asyncio
@@ -620,17 +621,6 @@ async def _run_resume_task(
         run_registry.fail(key, message="Resume generation failed. Please retry.")
 
 
-class _CoverLetterLintError(Exception):
-    """A cover letter that failed ATS lint inside the detached task.
-
-    Cover letters have no flagged-draft column to land in (see
-    ``CoverLetterPipelineLintFailure``), so the background path converts the
-    failure into a registry ``error`` the poll surfaces — rather than
-    persisting a letter that silently fails lint, or leaving the client
-    polling a run that will never produce a row.
-    """
-
-
 @router.post(
     "/cover-letter",
     response_model=None,
@@ -698,15 +688,12 @@ async def create_tailored_cover_letter(
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
         )
-        if isinstance(result, CoverLetterPipelineLintFailure):
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "ok": False,
-                    "violations": [v.model_dump() for v in result.lint.violations],
-                },
-            )
-        if not isinstance(result, CoverLetterPipelineSuccess):
+        # A lint failure is no longer a 422 — the draft is persisted flagged,
+        # so it comes back as a normal record whose ``lint_violations`` say why
+        # it needs attention (mirrors ``_resume_response``).
+        if not isinstance(
+            result, CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure
+        ):
             raise HTTPException(status_code=500, detail="Unexpected pipeline result")
         return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
 
@@ -757,12 +744,13 @@ async def _run_cover_letter_task(
 ) -> None:
     """Detached worker for the cover-letter pipeline (#656).
 
-    Unlike the resume task, a lint failure IS a failure here — there is no
-    flagged-draft column for letters — so it surfaces through the poll as a
-    retryable error.
+    Same contract as ``_run_resume_task``: a lint failure is a RESULT, not a
+    failure — the pipeline persisted a flagged draft, so the run finishes and
+    the client's poll finds a real record carrying its violations. Only an
+    exception marks the run ``error``.
     """
     try:
-        result = await run_cover_letter_pipeline(
+        await run_cover_letter_pipeline(
             supabase,
             llm,
             user_id=user_id,
@@ -776,18 +764,7 @@ async def _run_cover_letter_task(
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
         )
-        if isinstance(result, CoverLetterPipelineLintFailure):
-            raise _CoverLetterLintError(
-                "; ".join(v.message for v in result.lint.errors) or "ATS lint failed"
-            )
         run_registry.finish(key)
-    except _CoverLetterLintError as exc:
-        _log.warning(
-            "cover letter failed ATS lint job=%s: %s", body.job_posting_id, exc
-        )
-        run_registry.fail(
-            key, message=f"Cover letter failed ATS checks: {exc}. Please retry."
-        )
     except Exception:
         _log.exception("tailor cover-letter task failed job=%s", body.job_posting_id)
         run_registry.fail(key, message="Cover letter generation failed. Please retry.")
@@ -1040,12 +1017,7 @@ async def edit_tailored_resume(
         resume_id,
         body.markdown,
         user_id=user_id,
-        # Resume-scoped column: leave a cover letter's untouched (NULL).
-        lint_violations=(
-            [v.model_dump() for v in lint_result.violations]
-            if row.document_type == "resume"
-            else None
-        ),
+        lint_violations=[v.model_dump() for v in lint_result.violations],
     )
     return TailorResponse(record=record, lint_warnings=lint_result.warnings)
 
@@ -1069,9 +1041,8 @@ async def recheck_tailored_resume(
     approval lock to protect (and knowing a locked resume has an ATS problem
     is exactly when you'd want to unlock it).
 
-    Restricted to ``document_type == "resume"``: ``documents.lint_violations``
-    is resume-scoped, so accepting a cover letter here would write a column
-    nothing else on that path reads or maintains.
+    Works for cover letters as well as resumes — both run the same linter and
+    both persist flagged, so both need the same free way to confirm a fix.
 
     Ownership follows the PATCH handler — ``persistence.get(..., user_id=...)``
     returning ``None`` is a 404 whether the row is missing or someone else's,
@@ -1080,11 +1051,6 @@ async def recheck_tailored_resume(
     row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="tailored document not found")
-    if row.document_type != "resume":
-        raise HTTPException(
-            status_code=422,
-            detail="ATS re-check applies to resumes only",
-        )
     if not row.payload_md:
         # Legacy rows persisted before markdown became the source of truth have
         # nothing to lint. 422 (not 500) — the request is well-formed, the
@@ -1094,7 +1060,7 @@ async def recheck_tailored_resume(
             detail="this document has no markdown to check",
         )
 
-    lint_result = lint_markdown(row.payload_md, document_type="resume")
+    lint_result = lint_markdown(row.payload_md, document_type=row.document_type)
     record = await persistence.update_lint_violations(
         supabase,
         resume_id,

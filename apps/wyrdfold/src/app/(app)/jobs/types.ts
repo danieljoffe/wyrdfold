@@ -255,9 +255,9 @@ export interface TailoredResumeRecord {
   approved_at: string | null;
   source_resume_id: string | null;
   /**
-   * ATS lint state (#656). `null` = never linted (rows predating the column,
-   * and every cover letter — it's resume-scoped); `[]` = linted with nothing
-   * to report; a list with any `severity: 'error'` entry = **flagged draft**,
+   * ATS lint state (#656). `null` = never linted (rows predating the column);
+   * `[]` = linted with nothing to report; a list with any
+   * `severity: 'error'` entry = **flagged draft**,
    * persisted despite failing lint so the generation spend isn't thrown away.
    * A warnings-only list is clean-with-advisories, NOT flagged — use
    * `isFlaggedDraft()` rather than a length check.
