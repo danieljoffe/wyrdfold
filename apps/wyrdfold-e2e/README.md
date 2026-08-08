@@ -72,3 +72,45 @@ The wyrdfold app's login UI is magic-link only (`signInWithOtp`). A password-sig
 3. The spec inherits the storageState — no per-spec setup needed.
 
 If a spec needs deterministic data state (e.g., "user has no targets" or "user has exactly one resume_ready job"), wipe and seed inside the spec or via `apps/wyrdfold-api/scripts/wipe_user_data.py <user_id>` before the run.
+
+## The prod coverage sweep (`src/stress/`)
+
+Separate from CI. Drives **production** (`wyrdfold.com`) as the owner with a
+pre-minted session and ledgers every user-visible action with its network
+trace, flagging anything over **300ms**. Its own config, one worker, zero
+retries — a retried timing is a lie.
+
+```bash
+# one-time: mint a prod session from a real magic link (out of band)
+MAGIC_LINK='https://wyrdfold.com/auth/callback?...' node src/stress/auth-setup.mjs
+
+# full sweep — public → authed → deep → coverage gate
+npx playwright test -c playwright.stress.config.ts
+
+# re-run one project against an existing ledger
+STRESS_KEEP_LEDGER=1 npx playwright test -c playwright.stress.config.ts --project=deep --no-deps
+
+# read the result
+node src/stress/report.mjs                 # coverage + failures + >300ms list
+node src/stress/report.mjs 'jobs\.'        # filter by action id
+node src/stress/probe-controls.mjs         # dump accessible control names per surface
+```
+
+**`manifest.ts` is the contract.** Every id in it must either produce a ledger
+row or carry an `excluded` reason; `zz-coverage-gate.spec.ts` fails otherwise.
+That is what makes coverage measured rather than aspirational — so when you add
+a surface or an action, add its id to the manifest _first_.
+
+Two rules learned the hard way:
+
+- **Never invent a selector.** Four actions in the 2026-08-07 run each burned a
+  45s timeout on a control that didn't exist under that name. Run
+  `probe-controls.mjs` and target a name it actually printed.
+- **Make the assertion able to fail.** Three guards added on 2026-08-08 "passed"
+  in under 25ms because they compared 0 against 0 before the chart had
+  rendered. Assert the precondition (`bars > 0`) before asserting the property.
+
+`global-setup.ts` truncates the ledger once per sweep. Without it the ledger is
+append-only and the gate reads rows from _previous_ runs — an action could rot
+for weeks and coverage would still report green. `STRESS_KEEP_LEDGER=1` opts out
+for single-project re-runs.

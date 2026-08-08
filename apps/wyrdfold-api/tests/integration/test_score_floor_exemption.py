@@ -2,7 +2,7 @@
 
 Unit tests cover the Python logic with a mocked PostgREST chain; the one thing
 they can't prove is that the ``_apply_score_floor`` OR-expression
-(``scoring_status.is.null,scoring_status.neq.complete,score.gte.N``) is valid
+(``axis_scores.is.null,score.gte.N``) is valid
 PostgREST that the real database actually evaluates as intended. This runs the
 real query against the live local Supabase stack: a graded row below the floor
 is dropped, while a not-yet-graded ("Pending") row below the floor is exempt and
@@ -70,6 +70,14 @@ def seeded_floor_scores(service_client: Client) -> Iterator[tuple[str, str, str]
                     "score": 40,
                     "excluded": False,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                 },
                 # Pending (keyword placeholder) at 30 — below the floor, but
                 # exempt because it has no real fit score yet.

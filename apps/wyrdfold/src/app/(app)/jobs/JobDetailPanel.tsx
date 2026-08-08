@@ -586,6 +586,11 @@ export default function JobDetailPanel({
                 aria-label='More actions'
               >
                 <MoreVertical className='size-4' aria-hidden />
+                {/* Names the BUTTON shared-ui wraps this trigger in. The
+                    aria-label above sits on a role-less <span>, where it
+                    computes no accessible name — and it is the inner node
+                    regardless, so the focusable button had none at all. */}
+                <span className='sr-only'>More actions</span>
               </span>
             }
             items={[

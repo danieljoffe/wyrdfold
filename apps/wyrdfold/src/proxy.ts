@@ -83,7 +83,6 @@ function buildCspValue(
 // Reusing the same per-request `nonce` keeps Next's nonce-stamped
 // <script>/<style> tags valid under both headers.
 function buildReportOnlyCspValue(
-  request: NextRequest,
   nonce: string,
   extraConnectOrigins: string[] = []
 ): string {
@@ -97,11 +96,7 @@ function buildReportOnlyCspValue(
     object-src 'none';
     base-uri 'self';
     form-action 'self';
-    frame-ancestors 'none';${
-      request.nextUrl.protocol === 'https:'
-        ? `\n    upgrade-insecure-requests;`
-        : ''
-    }
+    frame-ancestors 'none';
     connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
     img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
 `;
@@ -135,7 +130,6 @@ export async function proxy(request: NextRequest) {
   // Non-enforcing companion policy (audit #29, round 3 M1). Set as
   // `Content-Security-Policy-Report-Only` below — it only reports, never blocks.
   const cspReportOnlyValue = buildReportOnlyCspValue(
-    request,
     nonce,
     supabaseOrigin ? [supabaseOrigin] : []
   );

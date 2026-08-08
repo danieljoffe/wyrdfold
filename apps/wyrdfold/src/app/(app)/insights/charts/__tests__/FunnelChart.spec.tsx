@@ -51,14 +51,30 @@ describe('FunnelChart', () => {
     // Saved (5), Draft (3), Applied (2) -> 3 links. Offer has count 0.
     const links = screen.getAllByRole('link');
     expect(links).toHaveLength(3);
-    expect(screen.getByRole('link', { name: /saved \(5\)/i })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: /^saved$/i })).toHaveAttribute(
       'href',
       '/jobs?status=saved'
     );
-    expect(screen.getByRole('link', { name: /draft \(3\)/i })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: /^draft$/i })).toHaveAttribute(
       'href',
       '/jobs?status=resume_draft'
     );
+  });
+
+  it('does not advertise a count the linked list cannot deliver', () => {
+    // The funnel spans EVERY target (`_user_target_ids` is any-status) while
+    // /jobs?status= shows only ACTIVE targets, so a chip carrying the funnel's
+    // number promises rows its own destination can't produce. Prod 2026-08-08:
+    // 6 targets / 1 active, chip read "Saved (3)" and landed on "No jobs
+    // found". The bar above still shows the count; the chip must not.
+    render(<FunnelChart data={SAMPLE} />);
+    for (const link of screen.getAllByRole('link')) {
+      expect(link).toHaveAttribute(
+        'href',
+        expect.stringContaining('/jobs?status=')
+      );
+      expect(link.textContent ?? '').not.toMatch(/\d/);
+    }
   });
 
   it('shows the empty-state message when all stages are zero', () => {

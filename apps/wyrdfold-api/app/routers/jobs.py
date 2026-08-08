@@ -637,7 +637,7 @@ _SCORE_ROW_COLS = (
 # zero extra round-trips.
 _JOBS_EMBED = (
     ", jobs!inner(id, role_family, source_posted_at, cataloged_at, "
-    "salary_min, salary_max, salary_currency, salary_period)"
+    "salary_min, salary_max, salary_currency, salary_period, country)"
 )
 
 
@@ -676,14 +676,36 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     """Apply the fit-score floor, exempting Pending rows (#47).
 
     The floor is a fit-quality bar, so it only applies to rows that actually
-    have a fit score (``scoring_status = 'complete'``). Pending rows hold only a
-    keyword placeholder, so flooring them would hide promising jobs purely
-    because the grading cap hasn't reached them yet — instead they always pass
-    and the list marks them Pending. ``min_score`` is a validated int, so the
-    interpolation below carries no injection surface."""
+    have a fit score. Pending rows hold only a keyword placeholder, so flooring
+    them would hide promising jobs purely because the grading cap hasn't reached
+    them yet — instead they always pass and the list marks them Pending.
+
+    THE EXEMPTION MUST USE THE SAME SIGNAL AS ``_is_pending`` (2026-08-08).
+    This predicate used to key on ``scoring_status != 'complete'``, which
+    ``_is_pending``'s own docstring already warns is unreliable — and the two
+    disagreed on **5,130 prod rows** (3,265 ``stage2`` + 1,865 ``stage1`` rows
+    that carry real ``axis_scores``). Those rows were exempted from the floor
+    while the list rendered them as ordinary graded results with a numeric
+    badge and no Pending marker, so "Score 85+" returned rows scored 62. Worse,
+    the exemption is *load-bearing in the wrong direction*: it also excluded the
+    genuinely-complete high scorers, so raising the bar made the list visibly
+    worse. Keying on ``axis_scores`` — Phase 2's atomic write and
+    ``_is_pending``'s primary signal — makes the floor exactly agree with the
+    badge the user sees.
+
+    ``axis_scores IS NULL`` is an exact match for ``_is_pending``'s
+    ``isinstance(axes, dict) and axes`` rung: prod carries **zero** rows with
+    ``axis_scores = '{}'`` (verified 2026-08-08), so the empty-dict case has no
+    population to diverge on.
+
+    Keep ``supabase/migrations/20260808040000_score_floor_axis_scores.sql`` in
+    step — ``pipeline_counts`` mirrors this predicate server-side, and a
+    divergence means the dashboard tiles and the list disagree about the same
+    floor. ``min_score`` is a validated int, so the interpolation below carries
+    no injection surface."""
     if not min_score or min_score <= 0:
         return query
-    return query.or_(f"scoring_status.is.null,scoring_status.neq.complete,score.gte.{min_score}")
+    return query.or_(f"axis_scores.is.null,score.gte.{min_score}")
 
 
 def _rank_graded_first(
@@ -1666,9 +1688,13 @@ def _logistics_passes(
       ``logistics_filters.salary_max`` (per-target LLM output, graded rows
       only) when the posting carries no structured yearly-USD salary. Before
       the columns existed this filter silently dropped every ungraded row.
-    - ``country`` — LENIENT: keep when ``location_country`` matches
-      (case-insensitive) OR is absent (a remote role with no country anchor
-      still passes).
+    - ``country`` — LENIENT, but only where the country is genuinely unknown.
+      PREFERS the deterministic ``jobs.country`` column (present on ~80% of the
+      live corpus) and falls back to the Phase-2 grader's
+      ``logistics_filters.location_country`` (graded rows only, ~4%) when the
+      posting carries no country. Only when BOTH are absent does the row pass
+      unfiltered — that's the real intent of the leniency (a remote role with no
+      country anchor), not "keep everything".
     """
     return _logistics_core(
         f,
@@ -1677,6 +1703,7 @@ def _logistics_passes(
         salary_period=posting.get("salary_period"),
         salary_max=posting.get("salary_max"),
         salary_min=posting.get("salary_min"),
+        posting_country=posting.get("country"),
         include_unknown_salary=include_unknown_salary,
     )
 
@@ -1689,6 +1716,7 @@ def _logistics_core(
     salary_period: Any,
     salary_max: Any,
     salary_min: Any,
+    posting_country: Any = None,
     include_unknown_salary: bool,
 ) -> bool:
     """The one logistics predicate. Both callers — the posting-level filter
@@ -1708,7 +1736,12 @@ def _logistics_core(
         elif bound < f.min_salary:
             return False
     if f.country:
-        country = log.get("location_country")
+        # Prefer the deterministic jobs-level column; fall back to the Phase-2
+        # grader's field only when the posting has no country of its own. The
+        # old order read ONLY the grader's field, which exists on ~4% of scores
+        # rows — so "absent ⇒ keep" admitted the other 96% and the filter was
+        # inert (selecting Canada returned a full page of US jobs, 2026-08-08).
+        country = posting_country if posting_country is not None else log.get("location_country")
         if country is not None and str(country).upper() != f.country.upper():
             return False
     return True
@@ -1732,6 +1765,7 @@ def _score_row_passes_logistics(
         salary_period=_embedded_jobs_field(row, "salary_period"),
         salary_max=_embedded_jobs_field(row, "salary_max"),
         salary_min=_embedded_jobs_field(row, "salary_min"),
+        posting_country=_embedded_jobs_field(row, "country"),
         include_unknown_salary=include_unknown_salary,
     )
 

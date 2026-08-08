@@ -90,3 +90,36 @@ async def test_manual_add_upsert_row_columns(async_service_client) -> None:
     await (
         async_service_client.table("jobs").delete().eq("id", posting_id).execute()
     )
+
+
+def test_jobs_embed_columns_resolve(service_client: Client) -> None:
+    """``_JOBS_EMBED`` is a PostgREST embed STRING on the hottest list path.
+
+    It rides every /jobs and dashboard query, so a jobs-column rename (or a
+    typo'd addition — ``country`` joined it on 2026-08-08 to fix the inert
+    country filter) breaks the whole list, not a best-effort background read.
+    Run the real embed against real Postgres so that fails here.
+    """
+    from app.routers.jobs import _JOBS_EMBED, _SCORE_ROW_COLS
+
+    resp = (
+        service_client.table("scores")
+        .select(f"{_SCORE_ROW_COLS}{_JOBS_EMBED}")
+        .limit(1)
+        .execute()
+    )
+    assert isinstance(resp.data, list)
+
+
+def test_score_floor_predicate_resolves(service_client: Client) -> None:
+    """The floor is an ``or_`` STRING too, and it changed on 2026-08-08 from
+    ``scoring_status`` to ``axis_scores`` (they disagreed on 5k+ live rows).
+    A column that doesn't exist would make PostgREST 400 the entire list."""
+    from app.routers.jobs import _apply_score_floor
+
+    resp = (
+        _apply_score_floor(service_client.table("scores").select("job_posting_id"), 70)
+        .limit(1)
+        .execute()
+    )
+    assert isinstance(resp.data, list)

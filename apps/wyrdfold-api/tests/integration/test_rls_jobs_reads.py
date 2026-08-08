@@ -236,6 +236,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 80,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
                 {
@@ -243,6 +251,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 30,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
                 {
@@ -257,6 +273,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 80,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
             ]
