@@ -342,6 +342,13 @@ class TestSingleResumeStatusBump:
                 new_callable=AsyncMock,
                 return_value=success,
             ),
+            # The kick now verifies the posting exists before spawning (a
+            # 202 must mean work that can actually run).
+            patch(
+                "app.routers.tailor._posting_exists",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
             patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock) as mock_mark,
         ):
             # Bypass the structural gap gate — we're testing the post-success path.

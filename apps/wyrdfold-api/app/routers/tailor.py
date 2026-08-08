@@ -210,6 +210,27 @@ async def _target_scoring_profile_row(
     return rows[0] if rows else None
 
 
+async def _posting_exists(supabase: AsyncClient, job_posting_id: str) -> bool:
+    """Does this ``jobs`` row exist?
+
+    Guards the 202 (#656 follow-up). ``TailorRequest.job_posting_id`` is a
+    plain ``str``, so a bogus id sails through validation, gets accepted, and
+    the detached run then spends a FULL LLM call before dying on the foreign
+    key at insert — burning the caller's daily cap on work that could never
+    have succeeded. Verified live during the release gate: a
+    ``job_posting_id="not-a-uuid"`` kick returned 202 and still wrote a
+    ``llm_costs`` row.
+
+    ``/analysis`` already validates its posting synchronously before spawning
+    (``_fetch_job_description`` → 404); this is the same contract — a 202 must
+    only ever mean "accepted work that can actually run".
+    """
+    resp = await (
+        supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
+    )
+    return bool(cast(list[dict[str, Any]], resp.data or []))
+
+
 async def _fetch_postings_by_ids(
     supabase: AsyncClient, ids: list[str]
 ) -> list[dict[str, Any]]:
@@ -404,6 +425,14 @@ async def create_tailored_resume(
         user_id=user_id, document_type="resume", job_posting_id=body.job_posting_id
     ):
         return _running_202()
+
+    # A 202 must only ever mean "accepted work that can actually run" — see
+    # _posting_exists. Checked before the reuse probe and the claim, so a bogus
+    # id costs one indexed lookup and nothing else.
+    if body.job_posting_id is not None and not await _posting_exists(
+        supabase, body.job_posting_id
+    ):
+        raise HTTPException(status_code=404, detail="job posting not found")
 
     # Reuse check (#504): skip pipeline if a similar resume exists in the target
     if not body.force_fresh and body.job_posting_id:
@@ -646,6 +675,11 @@ async def create_tailored_cover_letter(
         user_id=user_id, document_type="cover_letter", job_posting_id=body.job_posting_id
     ):
         return _running_202()
+
+    if body.job_posting_id is not None and not await _posting_exists(
+        supabase, body.job_posting_id
+    ):
+        raise HTTPException(status_code=404, detail="job posting not found")
 
     if body.job_posting_id is None:
         prefs_row = await _preferences_get(supabase, user_id=user_id)

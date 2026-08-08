@@ -185,6 +185,25 @@ def _client(
         app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def _posting_exists_by_default(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Every kick now verifies the posting exists before spawning (a 202 must
+    mean work that can actually run). Default it to True module-wide so each
+    test states only what it's actually about; the negatives override it
+    explicitly with their own ``patch``.
+
+    ``@pytest.mark.real_posting_exists`` opts out — the test of the helper
+    itself must reach the real function, not this stub.
+    """
+    if request.node.get_closest_marker("real_posting_exists"):
+        yield
+        return
+    with patch(
+        "app.routers.tailor._posting_exists", new_callable=AsyncMock, return_value=True
+    ):
+        yield
+
+
 def _capture_spawned(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     """Patch the router's ``spawn_detached`` to CAPTURE (not run) the task
     coroutine, so tests await it deterministically. Close each coro in a
@@ -894,3 +913,117 @@ def test_dedup_precedes_the_reuse_probe(monkeypatch: pytest.MonkeyPatch) -> None
     finally:
         for coro in captured:
             coro.close()
+
+
+# ---- A 202 must mean "work that can actually run" -------------------------
+
+
+def test_unknown_posting_404s_before_spending_an_llm_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release-gate finding: ``TailorRequest.job_posting_id`` is a plain ``str``,
+    so a bogus id sailed through validation, got a 202, and the detached run
+    spent a FULL LLM call before dying on the foreign key at insert — burning
+    the caller's daily cap on work that could never have succeeded. Verified
+    live: a ``job_posting_id="not-a-uuid"`` kick returned 202 and still wrote
+    an ``llm_costs`` row.
+
+    ``/analysis`` already validates its posting synchronously before spawning;
+    this is the same contract.
+    """
+    captured = _capture_spawned(monkeypatch)
+    try:
+        with (
+            _pipeline(_success()) as run,
+            patch(
+                "app.routers.tailor._posting_exists",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            _client() as tc,
+        ):
+            resp = tc.post("/tailor/resume", json=_resume_body(job_posting_id="ghost"))
+
+        assert resp.status_code == 404
+        assert captured == [], "a doomed run must never be spawned"
+        run.assert_not_called(), "the LLM must not be reached"
+        # And no claim was left behind for the bogus key.
+        assert (
+            run_registry.is_running(
+                run_registry.key_for(
+                    user_id=_USER, document_type="resume", job_posting_id="ghost"
+                )
+            )
+            is False
+        )
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+def test_cover_letter_unknown_posting_also_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_spawned(monkeypatch)
+    try:
+        with (
+            _pipeline(_success(), cover_letter=True) as run,
+            patch(
+                "app.routers.tailor._posting_exists",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            _client() as tc,
+        ):
+            resp = tc.post(
+                "/tailor/cover-letter",
+                json={
+                    "job_description": "Build things.",
+                    "company_name": "Acme",
+                    "job_posting_id": "ghost",
+                },
+            )
+        assert resp.status_code == 404
+        assert captured == []
+        run.assert_not_called()
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+def test_a_real_posting_still_kicks_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard must not break the happy path — the negative above is only
+    meaningful next to this."""
+    captured = _capture_spawned(monkeypatch)
+    try:
+        with (
+            _pipeline(_success()),
+            patch(
+                "app.routers.tailor._posting_exists",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            _client() as tc,
+        ):
+            resp = tc.post("/tailor/resume", json=_resume_body())
+        assert resp.status_code == 202
+        assert len(captured) == 1
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+@pytest.mark.real_posting_exists
+async def test_posting_exists_reads_the_jobs_table_by_id() -> None:
+    """Pins the query shape: an indexed id lookup, not a scan — this runs on
+    every kick, so it has to stay cheap."""
+    from app.routers.tailor import _posting_exists
+
+    supabase = MagicMock()
+    chain = supabase.table.return_value.select.return_value.eq.return_value.limit.return_value
+    chain.execute = AsyncMock(return_value=MagicMock(data=[{"id": "job-1"}]))
+    assert await _posting_exists(supabase, "job-1") is True
+
+    chain.execute = AsyncMock(return_value=MagicMock(data=[]))
+    assert await _posting_exists(supabase, "ghost") is False
+    supabase.table.assert_called_with("jobs")
