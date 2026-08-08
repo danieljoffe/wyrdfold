@@ -225,13 +225,24 @@ async def get(
     Returns ``None`` both when the row doesn't exist AND when it
     exists but belongs to another user — same response so we don't
     leak the existence of cross-tenant rows.
+
+    Uses ``.limit(1)``, NOT ``.single()``: PostgREST answers ``.single()`` on
+    zero rows by RAISING ``APIError PGRST116`` ("Cannot coerce the result to a
+    single JSON object"), so the ``if not resp.data: return None`` below was
+    unreachable and every caller 500'd where it meant to 404. Found by a live
+    drive on 2026-08-07 — six endpoints were affected in prod
+    (``GET /resumes/{id}``, ``/versions``, ``/download``, ``approve``,
+    ``unapprove``, ``export-zip``), and unit tests missed it because they mock
+    the client and hand back ``data=None`` directly, which the real driver
+    never does. Matches ``get_by_job``'s shape in this module.
     """
     query = supabase.table(TABLE).select("*").eq("id", resume_id)
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = await query.single().execute()
-    if not resp.data:
+    resp = await query.limit(1).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
         return None
-    return TailoredResumeRecord.model_validate(cast(dict[str, Any], resp.data))
+    return TailoredResumeRecord.model_validate(rows[0])
 
 
 def _scope_to_user(query: Any, user_id: str | None) -> Any:

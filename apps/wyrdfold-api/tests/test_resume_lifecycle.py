@@ -1326,3 +1326,51 @@ class TestDownloadCache:
                 supabase=supabase,
             )
         assert exc_info.value.status_code == 500
+
+
+class TestGetMissingRowReturnsNone:
+    """`persistence.get` must return None for a missing/foreign row, not raise.
+
+    Regression for a bug a live drive found on 2026-08-07: the query used
+    `.single()`, and PostgREST answers `.single()` on zero rows by RAISING
+    `APIError PGRST116` — so the `if not resp.data: return None` guard was
+    unreachable and SIX endpoints 500'd where they meant to 404
+    (`GET /resumes/{id}`, `/versions`, `/download`, approve, unapprove,
+    export-zip). It shipped because every unit test mocks the client and hands
+    back `data=None` directly, which the real driver never produces.
+
+    So this mock behaves like the real thing: `.single()` raises, `.limit(1)`
+    returns an empty list. Any reintroduction of `.single()` fails here.
+    """
+
+    @staticmethod
+    def _supabase_like_postgrest() -> MagicMock:
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+
+        def _single_raises() -> None:
+            raise AssertionError(
+                "persistence.get called .single() — PostgREST raises PGRST116 on "
+                "zero rows, which turns an intended 404 into a 500"
+            )
+
+        chain.single.side_effect = _single_raises
+        chain.limit.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+        return supabase
+
+    async def test_missing_row_returns_none(self) -> None:
+        from app.services.tailor.persistence import get
+
+        result = await get(self._supabase_like_postgrest(), "does-not-exist", user_id=None)
+        assert result is None
+
+    async def test_found_row_still_parses(self) -> None:
+        from app.services.tailor.persistence import get
+
+        supabase = self._supabase_like_postgrest()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+        chain.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[_make_record().model_dump(mode="json")])
+        )
+        result = await get(supabase, "rec-1", user_id=None)
+        assert result is not None and result.id == "rec-1"

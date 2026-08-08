@@ -295,3 +295,100 @@ def test_ats_hostile_resume_is_schema_valid_but_fails_the_real_linter() -> None:
 
     assert result.ok is False
     assert any(v.code == "no_tables" and v.severity == "error" for v in result.errors)
+
+
+def _dev_optimized():
+    from app.models.experience import OptimizedPayload, Outcome, Role, Skill
+
+    return OptimizedPayload(
+        summary="Senior FE.",
+        roles=[
+            Role(
+                id="fc",
+                company="FightCamp",
+                title="Senior Frontend Engineer",
+                start="2021-11",
+                end="2024-04",
+                summary="Led the PDP rebuild.",
+                skills=["React"],
+                outcome_refs=["o1"],
+            )
+        ],
+        skills=[Skill(name="React"), Skill(name="TypeScript")],
+        outcomes=[
+            Outcome(
+                description="Cut mobile load times from 10s to 2s",
+                metric="LCP",
+                value="2s",
+                role_ref="fc",
+            )
+        ],
+    )
+
+
+def test_dev_default_tailor_resume_survives_the_real_trace_validator() -> None:
+    """Schema-valid is NOT enough here — ``validate_trace_refs`` RAISES on a
+    ``source_role_ref`` that isn't a real ``Role.id``, and silently drops
+    bullets carrying a number the source doesn't have. So a canned response
+    would either explode or come back empty.
+
+    Same gap #608 closed for ``job_analysis``: without a seed the echo fails
+    validation and every mock-env tailoring dies with "Resume generation
+    failed" — local dev and CI can't drive the flow at all. Re-found by a live
+    drive on 2026-08-07, which is why this pins the validator, not the schema.
+    """
+    from app.models.tailor import ContactInfo, TailoredResume
+    from app.services.llm.mock import TAILOR_RESUME_PURPOSE, dev_default_responses
+    from app.services.tailor.tailor import build_user_message, validate_trace_refs
+
+    optimized = _dev_optimized()
+    prompt = build_user_message(
+        optimized=optimized,
+        job_description="We want a senior FE.",
+        contact=ContactInfo(name="Daniel Joffe", email="d@example.com"),
+        resume_type="generic",
+        preferences_text=None,
+        annotations_text=None,
+        critique=None,
+        page_budget=2,
+    )
+
+    source = dev_default_responses()[TAILOR_RESUME_PURPOSE]
+    assert callable(source)
+    resume = TailoredResume.model_validate_json(source(prompt, []))
+
+    repaired, warnings = validate_trace_refs(resume, optimized)
+    assert repaired.experience, "trace validation stripped every role"
+    assert repaired.experience[0].source_role_ref == "fc"
+    # The bullet survived — it traces to a real outcome and invents no number.
+    assert repaired.experience[0].bullets, "trace validation dropped every bullet"
+    assert repaired.skills, "every skill was rejected as unknown"
+
+
+def test_dev_default_cover_letter_survives_the_real_ref_validator() -> None:
+    from app.models.tailor import ContactInfo, TailoredCoverLetter
+    from app.services.llm.mock import TAILOR_COVER_LETTER_PURPOSE, dev_default_responses
+    from app.services.tailor.tailor import (
+        build_cover_letter_user_message,
+        validate_cover_letter_refs,
+    )
+
+    optimized = _dev_optimized()
+    prompt = build_cover_letter_user_message(
+        optimized=optimized,
+        job_description="We want a senior FE.",
+        company_name="Acme",
+        contact=ContactInfo(name="Daniel Joffe", email="d@example.com"),
+        role_title="Senior Frontend Engineer",
+        preferences_text=None,
+        annotations_text=None,
+        critique=None,
+    )
+
+    source = dev_default_responses()[TAILOR_COVER_LETTER_PURPOSE]
+    assert callable(source)
+    letter = TailoredCoverLetter.model_validate_json(source(prompt, []))
+
+    assert letter.recipient_company == "Acme"
+    assert letter.paragraphs
+    validate_cover_letter_refs(letter, optimized)
