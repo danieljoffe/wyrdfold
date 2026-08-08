@@ -81,6 +81,7 @@ export const MANIFEST: ManifestEntry[] = [
   { id: 'jobs.sort.request-fanout', surface: 'jobs' },
   { id: 'jobs.filter.min-score', surface: 'jobs' },
   { id: 'jobs.filter.min-score.floor-holds', surface: 'jobs' },
+  { id: 'jobs.filter.min-score.raw-floor-holds', surface: 'jobs' },
   { id: 'jobs.filter.status', surface: 'jobs' },
   { id: 'jobs.filter.remote-only', surface: 'jobs' },
   { id: 'jobs.filter.min-salary', surface: 'jobs' },

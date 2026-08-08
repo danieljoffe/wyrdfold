@@ -13,6 +13,7 @@ import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
+import { LocalDate } from '@/components/LocalFormat';
 import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -797,14 +798,16 @@ export default function JobDetailPanel({
                 key={entry.id}
                 className='flex items-center gap-2 text-xs text-text-secondary'
               >
-                <span className='shrink-0'>
-                  {new Date(entry.created_at).toLocaleDateString(undefined, {
+                <LocalDate
+                  className='shrink-0'
+                  value={entry.created_at}
+                  options={{
                     month: 'short',
                     day: 'numeric',
                     hour: 'numeric',
                     minute: '2-digit',
-                  })}
-                </span>
+                  }}
+                />
                 <span>&rarr;</span>
                 <StatusIndicator status={entry.new_status} />
                 {entry.note && (

@@ -7,6 +7,7 @@ import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import ScoreBadge from '@/components/ScoreBadge';
+import { LocalDate } from '@/components/LocalFormat';
 import { cn } from '@/lib/cn';
 import type { JobTargetSummary } from './types';
 
@@ -145,7 +146,7 @@ export default function TargetCard({
           </dd>
           <dt className='text-text-tertiary'>Updated</dt>
           <dd className='text-right text-text-secondary'>
-            {new Date(target.updated_at).toLocaleDateString()}
+            <LocalDate value={target.updated_at} />
           </dd>
         </dl>
 

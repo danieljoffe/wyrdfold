@@ -35,6 +35,7 @@ import type {
   TailorResponse,
 } from '../../types';
 import { useTailorDocument } from '../../useTailorDocument';
+import { LocalDateTime, LocalNumber } from '@/components/LocalFormat';
 
 interface ResumeReviewPageProps {
   jobPostingId: string;
@@ -730,7 +731,7 @@ export default function ResumeReviewPage({
         </Text>
         <Text variant='meta' as='span'>
           Tokens:{' '}
-          {(record.input_tokens + record.output_tokens).toLocaleString()}
+          <LocalNumber value={record.input_tokens + record.output_tokens} />
         </Text>
         {record.model && (
           <Text variant='meta' as='span'>
@@ -793,7 +794,7 @@ export default function ResumeReviewPage({
                         {v.source.replace('_', ' ')}
                       </Badge>
                       <Text variant='meta' as='span'>
-                        {new Date(v.created_at).toLocaleString()}
+                        <LocalDateTime value={v.created_at} />
                       </Text>
                     </span>
                     {!isApproved && (
@@ -953,7 +954,7 @@ export default function ResumeReviewPage({
               : !isApproved && saveLabel(saveStatus)}
           </Text>
           <Text variant='meta' as='span' className='text-text-tertiary'>
-            {markdown.length.toLocaleString()} chars
+            <LocalNumber value={markdown.length} /> chars
           </Text>
         </div>
       </div>

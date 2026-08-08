@@ -11,6 +11,7 @@ import {
 import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
+import { LocalDate } from '@/components/LocalFormat';
 
 interface UsageWindow {
   spent_usd: number;
@@ -112,8 +113,8 @@ export default function LlmUsageCard() {
             {usage.monthly_resets_at && (
               <Text variant='caption' className='text-text-tertiary'>
                 Allowance frees up around{' '}
-                {new Date(usage.monthly_resets_at).toLocaleDateString()} as
-                usage rolls out of the 30-day window.
+                <LocalDate value={usage.monthly_resets_at} /> as usage rolls out
+                of the 30-day window.
               </Text>
             )}
           </>
