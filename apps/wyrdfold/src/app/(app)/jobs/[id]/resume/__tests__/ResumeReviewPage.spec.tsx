@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import ResumeReviewPage from '../ResumeReviewPage';
 
 const mockToast = jest.fn();
@@ -95,7 +95,8 @@ describe('ResumeReviewPage', () => {
         return Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => RECORD,
+          // #656: the by-job route returns a {record, status} envelope.
+          json: async () => ({ record: RECORD, status: 'idle' }),
         } as Response);
       }
       return Promise.resolve({
@@ -144,5 +145,144 @@ describe('ResumeReviewPage', () => {
         })
       );
     });
+  });
+});
+
+/**
+ * Flagged drafts (#656). A resume that fails ATS lint is now PERSISTED with
+ * its violations rather than 422'd away — the LLM call is already paid for and
+ * regenerating burns the daily cap. These pin the half of that decision the
+ * user actually sees: the draft opens, says what's wrong, and offers the free
+ * deterministic re-check instead of a paid regeneration.
+ */
+const FLAGGED_VIOLATION = {
+  code: 'no_tables',
+  message: 'Markdown contains a table.',
+  severity: 'error' as const,
+};
+
+function mockPage(
+  state: unknown,
+  extra?: (url: string, init?: { method?: string }) => unknown
+) {
+  global.fetch = jest
+    .fn()
+    .mockImplementation((url: string, init?: { method?: string }) => {
+      const custom = extra?.(url, init);
+      if (custom) return Promise.resolve(custom as Response);
+      if (url === '/api/jobs/j-1') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => POSTING,
+        } as Response);
+      }
+      if (url.includes('/tailor/by-job/')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => state,
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ entries: [] }),
+      } as Response);
+    }) as unknown as typeof fetch;
+}
+
+describe('ResumeReviewPage — flagged drafts (#656)', () => {
+  it('shows why the draft failed ATS checks, with a free re-check action', async () => {
+    mockPage({
+      record: { ...RECORD, lint_violations: [FLAGGED_VIOLATION] },
+      status: 'idle',
+    });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(await screen.findByText(/Failed ATS checks/i)).toBeInTheDocument();
+    expect(screen.getByText(/Markdown contains a table/i)).toBeInTheDocument();
+    expect(screen.getByText(/Needs fixes/i)).toBeInTheDocument();
+    // The banner names the cost, because "regenerate" is the expensive
+    // alternative the flagged-persist decision exists to avoid.
+    expect(screen.getByText(/no AI credits/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /re-run ATS checks/i })
+    ).toBeInTheDocument();
+  });
+
+  it('clears the flag when a re-check passes', async () => {
+    const posted: string[] = [];
+    mockPage(
+      {
+        record: { ...RECORD, lint_violations: [FLAGGED_VIOLATION] },
+        status: 'idle',
+      },
+      (url, init) => {
+        if (init?.method === 'POST' && url.includes('/ats-recheck')) {
+          posted.push(url);
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              violations: [],
+              record: { ...RECORD, lint_violations: [] },
+            }),
+          };
+        }
+        return undefined;
+      }
+    );
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+    const button = await screen.findByRole('button', {
+      name: /re-run ATS checks/i,
+    });
+
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: 'success',
+          title: 'Passes ATS checks',
+        })
+      );
+    });
+    expect(posted).toEqual(['/api/jobs/tailor/r-1/ats-recheck']);
+    // Banner gone: `lint_violations: []` is "linted clean", not "unlinted".
+    await waitFor(() => {
+      expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+    });
+  });
+
+  it('renders a wait, not a dead end, when landing mid-generation', async () => {
+    // Kicked off from the job panel, then navigated straight here. The run
+    // outlives that navigation, so "not found" would be a lie.
+    mockPage({ record: null, status: 'running' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(
+      await screen.findByText(/Tailoring your resume/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/keeps running if you navigate away/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Tailored resume not found/i)).toBeNull();
+  });
+
+  it('still reports a genuinely missing draft as not found', async () => {
+    // The negative that keeps the wait state honest: a 200 + null record with
+    // nothing in flight is a settled empty state, not a pending one.
+    mockPage({ record: null, status: 'idle' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(
+      await screen.findByText(/Tailored resume not found/i)
+    ).toBeInTheDocument();
   });
 });

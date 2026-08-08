@@ -96,5 +96,6 @@ testpaths = ["tests"]
 # when the local stack isn't reachable.
 addopts = "--cov=app --cov-report=term-missing --no-cov-on-fail -m 'not integration'"
 markers = [
+    "real_posting_exists: use the real _posting_exists helper, not the module stub",
   "integration: requires a live local Supabase stack (deselected by default)",
 ]

@@ -151,12 +151,15 @@ describe('JobDetailPanel', () => {
     // itself happens on the backend persistence side-effect.
     global.fetch = jest.fn().mockImplementation((url: string) => {
       if (typeof url === 'string' && url.includes('/tailor/by-job/')) {
-        // ResumeSection fetches the existing tailored doc; 200 with a
-        // record means "Review tailored resume" link appears.
+        // ResumeSection polls the tailored doc's state; a record inside
+        // the #656 envelope means "Review tailored resume" link appears.
         return Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => ({ id: 'r-1', approved_at: null }),
+          json: async () => ({
+            record: { id: 'r-1', approved_at: null },
+            status: 'idle',
+          }),
         });
       }
       if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {

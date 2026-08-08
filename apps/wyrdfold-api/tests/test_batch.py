@@ -80,6 +80,18 @@ _RESUME_RECORD = TailoredResumeRecord(
 )
 
 
+def _flagged_record() -> TailoredResumeRecord:
+    """A resume persisted despite failing ATS lint (#656)."""
+    return _RESUME_RECORD.model_copy(
+        update={
+            "id": "rec-flagged",
+            "lint_violations": [
+                LintViolation(code="too_long", message="Page overflow", severity="error")
+            ],
+        }
+    )
+
+
 def _pending_item(jid: str) -> dict[str, Any]:
     return {
         "job_posting_id": jid,
@@ -255,7 +267,12 @@ class TestBatchProcessing:
             mock_pipeline.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_process_item_lint_failure(self) -> None:
+    async def test_process_item_lint_failure_completes_as_flagged_draft(self) -> None:
+        """#656: a batch item whose resume fails ATS lint now yields a real
+        (flagged) ``documents`` row, so the item COMPLETES carrying its
+        violations rather than being marked failed. Marking it failed would
+        strand a draft the user already paid an LLM call for — and leave
+        ``resume_record_id`` null, with nothing to link them to."""
         supabase = _mock_supabase_for_batch()
         llm = MagicMock()
 
@@ -269,12 +286,21 @@ class TestBatchProcessing:
             resume=_RESUME,
             warnings=[],
             llm_result=_LLM_RESULT,
+            record=_flagged_record(),
+            payload_md="# Flagged draft",
         )
 
-        with patch(
-            "app.services.batch.run_tailor_pipeline",
-            new_callable=AsyncMock,
-            return_value=lint_fail,
+        with (
+            patch(
+                "app.services.batch.run_tailor_pipeline",
+                new_callable=AsyncMock,
+                return_value=lint_fail,
+            ),
+            patch(
+                "app.services.tailor.persistence.mark_job_resume_draft",
+                new_callable=AsyncMock,
+            ) as mock_mark,
+            patch("app.services.batch._update_batch", new_callable=AsyncMock) as mock_update,
         ):
             await process_batch(
                 supabase,
@@ -289,8 +315,15 @@ class TestBatchProcessing:
                 page_budget=2,
             )
 
-        # Batch should still complete (with failures tracked)
-        # The _update_batch calls track the failed item
+        # The flagged draft is reachable and the posting advanced, exactly as
+        # a clean generation would.
+        item = next(
+            c.kwargs["items"][0] for c in mock_update.call_args_list if "items" in c.kwargs
+        )
+        assert item["status"] == "completed"
+        assert item["resume_record_id"] == "rec-flagged"
+        assert item["lint_violations"] == ["Page overflow"]
+        mock_mark.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_item_exception(self) -> None:

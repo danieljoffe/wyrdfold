@@ -1,13 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
-import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { promptForMissingContactName } from './promptForMissingContactName';
-import type { TailoredResumeRecord, TailorResponse } from './types';
+import { loadJobDescription } from './loadJobDescription';
+import { useTailorDocument } from './useTailorDocument';
 
 interface CoverLetterSectionProps {
   jobPostingId: string;
@@ -15,130 +14,53 @@ interface CoverLetterSectionProps {
   roleTitle: string;
 }
 
+/**
+ * Cover-letter twin of ``ResumeSection``. Generation is non-blocking (#656):
+ * ``useTailorDocument`` owns the 202 + poll loop, so the pill reflects a run
+ * in flight even across a navigation.
+ */
 export default function CoverLetterSection({
   jobPostingId,
   companyName,
   roleTitle,
 }: CoverLetterSectionProps) {
-  const [record, setRecord] = useState<TailoredResumeRecord | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [generating, setGenerating] = useState(false);
   const { toast } = useToast();
+  const { record, loading, generating, error, generate } = useTailorDocument({
+    jobPostingId,
+    kind: 'cover_letter',
+  });
 
-  const fetchCoverLetter = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(
-        `/api/jobs/tailor/by-job/${jobPostingId}/cover-letter`
-      );
-      // The route returns 200 with a ``null`` body when no record
-      // exists yet — see ``ResumeSection`` for the rationale.
-      if (!res.ok) return;
-      const data = (await res.json()) as TailoredResumeRecord | null;
-      setRecord(data);
-    } catch {
-      // Non-critical — silently fail on initial load
-    } finally {
-      setLoading(false);
-    }
-  }, [jobPostingId]);
-
+  // One toast per distinct failure — see ResumeSection for the guard rationale.
+  const toastedRef = useRef<string | null>(null);
   useEffect(() => {
-    fetchCoverLetter();
-  }, [fetchCoverLetter]);
+    if (error && toastedRef.current !== error) {
+      toastedRef.current = error;
+      toast({ variant: 'error', title: error });
+    }
+    if (!error) toastedRef.current = null;
+  }, [error, toast]);
 
   async function handleGenerate() {
-    setGenerating(true);
-    try {
-      const detailRes = await fetch(`/api/jobs/${jobPostingId}`);
-      if (!detailRes.ok) {
-        toast({ variant: 'error', title: 'Could not load job description' });
-        return;
-      }
-      const detail = (await detailRes.json()) as {
-        description_html: string | null;
-      };
-      const jd = (detail.description_html ?? '').trim();
-      if (!jd) {
-        toast({
-          variant: 'error',
-          title: 'Job has no description — cannot tailor a cover letter.',
-        });
-        return;
-      }
-
-      const postTailor = () =>
-        fetch('/api/jobs/tailor/cover-letter', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            job_description: jd,
-            job_posting_id: jobPostingId,
-            company_name: companyName,
-            role_title: roleTitle,
-          }),
-        });
-
-      let res = await postTailor();
-
-      // Defensive fallback for the contact-name gate. See
-      // ``promptForMissingContactName`` for which users still hit
-      // this post-#703.
-      if (!res.ok) {
-        const peek = (await res
-          .clone()
-          .json()
-          .catch(() => null)) as {
-          detail?: { code?: string; message?: string } | string;
-        } | null;
-        const peekDetail =
-          typeof peek?.detail === 'string' ? peek.detail : undefined;
-        if (await promptForMissingContactName(peekDetail)) {
-          res = await postTailor();
-        }
-      }
-
-      if (!res.ok) {
-        // Same shape as ResumeSection: ``gap_gate`` is a structured 422
-        // we surface specifically; everything else (string detail,
-        // ``llm_budget_exceeded`` 429, unknown shapes) goes through
-        // ``extractApiError``.
-        const peek = (await res
-          .clone()
-          .json()
-          .catch(() => null)) as {
-          detail?: { code?: string; message?: string } | string;
-        } | null;
-        const peekDetail = peek?.detail;
-        if (
-          typeof peekDetail === 'object' &&
-          peekDetail !== null &&
-          peekDetail.code === 'gap_gate'
-        ) {
-          toast({
-            variant: 'error',
-            title:
-              peekDetail.message ?? 'Master doc has gaps — update it first',
-          });
-        } else {
-          toast({
-            variant: 'error',
-            title: await extractApiError(res, 'Cover letter generation failed'),
-          });
-        }
-        return;
-      }
-
-      const data = (await res.json()) as TailorResponse;
-      setRecord(data.record);
-      toast({ variant: 'success', title: 'Cover letter generated' });
-    } catch {
+    const jd = await loadJobDescription(jobPostingId);
+    if (!jd.ok) {
       toast({
         variant: 'error',
-        title: 'Network error generating cover letter',
+        title:
+          jd.reason === 'empty'
+            ? 'Job has no description — cannot tailor a cover letter.'
+            : 'Could not load job description',
       });
-    } finally {
-      setGenerating(false);
+      return;
+    }
+
+    const ok = await generate({
+      job_description: jd.jd,
+      job_posting_id: jobPostingId,
+      company_name: companyName,
+      role_title: roleTitle,
+    });
+    if (ok) {
+      toast({ variant: 'success', title: 'Cover letter generated' });
     }
   }
 
@@ -166,6 +88,7 @@ export default function CoverLetterSection({
         variant='secondary'
         size='sm'
         disabled
+        title='Generating — safe to navigate away.'
       >
         <Spinner size='sm' aria-label='Generating cover letter' />
         <span>Generating…</span>

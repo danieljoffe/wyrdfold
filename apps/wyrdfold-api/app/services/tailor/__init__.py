@@ -11,6 +11,7 @@ Layout:
 - persistence.py  — documents CRUD + Supabase Storage (P3d)
 - pipeline.py     — end-to-end orchestration (P3d)
 - reuse.py        — resume reuse within targets (#504)
+- run_registry.py — in-flight state for the 202+poll generation flow (#656)
 """
 
 from app.services.tailor.pipeline import (

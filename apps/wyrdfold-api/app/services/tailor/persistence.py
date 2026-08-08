@@ -11,8 +11,11 @@ Markdown is the new source of truth: every persist() also writes
 `docx_payload_md_hash` (cache key for the rendered .docx). The
 structured `payload` JSONB column stays in place during transition.
 
-Lint failures do NOT reach this module — the router returns 422 before
-anything gets persisted.
+Generation lint failures DO reach this module as of #656: a resume that
+fails ATS lint is persisted as a flagged draft (`lint_violations` populated)
+rather than 422'd and thrown away — the run is backgrounded now, so nobody
+may be watching when it fails, and regenerating burns the daily cap. See
+`persist` and `update_lint_violations`.
 """
 
 from __future__ import annotations
@@ -129,8 +132,17 @@ async def persist(
     warnings: list[str],
     llm_result: LLMResult,
     storage_path: str | None,
+    lint_violations: list[dict[str, Any]] | None = None,
 ) -> TailoredResumeRecord:
-    """Insert one documents row for a resume."""
+    """Insert one documents row for a resume.
+
+    ``lint_violations`` (#656): NULL when unlinted, ``[]`` when clean, and a
+    populated list when the draft is persisted FLAGGED — a resume that fails
+    ATS lint is now kept rather than discarded, so the ~39s of generation
+    spend isn't lost and the user can edit + re-check instead of paying to
+    regenerate. Cover letters don't run ATS lint, so persist_cover_letter
+    deliberately does not carry this.
+    """
     row: dict[str, Any] = {
         "user_id": user_id,
         "job_posting_id": job_posting_id,
@@ -148,6 +160,7 @@ async def persist(
         "output_tokens": llm_result.usage.output_tokens,
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
+        "lint_violations": lint_violations,
     }
     return await insert_row(supabase, row, payload_md=payload_md)
 
@@ -212,13 +225,24 @@ async def get(
     Returns ``None`` both when the row doesn't exist AND when it
     exists but belongs to another user — same response so we don't
     leak the existence of cross-tenant rows.
+
+    Uses ``.limit(1)``, NOT ``.single()``: PostgREST answers ``.single()`` on
+    zero rows by RAISING ``APIError PGRST116`` ("Cannot coerce the result to a
+    single JSON object"), so the ``if not resp.data: return None`` below was
+    unreachable and every caller 500'd where it meant to 404. Found by a live
+    drive on 2026-08-07 — six endpoints were affected in prod
+    (``GET /resumes/{id}``, ``/versions``, ``/download``, ``approve``,
+    ``unapprove``, ``export-zip``), and unit tests missed it because they mock
+    the client and hand back ``data=None`` directly, which the real driver
+    never does. Matches ``get_by_job``'s shape in this module.
     """
     query = supabase.table(TABLE).select("*").eq("id", resume_id)
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = await query.single().execute()
-    if not resp.data:
+    resp = await query.limit(1).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
         return None
-    return TailoredResumeRecord.model_validate(cast(dict[str, Any], resp.data))
+    return TailoredResumeRecord.model_validate(rows[0])
 
 
 def _scope_to_user(query: Any, user_id: str | None) -> Any:
@@ -276,6 +300,7 @@ async def update_payload_md(
     payload_md: str,
     *,
     user_id: str | None,
+    lint_violations: list[dict[str, Any]] | None = None,
 ) -> TailoredResumeRecord:
     """Update the markdown payload and invalidate the cached docx hash.
 
@@ -289,6 +314,13 @@ async def update_payload_md(
     re-adapt) call `versions.checkpoint` separately. That keeps the
     free-tier version cap from being flooded by routine keystrokes.
 
+    ``lint_violations`` (#656): the caller already lints the incoming
+    markdown, so it passes that result through and the flag moves with the
+    content it describes. ``None`` leaves the column untouched — distinct
+    from ``[]``, which asserts "linted, clean" and is what actually CLEARS a
+    flagged draft once the user fixes it. Without this an edited-and-fixed
+    resume would stay flagged forever.
+
     Defense-in-depth (post-#714): see ``update_payload``.
     """
     updates: dict[str, Any] = {
@@ -300,11 +332,42 @@ async def update_payload_md(
         "docx_payload_md_hash": None,
         "updated_at": "now()",
     }
+    if lint_violations is not None:
+        updates["lint_violations"] = lint_violations
     query = supabase.table(TABLE).update(updates).eq("id", resume_id)
     resp = await _scope_to_user(query, user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError(f"Failed to update documents row {resume_id}")
+    return TailoredResumeRecord.model_validate(rows[0])
+
+
+async def update_lint_violations(
+    supabase: AsyncClient,
+    resume_id: str,
+    violations: list[dict[str, Any]],
+    *,
+    user_id: str | None,
+) -> TailoredResumeRecord:
+    """Overwrite a document's ATS lint state (#656).
+
+    Backs ``POST /tailor/resumes/{id}/ats-recheck``: lint is deterministic, so
+    re-running it after an edit costs nothing and either clears the flag
+    (``[]``) or refreshes which violations remain. Writes the list verbatim —
+    ``[]`` means "linted clean", which is distinct from the ``NULL`` that
+    means "never linted".
+
+    Deliberately does NOT touch ``updated_at``: re-checking inspects content
+    that didn't change, and bumping the timestamp would make a read-only
+    verification look like an edit in the UI.
+
+    Defense-in-depth (post-#714): see ``update_payload``.
+    """
+    query = supabase.table(TABLE).update({"lint_violations": violations}).eq("id", resume_id)
+    resp = await _scope_to_user(query, user_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        raise RuntimeError(f"Failed to update lint state on documents row {resume_id}")
     return TailoredResumeRecord.model_validate(rows[0])
 
 

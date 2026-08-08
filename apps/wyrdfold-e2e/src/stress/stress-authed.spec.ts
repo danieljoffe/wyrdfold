@@ -22,7 +22,8 @@ test.describe.configure({ mode: 'serial' });
 let analysisJobId: string | null = null;
 
 test('setup: activate target for jobs coverage', async ({ page }) => {
-  test.setTimeout(120_000);
+  // Must exceed the 60s readiness poll below plus the activate call itself.
+  test.setTimeout(180_000);
   await timedAction(
     page,
     'targets.activate',
@@ -38,6 +39,33 @@ test('setup: activate target for jobs coverage', async ({ page }) => {
       if (!res.ok()) throw new Error(`user-target ${res.status()}`);
     }
   );
+
+  // Activation is ASYNC: the POST returns as soon as the pipeline is
+  // spawned, so the dashboard journey used to race it and find an empty
+  // state (dash.top-match.click-through burned 45s waiting for a job link
+  // that did not exist yet).
+  //
+  // Gate on exactly what the dashboard renders — the first page of
+  // score-sorted new matches — NOT on activation_status: the pipeline sits
+  // in 'polling' for many minutes while it fans out over the whole source
+  // catalog, long after matches are servable (measured: still 'polling'
+  // 6min in with 11,966 scored live rows). Waiting for 'ready' timed the
+  // setup out and skipped the entire sweep.
+  const deadline = Date.now() + 60_000;
+  let matches = 0;
+  while (Date.now() < deadline) {
+    const res = await page.request.get(
+      '/api/jobs?status=new&sort=score&order=desc&page_size=1'
+    );
+    if (res.ok()) {
+      const body = (await res.json()) as { postings?: unknown[] };
+      matches = body.postings?.length ?? 0;
+      if (matches > 0) break;
+    }
+    await new Promise(r => setTimeout(r, 2_000));
+  }
+
+  console.log(`[stress] activation settled: first-page matches=${matches}`);
 });
 
 test('dashboard journey', async ({ page }) => {
@@ -227,7 +255,14 @@ test('jobs list journey', async ({ page }) => {
     'jobs.filter.min-score',
     'jobs',
     async () => {
-      await page.getByRole('button', { name: /any score/i }).click();
+      // shared-ui Dropdown: open-state gating races (#522), so a menu left
+      // open by a previous action swallows this click as a dismiss and the
+      // menu never opens — the item wait then ate the full 45s timeout.
+      // Dismiss first, then PROVE the menu opened before reaching for an item.
+      await page.keyboard.press('Escape');
+      const scoreTrigger = page.getByRole('button', { name: /any score/i });
+      await scoreTrigger.click();
+      await expect(scoreTrigger).toHaveAttribute('aria-expanded', 'true');
       await page.getByRole('menuitem', { name: /score 70\+/i }).click();
     },
     async () => {
@@ -478,14 +513,36 @@ test('job detail + tailor journey', async ({ page }) => {
     'jobdetail.description.toggle',
     'jobdetail',
     async () => {
+      // Native <details>/<summary>, EXPANDED by default and carrying no
+      // role=button (DOM-probed 2026-08-07). The old
+      // getByRole('button', …).click().catch(…) therefore never matched:
+      // it burned the full 45s actionTimeout and the swallowed error
+      // logged the row as a 45,4xx ms PASS on every single run.
       await page
-        .getByRole('button', { name: /description|show/i })
+        .locator('details')
+        .filter({ hasText: /job description/i })
         .first()
-        .click()
-        .catch(() => undefined);
+        .locator('summary')
+        .first()
+        .click();
     },
     async () => {
-      await page.waitForTimeout(400);
+      // Assert the toggle actually flipped state — open -> closed. Without
+      // this the action can 'succeed' while doing nothing at all.
+      // getAttribute, not evaluate(): the e2e tsconfig ships no DOM lib, so
+      // DOM types are unavailable inside evaluate callbacks. <details> drops
+      // the `open` attribute entirely when collapsed.
+      await expect
+        .poll(
+          async () =>
+            page
+              .locator('details')
+              .filter({ hasText: /job description/i })
+              .first()
+              .getAttribute('open'),
+          { timeout: 5_000 }
+        )
+        .toBeNull();
     }
   );
 
@@ -577,7 +634,15 @@ test('job detail + tailor journey', async ({ page }) => {
     'resume.approve',
     'tailor',
     async () => {
-      await page.getByRole('button', { name: /open more menu/i }).click();
+      // The trigger is an icon-only button with NO accessible name — no text,
+      // no aria-label, only aria-haspopup="menu" (DOM-probed 2026-08-07).
+      // getByRole('button', {name: /open more menu/i}) could never match.
+      // Selecting structurally until the a11y bug is fixed; then this should
+      // move back to an accessible-name query.
+      const moreMenu = page.locator('button[aria-haspopup="menu"]').first();
+      await page.keyboard.press('Escape');
+      await moreMenu.click();
+      await expect(moreMenu).toHaveAttribute('aria-expanded', 'true');
       await page.getByText(/lock from editing/i).click();
     },
     async () => {
@@ -592,7 +657,15 @@ test('job detail + tailor journey', async ({ page }) => {
     'resume.unapprove',
     'tailor',
     async () => {
-      await page.getByRole('button', { name: /open more menu/i }).click();
+      // The trigger is an icon-only button with NO accessible name — no text,
+      // no aria-label, only aria-haspopup="menu" (DOM-probed 2026-08-07).
+      // getByRole('button', {name: /open more menu/i}) could never match.
+      // Selecting structurally until the a11y bug is fixed; then this should
+      // move back to an accessible-name query.
+      const moreMenu = page.locator('button[aria-haspopup="menu"]').first();
+      await page.keyboard.press('Escape');
+      await moreMenu.click();
+      await expect(moreMenu).toHaveAttribute('aria-expanded', 'true');
       await page.getByText(/unlock for editing/i).click();
     },
     async () => {

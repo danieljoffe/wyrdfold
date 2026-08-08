@@ -4,15 +4,38 @@ POST  /tailor/resume                    — synthesize + render + lint + persist
 POST  /tailor/cover-letter              — same pipeline shape, for cover letters.
 GET   /tailor/resumes                   — recent resume tailorings.
 GET   /tailor/cover-letters             — recent cover-letter tailorings.
-GET   /tailor/resumes/by-job/{id}       — most recent resume for a job posting.
+GET   /tailor/resumes/by-job/{id}       — poll state + most recent resume for a posting.
 POST  /tailor/resumes/export-zip        — bulk .docx download as zip.
 PATCH /tailor/resumes/{id}              — edit a draft resume payload.
+POST  /tailor/resumes/{id}/ats-recheck  — re-run ATS lint over the saved markdown.
 POST  /tailor/resumes/{id}/approve      — approve (lock) a resume.
 POST  /tailor/resumes/{id}/unapprove    — reopen an approved resume for editing.
 GET   /tailor/resumes/{id}              — one record (either type; look up by id).
 GET   /tailor/resumes/{id}/download     — serves the `.docx` bytes.
 
-All 422 responses carry the LintFailureResponse shape.
+Generation is **non-blocking** (#656), the shape ``/analysis`` took in #459.
+``POST /tailor/resume`` (~39s) and ``POST /tailor/cover-letter`` (~27s) used
+to hold the request open for the whole LLM pipeline. They now hand it to a
+detached task and return ``202 {"status": "running"}``; the client polls
+``GET /tailor/resumes/by-job/{id}`` (or the cover-letter sibling) until the
+``documents`` row lands. Because the task persists regardless of the client,
+the user is free to navigate away mid-generation and come back to a finished
+draft.
+
+Two things stay synchronous on purpose, so they surface as a real HTTP status
+on the POST instead of a silent task failure the user only learns about by
+polling: the structural gap gate (422) and contact resolution (400) — the
+frontend has dedicated recovery UI for both. A 202 only means the LLM work
+was accepted.
+
+The blocking path survives for callers with no ``job_posting_id`` (operator /
+api-key drives against a bare JD): that id IS the poll surface, so there is
+nothing to poll without it.
+
+422 responses carry the LintFailureResponse shape — but as of #656 a
+generation lint failure is no longer one of them: the resume is persisted as
+a flagged draft carrying its violations (regenerating burns the daily cap,
+and with the run backgrounded nobody may be watching to retry).
 """
 
 import asyncio
@@ -26,11 +49,13 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi import status as http_status
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from supabase import AsyncClient
 
 from app.background import spawn_detached
+from app.config import Settings
 from app.constants import resolve_owner
 from app.dependencies import (
     enforce_llm_budget,
@@ -38,20 +63,26 @@ from app.dependencies import (
     get_async_user_supabase,
     get_current_user_id,
     get_llm_client,
+    get_settings,
     verify_api_key_or_jwt,
 )
 from app.models.batch import BatchJob, BatchRequest, BatchResponse
-from app.models.experience import OptimizedDoc, Preferences
+from app.models.experience import OptimizedDoc, Preferences, PreferencesPayload
 from app.models.tailor import (
+    AtsRecheckResponse,
     BulkExportRequest,
+    ContactInfo,
     CoverLetterRequest,
+    DocumentType,
     GapGateFailureResponse,
     ResumeCheckpointRequest,
     ResumeEditRequest,
+    TailoredDocumentState,
     TailoredResumeRecord,
     TailorLintFailureResponse,
     TailorRequest,
     TailorResponse,
+    TailorStatusResponse,
 )
 from app.models.user_profile import ResumeStyleSettings
 from app.rate_limit import limiter
@@ -69,9 +100,11 @@ from app.services.tailor import (
     CoverLetterPipelineLintFailure,
     CoverLetterPipelineSuccess,
     PipelineLintFailure,
+    PipelineResult,
     PipelineSuccess,
     persistence,
     run_cover_letter_pipeline,
+    run_registry,
     run_tailor_pipeline,
     versions,
 )
@@ -177,6 +210,27 @@ async def _target_scoring_profile_row(
     return rows[0] if rows else None
 
 
+async def _posting_exists(supabase: AsyncClient, job_posting_id: str) -> bool:
+    """Does this ``jobs`` row exist?
+
+    Guards the 202 (#656 follow-up). ``TailorRequest.job_posting_id`` is a
+    plain ``str``, so a bogus id sails through validation, gets accepted, and
+    the detached run then spends a FULL LLM call before dying on the foreign
+    key at insert — burning the caller's daily cap on work that could never
+    have succeeded. Verified live during the release gate: a
+    ``job_posting_id="not-a-uuid"`` kick returned 202 and still wrote a
+    ``llm_costs`` row.
+
+    ``/analysis`` already validates its posting synchronously before spawning
+    (``_fetch_job_description`` → 404); this is the same contract — a 202 must
+    only ever mean "accepted work that can actually run".
+    """
+    resp = await (
+        supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
+    )
+    return bool(cast(list[dict[str, Any]], resp.data or []))
+
+
 async def _fetch_postings_by_ids(
     supabase: AsyncClient, ids: list[str]
 ) -> list[dict[str, Any]]:
@@ -221,31 +275,13 @@ async def _resolve_target_for_posting(
     return cast(str, cast(dict[str, Any], rows[0])["target_id"])
 
 
-@router.post(
-    "/resume",
-    responses={422: {"model": TailorLintFailureResponse | GapGateFailureResponse}},
-    dependencies=[Depends(enforce_llm_budget)],
-)
-@limiter.limit("30/minute")
-async def create_tailored_resume(
-    request: Request,
-    body: TailorRequest,
-    supabase: AsyncClient = Depends(get_async_service_supabase),
-    llm: LLMClient = Depends(get_llm_client),
-    # JWT-required: the generated .docx is stored under the caller's
-    # <user_id>/ Storage folder, so anonymous generation is no longer allowed.
-    user_id: str = Depends(get_current_user_id),
-) -> TailorResponse:
-    # `async def`: the LLM tailor pipeline + every DB round-trip now run
-    # natively on the async service client (#57 slice 3), no threadpool worker
-    # held for the supabase calls.
-    current_optimized = await _optimized_latest(supabase, user_id=user_id)
-    if current_optimized is None:
-        raise HTTPException(
-            status_code=404,
-            detail="no optimized doc — derive one via POST /experience/derive first",
-        )
-
+def _gap_gate_or_422(current_optimized: OptimizedDoc) -> None:
+    """Structural gap gate (#498). Stays SYNCHRONOUS in front of the 202
+    (#656 decision 1): a master doc too thin to generate from is a setup
+    problem the user must fix, and the frontend renders a dedicated
+    "update your master doc" CTA off this exact ``gap_gate`` code. Deferring
+    it into the background task would turn an instant, actionable 422 into a
+    30-second wait that ends in a generic poll error."""
     gate = gap_tracker.can_generate(current_optimized.payload)
     if not gate.ok:
         health = gap_tracker.gap_health(current_optimized.payload)
@@ -260,6 +296,143 @@ async def create_tailored_resume(
                 "tier": health.tier,
             },
         )
+
+
+def _running_202() -> JSONResponse:
+    """The "keep polling" marker both POSTs return once a run is in flight."""
+    return JSONResponse(
+        status_code=http_status.HTTP_202_ACCEPTED,
+        content=TailorStatusResponse(status="running").model_dump(),
+    )
+
+
+def _already_running(
+    *, user_id: str, document_type: DocumentType, job_posting_id: str | None
+) -> bool:
+    """Cheap pre-check for an in-flight run on this exact document.
+
+    Deliberately called BEFORE the expensive preamble (the #504 reuse probe is
+    several DB round-trips), and it claims nothing — so a path that legitimately
+    returns without spawning stays free of claim-lifecycle bookkeeping. Without
+    it, a second tab kicking the same posting mid-run would sail past dedup into
+    the reuse probe and could clone a sibling resume alongside the run that's
+    already generating one.
+    """
+    if job_posting_id is None:
+        return False
+    return run_registry.is_running(
+        run_registry.key_for(
+            user_id=user_id,
+            document_type=document_type,
+            job_posting_id=job_posting_id,
+        )
+    )
+
+
+def _claim_run_or_202(
+    *,
+    user_id: str,
+    document_type: DocumentType,
+    job_posting_id: str,
+    max_concurrent: int,
+) -> tuple[run_registry.Key, JSONResponse | None]:
+    """Dedup + claim the in-flight slot for a background generation (#656).
+
+    Returns ``(key, response)``: a non-None response is what the handler must
+    return instead of spawning — a 202 ``running`` marker when an identical run
+    is already in flight.
+
+    The ``is_running`` check and the ``begin`` claim happen with no ``await``
+    between them, so on the single event loop two concurrent kicks can't both
+    pass and both spawn (the panel's auto-fire, a StrictMode double-invoke, or
+    an impatient double-click would otherwise pay twice for one document).
+
+    Raises 429 past ``max_concurrent`` in-flight runs for this user.
+    Backgrounding removed the natural serialization a 39s blocking request
+    imposed on a browser tab, and ``enforce_llm_budget`` meters *spend* whose
+    ``llm_costs`` rows don't exist until each run's LLM returns — so without
+    this, N simultaneous kicks across N different postings all read the same
+    pre-burst spend and all pass.
+    """
+    key = run_registry.key_for(
+        user_id=user_id,
+        document_type=document_type,
+        job_posting_id=job_posting_id,
+    )
+    if run_registry.is_running(key):
+        return key, _running_202()
+    if max_concurrent > 0 and run_registry.running_count_for_user(user_id) >= max_concurrent:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "tailor_concurrent_limit",
+                "limit": max_concurrent,
+                "message": (
+                    "Too many documents generating at once. "
+                    "Wait for one to finish, then try again."
+                ),
+            },
+        )
+    run_registry.begin(key, user_id=user_id)
+    return key, None
+
+
+@router.post(
+    "/resume",
+    response_model=None,
+    responses={
+        # The 202 is the normal outcome for a client with a job_posting_id;
+        # declare it so the contract is discoverable rather than inferred from
+        # a handler that returns a raw JSONResponse (response_model=None).
+        202: {"model": TailorStatusResponse},
+        422: {"model": TailorLintFailureResponse | GapGateFailureResponse},
+    },
+    dependencies=[Depends(enforce_llm_budget)],
+)
+@limiter.limit("30/minute")
+async def create_tailored_resume(
+    request: Request,
+    body: TailorRequest,
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+    llm: LLMClient = Depends(get_llm_client),
+    # JWT-required: the generated .docx is stored under the caller's
+    # <user_id>/ Storage folder, so anonymous generation is no longer allowed.
+    user_id: str = Depends(get_current_user_id),
+    s: Settings = Depends(get_settings),
+) -> TailorResponse | JSONResponse:
+    """Kick off a tailored resume. Non-blocking when a posting is known (#656).
+
+    Returns 202 ``{"status": "running"}`` and runs the ~39s pipeline in a
+    detached task; the client polls ``GET /tailor/resumes/by-job/{id}``. A
+    reuse-clone hit (#504) still returns 200 with the record inline — it costs
+    no LLM call, so there's nothing to wait for. Callers without a
+    ``job_posting_id`` keep the blocking path (see the module docstring).
+
+    `async def`: the LLM tailor pipeline + every DB round-trip run natively on
+    the async service client (#57 slice 3), no threadpool worker held for the
+    supabase calls.
+    """
+    current_optimized = await _optimized_latest(supabase, user_id=user_id)
+    if current_optimized is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no optimized doc — derive one via POST /experience/derive first",
+        )
+
+    _gap_gate_or_422(current_optimized)
+
+    if _already_running(
+        user_id=user_id, document_type="resume", job_posting_id=body.job_posting_id
+    ):
+        return _running_202()
+
+    # A 202 must only ever mean "accepted work that can actually run" — see
+    # _posting_exists. Checked before the reuse probe and the claim, so a bogus
+    # id costs one indexed lookup and nothing else.
+    if body.job_posting_id is not None and not await _posting_exists(
+        supabase, body.job_posting_id
+    ):
+        raise HTTPException(status_code=404, detail="job posting not found")
 
     # Reuse check (#504): skip pipeline if a similar resume exists in the target
     if not body.force_fresh and body.job_posting_id:
@@ -301,51 +474,173 @@ async def create_tailored_resume(
                             lint_warnings=[],
                         )
 
-    prefs_row = await _preferences_get(supabase, user_id=user_id)
-    prefs_payload = prefs_row.payload if prefs_row else None
-    contact = await resolve_contact(supabase, user_id, body.contact)
+    if body.job_posting_id is None:
+        # No posting → no poll surface (``by-job/{id}`` is keyed on it), so the
+        # operator/api-key JD-only path keeps blocking for the full pipeline.
+        prefs_row = await _preferences_get(supabase, user_id=user_id)
+        contact = await resolve_contact(supabase, user_id, body.contact)
+        result = await _run_resume_pipeline(
+            supabase,
+            llm,
+            user_id=user_id,
+            optimized=current_optimized,
+            body=body,
+            contact=contact,
+            preferences=prefs_row.payload if prefs_row else None,
+        )
+        return _resume_response(result)
 
+    key, dedup = _claim_run_or_202(
+        user_id=user_id,
+        document_type="resume",
+        job_posting_id=body.job_posting_id,
+        max_concurrent=s.tailor_max_concurrent_runs,
+    )
+    if dedup is not None:
+        return dedup
+
+    try:
+        # Resolved BEFORE the 202. ``resolve_contact`` 400s when the profile
+        # carries no name, and the frontend answers that with an inline
+        # name prompt + retry (``promptForMissingContactName``) — a recovery
+        # flow that only works if the failure is the POST's own status.
+        prefs_row = await _preferences_get(supabase, user_id=user_id)
+        contact = await resolve_contact(supabase, user_id, body.contact)
+    except Exception:
+        # Release the claim so a corrected retry re-kicks immediately, then
+        # surface the real error.
+        run_registry.finish(key)
+        raise
+
+    spawn_detached(
+        _run_resume_task(
+            key=key,
+            supabase=supabase,
+            llm=llm,
+            user_id=user_id,
+            optimized=current_optimized,
+            body=body,
+            contact=contact,
+            preferences=prefs_row.payload if prefs_row else None,
+        ),
+        name=f"tailor:resume:{body.job_posting_id}",
+    )
+    return _running_202()
+
+
+async def _run_resume_pipeline(
+    supabase: AsyncClient,
+    llm: LLMClient,
+    *,
+    user_id: str,
+    optimized: OptimizedDoc,
+    body: TailorRequest,
+    contact: ContactInfo,
+    preferences: PreferencesPayload | None,
+) -> PipelineResult:
+    """Run the resume pipeline and mirror the job's pipeline status.
+
+    Shared by the blocking path and the detached task so the two can't drift —
+    notably ``mark_job_resume_draft``, which used to sit only in the handler
+    and would silently stop firing for every backgrounded run.
+    """
     result = await run_tailor_pipeline(
         supabase,
         llm,
         user_id=user_id,
-        optimized=current_optimized,
+        optimized=optimized,
         job_description=body.job_description,
         contact=contact,
-        preferences=prefs_payload,
+        preferences=preferences,
         critique=body.critique,
         resume_type=body.resume_type or "generic",
         page_budget=body.page_budget,
         job_posting_id=body.job_posting_id,
         target_label=body.target_label,
     )
-
-    if isinstance(result, PipelineLintFailure):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "ok": False,
-                "violations": [v.model_dump() for v in result.lint.violations],
-            },
-        )
-
-    if not isinstance(result, PipelineSuccess):
-        raise HTTPException(status_code=500, detail="Unexpected pipeline result")
+    # A flagged draft is still a draft the user is about to work on, so the
+    # posting advances either way — the row exists in both branches now.
     if body.job_posting_id:
         await persistence.mark_job_resume_draft(
             supabase,
             body.job_posting_id,
             user_id=user_id,
         )
-    return TailorResponse(
-        record=result.record,
-        lint_warnings=result.lint.warnings,
-    )
+    return result
+
+
+def _resume_response(result: PipelineResult) -> TailorResponse:
+    """The blocking path's 200 body.
+
+    A lint failure is no longer a 422 (#656): the draft is persisted flagged,
+    so it comes back as a normal record whose ``lint_violations`` say why it
+    needs attention. Keeping one success shape means the operator path and the
+    poll surface describe a flagged draft identically.
+    """
+    if isinstance(result, PipelineLintFailure):
+        return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
+    if not isinstance(result, PipelineSuccess):
+        raise HTTPException(status_code=500, detail="Unexpected pipeline result")
+    return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
+
+
+async def _run_resume_task(
+    *,
+    key: run_registry.Key,
+    supabase: AsyncClient,
+    llm: LLMClient,
+    user_id: str,
+    optimized: OptimizedDoc,
+    body: TailorRequest,
+    contact: ContactInfo,
+    preferences: PreferencesPayload | None,
+) -> None:
+    """Detached worker: run the resume pipeline, then clear the in-flight flag.
+
+    A lint failure is NOT a failure here — the pipeline persisted a flagged
+    draft, so the run ``finish``es and the client's poll finds a real record
+    carrying its violations. Only an exception (LLM, trace validation, DB)
+    marks the run ``error`` so the next poll can offer a retry; it must never
+    let one escape (``spawn_detached``'s done-callback only logs, it can't
+    recover the user's request).
+    """
+    try:
+        await _run_resume_pipeline(
+            supabase,
+            llm,
+            user_id=user_id,
+            optimized=optimized,
+            body=body,
+            contact=contact,
+            preferences=preferences,
+        )
+        run_registry.finish(key)
+    except Exception:
+        _log.exception("tailor resume task failed job=%s", body.job_posting_id)
+        run_registry.fail(key, message="Resume generation failed. Please retry.")
+
+
+class _CoverLetterLintError(Exception):
+    """A cover letter that failed ATS lint inside the detached task.
+
+    Cover letters have no flagged-draft column to land in (see
+    ``CoverLetterPipelineLintFailure``), so the background path converts the
+    failure into a registry ``error`` the poll surfaces — rather than
+    persisting a letter that silently fails lint, or leaving the client
+    polling a run that will never produce a row.
+    """
 
 
 @router.post(
     "/cover-letter",
-    responses={422: {"model": TailorLintFailureResponse | GapGateFailureResponse}},
+    response_model=None,
+    responses={
+        # The 202 is the normal outcome for a client with a job_posting_id;
+        # declare it so the contract is discoverable rather than inferred from
+        # a handler that returns a raw JSONResponse (response_model=None).
+        202: {"model": TailorStatusResponse},
+        422: {"model": TailorLintFailureResponse | GapGateFailureResponse},
+    },
     dependencies=[Depends(enforce_llm_budget)],
 )
 @limiter.limit("30/minute")
@@ -356,9 +651,17 @@ async def create_tailored_cover_letter(
     llm: LLMClient = Depends(get_llm_client),
     # JWT-required: see create_tailored_resume (per-user Storage folder).
     user_id: str = Depends(get_current_user_id),
-) -> TailorResponse:
-    # `async def`: the LLM cover-letter pipeline + every DB round-trip run
-    # natively on the async service client (#57 slice 3).
+    s: Settings = Depends(get_settings),
+) -> TailorResponse | JSONResponse:
+    """Kick off a tailored cover letter. Non-blocking when a posting is known.
+
+    Mirror of ``create_tailored_resume`` (#656): 202 + detached task + poll via
+    ``GET /tailor/cover-letters/by-job/{id}``. The ~27s pipeline is shorter
+    than the resume's but still far past a comfortable request.
+
+    `async def`: the LLM cover-letter pipeline + every DB round-trip run
+    natively on the async service client (#57 slice 3).
+    """
     current_optimized = await _optimized_latest(supabase, user_id=user_id)
     if current_optimized is None:
         raise HTTPException(
@@ -366,55 +669,128 @@ async def create_tailored_cover_letter(
             detail="no optimized doc — derive one via POST /experience/derive first",
         )
 
-    gate = gap_tracker.can_generate(current_optimized.payload)
-    if not gate.ok:
-        health = gap_tracker.gap_health(current_optimized.payload)
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "ok": False,
-                "code": "gap_gate",
-                "reason": gate.reason,
-                "message": gate.message,
-                "gap_pct": health.gap_pct,
-                "tier": health.tier,
-            },
+    _gap_gate_or_422(current_optimized)
+
+    if _already_running(
+        user_id=user_id, document_type="cover_letter", job_posting_id=body.job_posting_id
+    ):
+        return _running_202()
+
+    if body.job_posting_id is not None and not await _posting_exists(
+        supabase, body.job_posting_id
+    ):
+        raise HTTPException(status_code=404, detail="job posting not found")
+
+    if body.job_posting_id is None:
+        prefs_row = await _preferences_get(supabase, user_id=user_id)
+        contact = await resolve_contact(supabase, user_id, body.contact)
+        result = await run_cover_letter_pipeline(
+            supabase,
+            llm,
+            user_id=user_id,
+            optimized=current_optimized,
+            job_description=body.job_description,
+            company_name=body.company_name,
+            contact=contact,
+            role_title=body.role_title,
+            preferences=prefs_row.payload if prefs_row else None,
+            critique=body.critique,
+            job_posting_id=body.job_posting_id,
+            target_label=body.target_label,
         )
+        if isinstance(result, CoverLetterPipelineLintFailure):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "ok": False,
+                    "violations": [v.model_dump() for v in result.lint.violations],
+                },
+            )
+        if not isinstance(result, CoverLetterPipelineSuccess):
+            raise HTTPException(status_code=500, detail="Unexpected pipeline result")
+        return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
 
-    prefs_row = await _preferences_get(supabase, user_id=user_id)
-    prefs_payload = prefs_row.payload if prefs_row else None
-    contact = await resolve_contact(supabase, user_id, body.contact)
-
-    result = await run_cover_letter_pipeline(
-        supabase,
-        llm,
+    key, dedup = _claim_run_or_202(
         user_id=user_id,
-        optimized=current_optimized,
-        job_description=body.job_description,
-        company_name=body.company_name,
-        contact=contact,
-        role_title=body.role_title,
-        preferences=prefs_payload,
-        critique=body.critique,
+        document_type="cover_letter",
         job_posting_id=body.job_posting_id,
-        target_label=body.target_label,
+        max_concurrent=s.tailor_max_concurrent_runs,
     )
+    if dedup is not None:
+        return dedup
 
-    if isinstance(result, CoverLetterPipelineLintFailure):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "ok": False,
-                "violations": [v.model_dump() for v in result.lint.violations],
-            },
+    try:
+        # See create_tailored_resume: contact resolution 400s before the 202
+        # so the frontend's inline name prompt still has a status to react to.
+        prefs_row = await _preferences_get(supabase, user_id=user_id)
+        contact = await resolve_contact(supabase, user_id, body.contact)
+    except Exception:
+        run_registry.finish(key)
+        raise
+
+    spawn_detached(
+        _run_cover_letter_task(
+            key=key,
+            supabase=supabase,
+            llm=llm,
+            user_id=user_id,
+            optimized=current_optimized,
+            body=body,
+            contact=contact,
+            preferences=prefs_row.payload if prefs_row else None,
+        ),
+        name=f"tailor:cover-letter:{body.job_posting_id}",
+    )
+    return _running_202()
+
+
+async def _run_cover_letter_task(
+    *,
+    key: run_registry.Key,
+    supabase: AsyncClient,
+    llm: LLMClient,
+    user_id: str,
+    optimized: OptimizedDoc,
+    body: CoverLetterRequest,
+    contact: ContactInfo,
+    preferences: PreferencesPayload | None,
+) -> None:
+    """Detached worker for the cover-letter pipeline (#656).
+
+    Unlike the resume task, a lint failure IS a failure here — there is no
+    flagged-draft column for letters — so it surfaces through the poll as a
+    retryable error.
+    """
+    try:
+        result = await run_cover_letter_pipeline(
+            supabase,
+            llm,
+            user_id=user_id,
+            optimized=optimized,
+            job_description=body.job_description,
+            company_name=body.company_name,
+            contact=contact,
+            role_title=body.role_title,
+            preferences=preferences,
+            critique=body.critique,
+            job_posting_id=body.job_posting_id,
+            target_label=body.target_label,
         )
-
-    if not isinstance(result, CoverLetterPipelineSuccess):
-        raise HTTPException(status_code=500, detail="Unexpected pipeline result")
-    return TailorResponse(
-        record=result.record,
-        lint_warnings=result.lint.warnings,
-    )
+        if isinstance(result, CoverLetterPipelineLintFailure):
+            raise _CoverLetterLintError(
+                "; ".join(v.message for v in result.lint.errors) or "ATS lint failed"
+            )
+        run_registry.finish(key)
+    except _CoverLetterLintError as exc:
+        _log.warning(
+            "cover letter failed ATS lint job=%s: %s", body.job_posting_id, exc
+        )
+        run_registry.fail(
+            key, message=f"Cover letter failed ATS checks: {exc}. Please retry."
+        )
+    except Exception:
+        _log.exception("tailor cover-letter task failed job=%s", body.job_posting_id)
+        run_registry.fail(key, message="Cover letter generation failed. Please retry.")
 
 
 # `async def` on the async user client (#57 slice 3): the DB read runs natively
@@ -452,22 +828,68 @@ async def list_tailored_cover_letters(
 # ---- Resume lifecycle (#505) -------------------------------------------------
 
 
+async def _document_state(
+    supabase: AsyncClient,
+    job_posting_id: str,
+    *,
+    user_id: str,
+    document_type: DocumentType,
+) -> TailoredDocumentState:
+    """Shared poll body: newest persisted document + in-flight run state (#656).
+
+    Read-only — no LLM spend and no writes, so it carries no budget gate and is
+    safe to poll on a timer.
+
+    The record is read FIRST and wins: a task that has persisted its row but
+    hasn't yet cleared its registry entry must report the finished document,
+    not ``running``. The reverse order would make a poll bounce back to
+    "generating…" for the width of that window.
+    """
+    record = await persistence.get_by_job(
+        supabase, job_posting_id, user_id=user_id, document_type=document_type
+    )
+    key = run_registry.key_for(
+        user_id=user_id, document_type=document_type, job_posting_id=job_posting_id
+    )
+    st = run_registry.get(key)
+    if record is not None:
+        # A settled document. Any lingering ``error`` belongs to a run that
+        # already has a persisted predecessor to fall back on, so don't dress
+        # a usable draft up as a failure.
+        return TailoredDocumentState(record=record, status="idle")
+    if st is not None and st.status == "running":
+        return TailoredDocumentState(record=None, status="running")
+    if st is not None and st.status == "error":
+        return TailoredDocumentState(record=None, status="error", message=st.error)
+    return TailoredDocumentState(record=None, status="idle")
+
+
 @router.get("/resumes/by-job/{job_posting_id}")
 async def get_resume_by_job(
     job_posting_id: str,
     supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
-) -> TailoredResumeRecord | None:
-    """Most recent resume for a given job posting, or ``null`` if none exists.
+) -> TailoredDocumentState:
+    """Poll the state of a (possibly backgrounded) resume for a posting (#656).
 
-    Returns ``null`` with a 200 status (rather than 404) for the
-    "no record yet" case so the browser doesn't log a "Failed to
-    load resource: 404" console error on every job-detail visit
-    before generation. The FE consumer (``ResumeSection``) treats
-    ``null`` and 404 the same way — render a "Generate Resume"
-    CTA — so dropping the 404 is a no-op for the user.
+    Returns a ``TailoredDocumentState`` envelope — ``{record, status,
+    message}`` — where it used to return the bare record or ``null``:
+
+    * ``record`` non-null → the document exists (``lint_violations`` marks a
+      flagged draft). ``status`` is ``idle``.
+    * ``running`` with a null record → a detached generation is in flight;
+      keep polling. The work persists regardless of the client, so navigating
+      away and coming back picks up the finished draft.
+    * ``error`` with a null record → the run failed; offer a retry (POST again).
+    * ``idle`` with a null record → nothing here and nothing coming; render the
+      "Generate" CTA.
+
+    Still 200-with-null rather than 404 for the empty state, so the browser
+    doesn't log a failed request on every job-detail visit before generation.
     """
-    return await persistence.get_by_job(supabase, job_posting_id, user_id=user_id)
+    return await _document_state(
+        supabase, job_posting_id, user_id=user_id, document_type="resume"
+    )
 
 
 @router.get("/cover-letters/by-job/{job_posting_id}")
@@ -475,12 +897,14 @@ async def get_cover_letter_by_job(
     job_posting_id: str,
     supabase: AsyncClient = Depends(get_async_user_supabase),
     user_id: str = Depends(get_current_user_id),
-) -> TailoredResumeRecord | None:
-    """Most recent cover letter for a given job posting, or ``null``
-    if none exists. See ``get_resume_by_job`` for the 200-with-null
-    rationale.
+) -> TailoredDocumentState:
+    """Poll the state of a (possibly backgrounded) cover letter for a posting.
+
+    Same envelope and semantics as ``get_resume_by_job``, except that a lint
+    failure arrives as ``status="error"`` rather than a flagged record — see
+    ``CoverLetterPipelineLintFailure``.
     """
-    return await persistence.get_by_job(
+    return await _document_state(
         supabase, job_posting_id, user_id=user_id, document_type="cover_letter"
     )
 
@@ -587,6 +1011,13 @@ async def edit_tailored_resume(
 
     The .docx isn't re-rendered eagerly — saving is cheap and the
     download endpoint detects a stale hash to re-render lazily.
+
+    A user edit that fails lint is still a 422 (unlike a *generation* lint
+    failure, which persists flagged — #656): nothing was spent producing it,
+    the user is right there watching, and rejecting the write is what keeps a
+    known-bad edit out of the row. Conversely a passing edit writes the fresh
+    lint result through, which is what CLEARS a flagged draft the user just
+    fixed.
     """
     row = await persistence.get(supabase, resume_id, user_id=user_id)
     if row is None:
@@ -605,9 +1036,76 @@ async def edit_tailored_resume(
         )
 
     record = await persistence.update_payload_md(
-        supabase, resume_id, body.markdown, user_id=user_id
+        supabase,
+        resume_id,
+        body.markdown,
+        user_id=user_id,
+        # Resume-scoped column: leave a cover letter's untouched (NULL).
+        lint_violations=(
+            [v.model_dump() for v in lint_result.violations]
+            if row.document_type == "resume"
+            else None
+        ),
     )
     return TailorResponse(record=record, lint_warnings=lint_result.warnings)
+
+
+@router.post("/resumes/{resume_id}/ats-recheck")
+async def recheck_tailored_resume(
+    resume_id: str,
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+    user_id: str = Depends(get_current_user_id),
+) -> AtsRecheckResponse:
+    """Re-run ATS lint over the saved markdown and refresh ``lint_violations``.
+
+    The companion to the flagged-draft decision (#656): a generation that
+    fails lint is kept rather than discarded, so the user needs a way to fix
+    it and confirm the fix. Lint is deterministic — no LLM, no cost, no budget
+    gate, no daily cap — so this is free to call as often as they like, which
+    is the whole point of not making them regenerate.
+
+    Allowed on approved documents: re-checking inspects content that didn't
+    change and only refreshes metadata about it, so there's nothing for the
+    approval lock to protect (and knowing a locked resume has an ATS problem
+    is exactly when you'd want to unlock it).
+
+    Restricted to ``document_type == "resume"``: ``documents.lint_violations``
+    is resume-scoped, so accepting a cover letter here would write a column
+    nothing else on that path reads or maintains.
+
+    Ownership follows the PATCH handler — ``persistence.get(..., user_id=...)``
+    returning ``None`` is a 404 whether the row is missing or someone else's,
+    so cross-tenant existence never leaks.
+    """
+    row = await persistence.get(supabase, resume_id, user_id=user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="tailored document not found")
+    if row.document_type != "resume":
+        raise HTTPException(
+            status_code=422,
+            detail="ATS re-check applies to resumes only",
+        )
+    if not row.payload_md:
+        # Legacy rows persisted before markdown became the source of truth have
+        # nothing to lint. 422 (not 500) — the request is well-formed, the
+        # document just can't answer it.
+        raise HTTPException(
+            status_code=422,
+            detail="this document has no markdown to check",
+        )
+
+    lint_result = lint_markdown(row.payload_md, document_type="resume")
+    record = await persistence.update_lint_violations(
+        supabase,
+        resume_id,
+        [v.model_dump() for v in lint_result.violations],
+        user_id=user_id,
+    )
+    return AtsRecheckResponse(
+        ok=lint_result.ok,
+        violations=lint_result.violations,
+        record=record,
+    )
 
 
 @router.post("/resumes/{resume_id}/checkpoint")
