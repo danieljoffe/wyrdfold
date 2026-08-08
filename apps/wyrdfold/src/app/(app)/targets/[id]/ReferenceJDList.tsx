@@ -16,6 +16,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { TargetReferenceJD } from '../types';
 import AddReferenceJDModal from './AddReferenceJDModal';
+import { LocalDate } from '@/components/LocalFormat';
 
 interface ReferenceJDListProps {
   targetId: string;
@@ -154,7 +155,7 @@ export default function ReferenceJDList({
                     {stripHtmlToText(jd.jd_text)}
                   </Text>
                   <Text variant='meta' as='span'>
-                    Added {new Date(jd.created_at).toLocaleDateString()}
+                    Added <LocalDate value={jd.created_at} />
                   </Text>
                 </div>
                 <div className='flex items-center gap-1 shrink-0'>

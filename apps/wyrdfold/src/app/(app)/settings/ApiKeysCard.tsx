@@ -15,6 +15,7 @@ import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import { LocalDate } from '@/components/LocalFormat';
 
 // v1 is OpenRouter-only (#5). The backend rejects other providers, so the
 // card hard-codes the one provider rather than rendering a list.
@@ -165,9 +166,8 @@ export default function ApiKeysCard() {
                     •••• {meta.last4 ?? '????'}
                   </Text>
                   <Text variant='meta' className='text-text-tertiary'>
-                    {meta.rotated_at
-                      ? `Rotated ${new Date(meta.rotated_at).toLocaleDateString()}`
-                      : `Added ${new Date(meta.created_at).toLocaleDateString()}`}
+                    {meta.rotated_at ? 'Rotated ' : 'Added '}
+                    <LocalDate value={meta.rotated_at ?? meta.created_at} />
                   </Text>
                 </div>
                 <div className='flex items-center gap-2'>

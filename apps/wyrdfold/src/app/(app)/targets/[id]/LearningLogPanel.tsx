@@ -14,6 +14,7 @@ import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import { LocalDate } from '@/components/LocalFormat';
 import type {
   LearningRunResult,
   LearningStatus,
@@ -181,7 +182,7 @@ function HistoryRow({ row }: { row: TargetLearningLogRow }) {
           {badge.label}
         </Badge>
         <Text variant='meta' as='span' className='text-text-tertiary'>
-          {new Date(row.created_at).toLocaleDateString()}
+          <LocalDate value={row.created_at} />
         </Text>
       </div>
     </div>

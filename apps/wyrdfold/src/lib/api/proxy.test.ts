@@ -54,10 +54,13 @@ function mockFetch(response: Response): jest.Mock {
 }
 
 describe('proxyToWyrdfoldAPI', () => {
-  it('returns 401 when getUser cannot verify the JWT', async () => {
-    mockGetUser.mockResolvedValueOnce({
+  it('returns 401 when getUser rejects the JWT', async () => {
+    // A real Supabase AuthError for a bad token carries status 401 — the
+    // fixture has to look like what GoTrue actually returns, or it certifies
+    // a code path the driver never produces.
+    mockGetUser.mockResolvedValue({
       data: { user: null },
-      error: { message: 'invalid token' },
+      error: { message: 'invalid token', status: 401 },
     });
     const fetchMock = mockFetch(new Response('{}'));
 
@@ -68,12 +71,94 @@ describe('proxyToWyrdfoldAPI', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('returns 401 when getUser throws', async () => {
-    mockGetUser.mockRejectedValueOnce(new Error('cookie error'));
+  it('does NOT retry a rejected credential', async () => {
+    mockGetUser.mockResolvedValue({
+      data: { user: null },
+      error: { message: 'invalid token', status: 401 },
+    });
+    mockFetch(new Response('{}'));
+
+    await proxyToWyrdfoldAPI('/experience/optimized');
+
+    // A 4xx is the answer, not a blip — re-asking wastes a round-trip on
+    // every unauthenticated request.
+    expect(mockGetUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 401 when there is genuinely no session', async () => {
+    mockGetUser.mockResolvedValue({ data: { user: null }, error: null });
     const fetchMock = mockFetch(new Response('{}'));
 
     const res = await proxyToWyrdfoldAPI('/experience/optimized');
 
+    expect(res.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockGetUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 401 when getUser keeps throwing', async () => {
+    mockGetUser.mockRejectedValue(new Error('cookie error'));
+    const fetchMock = mockFetch(new Response('{}'));
+
+    const res = await proxyToWyrdfoldAPI('/experience/optimized');
+
+    expect(res.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // The red-team finding (2026-08-08): 2/40 concurrent authed requests 401'd
+  // against prod while the session was perfectly valid. GoTrue shed a
+  // connection (this project caps Auth at 10) and the BFF read that as "not
+  // logged in". These pin the retry that tells the two apart.
+  it('retries a transient auth-server failure instead of logging the user out', async () => {
+    mockGetUser
+      .mockResolvedValueOnce({
+        data: { user: null },
+        error: { message: 'service unavailable', status: 503 },
+      })
+      .mockResolvedValue({ data: { user: { id: 'user-1' } }, error: null });
+    const fetchMock = mockFetch(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const res = await proxyToWyrdfoldAPI('/experience/optimized');
+
+    expect(res.status).toBe(200);
+    expect(mockGetUser).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('retries a thrown transient failure', async () => {
+    mockGetUser
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValue({ data: { user: { id: 'user-1' } }, error: null });
+    mockFetch(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+
+    const res = await proxyToWyrdfoldAPI('/experience/optimized');
+
+    expect(res.status).toBe(200);
+    expect(mockGetUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('never fails open when the auth server stays down', async () => {
+    mockGetUser.mockResolvedValue({
+      data: { user: null },
+      error: { message: 'service unavailable', status: 503 },
+    });
+    const fetchMock = mockFetch(new Response('{}'));
+
+    const res = await proxyToWyrdfoldAPI('/experience/optimized');
+
+    // Bounded retry, then refuse. It must never let the request through
+    // unauthenticated just because auth was unreachable.
     expect(res.status).toBe(401);
     expect(fetchMock).not.toHaveBeenCalled();
   });
