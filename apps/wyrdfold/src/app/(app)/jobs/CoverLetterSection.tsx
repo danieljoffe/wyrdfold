@@ -6,6 +6,7 @@ import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { loadJobDescription } from './loadJobDescription';
+import { isFlaggedDraft } from './types';
 import { useTailorDocument } from './useTailorDocument';
 
 interface CoverLetterSectionProps {
@@ -78,6 +79,7 @@ export default function CoverLetterSection({
   }
 
   const isApproved = record?.approved_at != null;
+  const flagged = isFlaggedDraft(record);
 
   // Single toolbar pill: the button verb conveys both state and action.
   // See ResumeSection for the rationale.
@@ -112,9 +114,22 @@ export default function CoverLetterSection({
       href={`/jobs/${jobPostingId}/cover-letter`}
       variant={isApproved ? 'secondary' : 'primary'}
       size='sm'
-      name='review-cover-letter'
+      name={
+        isApproved
+          ? 'review-cover-letter'
+          : flagged
+            ? 'fix-flagged-cover-letter'
+            : 'review-cover-letter'
+      }
+      title={
+        flagged ? 'This draft failed ATS checks — open it to fix' : undefined
+      }
     >
-      {isApproved ? 'View Cover Letter' : 'Review Cover Letter'}
+      {isApproved
+        ? 'View Cover Letter'
+        : flagged
+          ? 'Fix Cover Letter'
+          : 'Review Cover Letter'}
     </LinkButton>
   );
 }

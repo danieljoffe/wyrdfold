@@ -23,6 +23,7 @@ from app.http_client import get_http_client
 from app.models.schemas import SourceAction
 from app.seed.company_seed import COMPANY_SEED
 from app.services.ats_detect import detect_ats
+from app.services.db_read import fetch_one
 from app.services.greenhouse import GREENHOUSE_BASE
 
 # Default dependency = read auth (JWT or api-key). Write endpoints below
@@ -72,14 +73,11 @@ async def _delete_source(supabase: AsyncClient, *, board_token: str) -> None:
 
 
 async def _source_enabled(supabase: AsyncClient, *, board_token: str) -> dict[str, Any] | None:
-    resp = await (
-        supabase.table("sources")
-        .select("enabled")
-        .eq("board_token", board_token)
-        .single()
-        .execute()
+    # fetch_one, not .single(): the latter raises on zero rows, so the caller's
+    # "Source not found" branch was unreachable and a bad token 500'd.
+    return await fetch_one(
+        supabase.table("sources").select("enabled").eq("board_token", board_token)
     )
-    return cast("dict[str, Any] | None", resp.data)
 
 
 async def _set_source_enabled(supabase: AsyncClient, *, board_token: str, enabled: bool) -> None:

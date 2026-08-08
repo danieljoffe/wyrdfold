@@ -29,6 +29,7 @@ from app.models.feedback import (
     FeedbackSignal,
     LearnerPatchSummary,
 )
+from app.services.db_read import fetch_one
 from app.services.targets.profile_writes import apply_profile_patch_rpc_async
 
 logger = logging.getLogger(__name__)
@@ -259,10 +260,9 @@ async def maybe_run_learner(
         # learn from. v2's LLM step is what handles this case.
         return None
 
-    target_resp = (
-        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
-    )
-    target_row = cast(dict[str, Any] | None, target_resp.data)
+    # fetch_one, not .single() — the latter raises on zero rows, making this
+    # `return None` unreachable (see app/services/db_read.py).
+    target_row = await fetch_one(supabase.table("targets").select("*").eq("id", target_id))
     if target_row is None:
         return None
     profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})

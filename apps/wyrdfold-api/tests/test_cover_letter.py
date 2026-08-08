@@ -508,10 +508,14 @@ async def test_pipeline_preferences_are_passed_through(
     assert "lead with performance" in seen["latest"]
 
 
-async def test_pipeline_lint_failure_does_not_persist(
+async def test_pipeline_lint_failure_persists_flagged_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    supabase = _make_supabase_mock(insert_data=[])
+    """Cover letters get the resume's flagged-draft treatment: a letter that
+    fails ATS lint is PERSISTED with its violations, not discarded. They run
+    the same linter and cost the same daily-cap slot, so the earlier
+    resume-only carve-out had no rationale left."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
     monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     def fake_lint(_b: bytes, *, document_type: str = "resume") -> LintResult:
@@ -539,7 +543,19 @@ async def test_pipeline_lint_failure_does_not_persist(
         contact=_contact(),
     )
     assert isinstance(result, CoverLetterPipelineLintFailure)
-    supabase.table.return_value.insert.assert_not_called()
+    # The row was written, flagged with what failed.
+    rows = [
+        c.args[0]
+        for c in supabase.table.return_value.insert.call_args_list
+        if isinstance(c.args[0], dict) and "jd_snapshot" in c.args[0]
+    ]
+    assert len(rows) == 1, f"expected one documents insert, got {len(rows)}"
+    assert [v["code"] for v in rows[0]["lint_violations"]] == ["no_tables"]
+    assert rows[0]["document_type"] == "cover_letter"
+    assert rows[0]["payload_md"], "the flagged draft keeps its markdown to edit"
+    assert result.record.id
+    # No .docx uploaded for a flagged draft — download re-renders lazily.
+    supabase.storage.from_.return_value.upload.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

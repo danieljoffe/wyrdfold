@@ -26,6 +26,7 @@ from supabase import AsyncClient, Client
 
 from app.models.llm import LLMResult, LLMUsage, Message, ModelId
 from app.models.targets import DerivedTarget
+from app.services.db_read import fetch_one, fetch_one_sync
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
@@ -236,14 +237,12 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
     async client; off-loads a sync client to a thread (#57 PR-G2e-4)."""
     try:
         if isinstance(supabase, AsyncClient):
-            current = await (
-                supabase.table(_CACHE_TABLE)
-                .select("hit_count")
-                .eq("jd_hash", key)
-                .single()
-                .execute()
-            )
-            row = cast(dict[str, Any], current.data or {})
+            # fetch_one, not .single(): the outer try/except made the raise
+            # harmless, but it still turned every cache-row miss into a thrown
+            # (and swallowed) exception rather than a plain empty read.
+            row = await fetch_one(
+                supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+            ) or {}
             next_count = int(row.get("hit_count", 0)) + 1
             await (
                 supabase.table(_CACHE_TABLE)
@@ -258,14 +257,9 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
             )
         else:
             def _bump() -> None:
-                current = (
-                    supabase.table(_CACHE_TABLE)
-                    .select("hit_count")
-                    .eq("jd_hash", key)
-                    .single()
-                    .execute()
-                )
-                row = cast(dict[str, Any], current.data or {})
+                row = fetch_one_sync(
+                    supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+                ) or {}
                 next_count = int(row.get("hit_count", 0)) + 1
                 supabase.table(_CACHE_TABLE).update(
                     {

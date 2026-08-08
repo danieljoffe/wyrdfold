@@ -137,11 +137,13 @@ async def persist(
     """Insert one documents row for a resume.
 
     ``lint_violations`` (#656): NULL when unlinted, ``[]`` when clean, and a
-    populated list when the draft is persisted FLAGGED — a resume that fails
+    populated list when the draft is persisted FLAGGED — a document that fails
     ATS lint is now kept rather than discarded, so the ~39s of generation
     spend isn't lost and the user can edit + re-check instead of paying to
-    regenerate. Cover letters don't run ATS lint, so persist_cover_letter
-    deliberately does not carry this.
+    regenerate. ``persist_cover_letter`` carries the same field: letters run
+    the same linter, and the "don't burn the daily cap" argument applies to
+    them identically (the resume-only carve-out was dropped once the
+    asymmetry had no rationale left).
     """
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -176,11 +178,15 @@ async def persist_cover_letter(
     warnings: list[str],
     llm_result: LLMResult,
     storage_path: str | None,
+    lint_violations: list[dict[str, Any]] | None = None,
 ) -> TailoredResumeRecord:
     """Insert one documents row for a cover letter.
 
     `resume_type` is set to 'generic' since the column is NOT NULL; it's
     ignored on reads when `document_type == 'cover_letter'`.
+
+    ``lint_violations`` carries the same three-state ATS lint contract as
+    ``persist`` — see there.
     """
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -199,6 +205,7 @@ async def persist_cover_letter(
         "output_tokens": llm_result.usage.output_tokens,
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
+        "lint_violations": lint_violations,
     }
     return await insert_row(supabase, row, payload_md=payload_md)
 
