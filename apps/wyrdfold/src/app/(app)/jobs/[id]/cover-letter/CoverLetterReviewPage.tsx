@@ -25,6 +25,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
 import { isFlaggedDraft } from '../../types';
+import { LocalDateTime, LocalNumber } from '@/components/LocalFormat';
 import type {
   JobPosting,
   LintViolation,
@@ -643,7 +644,7 @@ export default function CoverLetterReviewPage({
         </Text>
         <Text variant='meta' as='span'>
           Tokens:{' '}
-          {(record.input_tokens + record.output_tokens).toLocaleString()}
+          <LocalNumber value={record.input_tokens + record.output_tokens} />
         </Text>
         {record.model && (
           <Text variant='meta' as='span'>
@@ -706,7 +707,7 @@ export default function CoverLetterReviewPage({
                         {v.source.replace('_', ' ')}
                       </Badge>
                       <Text variant='meta' as='span'>
-                        {new Date(v.created_at).toLocaleString()}
+                        <LocalDateTime value={v.created_at} />
                       </Text>
                     </span>
                     {!isApproved && (
@@ -844,7 +845,7 @@ export default function CoverLetterReviewPage({
             {!isApproved && saveLabel(saveStatus)}
           </Text>
           <Text variant='meta' as='span' className='text-text-tertiary'>
-            {markdown.length.toLocaleString()} chars
+            <LocalNumber value={markdown.length} /> chars
           </Text>
         </div>
       </div>

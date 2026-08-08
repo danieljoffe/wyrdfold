@@ -8,11 +8,11 @@ import { timedAction } from './timing';
 
 /**
  * Authed full-app sweep. Serial within one worker; state-restore
- * discipline: the target activated for /jobs coverage is deactivated at
- * the end (the owner had none active), reversible status flips are
- * reverted, approve is followed by unapprove. LLM spend is bounded to one
- * analysis + one resume + one cover letter (~$0.15), all on ONE job so
- * the artifacts land where the owner can find (or delete) them.
+ * discipline: the target's activation is CAPTURED at setup and put back
+ * exactly as found, reversible status flips are reverted, approve is
+ * followed by unapprove. LLM spend is bounded to one analysis + one resume
+ * + one cover letter (~$0.15), all on ONE job so the artifacts land where
+ * the owner can find (or delete) them.
  */
 
 const TARGET_ID = '012202b0-e6bd-4617-b9cb-226648e8218e';
@@ -20,6 +20,34 @@ const TARGET_ID = '012202b0-e6bd-4617-b9cb-226648e8218e';
 test.describe.configure({ mode: 'serial' });
 
 let analysisJobId: string | null = null;
+
+/**
+ * The target's activation state BEFORE this sweep touched anything.
+ *
+ * This used to be a hardcoded assumption — the teardown deactivated
+ * unconditionally, on a comment that said "the owner had none active". That
+ * assumption went stale: the owner's target 012202b0 is normally left ACTIVE,
+ * so every full sweep silently switched their pipeline off and left /jobs
+ * rendering an empty list until somebody noticed. (Observed 2026-08-08: after
+ * a sweep, `/api/jobs` returned 0 postings for every filter.)
+ *
+ * `stress-authed-deep.spec.ts` already does capture-and-restore; it just could
+ * not help, because it faithfully restored the *already-wrong* state this file
+ * left behind. Ask the app what the state is, and put that back.
+ */
+let wasActiveBeforeSweep: boolean | null = null;
+
+async function readIsActive(
+  page: import('@playwright/test').Page
+): Promise<boolean> {
+  const res = await page.request.get(`/api/targets/${TARGET_ID}/user-target`);
+  if (!res.ok()) return false;
+  const body = (await res.json()) as {
+    is_active?: boolean;
+    user_target?: { is_active?: boolean };
+  };
+  return Boolean(body.is_active ?? body.user_target?.is_active);
+}
 
 test('setup: activate target for jobs coverage', async ({ page }) => {
   // Must exceed the 60s readiness poll below plus the activate call itself.
@@ -33,16 +61,13 @@ test('setup: activate target for jobs coverage', async ({ page }) => {
       // and a redundant one just races the previous cycle — the sweep logged
       // ten `deactivated mid-fan-out — aborting remaining sources` lines in
       // prod on 2026-08-08 by cycling this target ~6 times per run.
-      const current = await page.request.get(
-        `/api/targets/${TARGET_ID}/user-target`
-      );
-      const body = current.ok()
-        ? ((await current.json()) as {
-            is_active?: boolean;
-            user_target?: { is_active?: boolean };
-          })
-        : {};
-      if (!(body.is_active ?? body.user_target?.is_active)) {
+      //
+      // The same read doubles as the restore baseline (see
+      // ``wasActiveBeforeSweep``): capture BEFORE mutating, or the teardown has
+      // nothing truthful to put back.
+      const active = await readIsActive(page);
+      if (wasActiveBeforeSweep === null) wasActiveBeforeSweep = active;
+      if (!active) {
         const res = await page.request.post(
           `/api/targets/${TARGET_ID}/activate`
         );
@@ -922,19 +947,35 @@ test('targets + profile + settings + onboarding', async ({ page }) => {
     }
   );
 
-  // Restore: the owner had NO active targets before the sweep.
+  // Restore the activation state EXACTLY as found — do not assume it was off.
+  // A sweep that leaves the owner's only active target deactivated leaves
+  // their /jobs list empty until someone notices (2026-08-08).
   await timedAction(
     page,
     'targets.deactivate-restore',
     'targets',
     async () => {
+      // Null means setup never ran (its own failure is reported separately);
+      // deactivating on a guess is precisely the bug this replaced.
+      if (wasActiveBeforeSweep === null) return;
+      if (wasActiveBeforeSweep) {
+        // It was on before us and it is on now — nothing to undo.
+        return;
+      }
       const res = await page.request.post(
         `/api/targets/${TARGET_ID}/deactivate`
       );
       if (!res.ok()) throw new Error(`deactivate ${res.status()}`);
     },
     async () => {
-      /* asserted in act */
+      if (wasActiveBeforeSweep === null) return;
+      const active = await readIsActive(page);
+      expect(
+        active,
+        `activation not restored: it was ${wasActiveBeforeSweep} before the ` +
+          `sweep and is ${active} after. Leaving the owner's target off ` +
+          `empties their /jobs list.`
+      ).toBe(wasActiveBeforeSweep);
     }
   );
 });
