@@ -1,13 +1,13 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
-import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { promptForMissingContactName } from './promptForMissingContactName';
-import type { TailoredResumeRecord, TailorResponse } from './types';
+import { loadJobDescription } from './loadJobDescription';
+import { isFlaggedDraft } from './types';
+import { useTailorDocument } from './useTailorDocument';
 
 interface ResumeSectionProps {
   jobPostingId: string;
@@ -22,132 +22,53 @@ interface ResumeSectionProps {
  * to ``/jobs/{id}/resume`` regardless of whether a tailored doc actually
  * existed, leaving the user staring at a "Resume not found" dead-end
  * page with nowhere to generate one.
+ *
+ * Generation is non-blocking (#656): ``useTailorDocument`` owns the 202 +
+ * poll loop, so the "Generating…" pill reflects a run in flight even when
+ * that run was started before this panel mounted (or in another tab), and
+ * navigating away mid-generation loses nothing.
  */
 export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
-  const [record, setRecord] = useState<TailoredResumeRecord | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [generating, setGenerating] = useState(false);
   const { toast } = useToast();
+  const { record, loading, generating, error, generate } = useTailorDocument({
+    jobPostingId,
+    kind: 'resume',
+  });
 
-  const fetchResume = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/jobs/tailor/by-job/${jobPostingId}`);
-      // The route returns 200 with a ``null`` body when no record
-      // exists yet — see the route docstring in
-      // ``wyrdfold-api/app/routers/tailor.py``. Treating ``null``
-      // the same way the legacy 404 was treated (record = null →
-      // render the Generate CTA) means the only observable change
-      // is that the browser no longer logs a 404 to the console
-      // on every job-detail visit before generation.
-      if (!res.ok) return;
-      const data = (await res.json()) as TailoredResumeRecord | null;
-      setRecord(data);
-    } catch {
-      // Non-critical — silently fail on initial load
-    } finally {
-      setLoading(false);
-    }
-  }, [jobPostingId]);
-
+  // Surface background failures as a toast exactly once each. The hook holds
+  // the error so a re-render can't re-fire it, but the effect still needs its
+  // own guard: `error` staying set across unrelated re-renders would otherwise
+  // toast again on every pass.
+  const toastedRef = useRef<string | null>(null);
   useEffect(() => {
-    fetchResume();
-  }, [fetchResume]);
+    if (error && toastedRef.current !== error) {
+      toastedRef.current = error;
+      toast({ variant: 'error', title: error });
+    }
+    if (!error) toastedRef.current = null;
+  }, [error, toast]);
 
   async function handleGenerate() {
-    setGenerating(true);
-    try {
-      // The tailor route requires the JD text alongside ``job_posting_id``
-      // — fetch it from the posting detail (description_html lives there
-      // since PR #677). Cover letter doesn't need this because the
-      // backend resolves the JD itself for that pipeline.
-      const detailRes = await fetch(`/api/jobs/${jobPostingId}`);
-      if (!detailRes.ok) {
-        toast({ variant: 'error', title: 'Could not load job description' });
-        return;
-      }
-      const detail = (await detailRes.json()) as {
-        description_html: string | null;
-      };
-      const jd = (detail.description_html ?? '').trim();
-      if (!jd) {
-        toast({
-          variant: 'error',
-          title: 'Job has no description — cannot tailor a resume.',
-        });
-        return;
-      }
+    // The tailor route requires the JD text alongside ``job_posting_id``
+    // — it lives on the posting detail, which list payloads omit.
+    const jd = await loadJobDescription(jobPostingId);
+    if (!jd.ok) {
+      toast({
+        variant: 'error',
+        title:
+          jd.reason === 'empty'
+            ? 'Job has no description — cannot tailor a resume.'
+            : 'Could not load job description',
+      });
+      return;
+    }
 
-      const postTailor = () =>
-        fetch('/api/jobs/tailor/resume', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            job_description: jd,
-            job_posting_id: jobPostingId,
-          }),
-        });
-
-      let res = await postTailor();
-
-      // Defensive fallback for the contact-name gate. Pre-#703 users,
-      // users who skipped the onboarding Identity step, or users who
-      // cleared their name in Settings still hit this. Prompt inline +
-      // retry rather than dead-ending in Settings. See
-      // ``promptForMissingContactName`` for the full rationale.
-      if (!res.ok) {
-        const peek = (await res
-          .clone()
-          .json()
-          .catch(() => null)) as {
-          detail?: { code?: string; message?: string } | string;
-        } | null;
-        const peekDetail =
-          typeof peek?.detail === 'string' ? peek.detail : undefined;
-        if (await promptForMissingContactName(peekDetail)) {
-          res = await postTailor();
-        }
-      }
-
-      if (!res.ok) {
-        // ``gap_gate`` is a structured 422 with its own message string
-        // we want to surface as-is — peek for it before falling back
-        // to ``extractApiError`` (which handles plain detail strings
-        // and the structured ``llm_budget_exceeded`` 429, but treats
-        // ``gap_gate`` as a status-prefixed fallback). Order matters.
-        const peek = (await res
-          .clone()
-          .json()
-          .catch(() => null)) as {
-          detail?: { code?: string; message?: string } | string;
-        } | null;
-        const peekDetail = peek?.detail;
-        if (
-          typeof peekDetail === 'object' &&
-          peekDetail !== null &&
-          peekDetail.code === 'gap_gate'
-        ) {
-          toast({
-            variant: 'error',
-            title:
-              peekDetail.message ?? 'Master doc has gaps — update it first',
-          });
-        } else {
-          toast({
-            variant: 'error',
-            title: await extractApiError(res, 'Resume generation failed'),
-          });
-        }
-        return;
-      }
-
-      const data = (await res.json()) as TailorResponse;
-      setRecord(data.record);
+    const ok = await generate({
+      job_description: jd.jd,
+      job_posting_id: jobPostingId,
+    });
+    if (ok) {
       toast({ variant: 'success', title: 'Tailored resume drafted with AI' });
-    } catch {
-      toast({ variant: 'error', title: 'Network error generating resume' });
-    } finally {
-      setGenerating(false);
     }
   }
 
@@ -166,6 +87,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
   }
 
   const isApproved = record?.approved_at != null;
+  const flagged = isFlaggedDraft(record);
 
   // Single toolbar pill: the button verb conveys both state and action
   // ("Generate Resume" implies no draft exists; "Review Resume" implies one
@@ -177,7 +99,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
         variant='secondary'
         size='sm'
         disabled
-        title='Tailoring in progress — usually 30–60 seconds'
+        title='Tailoring in progress — usually 30–60 seconds. Safe to navigate away.'
       >
         <Spinner size='sm' aria-label='Generating resume' />
         <span>Generating…</span>
@@ -201,9 +123,25 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
       href={`/jobs/${jobPostingId}/resume`}
       variant={isApproved ? 'secondary' : 'primary'}
       size='sm'
-      name={isApproved ? 'view-approved-resume' : 'review-resume'}
+      name={
+        isApproved
+          ? 'view-approved-resume'
+          : flagged
+            ? 'fix-flagged-resume'
+            : 'review-resume'
+      }
+      // A flagged draft still exists and is editable — the label says so
+      // rather than hiding it, because the whole point of persisting it is
+      // that the user can fix it without paying to regenerate (#656).
+      title={
+        flagged ? 'This draft failed ATS checks — open it to fix' : undefined
+      }
     >
-      {isApproved ? 'View tailored resume' : 'Review tailored resume'}
+      {isApproved
+        ? 'View tailored resume'
+        : flagged
+          ? 'Fix tailored resume'
+          : 'Review tailored resume'}
     </LinkButton>
   );
 }

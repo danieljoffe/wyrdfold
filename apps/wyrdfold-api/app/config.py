@@ -775,6 +775,15 @@ class Settings(BaseSettings):
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)
+    # Max concurrent backgrounded tailoring runs per user (#656). Backgrounding
+    # the ~39s resume pipeline removed the serialization a blocking request
+    # imposed on a browser tab, and `enforce_llm_budget` meters spend whose
+    # `llm_costs` rows don't land until each run's LLM returns — so N
+    # simultaneous kicks would all read the same pre-burst spend and all pass.
+    # Dedup already collapses repeat kicks for the SAME document; this bounds
+    # a fan-out across different postings. 0 disables. `/tailor/batch` is the
+    # sanctioned bulk path and has its own rate limit.
+    tailor_max_concurrent_runs: int = Field(default=3, ge=0)
     # Phase 2 grading quota per target per UTC day (was a hardcoded 100 in
     # daily_cap.py — at ~$0.0035/call that alone exceeded a $5 monthly
     # allowance; 20/day ≈ $2/month/target).

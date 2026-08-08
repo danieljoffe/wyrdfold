@@ -207,20 +207,20 @@ async def process_batch(
                 job_posting_id=job_posting_id,
             )
 
-            if isinstance(result, PipelineSuccess):
-                items[i]["status"] = "completed"
-                items[i]["resume_record_id"] = result.record.id
-                completed += 1
+            # Both branches now yield a persisted record (#656): a resume that
+            # fails ATS lint is kept as a flagged draft rather than discarded,
+            # so the item completes either way and carries the violations for
+            # the surface to badge. Marking it "failed" would strand a
+            # document the user already paid for.
+            items[i]["status"] = "completed"
+            items[i]["resume_record_id"] = result.record.id
+            if not isinstance(result, PipelineSuccess):
+                items[i]["lint_violations"] = [v.message for v in result.lint.violations]
+            completed += 1
 
-                await persistence.mark_job_resume_draft(
-                    supabase, job_posting_id, user_id=user_id
-                )
-            else:
-                # Lint failure
-                violations = [v.message for v in result.lint.violations]
-                items[i]["status"] = "failed"
-                items[i]["error"] = f"lint: {'; '.join(violations)}"
-                failed += 1
+            await persistence.mark_job_resume_draft(
+                supabase, job_posting_id, user_id=user_id
+            )
 
         except Exception as exc:
             items[i]["status"] = "failed"

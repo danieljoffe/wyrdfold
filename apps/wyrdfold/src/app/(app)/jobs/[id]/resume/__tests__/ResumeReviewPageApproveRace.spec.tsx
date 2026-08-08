@@ -116,7 +116,8 @@ test('an autosave armed against a locked record never PATCHes (no 409, no error 
       return Promise.resolve({
         ok: true,
         status: 200,
-        json: async () => APPROVED_RECORD,
+        // #656: {record, status} envelope.
+        json: async () => ({ record: APPROVED_RECORD, status: 'idle' }),
       });
     }
     return Promise.resolve({

@@ -83,7 +83,7 @@ describe('CoverLetterSection', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => null,
+      json: async () => ({ record: null, status: 'idle' }),
     }) as unknown as typeof fetch;
 
     render(
@@ -103,7 +103,7 @@ describe('CoverLetterSection', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => makeRecord(),
+      json: async () => ({ record: makeRecord(), status: 'idle' }),
     }) as unknown as typeof fetch;
 
     render(
@@ -124,7 +124,10 @@ describe('CoverLetterSection', () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => makeRecord({ approved_at: '2026-01-02' }),
+      json: async () => ({
+        record: makeRecord({ approved_at: '2026-01-02' }),
+        status: 'idle',
+      }),
     }) as unknown as typeof fetch;
 
     render(
@@ -153,7 +156,7 @@ describe('CoverLetterSection', () => {
         return Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => null,
+          json: async () => ({ record: null, status: 'idle' }),
         });
       }
       // Generate POST — 500

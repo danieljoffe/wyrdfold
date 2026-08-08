@@ -5,7 +5,14 @@ Glue between the four isolated units:
 
 Splits cleanly between "LLM synthesis" (can fail on hallucination
 trace-check with ValueError) and "format check" (returns LintResult).
-Lint errors short-circuit the pipeline and return without persisting.
+
+Lint errors short-circuit the *rendering* pipeline but no longer discard the
+work (#656): a resume that fails ATS lint is persisted as a flagged draft
+carrying its violations, so the ~39s of generation — now backgrounded, and
+charged against the user's daily cap — isn't lost when nobody is watching.
+The user edits the draft and re-checks (free; lint is deterministic) instead
+of paying to regenerate. Cover letters keep the discard-on-failure behavior;
+`documents.lint_violations` is resume-scoped by design.
 
 The router layer just calls `run_tailor_pipeline(...)` and converts the
 result into an HTTP response.
@@ -67,10 +74,20 @@ class PipelineSuccess:
 
 @dataclass
 class PipelineLintFailure:
+    """A generated resume that failed ATS lint — persisted FLAGGED (#656).
+
+    ``record`` is a real ``documents`` row with ``lint_violations`` populated,
+    NOT a discarded result: the caller surfaces the violations against a draft
+    the user can edit and re-check, rather than 422-ing away work that already
+    cost an LLM call and a slot in the daily cap.
+    """
+
     lint: LintResult
     resume: TailoredResume
     warnings: list[str]
     llm_result: LLMResult
+    record: TailoredResumeRecord
+    payload_md: str
 
 
 PipelineResult = PipelineSuccess | PipelineLintFailure
@@ -163,13 +180,47 @@ async def run_tailor_pipeline(
             resume, trace_warnings, llm_result = await _generate(combined)
 
     payload_md = to_markdown(resume)
+
+    async def _persist(lint_result: LintResult) -> TailoredResumeRecord:
+        """Insert the ``documents`` row carrying this run's lint state.
+
+        The stored list is the *decisive* lint result verbatim — warnings
+        included, not just the blocking errors. Post-#656 the POST returns 202
+        and the client polls for the record, so the transient
+        ``TailorResponse.lint_warnings`` channel no longer reaches the user on
+        a backgrounded run; persisting the whole list is what keeps advisories
+        on a clean draft from vanishing. Hence the column's three states are
+        really four: ``NULL`` never linted, ``[]`` nothing to report, a
+        warnings-only list = clean with advisories, and any ``severity ==
+        "error"`` entry = flagged draft.
+        """
+        return await persistence.persist(
+            supabase,
+            user_id=user_id,
+            job_posting_id=job_posting_id,
+            resume=resume,
+            payload_md=payload_md,
+            job_description=job_description,
+            warnings=trace_warnings,
+            llm_result=llm_result,
+            storage_path=None,
+            lint_violations=[v.model_dump() for v in lint_result.violations],
+        )
+
     md_lint = lint_markdown(payload_md, document_type="resume")
     if not md_lint.ok:
+        # Flagged, not discarded (#656). No .docx is rendered or uploaded for a
+        # flagged draft — the download route re-renders lazily from
+        # payload_md when the hash is stale, so the failure path skips a
+        # pandoc subprocess and a Storage round-trip it would only throw away
+        # the moment the user edits.
         return PipelineLintFailure(
             lint=md_lint,
             resume=resume,
             warnings=trace_warnings,
             llm_result=llm_result,
+            record=await _persist(md_lint),
+            payload_md=payload_md,
         )
     # pandoc is a sync subprocess; offload to a worker thread so the event
     # loop keeps serving other requests during the ~hundreds-of-ms render.
@@ -181,19 +232,11 @@ async def run_tailor_pipeline(
             resume=resume,
             warnings=trace_warnings,
             llm_result=llm_result,
+            record=await _persist(lint),
+            payload_md=payload_md,
         )
 
-    record = await persistence.persist(
-        supabase,
-        user_id=user_id,
-        job_posting_id=job_posting_id,
-        resume=resume,
-        payload_md=payload_md,
-        job_description=job_description,
-        warnings=trace_warnings,
-        llm_result=llm_result,
-        storage_path=None,
-    )
+    record = await _persist(lint)
     try:
         storage_path = await persistence.upload_docx(
             supabase,
@@ -237,6 +280,18 @@ class CoverLetterPipelineSuccess:
 
 @dataclass
 class CoverLetterPipelineLintFailure:
+    """A generated cover letter that failed ATS lint — nothing persisted.
+
+    Deliberately NOT the resume's flagged-draft treatment (#656):
+    ``documents.lint_violations`` is resume-scoped, so there is nowhere to
+    record why a letter is flagged and a persisted-but-unmarked letter would
+    silently serve a document that fails lint. The backgrounded caller marks
+    the run ``error`` instead, so the user's poll surfaces a retry rather than
+    hanging. Prose trips the ATS rules far less often than a structured
+    resume, so this path is rare — but it does re-spend on retry, which is the
+    asymmetry to revisit if it ever shows up in practice.
+    """
+
     lint: LintResult
     letter: TailoredCoverLetter
     warnings: list[str]

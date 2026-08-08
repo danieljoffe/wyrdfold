@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -285,10 +286,20 @@ class TestSingleResumeStatusBump:
     after a successful generation. Without this the JobDetailPanel never
     shows the 'Review Resume' button — the resume exists in the DB but is
     invisible to the user.
+
+    Post-#656 the bump runs inside the DETACHED task, not the handler — which
+    is exactly the drift this test now guards: the handler returns 202 long
+    before the pipeline finishes, so a bump left behind in the handler would
+    silently stop firing for every real (backgrounded) generation.
     """
 
     @pytest.mark.asyncio
-    async def test_full_generation_marks_job_resume_draft(self) -> None:
+    async def test_full_generation_marks_job_resume_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.responses import JSONResponse
+
+        from app.config import settings
         from app.models.tailor import TailorRequest
         from app.routers import tailor as tailor_router
         from app.services.tailor import PipelineSuccess
@@ -303,6 +314,15 @@ class TestSingleResumeStatusBump:
             warnings=[],
             lint=LintResult(ok=True, violations=[]),
             llm_result=MagicMock(),
+        )
+
+        # Capture the detached task instead of letting it run loose, so the
+        # assertion drives it deterministically.
+        captured: list[Any] = []
+        monkeypatch.setattr(
+            tailor_router,
+            "spawn_detached",
+            lambda coro, *, name: captured.append(coro) or MagicMock(),
         )
 
         with (
@@ -331,7 +351,7 @@ class TestSingleResumeStatusBump:
             ):
                 # force_fresh skips the reuse short-circuit so we hit the full
                 # generation branch deterministically.
-                await tailor_router.create_tailored_resume(
+                resp = await tailor_router.create_tailored_resume(
                     request=MagicMock(),
                     body=TailorRequest(
                         job_description="Build things.",
@@ -341,11 +361,20 @@ class TestSingleResumeStatusBump:
                     ),
                     supabase=supabase,
                     llm=llm,
+                    user_id="u-1",
+                    s=settings,
                 )
 
-        # Dual-write threads user_id through (#75 C1); the route is invoked
-        # without resolving the JWT dependency here, so just assert the
-        # positional contract + that user_id is passed as a keyword.
+            # The handler returned 202 without waiting for the pipeline...
+            assert isinstance(resp, JSONResponse)
+            assert resp.status_code == 202
+            mock_mark.assert_not_called()
+
+            # ...and the bump lands when the detached task runs.
+            assert len(captured) == 1
+            await captured[0]
+
+        # Dual-write threads user_id through (#75 C1).
         mock_mark.assert_called_once()
         assert mock_mark.call_args.args == (supabase, "job-1")
         assert "user_id" in mock_mark.call_args.kwargs
@@ -826,6 +855,8 @@ class TestExportZip:
 class TestGetByJob:
     @pytest.mark.asyncio
     async def test_get_by_job_found(self) -> None:
+        """A persisted record comes back inside the #656 poll envelope, with
+        ``status='idle'`` — nothing is in flight, this document is settled."""
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
@@ -838,18 +869,22 @@ class TestGetByJob:
             result = await tailor_router.get_resume_by_job(
                 job_posting_id="job-1",
                 supabase=supabase,
+                user_id="u-1",
             )
 
-        assert result.id == "rec-1"
-        assert result.job_posting_id == "job-1"
+        assert result.record is not None
+        assert result.record.id == "rec-1"
+        assert result.record.job_posting_id == "job-1"
+        assert result.status == "idle"
 
     @pytest.mark.asyncio
     async def test_get_by_job_returns_none_when_missing(self) -> None:
-        """The route returns ``None`` (200 + null body) instead of raising
-        a 404 when no record exists — the FE consumer treats null as
+        """The route returns a null ``record`` (200 + envelope) instead of
+        raising a 404 when nothing exists — the FE consumer treats it as
         "no record yet, render the Generate CTA", and dropping the 404
         avoids polluting Sentry with a console error on every
-        job-detail visit before generation.
+        job-detail visit before generation. ``status='idle'`` is what tells
+        it apart from "still generating".
         """
         from app.routers import tailor as tailor_router
 
@@ -862,8 +897,10 @@ class TestGetByJob:
             result = await tailor_router.get_resume_by_job(
                 job_posting_id="nonexistent",
                 supabase=supabase,
+                user_id="u-1",
             )
-        assert result is None
+        assert result.record is None
+        assert result.status == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -1289,3 +1326,51 @@ class TestDownloadCache:
                 supabase=supabase,
             )
         assert exc_info.value.status_code == 500
+
+
+class TestGetMissingRowReturnsNone:
+    """`persistence.get` must return None for a missing/foreign row, not raise.
+
+    Regression for a bug a live drive found on 2026-08-07: the query used
+    `.single()`, and PostgREST answers `.single()` on zero rows by RAISING
+    `APIError PGRST116` — so the `if not resp.data: return None` guard was
+    unreachable and SIX endpoints 500'd where they meant to 404
+    (`GET /resumes/{id}`, `/versions`, `/download`, approve, unapprove,
+    export-zip). It shipped because every unit test mocks the client and hands
+    back `data=None` directly, which the real driver never produces.
+
+    So this mock behaves like the real thing: `.single()` raises, `.limit(1)`
+    returns an empty list. Any reintroduction of `.single()` fails here.
+    """
+
+    @staticmethod
+    def _supabase_like_postgrest() -> MagicMock:
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+
+        def _single_raises() -> None:
+            raise AssertionError(
+                "persistence.get called .single() — PostgREST raises PGRST116 on "
+                "zero rows, which turns an intended 404 into a 500"
+            )
+
+        chain.single.side_effect = _single_raises
+        chain.limit.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+        return supabase
+
+    async def test_missing_row_returns_none(self) -> None:
+        from app.services.tailor.persistence import get
+
+        result = await get(self._supabase_like_postgrest(), "does-not-exist", user_id=None)
+        assert result is None
+
+    async def test_found_row_still_parses(self) -> None:
+        from app.services.tailor.persistence import get
+
+        supabase = self._supabase_like_postgrest()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+        chain.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[_make_record().model_dump(mode="json")])
+        )
+        result = await get(supabase, "rec-1", user_id=None)
+        assert result is not None and result.id == "rec-1"
