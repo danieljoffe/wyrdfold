@@ -31,7 +31,7 @@ def _build_supabase(
     """Mock supabase chain for status + delete routes.
 
     Status uses ``_assert_user_owns_posting`` which:
-      1. ``table("jobs").select("id").eq("id", id).single().execute()``
+      1. ``table("jobs").select("id").eq("id", id).limit(1).execute()``
       2. ``table("user_targets").select("target_id").eq("user_id", uid).execute()``
       3. ``table("scores").select("target_id").eq("job_posting_id", id).in_("target_id", [...]).limit(1).execute()``
 
@@ -63,9 +63,9 @@ def _build_supabase(
         t = MagicMock()
         if name == "jobs":
             sel = t.select.return_value
-            # status.py (async since #57 slice 4) uses .single().execute() — id only
-            sel.eq.return_value.single.return_value.execute = AsyncMock(
-                return_value=_Resp(posting_id_only)
+            # status.py reads via fetch_one -> .limit(1).execute() — id only
+            sel.eq.return_value.limit.return_value.execute = AsyncMock(
+                return_value=_Resp([posting_id_only] if posting_id_only else [])
             )
             # jobs.py delete/get use .limit(1).execute() — still selects target_id
             sel.eq.return_value.limit.return_value.execute = AsyncMock(
@@ -170,8 +170,8 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
-                    return_value=_Resp({"id": "abc"})
+                t.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"id": "abc"}])
                 )
                 t.update.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
             elif name == "user_targets":
@@ -231,8 +231,8 @@ def test_status_history_scopes_to_caller(client_factory):
         def _table(name: str):
             t = MagicMock()
             if name == "jobs":
-                t.select.return_value.eq.return_value.single.return_value.execute = AsyncMock(
-                    return_value=_Resp({"id": "abc"})
+                t.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
+                    return_value=_Resp([{"id": "abc"}])
                 )
             elif name == "user_targets":
                 t.select.return_value.eq.return_value.execute = AsyncMock(

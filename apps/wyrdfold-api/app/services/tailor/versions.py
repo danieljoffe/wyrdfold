@@ -15,6 +15,8 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel
 from supabase import AsyncClient
 
+from app.services.db_read import fetch_one
+
 VERSIONS_TABLE = "document_versions"
 
 VersionSource = Literal["initial", "user_edit", "llm_adapt"]
@@ -70,16 +72,13 @@ async def checkpoint(supabase: AsyncClient, resume_id: str) -> bool:
     calls do NOT snapshot — that would flood the free-tier cap within
     minutes of typing.
     """
-    resume_resp = await (
-        supabase.table("documents")
-        .select("payload, payload_md")
-        .eq("id", resume_id)
-        .single()
-        .execute()
+    # fetch_one, not .single(): the latter raises on zero rows, so this
+    # function's documented "returns False if the row is missing" was a lie.
+    row = await fetch_one(
+        supabase.table("documents").select("payload, payload_md").eq("id", resume_id)
     )
-    if not resume_resp.data:
+    if row is None:
         return False
-    row = cast(dict[str, Any], resume_resp.data)
     current_md = row.get("payload_md")
     current_payload = row.get("payload") or {}
 

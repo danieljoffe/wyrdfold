@@ -11,6 +11,7 @@ from app.dependencies import (
     verify_supabase_jwt,
 )
 from app.models.schemas import StatusUpdate
+from app.services.db_read import fetch_one
 
 # `verify_supabase_jwt` (not `_or_jwt`): status mutations are user actions,
 # never invoked by cron. Keeping the api-key fallback would let a leaked
@@ -39,10 +40,13 @@ async def _assert_user_owns_posting(
     # 1. Confirm the posting exists. ``jobs.status`` was dropped in #75 C4
     # (per-user status now lives in ``user_jobs``); select ``id`` purely as
     # an existence probe.
-    posting_resp = await supabase.table("jobs").select("id").eq("id", posting_id).single().execute()
-    if not posting_resp.data:
+    #
+    # ``fetch_one``, not ``.single()``: the latter RAISES on zero rows, so the
+    # 404 below was unreachable and an unknown posting id 500'd (see
+    # app/services/db_read.py).
+    posting = await fetch_one(supabase.table("jobs").select("id").eq("id", posting_id))
+    if posting is None:
         raise HTTPException(status_code=404, detail="Posting not found")
-    posting = cast(dict[str, Any], posting_resp.data)
 
     # 2. Get the caller's active+inactive target ids (auth boundary, not a
     # filter — the user can act on jobs even from a deactivated target).
