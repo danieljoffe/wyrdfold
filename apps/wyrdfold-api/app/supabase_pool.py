@@ -19,12 +19,16 @@ Two trust levels:
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 from postgrest.constants import DEFAULT_POSTGREST_CLIENT_TIMEOUT
 from supabase import AsyncClient, Client, ClientOptions, acreate_client, create_client
 from supabase.lib.client_options import AsyncClientOptions
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Async service-role client (#57). Created in the app lifespan (``acreate_client``
 # is async) and reused across requests within the single event loop. Since
@@ -97,6 +101,56 @@ _ASYNC_MAX_CONNECTIONS = 20
 _ASYNC_MAX_KEEPALIVE = 10
 
 
+class _GoawayRetryTransport(httpx.AsyncBaseTransport):
+    """Retry a request once when the HTTP/2 peer closes the connection.
+
+    A long-lived HTTP/2 connection has a finite stream budget (Supabase's edge
+    caps it at 20,000). When it runs out the server sends GOAWAY, httpcore
+    raises ``ConnectionTerminated``, and httpx surfaces it as
+    ``RemoteProtocolError`` — killing whatever request happened to be in flight.
+    Prod, 2026-08-08::
+
+        Failed to record Phase 1 cost for target 012202b0-…
+        httpcore.RemoteProtocolError: <ConnectionTerminated error_code:0,
+                                       last_stream_id:19999>
+
+    That write was swallowed by its caller's ``except``, so the LLM spend was
+    never recorded — silent, recurring data loss every ~20k requests on the
+    pooled service client, and it can hit ANY Supabase call, not just cost logs.
+
+    Retrying is safe *by protocol*, not by optimism: GOAWAY's ``last_stream_id``
+    is the highest stream the peer actually processed, and a request that raises
+    this error was assigned a stream ABOVE it — so the server provably never
+    saw it. That makes the retry correct even for non-idempotent writes like the
+    INSERT above, which a blanket retry policy could not claim. We retry once;
+    the pool has already discarded the dead connection, so the attempt lands on
+    a fresh one. A second failure is a real fault and propagates.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return await self._inner.handle_async_request(request)
+        except httpx.RemoteProtocolError as exc:
+            # Only GOAWAY-shaped terminations are provably unprocessed. A
+            # mid-body protocol error is NOT safe to replay, so let it through.
+            if "ConnectionTerminated" not in str(exc):
+                raise
+            logger.warning(
+                "HTTP/2 GOAWAY from Supabase (%s) — retrying %s %s on a fresh "
+                "connection; the peer never processed this stream",
+                exc,
+                request.method,
+                request.url.path,
+            )
+            return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 def _build_async_http2_client() -> httpx.AsyncClient:
     """httpx.AsyncClient for the async service-role client — HTTP/2 ON.
 
@@ -108,14 +162,19 @@ def _build_async_http2_client() -> httpx.AsyncClient:
     handshakes) — the payoff #57 is after. Connection limits keep the pooler
     safe under the migrated poll burst.
     """
+    limits = httpx.Limits(
+        max_connections=_ASYNC_MAX_CONNECTIONS,
+        max_keepalive_connections=_ASYNC_MAX_KEEPALIVE,
+    )
     return httpx.AsyncClient(
-        http2=True,
+        # Wrapped so a GOAWAY at the connection's stream ceiling can't take a
+        # request down with it — see _GoawayRetryTransport.
+        transport=_GoawayRetryTransport(
+            httpx.AsyncHTTPTransport(http2=True, limits=limits)
+        ),
         follow_redirects=True,
         timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
-        limits=httpx.Limits(
-            max_connections=_ASYNC_MAX_CONNECTIONS,
-            max_keepalive_connections=_ASYNC_MAX_KEEPALIVE,
-        ),
+        limits=limits,
     )
 
 

@@ -110,9 +110,43 @@ class _RecordingQuery:
 def test_apply_score_floor_exempts_pending_when_floored() -> None:
     q = _RecordingQuery()
     assert _apply_score_floor(q, 70) is q
-    # Pending rows pass via the status legs; graded rows must clear the floor.
-    assert q.or_calls == ["scoring_status.is.null,scoring_status.neq.complete,score.gte.70"]
+    # Pending rows pass via the axis_scores leg; graded rows must clear the floor.
+    assert q.or_calls == ["axis_scores.is.null,score.gte.70"]
     assert q.gte_calls == []  # never a flat floor that would hide Pending
+
+
+def test_apply_score_floor_uses_the_same_signal_as_is_pending() -> None:
+    """The floor's exemption and the Pending badge must not disagree.
+
+    Regression for the 2026-08-08 prod defect: the predicate keyed on
+    ``scoring_status != 'complete'``, which exempted 5,130 live rows that carry
+    real ``axis_scores`` — the list rendered them as ordinary graded results
+    with a numeric badge, so "Score 85+" returned rows scored 62.
+    ``_is_pending`` is the single source of truth for "not yet graded"; the SQL
+    predicate has to key on the same column it does.
+    """
+    q = _RecordingQuery()
+    _apply_score_floor(q, 70)
+    (expr,) = q.or_calls
+    assert "scoring_status" not in expr, (
+        "the floor is keyed on scoring_status again — _is_pending's own "
+        "docstring says that column is unreliable, and the two disagreed on "
+        "5,130 prod rows"
+    )
+    assert "axis_scores.is.null" in expr
+
+    # The exempted population per this predicate must be exactly the population
+    # _is_pending calls Pending. A stage1/stage2 row WITH axis_scores is graded.
+    graded_but_not_complete = {
+        "scoring_status": "stage1",
+        "axis_scores": {"title_fit": 62},
+        "score": 62,
+    }
+    assert _is_pending(graded_but_not_complete) is False, (
+        "a stage1 row carrying axis_scores is graded, so the floor must apply "
+        "to it — this is the row class the old predicate let through"
+    )
+    assert _is_pending({"scoring_status": "stage1", "score": 62}) is True
 
 
 @pytest.mark.parametrize("floor", [None, 0])

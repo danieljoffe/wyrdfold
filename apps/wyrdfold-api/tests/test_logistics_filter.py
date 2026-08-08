@@ -206,3 +206,56 @@ class TestIncludeUnknownSalaryPref:
             rows, self._floor(), include_unknown_salary_for=lambda p: p["id"] == "keep-me"
         )
         assert [p["id"] for p in out] == ["keep-me"]
+
+
+# ---- country: prefer the deterministic jobs.country column -----------------
+#
+# Regression for the 2026-08-08 prod defect: the filter read ONLY the Phase-2
+# grader's ``logistics_filters.location_country``, which exists on ~4% of scores
+# rows. Combined with "absent ⇒ keep", that admitted the other 96% and made the
+# filter inert — selecting Canada in the UI returned a full page of US jobs.
+# ``jobs.country`` covers ~80% of the live corpus and is now preferred, exactly
+# as the salary bound already prefers the deterministic salary columns.
+
+
+def test_country_uses_the_posting_column_when_the_grader_field_is_absent() -> None:
+    f = _LogisticsFilter(country="CA")
+    us_posting = {"id": "j", "logistics_filters": None, "country": "US"}
+    assert _logistics_passes(us_posting, f) is False, (
+        "a US posting must not survive a Canada filter just because the "
+        "grader never wrote location_country for it"
+    )
+
+
+def test_country_keeps_a_matching_posting_column() -> None:
+    f = _LogisticsFilter(country="CA")
+    ca_posting = {"id": "j", "logistics_filters": None, "country": "ca"}
+    assert _logistics_passes(ca_posting, f) is True  # case-insensitive
+
+
+def test_country_posting_column_wins_over_a_stale_grader_field() -> None:
+    f = _LogisticsFilter(country="CA")
+    conflicted = {
+        "id": "j",
+        "logistics_filters": {"location_country": "CA"},
+        "country": "US",
+    }
+    assert _logistics_passes(conflicted, f) is False
+
+
+def test_country_falls_back_to_the_grader_field_when_the_column_is_null() -> None:
+    f = _LogisticsFilter(country="CA")
+    graded_only = {
+        "id": "j",
+        "logistics_filters": {"location_country": "CA"},
+        "country": None,
+    }
+    assert _logistics_passes(graded_only, f) is True
+
+
+def test_country_stays_lenient_only_when_genuinely_unknown() -> None:
+    """The documented leniency is for a remote role with no country anchor —
+    not a licence to keep every ungraded row."""
+    f = _LogisticsFilter(country="CA")
+    unknown = {"id": "j", "logistics_filters": None, "country": None}
+    assert _logistics_passes(unknown, f) is True
