@@ -33,6 +33,7 @@ from app.models.learning import (
     TargetLearningLogRow,
 )
 from app.models.llm import Message, ModelId
+from app.services.db_read import fetch_one
 from app.services.feedback import _MIN_FEEDBACK_FOR_LEARN, _parse_row
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
@@ -341,10 +342,9 @@ async def run_llm_learner(
     if len(feedback) < _MIN_FEEDBACK_FOR_LEARN:
         return None
 
-    target_resp = (
-        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
-    )
-    target_row = cast(dict[str, Any] | None, target_resp.data)
+    # fetch_one, not .single() — the latter raises on zero rows, making this
+    # `return None` unreachable (see app/services/db_read.py).
+    target_row = await fetch_one(supabase.table("targets").select("*").eq("id", target_id))
     if target_row is None:
         return None
     prev_profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
@@ -664,24 +664,22 @@ async def apply_staged_patch(
     supabase: AsyncClient, *, user_id: str, run_id: str
 ) -> LearningRunResult | None:
     """Take a staged patch + apply it. Returns None if no staged row matches."""
-    log_resp = (
-        await supabase.table(LEARNING_LOG_TABLE)
+    # fetch_one, not .single(): the docstring's "Returns None if no staged row
+    # matches" was impossible — .single() raised instead.
+    log_row = await fetch_one(
+        supabase.table(LEARNING_LOG_TABLE)
         .select("*")
         .eq("id", run_id)
         .eq("user_id", user_id)
         .eq("status", "staged")
-        .single()
-        .execute()
     )
-    log_row = cast(dict[str, Any] | None, log_resp.data)
     if log_row is None:
         return None
 
     target_id = log_row["target_id"]
-    target_resp = (
-        await supabase.table("targets").select("*").eq("id", target_id).single().execute()
-    )
-    target_row = cast(dict[str, Any] | None, target_resp.data)
+    # fetch_one, not .single() — the latter raises on zero rows, making this
+    # `return None` unreachable (see app/services/db_read.py).
+    target_row = await fetch_one(supabase.table("targets").select("*").eq("id", target_id))
     if target_row is None:
         return None
 

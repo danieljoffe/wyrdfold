@@ -99,8 +99,8 @@ def test_sources_remove_calls_delete(client_factory):
 def test_sources_toggle_flips_enabled(client_factory):
     sb = MagicMock()
     (
-        sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value
-    ) = _Resp({"enabled": True})
+        sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value
+    ) = _Resp([{"enabled": True}])
     sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
     client = client_factory(sb)
     r = client.post("/sources", json={"action": "toggle", "board_token": "foo"})
