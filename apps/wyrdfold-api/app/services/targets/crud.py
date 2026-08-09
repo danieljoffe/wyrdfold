@@ -164,7 +164,7 @@ def get_by_normalized_label(supabase: Client, normalized_label: str) -> JobTarge
     return _parse_target(rows[0]) if rows else None
 
 
-def create(supabase: Client, payload: TargetCreate) -> JobTarget:
+def create(supabase: Client, payload: TargetCreate, *, app_active: bool = False) -> JobTarget:
     """Find-or-create a shared-catalog target, keyed on ``normalized_label``.
 
     The catalog is shared — one canonical row per role, ownership via
@@ -178,6 +178,19 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
     race-safe: concurrent creators converge on the one committed row. The
     richer exact+fuzzy dedup still lives in the higher-level paths; here we
     align exactly with the DB constraint (exact ``normalized_label``).
+
+    ``app_active`` sponsors the row AT BIRTH and is INTERNAL-ONLY — a keyword
+    argument, deliberately NOT a ``TargetCreate`` field, because that model is
+    bound straight from the ``POST /targets`` request body: exposing it would
+    let any caller self-sponsor a catalog target, which bypasses membership
+    scoping and makes the row permanently un-reapable.
+
+    Only the catalog seed passes it (#667). That script used to create the row
+    unsponsored, run an LLM derive, and only then set ``app_active`` — leaving a
+    window AN LLM CALL WIDE in which a legitimate catalog row was
+    indistinguishable from an orphaned one (``app_active`` false, zero
+    memberships). Sponsoring at insert closes that window instead of asking
+    every cleanup path to guess around it.
     """
     normalized = normalize_label(payload.label)
     row: dict[str, Any] = {
@@ -187,6 +200,8 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
         "scoring_profile": payload.scoring_profile.model_dump(),
         "search_keywords": payload.search_keywords,
     }
+    if app_active:
+        row["app_active"] = True
     # Insert unless the normalized label already exists; ignore_duplicates
     # skips (never overwrites) the existing canonical row.
     resp = (

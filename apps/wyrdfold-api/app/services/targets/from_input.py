@@ -114,37 +114,6 @@ DERIVATION_TIMEOUT_S = 60.0
 # router-inline pattern in routers/targets.py.
 
 
-async def _create(supabase: AsyncClient, payload: TargetCreate) -> JobTarget:
-    """Async inline of ``crud.create`` — find-or-create on ``normalized_label``."""
-    normalized = crud.normalize_label(payload.label)
-    row: dict[str, Any] = {
-        "label": payload.label,
-        "description": payload.description,
-        "normalized_label": normalized,
-        "scoring_profile": payload.scoring_profile.model_dump(),
-        "search_keywords": payload.search_keywords,
-    }
-    resp = await (
-        supabase.table(crud.TARGETS_TABLE)
-        .upsert(row, on_conflict="normalized_label", ignore_duplicates=True)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if rows:
-        return crud._parse_target(rows[0])
-    existing = await (
-        supabase.table(crud.TARGETS_TABLE)
-        .select("*")
-        .eq("normalized_label", normalized)
-        .limit(1)
-        .execute()
-    )
-    existing_rows = cast(list[dict[str, Any]], existing.data or [])
-    if existing_rows:
-        return crud._parse_target(existing_rows[0])
-    raise RuntimeError("Failed to insert or locate targets row")
-
-
 async def _update(supabase: AsyncClient, target_id: str, payload: TargetUpdate) -> JobTarget | None:
     """Async inline of ``crud.update`` — same partial field mapping."""
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
@@ -183,6 +152,50 @@ async def _get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
     resp = await supabase.table(crud.TARGETS_TABLE).select("*").eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return crud._parse_target(rows[0]) if rows else None
+
+
+async def _create_and_link(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    payload: TargetCreate,
+    activation_status: str | None = None,
+) -> tuple[JobTarget, UserTarget]:
+    """Find-or-create a target and link the caller to it, ATOMICALLY (#667).
+
+    Replaces the create -> update-status -> link trio of round-trips. Between
+    the first and the last, the target existed with `app_active = false` and no
+    membership — which IS the definition of an orphan, so an orphan was not a
+    detectable state but one the happy path passes through. Every cleanup
+    predicate then had to guess (by age) whether a row was being born or
+    abandoned. One transaction removes the guess.
+
+    It also fixes a real create-side bug: when the membership insert failed
+    after the target insert succeeded, the user got an error AND a permanent
+    orphan. Now it is both rows or neither.
+
+    Semantics are unchanged — see the RPC's own comment for how the
+    find-or-create idempotence and the activation-status update are preserved.
+    """
+    resp = await supabase.rpc(
+        "create_target_and_link",
+        {
+            "p_user_id": user_id,
+            "p_label": payload.label,
+            "p_normalized_label": crud.normalize_label(payload.label),
+            "p_activation_status": activation_status,
+            "p_description": payload.description,
+            "p_scoring_profile": payload.scoring_profile.model_dump(),
+            "p_search_keywords": payload.search_keywords,
+        },
+    ).execute()
+    data = cast(dict[str, Any] | None, resp.data)
+    if not data or "target" not in data or "user_target" not in data:
+        raise RuntimeError("create_target_and_link returned no target/user_target")
+    return (
+        crud._parse_target(cast(dict[str, Any], data["target"])),
+        crud._parse_user_target(cast(dict[str, Any], data["user_target"])),
+    )
 
 
 async def _link(
@@ -671,17 +684,15 @@ async def _create_or_link_from_suggestion(
     # New target: create immediately in "deriving" so it appears in the
     # list with a pending indicator while the background task derives the
     # scoring profile (+ fit score when we have a profile).
-    target = await _create(
+    target, link = await _create_and_link(
         supabase,
+        user_id=user_id,
         payload=TargetCreate(
             label=suggestion.label,
             description=suggestion.description,
         ),
+        activation_status="deriving",
     )
-    target = (
-        await _update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
-    )
-    link = await _link(supabase, user_id=user_id, target_id=target.id, is_active=False)
     spawn_detached(
         derive_manual_target_bg(
             supabase,
@@ -859,11 +870,12 @@ async def from_url(
         )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
-    target = await _create(supabase, payload=TargetCreate(label=label))
-    target = (
-        await _update(supabase, target.id, TargetUpdate(activation_status="deriving")) or target
+    target, link = await _create_and_link(
+        supabase,
+        user_id=user_id,
+        payload=TargetCreate(label=label),
+        activation_status="deriving",
     )
-    link = await _link(supabase, user_id=user_id, target_id=target.id, is_active=False)
     _schedule_url_bg_tasks(
         supabase,
         llm,
