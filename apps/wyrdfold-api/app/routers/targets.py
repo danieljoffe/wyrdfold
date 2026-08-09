@@ -614,6 +614,38 @@ async def _delete_target_async(supabase: AsyncClient, target_id: str) -> bool:
     return bool(resp.data)
 
 
+async def _reap_orphaned_target_async(supabase: AsyncClient, target_id: str) -> bool:
+    """Remove a target that just lost its LAST follower (#667).
+
+    The per-user unlink above is deliberate — targets are a shared catalog, so
+    dropping the row while co-followers remain would cascade away their scores.
+    But nothing removed the row once the last follower left, and the endpoint is
+    membership-scoped, so from that moment it 404s for everyone including its
+    creator: unreachable, and still holding every score row it accumulated (one
+    prod orphan carried 6,163 — ~3.8% of the whole ``scores`` table).
+
+    The guard ("no memberships remain, no ops sponsorship") is a NOT EXISTS
+    subquery PostgREST cannot express, and doing it as count-then-delete would
+    leave a window where someone links the target between the two calls. So it
+    lives in ``reap_orphaned_target``, where the check and the delete share one
+    snapshot.
+
+    Fail-soft: the unlink itself already succeeded and that is what the caller
+    asked for. A reap failure leaves a tidy-up job, not a broken delete, so it is
+    logged rather than raised.
+    """
+    try:
+        resp = await supabase.rpc("reap_orphaned_target", {"p_target_id": target_id}).execute()
+    except Exception:
+        logger.warning(
+            "reap_orphaned_target failed for %s — unlink succeeded, row left behind",
+            target_id,
+            exc_info=True,
+        )
+        return False
+    return bool(resp.data)
+
+
 async def _set_axis_weights_async(
     supabase: AsyncClient, *, user_id: str, target_id: str, weights: AxisWeights | None
 ) -> UserTarget | None:
@@ -1857,14 +1889,22 @@ async def delete_target(
     # deleting the shared row cascades away every co-follower's user_targets /
     # scores / feedback / analyses / learning (all those FKs are ON DELETE
     # CASCADE), which is exactly what account-erasure is documented never to do.
-    # The user_targets AFTER-DELETE trigger deactivates the target once its last
-    # active follower leaves. Operators (api-key path, user_id is None) keep the
-    # hard delete. Mirrors the audit-#29 H1 fix that turned the jobs "delete"
-    # into a per-user unlink for the same shared-row reason.
+    # Operators (api-key path, user_id is None) keep the hard delete. Mirrors the
+    # audit-#29 H1 fix that turned the jobs "delete" into a per-user unlink for
+    # the same shared-row reason.
+    #
+    # ...but once the LAST follower leaves, nobody can reach the row again: this
+    # endpoint is membership-scoped, so it 404s for everyone including its
+    # creator, while the row keeps every score it accumulated. This used to be
+    # handled by the ``sync_target_active`` AFTER-DELETE trigger, which
+    # 20260731090000 dropped when ``is_active`` became ``app_active`` — the
+    # comment here claimed otherwise for a week and the orphans piled up (#667).
+    # Reap explicitly instead of relying on a trigger that no longer exists.
     if user_id is not None:
         unlinked = await _unlink_user_from_target_async(supabase, user_id, target_id)
         if not unlinked:
             raise HTTPException(status_code=404, detail="Target not found")
+        await _reap_orphaned_target_async(supabase, target_id)
         return DeleteResponse(deleted=True)
     deleted = await _delete_target_async(supabase, target_id)
     if not deleted:

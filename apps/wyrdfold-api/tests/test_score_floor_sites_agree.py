@@ -148,6 +148,77 @@ def test_floored_rpc_does_not_exempt_on_scoring_status(fn_name: str) -> None:
     )
 
 
+@pytest.mark.parametrize("fn_name", _FLOORED_RPCS)
+def test_floored_rpc_judges_the_aged_score(fn_name: str) -> None:
+    """#665: the floor compares ``recency_score``, not ``score``.
+
+    A wyrdfold score means "good match AND still fresh", so the aged number is
+    the one the user sees and the one the chip must judge. Flooring the raw fit
+    while displaying the aged value is what made "Score 70+" render a card
+    reading 56 in prod. This is a separate assertion from the graded-signal one
+    above: the floor can exempt the right ROWS while still comparing the wrong
+    COLUMN — which is exactly the state prod shipped in for a day.
+    """
+    path, sql = _latest_definition(fn_name)
+    assert "recency_score >=" in sql, (
+        f"{path.name} floors public.{fn_name} on something other than "
+        f"recency_score. The list shows the aged score, so the floor must judge "
+        f"the aged score or the chip lies about its own results."
+    )
+    assert "s.score >=" not in sql, (
+        f"{path.name} still compares the RAW score in public.{fn_name}'s floor."
+    )
+
+
+def test_recency_score_cannot_be_null() -> None:
+    """The floor's silent-disappearance guard.
+
+    ``recency_score >= N`` evaluates NULL for a NULL row, so a row that missed
+    the writer would be EXCLUDED from every floored list — gone, not degraded.
+    The fix lives at the write site (trigger fill + NOT NULL) rather than as a
+    COALESCE at each read site, because PostgREST — which the two-query floor
+    filters through — cannot express COALESCE, so a read-side patch makes the
+    RPC and the Python path disagree. Measured: read-side COALESCE took the
+    integration suite from 13 failures to 36; the write-side fix took it to 0.
+    """
+    _, sql = _latest_definition("scores_sync_denorm")
+    assert "NEW.recency_score := COALESCE(NEW.recency_score, NEW.score);" in sql, (
+        "scores_sync_denorm no longer fills recency_score. Without it a NULL "
+        "silently drops the row from every floored list."
+    )
+    ddl = "\n".join(
+        p.read_text() for p in MIGRATIONS_DIR.glob("*.sql") if "recency_score" in p.read_text()
+    )
+    assert "ALTER COLUMN recency_score SET NOT NULL" in ddl, (
+        "recency_score is no longer NOT NULL — the schema must enforce what the "
+        "trigger guarantees, or a future writer can reintroduce the hole."
+    )
+
+
+def test_cross_target_dedup_tiebreak_matches_prefer_score_row() -> None:
+    """The per-job representative is chosen by the same number in both paths.
+
+    ``get_cross_target_jobs`` picks it with ``DISTINCT ON ... ORDER BY``; the
+    two-query path picks it with ``_prefer_score_row``. Same rule, two
+    implementations — so the same job can be attributed to different targets
+    depending on which path served the request if they drift. That is the #664
+    failure mode, one layer down.
+    """
+    _, sql = _latest_definition("get_cross_target_jobs")
+    assert "ORDER BY s.job_posting_id, s.is_graded DESC, s.recency_score DESC" in sql, (
+        "the RPC's DISTINCT ON tiebreak no longer orders by recency_score"
+    )
+    source = JOBS_ROUTER.read_text()
+    assert "def _representative_value(" in source, (
+        "_prefer_score_row no longer routes through _representative_value, so "
+        "the Python tiebreak can silently diverge from the RPC's"
+    )
+    assert 'stored = row.get("recency_score")' in source, (
+        "_representative_value no longer compares recency_score — it must "
+        "mirror the RPC's DISTINCT ON tiebreak"
+    )
+
+
 def test_python_floor_exempts_on_the_graded_signal() -> None:
     """``_apply_score_floor`` — the two-query path's copy of the same rule."""
 
@@ -161,7 +232,7 @@ def test_python_floor_exempts_on_the_graded_signal() -> None:
 
     q = _RecordingQuery()
     _apply_score_floor(q, 70)
-    assert q.filters == ["axis_scores.is.null,score.gte.70"]
+    assert q.filters == ["axis_scores.is.null,recency_score.gte.70"]
     assert not any("scoring_status" in f for f in q.filters)
 
 

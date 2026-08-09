@@ -19,7 +19,7 @@ import app.services.recency as recency_mod
 from app.config import settings
 from app.models.targets import AxisWeights
 from app.routers.jobs import (
-    _apply_display_recency,
+    _display_sort_value,
     _list_jobs_across_user_targets,
     _list_jobs_for_target_two_query,
 )
@@ -441,10 +441,12 @@ async def test_target_two_query_orders_by_recency_when_enabled(
     )
 
     assert [p["id"] for p in result["postings"]] == ["j-fresh", "j-stale"]
-    # The helper returns the raw fit score; the read-time display decay is
-    # applied one layer up in ``list_jobs`` (see ``_apply_display_recency``),
-    # so at this layer ``score`` is still the undecayed fit.
-    assert [p["score"] for p in result["postings"]] == [70, 95]
+    # #665: the helper returns THE score — the aged one, straight from the
+    # stored column — because that is the number the list shows, sorts by and
+    # floors on. j-stale's raw fit is 95 but it has decayed to 48, and 48 is
+    # what a user sees. There is no second number applied a layer up any more.
+    assert [p["score"] for p in result["postings"]] == [70, 48]
+    assert [p["raw_score"] for p in result["postings"]] == [70, 95]
 
 
 async def test_across_targets_orders_by_recency_when_enabled(
@@ -496,7 +498,9 @@ async def test_across_targets_orders_by_recency_when_enabled(
     )
 
     assert [p["id"] for p in result["postings"]] == ["j-fresh", "j-stale"]
-    assert [p["score"] for p in result["postings"]] == [70, 95]
+    # #665: THE score is the aged one (see the twin test above).
+    assert [p["score"] for p in result["postings"]] == [70, 48]
+    assert [p["raw_score"] for p in result["postings"]] == [70, 95]
 
 
 async def test_two_query_sorts_by_weighted_display_not_raw(
@@ -582,61 +586,76 @@ def test_display_recency_score_missing_first_seen_treated_as_fresh() -> None:
     assert display_recency_score(90, None, now) == 90
 
 
-# ---- _apply_display_recency (router-level display overlay) -----------------
+# ---- _display_sort_value (THE score, #665) ---------------------------------
+#
+# ``_apply_display_recency`` was DELETED in #665. It re-decayed the shown score
+# at read time, which made it a second implementation of the displayed number —
+# and it promptly drifted away from the floor, so "Score 70+" rendered cards at
+# 56. The displayed value now comes from one place: the stored ``recency_score``
+# column, which a scheduler sweep keeps current.
 
 
-def test_apply_display_recency_decays_score_and_records_raw(
+def test_display_value_reads_the_stored_column(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """No read-time arithmetic on the un-weighted path — the column IS the
+    answer, which is also what makes the floor indexable."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 100, "cataloged_at": old}]
+    row = {"job_posting_id": "j1", "score": 100, "recency_score": 70}
 
-    _apply_display_recency(postings)
+    value = _display_sort_value(row, weights=None, posted_at=old, now=datetime.now(UTC))
 
-    assert postings[0]["score"] == 70  # round(100 * 0.70)
-    assert postings[0]["raw_score"] == 100  # undecayed fit preserved
+    assert value == 70
 
 
-def test_apply_display_recency_noop_when_disabled(
+def test_display_value_ignores_the_decay_flag_when_unweighted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """``recency_score`` is an identity write when decay is off
+    (``compute_recency_score(..., enabled=False)`` returns ``score``), so the
+    reader does not branch on the flag at all."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
-    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 100, "cataloged_at": old}]
+    row = {"job_posting_id": "j1", "score": 100, "recency_score": 70}
 
-    _apply_display_recency(postings)
+    value = _display_sort_value(row, weights=None, posted_at=None, now=datetime.now(UTC))
 
-    assert postings[0]["score"] == 100
-    assert "raw_score" not in postings[0]
+    assert value == 70
 
 
-def test_apply_display_recency_preserves_overlay_raw_score(
+def test_display_value_falls_back_to_raw_when_column_absent() -> None:
+    """A select that didn't fetch the column must not sink the row to 0."""
+    row = {"job_posting_id": "j1", "score": 82}
+
+    value = _display_sort_value(row, weights=None, posted_at=None, now=datetime.now(UTC))
+
+    assert value == 82
+
+
+def test_display_value_still_decays_at_read_time_for_custom_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The score overlay sets ``score`` to the (axis-weighted) blend and
-    ``raw_score`` to the raw fit. Decay must multiply the blend and leave
-    the already-set ``raw_score`` untouched."""
+    """THE exception. ``recency_score`` derives from ``score``, not from the
+    per-membership weighted blend, so the weighted path recomputes. Mirrors
+    ``v_gk`` in ``get_cross_target_jobs`` — keep the two in step."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    postings = [{"id": "j1", "score": 80, "raw_score": 95, "cataloged_at": old}]
+    # Weights that lift the blend well above the stored (un-weighted) column,
+    # so reading the column instead would be visible.
+    weights = AxisWeights(title_fit=1.0, skills_fit=0.0, seniority_fit=0.0, domain_fit=0.0)
+    row = {
+        "job_posting_id": "j1",
+        "score": 50,
+        "recency_score": 35,
+        "axis_scores": {"title_fit": 100, "skills_fit": 0, "seniority_fit": 0, "domain_fit": 0},
+    }
 
-    _apply_display_recency(postings)
+    value = _display_sort_value(row, weights=weights, posted_at=old, now=datetime.now(UTC))
 
-    assert postings[0]["score"] == 56  # round(80 * 0.70) — the blend decays
-    assert postings[0]["raw_score"] == 95  # untouched
-
-
-def test_apply_display_recency_skips_rows_without_score(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "recency_decay_enabled", True)
-    postings = [{"id": "j1", "cataloged_at": "2026-01-01T00:00:00+00:00"}]
-
-    _apply_display_recency(postings)
-
-    assert "score" not in postings[0]
-    assert "raw_score" not in postings[0]
+    # blend = 100 (all weight on title_fit), decayed by 27 days => round(100*0.70)
+    assert value == 70
+    # ...and emphatically NOT the stored column, which knows nothing of weights.
+    assert value != 35
 
 
 # ---- refresh_all_recency_scores (full sweep) -------------------------------
