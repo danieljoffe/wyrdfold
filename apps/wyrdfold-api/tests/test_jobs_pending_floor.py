@@ -111,7 +111,8 @@ def test_apply_score_floor_exempts_pending_when_floored() -> None:
     q = _RecordingQuery()
     assert _apply_score_floor(q, 70) is q
     # Pending rows pass via the axis_scores leg; graded rows must clear the floor.
-    assert q.or_calls == ["axis_scores.is.null,score.gte.70"]
+    # #665: the floor judges the AGED score — the same number the list shows.
+    assert q.or_calls == ["axis_scores.is.null,recency_score.gte.70"]
     assert q.gte_calls == []  # never a flat floor that would hide Pending
 
 

@@ -362,15 +362,12 @@ test('deep: jobs filter + sort gaps', async ({ page }) => {
       expect(
         offenders.map(o => o.score),
         'min_score=70 returned non-pending rows whose DISPLAYED score is ' +
-          'below 70. Two distinct defects can cause this; check raw_score to ' +
-          'tell them apart. (a) raw_score also < 70 => the floor predicate is ' +
-          'broken (fixed for get_cross_target_jobs by migration ' +
-          '20260808120000). (b) raw_score >= 70 but shown < 70 => the floor ' +
-          'filters the RAW score while the API returns a read-time DECAYED ' +
-          'score (RECENCY_DECAY_ENABLED=true in prod), so a "Score 70+" chip ' +
-          'renders a card reading 56. (b) is a KNOWN OPEN DEFECT — see the ' +
-          'linked issue. Do not weaken this guard to get green; it encodes ' +
-          'the promise the chip makes to the user.'
+          'below 70. Since #665 there is only ONE score: the aged one ' +
+          '(scores.recency_score), and the floor judges that same number, so ' +
+          'a card under the chip can no longer read lower than the chip. If ' +
+          'this fails, the floor and the display have drifted apart again — ' +
+          'check that the RPC floors on recency_score AND returns it as ' +
+          '`score` (they are the same expression by construction).'
       ).toEqual([]);
     },
     async () => {
@@ -383,9 +380,17 @@ test('deep: jobs filter + sort gaps', async ({ page }) => {
   // list with a raw fit score under the bar. Split out from the guard above so
   // the two defects fail independently — before migration 20260808120000 this
   // returned 858 graded rows under the floor on the owner's target set.
+  //
+  // #665 repointed this. The shown score IS the aged score now, so
+  // "raw_score >= floor" is merely a CONSEQUENCE (decay only ever reduces, so
+  // recency >= 70 implies raw >= 70) rather than the thing worth guarding.
+  // What is worth guarding is the direction itself: the number on the card must
+  // never exceed the raw fit. If it ever does, decay has been applied twice, or
+  // inverted, or the weighted-blend branch has stopped decaying — all of which
+  // would silently re-open the gap between the chip and the card.
   await timedAction(
     page,
-    'jobs.filter.min-score.raw-floor-holds',
+    'jobs.filter.min-score.decay-direction',
     'jobs',
     async () => {
       const res = await page.request.get(
@@ -417,16 +422,29 @@ test('deep: jobs filter + sort gaps', async ({ page }) => {
           'assertion below cannot fail — the API stopped surfacing the ' +
           'undecayed fit score this guard reads'
       ).toHaveLength(0);
-      const offenders = graded.filter(
+      // Decay only ever reduces, so the shown score must sit at or below the
+      // raw fit — and, as a consequence of the floor, at or above the bar.
+      const inverted = graded.filter(
+        p =>
+          typeof p.raw_score === 'number' &&
+          typeof p.score === 'number' &&
+          p.score > p.raw_score
+      );
+      expect(
+        inverted.map(o => `${o.score} > ${o.raw_score}`),
+        'a shown score exceeded its own raw fit. Decay multiplies by at most ' +
+          '1.0, so this means it was applied twice, inverted, or the ' +
+          'weighted-blend branch stopped decaying — the failure modes that ' +
+          'would re-open the gap between the "Score 70+" chip and the card.'
+      ).toEqual([]);
+      const belowBar = graded.filter(
         p => typeof p.raw_score === 'number' && p.raw_score < 70
       );
       expect(
-        offenders.map(o => o.raw_score),
-        'min_score=70 admitted graded rows whose RAW fit score is below 70. ' +
-          'The floor must judge every row carrying a real grade and exempt ' +
-          'only not-yet-graded (Pending) rows. Keying the exemption on ' +
-          'scoring_status instead of the graded signal is what caused this ' +
-          'in prod on 2026-08-08.'
+        belowBar.map(o => o.raw_score),
+        'min_score=70 admitted graded rows whose RAW fit is below 70. Since ' +
+          'the floor judges the aged score and decay only reduces, this is ' +
+          'impossible unless recency_score has drifted above score.'
       ).toEqual([]);
     },
     async () => {
