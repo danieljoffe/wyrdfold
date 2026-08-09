@@ -554,12 +554,36 @@ def _display_sort_value(
     posted_at: Any,
     now: datetime,
 ) -> int:
-    """The score a row will actually DISPLAY: the axis-weighted blend, then
-    read-time recency decay. Sorting the list on this — rather than the stored,
-    un-weighted ``recency_score`` (which also freezes for jobs the poller stops
-    re-touching) — keeps the dashboard order matching the visible numbers (#47).
-    ``_apply_display_recency`` later sets each shown ``score`` to exactly this.
+    """THE score for a row — the one number the list filters, sorts AND shows.
+
+    #665: a wyrdfold score means "good match AND still fresh". Decay is not
+    cosmetic ageing, it encodes the probability the role is still open, so the
+    aged number is the real one and there is no second number to reconcile.
+
+    The source is the stored ``recency_score`` column, not a read-time
+    computation. That is what ``recency.py``'s design note prescribes, and the
+    objection that once justified computing it per request — that the column
+    "freezes for jobs the poller stops re-touching" — has been false since
+    ``scheduler.refresh_all_recency_scores`` started rewriting every live row on
+    a tick (prod 2026-08-08: pending 100% within +/-1 of a fresh calc, graded
+    98%). Keeping the read-time copy around is what let the displayed number
+    drift away from the floor in the first place.
+
+    It is also the only form the DB can index: ``get_cross_target_jobs`` floors
+    on ``s.recency_score`` and needs it in the covering index to stay on an
+    Index Only Scan.
+
+    CUSTOM AXIS WEIGHTS are the one exception. ``recency_score`` is derived from
+    ``score``, not from the per-membership weighted blend, so that path still
+    decays at read time — mirroring ``v_gk`` in the RPC. Keep the two in step.
     """
+    if weights is None:
+        stored = ts.get("recency_score")
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
+        # Older/stub rows fetched without the column: fall back to the raw fit
+        # rather than reporting 0, which would sink the row to the bottom.
+        return int(ts.get("score") or 0)
     weighted = display_score_or_passthrough(
         ts.get("axis_scores"), int(ts.get("score") or 0), weights
     )
@@ -698,14 +722,20 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     ``axis_scores = '{}'`` (verified 2026-08-08), so the empty-dict case has no
     population to diverge on.
 
-    Keep ``supabase/migrations/20260808040000_score_floor_axis_scores.sql`` in
-    step — ``pipeline_counts`` mirrors this predicate server-side, and a
-    divergence means the dashboard tiles and the list disagree about the same
-    floor. ``min_score`` is a validated int, so the interpolation below carries
-    no injection surface."""
+    THE FLOOR JUDGES ``recency_score``, NOT ``score`` (#665). A wyrdfold score
+    means "good match AND still fresh" — decay encodes the probability the role
+    is still open — so the aged number is the one the user sees and the one the
+    chip must judge. Flooring the raw fit while displaying the aged value is
+    what made "Score 70+" render a card reading 56 in prod.
+
+    Keep ``supabase/migrations/20260809090000_one_score_recency_everywhere.sql``
+    in step — ``pipeline_counts`` and ``get_cross_target_jobs`` mirror this
+    predicate server-side, and a divergence means the dashboard tiles and the
+    list disagree about the same floor. ``min_score`` is a validated int, so the
+    interpolation below carries no injection surface."""
     if not min_score or min_score <= 0:
         return query
-    return query.or_(f"axis_scores.is.null,score.gte.{min_score}")
+    return query.or_(f"axis_scores.is.null,recency_score.gte.{min_score}")
 
 
 def _rank_graded_first(
@@ -736,12 +766,28 @@ def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> boo
     """Whether ``candidate`` is a better per-job representative than ``current``
     in the untargeted (cross-target) view. A graded row beats a Pending one — a
     real fit score over a keyword placeholder (#47); among rows of the same
-    gradedness, the higher raw score wins."""
+    gradedness, the higher ``recency_score`` wins.
+
+    MIRRORS ``get_cross_target_jobs``'s ``DISTINCT ON ... ORDER BY
+    s.recency_score DESC`` — this is the same rule implemented twice (once here
+    for the two-query path, once in SQL for the RPC), so the two MUST change
+    together or the same job gets attributed to different targets depending on
+    which path served the request. ``tests/test_score_floor_sites_agree.py``
+    pins them."""
     cand_graded = not _is_pending(candidate)
     cur_graded = not _is_pending(current)
     if cand_graded != cur_graded:
         return cand_graded
-    return int(candidate.get("score") or 0) > int(current.get("score") or 0)
+    return _representative_value(candidate) > _representative_value(current)
+
+
+def _representative_value(row: dict[str, Any]) -> int:
+    """The number ``_prefer_score_row`` compares — ``recency_score`` when the
+    row carries it, else the raw fit (older stubs / selects without it)."""
+    stored = row.get("recency_score")
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+        return int(stored)
+    return int(row.get("score") or 0)
 
 
 @dataclass(frozen=True)
@@ -1007,15 +1053,14 @@ async def _assemble_jobs_page(
         search=search,
     )
 
-    # Overlay the displayed score (axis-weighted when weights are set, else the
-    # raw Sonnet score), keeping ``raw_score`` alongside and flagging Pending.
+    # Overlay THE score — the same value ``_display`` sorts by, so the number
+    # shown is the number ranked and floored on (#665). ``raw_score`` keeps the
+    # undecayed fit for debugging and for the e2e guards.
     for p in postings:
         ts = by_id.get(p["id"])
         if ts:
             raw_score = int(ts["score"])
-            p["score"] = display_score_or_passthrough(
-                ts.get("axis_scores"), raw_score, weights_for_row(ts)
-            )
+            p["score"] = _display(ts)
             p["raw_score"] = raw_score
             p["score_breakdown"] = ts.get("score_breakdown")
             # Graded rows explain their score with the fit AXES, not the
@@ -1351,9 +1396,10 @@ async def _list_jobs_across_user_targets_rpc(
             "p_limit": page_size + 1,
             "p_offset": offset,
             "p_user_id": user_id,
-            # Decay-aware graded sort key when read-time recency decay is on
-            # (prod). The shared _apply_display_recency post-step still sets the
-            # shown number; the RPC only needs the ORDER to match.
+            # Only the CUSTOM-WEIGHTS branch still decays at read time (#665):
+            # ``recency_score`` is derived from ``score``, not from the weighted
+            # blend, so the RPC recomputes it there. The un-weighted path reads
+            # the stored column and ignores this flag entirely.
             "p_recency_decay": settings.recency_decay_enabled,
             "p_weights": p_weights,
         },
@@ -1965,38 +2011,6 @@ def _apply_preferences_filter(
     ]
 
 
-def _apply_display_recency(postings: list[dict[str, Any]]) -> None:
-    """Decay each posting's *displayed* ``score`` by its age at read time.
-
-    The score overlay sets ``score`` to the fit/axis-weighted blend and
-    preserves the undecayed fit in ``raw_score``. Users also expect a stale
-    posting to visibly fade, so we multiply the displayed score by the age
-    decay derived from the posted date *now* — not the stored
-    ``recency_score`` (which the poller only refreshes for jobs it re-touches,
-    so it freezes for postings that age off the boards). ``raw_score`` is left
-    intact — set by the overlay, and defaulted here for any row the overlay
-    didn't touch — so the pure fit stays available to the UI/debugging.
-
-    In-place mutation of the ``postings`` list. No-op when the recency flag is
-    off (the displayed score is then the raw fit, exactly as before). Only the
-    two JWT list paths call this; the operator/api-key view keeps raw scores.
-    """
-    if not settings.recency_decay_enabled:
-        return
-    now = datetime.now(UTC)
-    for p in postings:
-        score = p.get("score")
-        # ``bool`` is an ``int`` subclass — guard so a stray True/False
-        # never gets treated as a score.
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            continue
-        score_int = int(score)
-        p.setdefault("raw_score", score_int)
-        p["score"] = display_recency_score(
-            score_int, p.get("source_posted_at") or p.get("cataloged_at"), now
-        )
-
-
 async def _list_jobs_operator(
     supabase: AsyncClient,
     *,
@@ -2237,9 +2251,8 @@ async def list_jobs(
             user_id=user_id,
             logistics=logistics,
         )
-        # Decay the displayed score by posting age (read-time, never stale).
-        # raw_score keeps the undecayed fit. No-op when the flag is off.
-        _apply_display_recency(result["postings"])
+        # No display post-step: both list paths already return THE score —
+        # the RPC selects it, the two-query overlay sets it from _display (#665).
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
         return result
@@ -2277,9 +2290,8 @@ async def list_jobs(
             logistics=logistics,
             include_unknown_salary_by_target=include_unknown_salary_by_target,
         )
-        # Decay the displayed score by posting age (read-time, never stale).
-        # raw_score keeps the undecayed fit. No-op when the flag is off.
-        _apply_display_recency(result["postings"])
+        # No display post-step: both list paths already return THE score —
+        # the RPC selects it, the two-query overlay sets it from _display (#665).
         result["applied_min_score"] = min_score
         job_list_cache.set(cache_key, result)
         return result
@@ -2969,10 +2981,13 @@ async def _assert_user_owns_posting_async(
     # detail overlay (the ``jobs.score*`` columns are stale). See the sync twin.
     score_resp = (
         await supabase.table("scores")
-        .select("target_id, score, score_breakdown, axis_scores")
+        .select("target_id, score, recency_score, score_breakdown, axis_scores")
         .eq("job_posting_id", posting_id)
         .in_("target_id", list(user_target_ids))
-        .order("score", desc=True)
+        # Best-scoring target by THE score (#665) — same rule as
+        # ``_prefer_score_row`` and the RPC's DISTINCT ON tiebreak, so the
+        # detail view attributes the job to the same target the list does.
+        .order("recency_score", desc=True)
         .limit(1)
         .execute()
     )
@@ -2982,6 +2997,7 @@ async def _assert_user_owns_posting_async(
     best = score_rows[0]
     row["target_id"] = best["target_id"]
     row["_target_score"] = best.get("score")
+    row["_target_recency_score"] = best.get("recency_score")
     row["_target_score_breakdown"] = best.get("score_breakdown")
     row["_target_axis_scores"] = best.get("axis_scores")
     return row
@@ -3045,10 +3061,14 @@ async def get_job(
     # across the user's targets (matches the untargeted list view's
     # per-job aggregation).
     target_score = row.pop("_target_score", None)
+    target_recency = row.pop("_target_recency_score", None)
     target_breakdown = row.pop("_target_score_breakdown", None)
     target_axes = row.pop("_target_axis_scores", None)
     if target_score is not None:
-        row["score"] = target_score
+        # THE score the detail view shows is the same aged number the list
+        # shows and floors on (#665); raw_score keeps the undecayed fit.
+        row["raw_score"] = target_score
+        row["score"] = target_recency if target_recency is not None else target_score
     if target_breakdown is not None:
         row["score_breakdown"] = target_breakdown
     # Fit axes for graded rows (#609 follow-up): the detail GET is the
@@ -3056,10 +3076,6 @@ async def get_job(
     # carry them. None for ungraded rows — the panel keeps the keyword
     # components there.
     row["axis_scores"] = target_axes
-    # Decay the displayed score by posting age so the detail view matches
-    # the (now age-decayed) list score; raw_score keeps the undecayed fit.
-    # No-op when the recency flag is off.
-    _apply_display_recency([row])
     # Drop the helper target_id column we only fetched for ownership.
     row.pop("target_id", None)
     # Overlay the per-user pipeline status (#75 C4: jobs.status was dropped).
