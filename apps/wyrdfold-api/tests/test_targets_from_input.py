@@ -12,7 +12,7 @@ is spawned as a DETACHED loop task — these tests assert both halves:
   and upsert the fit score — marking the target ``error`` on failure.
 
 #57 PR-G2b: ``from_input`` runs on the pooled async service client. Its crud
-reads/writes are module-inline async helpers (``_create`` / ``_update`` /
+reads/writes are module-inline async helpers (``_create_and_link`` / ``_update`` /
 ``_link`` / ``_get`` / ``_add_reference_jd`` / ``_list_reference_jds`` /
 ``_count_user_reference_jds``), the cost ledger is ``cost_log.record_async``,
 the #191 merge is ``apply_profile_merge_rpc_async``, and the deferred work is
@@ -304,12 +304,14 @@ async def test_from_manual_matched_links_inline_defers_fit_score(
     monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
 
     create_calls: list[TargetCreate] = []
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    async def fake_create(_s, *, payload):  # type: ignore[no-untyped-def]
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         create_calls.append(payload)
-        return matched
+        return matched, _user_target(target_id=matched.id)
 
-    monkeypatch.setattr(from_input, "_create", fake_create)
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
 
     result = await from_input.from_manual(
         supabase,
@@ -352,12 +354,22 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    async def fake_create(_s, *, payload):  # type: ignore[no-untyped-def]
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         create_calls.append(payload)
-        return created
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
 
-    monkeypatch.setattr(from_input, "_create", fake_create)
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
 
     result = await from_input.from_manual(
         supabase,
@@ -382,13 +394,20 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
     assert create_calls[0].description == "Canonical description."
     assert create_calls[0].search_keywords == []
     # Status flipped to 'deriving' inline.
-    update_call = stub_crud.by_name("update")[0]
-    assert update_call["body"].activation_status == "deriving"
-    # Linked inactive, no fit score yet.
-    link_kwargs = stub_crud.by_name("link")[0]
-    assert link_kwargs["target_id"] == "new"
-    assert link_kwargs["is_active"] is False
-    assert link_kwargs.get("fit_score") is None
+    # 'deriving' is requested in the SAME atomic call as the insert — there is
+    # no separate status round-trip to assert on any more (#667). Asserting the
+    # request (not just the returned row) keeps this honest: the stub echoes
+    # what it was given, so only this line proves the caller asked for it.
+    assert create_statuses == ["deriving"]
+    # Linked inside the same atomic call — no separate link round-trip to
+    # inspect. The membership is always is_active False there (following never
+    # trips the active cap) and carries no fit score yet; the RPC enforces both,
+    # and tests/integration/test_create_target_and_link.py proves it against a
+    # real Postgres.
+    assert create_users == ["user-1"]
+    assert result.user_target.target_id == "new"
+    assert result.user_target.is_active is False
+    assert result.user_target.fit_score is None
     # Deferred: the manual derivation task.
     assert "derive_manual_target_bg" in sched.calls
     assert "_apply_fit_score" not in sched.calls
@@ -562,12 +581,22 @@ async def test_from_suggestion_new_creates_without_normalize_call(
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    async def fake_create(_s, *, payload):  # type: ignore[no-untyped-def]
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         create_calls.append(payload)
-        return created
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
 
-    monkeypatch.setattr(from_input, "_create", fake_create)
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
 
     result = await from_input.from_suggestion(
         supabase,
@@ -585,8 +614,10 @@ async def test_from_suggestion_new_creates_without_normalize_call(
     # Created straight from the (already-canonical) label + description.
     assert create_calls[0].label == "Senior Frontend Engineer"
     assert create_calls[0].description == "Frontend roles."
-    link_kwargs = stub_crud.by_name("link")[0]
-    assert link_kwargs["is_active"] is False  # never trips the active cap
+    # The link is created inside the atomic call now; it is always is_active
+    # False there (following never trips the active cap), enforced by the RPC.
+    assert create_users == ["user-1"]
+    assert create_statuses == ["deriving"]
     assert "derive_manual_target_bg" in sched.calls
 
 
@@ -604,7 +635,7 @@ async def test_from_suggestion_matched_dedups_to_existing_row(
     matched = _target(id="existing")
     monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
     create_spy = AsyncMock()
-    monkeypatch.setattr(from_input, "_create", create_spy)
+    monkeypatch.setattr(from_input, "_create_and_link", create_spy)
 
     result = await from_input.from_suggestion(
         supabase,
@@ -736,12 +767,22 @@ async def test_from_url_new_creates_deriving_and_schedules(
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    async def fake_create(_s, *, payload):  # type: ignore[no-untyped-def]
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         create_calls.append(payload)
-        return created
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
 
-    monkeypatch.setattr(from_input, "_create", fake_create)
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
 
     result = await from_input.from_url(
         supabase,
@@ -796,10 +837,11 @@ async def test_from_url_label_resolution(
 
     monkeypatch.setattr(from_input, "find_matching_target", _match)
 
-    async def fake_create(_s, *, payload):  # type: ignore[no-untyped-def]
-        return _target(id="new", label=expected)
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=expected)
+        return target, _user_target(target_id=target.id)
 
-    monkeypatch.setattr(from_input, "_create", fake_create)
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         supabase,

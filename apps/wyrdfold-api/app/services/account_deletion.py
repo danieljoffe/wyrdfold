@@ -153,6 +153,25 @@ async def delete_account(supabase: AsyncClient, *, user_id: str) -> dict[str, in
     # 3. Scrub this user's PII off the shared scores rows for their targets.
     report["scores_scrubbed"] = await _scrub_shared_scores(supabase, target_ids)
 
+    # 3b. Reap any of those targets this user was the LAST follower of (#667).
+    #     Step 2 deleted the ``user_targets`` rows but deliberately leaves the
+    #     shared target — co-followers may remain. When none do, the row becomes
+    #     unreachable: every target route is membership-scoped, so it 404s for
+    #     everyone, while still holding all its scores. The request-path unlink
+    #     reaps for exactly this reason; erasure deletes memberships by a
+    #     different route and used to skip it.
+    #
+    #     ``reap_orphaned_target`` re-checks both guards server-side (no
+    #     memberships left, no ops sponsorship) in the same snapshot as the
+    #     delete, so passing a target another user still follows is a no-op
+    #     rather than a cross-tenant deletion. That is what makes it safe to
+    #     call on every id the user was linked to.
+    reaped = 0
+    for target_id in target_ids:
+        if await _reap_orphaned_target(supabase, target_id):
+            reaped += 1
+    report["targets_reaped"] = reaped
+
     # 4. notifications_sent is keyed by user_profiles.id, not the auth uid.
     profile_id = await _resolve_profile_id(supabase, user_id)
     if profile_id is not None:
@@ -209,6 +228,29 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> list[str]:
     resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [tid for r in rows if (tid := r.get("target_id"))]
+
+
+async def _reap_orphaned_target(supabase: AsyncClient, target_id: str) -> bool:
+    """Remove a shared target this user was the last follower of (#667).
+
+    Thin wrapper over the same guarded RPC the request-path unlink uses, so the
+    two erasure routes cannot drift. The guards (no memberships remain, no
+    ops sponsorship) live in SQL and are evaluated in the same snapshot as the
+    delete — critical here, because erasure hands it EVERY target the user was
+    linked to, most of which other people still follow.
+
+    Fail-soft: erasure has already removed the user's own data by this point and
+    must not abort partway on a tidy-up step. A failure leaves an orphan, which
+    is the pre-existing behaviour, not a regression.
+    """
+    try:
+        resp = await supabase.rpc("reap_orphaned_target", {"p_target_id": target_id}).execute()
+    except Exception:
+        logger.warning(
+            "account_deletion: reap_orphaned_target failed for %s", target_id, exc_info=True
+        )
+        return False
+    return bool(resp.data)
 
 
 async def _scrub_shared_scores(supabase: AsyncClient, target_ids: list[str]) -> int:
