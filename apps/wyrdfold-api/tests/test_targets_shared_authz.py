@@ -25,6 +25,7 @@ These pin all four fixes.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -97,6 +98,84 @@ def test_delete_by_jwt_owner_unlinks_and_never_hard_deletes(
     # Only the caller's own link is dropped (positional: supabase, user_id, target_id).
     unlink.assert_called_once()
     assert unlink.call_args.args[1:] == ("user-1", "target-1")
+
+
+def test_delete_by_jwt_owner_reaps_the_row_once_its_last_follower_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#667: the unlink is right, but nothing removed the row afterwards.
+
+    Once the last follower goes the endpoint is membership-scoped, so it 404s
+    for everyone including the creator — the row is unreachable and still holds
+    every score it accumulated (one prod orphan: 6,163 rows). The reap runs
+    AFTER the unlink and is itself guarded in SQL, so this only pins the wiring;
+    ``tests/integration/test_orphaned_target_reap.py`` proves the guard.
+    """
+    from app.routers import targets as mod
+
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", AsyncMock(return_value=True))
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
+    reap = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_reap_orphaned_target_async", reap)
+
+    resp = _client("user-1").delete("/targets/target-1")
+
+    assert resp.status_code == 200
+    reap.assert_called_once()
+    assert reap.call_args.args[1] == "target-1"
+    # Still never the unguarded shared-row delete — the reap is the guarded path.
+    hard_delete.assert_not_called()
+
+
+def test_delete_does_not_reap_when_the_unlink_found_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 means this caller never had a link. Reaping on that path would let
+    a non-follower probe drive deletions."""
+    from app.routers import targets as mod
+
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", AsyncMock(return_value=False))
+    monkeypatch.setattr(mod, "_delete_target_async", AsyncMock(return_value=True))
+    reap = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "_reap_orphaned_target_async", reap)
+
+    resp = _client("user-1").delete("/targets/target-1")
+
+    assert resp.status_code == 404
+    reap.assert_not_called()
+
+
+async def test_reap_helper_is_fail_soft_when_the_rpc_errors() -> None:
+    """Fail-soft belongs INSIDE the helper, so test it there.
+
+    Monkeypatching the helper to raise would only prove that a raise
+    propagates — it would assert the opposite of the behaviour and still pass
+    under a name claiming fail-soft. The real question is what the helper does
+    when the RPC errors: the unlink already succeeded and that is what the user
+    asked for, so a reap failure must degrade to a logged tidy-up job.
+    """
+    from app.routers import targets as mod
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(side_effect=RuntimeError("rpc exploded"))
+
+    result = await mod._reap_orphaned_target_async(supabase, "target-1")
+
+    assert result is False
+
+
+async def test_reap_helper_reports_whether_a_row_went() -> None:
+    from app.routers import targets as mod
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=True))
+    assert await mod._reap_orphaned_target_async(supabase, "target-1") is True
+
+    supabase.rpc.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=False))
+    assert await mod._reap_orphaned_target_async(supabase, "target-1") is False
 
 
 def test_delete_by_jwt_caller_unlinks_missing_link_is_404(
