@@ -156,12 +156,22 @@ test.beforeAll(async () => {
   // keys on. The pending row deliberately carries scoring_status 'stage2'
   // with NO graded-signal columns: the exact prod shape whose absence
   // from jest fixtures (which defaulted to 'complete') hid #603.
+  //
+  // `recency_score` MUST be seeded explicitly, not left to the trigger.
+  // `scores_sync_denorm` sets `recency_score := COALESCE(NEW.recency_score,
+  // NEW.score)` (#665), which only fills it on INSERT — on the UPDATE half of
+  // this upsert the unsupplied column keeps its OLD value. The list renders
+  // `recency_score`, not `score`, so once any recency sweep has aged this row
+  // the assertions below would compare against a stale number forever: the
+  // suite passes exactly once, on a virgin database. Seeding both keeps the
+  // fixture idempotent and makes it fully determine what the UI shows.
   const { error: scoresErr } = await admin.from('scores').upsert(
     [
       {
         job_posting_id: JOB_GRADED_ID,
         target_id: TARGET_ID,
         score: 87,
+        recency_score: 87,
         scoring_status: 'stage2',
         // Real fit-axis keys (title/skills/seniority/domain) — the graded
         // signal for _is_pending AND what the panel's axis breakdown
@@ -179,6 +189,7 @@ test.beforeAll(async () => {
         job_posting_id: JOB_PENDING_ID,
         target_id: TARGET_ID,
         score: 55,
+        recency_score: 55,
         scoring_status: 'stage2',
         axis_scores: null,
         excluded: false,
