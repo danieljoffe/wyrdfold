@@ -28,7 +28,7 @@ function makeTarget(scoring_profile: ScoringProfile | null): JobTarget {
     search_keywords: [],
     activation_status: 'ready',
     profile_version: 1,
-    is_active: true,
+    app_active: true,
     created_at: '2026-01-01',
     updated_at: '2026-01-01',
   };

@@ -17,7 +17,7 @@ interface JobDetailModalProps {
   /** Fired when the user binds this listing to a target from inside the modal,
    *  so the host can reflect it live — flipping this modal to its bound state
    *  (match/tailor unlock) (#467 §11.3). */
-  onAddedToTarget?: (target: TargetRef) => void;
+  onAddedToTarget?: ((target: TargetRef) => void) | undefined;
 }
 
 /**

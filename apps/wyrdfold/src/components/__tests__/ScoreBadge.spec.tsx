@@ -19,13 +19,19 @@ describe('ScoreBadge', () => {
     expect(screen.getByLabelText('Match score 42')).toBeInTheDocument();
   });
 
+  // `pending={undefined}` throughout this block is deliberate: it selects the
+  // scoring_status fallback (`pending ?? status !== 'complete'`), which is the
+  // path these cases exist to pin. The union (#603) requires the flag to be
+  // named alongside the status so a call site can't drop it by accident.
   it('renders a scoring spinner only while scoring is in flight', () => {
     const { rerender } = render(
-      <ScoreBadge score={50} scoringStatus='scoring' />
+      <ScoreBadge score={50} scoringStatus='scoring' pending={undefined} />
     );
     expect(screen.getByLabelText(/scoring in progress/i)).toBeInTheDocument();
 
-    rerender(<ScoreBadge score={50} scoringStatus='complete' />);
+    rerender(
+      <ScoreBadge score={50} scoringStatus='complete' pending={undefined} />
+    );
     expect(screen.queryByLabelText(/scoring in progress/i)).toBeNull();
 
     rerender(<ScoreBadge score={50} />);
@@ -35,13 +41,17 @@ describe('ScoreBadge', () => {
   it('hides the placeholder number while ungraded, showing a pending chip', () => {
     // stage1/stage2 carry only a keyword placeholder — it must NOT be shown as
     // a graded fit score (#47).
-    render(<ScoreBadge score={80} scoringStatus='stage2' />);
+    render(
+      <ScoreBadge score={80} scoringStatus='stage2' pending={undefined} />
+    );
     expect(screen.queryByText('80')).toBeNull();
     expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
   });
 
   it('shows the real number once graded (complete)', () => {
-    render(<ScoreBadge score={80} scoringStatus='complete' />);
+    render(
+      <ScoreBadge score={80} scoringStatus='complete' pending={undefined} />
+    );
     expect(screen.getByText('80')).toBeInTheDocument();
     expect(screen.getByLabelText('Match score 80')).toBeInTheDocument();
   });

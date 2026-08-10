@@ -41,7 +41,8 @@ describe('LinkButton (kit)', () => {
 
   test('renders nothing without an href', () => {
     const { container } = render(
-      // @ts-expect-error — deliberately exercising the runtime null-href guard
+      // Deliberately exercising the runtime empty-href guard. An empty string
+      // is a well-typed href, so this needs no type suppression.
       <LinkButton href=''>Go</LinkButton>
     );
     expect(container).toBeEmptyDOMElement();
