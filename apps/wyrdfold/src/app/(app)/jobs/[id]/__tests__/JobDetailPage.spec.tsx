@@ -34,12 +34,9 @@ type JobDetailPanelStubProps = {
   hideDelete?: boolean;
 };
 
-let _lastPanelProps: JobDetailPanelStubProps | null = null;
-
 jest.mock('../../JobDetailPanel', () => ({
   __esModule: true,
   default: (props: JobDetailPanelStubProps) => {
-    _lastPanelProps = props;
     const breakdown = props.posting.score_breakdown ?? {};
     return (
       <div data-testid='job-detail-panel-stub'>
@@ -99,7 +96,6 @@ afterAll(() => {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  _lastPanelProps = null;
   // Default fetch — used by JobDetailPage's posting load + targets fallback.
   // Tests override per-call as needed via mockImplementationOnce.
   global.fetch = jest.fn().mockImplementation((url: string) => {

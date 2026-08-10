@@ -73,7 +73,8 @@ const NOTIFICATIONS = {
   sms_score_threshold: 90,
   sms_daily_limit: 5,
   list_min_score: null,
-  phone_number: null,
+  // Widened: the SMS-card cases override this with a real number.
+  phone_number: null as string | null,
   email: 'me@example.com',
   email_available: true,
   sms_available: true,

@@ -6,12 +6,9 @@ import ConversationChatModal from '../ConversationChatModal';
 
 // ConversationChat itself is exercised in its own spec; stub here so the
 // modal spec only verifies modal open/close + onComplete wiring.
-let _lastChatProps: { onComplete: () => void; onSkip: () => void } | null =
-  null;
 jest.mock('../ConversationChat', () => ({
   __esModule: true,
   default: (props: { onComplete: () => void; onSkip: () => void }) => {
-    _lastChatProps = props;
     return (
       <div data-testid='conversation-chat-stub'>
         <button type='button' onClick={() => props.onComplete()}>
@@ -24,10 +21,6 @@ jest.mock('../ConversationChat', () => ({
     );
   },
 }));
-
-beforeEach(() => {
-  _lastChatProps = null;
-});
 
 describe('ConversationChatModal', () => {
   it('renders nothing when isOpen is false', () => {
