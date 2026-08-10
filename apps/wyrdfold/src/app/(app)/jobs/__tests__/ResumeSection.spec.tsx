@@ -81,7 +81,7 @@ describe('ResumeSection — background generation (#656)', () => {
     // The "survives navigation" case: generation was started from another
     // view (or another tab), the user lands here mid-run. Re-POSTing would
     // spend a second time; showing "Generate" would lie about the state.
-    const calls: { url: string; method?: string }[] = [];
+    const calls: { url: string; method?: string | undefined }[] = [];
     let polls = 0;
     global.fetch = jest
       .fn()
