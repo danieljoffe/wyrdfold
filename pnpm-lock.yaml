@@ -157,6 +157,9 @@ importers:
       babel-jest:
         specifier: ^30.0.2
         version: 30.4.1(@babel/core@7.29.7)
+      dompurify:
+        specifier: ^3.4.11
+        version: 3.4.13
       eslint:
         specifier: 10.8.0
         version: 10.8.0(jiti@2.7.0)
