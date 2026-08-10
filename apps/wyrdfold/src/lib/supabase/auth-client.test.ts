@@ -1,7 +1,18 @@
 /**
  * @jest-environment jsdom
  */
-const mockCreateBrowserClient = jest.fn(() => ({ auth: { _tag: 'browser' } }));
+
+// This file loads the module under test via `await import()` inside the tests
+// (so `jest.resetModules()` can re-evaluate it per case), which leaves no
+// top-level import/export. Without this marker TS treats the file as a global
+// script and its `const`s collide with the sibling auth-server.test.ts.
+export {};
+
+// Typed with a rest parameter so the `jest.mock` factory below can spread its
+// args through, and so `mock.calls[0]` is `unknown[]` rather than `[]`.
+const mockCreateBrowserClient = jest.fn((..._args: unknown[]) => ({
+  auth: { _tag: 'browser' },
+}));
 
 jest.mock('@supabase/ssr', () => ({
   createBrowserClient: (...args: unknown[]) => mockCreateBrowserClient(...args),
