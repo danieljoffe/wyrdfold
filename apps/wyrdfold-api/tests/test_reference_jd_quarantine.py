@@ -13,16 +13,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -46,7 +46,7 @@ def _target() -> JobTarget:
         id=_TARGET,
         label="Role",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         profile_version=3,
         created_at=now,
         updated_at=now,
@@ -76,32 +76,46 @@ def _capped_projection() -> RescoreProjection:
 
 @pytest.fixture
 def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Mock everything around the merge/cap branch; yield the table mocks."""
+    """Mock everything around the merge/cap branch; yield the table mocks.
+
+    #57 PR-G2b: the handler runs on the async service client, so the crud reads
+    are the router-inline async helpers (AsyncMock) and the quarantine writes go
+    through ``_suppress_reference_jd_async`` / ``_insert_learning_log_row_async``
+    on the async client (``.execute`` awaited → AsyncMock at the chain tail).
+    """
     ref_mock = MagicMock(name="reference_jds")
+    ref_mock.update.return_value.eq.return_value.execute = AsyncMock()
     log_mock = MagicMock(name="target_learning_log")
+    log_mock.insert.return_value.execute = AsyncMock()
     sb = MagicMock(name="supabase")
     sb.table.side_effect = lambda name: {
         "reference_jds": ref_mock,
         "target_learning_log": log_mock,
     }[name]
 
-    monkeypatch.setattr("app.routers.targets._require_user_owns_target", lambda *a, **k: None)
-    monkeypatch.setattr("app.routers.targets.crud.get", lambda *a, **k: _target())
+    async def _owns(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr("app.routers.targets._require_user_owns_target_async", _owns)
+    monkeypatch.setattr("app.routers.targets._target_get", AsyncMock(return_value=_target()))
     monkeypatch.setattr(
-        "app.routers.targets.crud.count_user_reference_jds",
-        lambda *a, **k: 0,
+        "app.routers.targets._count_user_reference_jds_async", AsyncMock(return_value=0)
     )
     monkeypatch.setattr(
-        "app.routers.targets.crud.add_reference_jd",
-        lambda *a, **k: TargetReferenceJD(
-            id="rj-1",
-            target_id=_TARGET,
-            jd_text=_JD_TEXT,
-            extracted_profile=ScoringProfile(),
-            created_at=datetime.now(UTC),
+        "app.routers.targets._add_reference_jd_async",
+        AsyncMock(
+            return_value=TargetReferenceJD(
+                id="rj-1",
+                target_id=_TARGET,
+                jd_text=_JD_TEXT,
+                extracted_profile=ScoringProfile(),
+                created_at=datetime.now(UTC),
+            )
         ),
     )
-    monkeypatch.setattr("app.routers.targets.crud.list_reference_jds", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "app.routers.targets._list_reference_jds_async", AsyncMock(return_value=[])
+    )
     monkeypatch.setattr(
         "app.routers.targets.merge_reference_jds",
         lambda *_a: ScoringProfile(),
@@ -117,10 +131,13 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
         )
 
     monkeypatch.setattr("app.routers.targets.derive_profile_from_jd", _derive)
-    monkeypatch.setattr("app.routers.targets.cost_log.record", lambda *a, **k: None)
+    monkeypatch.setattr("app.routers.targets.cost_log.record_async", AsyncMock())
+    # #57 PR-G2e-4: the handler runs derive (async cache path) + the projection
+    # (``project_profile_impact``) on the injected async service client, so
+    # ``sb`` is supplied via the ``get_async_service_supabase`` override below.
 
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: None
-    app.dependency_overrides[get_supabase] = lambda: sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
     app.dependency_overrides[get_llm_client] = lambda: object()
     app.dependency_overrides[get_current_user_id_optional] = lambda: _USER
     app.dependency_overrides[enforce_llm_budget] = lambda: None
@@ -138,10 +155,10 @@ def _post(client_body: dict[str, Any] | None = None) -> Any:
 def test_capped_contribution_is_quarantined_not_applied(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = MagicMock(name="project", return_value=_capped_projection())
+    project = AsyncMock(name="project", return_value=_capped_projection())
     monkeypatch.setattr("app.routers.targets.project_profile_impact", project)
-    rpc = MagicMock(name="merge_rpc")
-    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
+    rpc = AsyncMock(name="merge_rpc")
+    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
     r = _post()
 
@@ -169,9 +186,11 @@ def test_capped_contribution_is_quarantined_not_applied(
 def test_uncapped_contribution_writes_through_merge_rpc(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
-    rpc = MagicMock(name="merge_rpc", return_value=("applied", 4))
-    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
+    monkeypatch.setattr(
+        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
+    )
+    rpc = AsyncMock(name="merge_rpc", return_value=("applied", 4))
+    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
     r = _post()
 
@@ -189,9 +208,11 @@ def test_uncapped_contribution_writes_through_merge_rpc(
 def test_unresolvable_version_conflict_is_409(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("app.routers.targets.project_profile_impact", lambda *a, **k: None)
-    rpc = MagicMock(name="merge_rpc", return_value=("version_conflict", 9))
-    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc", rpc)
+    monkeypatch.setattr(
+        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
+    )
+    rpc = AsyncMock(name="merge_rpc", return_value=("version_conflict", 9))
+    monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
     r = _post()
 

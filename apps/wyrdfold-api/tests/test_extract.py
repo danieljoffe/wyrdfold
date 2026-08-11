@@ -193,3 +193,337 @@ class TestExtractCascade:
         result = extract_job_from_html(html, "https://example.com")
         assert result.tier == "none"
         assert "extraction_failed" in result.warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# Salary extraction v2 (#503) — regression corpus from REAL prod formats +
+# the new structural/single-bound/currency capabilities.
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from app.services.extract import extract_salary_from_html, extract_salary_from_text
+
+
+class TestSalaryProdRegressionCorpus:
+    """Every format prod has ACTUALLY matched must keep matching (sampled from
+    the live jobs table, 2026-07-26). Grow this list with every real miss."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "$120,000-$275,000",
+            "$125,000.00 - $145,000.00/per year",
+            "$77,600.00 to $176,000.00",
+            "$200K – $400K",  # en-dash, K-suffix
+            "$59.10 to $65.50",
+            "$100k to $500k",
+            "$17.89 - $26.35 / Hour",
+            "$18.47 - $18.97 per hour",
+            "$19.00 - 21.00",  # second amount without '$'
+            "$34.00 - $40.00/hour",
+            "$49 - $57",  # unit-less hourly range (USC) — ranges are not value-gated
+        ],
+    )
+    def test_prod_format_still_matches_exactly(self, text: str):
+        assert extract_salary_from_text(f"Compensation: {text} for this role") == text
+
+    def test_trailing_comma_is_trimmed(self):
+        # Prod once stored "$148,000 - $185,000," verbatim.
+        assert (
+            extract_salary_from_text("pays $148,000 - $185,000, plus equity")
+            == "$148,000 - $185,000"
+        )
+
+    def test_range_keeps_trailing_iso_code(self):
+        # The Greenhouse pay-range text (Reddit): the USD suffix now survives.
+        assert extract_salary_from_text("is: $190,800 — $267,100 USD") == "$190,800 — $267,100 USD"
+
+
+class TestSalaryNewCapabilities:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Salary up to $180,000 DOE", "up to $180,000"),
+            ("From £60,000 per annum", "From £60,000 per annum"),
+            ("starting at $25/hour", "starting at $25/hour"),
+            ("base from $150k", "from $150k"),
+            ("£60,000 - £75,000", "£60,000 - £75,000"),
+            ("€70,000 to €90,000", "€70,000 to €90,000"),
+            ("CA$120,000 - CA$150,000 CAD", "CA$120,000 - CA$150,000 CAD"),
+        ],
+    )
+    def test_new_forms_match(self, text: str, expected: str):
+        assert extract_salary_from_text(f"Pay: {text}.") == expected
+
+    def test_range_wins_over_single_bound_prefix(self):
+        # "from $150k to $190k" must yield the whole range, not the bound.
+        assert extract_salary_from_text("from $150k to $190k") == "$150k to $190k"
+
+
+class TestSalaryFalsePositiveGuards:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "we raised $30M in Series B",  # funding, no range/cue
+            "401(k) with employer match",  # no currency amount
+            "a $5 coffee budget",  # bare small amount, no cue
+            "up to $500 wellness stipend",  # cue word but perk-sized, no hourly unit
+            "up to 20 days PTO",  # no currency at all
+        ],
+    )
+    def test_non_salaries_do_not_match(self, text: str):
+        assert extract_salary_from_text(text) is None
+
+
+class TestSalaryFromHtmlStructural:
+    # The verbatim Greenhouse pay-transparency structure (Reddit, post-#500
+    # unescaped form): the REAL comp block must win over earlier prose figures.
+    _PAY_DIV = (
+        '<div class="content-pay-transparency"><div class="pay-input">'
+        '<div class="title">The base salary range for this position is:</div>'
+        '<div class="pay-range"><span>$190,800</span>'
+        '<span class="divider">—</span>'
+        "<span>$267,100 USD</span></div></div></div>"
+    )
+
+    def test_pay_range_block_is_parsed_structurally(self):
+        html = f"<div><p>About us…</p>{self._PAY_DIV}</div>"
+        assert extract_salary_from_html(html) == "$190,800 — $267,100 USD"
+
+    def test_structural_block_wins_over_earlier_prose_figure(self):
+        html = "<p>We manage $2,000 - $5,000 ad budgets daily.</p>" + self._PAY_DIV
+        # Prose regex alone would grab the ad-budget range first; the
+        # structural parse must return the real compensation instead.
+        assert extract_salary_from_html(html) == "$190,800 — $267,100 USD"
+
+    def test_stored_escaped_rows_still_extract_via_token_stream(self):
+        # Pre-#500 rows: the pay div is HTML-ESCAPED (no literal 'pay-range'
+        # class match for bs4) — the strip_html double-pass fallback recovers it.
+        escaped = (
+            "&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$190,800&lt;/span&gt;"
+            "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+            "&lt;span&gt;$267,100 USD&lt;/span&gt;&lt;/div&gt;"
+        )
+        got = extract_salary_from_html(escaped)
+        assert got is not None and "$190,800" in got and "$267,100" in got
+
+    def test_none_and_salary_free_html(self):
+        assert extract_salary_from_html(None) is None
+        assert extract_salary_from_html("<p>Great benefits and PTO.</p>") is None
+
+
+class TestUnescapeHtmlDoc:
+    """Column-level heal for pre-#500 escaped rows (backfill_escaped_html)."""
+
+    # Verbatim prod shape: the ENTIRE Greenhouse payload stored escaped.
+    _ESCAPED = (
+        "&lt;div class=&quot;content-intro&quot;&gt;&lt;p&gt;About the team&lt;/p&gt;"
+        "&lt;div class=&quot;content-pay-transparency&quot;&gt;&lt;div class=&quot;pay-input&quot;&gt;"
+        "&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$190,800&lt;/span&gt;"
+        "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+        "&lt;span&gt;$267,100 USD&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;"
+    )
+
+    def test_single_escaped_doc_heals_to_real_markup(self):
+        from app.services.extract import unescape_html_doc
+
+        healed = unescape_html_doc(self._ESCAPED)
+        assert healed is not None
+        assert healed.startswith('<div class="content-intro">')
+        assert '<div class="pay-range">' in healed
+
+    def test_double_escaped_doc_heals(self):
+        import html as html_mod
+
+        from app.services.extract import unescape_html_doc
+
+        double = html_mod.escape(self._ESCAPED)  # &amp;lt;div…
+        healed = unescape_html_doc(double)
+        assert healed is not None and healed.startswith('<div class="content-intro">')
+
+    def test_healed_doc_unlocks_structural_salary_parse(self):
+        # The whole point of the column heal: the escaped form defeats the
+        # structural pay-range parse; the healed form yields the EXACT
+        # canonical range (not just token-stream luck).
+        from app.services.extract import extract_salary_from_html, unescape_html_doc
+
+        healed = unescape_html_doc(self._ESCAPED)
+        assert extract_salary_from_html(healed) == "$190,800 — $267,100 USD"
+
+    def test_already_real_markup_is_left_alone(self):
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc("<div><p>Real markup.</p></div>") is None
+
+    def test_prose_with_leading_escaped_lt_is_rejected(self):
+        # "&lt; 5% raises…" unescapes to "< 5% raises…" — startswith("<") but
+        # NOT a tag shape. The healer must refuse rather than corrupt prose.
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc("&lt; 5% raises are typical here") is None
+
+    def test_none_and_empty_are_rejected(self):
+        from app.services.extract import unescape_html_doc
+
+        assert unescape_html_doc(None) is None
+        assert unescape_html_doc("") is None
+
+
+class TestParseSalaryText:
+    """Structured salary parts — every rule earned from the 5,834-format prod
+    corpus sweep (2026-07-29). Grow with every miss."""
+
+    def _parse(self, text):
+        from app.services.extract import parse_salary_text
+
+        return parse_salary_text(text)
+
+    def test_canonical_yearly_range_with_iso(self):
+        p = self._parse("$190,800 — $267,100 USD")
+        assert (p.min, p.max, p.currency, p.period) == (190800, 267100, "USD", "yearly")
+
+    def test_plain_hyphen_range(self):
+        p = self._parse("$120,000-$275,000")
+        assert (p.min, p.max, p.period) == (120000, 275000, "yearly")
+
+    def test_decimals_and_per_year_unit(self):
+        p = self._parse("$125,000.00 - $145,000.00/per year")
+        assert (p.min, p.max, p.period) == (125000, 145000, "yearly")
+
+    def test_k_suffix_both_sides(self):
+        p = self._parse("$200K – $400K")
+        assert (p.min, p.max, p.period) == (200000, 400000, "yearly")
+
+    def test_k_suffix_spreads_to_bare_partner(self):
+        p = self._parse("$190K-220K")
+        assert (p.min, p.max) == (190000, 220000)
+
+    def test_hourly_with_unit(self):
+        p = self._parse("$17.89 - $26.35 / Hour")
+        assert (p.min, p.max, p.period) == (17.89, 26.35, "hourly")
+
+    def test_bare_second_amount_hourly_by_magnitude(self):
+        # No unit token at all — magnitude decides (<500 ⇒ hourly).
+        p = self._parse("$19.00 - 21.00")
+        assert (p.min, p.max, p.period) == (19.0, 21.0, "hourly")
+
+    def test_bare_second_amount_yearly_by_magnitude(self):
+        p = self._parse("$29,600 - 54,340")
+        assert (p.min, p.max, p.period) == (29600, 54340, "yearly")
+
+    def test_through_separator_is_not_hourly(self):
+        # \b guard: the separator word "tHRough" must not read as "hr".
+        p = self._parse("$100,000 through $140,000")
+        assert (p.min, p.max, p.period) == (100000, 140000, "yearly")
+
+    def test_currencies(self):
+        assert self._parse("£60,000 - £75,000").currency == "GBP"
+        assert self._parse("€68,000 – €82,000").currency == "EUR"
+        assert self._parse("CA$110,000 - CA$140,000").currency == "CAD"
+        # Trailing ISO overrides/confirms the symbol.
+        assert self._parse("$105,400 — $155,000 USD").currency == "USD"
+
+    def test_up_to_is_max_only(self):
+        p = self._parse("up to $180,000")
+        assert (p.min, p.max) == (None, 180000)
+
+    def test_from_is_min_only(self):
+        p = self._parse("from £60k")
+        assert (p.min, p.max) == (60000, None)
+        assert (p.currency, p.period) == ("GBP", "yearly")
+
+    # -- defensive rules, each anchored to a REAL stored string --------------
+
+    def test_truncated_max_is_dropped_not_trusted(self):
+        # "$250,000 to $1" (16 prod rows): honoring max=$1 would EXCLUDE the
+        # row from every floor filter. Keep the min, drop the max.
+        p = self._parse("$250,000 to $1")
+        assert (p.min, p.max, p.period) == (250000, None, "yearly")
+
+    def test_separator_typo_max_is_dropped(self):
+        p = self._parse("$141,380 -$194.390")
+        assert (p.min, p.max) == (141380, None)
+
+    def test_malformed_two_digit_comma_group_is_thousands_typo(self):
+        # "$132,00" means $132,000 — real comma groups are 3 digits.
+        p = self._parse("$132,00 - $165,000")
+        assert (p.min, p.max) == (132000, 165000)
+
+    def test_malformed_four_digit_comma_group_is_extra_zero(self):
+        p = self._parse("$65,000 - $80,0000")
+        assert (p.min, p.max) == (65000, 80000)
+
+    def test_k_suffix_on_thousands_amount_is_a_typo(self):
+        # "$360,000k" is not 360 million.
+        p = self._parse("$325,000 - $360,000k")
+        assert (p.min, p.max) == (325000, 360000)
+
+    def test_elided_thousands_shorthand(self):
+        # "$150-175,000" means 150k-175k.
+        p = self._parse("$150-175,000,")
+        assert (p.min, p.max) == (150000, 175000)
+        p = self._parse("$90-115,000 annually")
+        assert (p.min, p.max, p.period) == (90000, 115000, "yearly")
+
+    def test_small_pairs_are_not_spread(self):
+        # "$200-$1,500" is a genuine small range (contract/stipend) — the
+        # elision rule must NOT inflate it.
+        p = self._parse("$200-$1,500")
+        assert (p.min, p.max, p.period) == (200, 1500, None)
+
+    def test_gray_zone_magnitude_has_no_period(self):
+        # 500..10k with no unit: could be monthly/weekly — never guess.
+        p = self._parse("$1,500 - $2,500")
+        assert (p.min, p.max, p.period) == (1500, 2500, None)
+        p = self._parse("from € 2,600")
+        assert (p.min, p.period) == (2600, None)
+
+    def test_implausible_amount_rejects_whole_parse(self):
+        # "$142,400,000 - $178,000": corrupted input — stay display-only.
+        p = self._parse("$142,400,000 - $178,000")
+        assert p.is_empty
+
+    def test_none_empty_and_junk(self):
+        assert self._parse(None).is_empty
+        assert self._parse("").is_empty
+        assert self._parse("competitive compensation").is_empty
+
+    def test_extractor_output_always_parses(self):
+        # Coherence property: everything the EXTRACTOR can store, the parser
+        # must structure (the whole point of deriving both from one string).
+        from app.services.extract import extract_salary_from_text
+
+        for prose in [
+            "Base pay range: $120,000-$275,000 for this role.",
+            "Compensation: $17.89 - $26.35 / Hour depending on site.",
+            "We offer up to $180,000 plus equity.",
+            "Le salaire: from £60k according to experience.",
+            "$77,600.00 to $176,000.00 is the annual range.",
+        ]:
+            stored = extract_salary_from_text(prose)
+            assert stored is not None
+            assert not self._parse(stored).is_empty
+
+
+class TestSalaryColumns:
+    def test_spread_shape_matches_jobs_columns(self):
+        from app.services.extract import salary_columns
+
+        cols = salary_columns("$100,000 - $150,000")
+        assert cols == {
+            "salary_min": 100000,
+            "salary_max": 150000,
+            "salary_currency": "USD",
+            "salary_period": "yearly",
+        }
+
+    def test_no_salary_spreads_nulls(self):
+        from app.services.extract import salary_columns
+
+        assert salary_columns(None) == {
+            "salary_min": None,
+            "salary_max": None,
+            "salary_currency": None,
+            "salary_period": None,
+        }

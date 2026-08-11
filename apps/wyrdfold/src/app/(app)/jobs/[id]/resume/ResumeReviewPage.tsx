@@ -8,6 +8,7 @@ import {
   Lock,
   MoreVertical,
   RotateCcw,
+  ShieldCheck,
   Unlock,
 } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
@@ -15,6 +16,7 @@ import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
+import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
@@ -22,7 +24,9 @@ import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
+import { isFlaggedDraft } from '../../types';
 import type {
+  AtsRecheckResponse,
   JobPosting,
   LintViolation,
   ResumeVersion,
@@ -30,6 +34,8 @@ import type {
   TailoredResumeRecord,
   TailorResponse,
 } from '../../types';
+import { useTailorDocument } from '../../useTailorDocument';
+import { LocalDateTime, LocalNumber } from '@/components/LocalFormat';
 
 interface ResumeReviewPageProps {
   jobPostingId: string;
@@ -56,7 +62,6 @@ export default function ResumeReviewPage({
   const { toast } = useToast();
 
   const [posting, setPosting] = useState<JobPosting | null>(null);
-  const [record, setRecord] = useState<TailoredResumeRecord | null>(null);
   const [markdown, setMarkdown] = useState('');
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   // Filename the user types in the download field; empty string means
@@ -64,11 +69,24 @@ export default function ResumeReviewPage({
   // persist a custom name on the resume row in v1).
   const [customFilename, setCustomFilename] = useState('');
 
-  const [loading, setLoading] = useState(true);
+  // The document itself, its 202+poll state, and re-adapt all live in the
+  // shared hook (#656). Landing here while a generation kicked off from the
+  // job panel is still running renders the in-progress state and picks the
+  // poll up — the run outlives the navigation that started it.
+  const {
+    record,
+    loading: recordLoading,
+    generating,
+    error: generationError,
+    generate,
+    setRecord,
+  } = useTailorDocument({ jobPostingId, kind: 'resume' });
+
+  const [postingLoading, setPostingLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [approving, setApproving] = useState(false);
   const [unapproving, setUnapproving] = useState(false);
-  const [readapting, setReadapting] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
   const [lintWarnings, setLintWarnings] = useState<LintViolation[]>([]);
   const [confirmReadaptOpen, setConfirmReadaptOpen] = useState(false);
   // The version awaiting restore confirmation; null when no dialog is open.
@@ -92,37 +110,51 @@ export default function ResumeReviewPage({
     return `${slugify(name)}-${slugify(posting.company_name)}-${new Date().toISOString().slice(0, 10)}`;
   }, [record, posting]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  // The posting is fetched independently of the document — the hook owns the
+  // document's lifecycle, and the two have different "missing" semantics.
+  const loadPosting = useCallback(async () => {
+    setPostingLoading(true);
     try {
-      const [jobRes, resumeRes] = await Promise.all([
-        fetch(`/api/jobs/${jobPostingId}`),
-        fetch(`/api/jobs/tailor/by-job/${jobPostingId}`),
-      ]);
-      if (jobRes.status === 404 || resumeRes.status === 404) {
+      const jobRes = await fetch(`/api/jobs/${jobPostingId}`);
+      if (jobRes.status === 404) {
         setNotFound(true);
         return;
       }
-      if (!jobRes.ok || !resumeRes.ok) {
+      if (!jobRes.ok) {
         toast({ variant: 'error', title: 'Failed to load resume' });
         return;
       }
-      const job = (await jobRes.json()) as JobPosting;
-      const resume = (await resumeRes.json()) as TailoredResumeRecord;
-      setPosting(job);
-      setRecord(resume);
-      setMarkdown(resume.payload_md ?? '');
-      setSaveStatus('idle');
+      setPosting((await jobRes.json()) as JobPosting);
     } catch {
       toast({ variant: 'error', title: 'Network error loading resume' });
     } finally {
-      setLoading(false);
+      setPostingLoading(false);
     }
   }, [jobPostingId, toast]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    loadPosting();
+  }, [loadPosting]);
+
+  // Adopt a document's markdown when a DIFFERENT document arrives — first
+  // load, or a re-adapt that inserted a new row. Deliberately keyed on the id
+  // rather than the record identity: a PATCH/approve round-trip returns the
+  // same document, and `persistMarkdown` already merges that result against
+  // whatever the user has typed since. Re-syncing there would clobber
+  // in-flight edits.
+  const loadedRecordIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!record || loadedRecordIdRef.current === record.id) return;
+    loadedRecordIdRef.current = record.id;
+    setMarkdown(record.payload_md ?? '');
+    setSaveStatus('idle');
+  }, [record]);
+
+  // A background generation that failed has no record to show — surface why
+  // rather than leaving the page on a bare "not found".
+  useEffect(() => {
+    if (generationError) toast({ variant: 'error', title: generationError });
+  }, [generationError, toast]);
 
   const loadVersions = useCallback(async () => {
     if (!record) return;
@@ -155,6 +187,16 @@ export default function ResumeReviewPage({
   const inflightRef = useRef(false);
   const persistMarkdown = useCallback(async (): Promise<boolean> => {
     if (!record) return false;
+    // Never PATCH a locked record: an edit or version-restore landing
+    // around the approve flight re-arms the debounce, and its timer used
+    // to outlive the lock — PATCH → 409 "already approved" + an error
+    // toast right after the green "Resume locked" one (observed live
+    // 2026-08-06, twice). Approval also sets saveStatus 'saved' to disarm
+    // the timer; this guard is the invariant if any other path re-arms it.
+    if (record.approved_at !== null) {
+      setSaveStatus('saved');
+      return true;
+    }
     // Single-flight: a slow PATCH overlapping the next debounce tick would
     // race to overwrite the row. Skip; the next keystroke or explicit
     // flushPendingSave will retry.
@@ -294,6 +336,11 @@ export default function ResumeReviewPage({
       }
       const approved = (await res.json()) as TailoredResumeRecord;
       setRecord(approved);
+      // Disarm any auto-save re-armed by an edit/restore that landed during
+      // the flush→approve flight — its debounce timer would PATCH the
+      // now-locked record into a 409. (persistMarkdown also guards on
+      // approved_at; this stops the timer from even firing.)
+      setSaveStatus('saved');
       toast({ variant: 'success', title: 'Resume locked' });
     } catch {
       toast({ variant: 'error', title: 'Network error locking resume' });
@@ -361,41 +408,60 @@ export default function ResumeReviewPage({
 
   async function handleReadapt() {
     if (!record || !record.job_posting_id) return;
-    setReadapting(true);
+    // Snapshot the current draft before regenerating so users can
+    // restore it from version history if the new generation is worse.
+    await flushPendingSave();
+    await recordCheckpoint();
+    // The modal closes on kick-off, not on completion: the POST returns 202
+    // and the run outlives this page, so holding a modal open for ~39s would
+    // pin the user to a screen they're free to leave. The toolbar's
+    // "Regenerating…" state carries the progress from here.
+    setConfirmReadaptOpen(false);
+    setVersions(null);
+    // `generate` handles the 202, polls for the NEW document id (the old one
+    // is still the most recent until the run lands), and surfaces budget /
+    // gap-gate / concurrency errors through `generationError`.
+    const ok = await generate({
+      job_description: record.jd_snapshot,
+      job_posting_id: record.job_posting_id,
+      force_fresh: true,
+    });
+    if (ok) {
+      toast({ variant: 'success', title: 'Resume re-adapted with AI' });
+    }
+  }
+
+  async function handleRecheck() {
+    if (!record) return;
+    setRechecking(true);
     try {
-      // Snapshot the current draft before regenerating so users can
-      // restore it from version history if the new generation is worse.
-      await flushPendingSave();
-      await recordCheckpoint();
-      const res = await fetch('/api/jobs/tailor/resume', {
+      // Flush any pending edit first — re-checking stale markdown would
+      // report violations the user has already fixed on screen.
+      const flushed = await flushPendingSave();
+      if (!flushed) return;
+      const res = await fetch(`/api/jobs/tailor/${record.id}/ats-recheck`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          job_description: record.jd_snapshot,
-          job_posting_id: record.job_posting_id,
-          force_fresh: true,
-        }),
       });
       if (!res.ok) {
-        // LLM-budgeted route — without ``extractApiError`` here, hitting
-        // the daily/hourly LLM cap would render as the generic
-        // "Re-adapt failed" with no recovery hint instead of the
-        // structured "$X of $Y budget reached — try again in an hour"
-        // message (PR #701).
         toast({
           variant: 'error',
-          title: await extractApiError(res, 'Re-adapt failed'),
+          title: await extractApiError(res, 'ATS re-check failed'),
         });
         return;
       }
-      toast({ variant: 'success', title: 'Resume re-adapted with AI' });
-      setConfirmReadaptOpen(false);
-      setVersions(null);
-      await load();
+      const data = (await res.json()) as AtsRecheckResponse;
+      setRecord(data.record);
+      setLintWarnings(data.violations.filter(v => v.severity === 'warning'));
+      toast({
+        variant: data.ok ? 'success' : 'error',
+        title: data.ok
+          ? 'Passes ATS checks'
+          : `${data.violations.filter(v => v.severity === 'error').length} ATS issue(s) remain`,
+      });
     } catch {
-      toast({ variant: 'error', title: 'Network error re-adapting resume' });
+      toast({ variant: 'error', title: 'Network error re-checking resume' });
     } finally {
-      setReadapting(false);
+      setRechecking(false);
     }
   }
 
@@ -437,7 +503,14 @@ export default function ResumeReviewPage({
   // ``<main id="main-content">`` landmark. Wrapping page-level content
   // in a second ``<main>`` here gave SR users two main landmarks per
   // page (WCAG 1.3.1 / ARIA spec). Use ``<div>`` instead.
-  if (notFound) {
+  // The poll route now answers "no document" with a 200 + null record rather
+  // than a 404 (#656), so a missing draft is a settled empty state — not a
+  // failed fetch. Only claim it once the fetch has settled and nothing is in
+  // flight, or a page opened mid-generation would flash "not found".
+  const documentMissing =
+    !recordLoading && !generating && !record && !generationError;
+
+  if (notFound || documentMissing) {
     return (
       <div className='mx-auto max-w-4xl p-6'>
         <Heading variant='hero' as='h1'>
@@ -457,7 +530,43 @@ export default function ResumeReviewPage({
     );
   }
 
-  if (loading || !record || !posting) {
+  // Landed here while a generation is still in flight (kicked off from the
+  // job panel, then navigated straight in — or a re-adapt on a page that had
+  // no prior draft). The run persists server-side, so this is a wait, not a
+  // dead end (#656).
+  if (generating && !record) {
+    return (
+      <div
+        className='mx-auto max-w-4xl space-y-4 p-6'
+        aria-live='polite'
+        role='status'
+      >
+        <Breadcrumbs
+          items={[
+            { label: 'Jobs', href: '/jobs' },
+            {
+              label: crumbLabel(posting?.title ?? 'Job'),
+              href: `/jobs/${jobPostingId}`,
+            },
+            { label: 'Resume' },
+          ]}
+        />
+        <Heading variant='hero' as='h1'>
+          Tailoring your resume
+        </Heading>
+        <div className='flex items-center gap-2'>
+          <Spinner size='sm' aria-label='Generating resume' />
+          <Text variant='body' className='text-text-secondary'>
+            Usually 30&ndash;60 seconds. This keeps running if you navigate away
+            &mdash; come back any time.
+          </Text>
+        </div>
+        <Skeleton variant='rectangular' className='h-[60vh] w-full' />
+      </div>
+    );
+  }
+
+  if (postingLoading || recordLoading || !record || !posting) {
     return (
       <div
         className='mx-auto max-w-4xl space-y-4 p-6'
@@ -502,6 +611,10 @@ export default function ResumeReviewPage({
   const isApproved = record.approved_at !== null;
   const isReused =
     record.warnings?.includes('reused_from_similar_job') ?? false;
+  const flagged = isFlaggedDraft(record);
+  const lintErrors = (record.lint_violations ?? []).filter(
+    v => v.severity === 'error'
+  );
 
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
@@ -513,11 +626,18 @@ export default function ResumeReviewPage({
             { label: 'Resume' },
           ]}
         />
-        {isApproved && (
-          <Badge variant='success' size='sm'>
-            Locked
-          </Badge>
-        )}
+        <div className='flex items-center gap-2'>
+          {flagged && (
+            <Badge variant='error' size='sm'>
+              Needs fixes
+            </Badge>
+          )}
+          {isApproved && (
+            <Badge variant='success' size='sm'>
+              Locked
+            </Badge>
+          )}
+        </div>
       </div>
 
       <div>
@@ -538,6 +658,53 @@ export default function ResumeReviewPage({
             Cloned from a similar job &mdash; no LLM cost. Edit freely or
             re-adapt with AI to regenerate from scratch.
           </Text>
+        </div>
+      )}
+
+      {/* Flagged draft (#656): this resume was generated and KEPT despite
+          failing ATS lint, rather than 422'd away — the LLM call is already
+          paid for and regenerating burns the daily cap. Editing the markdown
+          below and re-checking is free. */}
+      {flagged && (
+        <div className='space-y-2 rounded-md border border-error/30 bg-error/10 p-3'>
+          <div className='flex items-center justify-between gap-2'>
+            <Text variant='caption' className='text-error'>
+              Failed ATS checks
+            </Text>
+            <Button
+              name='ats-recheck'
+              variant='secondary'
+              size='sm'
+              onClick={handleRecheck}
+              disabled={rechecking || saveStatus === 'saving'}
+            >
+              {rechecking ? (
+                <>
+                  <Spinner size='sm' aria-label='Re-running ATS checks' />
+                  <span>Checking…</span>
+                </>
+              ) : (
+                <>
+                  <ShieldCheck className='size-4' aria-hidden='true' />
+                  <span>Re-run ATS checks</span>
+                </>
+              )}
+            </Button>
+          </div>
+          <Text variant='meta' className='text-text-secondary'>
+            This draft was saved so you don&rsquo;t lose the generation. Fix the
+            issues below, then re-run the checks &mdash; it&rsquo;s free and
+            instant, no AI credits.
+          </Text>
+          <ul className='list-inside list-disc space-y-1'>
+            {lintErrors.map((v, i) => (
+              <li key={i}>
+                <Text variant='meta' as='span'>
+                  [{v.code}] {v.message}
+                </Text>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
@@ -564,7 +731,7 @@ export default function ResumeReviewPage({
         </Text>
         <Text variant='meta' as='span'>
           Tokens:{' '}
-          {(record.input_tokens + record.output_tokens).toLocaleString()}
+          <LocalNumber value={record.input_tokens + record.output_tokens} />
         </Text>
         {record.model && (
           <Text variant='meta' as='span'>
@@ -627,7 +794,7 @@ export default function ResumeReviewPage({
                         {v.source.replace('_', ' ')}
                       </Badge>
                       <Text variant='meta' as='span'>
-                        {new Date(v.created_at).toLocaleString()}
+                        <LocalDateTime value={v.created_at} />
                       </Text>
                     </span>
                     {!isApproved && (
@@ -713,15 +880,25 @@ export default function ResumeReviewPage({
                   title='More actions'
                 >
                   <MoreVertical className='h-4 w-4' aria-hidden='true' />
+                  <span className='sr-only'>More actions</span>
                 </span>
               }
               items={[
+                {
+                  // Free + deterministic, so it sits in the menu for every
+                  // draft — a flagged one also gets the prominent button in
+                  // the banner above, where the failure is being explained.
+                  label: 'Re-run ATS checks',
+                  icon: <ShieldCheck className='size-4' aria-hidden />,
+                  onClick: handleRecheck,
+                  disabled: rechecking || saveStatus === 'saving',
+                },
                 {
                   label: 'Re-adapt with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
                   onClick: () => setConfirmReadaptOpen(true),
                   disabled:
-                    readapting ||
+                    generating ||
                     approving ||
                     saveStatus === 'saving' ||
                     isApproved,
@@ -763,7 +940,7 @@ export default function ResumeReviewPage({
             setMarkdown(next);
             setSaveStatus('pending');
           }}
-          disabled={isApproved || readapting || approving || unapproving}
+          disabled={isApproved || generating || approving || unapproving}
         />
         <div className='flex items-center justify-between gap-2'>
           <Text
@@ -772,10 +949,12 @@ export default function ResumeReviewPage({
             className='text-text-tertiary'
             aria-live='polite'
           >
-            {!isApproved && saveLabel(saveStatus)}
+            {generating
+              ? 'Regenerating — safe to navigate away'
+              : !isApproved && saveLabel(saveStatus)}
           </Text>
           <Text variant='meta' as='span' className='text-text-tertiary'>
-            {markdown.length.toLocaleString()} chars
+            <LocalNumber value={markdown.length} /> chars
           </Text>
         </div>
       </div>
@@ -791,7 +970,7 @@ export default function ResumeReviewPage({
             : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
         }
         confirmLabel='Regenerate'
-        loading={readapting}
+        loading={generating}
         loadingLabel='Regenerating…'
       />
 

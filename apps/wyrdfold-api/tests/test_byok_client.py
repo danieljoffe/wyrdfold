@@ -170,14 +170,14 @@ def test_decrypt_error_then_required_raises(
 # ---- end-to-end through the real store + crypto -----------------------
 
 
-def test_end_to_end_stored_key_threads_through(
+async def test_end_to_end_stored_key_threads_through(
     monkeypatch: pytest.MonkeyPatch, openrouter_mode: None
 ) -> None:
     """encrypt → persist → fetch → decrypt → client, with no mocking of
     the keys service — only the storage backend is faked."""
     monkeypatch.setattr(settings, "byok_master_key", _TEST_MASTER_KEY)
     sb = _FakeSupabase()
-    keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-REAL42")
+    await keys.set_key(sb, user_id="u1", provider="openrouter", plaintext="sk-or-REAL42")
     client = get_client(sb, "u1")
     assert isinstance(client, OpenRouterLLMClient)
     assert _client_key(client) == "sk-or-REAL42"
@@ -186,24 +186,46 @@ def test_end_to_end_stored_key_threads_through(
 # ---- DI layer: MissingUserKeyError → HTTP 402 -------------------------
 
 
-def test_get_llm_client_translates_missing_key_to_402(
+async def test_get_llm_client_translates_missing_key_to_402(
     monkeypatch: pytest.MonkeyPatch, openrouter_mode: None
 ) -> None:
     """The route-facing contract: a required-but-absent key surfaces as a
-    402 'add your key', not the raw domain error or a 500."""
+    402 'add your key', not the raw domain error or a 500. The dep is async
+    now (#57 PR-G2e-8): the JWT sub resolves off-loop and the BYOK read runs on
+    the async service client."""
     monkeypatch.setattr(settings, "byok_require_user_keys", True)
     monkeypatch.setattr(keys, "is_configured", lambda: True)
-    monkeypatch.setattr(keys, "get_key", lambda *a, **k: None)
-    # Force a resolved user + a configured pool without real JWT/Supabase.
-    monkeypatch.setattr(dependencies, "_try_decode_jwt_sub", lambda *a, **k: "user-1")
-    monkeypatch.setattr("app.supabase_pool.get_supabase_pool", lambda: object())
+
+    async def _no_key(*a: object, **k: object) -> None:
+        return None
+
+    monkeypatch.setattr(keys, "get_key_async", _no_key)
+
+    # Force a resolved user + a configured async pool without real JWT/Supabase.
+    async def _sub(*a: object, **k: object) -> str:
+        return "user-1"
+
+    monkeypatch.setattr(dependencies, "_try_decode_jwt_sub_async", _sub)
+    monkeypatch.setattr("app.supabase_pool.get_async_supabase", lambda: object())
     with pytest.raises(HTTPException) as exc:
-        dependencies.get_llm_client(SimpleNamespace(), settings)
+        await dependencies.get_llm_client(SimpleNamespace(), settings)
     assert exc.value.status_code == 402
     assert "key" in exc.value.detail.lower()
 
 
 # ---- in-memory fake supabase (mirrors test_byok_keys.py) --------------
+
+
+class _Result:
+    """Dual result: the async ``set_key`` write path ``await``s ``execute()``
+    while the still-sync ``get_key`` read path calls it directly (#57 slice 4)."""
+
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        yield from ()
+        return self
 
 
 class _FakeQuery:
@@ -233,7 +255,7 @@ class _FakeQuery:
     def _matches(self, row: dict[str, Any]) -> bool:
         return all(row.get(c) == v for c, v in self._filters)
 
-    def execute(self) -> SimpleNamespace:
+    def execute(self) -> _Result:
         if self._op == "upsert":
             assert self._row is not None
             # Mimic PostgREST's RETURNING representation: the full row,
@@ -242,11 +264,11 @@ class _FakeQuery:
             stored.setdefault("created_at", "2026-01-01T00:00:00+00:00")
             stored.setdefault("rotated_at", None)
             self._store.append(stored)
-            return SimpleNamespace(data=[stored])
+            return _Result(data=[stored])
         if self._op == "select":
             cols = [c.strip() for c in (self._cols or "").split(",")]
             out = [{c: row.get(c) for c in cols} for row in self._store if self._matches(row)]
-            return SimpleNamespace(data=out)
+            return _Result(data=out)
         raise AssertionError(f"unhandled op {self._op}")
 
 

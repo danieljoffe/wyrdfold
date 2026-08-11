@@ -7,6 +7,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import {
   LayoutDashboard,
   Briefcase,
+  Search,
   Target,
   User,
   Settings,
@@ -39,6 +40,7 @@ const NAV_ITEMS: NavItem[] = [
     lucide: LayoutDashboard,
   },
   { id: 'jobs', label: 'Jobs', href: '/jobs', lucide: Briefcase },
+  { id: 'search', label: 'Search', href: '/search', lucide: Search },
   { id: 'targets', label: 'Targets', href: '/targets', lucide: Target },
   { id: 'profile', label: 'Profile', href: '/profile', lucide: User },
   { id: 'settings', label: 'Settings', href: '/settings', lucide: Settings },

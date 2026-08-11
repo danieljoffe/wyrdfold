@@ -2,16 +2,15 @@
 capability flags + the enable-when-unconfigured guard."""
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_supabase,
-    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.main import app
@@ -32,8 +31,7 @@ def client_factory():
         # GET routes now resolve the JWT-bound user client (#79 Phase 2);
         # PATCH/POST still use the service-role client. Point both at the
         # same mock so this router's tests exercise either path.
-        app.dependency_overrides[get_supabase] = lambda: supabase
-        app.dependency_overrides[get_user_supabase] = lambda: supabase
+        app.dependency_overrides[get_async_user_supabase] = lambda: supabase
         app.dependency_overrides[verify_supabase_jwt] = lambda: _TEST_USER_ID
         app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
         return TestClient(app)
@@ -67,8 +65,8 @@ def _profile_row() -> dict[str, Any]:
 
 def test_get_returns_capabilities_false_when_unconfigured(client_factory, _reset_channel_settings):
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-        [_profile_row()]
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_profile_row()]))
     )
     client = client_factory(sb)
     r = client.get("/profile/notifications")
@@ -88,8 +86,8 @@ def test_get_returns_capabilities_true_when_configured(
     monkeypatch.setattr(settings, "twilio_phone_number", "+15551234567")
 
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-        [_profile_row()]
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_profile_row()]))
     )
     client = client_factory(sb)
     r = client.get("/profile/notifications")
@@ -127,10 +125,12 @@ def test_patch_allows_disabling_email_even_when_unconfigured(
     """Operator may have removed the credentials after the user enabled
     the channel — the user must still be able to turn it off."""
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-        [_profile_row()]
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_profile_row()]))
     )
-    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
+    sb.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
+        return_value=_Resp(None)
+    )
     # /profile UPDATE no longer reads back the row id — `.eq("user_id", ...)`
     # targets the row directly.
     client = client_factory(sb)

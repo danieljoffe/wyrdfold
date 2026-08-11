@@ -33,21 +33,25 @@ describe('ScoreDistributionChart', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders one drill link per non-zero bucket using the bucket low end', () => {
+  it('renders cumulative at-least counts linking the jobs min-score URL key (#605)', () => {
     render(<ScoreDistributionChart data={SAMPLE} />);
     const nav = screen.getByRole('navigation', { name: /view jobs by score/i });
     expect(nav).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /0\+ \(2\)/ })).toHaveAttribute(
+    // Counts are cumulative ("scoring at least"), so the series is
+    // monotonically decreasing — the old per-bucket counts read as
+    // nonsense (0+ smaller than 90+). Links use the jobs page's real
+    // ``score`` URL key; the old ``minScore`` param filtered nothing.
+    expect(screen.getByRole('link', { name: /0\+ \(10\)/ })).toHaveAttribute(
       'href',
-      '/jobs?minScore=0'
+      '/jobs?score=0'
     );
-    expect(screen.getByRole('link', { name: /40\+ \(5\)/ })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: /40\+ \(8\)/ })).toHaveAttribute(
       'href',
-      '/jobs?minScore=40'
+      '/jobs?score=40'
     );
     expect(screen.getByRole('link', { name: /70\+ \(3\)/ })).toHaveAttribute(
       'href',
-      '/jobs?minScore=70'
+      '/jobs?score=70'
     );
   });
 
@@ -67,6 +71,10 @@ describe('ScoreDistributionChart', () => {
     expect(
       screen.getByRole('link', { name: /40\+ \(4\)/ })
     ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /40\+/ })).toHaveAttribute(
+      'href',
+      '/jobs?score=40'
+    );
   });
 
   it('shows the empty-state message when all buckets are zero', () => {

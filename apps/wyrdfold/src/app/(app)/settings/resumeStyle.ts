@@ -9,11 +9,7 @@
 
 export type ResumeStylePreset = 'modern' | 'classic' | 'compact' | 'executive';
 export type ResumeStyleAccent =
-  | 'slate'
-  | 'navy'
-  | 'black'
-  | 'burgundy'
-  | 'forest';
+  'slate' | 'navy' | 'black' | 'burgundy' | 'forest';
 
 export interface ResumeStyleSettings {
   preset: ResumeStylePreset;

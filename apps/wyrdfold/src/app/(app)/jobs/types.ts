@@ -56,9 +56,25 @@ export interface JobPosting {
   title: string;
   company_name: string;
   location: string | null;
+  /**
+   * Structured parts parsed from `location` at ingest (#518) — compose with
+   * `formatLocation()`. Optional: older cached payloads may omit them.
+   */
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+  location_remote?: boolean | null;
   absolute_url: string | null;
   score: number;
   score_breakdown: Record<string, number> | null;
+  /**
+   * The fit grade's four axes (title/skills/seniority/domain, 0–100) for
+   * graded rows — the breakdown that actually averages to ``score`` (#609).
+   * ``null`` = graded signal absent (pending row); ``undefined`` = the
+   * serving path couldn't carry the column (the RPC list paths, until R3) —
+   * the detail panel lazily fetches ``/api/jobs/{id}`` to fill it in.
+   */
+  axis_scores?: Record<string, number> | null;
   scoring_status: ScoringStatus | undefined;
   /**
    * True when the row is not yet Sonnet-graded — ``score`` is a keyword
@@ -75,9 +91,22 @@ export interface JobPosting {
   logistics_filters?: LogisticsFilters | null;
   status: string;
   salary_text: string | null;
-  greenhouse_updated_at: string | null;
-  first_seen_at: string;
-  created_at: string;
+  /**
+   * Structured salary parsed at ingest (#528) — the display path
+   * (formatJobSalary) prefers these over ``salary_text``. Optional:
+   * older cached payloads may omit them. Vocabulary per
+   * services/job_search.py: 'yearly' | 'hourly', never guessed.
+   */
+  salary_min?: number | null;
+  salary_max?: number | null;
+  salary_currency?: string | null;
+  salary_period?: 'yearly' | 'hourly' | null;
+  /** Provider's posted/created date (normalized), null when the source gave
+   * none — e.g. manual adds. Renamed from greenhouse_updated_at (R2). */
+  source_posted_at: string | null;
+  /** When the listing entered OUR catalog. Renamed from created_at; also
+   * absorbed the byte-identical first_seen_at (R2). */
+  cataloged_at: string;
   /** Present only on the detail GET ``/jobs/{id}`` — list responses
    *  deliberately omit it to keep the payload small. */
   description_html?: string | null;
@@ -106,6 +135,8 @@ export interface JobsFilterState {
   country: string; // '' | ISO country code
 }
 
+/** Wire sort tokens. 'created_at' is kept for URL/param stability and sorts
+ * the renamed cataloged_at column server-side (R2). */
 export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';
 
 interface SkillMatch {
@@ -134,6 +165,20 @@ export interface JobAnalysis {
   cost_usd: number;
   latency_ms: number;
   created_at: string;
+}
+
+/**
+ * Poll marker for the non-blocking analysis flow (#459). The kick-off POST
+ * returns this (202) on a cache miss, and GET returns it while the detached
+ * run hasn't finished:
+ *  - `running` — in flight; keep polling.
+ *  - `error`   — the run failed; offer a retry.
+ *  - `idle`    — nothing cached and nothing in flight (e.g. a server restart
+ *    dropped the run); re-kick via POST.
+ */
+export interface AnalysisStatus {
+  status: 'running' | 'error' | 'idle';
+  message?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +254,56 @@ export interface TailoredResumeRecord {
   updated_at: string | null;
   approved_at: string | null;
   source_resume_id: string | null;
+  /**
+   * ATS lint state (#656). `null` = never linted (rows predating the column);
+   * `[]` = linted with nothing to report; a list with any
+   * `severity: 'error'` entry = **flagged draft**,
+   * persisted despite failing lint so the generation spend isn't thrown away.
+   * A warnings-only list is clean-with-advisories, NOT flagged — use
+   * `isFlaggedDraft()` rather than a length check.
+   */
+  lint_violations?: LintViolation[] | null;
+}
+
+/** True when a record's lint state marks it a flagged draft — i.e. it carries
+ *  at least one blocking violation. Warnings alone don't flag a draft. */
+export function isFlaggedDraft(
+  record: Pick<TailoredResumeRecord, 'lint_violations'> | null | undefined
+): boolean {
+  return (record?.lint_violations ?? []).some(v => v.severity === 'error');
+}
+
+/**
+ * Poll marker for the non-blocking tailor flow (#656), mirroring
+ * `AnalysisStatus` for #459.
+ *  - `running` — a detached generation is in flight; keep polling.
+ *  - `error`   — the run failed; offer a retry (POST again).
+ *  - `idle`    — nothing in flight. With a record that means "settled"; with
+ *    a null record it's the "Generate" empty state.
+ */
+export type TailorRunStatus = 'running' | 'error' | 'idle';
+
+/** Response shape of `GET /api/jobs/tailor/by-job/{id}` (and its cover-letter
+ *  sibling). Replaced the bare `TailoredResumeRecord | null` those routes used
+ *  to return: a client that kicked off a background run needs to tell "nothing
+ *  here yet, keep polling" from "nothing here, and nothing coming". */
+export interface TailoredDocumentState {
+  record: TailoredResumeRecord | null;
+  status: TailorRunStatus;
+  message?: string | null;
+}
+
+/** 202 body from POST /api/jobs/tailor/resume | /cover-letter. */
+export interface TailorStatusResponse {
+  status: TailorRunStatus;
+  message?: string | null;
+}
+
+/** Response shape of `POST /api/jobs/tailor/{id}/ats-recheck`. */
+export interface AtsRecheckResponse {
+  ok: boolean;
+  violations: LintViolation[];
+  record: TailoredResumeRecord;
 }
 
 interface CoverLetterParagraph {
@@ -256,4 +351,13 @@ export interface ResumeVersion {
 export interface ResumeVersionsResponse {
   versions: ResumeVersion[];
   cap: number;
+}
+
+/** The date a card shows as "Posted": the provider's own date when known,
+ * else when we cataloged the listing (R2 two-timestamp model). */
+export function postedAt(job: {
+  source_posted_at: string | null;
+  cataloged_at: string;
+}): string {
+  return job.source_posted_at ?? job.cataloged_at;
 }

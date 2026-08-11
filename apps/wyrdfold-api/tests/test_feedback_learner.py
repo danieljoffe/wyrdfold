@@ -182,7 +182,9 @@ class _FakeQuery:
         self._single = True
         return self
 
-    def execute(self) -> Any:
+    async def execute(self) -> Any:
+        # `async def` mirrors supabase-py's AsyncClient: ``maybe_run_learner`` is
+        # async since #57 PR-G2e-2 and ``await``s every ``.execute()``.
         self._fake.log.append(
             {
                 "table": self._table,
@@ -220,6 +222,15 @@ class _FakeSupabase:
     def table(self, name: str) -> _FakeQuery:
         return _FakeQuery(self, name)
 
+    def rpc(self, fn: str, params: Any) -> _FakeQuery:
+        # The shared-profile write now goes through apply_target_profile_patch
+        # (SEC-2). Match a pushed response on (fn, "rpc"); params are logged as
+        # the payload so tests can assert p_next_profile / p_expected_version.
+        query = _FakeQuery(self, fn)
+        query._op = "rpc"
+        query._payload = params
+        return query
+
 
 @pytest.fixture()
 def fake() -> _FakeSupabase:
@@ -227,17 +238,17 @@ def fake() -> _FakeSupabase:
 
 
 class TestMaybeRunLearner:
-    def test_no_op_below_threshold(self, fake: _FakeSupabase) -> None:
+    async def test_no_op_below_threshold(self, fake: _FakeSupabase) -> None:
         # 2 unapplied rows < threshold (3).
         fake.push_response(
             "job_feedback",
             "select",
             [_row("sales rep").model_dump(mode="json") for _ in range(2)],
         )
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         assert result is None
 
-    def test_no_op_when_no_token_repeats(self, fake: _FakeSupabase) -> None:
+    async def test_no_op_when_no_token_repeats(self, fake: _FakeSupabase) -> None:
         # 3 rows but no shared token after stopword filtering.
         fake.push_response(
             "job_feedback",
@@ -248,9 +259,9 @@ class TestMaybeRunLearner:
                 _row("consulting").model_dump(mode="json"),
             ],
         )
-        assert maybe_run_learner(fake, user_id="u", target_id="t") is None  # type: ignore[arg-type]
+        assert await maybe_run_learner(fake, user_id="u", target_id="t") is None  # type: ignore[arg-type]
 
-    def test_skips_token_already_in_negative_list(self, fake: _FakeSupabase) -> None:
+    async def test_skips_token_already_in_negative_list(self, fake: _FakeSupabase) -> None:
         # Reasons where only "sales" passes both the token + frequency
         # filters — picking a single-word reason avoids accidentally
         # promoting a stopword-adjacent helper into the negative list.
@@ -272,11 +283,11 @@ class TestMaybeRunLearner:
                 }
             ],
         )
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         # "sales" is already a negative — nothing new to apply.
         assert result is None
 
-    def test_applies_new_negative_and_bumps_version(self, fake: _FakeSupabase) -> None:
+    async def test_applies_new_negative_and_bumps_version(self, fake: _FakeSupabase) -> None:
         # 3 unapplied rows, all share "sales".
         fake.push_response(
             "job_feedback",
@@ -296,12 +307,15 @@ class TestMaybeRunLearner:
                 }
             ],
         )
-        # Update calls for targets + job_feedback. Push empty responses so
-        # the fake doesn't raise.
-        fake.push_response("targets", "update", [{"id": "t"}])
+        # The shared-profile write goes through the version-checked patch RPC
+        # (SEC-2), which returns the applied outcome + new version; the
+        # signal-consuming job_feedback update follows.
+        fake.push_response(
+            "apply_target_profile_patch", "rpc", [{"outcome": "applied", "new_version": 2}]
+        )
         fake.push_response("job_feedback", "update", [])
 
-        result = maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
         assert result is not None
         assert "sales" in result.added_negative_keywords
         # The "wrong" token shows up in all 3 rows too — also frequent.
@@ -310,12 +324,140 @@ class TestMaybeRunLearner:
         assert "rep" in result.added_negative_keywords
         assert result.signals_consumed == 3
         assert result.profile_version_after == 2
-        # An update on targets was logged.
-        target_updates = [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
-        assert target_updates, "expected a targets update"
-        payload = target_updates[0]["payload"]
-        assert payload["profile_version"] == 2
+        # The profile write went through the RPC, version-checked against the
+        # version we read (1), not a raw targets .update().
+        rpc_calls = [
+            r for r in fake.log if r["table"] == "apply_target_profile_patch" and r["op"] == "rpc"
+        ]
+        assert rpc_calls, "expected an apply_target_profile_patch RPC call"
+        params = rpc_calls[0]["payload"]
+        assert params["p_expected_version"] == 1
+        assert not [r for r in fake.log if r["table"] == "targets" and r["op"] == "update"]
         # New negatives appended; existing "junior" preserved.
-        new_negatives = payload["scoring_profile"]["negative"]["keywords"]
+        new_negatives = params["p_next_profile"]["negative"]["keywords"]
         assert "junior" in new_negatives
         assert "sales" in new_negatives
+
+    async def test_version_conflict_does_not_consume_signals(self, fake: _FakeSupabase) -> None:
+        # A concurrent writer bumped the profile: the patch RPC returns
+        # version_conflict, so the learner applies nothing AND leaves the
+        # pending signals unconsumed for a later run to retry (SEC-2).
+        fake.push_response(
+            "job_feedback",
+            "select",
+            [_row("sales rep").model_dump(mode="json") for _ in range(3)],
+        )
+        fake.push_response(
+            "targets",
+            "select",
+            [{"id": "t", "scoring_profile": {}, "profile_version": 1}],
+        )
+        fake.push_response(
+            "apply_target_profile_patch",
+            "rpc",
+            [{"outcome": "version_conflict", "new_version": None}],
+        )
+
+        result = await maybe_run_learner(fake, user_id="u", target_id="t")  # type: ignore[arg-type]
+        assert result is None
+        # No job_feedback update means the signals stay pending for a retry.
+        assert not [r for r in fake.log if r["table"] == "job_feedback" and r["op"] == "update"]
+
+
+# ---------------------------------------------------------------------------
+# run_learner_and_rescore (#57 PR-G2e-3): the post-feedback chain now runs the
+# follow-on re-score async — no sync client, no thread hop. Prove it re-reads the
+# (version-bumped) target async and re-scores via ``bulk_score_for_target``.
+# ---------------------------------------------------------------------------
+
+
+class _RescoreResp:
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+
+class _RescoreQuery:
+    def select(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    def eq(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    def limit(self, *_a: Any, **_k: Any) -> _RescoreQuery:
+        return self
+
+    async def execute(self) -> _RescoreResp:
+        return _RescoreResp(
+            [
+                {
+                    "id": "t-1",
+                    "label": "Senior FE",
+                    "app_active": True,
+                    "scoring_profile": {},
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            ]
+        )
+
+
+class _RescoreSupabase:
+    def table(self, _name: str) -> _RescoreQuery:
+        return _RescoreQuery()
+
+
+@pytest.mark.asyncio
+async def test_run_learner_and_rescore_rerescores_on_applied_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Learner applied a patch → re-read the target async + re-score via
+    ``bulk_score_for_target`` on the same client."""
+    from app.models.feedback import LearnerPatchSummary
+    from app.services.feedback import run_learner_and_rescore
+
+    async def _fake_learner(_sb: Any, *, user_id: str, target_id: str) -> LearnerPatchSummary:
+        return LearnerPatchSummary(
+            target_id=target_id,
+            applied_run_id="run-1",
+            added_negative_keywords=["sales"],
+            signals_consumed=3,
+            profile_version_after=2,
+        )
+
+    monkeypatch.setattr("app.services.feedback.maybe_run_learner", _fake_learner)
+
+    rescored: list[str] = []
+
+    async def _fake_bulk(_sb: Any, target: Any) -> int:
+        rescored.append(target.id)
+        return 7
+
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target", _fake_bulk)
+
+    await run_learner_and_rescore(_RescoreSupabase(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
+
+    assert rescored == ["t-1"]  # parsed the re-read target and re-scored it
+
+
+@pytest.mark.asyncio
+async def test_run_learner_and_rescore_noop_when_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No patch applied → no target re-read, no re-score."""
+    from app.services.feedback import run_learner_and_rescore
+
+    async def _no_patch(_sb: Any, *, user_id: str, target_id: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.services.feedback.maybe_run_learner", _no_patch)
+
+    called: list[Any] = []
+
+    async def _fake_bulk(_sb: Any, target: Any) -> int:
+        called.append(target)
+        return 0
+
+    monkeypatch.setattr("app.services.target_scoring.bulk_score_for_target", _fake_bulk)
+
+    await run_learner_and_rescore(object(), user_id="u", target_id="t-1")  # type: ignore[arg-type]
+    assert called == []

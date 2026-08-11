@@ -173,7 +173,19 @@ class Settings(BaseSettings):
     # URL validation — enable to validate job URLs during polling.
     validate_poll_urls: bool = True
 
+    # JSON-LD baseSalary fallback (#503): when a NEW row's JD text yields no
+    # salary, fetch its hosted posting page and read schema.org
+    # ``baseSalary`` (Lever/Ashby pages often carry structured pay their
+    # board APIs omit). Ships dark; the per-source cap bounds the extra
+    # fetch fan-out a cycle can add.
+    jsonld_salary_enabled: bool = False
+    jsonld_salary_max_fetches: int = 10
+
     # Periodic job URL health checks (see app/services/url_health.py).
+    # 2026-07-31 cadence fix: batch 50 → 250 (HEADs are free; full live-corpus
+    # sweep ~every 2 weeks) + the due-ordering RPC now serves rows carrying
+    # strikes FIRST, so a dead URL archives in ~threshold days instead of
+    # never (the pre-fix cascade had archived 0 jobs ever — audit doc).
     # Off by default. When enabled, the scheduler ticks every
     # ``url_health_tick_hours`` and HEAD-checks the oldest
     # ``url_health_batch_size`` live jobs. Jobs that fail
@@ -181,7 +193,7 @@ class Settings(BaseSettings):
     # error) get archived and their heavy fields NULL'd to reclaim space.
     url_health_check_enabled: bool = False
     url_health_tick_hours: int = Field(default=24, ge=1, le=720)
-    url_health_batch_size: int = Field(default=50, ge=1, le=500)
+    url_health_batch_size: int = Field(default=250, ge=1, le=500)
     url_health_concurrency: int = Field(default=10, ge=1, le=50)
     url_health_failure_threshold: int = Field(default=3, ge=1, le=10)
 
@@ -202,41 +214,6 @@ class Settings(BaseSettings):
     # out entirely; set this to 0 to disable the default floor instance-wide.
     # 40 = the "solid match" band (aligns with the #89 pre-scan cutoff).
     default_list_min_score: int = Field(default=40, ge=0, le=100)
-
-    # Pre-scan cosine gate — the #90 flip. When True, Phase-2 grading candidacy
-    # is gated on cosine(job, target) >= target.prescan_cosine_threshold,
-    # replacing the permissive keyword admission the shadow data showed admits
-    # ~100% (#60/#90). FAIL-OPEN by construction: a target with no calibrated
-    # threshold / embedding, or a job with no vector, is admitted — an
-    # unpopulated spine never silently drops jobs. Default off; flip per target
-    # once its threshold is calibrated (#89).
-    prescan_gate_enabled: bool = False
-    # Per-target SCOPE for the gate above — a staged rollout (#90). Comma-separated
-    # target UUIDs the gate applies to. EMPTY = NO targets (a safe no-op) — the gate
-    # requires EXPLICIT per-target opt-in, so it can never be silently applied to an
-    # unvalidated target. Cosine gating is only safe per-target, calibrated on live
-    # Phase-2 scores: it's a coarse off-domain filter (0% recall loss on CX, an
-    # off-cluster exec target) that FAILS in-domain (Frontend loses ~60% of good
-    # matches at its threshold — the fixture-based "2.8%" was measured on the
-    # keyword proxy, not real scores). No effect when ``prescan_gate_enabled`` is
-    # off. Parsed by ``prescan_gate_target_ids_set``.
-    prescan_gate_target_ids: str = ""
-    # Exploration holdout (#90 "measure it properly"): a deterministic ~fraction
-    # of gate-DROPPED (job, target) pairs are graded ANYWAY, so the gate's
-    # false-negative rate (dropped-but-actually-high-fit) is measurable against
-    # the shadow log (prescan_shadow.cosine_admit=false joined to a resulting
-    # complete grade). 0 disables the holdout. Kept small — it spends grades on
-    # would-drop jobs, but the gate frees ample daily-cap headroom.
-    prescan_gate_holdout_fraction: float = Field(default=0.05, ge=0.0, le=1.0)
-
-    # Poller async DB migration (#57). When True, hot poll-cycle DB writes run
-    # on the native async service-role client (HTTP/2, its own bounded pool)
-    # instead of the sync client in an ``asyncio.to_thread`` — so the poll's
-    # write herd stops competing for the shared ~40-thread executor with
-    # interactive requests. FAIL-SAFE: if the async client isn't initialised the
-    # call falls back to the sync/thread path, never dropping the write. Default
-    # off; flipped per the migration rollout after the before/after load test.
-    poller_async_db: bool = False
 
     # Synthetic "mock" board provider for local load testing (#57). When True,
     # a source row with ``provider='mock'`` synthesizes a deterministic job
@@ -266,6 +243,10 @@ class Settings(BaseSettings):
     # (#60): explicitly TEMPORARY analysis data with no other lifecycle
     # (2026-07-02 audit). 30d covers an analysis window; 0 = keep forever.
     prescan_shadow_retention_days: int = Field(default=30, ge=0)
+    # search_events.occurred_at — the search-funnel metrics ledger (#467
+    # §10 PR6). `query` is user input, so bounded retention is part of the
+    # privacy posture; 90d covers funnel iteration. 0 = keep forever.
+    search_events_retention_days: int = Field(default=90, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
@@ -402,6 +383,14 @@ class Settings(BaseSettings):
     # global catalog leaves it off, and the tagger still records ``is_us`` for
     # anyone who'd rather filter on it than archive.
     qualification_archive_non_us: bool = False
+    # Talent-pool / "general application" / evergreen NON-postings (#60,
+    # schema-audit wire-up 2026-07-31): the tagger's ``is_genuine_role=false``
+    # verdict archives the row in the same firewall write — a non-posting has
+    # no business in the corpus (prod had 139 of them being served in public
+    # search). Lenient by construction: only an explicit ``false`` archives;
+    # ``None`` (malformed/absent verdict) keeps the row. Reversible
+    # (archived_at flag), default ON.
+    qualification_archive_non_genuine: bool = True
     # Minimum ``us_confidence`` (0-100) for the archive above to fire. 80 keeps
     # the tagger's genuinely-uncertain calls (which include most US
     # false-negatives) live; a prod sample of the >=80 set was 100% non-US.
@@ -462,34 +451,18 @@ class Settings(BaseSettings):
     # the write is best-effort (an embedding error never breaks polling) and
     # content-hash cached (an unchanged re-poll re-embeds nothing). Requires
     # ``EMBEDDINGS_PROVIDER=voyage`` + ``VOYAGE_API_KEY`` to embed for real;
-    # with the mock provider it writes deterministic fake vectors. Flip
-    # per-deploy once the backfill has populated the table in DEV.
+    # with the mock provider it writes deterministic fake vectors. Since the
+    # Disk IO slim-down (2026-07-30) this gates the LAZY path only: vectors
+    # materialize at grade time (``ensure_job_vectors`` in the Phase-2
+    # runner) for exactly the candidate set — there is no embed-on-ingest.
     prescan_embed_enabled: bool = False
 
-    # Per-cycle cap for the vector-less-job sweep (#21). The on-ingest embed
-    # hook is fail-soft per row, so a job whose embed silently failed — or one
-    # ingested before the pipeline armed / while its source was delisting —
-    # never gets a vector, and the cosine gate (#90) fails OPEN on it, burning
-    # a blind Sonnet grade. Each scheduled cycle, embed up to this many of the
-    # NEWEST jobs with no ``job_embeddings`` row (archived included — they stay
-    # gradeable via click-through, and calibration reads their vectors).
-    # ~$0.00005/job, so the default costs ≈ $0.01/cycle worst case. 0 disables.
-    # Only runs when ``prescan_embed_enabled``.
+    # DEPRECATED (Disk IO slim-down, 2026-07-30): the vector-less-job sweep
+    # (#21) is gone — lazy grade-time embedding makes that stranding class
+    # structurally impossible (a job embeds exactly when first needed). The
+    # field survives so a stale env var doesn't break settings parsing;
+    # nothing reads it.
     prescan_embed_backfill_batch: int = Field(default=200, ge=0, le=2000)
-
-    # Pre-scan SHADOW MODE (#60/#68, Phase 3). When True the poller, AFTER the
-    # live keyword admit decision for each (job, target), ALSO computes the
-    # would-be cosine gate decision (cosine(job_vec, target_vec) >=
-    # target.prescan_cosine_threshold) and appends one ``prescan_shadow`` row
-    # recording BOTH decisions — the disagreement matrix. OBSERVATION ONLY: the
-    # keyword decision still drives what gets graded; this changes no admission
-    # behavior. The actual gate FLIP (cosine driving admission) is a LATER phase
-    # informed by this shadow data and is deliberately not built. Ships FALSE so
-    # merging is inert — flag off ⇒ no shadow rows and no cosine computation; the
-    # write is best-effort (a failure never breaks polling). Even with the flag
-    # on it stays cheap: cosine reuses the cached Phase-1/2 vectors (NO embedding
-    # spend) and yields NULL when those vectors aren't populated yet.
-    prescan_shadow_enabled: bool = False
 
     # Logistics extraction (plan-wyrdfold-logistics-chips.md). When True
     # the Phase 2 grader's system prompt includes a section asking the
@@ -547,7 +520,16 @@ class Settings(BaseSettings):
 
     # Slow-request log threshold (ms). Requests slower than this get logged
     # at WARNING with method/path/duration. Set to 0 to log every request.
-    slow_request_threshold_ms: int = Field(default=500, ge=0, le=60_000)
+    #
+    # 750, not 500: on the current (small) prod instance a healthy authed read
+    # is ~500-650ms (query + the API-to-Supabase round-trip + payload + JWT), so
+    # a 500ms bar flagged nearly every request -- noise, not signal. 750 flags
+    # the genuine anomalies (the /jobs family at 2.7-9s, /analysis LLM ~26s) and
+    # stays quiet on baseline reads (measured 2026-07-23). Prod already runs this
+    # via the SLOW_REQUEST_THRESHOLD_MS env override; this makes it the default so
+    # a cleared env var doesn't silently revert to the noisy 500. Lower it again
+    # once the instance is upsized and the baseline drops.
+    slow_request_threshold_ms: int = Field(default=750, ge=0, le=60_000)
 
     # Application log format (#26 F5). `text` keeps stdlib/uvicorn
     # defaults for local DX; `json` attaches a JSON formatter to the
@@ -577,6 +559,47 @@ class Settings(BaseSettings):
     # tick interval so an aborted cycle doesn't overlap the next. 0 disables
     # (wait forever — the pre-watchdog behavior).
     poll_cycle_timeout_seconds: int = Field(default=1200, ge=0)
+    # Max sources polled per cycle (#514 residual). An unbounded due batch
+    # interacts badly with the watchdog above: a backlog cycle (restart,
+    # cron gap) tries every due source at once, blows past
+    # ``poll_cycle_timeout_seconds``, the abort kills the unfinished tail
+    # un-stamped, and the next cycle repeats the exact same oversized batch —
+    # the fleet starves in a loop instead of draining. Measured 2026-07-29:
+    # 1,110 of 3,231 enabled sources >2x overdue, 1,077 unpolled for 24h+.
+    # Capping the batch to what a cycle can actually finish (and taking the
+    # most-overdue first) drains the backlog cap-sized-chunk by chunk.
+    # 0 = legacy unbounded. (The original sizing note said 250 comfortably
+    # fits the watchdog; live 2026-08-05 showed it does NOT when the batch
+    # holds giant boards — ~75/cycle landed and every tick aborted. The
+    # per-source budget below is the fix; the cap stays as the batch bound.)
+    poll_max_sources_per_cycle: int = Field(default=250, ge=0)
+    # Per-source wall-time budget inside a cycle (2026-08-05). The watchdog
+    # + cap bound the CYCLE, but one giant board (a workday tenant with
+    # hundreds of detail fetches behind 429 backoff) can occupy one of the
+    # POLL_CONCURRENCY slots for many minutes — observed live: every
+    # overnight tick blew the 1200s watchdog, cancelling every in-flight
+    # source, while only ~75 of the 250-source batch finished. The budget
+    # cancels ONE source, not the cycle: the worker stamps last_polled_at
+    # (so the board rotates to the back of the due queue instead of
+    # re-hogging a slot next tick), the stale-archive pass is skipped by
+    # construction (the cancel lands before it — a partial fetch must never
+    # mass-archive live rows), and the cycle keeps polling. Chronically
+    # over-budget boards surface via the WARNING log = catalog-hygiene
+    # candidates. Keep it well under poll_cycle_timeout_seconds. 0 disables.
+    poll_source_budget_seconds: int = Field(default=300, ge=0)
+    # In-process TTL cache for Phase-1 REJECTED titles (#514 residual). A
+    # rejected candidate never ingests, so the same title re-enters triage
+    # every poll cycle and re-pays the LLM verdict at the source's cadence
+    # (~4h) until the posting closes. Measured 2026-07-29:
+    # relevance.title_triage = 17,843 calls / $8.34 over 7 days — the
+    # dominant LLM line item, mostly repeat verdicts on unchanged titles.
+    # A rejection is remembered per (target, profile_version, title) for
+    # this many hours; profile edits bump profile_version, which re-judges
+    # everything under the new profile immediately. In-memory only: a
+    # restart clears it (worst case = one extra verdict per title), and the
+    # poller holds a fleet-wide advisory lock so exactly one process polls.
+    # 0 disables.
+    phase1_rejection_ttl_hours: float = Field(default=24.0, ge=0.0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,
@@ -637,6 +660,29 @@ class Settings(BaseSettings):
     # per-target cap — the legacy behavior that scales with target count).
     discovery_query_budget_per_run: int = Field(default=60, ge=0, le=20000)
 
+    # Per-user cap on boards a single account can register by creating targets
+    # from job URLs (the from-url flow — see source_registration). Sources are
+    # global + forever-polled, so this bounds the cost a single account can
+    # impose: at most this many DISTINCT boards per user. Discovery-inserted
+    # sources aren't attributed to a user and don't count against it.
+    source_registration_cap_per_user: int = Field(default=25, ge=0, le=1000)
+
+    # Lazy fit-score refresh (E2): max stale targets recomputed per /targets/mine
+    # view. Bounds the LLM cost one page load can trigger; the rest refresh on
+    # subsequent views. 0 disables the lazy refresh entirely.
+    fit_score_refresh_max_per_view: int = Field(default=3, ge=0, le=50)
+
+    # Concurrency cap for the pre-scan embedding write fan-out (job_embeddings
+    # HNSW upserts). Much lower than DB_WRITE_CONCURRENCY (12) on purpose: HNSW
+    # index inserts largely serialize internally + are IO-heavy, so a wide
+    # fan-out just piles contention on a small instance and STARVES foreground
+    # reads (the /jobs statement-timeouts, 2026-07-23) without real throughput.
+    # A few in flight keeps ingestion moving while leaving IO for user reads.
+    # DEPRECATED (2026-07-30): the on-ingest embed fan-out this bounded is
+    # gone (lazy grade-time embedding batches internally); kept for env-var
+    # compatibility, nothing reads it.
+    embedding_write_concurrency: int = Field(default=3, ge=1, le=32)
+
     # In-process scheduled source discovery. Off by default (same posture as
     # the poll scheduler) so tests and ad-hoc dev processes don't fire Brave
     # queries; ops opt-in via env var. When enabled the scheduler ticks every
@@ -682,13 +728,6 @@ class Settings(BaseSettings):
     @property
     def cors_allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
-
-    @property
-    def prescan_gate_target_ids_set(self) -> frozenset[str]:
-        """Parsed ``prescan_gate_target_ids`` — the target IDs the pre-scan gate
-        is scoped to. Empty means NO targets (a safe no-op requiring explicit
-        opt-in), NOT "all targets" (see ``_prescan_gate_applies``)."""
-        return frozenset(t.strip() for t in self.prescan_gate_target_ids.split(",") if t.strip())
 
     # Per-user LLM budget (defense-in-depth). Rolling window over llm_costs.
     # Set to 0 to disable a window. API-key callers (cron) bypass the HTTP
@@ -736,6 +775,15 @@ class Settings(BaseSettings):
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)
+    # Max concurrent backgrounded tailoring runs per user (#656). Backgrounding
+    # the ~39s resume pipeline removed the serialization a blocking request
+    # imposed on a browser tab, and `enforce_llm_budget` meters spend whose
+    # `llm_costs` rows don't land until each run's LLM returns — so N
+    # simultaneous kicks would all read the same pre-burst spend and all pass.
+    # Dedup already collapses repeat kicks for the SAME document; this bounds
+    # a fan-out across different postings. 0 disables. `/tailor/batch` is the
+    # sanctioned bulk path and has its own rate limit.
+    tailor_max_concurrent_runs: int = Field(default=3, ge=0)
     # Phase 2 grading quota per target per UTC day (was a hardcoded 100 in
     # daily_cap.py — at ~$0.0035/call that alone exceeded a $5 monthly
     # allowance; 20/day ≈ $2/month/target).

@@ -22,13 +22,15 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.feedback import (
     FeedbackRow,
     FeedbackSignal,
     LearnerPatchSummary,
 )
+from app.services.db_read import fetch_one
+from app.services.targets.profile_writes import apply_profile_patch_rpc_async
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +119,14 @@ def _parse_row(row: dict[str, Any]) -> FeedbackRow:
     return FeedbackRow.model_validate(row)
 
 
-def upsert_feedback(
-    supabase: Client,
+# `async def` on the async user client (#57 slice 4): the interactive
+# job_feedback CRUD runs natively on the event loop, off the threadpool. The
+# deterministic learner below is async too since PR-G2e-2 — it runs on the
+# pooled async SERVICE client through the shared #191 profile-write RPC's async
+# twin, and since PR-G2e-3 the follow-on re-score is async as well
+# (``bulk_score_for_target``), so the whole chain is on the async client.
+async def upsert_feedback(
+    supabase: AsyncClient,
     *,
     user_id: str,
     job_posting_id: str,
@@ -142,7 +150,7 @@ def upsert_feedback(
         "updated_at": datetime.now(UTC).isoformat(),
     }
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .upsert(payload, on_conflict="user_id,job_posting_id,target_id")
         .execute()
     )
@@ -152,10 +160,12 @@ def upsert_feedback(
     return _parse_row(rows[0])
 
 
-def delete_feedback(supabase: Client, *, user_id: str, job_posting_id: str, target_id: str) -> bool:
+async def delete_feedback(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, target_id: str
+) -> bool:
     """Remove a feedback row. Returns True if a row was deleted."""
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .delete()
         .eq("user_id", user_id)
         .eq("job_posting_id", job_posting_id)
@@ -166,8 +176,8 @@ def delete_feedback(supabase: Client, *, user_id: str, job_posting_id: str, targ
     return bool(rows)
 
 
-def list_for_target(
-    supabase: Client,
+async def list_for_target(
+    supabase: AsyncClient,
     *,
     user_id: str,
     target_id: str,
@@ -178,7 +188,7 @@ def list_for_target(
     from postgrest import CountMethod
 
     resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .select("*", count=CountMethod.exact)
         .eq("user_id", user_id)
         .eq("target_id", target_id)
@@ -216,17 +226,21 @@ def _frequent_tokens(rows: list[FeedbackRow], threshold: int) -> list[str]:
     return [tok for tok, n in seen_in.most_common() if n >= threshold]
 
 
-def maybe_run_learner(
-    supabase: Client, *, user_id: str, target_id: str
+async def maybe_run_learner(
+    supabase: AsyncClient, *, user_id: str, target_id: str
 ) -> LearnerPatchSummary | None:
     """Run the deterministic learner for one (user, target) pair.
 
     Returns a summary when something was applied, None when the trip
     threshold wasn't reached (so the caller can keep the API response
     cheap and skip the diff render).
+
+    Async on the pooled service client (#57 PR-G2e-2): every read/write is
+    awaited and the shared-profile write goes through the #191 patch RPC's
+    async twin (``apply_profile_patch_rpc_async``).
     """
     pending_resp = (
-        supabase.table(TABLE)
+        await supabase.table(TABLE)
         .select("*")
         .eq("user_id", user_id)
         .eq("target_id", target_id)
@@ -246,8 +260,9 @@ def maybe_run_learner(
         # learn from. v2's LLM step is what handles this case.
         return None
 
-    target_resp = supabase.table("targets").select("*").eq("id", target_id).single().execute()
-    target_row = cast(dict[str, Any] | None, target_resp.data)
+    # fetch_one, not .single() — the latter raises on zero rows, making this
+    # `return None` unreachable (see app/services/db_read.py).
+    target_row = await fetch_one(supabase.table("targets").select("*").eq("id", target_id))
     if target_row is None:
         return None
     profile = cast(dict[str, Any], target_row.get("scoring_profile") or {})
@@ -266,18 +281,37 @@ def maybe_run_learner(
         negative["weight"] = -10.0
     profile["negative"] = negative
 
-    next_version = int(target_row.get("profile_version") or 1) + 1
-    supabase.table("targets").update(
-        {
-            "scoring_profile": profile,
-            "profile_version": next_version,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    ).eq("id", target_id).execute()
+    # Write the shared profile through the #191 version-checked / follower-
+    # re-checked patch RPC — the same path the LLM learner and reference-JD
+    # merges use — instead of a raw read-modify-write ``.update()``. That closed
+    # the last un-migrated direct write to a shared ``scoring_profile``: a
+    # Python authz slip can't poison a profile every follower shares, and two
+    # concurrent learner runs (or a learner racing an LLM-learner / ref-JD
+    # merge) can't lose an update (hardening review 2026-07-21, SEC-2).
+    expected_version = int(target_row.get("profile_version") or 1)
+    outcome, new_version = await apply_profile_patch_rpc_async(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        next_profile=profile,
+        expected_version=expected_version,
+    )
+    if outcome != "applied" or new_version is None:
+        # Concurrent writer bumped the version (version_conflict) or the in-DB
+        # membership re-check failed — leave the pending signals unconsumed so a
+        # later run retries against fresh state. The learner is re-runnable.
+        logger.info(
+            "Feedback learner deferred for (user=%s, target=%s): patch RPC outcome=%s",
+            user_id,
+            target_id,
+            outcome,
+        )
+        return None
+    next_version = new_version
 
     run_id = str(uuid.uuid4())
     consumed_ids = [r.id for r in pending]
-    supabase.table(TABLE).update(
+    await supabase.table(TABLE).update(
         {
             "applied_at": datetime.now(UTC).isoformat(),
             "applied_run_id": run_id,
@@ -301,4 +335,96 @@ def maybe_run_learner(
         added_negative_keywords=truly_new,
         signals_consumed=len(consumed_ids),
         profile_version_after=next_version,
+    )
+
+
+# ---- Async router drivers (#57 PR-G2d-a → PR-G2e-3) -----------------------
+# The interactive feedback router is ``async def`` on the pooled async clients,
+# and since PR-G2e-2 the learner chain runs async on the pooled async SERVICE
+# client too (via the #191 profile-write RPC's async twin). Since PR-G2e-3 the
+# follow-on bulk re-score is async as well (``bulk_score_for_target``), so
+# the whole chain is on the async service client — no sync client, no thread hop.
+# The operator ``rescore_for_target`` handler (jobs.py) shares that same
+# ``bulk_score_for_target`` on the async service client. This seam acquires the
+# client in the service layer so the router body holds none.
+
+
+async def run_learner_off_loop(*, user_id: str, target_id: str) -> LearnerPatchSummary | None:
+    """Drive the deterministic learner for the ``POST /targets/{id}/learn``
+    handler (#57 PR-G2d-a → PR-G2e-2): fully async on the pooled async service
+    client now — no sync client, no thread hop."""
+    from app.dependencies import get_async_service_supabase
+
+    return await maybe_run_learner(
+        get_async_service_supabase(), user_id=user_id, target_id=target_id
+    )
+
+
+async def run_learner_and_rescore(
+    supabase: AsyncClient, *, user_id: str, target_id: str
+) -> None:
+    """The post-feedback background learner chain (moved from the router's
+    ``_safe_run_learner``, #57 PR-G2d-a; fully async since PR-G2e-3).
+
+    Run the deterministic learner and, when it actually mutated the profile
+    (returned a ``LearnerPatchSummary``), follow with a re-score pass so the user
+    sees the lifted/lowered scores on their next page load instead of waiting for
+    the next poll cycle. The patch bumped ``profile_version`` already, so the
+    re-score only touches rows whose ``scored_profile_version`` is now stale.
+
+    Both the learner and the re-score (``bulk_score_for_target``) run on
+    ``supabase`` (the pooled async service client); the re-score's heavy per-page
+    keyword compute stays off the loop in a thread internally (#107). Swallows its
+    own exceptions (a detached background failure must not surface as an opaque
+    500 on a later request) while still emitting a usable traceback.
+    """
+    from app.services.target_scoring import bulk_score_for_target
+    from app.services.targets import crud
+
+    try:
+        patch = await maybe_run_learner(supabase, user_id=user_id, target_id=target_id)
+        if patch is None:
+            return
+        # Re-read the (now version-bumped) target and re-score, both on the async
+        # service client. crud stays sync for its non-poll callers (#57), so inline
+        # the single-row read here — the parse is the same ``crud`` uses.
+        target_resp = (
+            await supabase.table("targets").select("*").eq("id", target_id).limit(1).execute()
+        )
+        target_rows = cast(list[dict[str, Any]], target_resp.data or [])
+        if not target_rows:
+            return
+        target = crud._parse_target(target_rows[0])
+        n = await bulk_score_for_target(supabase, target)
+        logger.info(
+            "Feedback learner triggered re-score for target=%s: "
+            "+%d negatives %s, %d rows re-scored",
+            target_id,
+            len(patch.added_negative_keywords),
+            patch.added_negative_keywords,
+            n,
+        )
+    except Exception:
+        logger.exception(
+            "Feedback learner failed for (user=%s, target=%s)",
+            user_id,
+            target_id,
+        )
+
+
+async def run_learner_and_rescore_off_loop(*, user_id: str, target_id: str) -> None:
+    """Async entry for the background learner chain (the coroutine the
+    ``create_feedback`` handler hands to ``spawn_detached``, #57 PR-G2d-a →
+    PR-G2e-3).
+
+    Acquires the pooled async service client and runs
+    :func:`run_learner_and_rescore`. Fully async now — the poller-shared bulk
+    re-score gained an async twin in PR-G2e-3, so no sync service client is
+    threaded here anymore."""
+    from app.dependencies import get_async_service_supabase
+
+    await run_learner_and_rescore(
+        get_async_service_supabase(),
+        user_id=user_id,
+        target_id=target_id,
     )

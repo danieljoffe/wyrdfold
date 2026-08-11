@@ -15,16 +15,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_email,
     get_current_user_id,
-    get_supabase,
-    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.main import app
@@ -41,8 +40,7 @@ _TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
 @pytest.fixture
 def client_factory():
     def _make(supabase: MagicMock) -> TestClient:
-        app.dependency_overrides[get_supabase] = lambda: supabase
-        app.dependency_overrides[get_user_supabase] = lambda: supabase
+        app.dependency_overrides[get_async_user_supabase] = lambda: supabase
         app.dependency_overrides[verify_supabase_jwt] = lambda: _TEST_USER_ID
         app.dependency_overrides[get_current_user_id] = lambda: _TEST_USER_ID
         app.dependency_overrides[get_current_user_email] = lambda: None
@@ -54,9 +52,13 @@ def client_factory():
 
 def _select_returns(sb: MagicMock, row: dict[str, Any]) -> None:
     """Match the .select(...).eq(...).limit(...).execute() chain used by
-    _get_or_create_profile."""
-    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = _Resp(
-        [row]
+    _get_or_create_profile — plus the update-chain execute, both awaitable
+    now that the handlers run on the async user client (#57 slice 3)."""
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([row]))
+    )
+    sb.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
+        return_value=_Resp(None)
     )
 
 

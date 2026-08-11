@@ -1,7 +1,17 @@
 /**
  * @jest-environment node
  */
-const mockCreateServerClient = jest.fn(() => ({ auth: { _tag: 'server' } }));
+
+// See auth-client.test.ts: the module under test is loaded via `await import()`
+// inside each case, so there is no top-level import/export to mark this a
+// module. Without it both files share one global scope and their `const`s clash.
+export {};
+
+// Rest-parameter typed so the `jest.mock` factory can spread args through, and
+// so `mock.calls[0]` is `unknown[]` — which the tuple casts below narrow.
+const mockCreateServerClient = jest.fn((..._args: unknown[]) => ({
+  auth: { _tag: 'server' },
+}));
 const mockConnection = jest.fn().mockResolvedValue(undefined);
 const mockCookieStore = {
   getAll: jest.fn().mockReturnValue([{ name: 'sb-token', value: 'abc' }]),

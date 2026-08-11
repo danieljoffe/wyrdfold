@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
+import { stripHtmlToText } from '@/lib/stripHtml';
 import { ExternalLink, ThumbsDown, ThumbsUp, Trash2 } from 'lucide-react';
 import {
   Card,
@@ -15,6 +16,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { TargetReferenceJD } from '../types';
 import AddReferenceJDModal from './AddReferenceJDModal';
+import { LocalDate } from '@/components/LocalFormat';
 
 interface ReferenceJDListProps {
   targetId: string;
@@ -150,10 +152,10 @@ export default function ReferenceJDList({
                     </a>
                   )}
                   <Text variant='caption' as='p' className='line-clamp-2'>
-                    {jd.jd_text}
+                    {stripHtmlToText(jd.jd_text)}
                   </Text>
                   <Text variant='meta' as='span'>
-                    Added {new Date(jd.created_at).toLocaleDateString()}
+                    Added <LocalDate value={jd.created_at} />
                   </Text>
                 </div>
                 <div className='flex items-center gap-1 shrink-0'>

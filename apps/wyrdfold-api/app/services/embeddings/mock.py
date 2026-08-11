@@ -59,8 +59,13 @@ class MockEmbeddingsClient:
         inputs: list[str],
         purpose: str,
         input_type: Literal["document", "query"] = "document",
+        output_dimension: int | None = None,
     ) -> EmbeddingResult:
-        dim = DIMENSIONS[model]
+        # Mirror voyage-3.5 Matryoshka behavior: an explicit output_dimension
+        # wins over the model default, and the vector really is that length —
+        # so dimension-mismatch bugs (a 512-d job vector cosined against a
+        # 1024-d target vector) reproduce in tests instead of hiding.
+        dim = output_dimension or DIMENSIONS[model]
         embeddings = [_deterministic_vector(text, dim) for text in inputs]
         usage = EmbeddingUsage(input_tokens=sum(_approx_tokens(t) for t in inputs))
 
@@ -70,6 +75,7 @@ class MockEmbeddingsClient:
                 "purpose": purpose,
                 "input_count": len(inputs),
                 "input_type": input_type,
+                "output_dimension": output_dimension,
             }
         )
 

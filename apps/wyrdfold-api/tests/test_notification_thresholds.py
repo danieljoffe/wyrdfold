@@ -10,12 +10,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_current_user_id, get_user_supabase, verify_api_key_or_jwt
+from app.dependencies import (
+    get_async_user_supabase,
+    get_current_user_id,
+    verify_api_key_or_jwt,
+)
 from app.main import app
 from app.services.targets import crud
 
@@ -50,6 +54,23 @@ def _wire_select(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
 def _wire_update(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
     chain = supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute
     chain.return_value.data = rows
+
+
+# ── Async wiring for the endpoint path (#57 slice 4) ─────────────────────────
+# The PATCH handler now holds the async user client and inlines the read-then-
+# write as ``_set_notification_thresholds_async``. supabase-py's AsyncClient
+# ``.execute()`` is a coroutine, so the endpoint tests wire it as an AsyncMock;
+# the sync crud helpers above keep the sync wiring.
+
+
+def _awire_select(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
+    chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+    chain.execute = AsyncMock(return_value=MagicMock(data=rows))
+
+
+def _awire_update(supabase: MagicMock, rows: list[dict[str, Any]]) -> None:
+    chain = supabase.table.return_value.update.return_value.eq.return_value.eq.return_value
+    chain.execute = AsyncMock(return_value=MagicMock(data=rows))
 
 
 # ---- crud -----------------------------------------------------------------
@@ -154,7 +175,9 @@ def test_returns_none_when_row_missing() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.dependency_overrides[get_user_supabase] = lambda: MagicMock()
+    # #57: the PATCH handler holds the async user client (the sync per-request
+    # client was retired in PR-F).
+    app.dependency_overrides[get_async_user_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
@@ -167,11 +190,11 @@ def test_patch_sets_thresholds(client: TestClient, monkeypatch: pytest.MonkeyPat
 
     captured: dict[str, Any] = {}
 
-    def _fake(supabase: Any, **kwargs: Any) -> Any:
+    async def _fake(supabase: Any, **kwargs: Any) -> Any:
         captured.update(kwargs)
         return _parse_user_target(_row(job_score_threshold=90, sms_score_threshold=70))
 
-    monkeypatch.setattr(router_mod.crud, "set_user_target_notification_thresholds", _fake)
+    monkeypatch.setattr(router_mod, "_set_notification_thresholds_async", _fake)
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -191,11 +214,11 @@ def test_patch_reset_sends_nulls(client: TestClient, monkeypatch: pytest.MonkeyP
 
     captured: dict[str, Any] = {}
 
-    def _fake(supabase: Any, **kwargs: Any) -> Any:
+    async def _fake(supabase: Any, **kwargs: Any) -> Any:
         captured.update(kwargs)
         return _parse_user_target(_row())
 
-    monkeypatch.setattr(router_mod.crud, "set_user_target_notification_thresholds", _fake)
+    monkeypatch.setattr(router_mod, "_set_notification_thresholds_async", _fake)
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -217,11 +240,11 @@ def test_patch_omitted_channel_not_forwarded(
 
     captured: dict[str, Any] = {}
 
-    def _fake(supabase: Any, **kwargs: Any) -> Any:
+    async def _fake(supabase: Any, **kwargs: Any) -> Any:
         captured.update(kwargs)
         return _parse_user_target(_row(job_score_threshold=90, sms_score_threshold=70))
 
-    monkeypatch.setattr(router_mod.crud, "set_user_target_notification_thresholds", _fake)
+    monkeypatch.setattr(router_mod, "_set_notification_thresholds_async", _fake)
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -239,9 +262,9 @@ def test_patch_partial_body_preserves_other_channel_end_to_end(
     """Drive the REAL crud: a partial PATCH must leave the omitted channel's
     column out of the UPDATE entirely (regression for the wipe footgun)."""
     supabase = MagicMock()
-    _wire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
-    _wire_update(supabase, [_row(job_score_threshold=90, sms_score_threshold=70)])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
+    _awire_update(supabase, [_row(job_score_threshold=90, sms_score_threshold=70)])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -257,8 +280,8 @@ def test_patch_partial_body_preserves_other_channel_end_to_end(
 def test_patch_empty_body_is_noop(client: TestClient) -> None:
     """An empty PATCH body issues no UPDATE and 200s with the current row."""
     supabase = MagicMock()
-    _wire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row(job_score_threshold=50, sms_score_threshold=70)])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.patch("/targets/target-1/notification-thresholds", json={})
 
@@ -271,8 +294,8 @@ def test_patch_idor_other_users_link_404(client: TestClient) -> None:
     """A user whose (user, target) link doesn't exist gets 404 and no write —
     the service-role client can't be steered onto another user's row."""
     supabase = MagicMock()
-    _wire_select(supabase, [])  # no link for this (user, target)
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [])  # no link for this (user, target)
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -286,9 +309,9 @@ def test_patch_idor_other_users_link_404(client: TestClient) -> None:
 @pytest.mark.parametrize("value,expected", [(0, 200), (200, 200), (-1, 422), (201, 422)])
 def test_patch_boundary_validation(client: TestClient, value: int, expected: int) -> None:
     supabase = MagicMock()
-    _wire_select(supabase, [_row()])
-    _wire_update(supabase, [_row(job_score_threshold=value if value in (0, 200) else None)])
-    app.dependency_overrides[get_user_supabase] = lambda: supabase
+    _awire_select(supabase, [_row()])
+    _awire_update(supabase, [_row(job_score_threshold=value if value in (0, 200) else None)])
+    app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.patch(
         "/targets/target-1/notification-thresholds",
@@ -301,7 +324,7 @@ def test_patch_404_when_no_link(client: TestClient, monkeypatch: pytest.MonkeyPa
     from app.routers import targets as router_mod
 
     monkeypatch.setattr(
-        router_mod.crud, "set_user_target_notification_thresholds", lambda *_a, **_kw: None
+        router_mod, "_set_notification_thresholds_async", AsyncMock(return_value=None)
     )
 
     resp = client.patch(

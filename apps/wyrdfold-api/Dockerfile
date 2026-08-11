@@ -4,7 +4,7 @@
 # Resolves the uv-managed virtualenv into /app/.venv. uv + the lockfile + the
 # build-context pyproject files only live in this stage; the runtime image
 # never sees them.
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS builder
+FROM python:3.14-slim@sha256:a7fb1e634c4a578f9e0bd6327f11a3cde11b7a9395f48e24360c0988bcc5c2bc AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -29,13 +29,30 @@ COPY apps/wyrdfold-api/pyproject.toml ./apps/wyrdfold-api/pyproject.toml
 RUN uv sync --frozen --no-dev --no-editable --package wyrdfold-api
 
 # ---- runtime ----------------------------------------------------------------
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS runtime
+FROM python:3.14-slim@sha256:a7fb1e634c4a578f9e0bd6327f11a3cde11b7a9395f48e24360c0988bcc5c2bc AS runtime
 
 # pandoc is shelled out to by the DOCX render pipeline; the rest of the
 # runtime stays bare (no uv, no apt cache, no monorepo lockfiles).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pandoc \
     && rm -rf /var/lib/apt/lists/*
+
+# Strip the base image's pip / ensurepip. The app runs entirely out of the
+# uv-built venv at /app/.venv (its own site-packages, base interpreter only),
+# so nothing here installs packages at runtime — and an image that can't
+# `pip install` is one an attacker who lands RCE can't extend either.
+#
+# It also closes a recurring false-positive channel in the Trivy gate: pip
+# vendors ~20 libraries under `pip/_vendor/`, and Trivy reports CVEs against
+# those vendored copies even though the runtime never invokes pip. The
+# python:3.14.6→3.14.7 base bump (pip 26.1.2→26.2.1) fired exactly that way,
+# on vendored msgpack 1.1.2 (GHSA-6v7p-g79w-8964) and setuptools 70.3.0
+# (CVE-2025-47273). Deleting pip fixes the finding instead of ignoring it,
+# and keeps future pip-vendored advisories from re-blocking base bumps.
+RUN rm -rf /usr/local/lib/python3.14/site-packages/pip \
+    /usr/local/lib/python3.14/site-packages/pip-*.dist-info \
+    /usr/local/lib/python3.14/ensurepip \
+    /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14
 
 RUN groupadd --system --gid 1001 app \
     && useradd --system --uid 1001 --gid app --home-dir /app --shell /sbin/nologin app

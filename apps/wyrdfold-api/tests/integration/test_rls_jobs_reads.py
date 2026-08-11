@@ -7,7 +7,7 @@ share the SAME scored job see DIFFERENT statuses, and a NULL ``p_user_id``
 stack (self-skips when unreachable — see conftest).
 
 #88 dual-auth flip: GET /jobs, /pipeline-counts and GET /{id} now run on the
-caller's RLS user client for JWT callers (``get_supabase_for_caller``). The
+caller's RLS user client for JWT callers (``get_async_supabase_for_caller``). The
 second half of this file proves that flip is loss-free and adds teeth:
 
 * both list RPCs (``get_target_jobs``, ``pipeline_counts``) return
@@ -218,7 +218,12 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "source_id": source_id,
                     "title": f"Job {name}",
                     "company_name": "Acme",
+                    # purged implies archived (jobs_purged_implies_archived CHECK,
+                    # 20260721120000) — a tombstone is always archived first, so a
+                    # purged-but-unarchived row is a state prod can't produce. Set
+                    # archived_at alongside purged_at to match the invariant.
                     "purged_at": ("2026-01-01T00:00:00Z" if name == "purged_pass" else None),
+                    "archived_at": ("2026-01-01T00:00:00Z" if name == "purged_pass" else None),
                 }
                 for name, jid in jobs.items()
             ]
@@ -231,6 +236,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 80,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
                 {
@@ -238,6 +251,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 30,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
                 {
@@ -252,6 +273,14 @@ def test_pipeline_counts_floor_exempts_pending_and_gates_liveness(
                     "target_id": target_id,
                     "score": 80,
                     "scoring_status": "complete",
+                    # A row is graded when Phase 2 wrote axis_scores — NOT when
+                    # scoring_status says 'complete'. _is_pending ignores that
+                    # column on purpose (prod carries "complete" rows that were
+                    # never graded), and since 2026-08-08 the score floor keys on
+                    # axis_scores too. A fixture that omits it models a row the
+                    # app classifies as Pending, so it exempted itself from the
+                    # very floor these tests exist to prove.
+                    "axis_scores": {"title_fit": 80},
                     "excluded": False,
                 },
             ]

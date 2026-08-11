@@ -23,30 +23,31 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.experience import OptimizedPayload
-from app.models.targets import JobTarget
+from app.models.targets import AxisWeights, JobTarget
 from app.services.db_write import poll_db_write
+from app.services.fit.axis_weights import display_score_from_axes
 from app.services.fit.job_fit import JOB_FIT_PURPOSE, JobFitResult, derive_job_fit
 from app.services.llm.client import LLMClient
-from app.services.llm.cost_log import record as record_llm_cost
+from app.services.llm.cost_log import record_async as record_llm_cost_async
 
 logger = logging.getLogger(__name__)
 
 
 async def _apply_scores_update(
-    supabase: Client,
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     target_id: str,
     payload: dict[str, Any],
 ) -> None:
     """Persist a ``scores`` UPDATE for one (job, target) via the poll-write
-    seam (#57): async on the event loop when ``POLLER_ASYNC_DB`` is on, else
-    the sync client in a thread — with transient-blip retry and cycle-wide
-    herd bounding either way. See ``app.services.db_write.poll_db_write``."""
+    seam (#57): awaited on the pooled ``AsyncClient`` (the poll cycle is
+    unconditionally async now), with transient-blip retry and cycle-wide herd
+    bounding. See ``app.services.db_write.poll_db_write``."""
     await poll_db_write(
         supabase,
         lambda c: (
@@ -60,7 +61,7 @@ async def _apply_scores_update(
 
 
 async def score_with_phase2_and_persist(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     payload: OptimizedPayload,
@@ -131,9 +132,12 @@ async def score_with_phase2_and_persist(
         return None
 
     # Log cost BEFORE the DB update so quota counting stays accurate
-    # even if the persistence step fails (we did spend the tokens).
+    # even if the persistence step fails (we did spend the tokens). Awaited on
+    # the pooled async client (#57 PR-G2e-3) — the interactive cost write lands
+    # on the loop rather than a threadpool worker, same immediate-INSERT
+    # semantics as the sync ``record`` so ``phase2_quota_remaining`` sees it.
     try:
-        record_llm_cost(
+        await record_llm_cost_async(
             supabase,
             user_id=user_id,
             purpose=JOB_FIT_PURPOSE,
@@ -151,8 +155,16 @@ async def score_with_phase2_and_persist(
         )
 
     try:
+        # #609: persist the deterministic default-weight axis blend, not the
+        # model's holistic ``fit_score``. The holistic number band-compresses
+        # upward (prod 2026-08-05: axes {title 85, skills 88, seniority 80,
+        # domain 55} stored as score=100; 326 rows >=90), which walled the
+        # graded band at ~100 and stripped the score column of signal. The
+        # quartile blend is what the per-user weighted display reproduces at
+        # read time, so stored and displayed scores now share one definition.
+        persisted_score = display_score_from_axes(fit.axes.model_dump(), AxisWeights())
         update_payload: dict[str, Any] = {
-            "score": fit.fit_score,
+            "score": persisted_score,
             "axis_scores": fit.axes.model_dump(),
             "fit_reasoning": fit.reasoning,
             "scoring_status": "complete",
@@ -167,7 +179,7 @@ async def score_with_phase2_and_persist(
             # decay is off). When decay is on the poller's
             # refresh_recency_scores_poll pass overwrites this with the
             # age-decayed value later in the same cycle.
-            "recency_score": fit.fit_score,
+            "recency_score": persisted_score,
             "updated_at": datetime.now(UTC).isoformat(),
         }
         # Only write logistics when the grader emitted it (flag was on

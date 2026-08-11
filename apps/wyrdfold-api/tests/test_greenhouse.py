@@ -60,10 +60,43 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
     assert job.external_id == "123"
     assert job.title == "Senior Frontend Engineer"
     assert job.location_name == "Remote"
-    assert job.department == "Engineering"
     assert job.content == "<p>desc</p>"
-    assert job.updated_at == "2024-01-01T00:00:00Z"
+    assert job.posted_at == "2024-01-01T00:00:00Z"
     assert job.absolute_url == "https://example.com/jobs/123"
+
+
+@pytest.mark.asyncio
+async def test_fetch_unescapes_html_escaped_content(mock_http_client):
+    """The Job Board API delivers `content` HTML-ESCAPED (unlike every other
+    board source). Ingestion must unescape so `description_html` stores REAL
+    markup — stored-escaped rows surfaced as literal tag soup on the public
+    search cards (prod bug, 2026-07-26)."""
+    payload = {
+        "jobs": [
+            {
+                "id": 7,
+                "title": "Senior Full Stack Engineer",
+                "location": {"name": "Remote"},
+                "departments": [{"name": "Engineering"}],
+                # Verbatim shape of the real prod payload (LeafLink head).
+                "content": (
+                    "&lt;div class=&quot;content-intro&quot;&gt;&lt;h2&gt;"
+                    "&lt;strong&gt;About LeafLink&lt;/strong&gt;&lt;/h2&gt;"
+                    "&lt;p&gt;B2B&amp;nbsp;platform&lt;/p&gt;&lt;/div&gt;"
+                ),
+                "updated_at": "2024-01-01T00:00:00Z",
+                "absolute_url": "https://example.com/jobs/7",
+            }
+        ]
+    }
+    resp = _mock_response(200, payload)
+    mock_http_client.get = AsyncMock(return_value=resp)
+    (job,) = await fetch_board_jobs("leaflink")
+    # Real markup now — the snippet builder's get_text() strips it cleanly.
+    assert job.content == (
+        '<div class="content-intro"><h2><strong>About LeafLink</strong></h2>'
+        "<p>B2B&nbsp;platform</p></div>"
+    )
 
 
 @pytest.mark.asyncio
@@ -85,4 +118,3 @@ async def test_fetch_missing_location_and_departments(mock_http_client):
     mock_http_client.get = AsyncMock(return_value=resp)
     result = await fetch_board_jobs("foo")
     assert result[0].location_name is None
-    assert result[0].department is None

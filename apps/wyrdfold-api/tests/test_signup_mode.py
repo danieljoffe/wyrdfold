@@ -9,27 +9,34 @@ state, and the operator lever is api-key-gated with a validated value.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
 
 
 @pytest.fixture
 def sb() -> Any:
     fake = MagicMock(name="supabase")
-    fake.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
-    app.dependency_overrides[get_supabase] = lambda: fake
+    # Both endpoints are async (#57 slice 4): the awaited ``.execute()`` needs
+    # AsyncMocks on the select-read and upsert-write chains.
+    fake.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    fake.table.return_value.upsert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    app.dependency_overrides[get_async_service_supabase] = lambda: fake
     yield fake
     app.dependency_overrides.clear()
 
 
 def _mode(sb: MagicMock, value: Any) -> None:
-    sb.table.return_value.select.return_value.eq.return_value.execute.return_value.data = (
-        [{"value": value}] if value is not None else []
+    sb.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[{"value": value}] if value is not None else [])
     )
 
 

@@ -27,17 +27,21 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config import settings
-from app.dependencies import _try_decode_jwt_sub
+from app.dependencies import try_decode_jwt_sub_cache_only
 
 
 def _user_or_ip_key(request: Request) -> str:
     """Return ``jwt:<sub>`` when a valid Supabase JWT is present, else
     ``ip:<host>``.
 
-    Synchronous on the hot path; the JWT decode is cached by PyJWKClient so
-    repeat lookups for the same key id are O(1).
+    Runs synchronously inside slowapi's middleware — on the event loop, on every
+    request. So it decodes against the pre-warmed, out-of-band-refreshed JWKS
+    key set (``try_decode_jwt_sub_cache_only``) and NEVER does a blocking network
+    fetch: a token whose key id isn't in the warm set falls back to IP keying
+    rather than stalling the loop on a JWKS round-trip (Perf-F1). The signature
+    is still verified against real keys, so a returned ``sub`` is authentic.
     """
-    sub = _try_decode_jwt_sub(request, settings)
+    sub = try_decode_jwt_sub_cache_only(request, settings)
     if sub:
         return f"jwt:{sub}"
     return f"ip:{get_remote_address(request)}"

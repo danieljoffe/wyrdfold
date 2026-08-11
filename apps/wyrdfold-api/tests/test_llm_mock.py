@@ -7,6 +7,7 @@ import pytest
 from app.models.llm import Message
 from app.models.targets import TargetSuggestions
 from app.services.llm.client import complete_json
+from app.services.llm.errors import MissingToolCallError
 from app.services.llm.mock import (
     QUERY_SUGGEST_PURPOSE,
     MockLLMClient,
@@ -166,6 +167,26 @@ async def test_complete_tool_use_returns_dict_from_scripted_json() -> None:
     assert result.content == '{"a": 1, "b": "two"}'
 
 
+async def test_complete_tool_use_prose_script_raises_missing_tool_call() -> None:
+    """Prose scripted output models the deepseek 2026-08-05 flake — the model
+    ignoring ``tool_choice`` and answering in plain text. The mock must raise
+    the same typed ``MissingToolCallError`` the real parser does, so surface
+    tests inherit the exact failure shape from the bug corpus."""
+    client = MockLLMClient(
+        scripted={"tool": "This title is clearly unrelated to DevOps/SRE engineering."}
+    )
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
+        await client.complete_tool_use(
+            model="deepseek-v3-2",
+            system="",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_TitleTriageResponse",
+            tool_description="d",
+            tool_input_schema={"type": "object"},
+            purpose="tool",
+        )
+
+
 async def test_complete_tool_use_records_tool_name_in_call_log() -> None:
     client = MockLLMClient(scripted={"tool": "{}"})
     await client.complete_tool_use(
@@ -230,3 +251,144 @@ async def test_dev_default_query_suggest_survives_blank_query() -> None:
     )
     assert parsed.suggestions
     assert all(s.label for s in parsed.suggestions)
+
+
+def test_dev_default_job_analysis_is_schema_valid() -> None:
+    """The dev-default analysis verdict must validate as ``JobAnalysis``.
+
+    The 2026-08-05 e2e drive found the generic echo failing validation, so
+    every mock-env analysis surfaced "Analysis failed" — local dev and CI
+    could not drive the panel's flagship flow (#608). This pins the canned
+    verdict to the real schema so model drift breaks the test, not the
+    mock environments.
+    """
+    import json
+
+    from app.models.analysis import JobAnalysis
+    from app.services.llm.mock import JOB_ANALYSIS_PURPOSE, dev_default_responses
+
+    source = dev_default_responses()[JOB_ANALYSIS_PURPOSE]
+    assert callable(source)
+    payload = json.loads(source("ignored", []))
+    analysis = JobAnalysis.model_validate(payload)
+    assert analysis.recommendation
+    assert analysis.scorecard.skills_matched
+
+
+def test_ats_hostile_resume_is_schema_valid_but_fails_the_real_linter() -> None:
+    """Bug-corpus entry for #656: a resume the model got *right* by its own
+    contract and wrong by the ATS linter's.
+
+    Both halves are load-bearing. Schema-valid, or the flagged-draft path
+    would never be reached (trace validation would reject it first). Actually
+    lint-failing under the REAL linter, or a surface scripting it would think
+    it was exercising the flagged path while quietly taking the success
+    branch. A stubbed linter can't catch either mistake.
+    """
+    from app.models.tailor import TailoredResume
+    from app.services.ats_lint import lint_markdown
+    from app.services.llm.mock import ats_hostile_resume_json
+    from app.services.tailor.markdown_render import to_markdown
+
+    resume = TailoredResume.model_validate_json(ats_hostile_resume_json())
+    result = lint_markdown(to_markdown(resume), document_type="resume")
+
+    assert result.ok is False
+    assert any(v.code == "no_tables" and v.severity == "error" for v in result.errors)
+
+
+def _dev_optimized():
+    from app.models.experience import OptimizedPayload, Outcome, Role, Skill
+
+    return OptimizedPayload(
+        summary="Senior FE.",
+        roles=[
+            Role(
+                id="fc",
+                company="FightCamp",
+                title="Senior Frontend Engineer",
+                start="2021-11",
+                end="2024-04",
+                summary="Led the PDP rebuild.",
+                skills=["React"],
+                outcome_refs=["o1"],
+            )
+        ],
+        skills=[Skill(name="React"), Skill(name="TypeScript")],
+        outcomes=[
+            Outcome(
+                description="Cut mobile load times from 10s to 2s",
+                metric="LCP",
+                value="2s",
+                role_ref="fc",
+            )
+        ],
+    )
+
+
+def test_dev_default_tailor_resume_survives_the_real_trace_validator() -> None:
+    """Schema-valid is NOT enough here — ``validate_trace_refs`` RAISES on a
+    ``source_role_ref`` that isn't a real ``Role.id``, and silently drops
+    bullets carrying a number the source doesn't have. So a canned response
+    would either explode or come back empty.
+
+    Same gap #608 closed for ``job_analysis``: without a seed the echo fails
+    validation and every mock-env tailoring dies with "Resume generation
+    failed" — local dev and CI can't drive the flow at all. Re-found by a live
+    drive on 2026-08-07, which is why this pins the validator, not the schema.
+    """
+    from app.models.tailor import ContactInfo, TailoredResume
+    from app.services.llm.mock import TAILOR_RESUME_PURPOSE, dev_default_responses
+    from app.services.tailor.tailor import build_user_message, validate_trace_refs
+
+    optimized = _dev_optimized()
+    prompt = build_user_message(
+        optimized=optimized,
+        job_description="We want a senior FE.",
+        contact=ContactInfo(name="Daniel Joffe", email="d@example.com"),
+        resume_type="generic",
+        preferences_text=None,
+        annotations_text=None,
+        critique=None,
+        page_budget=2,
+    )
+
+    source = dev_default_responses()[TAILOR_RESUME_PURPOSE]
+    assert callable(source)
+    resume = TailoredResume.model_validate_json(source(prompt, []))
+
+    repaired, warnings = validate_trace_refs(resume, optimized)
+    assert repaired.experience, "trace validation stripped every role"
+    assert repaired.experience[0].source_role_ref == "fc"
+    # The bullet survived — it traces to a real outcome and invents no number.
+    assert repaired.experience[0].bullets, "trace validation dropped every bullet"
+    assert repaired.skills, "every skill was rejected as unknown"
+
+
+def test_dev_default_cover_letter_survives_the_real_ref_validator() -> None:
+    from app.models.tailor import ContactInfo, TailoredCoverLetter
+    from app.services.llm.mock import TAILOR_COVER_LETTER_PURPOSE, dev_default_responses
+    from app.services.tailor.tailor import (
+        build_cover_letter_user_message,
+        validate_cover_letter_refs,
+    )
+
+    optimized = _dev_optimized()
+    prompt = build_cover_letter_user_message(
+        optimized=optimized,
+        job_description="We want a senior FE.",
+        company_name="Acme",
+        contact=ContactInfo(name="Daniel Joffe", email="d@example.com"),
+        role_title="Senior Frontend Engineer",
+        preferences_text=None,
+        annotations_text=None,
+        critique=None,
+    )
+
+    source = dev_default_responses()[TAILOR_COVER_LETTER_PURPOSE]
+    assert callable(source)
+    letter = TailoredCoverLetter.model_validate_json(source(prompt, []))
+
+    assert letter.recipient_company == "Acme"
+    assert letter.paragraphs
+    validate_cover_letter_refs(letter, optimized)

@@ -35,14 +35,13 @@ poll_db_read`), so the health pass rides the pooled async client when
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
 import httpx
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.config import settings
 from app.services.db_write import poll_db_read
@@ -92,18 +91,18 @@ class IngestionHealthReport:
     alerts: list[str] = field(default_factory=list)
 
 
-async def _newest_job_created_at(supabase: Client) -> datetime | None:
-    """``max(jobs.created_at)`` via a 1-row keyset read on the existing
-    ``created_at DESC`` index — cheaper than an aggregate scan."""
+async def _newest_job_created_at(supabase: AsyncClient) -> datetime | None:
+    """``max(jobs.cataloged_at)`` via a 1-row keyset read on the existing
+    ``idx_jobs_cataloged_at`` index — cheaper than an aggregate scan."""
     resp = await poll_db_read(
         supabase,
-        lambda c: c.table("jobs").select("created_at").order("created_at", desc=True).limit(1),
+        lambda c: c.table("jobs").select("cataloged_at").order("cataloged_at", desc=True).limit(1),
         label="health newest-job read",
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
-    raw = rows[0].get("created_at")
+    raw = rows[0].get("cataloged_at")
     if not raw:
         return None
     # PostgREST returns ISO-8601; normalise the trailing Z for fromisoformat.
@@ -113,7 +112,7 @@ async def _newest_job_created_at(supabase: Client) -> datetime | None:
     return parsed
 
 
-async def _source_counts(supabase: Client) -> tuple[int, int]:
+async def _source_counts(supabase: AsyncClient) -> tuple[int, int]:
     """Returns ``(total_sources, disabled_sources)``."""
     # ``head=True`` → PostgREST issues a HEAD, returning only the
     # Content-Range count and *zero* rows. Without it, ``count="exact"``
@@ -135,7 +134,7 @@ async def _source_counts(supabase: Client) -> tuple[int, int]:
     return int(total_resp.count or 0), int(disabled_resp.count or 0)
 
 
-async def _newest_discovery_at(supabase: Client) -> datetime | None:
+async def _newest_discovery_at(supabase: Client | AsyncClient) -> datetime | None:
     """``max(source_discoveries.discovered_at)`` via a 1-row keyset read on
     the ``discovered_at DESC`` index — the timestamp of the most recent
     discovery attempt of any outcome (inserted / duplicate / filtered)."""
@@ -161,7 +160,7 @@ async def _newest_discovery_at(supabase: Client) -> datetime | None:
     return parsed
 
 
-async def _newest_source_polled_at(supabase: Client) -> datetime | None:
+async def _newest_source_polled_at(supabase: AsyncClient) -> datetime | None:
     """``max(sources.last_polled_at)`` via a 1-row keyset read — the poll
     cycle's behavioral freshness stamp (every polled source updates it, so it
     advances continuously while any polling happens at all). ``nullsfirst=
@@ -189,7 +188,7 @@ async def _newest_source_polled_at(supabase: Client) -> datetime | None:
     return parsed
 
 
-async def _held_advisory_locks(supabase: Client) -> dict[int, dict[str, Any]]:
+async def _held_advisory_locks(supabase: AsyncClient) -> dict[int, dict[str, Any]]:
     """Granted session advisory locks keyed by their bigint lock key (#350).
 
     Reads the ``advisory_lock_info`` SECURITY DEFINER RPC (service-role
@@ -243,7 +242,7 @@ async def _openrouter_remaining_usd(
 
 
 async def check_ingestion_health(
-    supabase: Client, *, now: datetime | None = None
+    supabase: AsyncClient, *, now: datetime | None = None
 ) -> IngestionHealthReport:
     """Run the health checks and alert on anything unhealthy.
 
@@ -360,8 +359,8 @@ async def check_ingestion_health(
             remaining = await _openrouter_remaining_usd()
             report.credit_remaining_usd = remaining
             if remaining is not None:
-                week_spend = await asyncio.to_thread(
-                    cost_log.total_spend_all, supabase, moment - timedelta(days=7)
+                week_spend = await cost_log.total_spend_all_async(
+                    supabase, moment - timedelta(days=7)
                 )
                 daily_rate = week_spend / 7.0
                 runway_days = remaining / daily_rate if daily_rate > 0 else None

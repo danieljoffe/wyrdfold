@@ -66,8 +66,21 @@ async def test_call_is_tracked() -> None:
             "purpose": "tracked",
             "input_count": 2,
             "input_type": "document",
+            "output_dimension": None,
         },
     ]
+
+
+async def test_output_dimension_shortens_the_vector() -> None:
+    """Matryoshka contract: an explicit output_dimension wins over the model
+    default AND really is the vector length — so dimension-mismatch bugs
+    reproduce in tests instead of hiding behind a fixed-size mock."""
+    client = MockEmbeddingsClient()
+    result = await client.embed(
+        model="voyage-3.5", inputs=["x"], purpose="t", output_dimension=512
+    )
+    assert len(result.embeddings[0]) == 512
+    assert client.calls[0]["output_dimension"] == 512
 
 
 async def test_input_type_defaults_to_document() -> None:

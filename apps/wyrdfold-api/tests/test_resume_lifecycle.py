@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -115,55 +116,57 @@ class TestBulkExportRequestValidation:
 
 
 class TestPersistenceHelpers:
-    def test_update_payload(self) -> None:
+    async def test_update_payload(self) -> None:
         from app.services.tailor.persistence import update_payload
 
         supabase = MagicMock()
         updated_record = _make_record()
         # Chain: update → eq(id) → eq(user_id→SYSTEM) → execute (user_id=None path)
-        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
-            updated_record.model_dump(mode="json")
-        ]
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[updated_record.model_dump(mode="json")]))
+        )
 
-        result = update_payload(supabase, "rec-1", {"summary": "Updated"}, user_id=None)
+        with patch("app.services.tailor.versions.record", new_callable=AsyncMock):
+            result = await update_payload(supabase, "rec-1", {"summary": "Updated"}, user_id=None)
         assert result.id == "rec-1"
         supabase.table.assert_called_with("documents")
 
-    def test_update_payload_with_storage_path(self) -> None:
+    async def test_update_payload_with_storage_path(self) -> None:
         from app.services.tailor.persistence import update_payload
 
         supabase = MagicMock()
         updated_record = _make_record()
-        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
-            updated_record.model_dump(mode="json")
-        ]
-
-        result = update_payload(
-            supabase,
-            "rec-1",
-            {"summary": "Updated"},
-            storage_path="anon/rec-1.docx",
-            user_id=None,
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[updated_record.model_dump(mode="json")]))
         )
+
+        with patch("app.services.tailor.versions.record", new_callable=AsyncMock):
+            result = await update_payload(
+                supabase,
+                "rec-1",
+                {"summary": "Updated"},
+                storage_path="anon/rec-1.docx",
+                user_id=None,
+            )
         assert result.id == "rec-1"
         # Verify the update call included storage_path
         call_args = supabase.table.return_value.update.call_args
         assert call_args[0][0]["storage_path"] == "anon/rec-1.docx"
 
-    def test_approve(self) -> None:
+    async def test_approve(self) -> None:
         from app.services.tailor.persistence import approve
 
         supabase = MagicMock()
         approved_record = _make_record(approved_at=_NOW)
-        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
-            approved_record.model_dump(mode="json")
-        ]
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[approved_record.model_dump(mode="json")]))
+        )
 
-        result = approve(supabase, "rec-1", user_id=None)
+        result = await approve(supabase, "rec-1", user_id=None)
         assert result.id == "rec-1"
         assert result.approved_at is not None
 
-    def test_get_by_job_found(self) -> None:
+    async def test_get_by_job_found(self) -> None:
         from app.services.tailor.persistence import get_by_job
 
         supabase = MagicMock()
@@ -172,26 +175,28 @@ class TestPersistenceHelpers:
         # (``user_id=None`` legacy path here)
         chain = supabase.table.return_value.select.return_value
         chain = chain.eq.return_value.eq.return_value.eq.return_value
-        chain.order.return_value.limit.return_value.execute.return_value.data = [
-            record.model_dump(mode="json")
-        ]
+        chain.order.return_value.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[record.model_dump(mode="json")])
+        )
 
-        result = get_by_job(supabase, "job-1", user_id=None)
+        result = await get_by_job(supabase, "job-1", user_id=None)
         assert result is not None
         assert result.id == "rec-1"
 
-    def test_get_by_job_not_found(self) -> None:
+    async def test_get_by_job_not_found(self) -> None:
         from app.services.tailor.persistence import get_by_job
 
         supabase = MagicMock()
         chain = supabase.table.return_value.select.return_value
         chain = chain.eq.return_value.eq.return_value.eq.return_value
-        chain.order.return_value.limit.return_value.execute.return_value.data = []
+        chain.order.return_value.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
 
-        result = get_by_job(supabase, "nonexistent", user_id=None)
+        result = await get_by_job(supabase, "nonexistent", user_id=None)
         assert result is None
 
-    def test_get_by_job_filters_by_document_type(self) -> None:
+    async def test_get_by_job_filters_by_document_type(self) -> None:
         """Cover letter lookup must scope to document_type='cover_letter' so
         a resume on the same job posting doesn't shadow it."""
         from app.services.tailor.persistence import get_by_job
@@ -199,9 +204,11 @@ class TestPersistenceHelpers:
         supabase = MagicMock()
         chain = supabase.table.return_value.select.return_value
         chain = chain.eq.return_value.eq.return_value.eq.return_value
-        chain.order.return_value.limit.return_value.execute.return_value.data = []
+        chain.order.return_value.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
 
-        get_by_job(supabase, "job-1", user_id=None, document_type="cover_letter")
+        await get_by_job(supabase, "job-1", user_id=None, document_type="cover_letter")
 
         # Walk the .eq() calls and assert both the job + the document_type
         # filter were issued.
@@ -213,24 +220,27 @@ class TestPersistenceHelpers:
         assert ("job_posting_id", "job-1") in all_eq_args
         assert ("document_type", "cover_letter") in all_eq_args
 
-    def test_mark_job_resume_draft_does_not_touch_jobs_status(self) -> None:
+    async def test_mark_job_resume_draft_does_not_touch_jobs_status(self) -> None:
         """#75 C3: per-user pipeline state lives in user_jobs; the helper no
         longer writes the global jobs.status. With no user_id it's a no-op."""
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
-        mark_job_resume_draft(supabase, "job-42", user_id=None)
+        await mark_job_resume_draft(supabase, "job-42", user_id=None)
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
         assert "jobs" not in tables
 
-    def test_mark_job_resume_draft_writes_user_jobs(self) -> None:
+    async def test_mark_job_resume_draft_writes_user_jobs(self) -> None:
         """With a known user_id (#75 C3) the helper mirrors into user_jobs
         only (no global jobs.status write)."""
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
-        mark_job_resume_draft(supabase, "job-42", user_id="user-7")
+        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
+        await mark_job_resume_draft(supabase, "job-42", user_id="user-7")
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
         assert "jobs" not in tables
@@ -240,12 +250,12 @@ class TestPersistenceHelpers:
         assert upsert_payload["job_posting_id"] == "job-42"
         assert upsert_payload["status"] == "resume_draft"
 
-    def test_mark_job_resume_draft_skips_user_jobs_for_api_key(self) -> None:
+    async def test_mark_job_resume_draft_skips_user_jobs_for_api_key(self) -> None:
         """user_id=None (api-key/cron path) skips the mirror in C1."""
         from app.services.tailor.persistence import mark_job_resume_draft
 
         supabase = MagicMock()
-        mark_job_resume_draft(supabase, "job-42", user_id=None)
+        await mark_job_resume_draft(supabase, "job-42", user_id=None)
 
         tables = [c.args[0] for c in supabase.table.call_args_list]
         assert "user_jobs" not in tables
@@ -276,10 +286,20 @@ class TestSingleResumeStatusBump:
     after a successful generation. Without this the JobDetailPanel never
     shows the 'Review Resume' button — the resume exists in the DB but is
     invisible to the user.
+
+    Post-#656 the bump runs inside the DETACHED task, not the handler — which
+    is exactly the drift this test now guards: the handler returns 202 long
+    before the pipeline finishes, so a bump left behind in the handler would
+    silently stop firing for every real (backgrounded) generation.
     """
 
     @pytest.mark.asyncio
-    async def test_full_generation_marks_job_resume_draft(self) -> None:
+    async def test_full_generation_marks_job_resume_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.responses import JSONResponse
+
+        from app.config import settings
         from app.models.tailor import TailorRequest
         from app.routers import tailor as tailor_router
         from app.services.tailor import PipelineSuccess
@@ -296,23 +316,41 @@ class TestSingleResumeStatusBump:
             llm_result=MagicMock(),
         )
 
+        # Capture the detached task instead of letting it run loose, so the
+        # assertion drives it deterministically.
+        captured: list[Any] = []
+        monkeypatch.setattr(
+            tailor_router,
+            "spawn_detached",
+            lambda coro, *, name: captured.append(coro) or MagicMock(),
+        )
+
         with (
-            patch("app.routers.tailor.optimized") as mock_opt,
-            patch("app.routers.tailor.preferences") as mock_prefs,
+            patch(
+                "app.routers.tailor._optimized_latest",
+                new_callable=AsyncMock,
+                return_value=MagicMock(payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])),
+            ),
+            patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
             patch(
                 "app.routers.tailor.resolve_contact",
+                new_callable=AsyncMock,
                 return_value=_CONTACT,
             ),
             patch(
                 "app.routers.tailor.run_tailor_pipeline",
+                new_callable=AsyncMock,
                 return_value=success,
             ),
-            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
+            # The kick now verifies the posting exists before spawning (a
+            # 202 must mean work that can actually run).
+            patch(
+                "app.routers.tailor._posting_exists",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock) as mock_mark,
         ):
-            mock_opt.get_latest.return_value = MagicMock(
-                payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
-            )
-            mock_prefs.get.return_value = None
             # Bypass the structural gap gate — we're testing the post-success path.
             with patch(
                 "app.routers.tailor.gap_tracker.can_generate",
@@ -320,7 +358,7 @@ class TestSingleResumeStatusBump:
             ):
                 # force_fresh skips the reuse short-circuit so we hit the full
                 # generation branch deterministically.
-                await tailor_router.create_tailored_resume(
+                resp = await tailor_router.create_tailored_resume(
                     request=MagicMock(),
                     body=TailorRequest(
                         job_description="Build things.",
@@ -330,11 +368,20 @@ class TestSingleResumeStatusBump:
                     ),
                     supabase=supabase,
                     llm=llm,
+                    user_id="u-1",
+                    s=settings,
                 )
 
-        # Dual-write threads user_id through (#75 C1); the route is invoked
-        # without resolving the JWT dependency here, so just assert the
-        # positional contract + that user_id is passed as a keyword.
+            # The handler returned 202 without waiting for the pipeline...
+            assert isinstance(resp, JSONResponse)
+            assert resp.status_code == 202
+            mock_mark.assert_not_called()
+
+            # ...and the bump lands when the detached task runs.
+            assert len(captured) == 1
+            await captured[0]
+
+        # Dual-write threads user_id through (#75 C1).
         mock_mark.assert_called_once()
         assert mock_mark.call_args.args == (supabase, "job-1")
         assert "user_id" in mock_mark.call_args.kwargs
@@ -360,22 +407,24 @@ class TestSingleResumeStatusBump:
         )
 
         with (
-            patch("app.routers.tailor.optimized") as mock_opt,
-            patch("app.routers.tailor.preferences") as mock_prefs,
+            patch(
+                "app.routers.tailor._optimized_latest",
+                new_callable=AsyncMock,
+                return_value=MagicMock(payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])),
+            ),
+            patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
             patch(
                 "app.routers.tailor.resolve_contact",
+                new_callable=AsyncMock,
                 return_value=_CONTACT,
             ),
             patch(
                 "app.routers.tailor.run_tailor_pipeline",
+                new_callable=AsyncMock,
                 return_value=success,
             ),
-            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
+            patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock) as mock_mark,
         ):
-            mock_opt.get_latest.return_value = MagicMock(
-                payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
-            )
-            mock_prefs.get.return_value = None
             with patch(
                 "app.routers.tailor.gap_tracker.can_generate",
                 return_value=MagicMock(ok=True),
@@ -413,14 +462,16 @@ class TestEditResume:
         with (
             patch(
                 "app.services.tailor.persistence.get",
+                new_callable=AsyncMock,
                 return_value=record,
             ),
             patch(
                 "app.services.tailor.persistence.update_payload_md",
+                new_callable=AsyncMock,
                 return_value=updated_record,
             ),
         ):
-            result = tailor_router.edit_tailored_resume(
+            result = await tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -437,10 +488,10 @@ class TestEditResume:
         supabase = MagicMock()
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=None),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.edit_tailored_resume(
+            await tailor_router.edit_tailored_resume(
                 resume_id="nonexistent",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -457,10 +508,10 @@ class TestEditResume:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.edit_tailored_resume(
+            await tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=self._GOOD_MD),
                 supabase=supabase,
@@ -486,13 +537,14 @@ class TestEditResume:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.update_payload_md",
+                new_callable=AsyncMock,
                 return_value=record,
             ),
         ):
-            result = tailor_router.edit_tailored_resume(
+            result = await tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=cover_md),
                 supabase=supabase,
@@ -513,10 +565,10 @@ class TestEditResume:
         bad_md = "# Daniel Joffe\n\n## Skills\n\nPython\n"
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.edit_tailored_resume(
+            await tailor_router.edit_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeEditRequest(markdown=bad_md),
                 supabase=supabase,
@@ -535,17 +587,21 @@ class TestApproveResume:
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
+        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
         record = _make_record()
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.approve",
+                new_callable=AsyncMock,
                 return_value=approved_record,
             ),
         ):
-            result = tailor_router.approve_tailored_resume(
+            result = await tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -567,7 +623,7 @@ class TestApproveResume:
             "app.services.tailor.persistence.get",
             return_value=already_approved,
         ):
-            result = tailor_router.approve_tailored_resume(
+            result = await tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -583,10 +639,10 @@ class TestApproveResume:
         supabase = MagicMock()
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=None),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.approve_tailored_resume(
+            await tailor_router.approve_tailored_resume(
                 resume_id="nonexistent",
                 supabase=supabase,
             )
@@ -603,13 +659,14 @@ class TestApproveResume:
         approved_record = _make_record(document_type="cover_letter", approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.approve",
+                new_callable=AsyncMock,
                 return_value=approved_record,
             ),
         ):
-            result = tailor_router.approve_tailored_resume(
+            result = await tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
             )
@@ -626,17 +683,21 @@ class TestApproveResume:
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
+        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
         record = _make_record()
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.approve",
+                new_callable=AsyncMock,
                 return_value=approved_record,
             ),
         ):
-            tailor_router.approve_tailored_resume(
+            await tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id="user-7",
@@ -656,17 +717,21 @@ class TestApproveResume:
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
+        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
         record = _make_record()
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.approve",
+                new_callable=AsyncMock,
                 return_value=approved_record,
             ),
         ):
-            tailor_router.approve_tailored_resume(
+            await tailor_router.approve_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id=None,
@@ -683,17 +748,21 @@ class TestApproveResume:
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
+        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[])
+        )
         approved = _make_record(approved_at=_NOW)
         reopened = _make_record(approved_at=None)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=approved),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=approved),
             patch(
                 "app.services.tailor.persistence.unapprove",
+                new_callable=AsyncMock,
                 return_value=reopened,
             ),
         ):
-            tailor_router.unapprove_tailored_resume(
+            await tailor_router.unapprove_tailored_resume(
                 resume_id="rec-1",
                 supabase=supabase,
                 user_id="user-7",
@@ -724,9 +793,10 @@ class TestExportZip:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.download_docx",
+                new_callable=AsyncMock,
                 return_value=b"fake-docx",
             ),
         ):
@@ -756,7 +826,7 @@ class TestExportZip:
         unapproved = _make_record(approved_at=None)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=unapproved),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=unapproved),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.export_resumes_zip(
@@ -774,7 +844,7 @@ class TestExportZip:
         supabase = MagicMock()
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=None),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.export_resumes_zip(
@@ -792,6 +862,8 @@ class TestExportZip:
 class TestGetByJob:
     @pytest.mark.asyncio
     async def test_get_by_job_found(self) -> None:
+        """A persisted record comes back inside the #656 poll envelope, with
+        ``status='idle'`` — nothing is in flight, this document is settled."""
         from app.routers import tailor as tailor_router
 
         supabase = MagicMock()
@@ -801,21 +873,25 @@ class TestGetByJob:
             "app.services.tailor.persistence.get_by_job",
             return_value=record,
         ):
-            result = tailor_router.get_resume_by_job(
+            result = await tailor_router.get_resume_by_job(
                 job_posting_id="job-1",
                 supabase=supabase,
+                user_id="u-1",
             )
 
-        assert result.id == "rec-1"
-        assert result.job_posting_id == "job-1"
+        assert result.record is not None
+        assert result.record.id == "rec-1"
+        assert result.record.job_posting_id == "job-1"
+        assert result.status == "idle"
 
     @pytest.mark.asyncio
     async def test_get_by_job_returns_none_when_missing(self) -> None:
-        """The route returns ``None`` (200 + null body) instead of raising
-        a 404 when no record exists — the FE consumer treats null as
+        """The route returns a null ``record`` (200 + envelope) instead of
+        raising a 404 when nothing exists — the FE consumer treats it as
         "no record yet, render the Generate CTA", and dropping the 404
         avoids polluting Sentry with a console error on every
-        job-detail visit before generation.
+        job-detail visit before generation. ``status='idle'`` is what tells
+        it apart from "still generating".
         """
         from app.routers import tailor as tailor_router
 
@@ -825,11 +901,13 @@ class TestGetByJob:
             "app.services.tailor.persistence.get_by_job",
             return_value=None,
         ):
-            result = tailor_router.get_resume_by_job(
+            result = await tailor_router.get_resume_by_job(
                 job_posting_id="nonexistent",
                 supabase=supabase,
+                user_id="u-1",
             )
-        assert result is None
+        assert result.record is None
+        assert result.status == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -849,17 +927,17 @@ class TestUpdatePayloadMd:
     `versions.checkpoint` calls (session-end flush, pre-approve, pre-readapt).
     """
 
-    def test_invalidates_docx_cache_hash(self) -> None:
+    async def test_invalidates_docx_cache_hash(self) -> None:
         from app.services.tailor.persistence import update_payload_md
 
         supabase = MagicMock()
         updated = _make_record(payload_md=_GOOD_MD, docx_payload_md_hash=None)
-        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
-            updated.model_dump(mode="json")
-        ]
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[updated.model_dump(mode="json")]))
+        )
 
-        with patch("app.services.tailor.versions.record") as mock_record:
-            update_payload_md(supabase, "rec-1", _GOOD_MD, user_id=None)
+        with patch("app.services.tailor.versions.record", new_callable=AsyncMock) as mock_record:
+            await update_payload_md(supabase, "rec-1", _GOOD_MD, user_id=None)
 
         # Update payload includes the markdown and explicitly NULLs the cache hash.
         update_call = supabase.table.return_value.update.call_args[0][0]
@@ -891,14 +969,15 @@ class TestCheckpointEndpoint:
         record = _make_record(payload_md=_GOOD_MD)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.versions.checkpoint",
+                new_callable=AsyncMock,
                 return_value=True,
             ) as mock_checkpoint,
-            patch("app.services.tailor.persistence.update_payload_md") as mock_update,
+            patch("app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock) as mock_update,
         ):
-            result = tailor_router.checkpoint_tailored_resume(
+            result = await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
@@ -918,14 +997,15 @@ class TestCheckpointEndpoint:
         new_md = "# New\n\n## Experience\n\n### Eng — Acme\n\n- Did things\n"
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
-            patch("app.services.tailor.persistence.update_payload_md") as mock_update,
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch("app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock) as mock_update,
             patch(
                 "app.services.tailor.versions.checkpoint",
+                new_callable=AsyncMock,
                 return_value=True,
             ) as mock_checkpoint,
         ):
-            tailor_router.checkpoint_tailored_resume(
+            await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(markdown=new_md),
                 supabase=supabase,
@@ -954,11 +1034,11 @@ class TestCheckpointEndpoint:
         bad_md = "# Daniel\n\n## Skills\n\nPython\n"
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
-            patch("app.services.tailor.versions.checkpoint") as mock_checkpoint,
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch("app.services.tailor.versions.checkpoint", new_callable=AsyncMock) as mock_checkpoint,
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.checkpoint_tailored_resume(
+            await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(markdown=bad_md),
                 supabase=supabase,
@@ -976,10 +1056,10 @@ class TestCheckpointEndpoint:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
-            patch("app.services.tailor.versions.checkpoint") as mock_checkpoint,
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch("app.services.tailor.versions.checkpoint", new_callable=AsyncMock) as mock_checkpoint,
         ):
-            result = tailor_router.checkpoint_tailored_resume(
+            result = await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
@@ -998,10 +1078,10 @@ class TestCheckpointEndpoint:
         supabase = MagicMock()
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=None),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None),
             pytest.raises(HTTPException) as exc_info,
         ):
-            tailor_router.checkpoint_tailored_resume(
+            await tailor_router.checkpoint_tailored_resume(
                 resume_id="missing",
                 body=ResumeCheckpointRequest(),
                 supabase=supabase,
@@ -1015,11 +1095,14 @@ class TestMarkDocxRendered:
     real upload exists at storage_path.
     """
 
-    def test_writes_both_storage_path_and_hash(self) -> None:
+    async def test_writes_both_storage_path_and_hash(self) -> None:
         from app.services.tailor.persistence import mark_docx_rendered
 
         supabase = MagicMock()
-        mark_docx_rendered(
+        supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute = (
+            AsyncMock(return_value=MagicMock(data=[]))
+        )
+        await mark_docx_rendered(
             supabase,
             "rec-1",
             storage_path="anon/rec-1.docx",
@@ -1043,6 +1126,18 @@ class TestDownloadCache:
     - no payload_md AND no storage_path: 404.
     """
 
+    @pytest.fixture(autouse=True)
+    def _stub_style(self):
+        # The download handler resolves the docx style via the async
+        # ``_resolve_render_style`` (reads user_profiles). These tests exercise
+        # the cache/render matrix with the default unstyled path (style=None).
+        with patch(
+            "app.routers.tailor._resolve_render_style",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            yield
+
     @pytest.mark.asyncio
     async def test_cache_fresh_serves_cached_bytes(self) -> None:
         from app.routers import tailor as tailor_router
@@ -1056,13 +1151,14 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.download_docx",
+                new_callable=AsyncMock,
                 return_value=b"PKcached-bytes",
             ) as mock_download,
             patch("app.routers.tailor.md_to_docx") as mock_render,
-            patch("app.services.tailor.persistence.mark_docx_rendered") as mock_mark,
+            patch("app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock) as mock_mark,
         ):
             user_supabase = MagicMock()
             response = await tailor_router.download_tailored_resume(
@@ -1091,16 +1187,17 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.routers.tailor.md_to_docx",
                 return_value=b"PKfresh-bytes",
             ) as mock_render,
             patch(
                 "app.services.tailor.persistence.upload_docx",
+                new_callable=AsyncMock,
                 return_value="anon/rec-1.docx",
             ),
-            patch("app.services.tailor.persistence.mark_docx_rendered") as mock_mark,
+            patch("app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock) as mock_mark,
         ):
             response = await tailor_router.download_tailored_resume(
                 resume_id="rec-1",
@@ -1136,7 +1233,7 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.routers.tailor.md_to_docx",
                 return_value=b"PKfresh-bytes",
@@ -1166,9 +1263,10 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.services.tailor.persistence.download_docx",
+                new_callable=AsyncMock,
                 return_value=b"PKlegacy-bytes",
             ) as mock_download,
             patch("app.routers.tailor.md_to_docx") as mock_render,
@@ -1199,7 +1297,7 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.download_tailored_resume(
@@ -1223,7 +1321,7 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", return_value=record),
+            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
             patch(
                 "app.routers.tailor.md_to_docx",
                 side_effect=PandocNotInstalledError("pandoc missing"),
@@ -1235,3 +1333,51 @@ class TestDownloadCache:
                 supabase=supabase,
             )
         assert exc_info.value.status_code == 500
+
+
+class TestGetMissingRowReturnsNone:
+    """`persistence.get` must return None for a missing/foreign row, not raise.
+
+    Regression for a bug a live drive found on 2026-08-07: the query used
+    `.single()`, and PostgREST answers `.single()` on zero rows by RAISING
+    `APIError PGRST116` — so the `if not resp.data: return None` guard was
+    unreachable and SIX endpoints 500'd where they meant to 404
+    (`GET /resumes/{id}`, `/versions`, `/download`, approve, unapprove,
+    export-zip). It shipped because every unit test mocks the client and hands
+    back `data=None` directly, which the real driver never produces.
+
+    So this mock behaves like the real thing: `.single()` raises, `.limit(1)`
+    returns an empty list. Any reintroduction of `.single()` fails here.
+    """
+
+    @staticmethod
+    def _supabase_like_postgrest() -> MagicMock:
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+
+        def _single_raises() -> None:
+            raise AssertionError(
+                "persistence.get called .single() — PostgREST raises PGRST116 on "
+                "zero rows, which turns an intended 404 into a 500"
+            )
+
+        chain.single.side_effect = _single_raises
+        chain.limit.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+        return supabase
+
+    async def test_missing_row_returns_none(self) -> None:
+        from app.services.tailor.persistence import get
+
+        result = await get(self._supabase_like_postgrest(), "does-not-exist", user_id=None)
+        assert result is None
+
+    async def test_found_row_still_parses(self) -> None:
+        from app.services.tailor.persistence import get
+
+        supabase = self._supabase_like_postgrest()
+        chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value
+        chain.limit.return_value.execute = AsyncMock(
+            return_value=MagicMock(data=[_make_record().model_dump(mode="json")])
+        )
+        result = await get(supabase, "rec-1", user_id=None)
+        assert result is not None and result.id == "rec-1"

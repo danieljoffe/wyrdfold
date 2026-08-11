@@ -24,6 +24,9 @@ const PIPELINE: PipelineInsights = {
     { stage: 'new', count: 5 },
     { stage: 'applied', count: 3 },
   ],
+  // Period-over-period KPIs drive the dashboard deltas only; the CSV export
+  // never reads them. null is the real "no prior period" state.
+  previous: null,
 };
 
 const TARGETS: TargetInsights = {

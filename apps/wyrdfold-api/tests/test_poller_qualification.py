@@ -11,7 +11,7 @@ Covers ``poller._qualify_one_job`` / ``_qualify_jobs``:
 - A changed row (content differs from the stored hash) is re-tagged.
 - The step is best-effort: a tagger failure (tags=None) writes nothing and
   never raises; a write failure is swallowed.
-- It bills the instance key (``get_llm_client(supabase, None)``), never a
+- It bills the instance key (``get_llm_client_async(service_client, None)``), never a
   per-target payer.
 """
 
@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.config import settings as live_settings
 from app.services import poller as poller_mod
+from app.services.llm import provider_breaker
 from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
 from app.services.qualification import QualificationTags, qualification_hash
 
@@ -66,7 +67,7 @@ def _patch_common(
         "client_user_id": "UNSET",
     }
 
-    def fake_get_client(supabase: object, user_id: str | None) -> object:
+    async def fake_get_client(supabase: object, user_id: str | None) -> object:
         rec["client_user_id"] = user_id
         return MagicMock(name="instance-client")
 
@@ -84,9 +85,18 @@ def _patch_common(
     # the flag off it builds + executes the update on the MagicMock supabase
     # directly (the ``update`` side_effect below records the payload), so no
     # retry-helper patch is needed anymore.
-    monkeypatch.setattr(poller_mod, "get_llm_client", fake_get_client)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
     monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
     monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
+    # The qualification budget re-check reads the global spend meter on the ASYNC
+    # service client (``_async_service_client`` → ``get_async_supabase``, #57
+    # PR-G2e-1) rather than the client threaded into the cycle. Hand it a client
+    # whose meter RPC resolves under cap so the default (non-budget) path tags
+    # normally; budget-specific tests patch ``total_llm_spend_all_async`` (the
+    # meter fn), which short-circuits this client entirely.
+    meter_client = MagicMock()
+    meter_client.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=1.0))
+    monkeypatch.setattr(poller_mod, "_async_service_client", lambda: meter_client)
     return rec
 
 
@@ -127,7 +137,6 @@ class TestQualifyOneJob:
         assert payload["metro"] == "San Francisco"
         assert payload["is_remote"] is False
         assert payload["is_genuine_role"] is True
-        assert payload["us_confidence"] == 98
         assert payload["qualified_at"] is not None
         # The persisted hash matches the row's content hash.
         assert payload["qualified_hash"] == qualification_hash(
@@ -195,10 +204,10 @@ class TestQualifyOneJob:
     async def test_client_resolution_failure_skips_silently(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def boom(_sb: object, _uid: str | None) -> object:
+        async def boom(_sb: object, _uid: str | None) -> object:
             raise RuntimeError("no client")
 
-        monkeypatch.setattr(poller_mod, "get_llm_client", boom)
+        monkeypatch.setattr(poller_mod, "get_llm_client_async", boom)
         # tag_job should never be reached.
         called = {"n": 0}
 
@@ -217,6 +226,20 @@ def _unique_rows(n: int) -> list[dict[str, Any]]:
     """``n`` rows with distinct ids/content so each would (absent the gate)
     miss the content-hash cache and trigger one ``tag_job`` call."""
     return [_row(id=f"job-{i}", title=f"Engineer {i}") for i in range(n)]
+
+
+def _tags(*, is_genuine_role: bool | None = True) -> QualificationTags:
+    """A plain US verdict with an overridable ``is_genuine_role``."""
+    return QualificationTags(
+        is_us=True,
+        us_confidence=90,
+        role_family="engineering",
+        seniority="senior_ic",
+        employment_type="full_time",
+        metro=None,
+        is_remote=False,
+        is_genuine_role=is_genuine_role,
+    )
 
 
 def _non_us_tags(confidence: int | None) -> QualificationTags:
@@ -313,7 +336,6 @@ class TestNonUsArchive:
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
-        assert payload["us_confidence"] is None
         assert "archived_at" not in payload  # None confidence → not archived, no crash
 
     @pytest.mark.asyncio
@@ -365,7 +387,7 @@ class TestQualifyBudgetGate:
         not a stubbed predicate. Spend over cap → zero tagger calls."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         # Today's spend already over the cap.
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=12.5))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=12.5))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -383,7 +405,7 @@ class TestQualifyBudgetGate:
         """The gate must not break the happy path: under the cap, every
         cache-missing row is tagged."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=1.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=1.0))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -398,8 +420,8 @@ class TestQualifyBudgetGate:
         """cap=0 disables the breaker; even a huge spend reading tags
         everything (operator opt-out)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
-        spend = MagicMock(return_value=999.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
+        spend = AsyncMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -417,7 +439,7 @@ class TestQualifyBudgetGate:
         # Gate: under budget for the first check, over for the second.
         calls = {"n": 0}
 
-        def fake_exhausted(_sb: object, *, reserve_usd: float = 0.0) -> bool:
+        async def fake_exhausted(_sb: object, *, reserve_usd: float = 0.0) -> bool:
             calls["n"] += 1
             return calls["n"] > 1  # first chunk allowed, then deferred
 
@@ -440,8 +462,8 @@ class TestQualifyBudgetGate:
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         monkeypatch.setattr(
             poller_mod,
-            "total_llm_spend_all",
-            MagicMock(side_effect=RuntimeError("db down")),
+            "total_llm_spend_all_async",
+            AsyncMock(side_effect=RuntimeError("db down")),
         )
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
@@ -459,36 +481,36 @@ class TestGradingReserve:
     tagger — the recurring drain that left new jobs stuck at ``stage2`` (#60).
     The tagger stops at ``cap - reserve`` while grading reads the full cap."""
 
-    def test_reserve_lowers_the_taggers_effective_cap(
+    async def test_reserve_lowers_the_taggers_effective_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Spend sits in the reserved slice (between cap-reserve and cap):
         exhausted for the tagger (it yields), NOT for grading (full cap)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=8.0))
         sb = MagicMock()
         # $8 spent of $10: the tagger's $3 reserve makes it done ($8 >= $7)...
-        assert poller_mod._global_budget_exhausted(sb, reserve_usd=3.0) is True
+        assert await poller_mod._global_budget_exhausted(sb, reserve_usd=3.0) is True
         # ...but grading (no reserve) still has room ($8 < $10).
-        assert poller_mod._global_budget_exhausted(sb) is False
+        assert await poller_mod._global_budget_exhausted(sb) is False
 
-    def test_reserve_at_or_above_cap_makes_tagger_yield_entirely(
+    async def test_reserve_at_or_above_cap_makes_tagger_yield_entirely(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """reserve >= cap → effective cap 0 → the tagger always yields, without
         even reading the meter (a valid grading-only config)."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
-        spend = MagicMock(return_value=0.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
-        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=10.0) is True
+        spend = AsyncMock(return_value=0.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
+        assert await poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=10.0) is True
         spend.assert_not_called()
 
-    def test_disabled_cap_ignores_reserve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_disabled_cap_ignores_reserve(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """cap<=0 disables the breaker entirely — reserve is moot, meter unread."""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 0.0)
-        spend = MagicMock(return_value=999.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", spend)
-        assert poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=5.0) is False
+        spend = AsyncMock(return_value=999.0)
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", spend)
+        assert await poller_mod._global_budget_exhausted(MagicMock(), reserve_usd=5.0) is False
         spend.assert_not_called()
 
     @pytest.mark.asyncio
@@ -500,7 +522,7 @@ class TestGradingReserve:
         (With reserve=0 the same spend would let the tagger run.)"""
         monkeypatch.setattr(live_settings, "global_llm_daily_budget_usd", 10.0)
         monkeypatch.setattr(live_settings, "grading_budget_reserve_usd", 3.0)
-        monkeypatch.setattr(poller_mod, "total_llm_spend_all", MagicMock(return_value=8.0))
+        monkeypatch.setattr(poller_mod, "total_llm_spend_all_async", AsyncMock(return_value=8.0))
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
@@ -519,9 +541,11 @@ class TestProviderFastFail:
 
     @pytest.fixture(autouse=True)
     def _reset_latch(self) -> Any:
-        poller_mod._provider_fatal_until = 0.0
+        # The latch now lives in the shared provider_breaker module (imported into
+        # poller as the same private names); reset it there so it can't leak.
+        provider_breaker.reset_for_tests()
         yield
-        poller_mod._provider_fatal_until = 0.0
+        provider_breaker.reset_for_tests()
 
     @pytest.mark.asyncio
     async def test_402_latches_breaker_and_leaves_row_null(
@@ -556,7 +580,7 @@ class TestProviderFastFail:
     @pytest.mark.asyncio
     async def test_active_breaker_skips_the_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        poller_mod._provider_fatal_until = time.monotonic() + 300.0  # latched
+        provider_breaker._provider_fatal_until = time.monotonic() + 300.0  # latched
         sb = _supabase_capturing_updates(rec)
 
         await poller_mod._qualify_one_job(MagicMock(), sb, _row())
@@ -589,9 +613,175 @@ class TestProviderFastFail:
 
     @pytest.mark.asyncio
     async def test_triage_gate_honors_the_breaker(self) -> None:
-        poller_mod._provider_fatal_until = time.monotonic() + 300.0
+        provider_breaker._provider_fatal_until = time.monotonic() + 300.0
         assert await poller_mod._triage_budget_blocks(MagicMock()) is True
 
     def test_breaker_auto_clears_after_cooldown(self) -> None:
-        poller_mod._provider_fatal_until = time.monotonic() - 1.0  # in the past
+        provider_breaker._provider_fatal_until = time.monotonic() - 1.0  # in the past
         assert not poller_mod._provider_fatal_active()
+
+
+# ---- family reconcile + tag refresh (the _qualify_jobs closers) ------------
+
+
+class _TableChain:
+    """Self-returning query stub; records ``update(...).in_(...)`` calls."""
+
+    def __init__(self, table: str, data: list[dict[str, Any]], writes: list[Any]) -> None:
+        self._table = table
+        self._data = data
+        self._writes = writes
+        self._update_payload: dict[str, Any] | None = None
+
+    def select(self, *_a: Any, **_kw: Any) -> _TableChain:
+        return self
+
+    def eq(self, *_a: Any, **_kw: Any) -> _TableChain:
+        return self
+
+    def update(self, payload: dict[str, Any]) -> _TableChain:
+        self._update_payload = payload
+        return self
+
+    def in_(self, col: str, vals: list[str]) -> _TableChain:
+        if self._update_payload is not None:
+            self._writes.append((self._table, self._update_payload, col, list(vals)))
+        return self
+
+    def execute(self) -> Any:
+        return MagicMock(data=self._data)
+
+
+def _closer_sb(
+    *,
+    targets: list[dict[str, Any]] | None = None,
+    scores: list[dict[str, Any]] | None = None,
+    jobs: list[dict[str, Any]] | None = None,
+) -> tuple[MagicMock, list[Any]]:
+    writes: list[Any] = []
+    data = {"targets": targets or [], "scores": scores or [], "jobs": jobs or []}
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: _TableChain(name, data.get(name, []), writes)
+    return sb, writes
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retracts_offfamily_promising() -> None:
+    """The prod 2026-07-30 class: a promising verdict written pre-tag must be
+    retracted once the landed family hard-contradicts it. Keep-null on either
+    side survives (#277), and ``excluded`` is never touched."""
+    sb, writes = _closer_sb(
+        targets=[{"id": "t-eng", "role_family": "engineering"}],
+        scores=[
+            {"id": "s-cx", "target_id": "t-eng", "job_role_family": "customer_experience"},
+            {"id": "s-eng", "target_id": "t-eng", "job_role_family": "engineering"},
+            {"id": "s-null", "target_id": "t-eng", "job_role_family": None},
+        ],
+    )
+    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+
+    assert writes == [("scores", {"promising": False}, "id", ["s-cx"])]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_noop_when_no_target_is_classified() -> None:
+    sb, writes = _closer_sb(
+        targets=[{"id": "t-any", "role_family": None}],
+        scores=[{"id": "s-1", "target_id": "t-any", "job_role_family": "sales"}],
+    )
+    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+    assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_job_tags_patches_stale_row_dicts() -> None:
+    """The dicts the cycle threads into Phase 2 are upsert-time snapshots —
+    the refresh must overwrite their tag columns with the post-tagger DB
+    state so the Phase-2 family/US gates see this cycle's verdicts."""
+    sb, _writes = _closer_sb(
+        jobs=[{"id": "job-1", "role_family": "customer_experience", "is_us": True}]
+    )
+    rows: list[dict[str, Any]] = [{"id": "job-1", "title": "Support Specialist"}]
+    await poller_mod._refresh_job_tags(sb, rows)
+
+    assert rows[0]["role_family"] == "customer_experience"
+    assert rows[0]["is_us"] is True
+
+
+@pytest.mark.asyncio
+async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closers are DB-only and must run on EVERY exit path — including
+    the earliest one (no LLM client), where prior-cycle tags may still
+    contradict persisted promising rows."""
+    calls: list[str] = []
+
+    async def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("no client")
+
+    async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
+        calls.append(f"refresh:{len(rows)}")
+
+    async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
+        calls.append(f"reconcile:{','.join(job_ids)}")
+
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _raise)
+    monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
+    monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+
+    await poller_mod._qualify_jobs(MagicMock(), [_row(id="job-9")])
+
+    assert calls == ["refresh:1", "reconcile:job-9"]
+
+
+class TestNonGenuineArchive:
+    """Schema-audit wire-up (2026-07-31): an explicit ``is_genuine_role=false``
+    verdict (talent-pool / "general application" / evergreen collectors)
+    archives the row in the same tag write — non-postings leave every serving
+    surface via the standard liveness gate. Lenient: ``None`` never archives;
+    flag-gated (default ON) for emergencies."""
+
+    @pytest.mark.asyncio
+    async def test_non_genuine_is_archived_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tags = _tags(is_genuine_role=False)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        payload = rec["writes"][0]
+        assert payload["is_genuine_role"] is False
+        assert payload["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_malformed_none_verdict_never_archives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lenient contract: an absent/malformed verdict (None) must keep the
+        row — only an explicit False is evidence of a non-posting."""
+        tags = _tags(is_genuine_role=None)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        assert "archived_at" not in rec["writes"][0]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_tags_but_does_not_archive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "qualification_archive_non_genuine", False)
+        tags = _tags(is_genuine_role=False)
+        rec = _patch_common(monkeypatch, tag_result=(tags, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()])
+
+        payload = rec["writes"][0]
+        assert payload["is_genuine_role"] is False
+        assert "archived_at" not in payload

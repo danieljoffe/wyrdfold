@@ -33,20 +33,19 @@ import asyncio
 import logging
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.targets import JobTarget
-from app.services.embeddings.prescan_gate import (
-    cosine_gate_batch,
-    cosine_scores_batch,
-    in_prescan_holdout,
-)
-from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining
+from app.services.embeddings import get_default_client as get_embeddings_client
+from app.services.embeddings.job_embeddings import ensure_job_vectors
+from app.services.embeddings.prescan_gate import cosine_scores_batch
+from app.services.fit.daily_cap import DEFAULT_DAILY_CAP, phase2_quota_remaining_async
 from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
 from app.services.llm.client import LLMClient
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
@@ -88,8 +87,8 @@ def _needs_phase2(
     return not already_current
 
 
-def _fetch_phase2_state(
-    supabase: Client, target_id: str, job_ids: list[str]
+async def _fetch_phase2_state(
+    supabase: AsyncClient, target_id: str, job_ids: list[str]
 ) -> dict[str, tuple[bool | None, str | None, int | None, int | None]]:
     """Read (promising, scoring_status, scored_profile_version, phase1_confidence) per job.
 
@@ -99,11 +98,14 @@ def _fetch_phase2_state(
     for rows triaged before the confidence column existed — the runner's
     ordering treats None as "lowest priority" so legacy rows still grade
     but newer high-confidence rows go first.
+
+    Awaited on the pooled async service client (#57 PR-G2e-3); the chunked
+    ``.in_()`` reads yield the loop rather than blocking it.
     """
     state: dict[str, tuple[bool | None, str | None, int | None, int | None]] = {}
     for i in range(0, len(job_ids), _STATE_CHUNK_SIZE):
         chunk = job_ids[i : i + _STATE_CHUNK_SIZE]
-        resp = (
+        resp = await (
             supabase.table("scores")
             .select(
                 "job_posting_id, promising, scoring_status, "
@@ -135,26 +137,8 @@ def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[s
     return batches
 
 
-def _prescan_gate_applies(target_id: str) -> bool:
-    """Whether the pre-scan cosine gate acts on this target (#90 staged rollout).
-
-    The global ``prescan_gate_enabled`` must be on AND the target must be in the
-    ``prescan_gate_target_ids`` allowlist. An EMPTY allowlist means **no
-    targets** — NOT "all targets" — so the gate can never be silently applied to
-    an unvalidated target. This matters because cosine gating is only safe
-    per-target, calibrated against live Phase-2 scores: it's a coarse off-domain
-    filter (0% recall loss on CX, an off-cluster exec target) that FAILS on an
-    in-domain one (Frontend drops ~60% of good matches at its calibrated
-    threshold, #90). Enabling the gate with an empty allowlist is therefore a
-    no-op, never a gate-everything that would silently drop good matches.
-    """
-    if not settings.prescan_gate_enabled:
-        return False
-    return str(target_id) in settings.prescan_gate_target_ids_set
-
-
 async def run_phase2_for_jobs(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     target: JobTarget,
@@ -169,7 +153,7 @@ async def run_phase2_for_jobs(
     """Grade the promising, not-yet-current jobs in ``jobs`` for ``target``.
 
     ``jobs`` are job dicts carrying at least ``id`` and ``title`` (and
-    ``description_html`` for the JD context; ``first_seen_at`` is used for
+    ``description_html`` for the JD context; the posted date is used for
     ordering when present). Returns the number of jobs actually graded.
 
     Order of operations: gate + re-grade filter → order newest-first →
@@ -183,12 +167,13 @@ async def run_phase2_for_jobs(
 
     # US-only corpus (#60): never (re-)grade a CONFIRMED non-US job — the write
     # side of the display read gate (``jobs.py`` ``_gate_live_us``: is_us IS NOT
-    # FALSE). The L2 tagger sets ``is_us`` only AFTER a job's first grade, so
-    # first grades still happen (is_us NULL passes); once a job is confirmed
-    # non-US it's never re-graded. Without this a re-polled non-US job burns a
-    # fresh LLM grade every cycle — ``archived_at`` does NOT gate grading (134
-    # non-US jobs were graded *after* being archived in one 7-day window). Keep
-    # true + null (``is not False``); drop only confirmed-false.
+    # FALSE). The poller's post-tagger ``_refresh_job_tags`` patches this
+    # cycle's verdicts into the job dicts, so a first-cycle confirmed-non-US
+    # job is skipped here too; a still-untagged job (is_us NULL) passes.
+    # Without this a re-polled non-US job burns a fresh LLM grade every cycle —
+    # ``archived_at`` does NOT gate grading (134 non-US jobs were graded
+    # *after* being archived in one 7-day window). Keep true + null (``is not
+    # False``); drop only confirmed-false.
     us_jobs = [j for j in jobs if j.get("is_us") is not False]
     non_us_skipped = len(jobs) - len(us_jobs)
     if non_us_skipped:
@@ -201,12 +186,37 @@ async def run_phase2_for_jobs(
     if not jobs:
         return 0
 
+    # Family gate (#277/#278, write side): never spend a grade on a pair the
+    # read gates (`get_target_jobs` / `_gate_off_family` / the membership
+    # badge) will hide from every surface anyway. Same shared predicate,
+    # keep-null both ways: an untagged job (role_family NULL — the tagger is
+    # async and may not have landed) and an unclassified target both admit.
+    # Before this gate, hard off-family pairs burned full grades — the
+    # 2026-07-30 prod audit found 55% of all promising rows were off-family,
+    # each graded one pure waste (e.g. a customer_experience listing graded
+    # against a frontend-engineer target, scored 0).
+    if target.role_family:
+        in_family = [
+            j for j in jobs if passes_family_gate(target.role_family, j.get("role_family"))
+        ]
+        family_skipped = len(jobs) - len(in_family)
+        if family_skipped:
+            logger.info(
+                "Phase 2 family gate: skipped %d off-family job(s) for target %s (family=%s)",
+                family_skipped,
+                target.id,
+                target.role_family,
+            )
+        jobs = in_family
+        if not jobs:
+            return 0
+
     job_by_id = {j["id"]: j for j in jobs if j.get("id")}
     job_ids = list(job_by_id)
     if not job_ids:
         return 0
 
-    state = _fetch_phase2_state(supabase, target.id, job_ids)
+    state = await _fetch_phase2_state(supabase, target.id, job_ids)
     candidates = [
         jid
         for jid in job_ids
@@ -247,66 +257,28 @@ async def run_phase2_for_jobs(
         if not candidates:
             return 0
 
-    # Pre-scan cosine gate (#90 flip): admit to the LLM grade only where
-    # cosine(job, target) >= the calibrated threshold, replacing the permissive
-    # keyword admission (shadow data: keyword admits ~100%, cosine ~5%).
-    # DATA absence fails open — a None verdict (target uncalibrated / job
-    # unvectored) is admitted, so an unpopulated spine never drops jobs.
-    # INFRA errors fail CLOSED — a failed vector read DEFERS the whole batch
-    # to the next cycle instead of grading it ungated ("defer, never
-    # admit-blind", the same contract as the Phase-1 budget gate). The
-    # 2026-07-12 gated-cycle audit is why: the old error→admit-all path
-    # converted IO timeouts into ~20% of a 48h sample being graded ungated.
-    # A deterministic exploration holdout keeps a small slice of would-drop
-    # jobs FOR grading, so the gate's false-negative rate stays measurable.
-    # Flag-off by default; enabled per-target (``prescan_gate_target_ids``)
-    # after calibration (#89) so a zero-loss target flips before a lossier
-    # one (#90 rollout).
-    cosines: dict[str, float]
-    if _prescan_gate_applies(target.id):
-        try:
-            gate = await cosine_gate_batch(supabase, target, candidates)
-        except Exception:
-            logger.warning(
-                "Phase 2 pre-scan gate: vector read failed for target %s — "
-                "deferring %d candidate(s) to the next cycle (fail-closed; "
-                "an IO error must not buy ungated grades)",
-                target.id,
-                len(candidates),
-                exc_info=True,
-            )
-            return 0
-        holdout = settings.prescan_gate_holdout_fraction
-        kept = []
-        dropped = held = 0
-        for jid in candidates:
-            if gate.admit(jid) is False:
-                if in_prescan_holdout(jid, target.id, holdout):
-                    held += 1
-                    kept.append(jid)  # exploration holdout — grade to measure FN
-                else:
-                    dropped += 1
-                continue
-            kept.append(jid)  # True (>= threshold) or None (data absence) → admit
-        if dropped or held:
-            logger.info(
-                "Phase 2 pre-scan gate: dropped %d, held %d (holdout), kept %d/%d for target %s",
-                dropped,
-                held,
-                len(kept),
-                len(candidates),
-                target.id,
-            )
-        candidates = kept
-        if not candidates:
-            return 0
-        # Reuse the gate's cosines for ordering — no second vector fetch.
-        cosines = gate.cosines
-    else:
-        # Gate not enforced for this target: cosines are fetched for ORDERING
-        # only, best-effort ({} on error) — a read failure here degrades
-        # priority order but cannot change what gets admitted or spent.
-        cosines = await cosine_scores_batch(supabase, target, candidates)
+    # Lazy vector materialization (Disk IO slim-down, 2026-07-30): embeddings
+    # are no longer written at ingest — this grade-time candidate set is the
+    # ONLY serving reader of job vectors, so they're ensured exactly here,
+    # for exactly these jobs ("only a few will ever be read"). Best-effort by
+    # construction: any id that fails to materialize is simply absent and the
+    # cosine paths below fail open for it, same as any missing vector.
+    if settings.prescan_embed_enabled and candidates:
+        await ensure_job_vectors(
+            supabase,
+            get_embeddings_client(),
+            [job_by_id[jid] for jid in candidates],
+        )
+
+    # Cosine(job, target) for ORDERING only — best-effort ({} on error): a
+    # read failure degrades priority order but cannot change what gets
+    # admitted or spent. (The #90 pre-scan admission GATE that used to fork
+    # here was retired in R2: its shadow-vs-outcome join showed the armed
+    # threshold dropped 61.5% of promising matches; the full analysis + the
+    # threshold trade-off curve are preserved in docs/decisions.md
+    # 2026-07-30 "retired by its own shadow data". The cosine ORDERING below
+    # survives on its own evidence.)
+    cosines: dict[str, float] = await cosine_scores_batch(supabase, target, candidates)
 
     # Order candidates so the Phase 2 daily cap goes to the highest-FIT-
     # PROBABILITY jobs first. cosine(job, target) is the strongest cheap
@@ -316,15 +288,19 @@ async def run_phase2_for_jobs(
     # fit < 20). So order by (#9):
     #   1) cosine DESC — the fit-predictive signal (missing → -1: sorts last,
     #      for an un-embedded job or an un-calibrated target).
-    #   2) phase1_confidence DESC, then 3) first_seen_at DESC — tie-breakers.
-    # ``first_seen_at`` is an ISO-8601 string, sortable lexically; missing
+    #   2) phase1_confidence DESC, then 3) posted date DESC — tie-breakers.
+    # The posted date is an ISO-8601 string, sortable lexically; missing
     # values sort last.
 
     def _priority(jid: str) -> tuple[float, int, str]:
         cos = cosines.get(jid, -1.0)
         conf = state[jid][3]  # phase1_confidence
         c = int(conf) if conf is not None else -1
-        seen = job_by_id[jid].get("first_seen_at") or ""
+        seen = (
+            job_by_id[jid].get("source_posted_at")
+            or job_by_id[jid].get("cataloged_at")
+            or ""
+        )
         return (cos, c, seen)
 
     candidates.sort(key=_priority, reverse=True)
@@ -333,7 +309,7 @@ async def run_phase2_for_jobs(
     # is a soft, best-effort budget — concurrent poll cycles for the same
     # target can each read the same remaining count and slightly overshoot;
     # the cap exists to bound runaway spend, not to be exact.
-    quota = phase2_quota_remaining(supabase, target.id, cap)
+    quota = await phase2_quota_remaining_async(supabase, target.id, cap)
     if quota <= 0:
         logger.info(
             "Phase 2: target %s at daily cap; deferring %d promising job(s)",

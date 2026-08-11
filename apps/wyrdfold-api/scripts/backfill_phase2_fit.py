@@ -37,7 +37,7 @@ from app.services.fit import run_phase2_for_jobs
 from app.services.fit.phase2_runner import _fetch_phase2_state, _needs_phase2
 from app.services.llm import get_default_client as get_llm_client
 from app.services.targets.crud import get_active as get_active_targets
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_phase2")
@@ -80,13 +80,13 @@ def _promising_job_ids(supabase: Any, target_id: str) -> list[str]:
 
 
 def _fetch_jobs(supabase: Any, job_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch the job rows Phase 2 needs (id, title, JD, first_seen_at)."""
+    """Fetch the job rows Phase 2 needs (id, title, JD, posted date)."""
     jobs: list[dict[str, Any]] = []
     for i in range(0, len(job_ids), _PAGE):
         chunk = job_ids[i : i + _PAGE]
         resp = (
             supabase.table("jobs")
-            .select("id, title, description_html, first_seen_at")
+            .select("id, title, description_html, source_posted_at, cataloged_at")
             .in_("id", chunk)
             .execute()
         )
@@ -116,8 +116,7 @@ def _resolve_target_user(supabase: Any, target: JobTarget) -> tuple[str, Any] | 
 
 
 async def backfill(*, dry_run: bool, cap: int, target_id: str | None) -> int:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
 

@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
-    get_supabase,
+    get_async_service_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -15,14 +15,21 @@ from app.seed.company_seed import COMPANY_SEED
 
 
 class _Resp:
+    """A query result that also works when the async handler ``await``s
+    ``.execute()`` (#57 slice 4): ``__await__`` yields this same object."""
+
     def __init__(self, data: Any) -> None:
         self.data = data
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        yield from ()
+        return self
 
 
 @pytest.fixture
 def client_factory():
     def _make(supabase: MagicMock, *, authed: bool = True) -> TestClient:
-        app.dependency_overrides[get_supabase] = lambda: supabase
+        app.dependency_overrides[get_async_service_supabase] = lambda: supabase
         if authed:
             app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
             # Write endpoints (manage/seed) layer on verify_api_key — override
@@ -43,7 +50,7 @@ def test_sources_unauth_returns_401():
 def test_sources_jwt_only_caller_cannot_write():
     """JWT-only authenticated users must not mutate the global source list —
     only the operator/cron API key can. Regression for P0-Sec-1."""
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     # Pass the *or-jwt* check (mimicking a JWT user) but leave verify_api_key
     # un-overridden so it falls through to the real check (no api-key header).
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
@@ -92,8 +99,8 @@ def test_sources_remove_calls_delete(client_factory):
 def test_sources_toggle_flips_enabled(client_factory):
     sb = MagicMock()
     (
-        sb.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value
-    ) = _Resp({"enabled": True})
+        sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value
+    ) = _Resp([{"enabled": True}])
     sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
     client = client_factory(sb)
     r = client.post("/sources", json={"action": "toggle", "board_token": "foo"})

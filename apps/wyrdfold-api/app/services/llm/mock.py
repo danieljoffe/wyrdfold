@@ -27,6 +27,7 @@ from app.models.llm import (
     Message,
     ModelId,
 )
+from app.services.llm.errors import MissingToolCallError
 from app.services.llm.pricing import calculate_cost
 
 
@@ -41,6 +42,41 @@ ResponseSource = str | Callable[[str, list[Message]], str]
 # Kept in sync with ``targets.suggest.QUERY_DEFAULT_PURPOSE``. Duplicated (not
 # imported) to keep the mock free of service-layer imports.
 QUERY_SUGGEST_PURPOSE = "target.suggest_from_query"
+
+# Kept in sync with ``analysis.analyze.DEFAULT_PURPOSE``. Duplicated (not
+# imported) — same service-layer-free rule as above.
+JOB_ANALYSIS_PURPOSE = "job_analysis"
+
+# Kept in sync with ``tailor.tailor.DEFAULT_PURPOSE`` /
+# ``DEFAULT_COVER_LETTER_PURPOSE``. Same duplication rule.
+TAILOR_RESUME_PURPOSE = "tailor.resume"
+TAILOR_COVER_LETTER_PURPOSE = "tailor.cover_letter"
+
+
+def _prompt_section(latest_user: str, tag: str) -> str | None:
+    """The body of a ``[Tag]`` section from a tailor/cover-letter user message.
+
+    Both builders join sections with a blank line, so a section runs from its
+    tag to the next blank line followed by ``[``.
+    """
+    marker = f"[{tag}]\n"
+    start = latest_user.find(marker)
+    if start == -1:
+        return None
+    body = latest_user[start + len(marker) :]
+    end = body.find("\n\n[")
+    return (body if end == -1 else body[:end]).strip()
+
+
+def _prompt_json(latest_user: str, tag: str) -> dict[str, Any]:
+    raw = _prompt_section(latest_user, tag)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 # Seniority words we strip off the front of a query so we can rebuild a small
@@ -95,6 +131,230 @@ def _dev_suggest_from_query(latest_user: str, _messages: list[Message]) -> str:
     return json.dumps({"suggestions": suggestions})
 
 
+def _dev_job_analysis(_latest_user: str, _messages: list[Message]) -> str:
+    """Schema-valid ``JobAnalysis`` verdict for mock environments.
+
+    The 2026-08-05 e2e UX drive (#608/#610) found the generic echo response
+    failing ``JobAnalysis`` validation (missing scorecard/recommendation),
+    so every mock-env analysis surfaced "Analysis failed. Please retry." —
+    local dev and CI could never drive the panel's flagship flow. A
+    deterministic moderate verdict keeps the full journey (auto-fire →
+    poll → verdict render → completion refetch) drivable with no provider
+    key. Grown per .claude/rules/llm-surfaces.md.
+    """
+    return json.dumps(
+        {
+            "scorecard": {
+                "skills_matched": [
+                    {
+                        "name": "TypeScript",
+                        "matched": True,
+                        "confidence": "high",
+                        "evidence": "Named in the posting's core stack.",
+                    },
+                    {
+                        "name": "React",
+                        "matched": True,
+                        "confidence": "medium",
+                        "evidence": None,
+                    },
+                ],
+                "skills_missing": ["Kubernetes"],
+                "nice_to_haves": ["GraphQL"],
+                "seniority_fit": "moderate",
+                "seniority_rationale": (
+                    "Scope reads mid-to-senior individual contributor."
+                ),
+                "domain_fit": "moderate",
+                "domain_rationale": (
+                    "Adjacent product domain with core stack overlap."
+                ),
+            },
+            "recommendation": (
+                "Solid match on the core stack; close the missing "
+                "infrastructure skills before applying. (Mock verdict.)"
+            ),
+        }
+    )
+
+
+def _dev_tailor_resume(latest_user: str, _messages: list[Message]) -> str:
+    """Deterministic happy-path ``TailoredResume`` for local dev / mock env.
+
+    MUST be derived from the ``[OptimizedPayload]`` in the prompt, not canned:
+    ``validate_trace_refs`` **raises** on a ``source_role_ref`` that isn't a
+    real ``Role.id``, and drops bullets whose text ships a number absent from
+    the source they trace to. So every ref here is echoed from the caller's own
+    payload, and bullet text IS the outcome description — which can't fabricate
+    a number by construction.
+
+    Same class of gap #608 fixed for ``job_analysis``: without a seeded
+    response the echo (``{"mock": true, …}``) fails ``TailoredResume``
+    validation, so every mock-env tailoring dies with "Resume generation
+    failed" and local dev / CI can't drive the flow at all. Found again the
+    same way — a live drive, 2026-08-07.
+    """
+    payload = _prompt_json(latest_user, "OptimizedPayload")
+    contact = _prompt_json(latest_user, "ContactInfo") or {"name": "Local Dev"}
+    roles = [r for r in payload.get("roles", []) if isinstance(r, dict)] or [
+        {"id": "role-1", "company": "Acme", "title": "Engineer", "start": "2020-01"}
+    ]
+    outcomes = [o for o in payload.get("outcomes", []) if isinstance(o, dict)]
+    skills = [
+        s.get("name")
+        for s in payload.get("skills", [])
+        if isinstance(s, dict) and s.get("name")
+    ]
+
+    experience = []
+    for role in roles[:3]:
+        role_id = role.get("id") or "role-1"
+        bullets = [
+            # text == description: traces cleanly AND carries no number the
+            # source doesn't already have.
+            {"text": o["description"], "source_outcome_ref": o["description"]}
+            for o in outcomes
+            if o.get("role_ref") == role_id and o.get("description")
+        ][:3]
+        experience.append(
+            {
+                "company": role.get("company") or "Acme",
+                "title": role.get("title") or "Engineer",
+                "start": role.get("start") or "2020-01",
+                "end": role.get("end"),
+                "bullets": bullets,
+                "source_role_ref": role_id,
+            }
+        )
+
+    return json.dumps(
+        {
+            # No digits: the summary's numbers are warned about, not stripped,
+            # and a mock shouldn't manufacture warnings on every local run.
+            "summary": "Engineer with a track record of shipping user-facing work.",
+            "contact": contact,
+            "experience": experience,
+            "skills": skills[:12],
+            "education": [],
+            "jd_snippet": (_prompt_section(latest_user, "JobDescription") or "")[:200],
+            "preferences_applied": [],
+        }
+    )
+
+
+def _dev_cover_letter(latest_user: str, _messages: list[Message]) -> str:
+    """Deterministic happy-path ``TailoredCoverLetter`` for local dev / mock env.
+
+    ``validate_cover_letter_refs`` checks the declared refs exist in the source
+    doc, so these are echoed from the prompt's own payload — see
+    ``_dev_tailor_resume`` for why canned values can't work.
+    """
+    payload = _prompt_json(latest_user, "OptimizedPayload")
+    contact = _prompt_json(latest_user, "ContactInfo") or {"name": "Local Dev"}
+    company = _prompt_section(latest_user, "RecipientCompany") or "Acme"
+    # `[RecipientCompany] Acme` is a single-line tag, not a block.
+    inline = latest_user.find("[RecipientCompany] ")
+    if inline != -1:
+        company = latest_user[inline + len("[RecipientCompany] ") :].split("\n", 1)[0].strip()
+
+    return json.dumps(
+        {
+            "contact": contact,
+            "recipient_company": company or "Acme",
+            "salutation": "Dear Hiring Team,",
+            "paragraphs": [
+                {
+                    "text": (
+                        "I am writing to express my interest in this role. My "
+                        "background lines up closely with what the team is building."
+                    )
+                },
+                {
+                    "text": (
+                        "Across my recent work I have focused on shipping "
+                        "user-facing software and improving how teams deliver it."
+                    )
+                },
+            ],
+            "closing": "Sincerely,",
+            "signature": contact.get("name") or "Local Dev",
+            "jd_snippet": (_prompt_section(latest_user, "JobDescription") or "")[:200],
+            "preferences_applied": [],
+            "source_outcome_refs": [
+                o["description"]
+                for o in payload.get("outcomes", [])
+                if isinstance(o, dict) and o.get("description")
+            ][:3],
+            "source_role_refs": [
+                r["id"] for r in payload.get("roles", []) if isinstance(r, dict) and r.get("id")
+            ][:3],
+            "source_skill_refs": [
+                s["name"]
+                for s in payload.get("skills", [])
+                if isinstance(s, dict) and s.get("name")
+            ][:5],
+        }
+    )
+
+
+def ats_hostile_resume_json(contact_name: str = "Daniel Joffe") -> str:
+    """A schema-VALID ``TailoredResume`` whose rendered markdown fails ATS lint.
+
+    Bug-corpus entry for #656. Every other failure in this module is the model
+    breaking its contract — prose instead of a tool call, truncated JSON,
+    malformed payloads. This one is the opposite and easier to miss: the model
+    returns a perfectly well-formed object that only becomes a problem once
+    ``to_markdown`` renders it and the linter reads the result. A pipe table
+    smuggled into bullet text is the canonical case (Greenhouse's parser reads
+    tables inconsistently, so ``no_tables`` is a blocking violation).
+
+    Scripting this is what lets a surface exercise the flagged-draft path
+    through the REAL linter instead of monkeypatching ``lint_docx`` — the stub
+    would happily "fail" on markdown the production linter accepts. Verified
+    the hard way while writing this: the obvious version, with the pipes
+    inlined into one bullet, lints CLEAN. ``_TABLE_PIPE_RE`` anchors per line
+    (``^\\s*\\|.*\\|\\s*$``), so the table only trips it once the model emits
+    real newlines — which is exactly the detail a stubbed linter would hide.
+
+    Deliberately returns a JSON string, not a model instance: the mock's
+    contract is text in, text out, and importing ``app.models.tailor`` here
+    would drag service-layer types into a module that stays free of them (same
+    rule as the duplicated purpose constants above).
+    """
+    return json.dumps(
+        {
+            "summary": "Senior frontend engineer with a decade of shipped work.",
+            "contact": {"name": contact_name, "email": "d@example.com"},
+            "experience": [
+                {
+                    "company": "FightCamp",
+                    "title": "Senior Frontend Engineer",
+                    "start": "2021-11",
+                    "end": "2024-04",
+                    "bullets": [
+                        {
+                            # The payload under test: a markdown table the
+                            # renderer passes straight through onto its own
+                            # lines, which is what the linter keys on.
+                            "text": (
+                                "Owned delivery metrics:\n"
+                                "| Metric | Before | After |\n"
+                                "|---|---|---|\n"
+                                "| LCP | 10s | 2s |"
+                            ),
+                            "source_outcome_ref": "Cut mobile load times from 10s to 2s",
+                        }
+                    ],
+                    "source_role_ref": "fc",
+                }
+            ],
+            "skills": ["React", "TypeScript"],
+            "education": [{"school": "UCLA", "degree": "BA"}],
+            "jd_snippet": "Senior FE role",
+        }
+    )
+
+
 def dev_default_responses() -> dict[str, ResponseSource]:
     """Scripted responses seeded into the mock for LOCAL DEV / integration only
     (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data
@@ -104,7 +364,12 @@ def dev_default_responses() -> dict[str, ResponseSource]:
     their own responses, so this never changes test behavior. A fresh dict is
     returned each call so callers can mutate their own copy.
     """
-    return {QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query}
+    return {
+        QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query,
+        JOB_ANALYSIS_PURPOSE: _dev_job_analysis,
+        TAILOR_RESUME_PURPOSE: _dev_tailor_resume,
+        TAILOR_COVER_LETTER_PURPOSE: _dev_cover_letter,
+    }
 
 
 class MockLLMClient:
@@ -201,9 +466,17 @@ class MockLLMClient:
             messages[-1].content,
         )
         response_text = self._render_response(purpose, latest_user, messages)
-        # Will raise json.JSONDecodeError if scripted text is not valid JSON
-        # — mirrors the real client failing when the model emits no tool_use.
-        tool_input = json.loads(response_text)
+        # A non-JSON script models the model answering in PROSE instead of
+        # emitting the forced tool call (the deepseek 2026-08-05 flake) —
+        # raise the same typed error the real parser does so downstream
+        # surfaces inherit the exact failure shape from the bug corpus.
+        try:
+            tool_input = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise MissingToolCallError(
+                f"Expected a forced tool_call for {tool_name!r}, got prose "
+                f"content={response_text[:200]!r}"
+            ) from exc
         if not isinstance(tool_input, dict):
             raise ValueError(
                 f"Scripted response for {purpose!r} must decode to a JSON object, "

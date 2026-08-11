@@ -10,18 +10,19 @@ F3 — learn-llm must sit behind the LLM budget gate.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
 
+import app.routers.analysis as analysis_router
 from app.dependencies import (
     enforce_llm_budget,
+    get_async_service_supabase,
+    get_async_supabase_for_caller,
     get_current_user_id,
     get_current_user_id_optional,
     get_llm_client,
-    get_supabase,
-    get_supabase_for_caller,
     verify_api_key_or_jwt,
 )
 from app.services.llm.mock import MockLLMClient
@@ -71,10 +72,12 @@ async def test_analysis_unowned_target_is_404_before_any_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """JWT caller not linked to target_id → 404; no cache read, no LLM call."""
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"})
+    monkeypatch.setattr(
+        analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"})
+    )
     from app.services.analysis import persistence as persistence_mod
 
-    get_cached = MagicMock()
+    get_cached = AsyncMock()
     monkeypatch.setattr(persistence_mod, "get_cached", get_cached)
 
     llm = MockLLMClient()
@@ -82,11 +85,11 @@ async def test_analysis_unowned_target_is_404_before_any_work(
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             get_llm_client: lambda: llm,
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
-            get_supabase_for_caller: lambda: MagicMock(),
+            get_async_supabase_for_caller: lambda: MagicMock(),
             enforce_llm_budget: lambda: None,
         }
     )
@@ -104,20 +107,20 @@ async def test_analysis_owned_target_passes_gate(
 ) -> None:
     """Linked caller proceeds past the ownership gate (404s later on the
     missing optimized doc, NOT on ownership)."""
-    monkeypatch.setattr(crud, "get_user_target_ids", lambda *_a, **_kw: {"tgt-owned"})
-    from app.services.experience import optimized as opt_mod
-
-    monkeypatch.setattr(opt_mod, "get_latest", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"})
+    )
+    monkeypatch.setattr(analysis_router, "_optimized_latest", AsyncMock(return_value=None))
 
     from app.main import app
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            get_async_service_supabase: lambda: MagicMock(),
             get_llm_client: lambda: MockLLMClient(),
             verify_api_key_or_jwt: lambda: "jwt",
             get_current_user_id_optional: lambda: "user-a",
-            get_supabase_for_caller: lambda: MagicMock(),
+            get_async_supabase_for_caller: lambda: MagicMock(),
             enforce_llm_budget: lambda: None,
         }
     )
@@ -144,7 +147,10 @@ async def test_learn_llm_blocked_when_budget_exhausted() -> None:
 
     tc = _client_with_overrides(
         {
-            get_supabase: lambda: MagicMock(),
+            # learn-llm is async on the service client (#57 slice 4), and
+            # enforce_llm_budget resolves it too (#57 PR-G2e-8) — override it so
+            # dependency resolution doesn't 503 before the budget gate.
+            get_async_service_supabase: lambda: MagicMock(),
             get_llm_client: lambda: MockLLMClient(),
             get_current_user_id: lambda: "user-a",
             enforce_llm_budget: _over_budget,

@@ -2,60 +2,50 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
+from app.constants import resolve_owner
 from app.models.experience import OptimizedDoc
 from app.models.schemas import PollResult
 from app.models.targets import JobTarget
 from app.services import notify
-from app.services.analysis.analyze import analyze_job
-from app.services.analysis.persistence import (
-    get_cached as get_cached_analysis,
-)
-from app.services.analysis.persistence import (
-    persist as persist_analysis,
-)
-from app.services.analysis.scoring import blend_scores, scorecard_to_numeric
 from app.services.ashby import fetch_ashby_jobs
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
-from app.services.embeddings import get_default_client as get_embeddings_client
-from app.services.embeddings.job_embeddings import (
-    DEFAULT_MODEL as EMBED_DEFAULT_MODEL,
-)
-from app.services.embeddings.job_embeddings import (
-    embed_jobs_batch,
-    upsert_job_embedding,
-)
-from app.services.embeddings.prescan_gate import cosine_gate_decision
-from app.services.embeddings.prescan_shadow import record_shadow_observation
-from app.services.experience.optimized import get_latest as get_latest_optimized
-from app.services.extract import extract_salary_from_text
+from app.services.experience import optimized
+from app.services.extract import extract_salary_from_html, salary_columns
 from app.services.firecrawl import fetch_firecrawl_jobs
 from app.services.fit import run_phase2_for_jobs
-from app.services.fit.phase2_runner import _prescan_gate_applies
 from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
-from app.services.jsonld import fetch_jsonld_jobs
+from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
 from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError
-from app.services.llm import get_client as get_llm_client
+from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
-from app.services.llm.cost_log import record as record_llm_cost
-from app.services.llm.cost_log import total_spend_all as total_llm_spend_all
+from app.services.llm.cost_log import record_async as record_llm_cost_async
+from app.services.llm.cost_log import total_spend_all_async as total_llm_spend_all_async
 from app.services.llm.errors import (
     LLMQuotaExhaustedError,
     LLMRateLimitedError,
     LLMServiceError,
 )
+from app.services.llm.provider_breaker import (
+    provider_fatal_active as _provider_fatal_active,
+)
+from app.services.llm.provider_breaker import (
+    trip_provider_fatal as _trip_provider_fatal,
+)
+from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
@@ -64,6 +54,7 @@ from app.services.qualification import (
     qualification_hash,
     tag_job,
 )
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.title_triage import (
     PHASE1_PURPOSE,
@@ -73,27 +64,30 @@ from app.services.relevance.title_triage import (
     triage_titles,
 )
 from app.services.sanitize import sanitize_html
-from app.services.scoring import score_title_against_profile, strip_html
+from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
 from app.services.target_scoring import (
-    batch_update_global_scores_poll as batch_update_global_scores,
+    score_and_upsert as target_score_and_upsert,
 )
 from app.services.target_scoring import (
-    mark_complete_poll as mark_target_scores_complete,
+    score_title_and_upsert as target_title_score_and_upsert,
 )
-from app.services.target_scoring import (
-    score_and_upsert_poll as target_score_and_upsert,
-)
-from app.services.target_scoring import (
-    score_title_and_upsert_poll as target_title_score_and_upsert,
-)
-from app.services.targets.crud import get_active as get_active_target
+from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
+from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
+
+# Every poll-cycle entry point now passes the pooled ``AsyncClient`` (#57): the
+# scheduler + force poll (PR-G2d-b) and the target-activation poll
+# (``routers.targets`` → ``poll_sources_for_target``). Every DB touch below routes
+# through the ``db_write`` seam (client-agnostic — it uses ``get_async_supabase()``
+# internally), and the cross-user service-role collaborators (budget meter, payer
+# resolver, alert dispatch) await on the pooled async service client via
+# ``_async_service_client`` (PR-G2e-1).
 
 # Large id lists derived from a source's job feed (re-read of newly-inserted
 # rows, Stage 3 score lookups, stale-archive) never go through a request URL:
@@ -123,6 +117,12 @@ FETCHERS: dict[str, Fetcher] = {
 # ``DB_WRITE_CONCURRENCY`` (see ``app.services.db_write``), but a lower
 # source fan-out also keeps the per-source detail/JD fetches civil.
 POLL_CONCURRENCY = 6
+
+# How often the target-activation fan-out re-checks that its target is
+# still pipeline-active (#638). One cheap read a minute against a
+# multi-hour full-catalog grind; deactivation drains the fan-out within
+# roughly one interval.
+_ACTIVE_RECHECK_S = 60
 LLM_CONCURRENCY = 3
 
 # Cycle-wide caps for the two fan-outs that otherwise had none. Both
@@ -165,10 +165,6 @@ def _validate_semaphore() -> asyncio.Semaphore:
 # persistence) — a few calls per cycle, migrating with the request-handler
 # slice, not per-row fan-outs.
 
-# Minimum keyword score to trigger LLM analysis during polling.
-# Below this threshold, only keyword scoring is used.
-LLM_SCORE_THRESHOLD = 40
-
 # How many qualification-tagger jobs to fan out between global-budget
 # re-reads (#60 overspend fix). The tagger bills the instance key, so it is
 # invisible to the per-payer ``PayerBudgetGate``; left ungated it ground the
@@ -180,37 +176,15 @@ LLM_SCORE_THRESHOLD = 40
 QUALIFICATION_BUDGET_RECHECK_EVERY = 50
 
 # --- Provider-fatal fast-fail breaker (audit PERF-M "402/429 fast-fail") -------
-# ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. This
-# breaker catches the *provider* rejecting every call — OpenRouter out of
-# credits (402) or sustained rate-limiting (429, after the client's own
-# retries) — which can happen while we're still UNDER budget (a low account
-# balance with a high cap). The first such error from the tagger latches this
-# for a cooldown so the qualify fan-out stops firing hundreds of doomed calls
-# per cycle; it auto-clears (monotonic), so the first cycle after the cooldown
-# retries once (credits may be topped up / the 429 window may have passed).
-# Module-level + in-process is fine on the single poller worker (same rationale
-# as the lifecycle sweep below).
-_PROVIDER_FATAL_COOLDOWN_S = 300.0
-_provider_fatal_until = 0.0
-
-
-def _trip_provider_fatal(exc: BaseException) -> None:
-    """Latch the fast-fail breaker for the cooldown after a provider 402/429."""
-    global _provider_fatal_until
-    _provider_fatal_until = time.monotonic() + _PROVIDER_FATAL_COOLDOWN_S
-    logger.warning(
-        "LLM provider fast-fail latched for %.0fs — provider rejecting calls "
-        "(%s: %s). Deferring the rest of this cycle's tagging; it retries after "
-        "the cooldown. If this is a 402, top up OpenRouter credits.",
-        _PROVIDER_FATAL_COOLDOWN_S,
-        type(exc).__name__,
-        exc,
-    )
-
-
-def _provider_fatal_active() -> bool:
-    """True while the provider-fatal breaker is latched (within the cooldown)."""
-    return time.monotonic() < _provider_fatal_until
+# ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. The
+# provider-fatal breaker catches the *provider* rejecting every call — OpenRouter
+# out of credits (402) or sustained rate-limiting (429) — which can happen while
+# we're still UNDER budget. The first such error from the tagger latches it for a
+# cooldown so the qualify fan-out stops firing doomed calls; it auto-clears
+# (monotonic). It now lives in ``app.services.llm.provider_breaker`` (imported at
+# the top as ``_provider_fatal_active`` / ``_trip_provider_fatal``) so the E2 lazy
+# fit-score refresh shares the SAME latch — a credits outage caught by either
+# backs the other off too.
 
 
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
@@ -436,6 +410,54 @@ def _phase1_promising(
     return None
 
 
+# Phase-1 negative-verdict cache (#514 residual). A REJECTED candidate never
+# ingests, so its title re-enters triage every cycle and re-pays the LLM for
+# the same "no" at the source's poll cadence until the posting closes —
+# measured as the dominant LLM line item (17,843 title_triage calls / $8.34
+# per 7d, 2026-07-29). Remember rejections per (target, profile_version,
+# normalized title) for ``settings.phase1_rejection_ttl_hours``; a cache hit
+# re-injects a synthetic ``promising=False`` verdict, so every downstream
+# mechanism (attempted-set defer semantics, ``_any_target_admits``, Stage-2
+# floor writes) behaves exactly as if the LLM had re-said no. Admits are
+# never cached: an admitted job INGESTS, so known-ness already stops its
+# re-triage. Keyed on profile_version so a profile edit re-judges everything
+# under the new profile immediately. In-process only — the poller runs under
+# a fleet-wide advisory lock, so one process sees all cycles; a restart just
+# costs one extra verdict per title.
+_PHASE1_REJECTIONS: dict[tuple[str, int, str], float] = {}
+# Hard size bound. ~60k rejections is far beyond a day of fleet-wide triage
+# (~2.5k verdicts/day measured); hitting it means something is looping.
+_PHASE1_REJECTIONS_CAP = 60_000
+
+
+def _phase1_rejection_key(target: JobTarget, title: str) -> tuple[str, int, str]:
+    return (target.id, target.profile_version, " ".join(title.lower().split()))
+
+
+def _phase1_cached_rejection(target: JobTarget, title: str) -> bool:
+    """True iff this (target, title) was LLM-rejected within the TTL."""
+    if settings.phase1_rejection_ttl_hours <= 0:
+        return False
+    expiry = _PHASE1_REJECTIONS.get(_phase1_rejection_key(target, title))
+    return expiry is not None and expiry > time.monotonic()
+
+
+def _phase1_record_rejection(target: JobTarget, title: str) -> None:
+    if settings.phase1_rejection_ttl_hours <= 0:
+        return
+    if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
+        now = time.monotonic()
+        for key in [k for k, exp in _PHASE1_REJECTIONS.items() if exp <= now]:
+            del _PHASE1_REJECTIONS[key]
+        if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
+            # Still full of LIVE entries — blunt reset. Losing the cache
+            # costs extra verdicts, never correctness.
+            _PHASE1_REJECTIONS.clear()
+    _PHASE1_REJECTIONS[_phase1_rejection_key(target, title)] = (
+        time.monotonic() + settings.phase1_rejection_ttl_hours * 3600.0
+    )
+
+
 def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, str]:
     """Stable lowercase + collapsed-whitespace key for the
     (company, title) dedupe pass. Whitespace differences ("Director"
@@ -447,6 +469,65 @@ def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, st
     co = " ".join((company or "").lower().split())
     ti = " ".join((title or "").lower().split())
     return (co, ti)
+
+
+# The refreshable payload fields the per-cycle content hash covers (#642).
+# Derived columns (city/state/country/location_remote from ``location``;
+# salary_min/max/currency/period from ``salary_text``) are deliberately
+# absent: they are pure functions of hashed inputs, so hashing the inputs
+# suffices — and code changes to the derivations are healed by backfills,
+# not by rewriting every row every cycle.
+_CONTENT_HASH_FIELDS = (
+    "title",
+    "location",
+    "description_html",
+    "absolute_url",
+    "source_posted_at",
+    "salary_text",
+)
+
+
+def _content_hash(row: dict[str, Any]) -> str:
+    """sha256 over the poller-refreshable payload of a built jobs row.
+
+    Change-detection for the per-cycle content refresh (#642): the poller
+    used to rewrite every KNOWN row's full payload every cycle (~63
+    rewrites per row measured; description_html TOAST included) and then
+    re-run stage-2 scoring on it — the dominant write load behind the
+    2026-08-06/07 disk-IO exhaustion incidents. Rows whose hash matches
+    the stored ``jobs.content_hash`` skip both.
+    """
+    h = hashlib.sha256()
+    for field in _CONTENT_HASH_FIELDS:
+        value = row.get(field)
+        h.update(b"\x1f")
+        h.update(("" if value is None else str(value)).encode())
+    return h.hexdigest()
+
+
+def _partition_unchanged(
+    rows: list[dict[str, Any]],
+    known_hashes: dict[str | None, str | None],
+) -> tuple[list[dict[str, Any]], int]:
+    """Split built rows into (to_write, skipped_unchanged_count).
+
+    A row skips iff its external_id is KNOWN and the stored hash equals its
+    freshly computed hash. Fresh rows and NULL-stored-hash rows (pre-#642
+    ingests) always write — the write stamps ``content_hash``, so each
+    legacy row pays exactly one more rewrite and then skips forever.
+    Every written row carries its hash in the payload.
+    """
+    to_write: list[dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        digest = _content_hash(row)
+        ext = row.get("external_id")
+        if ext in known_hashes and known_hashes[ext] == digest:
+            skipped += 1
+            continue
+        row["content_hash"] = digest
+        to_write.append(row)
+    return to_write, skipped
 
 
 def _dedupe_by_content(
@@ -518,15 +599,14 @@ async def _validate_one_row(row: dict[str, Any]) -> dict[str, Any]:
         # PERF-H3: bound the URL-validation fan-out cycle-wide.
         async with _validate_semaphore():
             result = await validate_job_url(url)
+        # The validation's OBSERVABLE effects live on absolute_url (null a
+        # rejected link, normalize redirects). The old per-row ledger columns
+        # (url_validation_status/warnings) were write-only for their whole
+        # life — 0 rejected / 35k 'valid' ever — and were dropped in R2.
         if not result.is_valid:
-            row["url_validation_status"] = "rejected"
-            row["url_validation_warnings"] = [result.rejection_reason]
             row["absolute_url"] = None
-        else:
-            row["url_validation_status"] = "valid"
-            row["url_validation_warnings"] = result.warnings
-            if result.final_url != url:
-                row["absolute_url"] = result.final_url
+        elif result.final_url != url:
+            row["absolute_url"] = result.final_url
     except Exception:
         logger.exception("URL validation failed for %s", url)
     return row
@@ -537,37 +617,48 @@ async def _validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(await asyncio.gather(*(_validate_one_row(r) for r in rows)))
 
 
-async def _batch_fetch_job_scores(supabase: Client, job_ids: list[str]) -> dict[str, int]:
-    """Return ``{job_id: score}`` for the given ids in a single round-trip.
+async def _fill_jsonld_salaries(
+    rows: list[dict[str, Any]], known_external_ids: set[str | None]
+) -> None:
+    """#503: bounded JSON-LD ``baseSalary`` fallback for NEW salary-less rows.
 
-    Callers in the poller fan out Stage 3 over N rows; without this batch
-    helper each call did its own ``.eq("id", jid).single()`` lookup — N
-    sequential queries to read scores that Stage 2 just wrote. One RPC
-    call replaces all of them.
-
-    ``job_ids`` scales with a source's job feed (every upsertable row), so
-    they ride in the ``get_job_scores_by_ids`` RPC's ``p_ids`` jsonb body —
-    no id list in the request URL, no URL-length limit, one round-trip
-    (#93). The result dict is keyed by id, identical to the old ``.in_()``
-    read.
+    Board APIs often omit the structured pay their hosted posting pages carry
+    as schema.org markup (Lever/Ashby especially). For up to
+    ``jsonld_salary_max_fetches`` NEW rows per source per cycle whose JD text
+    yielded no salary, fetch the posting page and read ``baseSalary``.
+    Flag-gated (ships dark), bounded by the same cycle-wide fetch semaphore
+    as URL validation, and best-effort — failures leave the row's salary
+    null, exactly as before. Known rows are skipped: their salary re-derives
+    from JD content every cycle (#514), and re-fetching every known row's
+    page per cycle would be the same fan-out storm URL validation avoids.
     """
-    if not job_ids:
-        return {}
-    resp = await poll_db_read(
-        supabase,
-        lambda c: c.rpc("get_job_scores_by_ids", {"p_ids": job_ids}),
-        label="poll job-scores read",
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    out: dict[str, int] = {}
-    for r in rows:
-        if r.get("id") is not None:
-            out[cast(str, r["id"])] = int(r.get("score") or 0)
-    return out
+    if not settings.jsonld_salary_enabled:
+        return
+    candidates = [
+        r
+        for r in rows
+        if r.get("external_id") not in known_external_ids
+        and not r.get("salary_text")
+        and r.get("absolute_url")
+    ][: settings.jsonld_salary_max_fetches]
+    if not candidates:
+        return
+
+    async def _one(row: dict[str, Any]) -> None:
+        try:
+            async with _validate_semaphore():
+                salary = await fetch_salary_from_posting_page(str(row["absolute_url"]))
+            if salary:
+                row["salary_text"] = salary
+                row.update(salary_columns(salary))
+        except Exception:
+            logger.exception("jsonld salary fill failed for %s", row.get("absolute_url"))
+
+    await asyncio.gather(*(_one(r) for r in candidates))
 
 
 async def _load_alert_rows(
-    supabase: Client, new_rows: list[dict[str, Any]]
+    supabase: AsyncClient, new_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Re-read newly-inserted job rows with their post-scoring state.
 
@@ -605,172 +696,126 @@ async def _load_alert_rows(
     return new_rows
 
 
-async def _run_llm_scoring_for_row(
-    supabase: Client,
-    row_data: dict[str, Any],
-    optimized_doc: OptimizedDoc,
-    llm: LLMClient,
-    target: JobTarget,
-    *,
-    current_score: int | None = None,
-    payer_user_id: str | None = None,
-) -> None:
-    """Stage 3: Run LLM analysis and mark target scores as complete.
+def _async_service_client() -> AsyncClient:
+    """Async service-role client for the poll cycle's now-async collaborators.
 
-    The caller may pass ``current_score`` to skip the per-job score
-    lookup — strongly preferred when invoking in a fan-out loop, since
-    Stage 2 already wrote the score and pre-fetching the batch via
-    ``_batch_fetch_job_scores`` collapses N round-trips into 1. When
-    omitted, falls back to a per-row ``.eq().single()`` lookup for
-    callers that don't have a batch context.
+    The async twin of the retired sync service-client escape-hatch (#57
+    PR-G2e-1): the budget/spend meter (``build_budget_gate`` + the global-spend
+    predicates on
+    cost_log's async meter twins), the per-payer BYOK resolver, the Phase-1 cost
+    write, and the email/SMS alert dispatch now await on the pooled ``AsyncClient``
+    instead of running a sync client in a thread.
 
-    Blends keyword and LLM scores, updates global score, and marks all
-    target scores for this job as 'complete'.
+    Deliberately the SERVICE-role pool, NOT the cycle's ``supabase`` argument:
+    on the scheduled/force path ``supabase`` IS this client, but on the
+    target-activation path it can be a user-scoped client, and these are
+    cross-user reads (spend across all users, every alertable profile, every
+    payer link) that must bypass RLS — exactly what the sync helper guaranteed.
 
-    Cache key is (job_posting_id, target.id, optimized_doc.id) — the
-    same row is reused by the user-facing analysis flow when viewing
-    the job under this target.
+    Prod always has it (``init_async_supabase`` runs in the lifespan); the
+    ``cast`` covers the unconfigured/test path, where every caller's collaborator
+    is stubbed and the client is never dereferenced.
 
-    Silently falls back to keyword-only score on any error.
+    NOTE: ``run_phase2_for_jobs`` takes this async client too (#57 PR-G2e-3 —
+    its scoring/embeddings vertical, incl. the Phase-2 grader, quota counter, and
+    the lazy vector reads/writes, migrated). The lifecycle/archival sweeps and the
+    qualification tagger's LLM-client construction now take it as well (#57
+    PR-G2e-6): the sweeps route their DB through the ``db_write`` seam, so this is
+    the last sync-client escape hatch the poll cycle retired.
     """
-    job_id = row_data.get("id")
-    if not job_id:
-        return
+    return cast(AsyncClient, get_async_supabase())
 
-    if current_score is None:
-        # Single-row fallback for callers without a pre-fetched batch.
-        try:
-            score_resp = await poll_db_read(
-                supabase,
-                lambda c: c.table("jobs").select("score").eq("id", job_id).single(),
-                label="poll job-score fallback read",
-            )
-            current_score = int(cast(dict[str, Any], score_resp.data).get("score", 0))
-        except Exception:
-            # Score row missing or unparseable — treat as 0 so the LLM-threshold
-            # gate applies as if this is a fresh job. Logged so silent zeroing is
-            # observable when investigating low-confidence matches.
-            logger.warning(
-                "Could not read current score for job %s — defaulting to 0",
-                job_id,
-                exc_info=True,
-            )
-            current_score = 0
 
-    if current_score < LLM_SCORE_THRESHOLD:
-        # Below threshold — skip LLM but still mark as complete
-        try:
-            await mark_target_scores_complete(supabase, job_id)
-        except Exception:
-            logger.exception("Failed to mark scores complete for job %s", job_id)
-        return
-
-    # Check LLM cache — skip re-analysis if this job+target+optimized was already
-    # done. Scope to the doc's OWNING user (``optimized_doc.user_id``) — the same
-    # tenant the user-facing ``POST /analysis`` reads under (its
-    # ``get_latest(user_id=sub)`` returns this very doc). Reading/persisting under
-    # ``user_id=None`` (the old value) stranded cron-computed analyses in a
-    # separate namespace the user view could never hit, so every first visit
-    # re-fired a full-price LLM call the cron had already paid for.
-    try:
-        cached = await asyncio.to_thread(
-            get_cached_analysis,
+async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
+    """Async inline of ``crud.get_active`` (the sync twin stays for its non-poll
+    callers): the derived ``app_active OR EXISTS(active membership)`` pipeline
+    predicate — two indexed reads deduped in Python (see the crud docstring for
+    the dropped-trigger history). Routed through the poll seam so it rides the
+    pooled async client; mirror of ``routers.targets._active_targets``.
+    """
+    floor_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table(crud.TARGETS_TABLE).select("*").eq("app_active", True),
+        label="poll active-targets floor",
+        retry_sync=True,
+    )
+    member_ids_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table(crud.USER_TARGETS_TABLE).select("target_id").eq("is_active", True),
+        label="poll active-targets members",
+        retry_sync=True,
+    )
+    member_ids = {
+        cast(str, r["target_id"])
+        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+    }
+    rows = cast(list[dict[str, Any]], floor_resp.data or [])
+    seen = {cast(str, r["id"]) for r in rows}
+    missing = sorted(member_ids - seen)
+    if missing:
+        member_resp = await poll_db_read(
             supabase,
-            job_id,
-            target_id=target.id,
-            optimized_doc_id=optimized_doc.id,
-            user_id=optimized_doc.user_id,
+            lambda c, _missing=missing: c.table(crud.TARGETS_TABLE).select("*").in_("id", _missing),
+            label="poll active-targets missing",
+            retry_sync=True,
         )
-        if cached is not None:
-            llm_score = scorecard_to_numeric(cached.scorecard)
-            blended = blend_scores(current_score, llm_score)
-            await poll_db_write(
-                supabase,
-                lambda c: (
-                    c.table("jobs")
-                    .update(
-                        {
-                            "score": blended,
-                            "llm_score": llm_score,
-                            "llm_analysis_id": cached.id,
-                        }
-                    )
-                    .eq("id", job_id)
-                ),
-                label="poll llm-score cached update",
-            )
-            await mark_target_scores_complete(supabase, job_id)
-            return
-    except Exception:
-        logger.debug("LLM cache check failed for job %s, proceeding with analysis", job_id)
+        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
+    return [crud._parse_target(r) for r in rows]
 
-    try:
-        description_text = strip_html(row_data.get("description_html", ""))
 
-        analysis, llm_result = await analyze_job(
-            llm,
-            optimized=optimized_doc.payload,
-            job_description=description_text,
-            purpose="poll_scoring",
-        )
+async def _is_pipeline_active(supabase: AsyncClient, target_id: str) -> bool:
+    """Async inline of ``crud.is_pipeline_active`` (sync twin stays for the bulk
+    re-scorer): the instance floor OR any active membership. Seam-routed."""
+    t_resp = await poll_db_read(
+        supabase,
+        lambda c: c.table(crud.TARGETS_TABLE).select("app_active").eq("id", target_id).limit(1),
+        label="poll pipeline-active target",
+        retry_sync=True,
+    )
+    t_rows = cast(list[dict[str, Any]], t_resp.data or [])
+    if not t_rows:
+        return False
+    if bool(t_rows[0].get("app_active")):
+        return True
+    m_resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table(crud.USER_TARGETS_TABLE)
+            .select("id", count="exact", head=True)
+            .eq("target_id", target_id)
+            .eq("is_active", True)
+        ),
+        label="poll pipeline-active members",
+        retry_sync=True,
+    )
+    return bool(m_resp.count or 0)
 
-        # Persist analysis and log cost. Owned by ``optimized_doc.user_id`` so
-        # the user-facing ``POST /analysis`` flow reuses this exact row (shared
-        # cache key (job, target, optimized_doc_id, user_id)) instead of
-        # re-running the LLM on first view.
-        record = await asyncio.to_thread(
-            persist_analysis,
-            supabase,
-            job_posting_id=job_id,
-            target_id=target.id,
-            user_id=optimized_doc.user_id,
-            optimized_doc_id=optimized_doc.id,
-            analysis=analysis,
-            llm_result=llm_result,
-        )
-        # Cron path: enqueue instead of inline INSERT. The background
-        # buffer batches per-row writes into a single bulk INSERT every
-        # few seconds, so a fan-out of N concurrent LLM calls produces
-        # ~1 cost-log INSERT instead of N. Charged to the payer (the
-        # user whose optimized doc this run scores against).
-        enqueue_llm_cost(payer_user_id, "poll_scoring", llm_result)
 
-        llm_score = scorecard_to_numeric(analysis.scorecard)
-        blended = blend_scores(current_score, llm_score)
-
-        # Update the jobs row with LLM score data
-        await poll_db_write(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .update(
-                    {
-                        "score": blended,
-                        "llm_score": llm_score,
-                        "llm_analysis_id": record.id,
-                    }
-                )
-                .eq("id", job_id)
-            ),
-            label="poll llm-score update",
-        )
-
-        # Mark all target scores as complete
-        await mark_target_scores_complete(supabase, job_id)
-
-    except Exception:
-        logger.exception(
-            "LLM scoring failed for job %s ('%s')",
-            row_data.get("id"),
-            row_data.get("title", "?"),
-        )
-        # Still mark as complete on error — don't leave jobs stuck in stage2
-        with contextlib.suppress(Exception):
-            await mark_target_scores_complete(supabase, job_id)
+async def _latest_optimized(supabase: AsyncClient, user_id: str | None) -> OptimizedDoc | None:
+    """Async inline of ``optimized.get_latest`` (sync twin stays for the request
+    path's TTL cache + non-poll callers). Seam-routed; skips the module TTL
+    cache (the poller reads a user's doc at most once per cycle, and the cache
+    exists for the hot request path)."""
+    resp = await poll_db_read(
+        supabase,
+        lambda c: (
+            c.table(optimized.TABLE)
+            .select("*")
+            .eq("user_id", resolve_owner(user_id))
+            .order("version", desc=True)
+            .limit(1)
+        ),
+        label="poll optimized-doc read",
+        retry_sync=True,
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return OptimizedDoc.model_validate(rows[0])
 
 
 async def _resolve_user_targets_for_stage3(
-    supabase: Client,
+    supabase: AsyncClient,
     active_targets: list[JobTarget],
     company_name: str,
 ) -> tuple[dict[str, JobTarget], dict[str, OptimizedDoc]]:
@@ -810,7 +855,7 @@ async def _resolve_user_targets_for_stage3(
         for user_id in users_by_target.get(t.id, []):
             if user_id in primary_by_user:
                 continue
-            doc = await asyncio.to_thread(get_latest_optimized, supabase, user_id)
+            doc = await _latest_optimized(supabase, user_id)
             if doc is None:
                 logger.info(
                     "No optimized doc for user %s; skipping stage 3 for %s",
@@ -826,7 +871,7 @@ async def _resolve_user_targets_for_stage3(
 
 async def _qualify_one_job(
     llm: LLMClient,
-    supabase: Client,
+    supabase: AsyncClient,
     row: dict[str, Any],
 ) -> None:
     """Tag ONE job row and persist its qualification columns (#60).
@@ -890,7 +935,6 @@ async def _qualify_one_job(
 
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
-        "us_confidence": tags.us_confidence,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
         "employment_type": tags.employment_type,
@@ -919,6 +963,12 @@ async def _qualify_one_job(
         and not positively_us_location(row.get("location"))
     ):
         payload["archived_at"] = datetime.now(UTC).isoformat()
+    # Non-postings (#60 wire-up): an explicit ``is_genuine_role=false``
+    # verdict ("join our talent community", evergreen collectors) archives in
+    # the same write — these aren't jobs, so they leave every serving surface
+    # via the standard liveness gate. Lenient: ``None`` never archives.
+    if settings.qualification_archive_non_genuine and tags.is_genuine_role is False:
+        payload["archived_at"] = datetime.now(UTC).isoformat()
     try:
         await poll_db_write(
             supabase,
@@ -930,7 +980,7 @@ async def _qualify_one_job(
 
 
 async def _qualify_jobs(
-    supabase: Client,
+    supabase: AsyncClient,
     rows: list[dict[str, Any]],
 ) -> None:
     """Run the #60 qualification tagger over ``rows`` (best-effort).
@@ -949,15 +999,40 @@ async def _qualify_jobs(
     to one chunk instead of the whole backlog. Untagged rows simply stay
     NULL (fail-soft, exactly like a tagger outage) and re-attempt next cycle
     once the UTC day rolls over and the meter resets.
+
+    Whatever happens above — full tag pass, budget defer, provider trip, even
+    an unavailable LLM client — the ``finally`` step ALWAYS runs the two
+    DB-only closers: ``_refresh_job_tags`` (patch fresh tag columns back into
+    the caller's row dicts, which are upsert-time snapshots that predate this
+    cycle's tag writes) and ``_reconcile_offfamily_promising`` (retract
+    ``promising`` verdicts the now-known family hard-contradicts — Phase 1
+    triages titles pre-ingest, before any tag exists, and #517 deliberately
+    never demotes on re-poll, so a late-landing tag is the ONLY chance to
+    correct an off-family admit; prod 2026-07-30: 55% of promising rows).
+    Neither needs the LLM, and both are cheap id-scoped reads/writes.
     """
     if not rows:
         return
     try:
-        llm = get_llm_client(supabase, None)
-    except Exception:
-        logger.exception("Qualification tagger: LLM client unavailable; skipping")
-        return
+        try:
+            llm = await get_llm_client_async(_async_service_client(), None)
+        except Exception:
+            logger.exception("Qualification tagger: LLM client unavailable; skipping")
+            return
+        await _qualify_rows_with_budget(supabase, llm, rows)
+    finally:
+        await _refresh_job_tags(supabase, rows)
+        await _reconcile_offfamily_promising(
+            supabase, [cast(str, r["id"]) for r in rows if r.get("id")]
+        )
 
+
+async def _qualify_rows_with_budget(
+    supabase: AsyncClient,
+    llm: LLMClient,
+    rows: list[dict[str, Any]],
+) -> None:
+    """The budget-gated tagger fan-out (see ``_qualify_jobs`` docstring)."""
     for start in range(0, len(rows), QUALIFICATION_BUDGET_RECHECK_EVERY):
         # Provider fast-fail (audit PERF-M): if a prior chunk already hit a
         # 402/429, the provider is rejecting every call — defer the rest of the
@@ -974,9 +1049,8 @@ async def _qualify_jobs(
         # refuse to spend when we can't see the budget, matching the cycle
         # gate's posture.
         try:
-            exhausted = await asyncio.to_thread(
-                _global_budget_exhausted,
-                supabase,
+            exhausted = await _global_budget_exhausted(
+                _async_service_client(),
                 reserve_usd=settings.grading_budget_reserve_usd,
             )
         except Exception:
@@ -1004,7 +1078,116 @@ async def _qualify_jobs(
         )
 
 
-async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
+# in_() id-chunk bound for the tag-refresh / reconcile reads (#57 lesson:
+# ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
+_IN_CHUNK = 150
+
+
+async def _refresh_job_tags(supabase: AsyncClient, rows: list[dict[str, Any]]) -> None:
+    """Patch fresh tag columns back into ``rows`` (in place, best-effort).
+
+    The dicts the poll cycle threads into Phase 2 (``upsert_resp.data``) are
+    snapshots from BEFORE the tagger's UPDATE, so on a job's first cycle
+    ``role_family``/``is_us`` read as NULL downstream even though the row is
+    tagged — the Phase-2 family and US gates then fail open on exactly the
+    cycle that grades most jobs. One chunked read closes that window; a read
+    failure leaves the snapshots as they were (the pre-existing behavior).
+    """
+    ids = [cast(str, r["id"]) for r in rows if r.get("id")]
+    if not ids:
+        return
+    by_id = {cast(str, r["id"]): r for r in rows if r.get("id")}
+    try:
+        for start in range(0, len(ids), _IN_CHUNK):
+            chunk = ids[start : start + _IN_CHUNK]
+            resp = await poll_db_read(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("jobs").select("id, role_family, is_us").in_("id", _chunk)
+                ),
+                label="qualify tag refresh",
+            )
+            for raw in cast(list[dict[str, Any]], resp.data or []):
+                row = by_id.get(cast(str, raw.get("id")))
+                if row is not None:
+                    row["role_family"] = raw.get("role_family")
+                    row["is_us"] = raw.get("is_us")
+    except Exception:
+        logger.exception("Qualification tag refresh failed (best-effort; dicts stay stale)")
+
+
+async def _reconcile_offfamily_promising(supabase: AsyncClient, job_ids: list[str]) -> None:
+    """Retract ``promising`` verdicts that the (now-landed) family tag
+    hard-contradicts (best-effort).
+
+    Phase 1 triages titles PRE-ingest — no jobs row, no tag — and #517's
+    floor deliberately never demotes a persisted verdict on re-poll, so an
+    off-family admit would otherwise stand forever (the 2026-07-30 audit:
+    55% of all promising rows were hard off-family; the one-off
+    ``backfill_offfamily_promising.py`` cleaned the stock, this closes the
+    flow). Mismatch test = the shared ``passes_family_gate`` over the
+    trigger-synced ``scores.job_role_family`` denorm vs the target's family;
+    keep-null on either side, exactly like every read gate. ``excluded`` is
+    never touched (user-preference semantics).
+    """
+    if not job_ids:
+        return
+    try:
+        tresp = await poll_db_read(
+            supabase,
+            lambda c: c.table("targets").select("id, role_family"),
+            label="reconcile target families",
+        )
+        target_family = {
+            cast(str, r["id"]): cast("str | None", r.get("role_family"))
+            for r in cast(list[dict[str, Any]], tresp.data or [])
+        }
+        if not any(target_family.values()):
+            return  # no classified targets — nothing can mismatch
+
+        to_retract: list[str] = []
+        # Third-size chunks: this read returns up to one row per (job, target)
+        # pair, and a full 150-job chunk on a many-target install could cross
+        # PostgREST's 1000-row response cap (silent truncation).
+        scan_chunk = _IN_CHUNK // 3
+        for start in range(0, len(job_ids), scan_chunk):
+            chunk = job_ids[start : start + scan_chunk]
+            sresp = await poll_db_read(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("scores")
+                    .select("id, target_id, job_role_family")
+                    .eq("promising", True)
+                    .in_("job_posting_id", _chunk)
+                ),
+                label="reconcile promising read",
+            )
+            for s in cast(list[dict[str, Any]], sresp.data or []):
+                tfam = target_family.get(cast(str, s.get("target_id")))
+                if not passes_family_gate(tfam, cast("str | None", s.get("job_role_family"))):
+                    to_retract.append(cast(str, s["id"]))
+
+        for start in range(0, len(to_retract), _IN_CHUNK):
+            chunk = to_retract[start : start + _IN_CHUNK]
+            await poll_db_write(
+                supabase,
+                lambda c, _chunk=chunk: (
+                    c.table("scores").update({"promising": False}).in_("id", _chunk)
+                ),
+                label="reconcile promising retract",
+            )
+        if to_retract:
+            logger.info(
+                "Family reconcile: retracted %d off-family promising verdict(s) "
+                "across %d job(s)",
+                len(to_retract),
+                len(job_ids),
+            )
+    except Exception:
+        logger.exception("Family reconcile failed (best-effort; next cycle retries)")
+
+
+async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
     """Liveness-check + tag a bounded batch of the OLDEST untagged, unarchived
     jobs (#285); archive the ones whose listing is gone.
 
@@ -1043,7 +1226,7 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
                 )
                 .is_("role_family", "null")
                 .is_("archived_at", "null")
-                .order("created_at", desc=False)
+                .order("cataloged_at", desc=False)
                 .limit(limit)
             ),
             label="poll qualify-backfill select",
@@ -1096,47 +1279,8 @@ async def _backfill_qualify_stale(supabase: Client, limit: int) -> None:
         await _qualify_jobs(supabase, live)
 
 
-async def _embed_jobs(
-    supabase: Client,
-    rows: list[dict[str, Any]],
-) -> None:
-    """Embed ``rows`` for the #60 pre-scan (best-effort, target-INDEPENDENT).
-
-    PURELY populates ``job_embeddings`` — no gating, no behavior change.
-    ``upsert_job_embedding`` is itself content-hash cached (an unchanged
-    re-poll re-embeds nothing) and fail-soft (it never raises). The fan-out
-    is bounded by a dedicated semaphore sized like the DB-write cap so a
-    large poll's embeds can't thundering-herd the pool; we don't reuse the
-    shared DB-write semaphore because that would also serialize the slow
-    Voyage network call. Resolving the client and the whole step are wrapped
-    so any failure can never break the poll.
-    """
-    try:
-        embeddings_client = get_embeddings_client()
-    except Exception:
-        logger.exception("Pre-scan embed: embeddings client unavailable; skipping")
-        return
-
-    sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
-
-    async def _one(row: dict[str, Any]) -> None:
-        async with sem:
-            await upsert_job_embedding(
-                supabase,
-                embeddings_client,
-                job_id=row["id"],
-                title=row.get("title"),
-                description_html=row.get("description_html"),
-            )
-
-    await asyncio.gather(
-        *(_one(row) for row in rows),
-        return_exceptions=True,
-    )
-
-
 async def _drop_purged_rows(
-    supabase: Client, source_id: str, rows: list[dict[str, Any]]
+    supabase: AsyncClient, source_id: str, rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """Filter out rows whose (source, external_id) was TOMBSTONED (archival
     Stage 2, option B).
@@ -1182,71 +1326,7 @@ async def _drop_purged_rows(
         return rows
 
 
-async def _backfill_embed_missing(supabase: Client, limit: int) -> None:
-    """Embed a bounded batch of jobs with NO ``job_embeddings`` row (#21 sweep).
-
-    The on-ingest hook (``_embed_jobs`` above) only sees jobs upserted THIS
-    cycle, and it's fail-soft per row — so a job whose embed silently failed
-    (provider hiccup, cancelled cycle) is only retried if its source re-lists
-    it, and a job ingested before the embed pipeline armed is never visited at
-    all. On prod that left ~5.6k jobs (1.3k of them Phase-2 candidates)
-    permanently vector-less, where the cosine gate fails OPEN and burns a blind
-    Sonnet grade (#90). Same stranding the qualification sweep
-    (``_backfill_qualify_stale``) fixes for the tagger — this is its embedding
-    twin, minus the liveness check: a Voyage embed costs ~$0.00005, far less
-    than the HTTP probe that would guard it, and ARCHIVED jobs stay included
-    because they remain gradeable (click-through re-grades ignore
-    ``archived_at``) and threshold calibration reads their vectors.
-
-    Selection is the PostgREST anti-join (``job_embeddings=is.null`` on the
-    embedded resource), NEWEST first: the drip this drains is dominated by
-    recently-ingested jobs whose first embed failed — exactly the rows about
-    to face the gate. A row that persistently can't embed (e.g. no title and
-    no description → ``skipped_empty`` writes nothing) is re-selected and
-    re-skipped each cycle, wasting one slot — bounded and harmless. Batch cost
-    is ``limit`` embeds ≈ $0.01 at the default, so no budget gate.
-    """
-    if limit <= 0:
-        return
-    try:
-        # Model-aware anti-join: a job counts as vector-less iff it has no
-        # ``job_embeddings`` row for the CURRENT model — a stale row from a
-        # retired model (voyage-3) must not mask the missing current-space
-        # vector, or a model migration would strand the whole old corpus.
-        resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .select("id, title, description_html, job_embeddings(job_posting_id)")
-                .eq("job_embeddings.model", EMBED_DEFAULT_MODEL)
-                .is_("job_embeddings", "null")
-                # Tombstoned rows have their payload stripped — embedding them
-                # would return skipped_empty forever, wasting sweep slots.
-                .is_("purged_at", "null")
-                .order("created_at", desc=True)
-                .limit(limit)
-            ),
-            label="poll embed-backfill select",
-        )
-    except Exception:
-        logger.exception("Embed backfill: select failed; skipping this cycle")
-        return
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        return
-    logger.info("Embed backfill: embedding %d vector-less job(s)", len(rows))
-    # Batched path: the anti-join above guarantees these rows have no
-    # current-model vector, so we can skip the per-job hash probes and use
-    # ~15 IO operations per 200 jobs instead of ~800 (2026-07-10 incident).
-    try:
-        embeddings_client = get_embeddings_client()
-    except Exception:
-        logger.exception("Embed backfill: embeddings client unavailable; skipping")
-        return
-    await embed_jobs_batch(supabase, embeddings_client, rows)
-
-
-async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
+async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
     """Grade a bounded, view-ordered batch of the stale ``promising`` backlog.
 
     ``run_phase2_for_jobs`` only ever sees jobs a poll cycle re-touched, so a
@@ -1278,7 +1358,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
         return
     try:
         gate, _has_active = await _cycle_budget_gate(supabase)
-        active_targets = await asyncio.to_thread(get_active_target, supabase)
+        active_targets = await _active_targets(supabase)
         primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
             supabase, active_targets, "(grade backfill)"
         )
@@ -1297,7 +1377,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
                 target.id,
             )
             continue
-        llm = _resolve_payer_client(payer_clients, supabase, uid)
+        llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
         if llm is None:
             continue  # BYOK require-mode without a key — defer (logged inside)
         try:
@@ -1307,7 +1387,7 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
                     c.table("scores")
                     .select(
                         "recency_score, jobs!inner(id, title, description_html, "
-                        "first_seen_at, archived_at, purged_at, is_us)"
+                        "cataloged_at, archived_at, purged_at, is_us, role_family)"
                     )
                     .eq("target_id", tid)
                     .eq("promising", True)
@@ -1335,8 +1415,8 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
             target.id,
         )
         try:
-            graded = await run_phase2_for_jobs(
-                supabase,
+            await run_phase2_for_jobs(
+                _async_service_client(),
                 llm,
                 target=target,
                 payload=user_optimized[uid].payload,
@@ -1346,103 +1426,17 @@ async def _backfill_grade_stale(supabase: Client, limit: int) -> None:
         except Exception:
             logger.exception("Grade backfill failed for target %s", target.id)
             continue
-        if graded:
-            # Phase 2 rewrote ``scores.score``; re-aggregate the global
-            # ``jobs.score`` for the touched rows (mirrors the cycle path).
-            try:
-                await batch_update_global_scores(supabase, [cast(str, j["id"]) for j in stale_jobs])
-            except Exception:
-                logger.exception("Grade backfill: global score update failed")
 
 
-async def _shadow_observe(
-    supabase: Client,
-    *,
-    job_id: str,
-    target: JobTarget,
-    keyword_admit: bool | None,
-    keyword_score: int | None,
-) -> None:
-    """Log the pre-scan disagreement matrix for one (job, target) (#60/#68 P3).
-
-    SHADOW MODE — OBSERVATION ONLY. The keyword decision passed in
-    (``keyword_admit`` / ``keyword_score``) is what actually drove admission;
-    here we ALSO compute the would-be cosine gate decision and append one
-    ``prescan_shadow`` row recording both, so the keyword↔cosine disagreement can
-    be sized BEFORE any gate flip. This changes NO admission behavior.
-
-    Best-effort and fully fail-soft: the cosine computation returns ``(None,
-    None)`` when the Phase-1/2 vectors aren't populated, and both it and the row
-    write swallow their own errors — a shadow failure can never break polling.
-    Only ever reached behind ``settings.prescan_shadow_enabled`` (the caller
-    gates on the flag; flag off ⇒ this is never invoked, no cosine work, no row).
-
-    Once the gate is LIVE for a target (``_prescan_gate_applies``), the
-    disagreement matrix is moot for it — cosine already drives admission — so
-    the shadow is skipped. This isn't just tidiness: each shadow observation
-    costs two full-vector reads (~8-16KB each) plus a row write, per
-    (job, target), per cycle — a steady IO stream the 2026-07-10 disk-budget
-    incident taught us to account for.
-    """
-    if _prescan_gate_applies(target.id):
-        return
-    try:
-        cosine, cosine_admit = await cosine_gate_decision(supabase, job_id=job_id, target=target)
-        threshold = await _shadow_threshold(supabase, target_id=target.id)
-        await record_shadow_observation(
-            supabase,
-            job_id=job_id,
-            target_id=target.id,
-            keyword_admit=keyword_admit,
-            keyword_score=keyword_score,
-            cosine=cosine,
-            cosine_admit=cosine_admit,
-            threshold=threshold,
-        )
-    except Exception:
-        logger.exception(
-            "Pre-scan shadow observation failed for job %s / target %s",
-            job_id,
-            target.id,
-        )
-
-
-async def _shadow_threshold(supabase: Client, *, target_id: str) -> float | None:
-    """Best-effort read of a target's ``prescan_cosine_threshold`` for the shadow
-    row's ``threshold`` column. Returns ``None`` on any miss/error so the shadow
-    log is never blocked by it.
-
-    Read separately from ``cosine_gate_decision`` (which fetches the threshold
-    internally but only returns the cosine + verdict): the matrix wants the raw
-    threshold logged even when cosine is NULL.
-    """
-    try:
-        resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("targets").select("prescan_cosine_threshold").eq("id", target_id).limit(1)
-            ),
-            label="poll shadow-threshold read",
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
-            return None
-        raw = rows[0].get("prescan_cosine_threshold")
-        return float(raw) if raw is not None else None
-    except Exception:
-        logger.exception("Pre-scan shadow threshold read failed for target %s", target_id)
-        return None
-
-
-def _resolve_payer_client(
+async def _resolve_payer_client(
     cache: dict[str | None, LLMClient | None],
-    supabase: Client,
+    supabase: AsyncClient | None,
     payer_user_id: str | None,
 ) -> LLMClient | None:
     """Per-payer LLM client for background grading (#5 P3 BYOK).
 
     Each payer's background LLM work bills the payer's own OpenRouter key
-    (via ``llm.get_client``), not the instance key. Memoized by payer for
+    (via ``llm.get_client_async``), not the instance key. Memoized by payer for
     the duration of one source poll, so the N targets/jobs a payer owns
     reuse a single client — one key decrypt, and that payer's calls stay
     grouped rather than interleaved across keys (interleaving would
@@ -1458,7 +1452,7 @@ def _resolve_payer_client(
     """
     if payer_user_id not in cache:
         try:
-            cache[payer_user_id] = get_llm_client(supabase, payer_user_id)
+            cache[payer_user_id] = await get_llm_client_async(supabase, payer_user_id)
         except MissingUserKeyError:
             logger.info(
                 "Background grading deferred for payer %s "
@@ -1471,7 +1465,7 @@ def _resolve_payer_client(
 
 async def _poll_one_source(
     source: dict[str, Any],
-    supabase: Client,
+    supabase: AsyncClient,
     budget_gate: PayerBudgetGate | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
@@ -1523,7 +1517,7 @@ async def _poll_one_source(
         # Targets are normally resolved once per cycle by the caller; the
         # fallback keeps direct/legacy callers working.
         if active_targets is None:
-            active_targets = await asyncio.to_thread(get_active_target, supabase)
+            active_targets = await _active_targets(supabase)
 
         # Existing rows are needed in three places: skipping Phase 1
         # triage for already-known jobs, the (company, title) dedupe, and
@@ -1550,7 +1544,30 @@ async def _poll_one_source(
             retry_sync=True,
         )
         existing_rows = cast(list[dict[str, Any]], existing_resp.data or [])
-        known_external_ids = {r.get("external_id") for r in existing_rows}
+        # #514: admission scoping keys on EVERY external_id this source
+        # already has, not the live-unengaged view above. Engaged
+        # (saved/applied) and archived rows are still KNOWN rows — they were
+        # admitted on a prior cycle, so they must neither re-enter Phase-1
+        # triage as candidates nor be judged by its budget-defer rule below.
+        # The RPC view keeps its narrower scope for the (company, title)
+        # dedupe and the stale-archive pass, where engaged/archived rows are
+        # deliberately out of bounds.
+        known_ids_resp = await poll_db_read(
+            supabase,
+            lambda c: c.table("jobs")
+            .select("external_id, content_hash")
+            .eq("source_id", source_id),
+            label=f"poll known ids {company_name}",
+            retry_sync=True,
+        )
+        known_rows_read = cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_external_ids = {r.get("external_id") for r in known_rows_read}
+        # external_id → stored content hash (#642): drives the unchanged-row
+        # skip before the upsert. NULL for pre-migration rows (always write
+        # once, stamping the hash).
+        known_hashes: dict[str | None, str | None] = {
+            r.get("external_id"): r.get("content_hash") for r in known_rows_read
+        }
 
         # Payer/allowance snapshot: who pays for each target's LLM work,
         # and which payers are over their monthly allowance. Built once
@@ -1558,8 +1575,8 @@ async def _poll_one_source(
         gate = budget_gate
         if gate is None:
             try:
-                gate = await asyncio.to_thread(
-                    build_budget_gate, supabase, [t.id for t in active_targets]
+                gate = await build_budget_gate(
+                    _async_service_client(), [t.id for t in active_targets]
                 )
             except Exception:
                 logger.exception(
@@ -1608,22 +1625,24 @@ async def _poll_one_source(
         # the newest. Global idx travels with each row, so verdict mapping is
         # unaffected. Undated rows sort last.
         triage_candidates.sort(
-            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+            key=lambda c: normalize_posted_at(c[1].posted_at) or "", reverse=True
         )
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
-            titles = [job.title for _, job in triage_candidates]
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
-                    # Payer over monthly allowance (or unattributable) —
-                    # spend nothing. Empty verdicts → fail-open admit, so
-                    # jobs still ingest (promising, score=NULL) and get
-                    # graded once the payer's window frees up. Same defer
-                    # semantics as the Phase 2 daily cap.
+                    # Sponsored target whose payer is blocked (over
+                    # allowance / idle / disabled) — spend nothing. Empty
+                    # verdicts → fail-open admit, so jobs still ingest
+                    # (promising, score=NULL) and get graded once the
+                    # payer's window frees up. Same defer semantics as the
+                    # Phase 2 daily cap. Catalog targets (no active user
+                    # link) are never blocked here — their triage bills
+                    # the instance key via ``_resolve_payer_client(None)``.
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s over "
-                        "monthly allowance or unknown)",
+                        "Phase 1 deferred for target %s (payer %s blocked: "
+                        "over allowance / idle / disabled)",
                         active_target.id,
                         gate.payer_for(active_target.id),
                     )
@@ -1633,7 +1652,7 @@ async def _poll_one_source(
                 # (empty verdicts → fail-open ingest, grade once a key is
                 # added).
                 payer = gate.payer_for(active_target.id)
-                llm = _resolve_payer_client(payer_clients, supabase, payer)
+                llm = await _resolve_payer_client(payer_clients, _async_service_client(), payer)
                 if llm is None:
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
@@ -1651,6 +1670,21 @@ async def _poll_one_source(
                 batch_cap = phase1_batch_size()
                 target_verdicts: dict[int, TitleVerdict] = {}
                 attempted_here: set[int] = set()
+                # Negative-verdict cache (#514): titles this target's LLM
+                # rejected within the TTL skip the model and re-enter as a
+                # synthetic promising=False verdict, marked attempted — the
+                # downstream gates treat them exactly like a fresh "no"
+                # (rejected, not budget-deferred). Only the remainder is
+                # actually sent.
+                send_candidates: list[tuple[int, StandardJob]] = []
+                for cand_idx, cand_job in triage_candidates:
+                    if _phase1_cached_rejection(active_target, cand_job.title):
+                        global_idx = cand_idx + 1
+                        target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
+                        attempted_here.add(global_idx)
+                    else:
+                        send_candidates.append((cand_idx, cand_job))
+                titles = [job.title for _, job in send_candidates]
                 for start in range(0, len(titles), batch_cap):
                     # Re-check the global daily cap before each batch (#60
                     # overspend fix). The per-cycle gate above trips the
@@ -1677,11 +1711,11 @@ async def _poll_one_source(
                         # leaves them UN-attempted → they DEFER, not fail-open admit,
                         # and re-triage once the LLM is healthy. A dead key / spent cap
                         # must PAUSE the pipeline, never flood 100% admit.
-                        for sp in range(start, min(start + len(batch), len(triage_candidates))):
-                            attempted_here.add(triage_candidates[sp][0] + 1)
+                        for sp in range(start, min(start + len(batch), len(send_candidates))):
+                            attempted_here.add(send_candidates[sp][0] + 1)
                         try:
-                            record_llm_cost(
-                                supabase,
+                            await record_llm_cost_async(
+                                _async_service_client(),
                                 user_id=payer,
                                 purpose=PHASE1_PURPOSE,
                                 result=result,
@@ -1696,14 +1730,24 @@ async def _poll_one_source(
                                 "Failed to record Phase 1 cost for target %s",
                                 active_target.id,
                             )
-                    # Shift batch-local ids (1-based within the triage
-                    # subset) to global 1-based job indices via the
-                    # triage-candidate mapping.
+                    # Shift batch-local ids (1-based within the SENT subset)
+                    # to global 1-based job indices via the send-candidate
+                    # mapping. A raw promising=False lands in the negative
+                    # cache so the next cycle skips the model for this title.
+                    # Only outright rejections are cached — a low-confidence
+                    # promising verdict may be gated out by ``admitted()``
+                    # today, but the confidence threshold is a live setting
+                    # and re-judging borderline titles is the cheap side of
+                    # that trade.
                     for batch_idx, verdict in verdicts.items():
                         subset_pos = start + batch_idx - 1  # 0-based
-                        if 0 <= subset_pos < len(triage_candidates):
-                            global_idx = triage_candidates[subset_pos][0] + 1
+                        if 0 <= subset_pos < len(send_candidates):
+                            global_idx = send_candidates[subset_pos][0] + 1
                             target_verdicts[global_idx] = verdict
+                            if not verdict.promising:
+                                _phase1_record_rejection(
+                                    active_target, send_candidates[subset_pos][1].title
+                                )
                 phase1_verdicts[active_target.id] = target_verdicts
                 phase1_attempted[active_target.id] = attempted_here
 
@@ -1760,11 +1804,20 @@ async def _poll_one_source(
             # below uses the same idx + 1 convention. Non-survivors
             # never reach this line, so their missing verdicts can't
             # fail-open anything into the upsert.
-            if not _any_target_admits(idx + 1):
+            #
+            # KNOWN rows bypass the gate (#514): they were admitted on the
+            # cycle that ingested them and are never triage candidates, so
+            # to ``_any_target_admits`` they are indistinguishable from
+            # budget-deferred candidates — judging them dropped every known
+            # row from the conflict-update whenever a cycle produced any
+            # verdicts, starving busy boards of content refreshes entirely
+            # (JD edits, the escaped-HTML heal, salary re-extraction).
+            if job.external_id not in known_external_ids and not _any_target_admits(idx + 1):
                 dropped_phase1 += 1
                 continue
 
-            salary = job.salary_text or extract_salary_from_text(strip_html(job.content))
+            salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -1774,19 +1827,32 @@ async def _poll_one_source(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
-                    "department": job.department,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "score": 0,  # Placeholder — updated by target scoring pipeline
-                    "score_breakdown": {},
-                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
+                    "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
+                    **salary_columns(salary),
                 }
             )
 
-        # Optional: validate job URLs before upserting (#496)
+        # Optional: validate job URLs before upserting (#496). NEW rows only
+        # (#514): a known row's URL was validated at ingest and url_health
+        # monitors it from then on — re-validating every known row per cycle
+        # is a fleet-wide HEAD storm, and a transient upstream blip would
+        # null a working absolute_url on refresh.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
+
+        # #503: JSON-LD baseSalary fallback for new salary-less rows
+        # (flag-gated, bounded; no-op by default).
+        if rows_to_upsert:
+            await _fill_jsonld_salaries(rows_to_upsert, known_external_ids)
 
         new_rows: list[dict[str, Any]] = []
         if rows_to_upsert:
@@ -1808,6 +1874,20 @@ async def _poll_one_source(
         if rows_to_upsert:
             rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
 
+        # #642: drop KNOWN rows whose refreshable payload is byte-identical
+        # to what's stored — no jobs rewrite (TOAST included), and because
+        # the scoring stages below iterate the UPSERT RESULT, no redundant
+        # stage-1/2 rescore either. Content or salary changes alter the
+        # hash and flow through unchanged-path-free. Profile-version bumps
+        # rescore via bulk_score_for_target at bump time, not here.
+        unchanged_skipped = 0
+        if rows_to_upsert:
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(
+                rows_to_upsert, known_hashes
+            )
+            if unchanged_skipped:
+                summary["unchanged"] = unchanged_skipped
+
         # Re-check after dedupe: it can remove EVERY row (a source whose
         # postings are all cross-posting dupes of existing rows). Calling
         # ``.upsert([])`` then raises PGRST100 "failed to parse columns
@@ -1822,13 +1902,25 @@ async def _poll_one_source(
                 ),
                 label=f"poll upsert {company_name}",
             )
+            # #514: a row is a REFRESH iff its external_id was known BEFORE
+            # this cycle's upsert. NOT derivable from created_at ==
+            # updated_at: nothing bumps jobs.updated_at on a conflict-update
+            # (no moddatetime trigger; the payload doesn't set it), so a
+            # refreshed row keeps created == updated forever and the old
+            # timestamp split misclassified every refresh as "new" — which
+            # would re-fire the new-job email/SMS alerts below on EVERY
+            # cycle. The Stage-2 pass preserves the persisted Phase-1
+            # verdict for refreshed rows instead of re-litigating admission
+            # with this cycle's (absent) verdict.
+            known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
-                if data.get("created_at") == data.get("updated_at"):
+                if data.get("external_id") in known_external_ids:
+                    summary["updated"] += 1
+                    known_upserted_ids.append(data["id"])
+                else:
                     summary["new"] += 1
                     new_rows.append(data)
-                else:
-                    summary["updated"] += 1
 
             # ---- Qualification firewall (#60) ----
             # Target-INDEPENDENT tagging: classify each upserted job ONCE and
@@ -1844,19 +1936,10 @@ async def _poll_one_source(
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
 
-            # ---- Pre-scan job embeddings (#60, Phase 1) ----
-            # Target-INDEPENDENT: embed each upserted job ONCE and cache the
-            # vector for a future semantic pre-filter. PURELY populates
-            # ``job_embeddings`` — no gating, no behavior change. Best-effort
-            # and flag-gated: nothing runs (and no embedding spend) unless
-            # ``prescan_embed_enabled`` is set; an embedding outage is swallowed
-            # so it can never break polling, and the content-hash skips
-            # re-embedding unchanged rows.
-            if settings.prescan_embed_enabled and upsert_resp.data:
-                await _embed_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                )
+            # Job embeddings are LAZY now (Disk IO slim-down, 2026-07-30):
+            # no embed-on-ingest — ``ensure_job_vectors`` in the Phase-2
+            # runner materializes vectors for exactly the candidate set
+            # about to be read ("only a few will ever be read").
 
             # ---- Stage 1: Title scoring per target ----
             for active_target in active_targets:
@@ -1878,14 +1961,6 @@ async def _poll_one_source(
                     *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
 
-            # Update global scores after stage 1 (batched)
-            stage1_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if stage1_ids:
-                try:
-                    await batch_update_global_scores(supabase, stage1_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 1")
-
             # ---- Stage 2: Full JD scoring per target (async) ----
             # Pre-parse each JD once, reuse across all targets
             jd_cache: dict[str, Any] = {}
@@ -1901,33 +1976,69 @@ async def _poll_one_source(
                 # verdict. Missing entries are fail-open (admit).
                 target_verdicts = phase1_verdicts.get(active_target.id, {})
 
+                # #514: persisted Phase-1 verdicts for the refreshed rows.
+                # ``promising=False`` is the exclusion floor on re-score
+                # (``bulk_score_for_target``'s contract — a refresh must not
+                # walk back a Phase-1 rejection); True/NULL rely on the
+                # keyword scorer. Chunked ≤150 ids to stay inside
+                # PostgREST's URL-safe ``in_`` bound.
+                promising_floor: dict[str, bool | None] = {}
+                for start in range(0, len(known_upserted_ids), 150):
+                    chunk = known_upserted_ids[start : start + 150]
+                    floor_resp = await poll_db_read(
+                        supabase,
+                        lambda c, _chunk=chunk, _tid=active_target.id: (
+                            c.table("scores")
+                            .select("job_posting_id, promising")
+                            .eq("target_id", _tid)
+                            .in_("job_posting_id", _chunk)
+                        ),
+                        label=f"poll stage2 floor {company_name}",
+                        retry_sync=True,
+                    )
+                    for floor_row in cast(list[dict[str, Any]], floor_resp.data or []):
+                        promising_floor[floor_row["job_posting_id"]] = floor_row.get("promising")
+
                 async def _full_score_one(
                     row_data: dict[str, Any],
                     target: JobTarget = active_target,
                     verdicts: dict[int, TitleVerdict] = target_verdicts,
+                    floor: dict[str, bool | None] = promising_floor,
                 ) -> None:
                     try:
                         ext_id = row_data.get("external_id", "")
-                        phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                        verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
-                        # Gate admission on confidence (#47) AND budget-deferral
-                        # (#285 f/u): a missing verdict fail-opens ONLY if this
-                        # target actually triaged the job; a job the budget
-                        # deferred (never triaged) → promising=None = defer
-                        # (excluded now, re-triaged after the budget resets),
-                        # never admit-blind.
-                        attempted_here = (
-                            phase1_idx is not None
-                            and phase1_idx in phase1_attempted.get(target.id, set())
-                        )
-                        promising = _phase1_promising(
-                            verdict,
-                            attempted=attempted_here,
-                            gate_active=bool(phase1_verdicts),
-                            min_confidence=settings.phase1_min_confidence,
-                        )
-                        phase1_confidence = verdict.confidence if verdict is not None else None
-                        stage2 = await target_score_and_upsert(
+                        promising: bool | None
+                        if ext_id in known_external_ids:
+                            # #514: refresh of an already-ingested row — Phase 1
+                            # does not re-litigate admission. ``promising=False``
+                            # is the persisted exclusion floor; the stored
+                            # verdict/confidence columns stay untouched (None
+                            # args = leave-unchanged upsert semantics).
+                            promising = floor.get(row_data["id"]) is not False
+                            promising_arg: bool | None = None
+                            phase1_confidence: int | None = None
+                        else:
+                            phase1_idx = phase1_idx_by_external_id.get(ext_id)
+                            verdict = verdicts.get(phase1_idx) if phase1_idx is not None else None
+                            # Gate admission on confidence (#47) AND budget-deferral
+                            # (#285 f/u): a missing verdict fail-opens ONLY if this
+                            # target actually triaged the job; a job the budget
+                            # deferred (never triaged) → promising=None = defer
+                            # (excluded now, re-triaged after the budget resets),
+                            # never admit-blind.
+                            attempted_here = (
+                                phase1_idx is not None
+                                and phase1_idx in phase1_attempted.get(target.id, set())
+                            )
+                            promising = _phase1_promising(
+                                verdict,
+                                attempted=attempted_here,
+                                gate_active=bool(phase1_verdicts),
+                                min_confidence=settings.phase1_min_confidence,
+                            )
+                            promising_arg = promising if phase1_verdicts else None
+                            phase1_confidence = verdict.confidence if verdict is not None else None
+                        await target_score_and_upsert(
                             supabase,
                             job_posting_id=row_data["id"],
                             title=row_data.get("title", ""),
@@ -1935,38 +2046,15 @@ async def _poll_one_source(
                             target=target,
                             parsed_jd=jd_cache.get(row_data["id"]),
                             excluded_by_prefilter=not promising,
-                            promising=promising if phase1_verdicts else None,
+                            promising=promising_arg,
                             phase1_confidence=phase1_confidence,
                         )
-                        # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
-                        # OBSERVATION ONLY: the keyword decision above already
-                        # drove admission; here we also log the would-be cosine
-                        # gate verdict alongside it (the disagreement matrix).
-                        # Best-effort + flag-gated — nothing happens (no cosine
-                        # work, no row) unless ``prescan_shadow_enabled`` is set,
-                        # and a shadow failure can never break scoring.
-                        if settings.prescan_shadow_enabled:
-                            await _shadow_observe(
-                                supabase,
-                                job_id=row_data["id"],
-                                target=target,
-                                keyword_admit=promising,
-                                keyword_score=stage2.score,
-                            )
                     except Exception:
                         logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
                 await asyncio.gather(
                     *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
                 )
-
-            # Update global scores after stage 2 (batched)
-            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if stage2_ids:
-                try:
-                    await batch_update_global_scores(supabase, stage2_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 2")
 
             # ---- Stage 3: LLM scoring for qualified jobs (concurrent) ----
             # Each user with an active target gets one LLM analysis per
@@ -2011,7 +2099,7 @@ async def _poll_one_source(
                         continue
                     # BYOK (#5 P3): grade on this user's own key; no key in
                     # hosted require-mode defers like over-allowance.
-                    llm = _resolve_payer_client(payer_clients, supabase, uid)
+                    llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
                     if llm is None:
                         logger.info(
                             "Phase 2 deferred for user %s / target %s (no BYOK key)",
@@ -2021,7 +2109,7 @@ async def _poll_one_source(
                         continue
                     try:
                         await run_phase2_for_jobs(
-                            supabase,
+                            _async_service_client(),
                             llm,
                             target=p2_target,
                             payload=user_optimized[uid].payload,
@@ -2034,62 +2122,10 @@ async def _poll_one_source(
                             uid,
                             p2_target.id,
                         )
-                if stage2_ids:
-                    try:
-                        await batch_update_global_scores(supabase, stage2_ids)
-                    except Exception:
-                        logger.exception("Global score update failed after Phase 2")
-            elif primary_by_user:
-                llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-
-                # Pre-fetch scores once: Stage 2 just wrote them, and
-                # _run_llm_scoring_for_row would otherwise issue one
-                # .eq().single() per row in the fan-out below.
-                stage3_ids = [
-                    cast(str, cast(dict[str, Any], r).get("id"))
-                    for r in upsert_resp.data or []
-                    if cast(dict[str, Any], r).get("id")
-                ]
-                score_map = await _batch_fetch_job_scores(supabase, stage3_ids)
-
-                async def _llm_one(
-                    row_data: dict[str, Any],
-                    target: JobTarget,
-                    doc: OptimizedDoc,
-                    payer: str,
-                ) -> None:
-                    # BYOK (#5 P3): each row grades on its payer's own key
-                    # (memoized, so a payer's rows reuse one client). No
-                    # key in hosted require-mode → skip this row's grading.
-                    client = _resolve_payer_client(payer_clients, supabase, payer)
-                    if client is None:
-                        return
-                    async with llm_sem:
-                        await _run_llm_scoring_for_row(
-                            supabase,
-                            row_data,
-                            doc,
-                            client,
-                            target,
-                            current_score=score_map.get(cast(str, row_data.get("id", "")), 0),
-                            payer_user_id=payer,
-                        )
-
-                await asyncio.gather(
-                    *(
-                        _llm_one(
-                            cast(dict[str, Any], r),
-                            primary_by_user[uid],
-                            user_optimized[uid],
-                            uid,
-                        )
-                        for r in upsert_resp.data or []
-                        for uid in primary_by_user
-                        # Over-allowance payers defer — same semantics as
-                        # the Phase 2 branch above.
-                        if not gate.user_blocked(uid)
-                    )
-                )
+            # Ids of every row touched this cycle — feeds the recency
+            # refresh (the legacy global-score recompute that shared this
+            # list was retired in R2, schema audit Group A).
+            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
 
             # ---- Recency decay refresh (#5) ----
             # Re-derive ``scores.recency_score`` for every row touched
@@ -2187,11 +2223,11 @@ async def _poll_one_source(
             # Re-read the rows now that the stages have written final scores.
             alert_rows = await _load_alert_rows(supabase, new_rows)
             try:
-                await notify.send_alerts_for_new_jobs(supabase, alert_rows)
+                await notify.send_alerts_for_new_jobs(_async_service_client(), alert_rows)
             except Exception:
                 logger.exception("Email alert dispatch raised for %s", company_name)
             try:
-                await notify.send_sms_alerts_for_new_jobs(supabase, alert_rows)
+                await notify.send_sms_alerts_for_new_jobs(_async_service_client(), alert_rows)
             except Exception:
                 logger.exception("SMS alert dispatch raised for %s", company_name)
 
@@ -2234,7 +2270,7 @@ _SOURCE_LAST_ERROR_MAX_LEN = 500
 
 
 async def _record_source_failure(
-    supabase: Client, source: dict[str, Any], *, error: str | None = None
+    supabase: AsyncClient, source: dict[str, Any], *, error: str | None = None
 ) -> None:
     """Failure backoff: count consecutive fetch failures per source, persist
     the failure cause, and auto-disable at the threshold (a dead board
@@ -2293,7 +2329,7 @@ async def _record_source_failure(
         logger.exception("Failed to record source failure for %s", source_id)
 
 
-async def recover_stale_sources(supabase: Client, *, now: datetime | None = None) -> int:
+async def recover_stale_sources(supabase: AsyncClient, *, now: datetime | None = None) -> int:
     """Auto-recovery: re-enable sources the backoff auto-disabled longer ago
     than ``source_recovery_after_hours``, resetting their failure counter so
     they get polled again.
@@ -2353,7 +2389,7 @@ async def recover_stale_sources(supabase: Client, *, now: datetime | None = None
 _GLOBAL_APPROACHING_DAY: str | None = None
 
 
-def _global_budget_exhausted(supabase: Client, *, reserve_usd: float = 0.0) -> bool:
+async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float = 0.0) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``. 0 disables (never True).
 
@@ -2383,10 +2419,33 @@ def _global_budget_exhausted(supabase: Client, *, reserve_usd: float = 0.0) -> b
         # spender yields entirely, leaving the budget for grading.
         return True
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    return total_llm_spend_all(supabase, since=midnight) >= effective_cap
+    return await _memoized_total_spend(supabase, midnight) >= effective_cap
 
 
-async def _triage_budget_blocks(supabase: Client) -> bool:
+# #642: TTL memo for the day-spend aggregate. The mid-loop budget re-checks
+# (per qualify chunk, per triage batch) each re-aggregated today's llm_costs
+# — pg_stat showed the spend read among the top time consumers (236k calls).
+# One chunk of LLM work takes minutes, so a 60s-stale meter changes nothing
+# operationally: worst case one extra ~15-job chunk (~cents) before the next
+# fresh read trips the breaker. Cache keys on the midnight boundary so the
+# UTC-day rollover naturally invalidates.
+_SPEND_MEMO_TTL_S = 60.0
+_spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0}
+
+
+async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> float:
+    now = time.monotonic()
+    if (
+        _spend_memo["midnight"] == midnight
+        and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S
+    ):
+        return cast(float, _spend_memo["value"])
+    value = await total_llm_spend_all_async(supabase, since=midnight)
+    _spend_memo.update(at=now, midnight=midnight, value=value)
+    return value
+
+
+async def _triage_budget_blocks(supabase: AsyncClient) -> bool:
     """Async, fail-OPEN global-budget check for the Phase-1 triage loops.
 
     Reads the meter off-thread (it's a sync DB call). Returns True only when
@@ -2404,7 +2463,7 @@ async def _triage_budget_blocks(supabase: Client) -> bool:
     if _provider_fatal_active():
         return True
     try:
-        return await asyncio.to_thread(_global_budget_exhausted, supabase)
+        return await _global_budget_exhausted(_async_service_client())
     except Exception:
         logger.exception(
             "Phase 1 triage: global-budget read failed — continuing "
@@ -2413,7 +2472,7 @@ async def _triage_budget_blocks(supabase: Client) -> bool:
         return False
 
 
-def _global_circuit_breaker_tripped(supabase: Client) -> bool:
+async def _global_circuit_breaker_tripped(supabase: AsyncClient) -> bool:
     """True when today's total LLM spend (ALL users, since UTC midnight)
     has reached ``global_llm_daily_budget_usd``.
 
@@ -2431,7 +2490,7 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
         return False
     now = datetime.now(UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    spent = total_llm_spend_all(supabase, since=midnight)
+    spent = await total_llm_spend_all_async(supabase, since=midnight)
     if spent < cap:
         # Approaching-cap warning (#26 F3) — once per UTC day.
         if spent >= cap * 0.8:
@@ -2478,7 +2537,7 @@ def _global_circuit_breaker_tripped(supabase: Client) -> bool:
     return True
 
 
-async def _cycle_budget_gate(supabase: Client) -> tuple[PayerBudgetGate, bool]:
+async def _cycle_budget_gate(supabase: AsyncClient) -> tuple[PayerBudgetGate, bool]:
     """Build the payer/allowance snapshot once per poll cycle.
 
     Returns ``(gate, has_active_targets)`` — the active-target fetch is
@@ -2497,10 +2556,10 @@ async def _cycle_budget_gate(supabase: Client) -> tuple[PayerBudgetGate, bool]:
     when we can't see the meter.
     """
     try:
-        active = await asyncio.to_thread(get_active_target, supabase)
-        if await asyncio.to_thread(_global_circuit_breaker_tripped, supabase):
+        active = await _active_targets(supabase)
+        if await _global_circuit_breaker_tripped(_async_service_client()):
             return PayerBudgetGate(), bool(active)
-        gate = await asyncio.to_thread(build_budget_gate, supabase, [t.id for t in active])
+        gate = await build_budget_gate(_async_service_client(), [t.id for t in active])
         return gate, bool(active)
     except Exception:
         logger.exception("Budget gate build failed — deferring all LLM work this cycle")
@@ -2514,10 +2573,9 @@ _LIFECYCLE_LAST_RUN: float = 0.0
 LIFECYCLE_SWEEP_INTERVAL_S = 6 * 3600.0
 
 
-async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
+async def _maybe_run_lifecycle_sweep(supabase: AsyncClient) -> None:
     """Run the idle-account sweep at most every 6h, never blocking polls."""
     global _LIFECYCLE_LAST_RUN
-    import time
 
     from app.services.lifecycle import run_lifecycle_sweep
 
@@ -2534,7 +2592,7 @@ async def _maybe_run_lifecycle_sweep(supabase: Client) -> None:
 _ARCHIVAL_LAST_RUN: float = 0.0
 
 
-async def _maybe_run_archival_sweep(supabase: Client) -> None:
+async def _maybe_run_archival_sweep(supabase: AsyncClient) -> None:
     """Run the archival lifecycle sweep at most every 6h (UX/IA §5).
 
     Same throttle shape as the idle-account sweep above: piggybacks the
@@ -2542,7 +2600,6 @@ async def _maybe_run_archival_sweep(supabase: Client) -> None:
     inert until the operator flips ``ARCHIVAL_SWEEP_ENABLED``.
     """
     global _ARCHIVAL_LAST_RUN
-    import time
 
     from app.services.archival import run_archival_sweep
 
@@ -2574,17 +2631,175 @@ def _drop_paid_sources_if_unconsumed(
     return kept
 
 
-async def poll_all_sources(supabase: Client) -> PollResult:
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
+# Page size for the enabled-sources read. Deliberately UNDER PostgREST's
+# max-rows clamp (hosted default 1,000): a full page unambiguously means
+# "there may be more", a short page means "done" — if the page size equaled
+# the server clamp, a server-truncated page would be indistinguishable from
+# the final page and the loop would silently stop early (the exact bug this
+# helper exists to fix).
+_SOURCES_PAGE_SIZE = 500
+
+
+async def _read_enabled_sources(supabase: AsyncClient) -> list[dict[str, Any]]:
+    """Every enabled source row, paginated past PostgREST's max-rows clamp.
+
+    The hosted PostgREST silently truncates ANY un-ranged select at
+    ``db-max-rows`` (~1,000). Found live 2026-08-05: 3,676 enabled sources,
+    the cycle's read returned exactly 1,000 — the 1,144 never-polled catalog
+    rows (physically newest, outside the drifting heap-order window) never
+    entered a cycle, so the backlog froze while the visible cohort re-polled
+    on cadence. Pages are ordered by primary key: heap-order pagination can
+    skip or duplicate rows across pages when concurrent updates relocate
+    tuples mid-read.
+    """
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        resp = await poll_db_read(
+            supabase,
+            lambda c, _o=offset: (
+                c.table("sources")
+                .select("*")
+                .eq("enabled", True)
+                .order("id")
+                .range(_o, _o + _SOURCES_PAGE_SIZE - 1)
+            ),
+            label=f"poll sources read (offset {offset})",
+        )
+        page = cast(list[dict[str, Any]], resp.data or [])
+        out.extend(page)
+        if len(page) < _SOURCES_PAGE_SIZE:
+            logger.debug(
+                "enabled-sources read: %d rows over %d page(s)",
+                len(out),
+                offset // _SOURCES_PAGE_SIZE + 1,
+            )
+            return out
+        offset += _SOURCES_PAGE_SIZE
+
+
+async def _poll_one_source_budgeted(
+    source: dict[str, Any],
+    supabase: AsyncClient,
+    budget_gate: PayerBudgetGate | None,
+    *,
+    active_targets: list[JobTarget] | None,
+    stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
+) -> dict[str, Any]:
+    """``_poll_one_source`` bounded by the per-source wall-time budget.
+
+    One giant board (a workday tenant with hundreds of 429-throttled detail
+    fetches) must not occupy a concurrency slot until the CYCLE watchdog
+    kills everything. On expiry the source's coroutine is cancelled — safe
+    by construction: the stale-archive pass sits after the full fetch, so a
+    cancel can never archive against a partial board list, and completed
+    ingest stages persist (idempotent upserts). The board's row is stamped
+    ``last_polled_at`` so it rotates to the BACK of the most-overdue-first
+    queue instead of re-hogging a slot next tick; the stamp deliberately
+    touches nothing else (no ``job_count``/failure-counter reset — this was
+    not a clean poll). Returns a not-polled summary with no error string so
+    ingestion-health error alarms don't fire on a bounded, expected event.
+    """
+    budget = settings.poll_source_budget_seconds
+    if not budget:
+        return await _poll_one_source(
+            source,
+            supabase,
+            budget_gate,
+            active_targets=active_targets,
+            stage3_users=stage3_users,
+        )
+    try:
+        return await asyncio.wait_for(
+            _poll_one_source(
+                source,
+                supabase,
+                budget_gate,
+                active_targets=active_targets,
+                stage3_users=stage3_users,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        company_name = source.get("company_name", "?")
+        logger.warning(
+            "poll %s exceeded the %ds per-source budget and was cancelled — "
+            "stamped last_polled_at so it rotates to the back of the due queue; "
+            "nothing archived. A chronically over-budget board is a "
+            "catalog-hygiene candidate.",
+            company_name,
+            budget,
+        )
+        try:
+            source_id = source.get("id")
+            if source_id:
+                await poll_db_write(
+                    supabase,
+                    lambda c: (
+                        c.table("sources")
+                        .update({"last_polled_at": datetime.now(UTC).isoformat()})
+                        .eq("id", source_id)
+                    ),
+                    label=f"poll budget stamp {company_name}",
+                )
+        except Exception:
+            # Non-fatal: an unstamped board just stays at the queue front —
+            # the next cycle re-attempts it (today's behavior).
+            logger.exception("budget stamp failed for %s", company_name)
+        return {
+            "polled": False,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+            "budget_exhausted": True,
+        }
+
+
+def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> None:
+    """Fold one source's poll summary into the cycle result.
+
+    Runs inside each worker as it finishes (single-threaded on the event
+    loop, so no synchronization needed) rather than after the gather — a
+    watchdog-cancelled cycle then still exposes the completed sources'
+    counts through the caller-owned ``progress`` accumulator instead of
+    losing them with the cancelled gather.
+    """
+    if summary["polled"]:
+        result.sources_polled += 1
+    result.new_jobs += summary["new"]
+    result.updated_jobs += summary["updated"]
+    # #642 visibility: unchanged-row skips ride the log, not PollResult
+    # (API model stability). Grep 'poll cycle unchanged' for the cycle sum.
+    if summary.get("unchanged"):
+        logger.debug(
+            "poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"]
+        )
+    result.archived_jobs += summary["archived"]
+    if summary["error"]:
+        result.errors.append(summary["error"])
+
+
+async def poll_all_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
+    """Force-poll every enabled source (ignores ``poll_interval_minutes``).
+
+    ``progress``: optional caller-owned accumulator. Per-source counts fold
+    into it as each source finishes, so a cycle the caller cancels (the
+    scheduler's watchdog) still exposes partial progress. When provided, the
+    return value is that same object.
+    """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     )
-    all_sources = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_sources = await _read_enabled_sources(supabase)
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
-    active_targets = await asyncio.to_thread(get_active_target, supabase)
+    active_targets = await _active_targets(supabase)
     stage3_users = await _resolve_user_targets_for_stage3(
         supabase, active_targets, "(cycle prefetch)"
     )
@@ -2593,28 +2808,20 @@ async def poll_all_sources(supabase: Client) -> PollResult:
     sources = _drop_paid_sources_if_unconsumed(all_sources, has_active_targets=has_active)
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(raw_source: Any) -> dict[str, Any]:
+    async def _worker(raw_source: Any) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 cast(dict[str, Any], raw_source),
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in sources))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in sources))
     return result
 
 
@@ -2657,34 +2864,42 @@ def filter_due_sources(
     return [s for s in sources if _is_due(s, moment)]
 
 
-async def poll_due_sources(supabase: Client) -> PollResult:
+async def poll_due_sources(
+    supabase: AsyncClient, *, progress: PollResult | None = None
+) -> PollResult:
     """Poll only the sources whose interval has elapsed.
 
     Same shape as ``poll_all_sources`` but skips sources that were
     polled recently. Designed to be called from a frequent cron tick
     (e.g. every 30 min) without re-hammering boards that have a longer
     configured cadence.
+
+    ``progress``: optional caller-owned accumulator — per-source counts fold
+    in as each source finishes, so the scheduler's watchdog abort still sees
+    partial progress. When provided, the return value is that same object.
     """
+    result = (
+        progress
+        if progress is not None
+        else PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    )
     # Auto-recovery first, so a source whose cooldown just elapsed is
     # re-enabled and picked up in THIS cycle rather than waiting a tick.
     # A transient ATS-wide outage that tripped every source can't keep
     # ingestion down forever (the Sept-2026 failure mode).
     await recover_stale_sources(supabase)
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    all_enabled = cast(list[dict[str, Any]], sources_resp.data or [])
+    all_enabled = await _read_enabled_sources(supabase)
 
     # Idle-account housekeeping piggybacks the cron tick (throttled to
-    # ~6h inside; never blocks or fails the poll).
-    await _maybe_run_lifecycle_sweep(supabase)
+    # ~6h inside; never blocks or fails the poll). Runs on the pooled async
+    # service client — the sweeps' DB routes through the ``db_write`` seam now
+    # (#57 PR-G2e-6), so it awaits natively in prod.
+    await _maybe_run_lifecycle_sweep(_async_service_client())
 
     # Archival lifecycle (UX/IA §5): 30d soft-archive + 60d purge, same
     # piggyback/throttle shape, flag-gated.
-    await _maybe_run_archival_sweep(supabase)
+    await _maybe_run_archival_sweep(_async_service_client())
 
     due = filter_due_sources(all_enabled)
 
@@ -2697,13 +2912,10 @@ async def poll_due_sources(supabase: Client) -> PollResult:
     if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
         await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
 
-    # Same stranding fix for the embedding spine (#21): jobs whose on-ingest
-    # embed silently failed (or that predate the embed pipeline) never get a
-    # vector, so the cosine gate fails open and burns blind grades. Drain a
-    # bounded, newest-first slice of the vector-less backlog every cycle.
-    # Cheap (~$0.00005/job), so no budget gate; 0 disables.
-    if settings.prescan_embed_enabled and settings.prescan_embed_backfill_batch > 0:
-        await _backfill_embed_missing(supabase, settings.prescan_embed_backfill_batch)
+    # The embedding drain is GONE (Disk IO slim-down, 2026-07-30): vectors
+    # materialize lazily at grade time (``ensure_job_vectors``), so #21-class
+    # stranding is structurally impossible — a job is embedded exactly when
+    # first needed and the content-hash makes retries free.
 
     # Grade a slice of the stale promising backlog (the qualify sweep's
     # grading twin) — also before the ``not due`` early-exit, so quiet
@@ -2712,41 +2924,52 @@ async def poll_due_sources(supabase: Client) -> PollResult:
         await _backfill_grade_stale(supabase, settings.phase2_backfill_batch)
 
     if not due:
-        return PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+        return result
 
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
-    active_targets = await asyncio.to_thread(get_active_target, supabase)
+    active_targets = await _active_targets(supabase)
     stage3_users = await _resolve_user_targets_for_stage3(
         supabase, active_targets, "(cycle prefetch)"
     )
 
     budget_gate, has_active = await _cycle_budget_gate(supabase)
     due = _drop_paid_sources_if_unconsumed(due, has_active_targets=has_active)
+
+    # Bound the cycle (#514 residual): an UNBOUNDED due batch is how the
+    # fleet starved — with ~3,200 enabled sources, one slow tail (Workday
+    # 429 retry storms) dragged the gather past the 1200s watchdog, the
+    # abort killed every unfinished source, and the un-stamped tail stayed
+    # due for the next identical over-long cycle. Measured 2026-07-29: 1,110
+    # of 3,231 enabled sources >2x overdue, 1,077 unpolled for 24h+. Cap
+    # the batch and take the MOST OVERDUE first (never-polled at the very
+    # front) so every source rotates through within a few ticks and each
+    # cycle finishes well inside the watchdog. 0 = legacy unbounded.
+    cap = settings.poll_max_sources_per_cycle
+    total_due = len(due)
+    if cap > 0 and total_due > cap:
+        due = sorted(due, key=lambda s: s.get("last_polled_at") or "")[:cap]
+        logger.info(
+            "poll cycle capped: %d due, polling the %d most-overdue this tick",
+            total_due,
+            cap,
+        )
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(source: dict[str, Any]) -> dict[str, Any]:
+    async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
-            return await _poll_one_source(
+            summary = await _poll_one_source_budgeted(
                 source,
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
             )
+        # No await between the source completing and the fold, so a
+        # cancellation can never drop a finished source's counts.
+        _accumulate_poll_summary(result, summary)
 
-    summaries = await asyncio.gather(*(_worker(s) for s in due))
-
-    result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
-    for s in summaries:
-        if s["polled"]:
-            result.sources_polled += 1
-        result.new_jobs += s["new"]
-        result.updated_jobs += s["updated"]
-        result.archived_jobs += s["archived"]
-        if s["error"]:
-            result.errors.append(s["error"])
-
+    await asyncio.gather(*(_worker(s) for s in due))
     return result
 
 
@@ -2755,7 +2978,7 @@ async def poll_due_sources(supabase: Client) -> PollResult:
 
 async def _poll_one_source_for_target(
     source: dict[str, Any],
-    supabase: Client,
+    supabase: AsyncClient,
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_over_budget: bool = False,
@@ -2786,17 +3009,41 @@ async def _poll_one_source_for_target(
         jobs = await fetcher(board_token)
         summary["polled"] = True
 
+        # #514: this path had no known-row read at all, so already-ingested
+        # external_ids were re-triaged on every cycle (the exact LLM waste
+        # the shared path's candidate comment calls out) and a flipped
+        # verdict — or the fail-closed gate below — starved their content
+        # refresh. Same full-set admission scoping as ``_poll_one_source``.
+        known_ids_resp = await poll_db_read(
+            supabase,
+            lambda c: c.table("jobs")
+            .select("external_id, content_hash")
+            .eq("source_id", source_id),
+            label=f"poll known ids {company_name}",
+            retry_sync=True,
+        )
+        known_rows_read = cast(list[dict[str, Any]], known_ids_resp.data or [])
+        known_external_ids = {r.get("external_id") for r in known_rows_read}
+        # external_id → stored content hash (#642): drives the unchanged-row
+        # skip before the upsert. NULL for pre-migration rows (always write
+        # once, stamping the hash).
+        known_hashes: dict[str | None, str | None] = {
+            r.get("external_id"): r.get("content_hash") for r in known_rows_read
+        }
+
         # Phase 1 per-target triage (single target). Same semantics as
         # ``_poll_one_source`` but the candidate set is one target, so
-        # ``phase1_verdicts`` collapses to a single dict. Skipped when
-        # the payer is over their monthly allowance (or unattributable):
-        # empty verdicts → fail-open ingest, grading defers.
+        # ``phase1_verdicts`` collapses to a single dict. Skipped when a
+        # SPONSORED payer is blocked (over allowance / idle / disabled):
+        # empty verdicts → fail-open ingest, grading defers. A catalog
+        # target (no active user link) triages on the instance key.
         #
-        # Only FREE-GATE SURVIVORS are triaged (mirrors
-        # ``_poll_one_source``): the per-job loop below drops keyword
-        # misses and non-US locations regardless of verdict, so paying
-        # the LLM to classify them was pure waste. Verdicts stay keyed
-        # by ORIGINAL 1-based job index via the candidate mapping;
+        # Only NEW external_ids that are FREE-GATE SURVIVORS are triaged
+        # (mirrors ``_poll_one_source``): the per-job loop below drops
+        # keyword misses and non-US locations regardless of verdict, and
+        # known rows were admitted on a prior cycle (#514) — paying the
+        # LLM to classify either is pure waste. Verdicts stay keyed by
+        # ORIGINAL 1-based job index via the candidate mapping;
         # non-survivors have no entry (fail-open, then free-gate drop).
         target_verdicts: dict[int, TitleVerdict] = {}
         # Global idxs actually sent to triage (before any budget defer). Missing
@@ -2806,24 +3053,37 @@ async def _poll_one_source_for_target(
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
-            if _title_matches_target(job.title, target.search_keywords)
+            if job.external_id not in known_external_ids
+            and _title_matches_target(job.title, target.search_keywords)
             and _is_us_location(job.location_name)
         ]
         # Grade the most RECENT first (#285 f/u): budget truncation defers the
         # oldest tail, not the newest. Undated rows sort last.
         triage_candidates.sort(
-            key=lambda c: normalize_posted_at(c[1].updated_at) or "", reverse=True
+            key=lambda c: normalize_posted_at(c[1].posted_at) or "", reverse=True
         )
         # BYOK (#5 P3): triage on the payer's own key. ``None`` means
         # triage is off / over-budget / no BYOK key in require-mode — all
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
         llm = (
-            _resolve_payer_client(payer_clients, supabase, payer_user_id)
+            await _resolve_payer_client(payer_clients, _async_service_client(), payer_user_id)
             if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget
             else None
         )
         if llm is not None:
-            titles = [job.title for _, job in triage_candidates]
+            # Negative-verdict cache (#514): titles this target's LLM already
+            # rejected within the TTL skip the model — synthetic
+            # promising=False verdict, marked attempted (rejected, not
+            # deferred). Same semantics as the scheduled path.
+            send_candidates: list[tuple[int, StandardJob]] = []
+            for cand_idx, cand_job in triage_candidates:
+                if _phase1_cached_rejection(target, cand_job.title):
+                    global_idx = cand_idx + 1
+                    target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
+                    phase1_attempted.add(global_idx)
+                else:
+                    send_candidates.append((cand_idx, cand_job))
+            titles = [job.title for _, job in send_candidates]
             batch_cap = phase1_batch_size()
             for start in range(0, len(titles), batch_cap):
                 # Re-check the global daily cap before each batch (#60
@@ -2847,11 +3107,11 @@ async def _poll_one_source_for_target(
                     # OpenRouter 401 / spent limit / error) leaves these un-attempted
                     # → they DEFER, not fail-open admit (a dead key must PAUSE the
                     # pipeline, never flood 100% admit).
-                    for sp in range(start, min(start + len(batch), len(triage_candidates))):
-                        phase1_attempted.add(triage_candidates[sp][0] + 1)
+                    for sp in range(start, min(start + len(batch), len(send_candidates))):
+                        phase1_attempted.add(send_candidates[sp][0] + 1)
                     try:
-                        record_llm_cost(
-                            supabase,
+                        await record_llm_cost_async(
+                            _async_service_client(),
                             user_id=payer_user_id,
                             purpose=PHASE1_PURPOSE,
                             result=result,
@@ -2866,14 +3126,16 @@ async def _poll_one_source_for_target(
                             "Failed to record Phase 1 cost for target %s",
                             target.id,
                         )
-                # Shift batch-local ids (1-based within the triage
-                # subset) back to global 1-based job indices via the
-                # candidate mapping.
+                # Shift batch-local ids (1-based within the SENT subset)
+                # back to global 1-based job indices via the send-candidate
+                # mapping; raw rejections feed the negative cache (#514).
                 for batch_idx, verdict in verdicts.items():
                     subset_pos = start + batch_idx - 1  # 0-based
-                    if 0 <= subset_pos < len(triage_candidates):
-                        global_idx = triage_candidates[subset_pos][0] + 1
+                    if 0 <= subset_pos < len(send_candidates):
+                        global_idx = send_candidates[subset_pos][0] + 1
                         target_verdicts[global_idx] = verdict
+                        if not verdict.promising:
+                            _phase1_record_rejection(target, send_candidates[subset_pos][1].title)
 
         rows_to_upsert: list[dict[str, Any]] = []
         phase1_idx_by_external_id: dict[str, int] = {}
@@ -2888,13 +3150,27 @@ async def _poll_one_source_for_target(
             # job we actually triaged (LLM dropped an id). A job the budget
             # DEFERRED (never triaged) is dropped from the upsert here — deferred,
             # re-triaged next cycle, not admitted blind (#285 f/u).
-            if settings.phase1_triage_enabled:
+            #
+            # The gate judges CANDIDATES only (#514): known rows were admitted
+            # on a prior cycle, and when triage was deliberately skipped this
+            # cycle (``llm is None`` — over-budget / BYOK require-mode without
+            # a key / zero candidates) ingest fails OPEN as documented above,
+            # with grading deferred. The old form dropped EVERY job in both
+            # states — fail-closed, the opposite of the documented contract.
+            # ``llm is not None`` with FAILED calls keeps the dead-key defer:
+            # those candidates stay un-attempted and drop below.
+            if (
+                settings.phase1_triage_enabled
+                and llm is not None
+                and job.external_id not in known_external_ids
+            ):
                 gj = idx + 1
                 v = target_verdicts.get(gj)
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
-            salary = job.salary_text or extract_salary_from_text(strip_html(job.content))
+            salary = job.salary_text or extract_salary_from_html(job.content)
+            loc = parse_location(job.location_name)
 
             phase1_idx_by_external_id[job.external_id] = idx + 1
             rows_to_upsert.append(
@@ -2904,23 +3180,47 @@ async def _poll_one_source_for_target(
                     "title": job.title,
                     "company_name": company_name,
                     "location": job.location_name,
-                    "department": job.department,
+                    "city": loc.city,
+                    "state": loc.state,
+                    "country": loc.country,
+                    "location_remote": loc.remote,
                     "description_html": sanitize_html(job.content),
                     "absolute_url": job.absolute_url,
-                    "score": 0,  # Updated by target scoring pipeline
-                    "score_breakdown": {},
-                    "greenhouse_updated_at": normalize_posted_at(job.updated_at),
+                    "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
+                    **salary_columns(salary),
                 }
             )
 
+        # NEW rows only (#514) — same scoping as _poll_one_source: known
+        # rows' URLs were validated at ingest and are url_health-monitored.
         if settings.validate_poll_urls and rows_to_upsert:
-            rows_to_upsert = await _validate_rows(rows_to_upsert)
+            fresh = [r for r in rows_to_upsert if r.get("external_id") not in known_external_ids]
+            kept = [r for r in rows_to_upsert if r.get("external_id") in known_external_ids]
+            rows_to_upsert = (await _validate_rows(fresh)) + kept
+
+        # #503: JSON-LD baseSalary fallback (flag-gated, bounded; no-op by default).
+        if rows_to_upsert:
+            await _fill_jsonld_salaries(rows_to_upsert, known_external_ids)
 
         # Tombstoned (purged) postings must not be resurrected by the
         # conflict-update (archival Stage 2) — same guard as _poll_one_source.
         if rows_to_upsert:
             rows_to_upsert = await _drop_purged_rows(supabase, source_id, rows_to_upsert)
+
+        # #642: drop KNOWN rows whose refreshable payload is byte-identical
+        # to what's stored — no jobs rewrite (TOAST included), and because
+        # the scoring stages below iterate the UPSERT RESULT, no redundant
+        # stage-1/2 rescore either. Content or salary changes alter the
+        # hash and flow through unchanged-path-free. Profile-version bumps
+        # rescore via bulk_score_for_target at bump time, not here.
+        unchanged_skipped = 0
+        if rows_to_upsert:
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(
+                rows_to_upsert, known_hashes
+            )
+            if unchanged_skipped:
+                summary["unchanged"] = unchanged_skipped
 
         if rows_to_upsert:
             # Routing through the seam also gives this upsert the transient-
@@ -2933,12 +3233,19 @@ async def _poll_one_source_for_target(
                 ),
                 label=f"poll upsert {company_name}",
             )
+            # #514: a row is a REFRESH iff its external_id was known before
+            # this cycle's upsert — NOT created==updated (a conflict-update
+            # never bumps jobs.updated_at, see _poll_one_source). The
+            # Stage-2 pass preserves the persisted Phase-1 verdict for
+            # refreshed rows instead of re-litigating admission.
+            known_upserted_ids: list[str] = []
             for raw_row in upsert_resp.data or []:
                 data = cast(dict[str, Any], raw_row)
-                if data.get("created_at") == data.get("updated_at"):
-                    summary["new"] += 1
-                else:
+                if data.get("external_id") in known_external_ids:
                     summary["updated"] += 1
+                    known_upserted_ids.append(data["id"])
+                else:
+                    summary["new"] += 1
 
             # Qualification firewall (#60): same target-INDEPENDENT tagging
             # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target
@@ -2949,16 +3256,8 @@ async def _poll_one_source_for_target(
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
                 )
 
-            # Pre-scan job embeddings (#60, Phase 1): same target-INDEPENDENT
-            # populate as ``_poll_one_source`` — flag-gated, best-effort. This
-            # path runs per-target, but the embed is content-hash cached, so a
-            # job already embedded for another target is a cheap cache-hit
-            # (one SELECT, no embed, no write).
-            if settings.prescan_embed_enabled and upsert_resp.data:
-                await _embed_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                )
+            # Job embeddings are LAZY (see _poll_one_source): the Phase-2
+            # runner's ensure_job_vectors materializes exactly the read set.
 
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
@@ -2982,6 +3281,27 @@ async def _poll_one_source_for_target(
                 rd = cast(dict[str, Any], raw_row)
                 jd_cache[rd["id"]] = parse_jd(rd.get("description_html") or "")
 
+            # #514: persisted Phase-1 verdicts for the refreshed rows —
+            # ``promising=False`` is the exclusion floor on re-score
+            # (``bulk_score_for_target``'s contract); True/NULL rely on the
+            # keyword scorer. Chunked ≤150 ids for PostgREST's URL bound.
+            promising_floor: dict[str, bool | None] = {}
+            for start in range(0, len(known_upserted_ids), 150):
+                chunk = known_upserted_ids[start : start + 150]
+                floor_resp = await poll_db_read(
+                    supabase,
+                    lambda c, _chunk=chunk: (
+                        c.table("scores")
+                        .select("job_posting_id, promising")
+                        .eq("target_id", target.id)
+                        .in_("job_posting_id", _chunk)
+                    ),
+                    label=f"poll stage2 floor {company_name}",
+                    retry_sync=True,
+                )
+                for floor_row in cast(list[dict[str, Any]], floor_resp.data or []):
+                    promising_floor[floor_row["job_posting_id"]] = floor_row.get("promising")
+
             async def _full_score_one(row_data: dict[str, Any]) -> None:
                 try:
                     # Phase 1 verdict for this (job, this-target) pair.
@@ -2990,19 +3310,31 @@ async def _poll_one_source_for_target(
                     # still want ``scores.promising=True`` persisted so
                     # Phase 2 candidate selection can rely on it.
                     ext_id = row_data.get("external_id", "")
-                    phase1_idx = phase1_idx_by_external_id.get(ext_id)
-                    verdict = target_verdicts.get(phase1_idx) if phase1_idx is not None else None
-                    # Confidence gate (#47) + budget-deferral (#285 f/u): defer a
-                    # never-triaged job instead of admitting it blind.
-                    attempted_here = phase1_idx is not None and phase1_idx in phase1_attempted
-                    promising = _phase1_promising(
-                        verdict,
-                        attempted=attempted_here,
-                        gate_active=settings.phase1_triage_enabled,
-                        min_confidence=settings.phase1_min_confidence,
-                    )
-                    phase1_confidence = verdict.confidence if verdict is not None else None
-                    stage2 = await target_score_and_upsert(
+                    promising: bool | None
+                    if ext_id in known_external_ids:
+                        # #514: refresh of an already-ingested row — Phase 1
+                        # does not re-litigate admission; the persisted
+                        # verdict is the floor and its columns stay untouched.
+                        promising = promising_floor.get(row_data["id"]) is not False
+                        promising_arg: bool | None = None
+                        phase1_confidence: int | None = None
+                    else:
+                        phase1_idx = phase1_idx_by_external_id.get(ext_id)
+                        verdict = (
+                            target_verdicts.get(phase1_idx) if phase1_idx is not None else None
+                        )
+                        # Confidence gate (#47) + budget-deferral (#285 f/u): defer a
+                        # never-triaged job instead of admitting it blind.
+                        attempted_here = phase1_idx is not None and phase1_idx in phase1_attempted
+                        promising = _phase1_promising(
+                            verdict,
+                            attempted=attempted_here,
+                            gate_active=settings.phase1_triage_enabled,
+                            min_confidence=settings.phase1_min_confidence,
+                        )
+                        promising_arg = promising if target_verdicts else None
+                        phase1_confidence = verdict.confidence if verdict is not None else None
+                    await target_score_and_upsert(
                         supabase,
                         job_posting_id=row_data["id"],
                         title=row_data.get("title", ""),
@@ -3010,36 +3342,15 @@ async def _poll_one_source_for_target(
                         target=target,
                         parsed_jd=jd_cache.get(row_data["id"]),
                         excluded_by_prefilter=not promising,
-                        promising=promising if target_verdicts else None,
+                        promising=promising_arg,
                         phase1_confidence=phase1_confidence,
                     )
-                    # ---- Pre-scan SHADOW MODE (#60/#68, Phase 3) ----
-                    # OBSERVATION ONLY: log the would-be cosine gate verdict
-                    # alongside the live keyword decision above. Best-effort +
-                    # flag-gated (no cosine work / no row unless
-                    # ``prescan_shadow_enabled``); never breaks scoring.
-                    if settings.prescan_shadow_enabled:
-                        await _shadow_observe(
-                            supabase,
-                            job_id=row_data["id"],
-                            target=target,
-                            keyword_admit=promising,
-                            keyword_score=stage2.score,
-                        )
                 except Exception:
                     logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
             await asyncio.gather(
                 *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
             )
-
-            # Update global scores after stage 2 (batched)
-            s2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
-            if s2_ids:
-                try:
-                    await batch_update_global_scores(supabase, s2_ids)
-                except Exception:
-                    logger.exception("Batch global score update failed after stage 2")
 
             # Stage 3: LLM scoring for qualified jobs (concurrent).
             # JobTarget is a global row with no user_id — resolve owning
@@ -3067,7 +3378,9 @@ async def _poll_one_source_for_target(
                 # BYOK (#5 P3): grade on the payer's own key; no key in
                 # hosted require-mode defers (jobs stay promising/NULL,
                 # grade once a key is added).
-                llm = _resolve_payer_client(payer_clients, supabase, payer_user_id)
+                llm = await _resolve_payer_client(
+                    payer_clients, _async_service_client(), payer_user_id
+                )
                 if llm is None:
                     logger.info(
                         "Phase 2 deferred for target %s (payer %s has no BYOK key)",
@@ -3079,7 +3392,7 @@ async def _poll_one_source_for_target(
                     for uid in primary_by_user:
                         try:
                             await run_phase2_for_jobs(
-                                supabase,
+                                _async_service_client(),
                                 llm,
                                 target=target,
                                 payload=user_optimized[uid].payload,
@@ -3092,57 +3405,6 @@ async def _poll_one_source_for_target(
                                 uid,
                                 target.id,
                             )
-                    if s2_ids:
-                        try:
-                            await batch_update_global_scores(supabase, s2_ids)
-                        except Exception:
-                            logger.exception("Global score update failed after Phase 2")
-            elif primary_by_user:
-                # BYOK (#5 P3): grade on the payer's own key; no key in
-                # hosted require-mode defers.
-                llm = _resolve_payer_client(payer_clients, supabase, payer_user_id)
-                if llm is None:
-                    logger.info(
-                        "Stage 3 deferred for target %s (payer %s has no BYOK key)",
-                        target.id,
-                        payer_user_id,
-                    )
-                else:
-                    # Bind a non-optional alias: mypy doesn't carry the
-                    # ``llm is not None`` narrowing into the nested closure.
-                    grading_client: LLMClient = llm
-                    llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-
-                    # Pre-fetch scores once (Stage 2 just wrote them).
-                    stage3_ids_t = [
-                        cast(str, cast(dict[str, Any], r).get("id"))
-                        for r in upsert_resp.data or []
-                        if cast(dict[str, Any], r).get("id")
-                    ]
-                    score_map_t = await _batch_fetch_job_scores(supabase, stage3_ids_t)
-
-                    async def _llm_one_t(
-                        row_data: dict[str, Any],
-                        doc: OptimizedDoc,
-                    ) -> None:
-                        async with llm_sem:
-                            await _run_llm_scoring_for_row(
-                                supabase,
-                                row_data,
-                                doc,
-                                grading_client,
-                                target,
-                                current_score=score_map_t.get(cast(str, row_data.get("id", "")), 0),
-                                payer_user_id=payer_user_id,
-                            )
-
-                    await asyncio.gather(
-                        *(
-                            _llm_one_t(cast(dict[str, Any], r), user_optimized[uid])
-                            for r in upsert_resp.data or []
-                            for uid in primary_by_user
-                        )
-                    )
 
     except Exception:
         logger.exception("Poll failed for %s (target %s)", company_name, target.label)
@@ -3176,19 +3438,19 @@ async def _poll_one_source_for_target(
     return summary
 
 
-async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollResult:
+async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> PollResult:
     """Poll all enabled sources, filtering for jobs matching a target's search keywords.
 
-    Skips inactive targets entirely (returns an empty ``PollResult``).
-    The ``targets.is_active`` flag is the OR across all users via the
-    user_targets trigger; if it's ``False`` no one currently has the
-    target enabled, so a per-target poll would fan out work nobody
-    will see. The /activate endpoint sets ``is_active`` to ``True``
-    before calling this, so the activation pipeline still works.
+    Skips non-pipeline-active targets entirely (returns an empty
+    ``PollResult``). Pipeline-active = ``app_active`` (the instance
+    floor) OR any active membership — the derived predicate from
+    ``crud.is_pipeline_active`` (the trigger-cached flag is gone, schema
+    audit P0). The /activate endpoint activates the caller's membership
+    before invoking this, which satisfies the membership arm.
     """
-    if not target.is_active:
+    if not await _is_pipeline_active(supabase, target.id):
         logger.info(
-            "poll_sources_for_target: skipping inactive target %s (%s)",
+            "poll_sources_for_target: skipping non-pipeline-active target %s (%s)",
             target.id,
             target.label,
         )
@@ -3203,12 +3465,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
             errors=["Target has no search keywords"],
         )
 
-    sources_resp = await poll_db_read(
-        supabase,
-        lambda c: c.table("sources").select("*").eq("enabled", True),
-        label="poll sources read",
-    )
-    sources = sources_resp.data or []
+    sources: list[dict[str, Any]] = await _read_enabled_sources(supabase)
 
     # Optimized doc is fetched per-user inside
     # ``_poll_one_source_for_target`` now — the previous shared-doc fetch
@@ -3218,7 +3475,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
     # monthly allowance decides whether Phase 1 spends anything. On
     # failure: refuse to spend (defer LLM work), keep ingesting.
     try:
-        gate = await asyncio.to_thread(build_budget_gate, supabase, [target.id])
+        gate = await build_budget_gate(_async_service_client(), [target.id])
     except Exception:
         logger.exception(
             "Budget gate build failed for target %s — deferring LLM work",
@@ -3230,15 +3487,59 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
     if over:
         logger.info(
             "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s over monthly allowance or unknown)",
+            "(payer %s blocked: over allowance / idle / disabled)",
             target.id,
             payer,
         )
 
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
+    # Cooperative cancellation (#638): the active check above runs ONCE at
+    # entry, but this fan-out grinds the full catalog for HOURS on a big
+    # source set — and deactivating the target used to change nothing (the
+    # 2026-08-06 incident: a sweep-activated target was deactivated 26 min
+    # in; the fan-out ran 3+ more hours, saturated Supabase into gateway
+    # 504s, and 500'd the owner's /search). A watcher re-checks
+    # pipeline-active every ``_ACTIVE_RECHECK_S``; on deactivation the
+    # remaining workers drain as no-ops within one interval.
+    abort = asyncio.Event()
+    deactivated_mid_run = False
+
+    async def _watch_active() -> None:
+        nonlocal deactivated_mid_run
+        while not abort.is_set():
+            try:
+                await asyncio.wait_for(abort.wait(), timeout=_ACTIVE_RECHECK_S)
+                return
+            except TimeoutError:
+                pass
+            try:
+                still_active = await _is_pipeline_active(supabase, target.id)
+            except Exception:
+                # Transient read failure must not kill the fan-out — keep
+                # polling on the next interval; the entry check already
+                # proved the target active once.
+                logger.debug("activation watcher re-check failed; retrying", exc_info=True)
+                continue
+            if not still_active:
+                logger.warning(
+                    "poll_sources_for_target: target %s (%s) deactivated "
+                    "mid-fan-out — aborting remaining sources",
+                    target.id,
+                    target.label,
+                )
+                deactivated_mid_run = True
+                abort.set()
+                return
+
+    watcher = asyncio.create_task(_watch_active())
+
     async def _worker(raw_source: Any) -> dict[str, Any]:
+        if abort.is_set():
+            return {"polled": False, "new": 0, "updated": 0, "error": None}
         async with semaphore:
+            if abort.is_set():
+                return {"polled": False, "new": 0, "updated": 0, "error": None}
             return await _poll_one_source_for_target(
                 cast(dict[str, Any], raw_source),
                 supabase,
@@ -3247,7 +3548,11 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
                 payer_over_budget=over,
             )
 
-    summaries = await asyncio.gather(*(_worker(s) for s in sources))
+    try:
+        summaries = await asyncio.gather(*(_worker(s) for s in sources))
+    finally:
+        abort.set()
+        watcher.cancel()
 
     result = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
     for s in summaries:
@@ -3257,5 +3562,7 @@ async def poll_sources_for_target(supabase: Client, target: JobTarget) -> PollRe
         result.updated_jobs += s["updated"]
         if s.get("error"):
             result.errors.append(s["error"])
+    if deactivated_mid_run:
+        result.errors.append("activation fan-out aborted: target deactivated mid-run")
 
     return result

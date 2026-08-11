@@ -114,13 +114,22 @@ export default function FunnelChart({ data }: FunnelChartProps) {
         >
           <span className='text-xs text-text-tertiary'>View jobs:</span>
           {drillStages.map(row => (
+            // No count on the chip, deliberately (2026-08-08). The funnel
+            // spans EVERY target the user has (`_user_target_ids` is
+            // any-status), while /jobs?status= shows only ACTIVE targets — so
+            // with any paused target the chip advertised a number its own
+            // destination could not produce. Prod: 6 targets, 1 active, 5 jobs
+            // saved, 2 reachable in the list; the chip said "Saved (3)" and
+            // landed on "No jobs found". The bar directly above already carries
+            // the number, so dropping it here loses nothing and stops the chip
+            // making a promise the list can't keep.
             <Link
               key={row.stage}
               href={`/jobs?status=${row.stage}`}
               prefetch={false}
               className={DRILL_LINK_CLASS}
             >
-              {row.label} ({row.count})
+              {row.label}
             </Link>
           ))}
         </nav>

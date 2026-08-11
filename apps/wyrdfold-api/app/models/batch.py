@@ -17,6 +17,15 @@ class BatchItem(BaseModel):
     reused_from: str | None = None
     """Source resume ID when this item reused an existing resume (#504)."""
     error: str | None = None
+    lint_violations: list[str] | None = None
+    """ATS lint messages when the generated resume is a flagged draft (#656).
+
+    The item is still ``completed`` — a real ``documents`` row exists at
+    ``resume_record_id`` and the posting advanced to ``resume_draft``. Before
+    #656 a lint failure produced nothing and the item was marked ``failed``;
+    marking it that way now would hide a draft the user already paid for and
+    can fix in the editor.
+    """
 
 
 class BatchJob(BaseModel):

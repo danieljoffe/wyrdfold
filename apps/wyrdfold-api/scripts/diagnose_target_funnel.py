@@ -24,7 +24,7 @@ import sys
 from typing import Any, cast
 
 from app.services.diagnostics.funnel import compute_target_funnel
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 
 def _resolve_target_id_for_email(sb: Any, email: str) -> str:
@@ -72,7 +72,7 @@ def _print_report(report: Any) -> None:
 
     print(f"\n# Nomenclature  ({n.target_id})")
     print(f"  label:          {n.label!r}")
-    print(f"  is_active:      {n.is_active}  status={n.activation_status}  v{n.profile_version}")
+    print(f"  app_active:     {n.app_active}  status={n.activation_status}  v{n.profile_version}")
     print(f"  seniority_hint: {n.seniority_hint!r}")
     print(f"  domain_hints:   {n.domain_hints}")
     print(f"  example_promising_titles  ({len(n.example_promising_titles)}):")
@@ -161,8 +161,7 @@ def main() -> None:
     if not args.target_id and not args.email:
         parser.error("provide target_id or --email")
 
-    init_supabase()
-    sb = get_supabase_pool()
+    sb = create_service_client()
     if sb is None:
         raise SystemExit("Supabase not configured — check .env / SUPABASE_URL")
 

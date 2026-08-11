@@ -142,6 +142,38 @@ def _format_salary(posting: dict[str, object]) -> str | None:
     return None
 
 
+def salary_from_jsonld_html(html: str) -> str | None:
+    """First formatted ``baseSalary`` from any JSON-LD JobPosting in ``html``.
+
+    Pure/parse-only twin of the fetch helper below — unit-testable without
+    network. Returns None when no posting carries structured pay.
+    """
+    for posting in _extract_jobs(html):
+        salary = _format_salary(posting)
+        if salary:
+            return salary
+    return None
+
+
+async def fetch_salary_from_posting_page(url: str) -> str | None:
+    """Fetch one posting page and pull ``baseSalary`` from its JSON-LD (#503).
+
+    Board APIs often omit structured pay that the HOSTED posting page carries
+    as schema.org markup (Lever/Ashby especially). The poller calls this as a
+    bounded, flag-gated fallback for NEW rows whose JD text yielded no salary.
+    Best-effort: any fetch/parse failure returns None — the row simply keeps
+    a null salary, exactly as before.
+    """
+    try:
+        resp = await request_with_retry("GET", url)
+    except FetchExhaustedError as exc:
+        logger.info("jsonld salary fetch exhausted retries for %s: %s", url, exc)
+        return None
+    if resp.status_code != 200:
+        return None
+    return salary_from_jsonld_html(resp.text)
+
+
 async def fetch_jsonld_jobs(careers_url: str) -> list[StandardJob]:
     """Fetch a careers page and extract jobs from JSON-LD markup."""
     try:
@@ -174,19 +206,13 @@ async def fetch_jsonld_jobs(careers_url: str) -> list[StandardJob]:
         id_source = url or f"{title}|{_get_location(posting) or ''}"
         external_id = hashlib.sha256(id_source.encode()).hexdigest()[:16]
 
-        org = posting.get("hiringOrganization")
-        dept = ""
-        if isinstance(org, dict):
-            dept = _get_str(org, "department")
-
         jobs.append(
             StandardJob(
                 external_id=external_id,
                 title=title,
                 location_name=_get_location(posting),
-                department=dept or None,
                 content=clean_desc,
-                updated_at=_get_str(posting, "datePosted"),
+                posted_at=_get_str(posting, "datePosted"),
                 absolute_url=url,
                 salary_text=_format_salary(posting),
             )

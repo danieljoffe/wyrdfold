@@ -44,7 +44,7 @@ def _target() -> JobTarget:
         id="t-1",
         label="Director of CX Operations",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )

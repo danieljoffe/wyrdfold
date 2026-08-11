@@ -105,7 +105,6 @@ async def test_flag_on_lock_rpcs_use_async_client(
 ) -> None:
     from app.services import poll_lock
 
-    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
     async_client = _AsyncLockClient()
     monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: async_client)
     sync_sb, _ = _fake_lock_supabase()
@@ -127,7 +126,6 @@ async def test_flag_on_without_async_client_falls_back_to_sync(
 ) -> None:
     from app.services import poll_lock
 
-    monkeypatch.setattr(poll_lock.settings, "poller_async_db", True)
     monkeypatch.setattr(poll_lock, "get_async_supabase", lambda: None)
     sb, state = _fake_lock_supabase()
 
@@ -145,7 +143,7 @@ async def test_scheduled_poll_runs_when_lock_acquired() -> None:
         sources_polled=1, new_jobs=2, updated_jobs=0, archived_jobs=0, errors=[]
     )
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=sb),
+        patch("app.scheduler.get_async_supabase", return_value=sb),
         patch(
             "app.scheduler.poll_due_sources",
             new=AsyncMock(return_value=poll_result),
@@ -154,7 +152,11 @@ async def test_scheduled_poll_runs_when_lock_acquired() -> None:
     ):
         await _run_scheduled_poll()
 
-    mock_poll.assert_awaited_once_with(sb)
+    # The client positionally, plus the caller-owned ``progress`` accumulator
+    # (partial counts for the watchdog-abort log).
+    mock_poll.assert_awaited_once()
+    assert mock_poll.await_args.args == (sb,)
+    assert "progress" in mock_poll.await_args.kwargs
     mock_health.assert_awaited_once_with(sb)
 
 
@@ -169,7 +171,7 @@ async def test_scheduled_poll_skips_when_lock_held() -> None:
     state["held"] = True  # someone else already polling
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=sb),
+        patch("app.scheduler.get_async_supabase", return_value=sb),
         patch("app.scheduler.poll_due_sources") as mock_poll,
         patch("app.scheduler.check_ingestion_health", new=AsyncMock()) as mock_health,
     ):

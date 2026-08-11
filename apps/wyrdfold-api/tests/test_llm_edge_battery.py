@@ -34,6 +34,7 @@ from app.models.targets import TargetSuggestion, TargetSuggestions
 from app.services.analysis.analyze import analyze_job
 from app.services.experience.derive import derive_from_prose
 from app.services.llm.client import strip_markdown_fence
+from app.services.llm.errors import MissingToolCallError
 from app.services.llm.mock import MockLLMClient
 from app.services.tailor.tailor import tailor_resume
 from app.services.targets.suggest import suggest_targets_from_query
@@ -220,10 +221,12 @@ async def test_schema_violation_is_rejected_at_the_boundary(
 
 @pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.name)
 async def test_malformed_tool_json_raises(surface: Surface) -> None:
-    """Non-JSON scripted output models the provider failing to emit tool_use;
-    the mock raises JSONDecodeError, mirroring the real client's failure."""
+    """Non-JSON scripted output models the model answering in PROSE instead of
+    emitting the forced tool call (the deepseek 2026-08-05 flake); the mock
+    raises the same typed ``MissingToolCallError`` the real parser does, so
+    every surface inherits the exact failure shape."""
     llm = MockLLMClient(scripted={surface.purpose: TEXT_EDGES["malformed_json"]})
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(MissingToolCallError):
         await surface.call(llm)
 
 

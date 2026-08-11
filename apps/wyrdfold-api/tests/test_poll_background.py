@@ -28,8 +28,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.dependencies import get_settings, get_supabase
+from app.dependencies import get_async_service_supabase, get_settings
 from app.main import app
+from app.models.schemas import PollResult
 from app.scheduler import run_force_poll_locked
 
 _SETTINGS = Settings(
@@ -41,7 +42,7 @@ _SETTINGS = Settings(
 
 def _client() -> TestClient:
     app.dependency_overrides[get_settings] = lambda: _SETTINGS
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -150,7 +151,7 @@ async def test_force_poll_runs_when_lock_acquired() -> None:
         sources_polled=1, new_jobs=2, updated_jobs=0, archived_jobs=0, errors=[]
     )
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=sb),
+        patch("app.scheduler.get_async_supabase", return_value=sb),
         patch(
             "app.scheduler.poll_all_sources",
             new=AsyncMock(return_value=poll_result),
@@ -159,7 +160,11 @@ async def test_force_poll_runs_when_lock_acquired() -> None:
     ):
         await run_force_poll_locked()
 
-    mock_poll.assert_awaited_once_with(sb)
+    # The client positionally, plus the caller-owned ``progress`` accumulator
+    # (partial counts for the watchdog-abort log).
+    mock_poll.assert_awaited_once()
+    assert mock_poll.await_args.args == (sb,)
+    assert isinstance(mock_poll.await_args.kwargs["progress"], PollResult)
     mock_health.assert_awaited_once_with(sb)
     assert state["held"] is False  # lock released
 
@@ -173,7 +178,7 @@ async def test_force_poll_skips_when_lock_held() -> None:
     state["held"] = True  # the scheduled poll (or another trigger) holds it
 
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=sb),
+        patch("app.scheduler.get_async_supabase", return_value=sb),
         patch("app.scheduler.poll_all_sources") as mock_poll,
         patch("app.scheduler.check_ingestion_health") as mock_health,
     ):
@@ -189,7 +194,7 @@ async def test_force_poll_skips_when_lock_held() -> None:
 async def test_force_poll_skips_when_client_uninitialized() -> None:
     """No supabase singleton (startup race) → skip cleanly, no poll, no crash."""
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=None),
+        patch("app.scheduler.get_async_supabase", return_value=None),
         patch("app.scheduler.poll_all_sources") as mock_poll,
     ):
         await run_force_poll_locked()
@@ -203,7 +208,7 @@ async def test_force_poll_swallows_and_logs_exceptions() -> None:
     *or* surface an unhandled-exception in the event loop."""
     sb, _ = _fake_lock_supabase()
     with (
-        patch("app.scheduler.get_supabase_pool", return_value=sb),
+        patch("app.scheduler.get_async_supabase", return_value=sb),
         patch(
             "app.scheduler.poll_all_sources",
             new=AsyncMock(side_effect=RuntimeError("poll boom")),

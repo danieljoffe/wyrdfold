@@ -2,12 +2,17 @@
 
 Covers normalize/exact/fuzzy/RPC-fallback paths in find_matching_target,
 and the user-already-linked exclusion in suggest_and_match.
+
+#57 PR-G2b: match runs on the pooled async service client — the DB reads are
+``await``ed, so ``.execute()`` is stubbed with ``AsyncMock`` and
+``find_matching_target`` is awaited. The any-status membership read is the
+module-inline ``_user_target_ids`` (async), monkeypatched here.
 """
 
 import json
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -33,7 +38,7 @@ def _target_row(*, id: str = "t1", label: str = "Senior Frontend Engineer") -> d
         "search_keywords": [],
         "activation_status": "idle",
         "profile_version": 1,
-        "is_active": False,
+        "app_active": False,
         "created_at": now,
         "updated_at": now,
     }
@@ -72,53 +77,58 @@ def test_normalize_label_collapses_whitespace() -> None:
 # ---- find_matching_target ---------------------------------------------------
 
 
-def test_find_matching_target_exact_match() -> None:
+@pytest.mark.asyncio
+async def test_find_matching_target_exact_match() -> None:
     supabase = MagicMock()
-    chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(
+            return_value=MagicMock(
+                data=[_target_row(id="t1", label="Senior Frontend Engineer")]
+            )
+        )
     )
-    chain.return_value.data = [_target_row(id="t1", label="Senior Frontend Engineer")]
 
-    result = find_matching_target(supabase, "  senior frontend engineer  ")
+    result = await find_matching_target(supabase, "  senior frontend engineer  ")
     assert result is not None
     assert result.id == "t1"
 
 
-def test_find_matching_target_no_match_returns_none() -> None:
+@pytest.mark.asyncio
+async def test_find_matching_target_no_match_returns_none() -> None:
     supabase = MagicMock()
-    exact_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
-    exact_chain.return_value.data = []
-    supabase.rpc.return_value.execute.return_value.data = []
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    assert find_matching_target(supabase, "Some Unique Role") is None
+    assert await find_matching_target(supabase, "Some Unique Role") is None
 
 
-def test_find_matching_target_falls_back_to_rpc() -> None:
+@pytest.mark.asyncio
+async def test_find_matching_target_falls_back_to_rpc() -> None:
     supabase = MagicMock()
-    exact_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
-    exact_chain.return_value.data = []
-    rpc_chain = supabase.rpc.return_value.execute
-    rpc_chain.return_value.data = [_target_row(id="t-fuzzy", label="Sr. Frontend Eng")]
+    supabase.rpc.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[_target_row(id="t-fuzzy", label="Sr. Frontend Eng")])
+    )
 
-    result = find_matching_target(supabase, "Senior Frontend Engineer")
+    result = await find_matching_target(supabase, "Senior Frontend Engineer")
     assert result is not None
     assert result.id == "t-fuzzy"
 
 
-def test_find_matching_target_swallows_rpc_failure() -> None:
+@pytest.mark.asyncio
+async def test_find_matching_target_swallows_rpc_failure() -> None:
     """If the trgm RPC isn't installed, the function logs and returns None."""
     supabase = MagicMock()
-    exact_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
-    exact_chain.return_value.data = []
-    supabase.rpc.return_value.execute.side_effect = RuntimeError("RPC missing")
+    supabase.rpc.return_value.execute = AsyncMock(side_effect=RuntimeError("RPC missing"))
 
-    assert find_matching_target(supabase, "Some Role") is None
+    assert await find_matching_target(supabase, "Some Role") is None
 
 
 # ---- suggest_and_match ------------------------------------------------------
@@ -133,17 +143,18 @@ async def test_suggest_and_match_excludes_users_existing_targets(
     supabase = MagicMock()
 
     # Sequence the two find_matching_target calls: first hits t1, second misses.
-    exact_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(
+            side_effect=[
+                MagicMock(data=[_target_row(id="t1", label="Senior Frontend Engineer")]),
+                MagicMock(data=[]),
+            ]
+        )
     )
-    exact_chain.side_effect = [
-        MagicMock(data=[_target_row(id="t1", label="Senior Frontend Engineer")]),
-        MagicMock(data=[]),
-    ]
-    supabase.rpc.return_value.execute.return_value.data = []
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    # Bypass the supabase chain for get_user_target_ids — it's not the SUT here.
-    monkeypatch.setattr(match_module, "get_user_target_ids", lambda _s, _u: {"t1"})
+    # Bypass the supabase chain for the membership read — not the SUT here.
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value={"t1"}))
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
 
@@ -162,13 +173,12 @@ async def test_suggest_and_match_marks_unmatched_suggestions_as_new(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = MagicMock()
-    exact_chain = (
-        supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
-    exact_chain.return_value.data = []
-    supabase.rpc.return_value.execute.return_value.data = []
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    monkeypatch.setattr(match_module, "get_user_target_ids", lambda _s, _u: set())
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value=set()))
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
 

@@ -7,6 +7,16 @@ import { isProduction } from '@/utils/helpers';
 // page lives at `/`; authenticated users belong on the dashboard.
 const HOME_DEFAULT = '/dashboard';
 
+// Shareable listing URLs (#467 §11.2 fast-follow): `/search/<listing id>` must
+// be reachable logged-out too — a shared link is the growth funnel's entry
+// point. Listing ids are UUIDs, so the allowlist admits ONLY UUID-shaped detail
+// paths: shape-restricting keeps the public hole to exactly the shareable
+// surface. Anything else under /search (junk segments, extra path parts,
+// trailing slashes) still falls through to the redirect-to-/login gate, so the
+// widened entry can't become a wildcard hole into the (app)/* namespace.
+const SEARCH_DETAIL_RE =
+  /^\/search\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Constrains `next` to a same-origin relative path. Anything else
  * (absolute URL, protocol-relative `//evil.com`, missing leading `/`,
@@ -73,7 +83,6 @@ function buildCspValue(
 // Reusing the same per-request `nonce` keeps Next's nonce-stamped
 // <script>/<style> tags valid under both headers.
 function buildReportOnlyCspValue(
-  request: NextRequest,
   nonce: string,
   extraConnectOrigins: string[] = []
 ): string {
@@ -87,11 +96,7 @@ function buildReportOnlyCspValue(
     object-src 'none';
     base-uri 'self';
     form-action 'self';
-    frame-ancestors 'none';${
-      request.nextUrl.protocol === 'https:'
-        ? `\n    upgrade-insecure-requests;`
-        : ''
-    }
+    frame-ancestors 'none';
     connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
     img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
 `;
@@ -125,7 +130,6 @@ export async function proxy(request: NextRequest) {
   // Non-enforcing companion policy (audit #29, round 3 M1). Set as
   // `Content-Security-Policy-Report-Only` below — it only reports, never blocks.
   const cspReportOnlyValue = buildReportOnlyCspValue(
-    request,
     nonce,
     supabaseOrigin ? [supabaseOrigin] : []
   );
@@ -253,6 +257,24 @@ export async function proxy(request: NextRequest) {
   // pre-signup: prospective users read them before creating an account, and
   // the payment processor requires public Terms/Privacy URLs.
   if (pathname === '/terms' || pathname === '/privacy') {
+    supabaseResponse.headers.set('Content-Security-Policy', cspValue);
+    supabaseResponse.headers.set(
+      'Content-Security-Policy-Report-Only',
+      cspReportOnlyValue
+    );
+    return supabaseResponse;
+  }
+
+  // Public job search (#467 §10) — the auth-adaptive `/search` surface serves
+  // logged-out visitors (the growth funnel) as well as signed-in users at the
+  // same URL. Like the legal pages above, it must be reachable WITHOUT a
+  // session, so it's allowlisted here before the redirect-to-/login gate below.
+  // TARGETED: the exact `/search` path, plus UUID-shaped `/search/<id>` detail
+  // paths only (SEARCH_DETAIL_RE — the shareable listing URLs, §11.2). Every
+  // other `(app)/*` route stays fully gated (an anonymous hit to `/jobs`,
+  // `/settings`, … still redirects to /login). The page/layout branch shell +
+  // rendering on `getUser()` themselves.
+  if (pathname === '/search' || SEARCH_DETAIL_RE.test(pathname)) {
     supabaseResponse.headers.set('Content-Security-Policy', cspValue);
     supabaseResponse.headers.set(
       'Content-Security-Policy-Report-Only',

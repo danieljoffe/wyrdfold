@@ -25,15 +25,16 @@ These pin all four fixes.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -46,7 +47,7 @@ def _job_target() -> JobTarget:
         id="target-1",
         label="Software Engineer",
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -59,7 +60,10 @@ def _clear_overrides():
 
 
 def _client(user_id: str | None) -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    # #57 slice 4: delete/deactivate/update handlers now hold the async service
+    # client and inline their reads/writes; override both providers.
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
     # get_current_user_id is JWT-required; the deactivate route uses it. When a
     # test exercises the operator path (user_id is None) it only touches DELETE,
@@ -79,11 +83,11 @@ def test_delete_by_jwt_owner_unlinks_and_never_hard_deletes(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: {"target-1"})
-    unlink = MagicMock(return_value=True)
-    hard_delete = MagicMock(return_value=True)
-    monkeypatch.setattr(mod.crud, "unlink_user_from_target", unlink)
-    monkeypatch.setattr(mod.crud, "delete", hard_delete)
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    unlink = AsyncMock(return_value=True)
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", unlink)
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
 
     resp = _client("user-1").delete("/targets/target-1")
 
@@ -96,6 +100,84 @@ def test_delete_by_jwt_owner_unlinks_and_never_hard_deletes(
     assert unlink.call_args.args[1:] == ("user-1", "target-1")
 
 
+def test_delete_by_jwt_owner_reaps_the_row_once_its_last_follower_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#667: the unlink is right, but nothing removed the row afterwards.
+
+    Once the last follower goes the endpoint is membership-scoped, so it 404s
+    for everyone including the creator — the row is unreachable and still holds
+    every score it accumulated (one prod orphan: 6,163 rows). The reap runs
+    AFTER the unlink and is itself guarded in SQL, so this only pins the wiring;
+    ``tests/integration/test_orphaned_target_reap.py`` proves the guard.
+    """
+    from app.routers import targets as mod
+
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", AsyncMock(return_value=True))
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
+    reap = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_reap_orphaned_target_async", reap)
+
+    resp = _client("user-1").delete("/targets/target-1")
+
+    assert resp.status_code == 200
+    reap.assert_called_once()
+    assert reap.call_args.args[1] == "target-1"
+    # Still never the unguarded shared-row delete — the reap is the guarded path.
+    hard_delete.assert_not_called()
+
+
+def test_delete_does_not_reap_when_the_unlink_found_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 means this caller never had a link. Reaping on that path would let
+    a non-follower probe drive deletions."""
+    from app.routers import targets as mod
+
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", AsyncMock(return_value=False))
+    monkeypatch.setattr(mod, "_delete_target_async", AsyncMock(return_value=True))
+    reap = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "_reap_orphaned_target_async", reap)
+
+    resp = _client("user-1").delete("/targets/target-1")
+
+    assert resp.status_code == 404
+    reap.assert_not_called()
+
+
+async def test_reap_helper_is_fail_soft_when_the_rpc_errors() -> None:
+    """Fail-soft belongs INSIDE the helper, so test it there.
+
+    Monkeypatching the helper to raise would only prove that a raise
+    propagates — it would assert the opposite of the behaviour and still pass
+    under a name claiming fail-soft. The real question is what the helper does
+    when the RPC errors: the unlink already succeeded and that is what the user
+    asked for, so a reap failure must degrade to a logged tidy-up job.
+    """
+    from app.routers import targets as mod
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(side_effect=RuntimeError("rpc exploded"))
+
+    result = await mod._reap_orphaned_target_async(supabase, "target-1")
+
+    assert result is False
+
+
+async def test_reap_helper_reports_whether_a_row_went() -> None:
+    from app.routers import targets as mod
+
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=True))
+    assert await mod._reap_orphaned_target_async(supabase, "target-1") is True
+
+    supabase.rpc.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=False))
+    assert await mod._reap_orphaned_target_async(supabase, "target-1") is False
+
+
 def test_delete_by_jwt_caller_unlinks_missing_link_is_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -103,10 +185,10 @@ def test_delete_by_jwt_caller_unlinks_missing_link_is_404(
 
     # Owns the target (passes the guard) but the unlink deletes zero rows
     # (already gone) → 404, still no hard delete.
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: {"target-1"})
-    hard_delete = MagicMock(return_value=True)
-    monkeypatch.setattr(mod.crud, "unlink_user_from_target", lambda *_a, **_k: False)
-    monkeypatch.setattr(mod.crud, "delete", hard_delete)
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", AsyncMock(return_value=False))
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
 
     resp = _client("user-1").delete("/targets/target-1")
 
@@ -119,11 +201,11 @@ def test_delete_by_non_owner_jwt_is_404_before_any_write(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: set())
-    unlink = MagicMock(return_value=True)
-    hard_delete = MagicMock(return_value=True)
-    monkeypatch.setattr(mod.crud, "unlink_user_from_target", unlink)
-    monkeypatch.setattr(mod.crud, "delete", hard_delete)
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value=set()))
+    unlink = AsyncMock(return_value=True)
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", unlink)
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
 
     resp = _client("attacker").delete("/targets/target-1")
 
@@ -139,10 +221,10 @@ def test_delete_by_operator_still_hard_deletes(
 
     # Operator path (user_id is None): _require_user_owns_target early-returns,
     # and the shared-row hard delete is the intended behavior.
-    unlink = MagicMock(return_value=True)
-    hard_delete = MagicMock(return_value=True)
-    monkeypatch.setattr(mod.crud, "unlink_user_from_target", unlink)
-    monkeypatch.setattr(mod.crud, "delete", hard_delete)
+    unlink = AsyncMock(return_value=True)
+    hard_delete = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_unlink_user_from_target_async", unlink)
+    monkeypatch.setattr(mod, "_delete_target_async", hard_delete)
 
     resp = _client(None).delete("/targets/target-1")
 
@@ -161,11 +243,11 @@ def test_deactivate_non_owner_is_404_and_reads_no_target(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: set())
-    get_spy = MagicMock(return_value=_job_target())
-    inactivate = MagicMock()
-    monkeypatch.setattr(mod.crud, "get", get_spy)
-    monkeypatch.setattr(mod.crud, "set_user_target_inactive", inactivate)
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value=set()))
+    get_spy = AsyncMock(return_value=_job_target())
+    inactivate = AsyncMock()
+    monkeypatch.setattr(mod, "_target_get", get_spy)
+    monkeypatch.setattr(mod, "_set_user_target_inactive_async", inactivate)
 
     resp = _client("attacker").post("/targets/target-1/deactivate")
 
@@ -178,10 +260,10 @@ def test_deactivate_non_owner_is_404_and_reads_no_target(
 def test_deactivate_owner_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: {"target-1"})
-    monkeypatch.setattr(mod.crud, "get", lambda *_a, **_k: _job_target())
-    inactivate = MagicMock()
-    monkeypatch.setattr(mod.crud, "set_user_target_inactive", inactivate)
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(mod, "_target_get", AsyncMock(return_value=_job_target()))
+    inactivate = AsyncMock()
+    monkeypatch.setattr(mod, "_set_user_target_inactive_async", inactivate)
 
     resp = _client("user-1").post("/targets/target-1/deactivate")
 
@@ -200,8 +282,8 @@ def test_update_target_by_jwt_user_is_403_and_never_writes(
 ) -> None:
     from app.routers import targets as mod
 
-    update = MagicMock(return_value=_job_target())
-    monkeypatch.setattr(mod.crud, "update", update)
+    update = AsyncMock(return_value=_job_target())
+    monkeypatch.setattr(mod, "_update_target_async", update)
 
     resp = _client("user-1").patch("/targets/target-1", json={"label": "hacked"})
 
@@ -217,8 +299,8 @@ def test_update_target_by_operator_still_writes(
     from app.routers import targets as mod
 
     # Operator path (user_id is None): curation via the api-key is preserved.
-    update = MagicMock(return_value=_job_target())
-    monkeypatch.setattr(mod.crud, "update", update)
+    update = AsyncMock(return_value=_job_target())
+    monkeypatch.setattr(mod, "_update_target_async", update)
 
     resp = _client(None).patch("/targets/target-1", json={"label": "Renamed"})
 

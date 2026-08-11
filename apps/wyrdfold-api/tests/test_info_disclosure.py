@@ -85,14 +85,17 @@ def test_manual_job_ssrf_rejection_is_generic(monkeypatch) -> None:  # type: ign
     monkeypatch.setattr(validate_mod, "_resolve_addresses", _internal)
 
     from app.dependencies import (
+        get_async_service_supabase,
+        get_async_supabase_for_caller,
         get_current_user_id_optional,
-        get_supabase,
-        get_supabase_for_caller,
         verify_api_key_or_jwt,
     )
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
-    app.dependency_overrides[get_supabase_for_caller] = lambda: MagicMock()
+    # #57 PR-G2e-4: /jobs/manual acquires the service client via
+    # ``get_async_service_supabase``; provide it so the handler body runs and the
+    # SSRF check (not a 503 for an unconfigured client) is what rejects the URL.
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_supabase_for_caller] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-a"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-a"
     try:
@@ -124,7 +127,7 @@ async def test_resume_download_storage_error_is_generic() -> None:
     exception (which can carry the internal Storage path) stays server-side
     (audit #29 R3 / M4)."""
     from datetime import UTC, datetime
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     from fastapi import HTTPException
 
@@ -158,10 +161,16 @@ async def test_resume_download_storage_error_is_generic() -> None:
     secret = "Storage 403 at user-a/secret-internal-path/rec-1.docx token=XYZ"
 
     with (
-        patch("app.services.tailor.persistence.get", return_value=record),
+        patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
         patch(
             "app.services.tailor.persistence.download_docx",
+            new_callable=AsyncMock,
             side_effect=RuntimeError(secret),
+        ),
+        patch(
+            "app.routers.tailor._resolve_render_style",
+            new_callable=AsyncMock,
+            return_value=None,
         ),
     ):
         with pytest.raises(HTTPException) as exc_info:

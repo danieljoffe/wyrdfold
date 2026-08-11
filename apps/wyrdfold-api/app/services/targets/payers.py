@@ -9,6 +9,14 @@ Payer rule: the user whose ``user_targets`` link is active; if several,
 the earliest-standing link wins (``created_at`` — NOT ``updated_at``,
 which upserts stamp on every fit-score refresh). Tie-break ``user_id``
 ascending for determinism.
+
+A target with NO active link is not an error state — it is the app's own
+catalog (the app-owned targets model): ``targets`` rows are shared catalog
+entries; ``user_targets`` merely attributes them. Catalog targets' Phase-1
+admission bills the INSTANCE key (``_resolve_payer_client(None)`` — the
+qualification tagger's precedent), bounded by the global daily budget.
+User-scoped spend (Phase 2 grading, alerts) never runs for them because
+those paths key off ``user_targets`` links.
 """
 
 from __future__ import annotations
@@ -17,18 +25,23 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
 
 
-def resolve_target_payers(supabase: Client, target_ids: list[str]) -> dict[str, str | None]:
-    """Map each target id to its payer user id (or None if orphaned)."""
+async def resolve_target_payers(
+    supabase: AsyncClient, target_ids: list[str]
+) -> dict[str, str | None]:
+    """Map each target id to its payer user id (or None if orphaned).
+
+    Async on the pooled service client (#57 PR-G2e-1): the poll cycle awaits this
+    on the loop instead of via a threadpool hop."""
     if not target_ids:
         return {}
-    resp = (
+    resp = await (
         supabase.table("user_targets")
         .select("target_id,user_id,created_at")
         .eq("is_active", True)
@@ -64,14 +77,28 @@ class PayerBudgetGate:
     def target_blocked(self, target_id: str) -> bool:
         """True when this target's LLM work must be skipped this cycle.
 
-        Blocked when the payer is over budget, idle, operator-disabled,
-        OR unknown (orphan active target, or activated after the
-        snapshot) — never spend money nobody will consume. Jobs still
-        ingest fail-open; grading resumes once the payer's window frees
-        up / they return / the operator re-enables them.
+        Blocked when the target HAS a payer and that payer is over
+        budget, idle, or operator-disabled — grading resumes once their
+        window frees up / they return / the operator re-enables them.
+
+        A target with NO payer (no active ``user_targets`` link) is the
+        app's catalog, NOT blocked: its Phase-1 admission deliberately
+        bills the instance key (see the module docstring), so the corpus
+        keeps ingesting for catalog entries nobody has joined. The old
+        rule ("never spend money nobody will consume") starved the
+        public /search corpus down to one sponsored target's family —
+        the app itself is the consumer of catalog admission.
+
+        EXCEPTION — the EMPTY gate stays fail-closed: ``PayerBudgetGate()``
+        with no payer map is the sentinel the global circuit breaker and
+        the build-failure fallback construct to refuse ALL spend for the
+        cycle ("when we can't see budgets, don't spend"). Catalog
+        semantics apply only within a healthy snapshot.
         """
+        if not self.payer_by_target:
+            return True  # fail-closed sentinel (breaker / build failure)
         payer = self.payer_by_target.get(target_id)
-        return payer is None or self.user_blocked(payer)
+        return payer is not None and self.user_blocked(payer)
 
     def user_blocked(self, user_id: str) -> bool:
         return (
@@ -81,7 +108,7 @@ class PayerBudgetGate:
         )
 
 
-def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGate:
+async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:
     """Build the cycle snapshot: payers, overrides + activity, spends.
 
     Three queries total (payers IN, profiles IN, one spend RPC per
@@ -90,8 +117,13 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
     ``idle_defer_days=0`` disables idle gating. A NULL ``last_seen_at``
     (profile predating the column backfill, or no profile row) is
     treated as active — never punish missing data.
+
+    Async on the pooled service client (#57 PR-G2e-1): payers/profiles reads and
+    the per-payer spend meter all await on the loop. Logic (caps, reserves,
+    idle/disabled gating) is byte-for-byte the sync original — only the DB hop
+    model changed. Only the poll cycle calls it, so there is no sync twin.
     """
-    payers = resolve_target_payers(supabase, target_ids)
+    payers = await resolve_target_payers(supabase, target_ids)
     distinct = sorted({p for p in payers.values() if p is not None})
     if not distinct:
         return PayerBudgetGate(payer_by_target=payers)
@@ -99,7 +131,7 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
     overrides: dict[str, float | None] = {}
     last_seen: dict[str, str | None] = {}
     disabled: set[str] = set()
-    resp = (
+    resp = await (
         supabase.table("user_profiles")
         .select("user_id,llm_monthly_budget_usd,last_seen_at,llm_enabled")
         .in_("user_id", distinct)
@@ -136,7 +168,7 @@ def build_budget_gate(supabase: Client, target_ids: list[str]) -> PayerBudgetGat
         cap = float(raw) if raw is not None else settings.user_llm_monthly_budget_usd
         if cap <= 0:
             continue
-        spent = cost_log.total_spend(supabase, user_id=uid, since=since)
+        spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
         if spent >= cap:
             over.add(uid)
 

@@ -1,14 +1,17 @@
+import asyncio
 import hmac
 import logging
+import threading
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import jwt
 from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
-from jwt import PyJWKClient, PyJWKClientError
-from supabase import Client
+from jwt import PyJWK, PyJWKClient, PyJWKClientError
+from supabase import AsyncClient
 
+from app.background import spawn_detached
 from app.config import Settings, settings
 
 logger = logging.getLogger(__name__)
@@ -28,26 +31,31 @@ def get_settings() -> Settings:
     return settings
 
 
-def get_supabase() -> Client:
-    from app.supabase_pool import get_supabase_pool
+def get_async_service_supabase() -> AsyncClient:
+    """Async service-role client (#57 slice 3) — the client for router paths
+    that bypass RLS (cost ledger, shared-catalog reads, the LLM-budget gate).
+    Returns the shared singleton (no await; created in the lifespan); 503 when
+    unconfigured. The sync service client it once mirrored was deleted in
+    PR-G2e-8 once the last three sync deps moved onto this one."""
+    from app.supabase_pool import get_async_supabase
 
-    client = get_supabase_pool()
+    client = get_async_supabase()
     if client is None:
         raise HTTPException(status_code=503, detail="Supabase not configured")
     return client
 
 
-def get_user_supabase(
+async def get_async_user_supabase(
     request: Request,
     s: Settings = Depends(get_settings),
-) -> Client:
-    """Per-request Supabase client bound to the caller's JWT (#79).
+) -> AsyncClient:
+    """Per-request, RLS-enforced user client on the pooled async HTTP/2 transport.
 
-    Unlike ``get_supabase`` (service-role, bypasses RLS), this routes
-    queries through the user's token so Postgres RLS enforces per-user
-    access. JWT-only: api-key/cron callers have no user token and must
-    use ``get_supabase``. Not wired into any route yet — the per-user
-    data paths migrate onto it table-by-table in later #79 phases.
+    Routes queries through the caller's JWT so Postgres RLS enforces per-user
+    access (unlike ``get_async_service_supabase``, which is service-role and
+    bypasses RLS). JWT-only: api-key/cron callers have no user token and must use
+    the service-role client. This is the per-request user client for every RLS
+    route since PR-F retired the sync per-request client (#57).
     """
     if not s.supabase_url or not s.supabase_anon_key:
         raise HTTPException(status_code=503, detail="Supabase user client not configured")
@@ -55,33 +63,31 @@ def get_user_supabase(
     if not token:
         raise HTTPException(status_code=401, detail="Missing auth token")
 
-    from app.supabase_pool import get_user_client
+    from app.supabase_pool import get_async_user_client
 
-    return get_user_client(token)
+    return await get_async_user_client(token)
 
 
-def get_supabase_for_caller(
+async def get_async_supabase_for_caller(
     request: Request,
     s: Settings = Depends(get_settings),
-) -> Client:
-    """Return the per-request RLS-enforced user client for a JWT caller.
+) -> AsyncClient:
+    """Per-request RLS-enforced user client for a JWT caller (dual-auth routers).
 
-    Used by the dual-auth user routers to scope queries by
-    ``auth.uid() = user_id`` at Postgres (not just in Python). **JWT-only.**
-
-    Since #192 the user-data gate (``verify_api_key_or_jwt``) rejects shared
-    API keys, so no api-key caller reaches the routes that use this. This dep
-    therefore no longer honours the broad key either — defense in depth: a
-    leaked automation key can never obtain a service-role client on a user
-    route, independent of how a future route wires its auth. An absent or
-    unverifiable token 401s (and a JWT with no user client configured 503s,
-    never a silent fall-back to service-role that would bypass RLS).
+    Scopes queries by ``auth.uid() = user_id`` at Postgres (not just in Python).
+    JWT-only: since #192 the user-data gate rejects shared API keys, so this dep
+    honours no key either — a leaked automation key can never obtain a
+    service-role client on a user route. An absent/unverifiable token 401s (a JWT
+    with no user client configured 503s — never a silent service-role fall-back
+    that would bypass RLS). The JWT decode can trigger a blocking JWKS fetch
+    (cold cache / unknown kid), so it runs in a worker thread — never on the
+    event loop this async dependency executes on.
     """
     if s.supabase_url:
         token = _extract_bearer_token(request)
         if token:
             try:
-                _decode_supabase_jwt(token, s)
+                await asyncio.to_thread(_decode_supabase_jwt, token, s)
             except HTTPException:
                 logger.warning(
                     "auth_jwt_decode_failed path=%s reason=client_select",
@@ -93,9 +99,9 @@ def get_supabase_for_caller(
                         status_code=503,
                         detail="Supabase user client not configured",
                     )
-                from app.supabase_pool import get_user_client
+                from app.supabase_pool import get_async_user_client
 
-                return get_user_client(token)
+                return await get_async_user_client(token)
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -108,7 +114,7 @@ def get_embeddings_client() -> "EmbeddingsClient":
     return get_default_client()
 
 
-def get_llm_client(
+async def get_llm_client(
     request: Request,
     s: Settings = Depends(get_settings),
 ) -> "LLMClient":
@@ -117,21 +123,23 @@ def get_llm_client(
     Threads the caller's per-user OpenRouter key (when they've stored one)
     so their inference bills their key; otherwise falls back to the
     instance key, or — when ``BYOK_REQUIRE_USER_KEYS`` is set — 402s the
-    request asking them to add one. See ``app.services.llm.get_client``.
+    request asking them to add one. See ``app.services.llm.get_client_async``.
 
     Auth is unchanged: the user is read opportunistically via the same
-    non-raising JWT path as the optional-user dep, so a valid Bearer token
-    identifies the user and api-key / cron callers resolve to None (and
-    use the instance key). A route's own auth dependency still governs
-    access.
+    non-raising JWT path as the optional-user dep — its CPU/verify (and any
+    cold-cache JWKS fetch) run off the event loop in a worker thread
+    (``asyncio.to_thread``, Perf-F1) — so a valid Bearer token identifies the
+    user and api-key / cron callers resolve to None (and use the instance key).
+    The BYOK key + plan reads run natively on the pooled async service client.
+    A route's own auth dependency still governs access.
     """
-    from app.services.llm import MissingUserKeyError, get_client
-    from app.supabase_pool import get_supabase_pool
+    from app.services.llm import MissingUserKeyError, get_client_async
+    from app.supabase_pool import get_async_supabase
 
-    user_id = _try_decode_jwt_sub(request, s)
-    supabase = get_supabase_pool()
+    user_id = await _try_decode_jwt_sub_async(request, s)
+    supabase = get_async_supabase()
     try:
-        return get_client(supabase, user_id)
+        return await get_client_async(supabase, user_id)
     except MissingUserKeyError as exc:
         raise HTTPException(
             status_code=402,
@@ -276,6 +284,140 @@ def _decode_supabase_jwt(token: str, s: Settings) -> dict[str, object]:
     return payload
 
 
+# ---- Warm JWKS cache for the on-loop rate-limit key_func --------------------
+#
+# slowapi's middleware calls the limiter key_func synchronously inside its async
+# dispatch — on the event loop, on EVERY request. Decoding the JWT there via
+# PyJWKClient can trigger a BLOCKING JWKS network fetch: on the 300s cache
+# expiry, and — the attacker lever — on any token whose ``kid`` isn't cached
+# (PyJWT force-refreshes on an unknown kid). A flood of garbage-kid tokens
+# becomes a flood of blocking HTTPS round-trips serialized on the loop, stalling
+# every in-flight request (hardening review 2026-07-21, Perf-F1).
+#
+# Fix: the key_func decodes against THIS warm, in-memory key set and NEVER
+# fetches — an unknown kid just falls back to IP keying. It is pre-warmed at
+# startup and refreshed out-of-band (``prewarm_and_start_jwks_refresher``). The
+# authoritative route-dependency decode (``_decode_supabase_jwt``) is unchanged:
+# it runs in FastAPI's threadpool, where a fetch is off-loop and safe.
+_jwks_keys_lock = threading.Lock()
+_jwks_keys: dict[str, PyJWK] = {}
+
+
+def refresh_jwks_cache(s: Settings) -> int:
+    """Blocking JWKS fetch → repopulate the warm key set. Returns the key count.
+
+    Call from a worker thread (``asyncio.to_thread``), never on the event loop.
+    """
+    jwk_set = _get_jwks_client(s).get_jwk_set(refresh=True)
+    fresh: dict[str, PyJWK] = {}
+    for key in jwk_set.keys:
+        kid = key.key_id
+        if kid:
+            fresh[kid] = key
+    with _jwks_keys_lock:
+        _jwks_keys.clear()
+        _jwks_keys.update(fresh)
+    return len(fresh)
+
+
+def _decode_jwt_cache_only(token: str, s: Settings) -> dict[str, object] | None:
+    """Verify a Supabase JWT against the warm key set ONLY — never fetches.
+
+    Returns the claims on success; None on an unknown kid, a cold cache, or an
+    invalid signature/claim. Same verification options as ``_decode_supabase_jwt``
+    (algorithms, exp/sub required, audience + issuer), so a returned ``sub`` is
+    authentic — the key_func can safely bucket by it.
+    """
+    try:
+        kid = jwt.get_unverified_header(token).get("kid")
+    except jwt.PyJWTError:
+        return None
+    if not isinstance(kid, str) or not kid:
+        return None
+    with _jwks_keys_lock:
+        signing_key = _jwks_keys.get(kid)
+    if signing_key is None:
+        return None
+    try:
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=_JWT_ALGORITHMS,
+            options={"require": ["exp", "sub"]},
+            audience=s.supabase_jwt_audience,
+            issuer=_issuer(s),
+        )
+    except jwt.PyJWTError:
+        return None
+
+
+def try_decode_jwt_sub_cache_only(request: Request, s: Settings) -> str | None:
+    """``sub`` from a valid Bearer token, decoded against the warm key set only.
+
+    For the rate-limit key_func, which runs on the event loop where a blocking
+    JWKS fetch would stall all in-flight requests. An unknown kid / cold cache
+    returns None so the caller IP-keys instead. Stamps the Sentry scope on
+    success (mirrors ``_try_decode_jwt_sub_async``, #26 F1).
+    """
+    if not s.supabase_url:
+        return None
+    token = _extract_bearer_token(request)
+    if not token:
+        return None
+    payload = _decode_jwt_cache_only(token, s)
+    if payload is None:
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return None
+    try:
+        import sentry_sdk
+
+        sentry_sdk.set_user({"id": sub})
+    except ImportError:  # pragma: no cover
+        pass
+    return sub
+
+
+# < PyJWKClient's 300s cache lifespan so the warm set never expires between
+# refreshes; also picks up a Supabase signing-key rotation within this window.
+_JWKS_REFRESH_INTERVAL_S = 240
+
+
+async def _jwks_refresh_loop(s: Settings) -> None:
+    while True:
+        await asyncio.sleep(_JWKS_REFRESH_INTERVAL_S)
+        try:
+            n = await asyncio.to_thread(refresh_jwks_cache, s)
+            logger.debug("jwks warm cache refreshed (%d keys)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("jwks warm-cache refresh failed: %s: %s", type(exc).__name__, exc)
+
+
+async def prewarm_and_start_jwks_refresher(s: Settings) -> "asyncio.Task[None] | None":
+    """Pre-warm the JWKS key set and start the out-of-band refresher.
+
+    Returns the refresher task (cancel it on shutdown) or None when Supabase
+    isn't configured. A pre-warm failure is logged, not raised — the rate
+    limiter degrades to IP keying until a refresh succeeds, and auth still works
+    (the route dependency fetches in the threadpool).
+    """
+    if not s.supabase_url:
+        return None
+    try:
+        n = await asyncio.to_thread(refresh_jwks_cache, s)
+        logger.info("jwks warm cache pre-warmed (%d keys)", n)
+    except Exception as exc:
+        logger.warning(
+            "jwks pre-warm failed (rate limiter IP-keys until refresh): %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+    return asyncio.create_task(_jwks_refresh_loop(s))
+
+
 def verify_supabase_jwt(
     request: Request,
     s: Settings = Depends(get_settings),
@@ -328,17 +470,22 @@ def verify_api_key_or_jwt(
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _try_decode_jwt_sub(request: Request, s: Settings) -> str | None:
+async def _try_decode_jwt_sub_async(request: Request, s: Settings) -> str | None:
     """Return the JWT `sub` if a valid Bearer token is present, else None.
 
-    Decode failures are logged at WARNING — see `verify_api_key_or_jwt`
-    for rationale.
+    The async auth path (``get_current_user_id`` / ``_optional`` /
+    ``get_llm_client``, #57 PR-G2e-8). Same result and side effects as the
+    retired sync ``_try_decode_jwt_sub``: decode failures logged at WARNING
+    (see ``verify_api_key_or_jwt`` for rationale), and the user id stamped onto
+    the current Sentry scope on success (#26 F1) so any event captured later in
+    the request carries the user (the SDK no-ops when uninitialized, so this is
+    cheap when no DSN is configured).
 
-    On success, stamps the user id onto the current Sentry scope so any
-    event captured later in the request carries the user (#26 F1). Without
-    this, 500s on authenticated routes land in Sentry with no way to
-    correlate to who hit them. The Sentry SDK no-ops when uninitialized,
-    so this is cheap when no DSN is configured.
+    The signature verify — and any cold-cache / unknown-kid JWKS fetch — inside
+    ``_decode_supabase_jwt`` run in a worker thread (``asyncio.to_thread``) so
+    that CPU + potential blocking IO never lands on the event loop these
+    ``async def`` deps run on (Perf-F1). The on-loop rate-limit key_func keeps
+    its own never-fetch cache-only decoder (``try_decode_jwt_sub_cache_only``).
     """
     if not s.supabase_url:
         return None
@@ -346,7 +493,7 @@ def _try_decode_jwt_sub(request: Request, s: Settings) -> str | None:
     if not token:
         return None
     try:
-        payload = _decode_supabase_jwt(token, s)
+        payload = await asyncio.to_thread(_decode_supabase_jwt, token, s)
     except HTTPException as exc:
         logger.warning(
             "auth_jwt_decode_failed path=%s reason=%s",
@@ -370,44 +517,71 @@ _LAST_SEEN_STAMPED: dict[str, float] = {}
 _LAST_SEEN_THROTTLE_S = 3600.0
 
 
-def _touch_last_seen(user_id: str, s: Settings) -> None:
-    """Fire-and-forget ``user_profiles.last_seen_at`` refresh.
+def _should_stamp_last_seen(user_id: str, s: Settings) -> bool:
+    """Throttle gate for the last-seen stamp: True at most once per user per
+    hour (and never when activity tracking is disabled), stamping the in-process
+    map as its side effect.
 
-    Drives the idle-account lifecycle (defer/deactivate). Throttled to
-    one write per user per hour, and swallowed on any failure — activity
-    tracking must never affect auth or add a failure mode to requests.
+    Kept synchronous so the ``async def`` auth deps decide *without* awaiting
+    whether to spawn the detached DB write — the ~one-write-per-user-per-hour
+    throttle means almost every request short-circuits here with no round-trip.
     """
     if not s.activity_tracking_enabled:
-        return
+        return False
     import time
 
     now = time.monotonic()
     last = _LAST_SEEN_STAMPED.get(user_id)
     if last is not None and now - last < _LAST_SEEN_THROTTLE_S:
-        return
+        return False
     _LAST_SEEN_STAMPED[user_id] = now
+    return True
+
+
+async def _write_last_seen(user_id: str) -> None:
+    """Best-effort ``user_profiles.last_seen_at`` UPDATE on the pooled async
+    service client. Drives the idle-account lifecycle (defer/deactivate).
+
+    Every failure is swallowed, and it no-ops when the async client isn't
+    configured — activity tracking must never affect auth or add a request
+    failure mode. Spawned DETACHED by the auth deps (``spawn_detached``) so the
+    write never sits on the request's critical path (the sync per-request
+    service client it used to write through was deleted in #57 PR-G2e-8).
+    """
     try:
         from datetime import UTC, datetime
 
-        get_supabase().table("user_profiles").update(
-            {"last_seen_at": datetime.now(UTC).isoformat()}
-        ).eq("user_id", user_id).execute()
+        from app.supabase_pool import get_async_supabase
+
+        client = get_async_supabase()
+        if client is None:
+            return
+        await (
+            client.table("user_profiles")
+            .update({"last_seen_at": datetime.now(UTC).isoformat()})
+            .eq("user_id", user_id)
+            .execute()
+        )
     except Exception:
         logger.debug("last_seen stamp failed for %s", user_id, exc_info=True)
 
 
-def get_current_user_id(
+async def get_current_user_id(
     request: Request,
     s: Settings = Depends(get_settings),
 ) -> str:
     """Return the JWT `sub` for the current request (JWT-required).
 
     Use on endpoints that need a real user identity (no api-key fallback).
+    The JWT verify runs off the event loop (``_try_decode_jwt_sub_async``); the
+    best-effort last-seen stamp is spawned DETACHED so it never sits on the
+    request's critical path (#57 PR-G2e-8).
     """
-    sub = _try_decode_jwt_sub(request, s)
+    sub = await _try_decode_jwt_sub_async(request, s)
     if sub is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    _touch_last_seen(sub, s)
+    if _should_stamp_last_seen(sub, s):
+        spawn_detached(_write_last_seen(sub), name="last-seen-stamp")
     return sub
 
 
@@ -441,7 +615,7 @@ def get_current_user_email(
     return email if isinstance(email, str) and email else None
 
 
-def get_current_user_id_optional(
+async def get_current_user_id_optional(
     request: Request,
     key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
@@ -451,20 +625,23 @@ def get_current_user_id_optional(
     Routes accepting both auth modes use this to thread the user identity
     through the service layer: JWT → real per-user data, api-key → legacy
     single-tenant rows (where user_id IS NULL). Raises 401 if neither auth
-    mode matches.
+    mode matches. The JWT verify runs off the event loop
+    (``_try_decode_jwt_sub_async``); the best-effort last-seen stamp is spawned
+    DETACHED so it never sits on the request's critical path (#57 PR-G2e-8).
     """
-    sub = _try_decode_jwt_sub(request, s)
+    sub = await _try_decode_jwt_sub_async(request, s)
     if sub is not None:
-        _touch_last_seen(sub, s)
+        if _should_stamp_last_seen(sub, s):
+            spawn_detached(_write_last_seen(sub), name="last-seen-stamp")
         return sub
     if _api_key_matches(key, s.wyrdfold_api_key):
         return None
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def enforce_llm_budget(
+async def enforce_llm_budget(
     user_id: str | None = Depends(get_current_user_id_optional),
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
     s: Settings = Depends(get_settings),
 ) -> None:
     """Defense-in-depth budget gate for LLM-touching routes.
@@ -473,18 +650,23 @@ def enforce_llm_budget(
     from `llm_costs`. API-key callers (cron/poller/batch) bypass here —
     background work is charged to the target's activator and gated in
     the poller. The monthly cap resolves per plan tier in saas mode
-    (`budget.resolve_llm_quota`: BYOK payers skip it, managed tiers get
+    (`budget.resolve_llm_quota_async`: BYOK payers skip it, managed tiers get
     the plan's interactive-only quota, per-user override wins); self_host
     keeps the settings default + override. 0 disables a window.
+
+    Runs on the pooled async service client (#57 PR-G2e-8): the quota resolve
+    and every spend/cap read are awaited natively instead of blocking a
+    FastAPI threadpool worker. Same thresholds / tiers / window ordering as the
+    sync gate it replaced.
     """
     if user_id is None:
         return
     from app.services.entitlements import NON_BILLABLE_PURPOSES
     from app.services.llm import budget
 
-    quota = budget.resolve_llm_quota(supabase, user_id=user_id)
+    quota = await budget.resolve_llm_quota_async(supabase, user_id=user_id)
     budget.raise_if_llm_disabled(quota.llm_enabled)
-    budget.check_user_budget(
+    await budget.check_user_budget_async(
         supabase,
         user_id=user_id,
         daily_limit_usd=s.user_llm_daily_budget_usd,

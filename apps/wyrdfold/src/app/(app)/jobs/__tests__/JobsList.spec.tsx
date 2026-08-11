@@ -162,9 +162,9 @@ const POSTINGS: JobPosting[] = [
     scoring_status: 'complete',
     status: 'new',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-01T00:00:00Z',
-    created_at: '2026-01-01T00:00:00Z',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-01T00:00:00Z',
   },
   {
     id: 'job-2',
@@ -179,9 +179,9 @@ const POSTINGS: JobPosting[] = [
     scoring_status: 'complete',
     status: 'saved',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-02T00:00:00Z',
-    created_at: '2026-01-02T00:00:00Z',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-02T00:00:00Z',
   },
 ];
 
@@ -221,8 +221,8 @@ describe('JobsList — empty targets state', () => {
 
 describe('JobsList — with targets', () => {
   const TARGETS: TargetTab[] = [
-    { id: 't1', label: 'Frontend', paused: false },
-    { id: 't2', label: 'Backend', paused: false },
+    { id: 't1', label: 'Frontend' },
+    { id: 't2', label: 'Backend' },
   ];
 
   it('renders the page heading and a target filter group with "All Jobs" + targets', () => {
@@ -252,36 +252,16 @@ describe('JobsList — with targets', () => {
     ).toBeInTheDocument();
   });
 
-  it('marks paused targets in the tab strip and shows the paused banner with a working Reactivate', async () => {
-    const user = userEvent.setup();
-    const PAUSED: TargetTab[] = [
-      { id: 't1', label: 'Frontend', paused: false },
-      { id: 't2', label: 'Backend', paused: true },
-    ];
-    const fetchSpy = jest.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ activation_status: 'ready', jobs_count: 0 }),
-    });
-    global.fetch = fetchSpy as unknown as typeof fetch;
-
-    render(<JobsList targetId='t2' initialTargets={PAUSED} />);
-
-    expect(
-      screen.getByRole('button', { name: /backend \(paused\)/i })
-    ).toBeInTheDocument();
-    expect(screen.getByText(/this target is paused/i)).toBeInTheDocument();
-
-    await user.click(screen.getByRole('button', { name: /^reactivate$/i }));
-    await waitFor(() => {
-      expect(fetchSpy).toHaveBeenCalledWith('/api/targets/t2/activate', {
-        method: 'POST',
-      });
-    });
-  });
-
-  it('shows no paused banner on active targets', () => {
+  it('renders target tabs with a plain label and no paused affordance', () => {
+    // Paused targets are omitted upstream (page.tsx → toActiveTargetTabs), so
+    // JobsList is paused-agnostic: tabs are plain labels, never a "(paused)"
+    // suffix, and there is no in-list reactivate banner (that lives on /targets).
     render(<JobsList targetId='t1' initialTargets={TARGETS} />);
-    expect(screen.queryByText(/this target is paused/i)).toBeNull();
+    expect(
+      screen.getByRole('button', { name: /^frontend$/i })
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/paused/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /^reactivate$/i })).toBeNull();
   });
 
   it('renders the loading skeleton state via JobsListView', () => {
@@ -374,7 +354,7 @@ describe('JobsList — activation status poll cadence', () => {
   // then 15s, parked entirely while the tab is hidden. It replaced a flat
   // 3s setInterval that burned its whole 60-attempt budget in 3 minutes at
   // 20 req/min against a pipeline that legitimately runs for many minutes.
-  const TARGETS: TargetTab[] = [{ id: 't1', label: 'Frontend', paused: false }];
+  const TARGETS: TargetTab[] = [{ id: 't1', label: 'Frontend' }];
 
   const pollingResponse = {
     ok: true,

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.models.analysis import JobAnalysis, JobAnalysisRecord
@@ -37,8 +37,8 @@ from app.models.llm import LLMResult
 TABLE = "analyses"
 
 
-def get_cached(
-    supabase: Client,
+async def get_cached(
+    supabase: AsyncClient,
     job_posting_id: str,
     *,
     target_id: str,
@@ -56,7 +56,7 @@ def get_cached(
         .limit(1)
     )
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = query.execute()
+    resp = await query.execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
@@ -71,8 +71,8 @@ def get_cached(
 _CACHE_KEY_COLS = "job_posting_id,target_id,optimized_doc_id,user_id"
 
 
-def persist(
-    supabase: Client,
+async def persist(
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     target_id: str,
@@ -107,7 +107,7 @@ def persist(
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
     }
-    resp = supabase.table(TABLE).upsert(row, on_conflict=_CACHE_KEY_COLS).execute()
+    resp = await supabase.table(TABLE).upsert(row, on_conflict=_CACHE_KEY_COLS).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert analyses row")

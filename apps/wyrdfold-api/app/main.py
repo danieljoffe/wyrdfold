@@ -17,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import Receive, Scope, Send
 
 from app.config import Settings, settings
+from app.dependencies import prewarm_and_start_jwks_refresher
 from app.http_client import close_http_client, close_safe_http_client
 from app.logging_config import init_logging
 from app.observability import init_sentry
@@ -29,12 +30,16 @@ from app.routers import (
     experience,
     feedback,
     insights,
+    job_search,
     jobs,
     keys,
     poll,
+    public_search,
+    search_events,
     sources,
     status,
     tailor,
+    target_membership,
     targets,
     user_profile,
     waitlist,
@@ -43,12 +48,12 @@ from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
 from app.services.llm.errors import LLMServiceError
 from app.services.owner_provisioning import provision_owner
+from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
     close_async_supabase,
-    close_supabase,
-    get_supabase_pool,
+    close_async_user_client,
+    get_async_supabase,
     init_async_supabase,
-    init_supabase,
 )
 
 _log = logging.getLogger("app")
@@ -207,36 +212,57 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # so a future `with TestClient(app)` test can't hit the network).
     if os.environ.get("WYRDFOLD_API_TESTING") != "1":
         await _probe_supabase_keys(settings)
-    init_supabase()
-    # Async service-role client (#57), stood up alongside the sync one for the
-    # incremental poller migration. No-op when Supabase isn't configured.
+    # Async service-role client (#57): the single pooled service-role client
+    # every service-role path awaits — background work, owner provisioning, the
+    # cost/search-event buffers, the scheduler discovery-catchup, ``/ready``
+    # below, and (since PR-G2e-8) the last interactive deps too:
+    # ``enforce_llm_budget``, ``get_llm_client``, and ``get_current_user_id`` →
+    # the detached last-seen stamp. There is no sync service-role client anymore
+    # (its JWKS decode stays off the loop via ``asyncio.to_thread`` instead,
+    # Perf-F1). No-op when Supabase isn't configured.
     await init_async_supabase()
     # Self-host first-run: idempotently create the OWNER_EMAIL auth user so a
     # fresh instance is sign-in-able without dashboard work (Phase 2; no-op in
     # saas mode, when OWNER_EMAIL is unset, or when the owner already exists).
+    # Runs on the async service client (#57 — GoTrue admin create_user awaited).
     # Same test-flag guard as the key probe above: provisioning hits the
     # auth admin API — a future `with TestClient(app)` test must not create
     # real users or need a live stack.
-    supabase_for_owner = get_supabase_pool()
+    supabase_for_owner = get_async_supabase()
     if supabase_for_owner is not None and os.environ.get("WYRDFOLD_API_TESTING") != "1":
-        provision_owner(supabase_for_owner, settings)
+        await provision_owner(supabase_for_owner, settings)
     scheduler = start_scheduler_if_enabled()
+    # Pre-warm the JWKS key set and start its out-of-band refresher, so the
+    # rate-limit key_func (which runs on the event loop) never blocks on a JWKS
+    # fetch (Perf-F1). Same test-flag guard as the other network-touching
+    # startup steps — no test boots the lifespan or should hit auth's network.
+    jwks_refresher = None
+    if os.environ.get("WYRDFOLD_API_TESTING") != "1":
+        jwks_refresher = await prewarm_and_start_jwks_refresher(settings)
     # Background cost-log flush task. Cron paths enqueue rows and the
-    # buffer drains them in a single bulk INSERT every few seconds.
-    # Started only when supabase is configured (otherwise enqueued rows
-    # would accumulate forever in tests/local dev without a backing DB).
-    supabase_for_buffer = get_supabase_pool()
+    # buffer drains them in a single bulk INSERT every few seconds, awaited
+    # on the pooled async service client (#57). Started only when supabase is
+    # configured (otherwise enqueued rows would accumulate forever in
+    # tests/local dev without a backing DB).
+    supabase_for_buffer = get_async_supabase()
     if supabase_for_buffer is not None:
         cost_log_buffer.start(supabase_for_buffer)
+        # Search-funnel metrics ride the same buffered-INSERT machinery
+        # (#467 §10 PR6) — a second instance pointed at search_events.
+        search_events_buffer.start(supabase_for_buffer)
     try:
         yield
     finally:
+        if jwks_refresher is not None:
+            jwks_refresher.cancel()
+            await asyncio.gather(jwks_refresher, return_exceptions=True)
         if scheduler is not None:
             scheduler.shutdown(wait=False)
         if supabase_for_buffer is not None:
             await cost_log_buffer.stop(supabase_for_buffer)
-        close_supabase()
+            await search_events_buffer.stop(supabase_for_buffer)
         await close_async_supabase()
+        await close_async_user_client()
         await close_http_client()
         await close_safe_http_client()
 
@@ -414,6 +440,24 @@ async def _postgrest_error_handler(request: Request, exc: APIError) -> JSONRespo
             request.url.path,
         )
         return JSONResponse(status_code=404, content={"detail": "Not found"})
+    if exc.code == "57014":
+        # Statement timeout: the database refused the work under load, the
+        # request itself was fine. An unhandled 500 here used to dump a full
+        # ExceptionGroup traceback per occurrence (two during the 2026-08-05
+        # verification drive, #604) and read as a server bug to every retry
+        # layer. 503 + Retry-After is the honest contract — the BFF/RSC
+        # fetch helpers already retry 5xx once, and both masked exactly this
+        # failure in prod.
+        _log.warning(
+            "postgrest 57014 (statement timeout) -> 503 on %s %s",
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Temporarily overloaded — please retry."},
+            headers={"Retry-After": "5"},
+        )
     # Not a malformed-input error — hand off to the generic 500 handler, which
     # logs the traceback and applies the fail-closed body posture.
     raise exc
@@ -463,12 +507,16 @@ app.include_router(discovery.router)
 app.include_router(experience.router)
 app.include_router(feedback.router)
 app.include_router(insights.router)
+app.include_router(job_search.router)
 app.include_router(jobs.router)
 app.include_router(keys.router)
 app.include_router(poll.router)
+app.include_router(public_search.router)
+app.include_router(search_events.router)
 app.include_router(sources.router)
 app.include_router(status.router)
 app.include_router(tailor.router)
+app.include_router(target_membership.router)
 app.include_router(targets.router)
 app.include_router(user_profile.router)
 app.include_router(waitlist.router)
@@ -507,22 +555,27 @@ async def ready() -> JSONResponse:
     alerting but leave liveness as the thing that decides "kill and
     restart". See railway.toml and the Dockerfile HEALTHCHECK.
 
-    Wrapped in ``asyncio.to_thread`` because supabase-py is synchronous;
-    a bare ``.execute()`` here would block the event loop (repo #107
-    convention, enforced by
-    ``tests/test_no_blocking_supabase_in_async_handlers.py``).
+    Uses the async service-role client: ``asyncio.wait_for`` actually cancels
+    an in-flight async httpx request on timeout, so a slow Supabase can't strand
+    a threadpool worker for the full 120s postgrest client timeout — which, at LB
+    probe cadence, would starve the shared executor every ``to_thread`` handler
+    depends on (Perf-F4). An absent async client means the dependency is
+    unconfigured → 503 (the sync + async service clients share one configuration
+    guard, so if one is absent both are).
     """
-    supabase = get_supabase_pool()
-    if supabase is None:
+    async_supabase = get_async_supabase()
+    if async_supabase is None:
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "dependency": "supabase", "reason": "unconfigured"},
+            content={
+                "status": "not_ready",
+                "dependency": "supabase",
+                "reason": "unconfigured",
+            },
         )
+    ping = async_supabase.table("sources").select("id").limit(1).execute()
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(lambda: supabase.table("sources").select("id").limit(1).execute()),
-            timeout=_READY_PING_TIMEOUT_S,
-        )
+        await asyncio.wait_for(ping, timeout=_READY_PING_TIMEOUT_S)
     except Exception as exc:
         # Covers asyncio.TimeoutError (== TimeoutError in 3.11+) from the
         # wait_for deadline and any transport/SDK error from the ping.

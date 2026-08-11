@@ -5,8 +5,10 @@ Three-stage scoring pipeline:
   Stage 2: Full JD match (async, after stage 1 passes)
   Stage 3: LLM analysis (async, for top stage-2 scores)
 
-Stores target-specific scores in `scores`. The global score
-on `jobs` = average across active targets (updated after each stage).
+Stores target-specific scores in `scores` — the ONLY score store. (The
+"global score on jobs" this header used to describe was dropped in R2;
+writing jobs.score PGRST204s, as the from-url flow proved live on
+2026-08-06.)
 
 Consumers:
 - Poller: stage 1 title scoring during poll, stage 2+3 async after
@@ -22,14 +24,14 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.schemas import JobTargetScore, ScoreBreakdown, ScoreResult, ScoringStatus
 from app.models.targets import JobTarget
-from app.services.db_write import poll_db_read, poll_db_write
+from app.services.db_write import poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
 from app.services.scoring import score_job_with_profile, score_title_against_profile
-from app.services.supabase_retry import execute_with_retry_sync
+from app.services.supabase_retry import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +71,16 @@ def _score_row_payload(
     promising: bool | None = None,
     phase1_confidence: int | None = None,
 ) -> dict[str, Any]:
-    """Build the ``scores`` upsert row. Pure; shared by :func:`_upsert_score`
-    and its poll twin :func:`_upsert_score_poll` so the sync and async-seam
-    paths can't drift (#57)."""
+    """Build the ``scores`` upsert row. Pure; the single source of the upsert
+    payload for :func:`_upsert_score` (#57 collapsed the sync/poll scoring
+    twins into one async writer)."""
     row: dict[str, Any] = {
         "job_posting_id": job_posting_id,
         "target_id": target_id,
         "score": score,
         "score_breakdown": breakdown.model_dump(),
-        "matched_keywords": matched_keywords,
+        # matched_keywords is no longer persisted (write-only column dropped
+        # in R2 — the breakdown JSONB already embeds match components).
         "excluded": excluded,
         "scoring_status": scoring_status,
         "scored_profile_version": scored_profile_version,
@@ -98,15 +101,16 @@ def _score_row_payload(
 
 def _parse_upsert_response(resp: Any) -> JobTargetScore:
     """Parse an upsert response's first row, raising when the write landed
-    nothing. Shared by the sync and poll upsert paths."""
+    nothing. Shared by the upsert paths (:func:`_upsert_score` and
+    :func:`score_and_upsert_async`)."""
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert scores row")
     return _parse_score(rows[0])
 
 
-def _upsert_score(
-    supabase: Client,
+async def _upsert_score(
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     target_id: str,
@@ -118,7 +122,6 @@ def _upsert_score(
     scored_profile_version: int = 1,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
-    gated: bool = False,
 ) -> JobTargetScore:
     """Upsert a score row and return the parsed result.
 
@@ -132,58 +135,18 @@ def _upsert_score(
     verdict. Same None-leaves-untouched semantics. Used by
     ``phase2_runner`` to order candidates by phase1_confidence DESC so
     the daily Sonnet cap goes to highest-likelihood-promising jobs first.
-    """
-    row = _score_row_payload(
-        job_posting_id=job_posting_id,
-        target_id=target_id,
-        score=score,
-        breakdown=breakdown,
-        matched_keywords=matched_keywords,
-        excluded=excluded,
-        scoring_status=scoring_status,
-        scored_profile_version=scored_profile_version,
-        promising=promising,
-        phase1_confidence=phase1_confidence,
-    )
-    # Idempotent upsert (`on_conflict` matches the unique constraint), so
-    # retrying on a Supabase HTTP/2 stream drop is safe. When ``gated`` (the
-    # user-facing manual-add path, #6 R2), route through the user_upsert_score
-    # SECURITY DEFINER RPC on the caller's client so Postgres enforces target
-    # ownership; the poller keeps the direct service-role upsert.
-    resp: Any
-    if gated:
-        resp = execute_with_retry_sync(
-            supabase.rpc("user_upsert_score", {"p_row": row}).execute,
-            label="scores upsert (gated)",
-        )
-    else:
-        resp = execute_with_retry_sync(
-            supabase.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id").execute,
-            label="scores upsert",
-        )
-    return _parse_upsert_response(resp)
 
-
-async def _upsert_score_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    target_id: str,
-    score: int,
-    breakdown: ScoreBreakdown,
-    matched_keywords: list[str],
-    excluded: bool,
-    scoring_status: ScoringStatus,
-    scored_profile_version: int = 1,
-    promising: bool | None = None,
-    phase1_confidence: int | None = None,
-) -> JobTargetScore:
-    """Poll-seam twin of :func:`_upsert_score`: the same row (via
-    :func:`_score_row_payload`), written through
-    :func:`app.services.db_write.poll_db_write` (see its docstring for
-    backend selection, retry and herd bounding). Service-role only — there is
-    no ``gated`` parameter because the gated ``user_upsert_score`` RPC path
-    is user-client-only (manual add, #6 R2) and never runs in the poller.
+    Idempotent upsert (``on_conflict`` matches the unique constraint), so
+    retrying a Supabase HTTP/2 stream drop is safe. This is the
+    poller/rescore write path: a direct upsert through
+    :func:`app.services.db_write.poll_db_write`, bounded by the cycle's
+    write-herd semaphore. The user-facing manual-add path never comes
+    through here — it takes :func:`score_and_upsert_async`, whose write
+    rides the ``user_upsert_score`` ownership RPC (SEC-H2) with a bare
+    async retry instead (an interactive write must not head-of-line-block
+    behind a mid-cycle poll burst). A ``gated`` flag used to switch the
+    two inside this function; every gated caller migrated to the async
+    twin in #57 and the flag died (removed 2026-08-06).
     """
     row = _score_row_payload(
         job_posting_id=job_posting_id,
@@ -222,60 +185,30 @@ def _title_score_result(title: str, target: JobTarget) -> ScoreResult | None:
     return result
 
 
-def score_title_and_upsert(
-    supabase: Client,
+async def score_title_and_upsert(
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     title: str,
     target: JobTarget,
 ) -> JobTargetScore | None:
-    """Stage 1: Score a job title against a target and upsert if any match.
+    """Stage 1: score a job title against a target and upsert if any match.
 
     Returns the upserted score, or None if no keywords matched (skip).
-    """
-    result = _title_score_result(title, target)
-    if result is None:
-        return None
+    Service-role only — Stage 1 never gates (the ``user_upsert_score`` RPC
+    path is the manual-add flow, #6 R2, which starts at Stage 2).
 
-    return _upsert_score(
-        supabase,
-        job_posting_id=job_posting_id,
-        target_id=target.id,
-        score=result.score,
-        breakdown=result.breakdown,
-        matched_keywords=result.matched_keywords,
-        excluded=result.excluded,
-        scoring_status="stage1",
-        scored_profile_version=target.profile_version,
-    )
-
-
-async def score_title_and_upsert_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    title: str,
-    target: JobTarget,
-) -> JobTargetScore | None:
-    """The poller's seam twin of :func:`score_title_and_upsert` (#57 slice 2):
-    identical Stage 1 compute (:func:`_title_score_result`), with the upsert
-    routed through :func:`app.services.db_write.poll_db_write` — see that
-    docstring for backend selection. Service-role only; the ``gated`` path is
-    user-client-only and never runs in the poller. Slice 4 (#57) collapses
-    the pair once the sync callers migrate.
-
-    The keyword compute runs in the executor, NOT on the event loop: the
-    sync path always had it inside ``to_thread`` (the whole helper was
-    offloaded), and the poll fans this out per (row x target) — at cycle
-    scale that is tens of seconds of pure-Python scoring, which on the loop
-    taxes every interactive request (measured ~+45ms p50 in the #57 load
-    test). Only the IO awaits on the loop.
+    The keyword compute runs in the executor, NOT on the event loop: the poll
+    fans this out per (row x target), and at cycle scale that is tens of
+    seconds of pure-Python scoring, which on the loop would tax every
+    interactive request (measured ~+45ms p50 in the #57 load test). Only the
+    IO awaits on the loop.
     """
     result = await asyncio.to_thread(_title_score_result, title, target)
     if result is None:
         return None
 
-    return await _upsert_score_poll(
+    return await _upsert_score(
         supabase,
         job_posting_id=job_posting_id,
         target_id=target.id,
@@ -313,8 +246,8 @@ def _stage2_score_result(
     return result
 
 
-def score_and_upsert(
-    supabase: Client,
+async def score_and_upsert(
+    supabase: AsyncClient,
     *,
     job_posting_id: str,
     title: str,
@@ -324,9 +257,8 @@ def score_and_upsert(
     excluded_by_prefilter: bool = False,
     promising: bool | None = None,
     phase1_confidence: int | None = None,
-    gated: bool = False,
 ) -> JobTargetScore:
-    """Stage 2: Score one job's full JD against one target and upsert.
+    """Stage 2: score one job's full JD against one target and upsert.
 
     Pass ``parsed_jd`` to reuse a pre-parsed JD across multiple targets.
 
@@ -343,53 +275,14 @@ def score_and_upsert(
     that column. Pass ``None`` to leave the column unchanged on re-
     upserts (the default — keyword-only callers don't need to know about
     Phase 1).
-    """
-    result = _stage2_score_result(
-        title,
-        description_html,
-        target,
-        parsed_jd=parsed_jd,
-        excluded_by_prefilter=excluded_by_prefilter,
-    )
 
-    return _upsert_score(
-        supabase,
-        job_posting_id=job_posting_id,
-        target_id=target.id,
-        score=result.score,
-        breakdown=result.breakdown,
-        matched_keywords=result.matched_keywords,
-        excluded=result.excluded,
-        scoring_status="stage2",
-        scored_profile_version=target.profile_version,
-        promising=promising,
-        phase1_confidence=phase1_confidence,
-        gated=gated,
-    )
+    This is the poller/rescore seam (write-herd-bounded direct upsert);
+    the interactive manual-add path uses :func:`score_and_upsert_async`
+    (ownership-RPC write). See :func:`_upsert_score` for why the split.
 
-
-async def score_and_upsert_poll(
-    supabase: Client,
-    *,
-    job_posting_id: str,
-    title: str,
-    description_html: str,
-    target: JobTarget,
-    parsed_jd: ParsedJD | None = None,
-    excluded_by_prefilter: bool = False,
-    promising: bool | None = None,
-    phase1_confidence: int | None = None,
-) -> JobTargetScore:
-    """The poller's seam twin of :func:`score_and_upsert` (#57 slice 2):
-    identical Stage 2 compute (:func:`_stage2_score_result`), with the upsert
-    routed through :func:`app.services.db_write.poll_db_write` — see that
-    docstring for backend selection. Service-role only; the ``gated`` path is
-    user-client-only and never runs in the poller. Slice 4 (#57) collapses
-    the pair once the sync callers migrate.
-
-    Compute in the executor, IO on the loop — see
-    :func:`score_title_and_upsert_poll` for why (full-JD scoring is the
-    heaviest per-row compute in the cycle).
+    Compute in the executor, IO on the loop: full-JD scoring is the heaviest
+    per-row compute in the cycle and the poll fans it out per (row x target),
+    so running it on the loop would tax every interactive request.
     """
     result = await asyncio.to_thread(
         _stage2_score_result,
@@ -400,7 +293,7 @@ async def score_and_upsert_poll(
         excluded_by_prefilter=excluded_by_prefilter,
     )
 
-    return await _upsert_score_poll(
+    return await _upsert_score(
         supabase,
         job_posting_id=job_posting_id,
         target_id=target.id,
@@ -415,32 +308,159 @@ async def score_and_upsert_poll(
     )
 
 
+async def score_and_upsert_async(
+    supabase: AsyncClient,
+    *,
+    job_posting_id: str,
+    title: str,
+    description_html: str,
+    target: JobTarget,
+    parsed_jd: ParsedJD | None = None,
+    excluded_by_prefilter: bool = False,
+    promising: bool | None = None,
+    phase1_confidence: int | None = None,
+) -> JobTargetScore:
+    """Async-client twin of :func:`score_and_upsert` for the interactive
+    manual-add path on the pooled async service client (#57 PR-G2d-a).
+
+    Always **gated** — the write goes through the ``user_upsert_score`` ownership
+    RPC (SEC-H2; with a service-role client ``auth.uid()`` is NULL so it takes the
+    function's service-role-exempt branch). The heavy full-JD scoring stays off
+    the loop in the executor; only the single RPC round-trip lands on it, natively
+    on the passed async client. :func:`score_and_upsert` (also async) stays for
+    the poller/rescore seam path (non-gated, write-herd-bounded), which this
+    variant deliberately does not cover.
+    """
+    result = await asyncio.to_thread(
+        _stage2_score_result,
+        title,
+        description_html,
+        target,
+        parsed_jd=parsed_jd,
+        excluded_by_prefilter=excluded_by_prefilter,
+    )
+    row = _score_row_payload(
+        job_posting_id=job_posting_id,
+        target_id=target.id,
+        score=result.score,
+        breakdown=result.breakdown,
+        matched_keywords=result.matched_keywords,
+        excluded=result.excluded,
+        scoring_status="stage2",
+        scored_profile_version=target.profile_version,
+        promising=promising,
+        phase1_confidence=phase1_confidence,
+    )
+    resp = await execute_with_retry(
+        supabase.rpc("user_upsert_score", {"p_row": row}).execute,
+        label="scores upsert (gated)",
+    )
+    return _parse_upsert_response(resp)
+
+
 # Page size for streaming stale ``scores`` rows in ``bulk_score_for_target``.
 # Kept as a module constant so peak memory is bounded to one page and so tests
 # can shrink it to exercise the multi-page streaming path cheaply.
 _RESCORE_BATCH_SIZE = 500
 
 
-def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
-    """Re-score stale jobs for this target. Returns count scored.
+def _rescore_page_rows(
+    jobs: list[dict[str, Any]],
+    target: JobTarget,
+    existing_promising_by_job: dict[str, bool | None],
+) -> list[dict[str, Any]]:
+    """Deterministically re-score one page of ``jobs`` for ``target`` and build
+    the ``scores`` upsert rows.
 
-    Only fetches jobs with existing ``scores`` rows whose
-    ``scored_profile_version`` is less than the target's current
-    ``profile_version`` (lazy re-scoring). Used by the re-score endpoint
-    when a target's profile changes.
+    The pure compute of :func:`bulk_score_for_target` — the scoring math + the
+    promising / prefilter-exclusion carry-over kept in one place. No IO — the
+    caller owns the read/write round-trips (and off-loads this to a thread,
+    #107)."""
+    rows_to_upsert: list[dict[str, Any]] = []
+    now = datetime.now(UTC).isoformat()
+    for job in jobs:
+        description_html = job.get("description_html") or ""
+        parsed = parse_jd(description_html)
+        result = score_job_with_profile(
+            job["title"],
+            description_html,
+            target.scoring_profile,
+            parsed_jd=parsed,
+            search_keywords=target.search_keywords,
+        )
+        existing_promising = existing_promising_by_job.get(job["id"])
+        excluded_by_prefilter = existing_promising is False
+        row: dict[str, Any] = {
+            "job_posting_id": job["id"],
+            "target_id": target.id,
+            "score": result.score,
+            "score_breakdown": result.breakdown.model_dump(),
+            "matched_keywords": result.matched_keywords,
+            "excluded": result.excluded or excluded_by_prefilter,
+            "scoring_status": "stage2",
+            "scored_profile_version": target.profile_version,
+            # Reset recency_score to the new raw score; the next poll
+            # cycle's refresh pass re-applies age decay (see
+            # ``_upsert_score`` and ``app/services/recency.py``).
+            "recency_score": result.score,
+            "updated_at": now,
+        }
+        # Pass-through ``promising`` only when it's set on the
+        # existing row; ``None`` leaves the column unchanged on
+        # this upsert (preserving the legacy/null state).
+        if existing_promising is not None:
+            row["promising"] = existing_promising
+        rows_to_upsert.append(row)
+    return rows_to_upsert
 
-    Skips inactive targets entirely. The ``targets.is_active`` flag is
-    the OR across all users via the user_targets trigger; if it's
-    ``False`` nobody currently has this target enabled, so the
-    re-score would just burn LLM/CPU on rows nobody will see.
 
-    Streams the stale rows page-by-page (peak memory O(page), not
-    O(catalog)) — see the loop below for why each iteration re-reads the
-    first page (audit #29).
-    """
-    if not target.is_active:
+async def _is_pipeline_active_async(supabase: AsyncClient, target_id: str) -> bool:
+    """Async inline of ``crud.is_pipeline_active`` (#57 PR-G2e-3 — crud stays
+    sync for its non-poll callers). Same two-arm rule: the ``app_active``
+    instance floor OR any active membership, awaited on the loop."""
+    t_resp = await (
+        supabase.table("targets").select("app_active").eq("id", target_id).limit(1).execute()
+    )
+    t_rows = cast(list[dict[str, Any]], t_resp.data or [])
+    if not t_rows:
+        return False
+    if bool(t_rows[0].get("app_active")):
+        return True
+    m_resp = await (
+        supabase.table("user_targets")
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("target_id", target_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return bool(m_resp.count or 0)
+
+
+async def bulk_score_for_target(supabase: AsyncClient, target: JobTarget) -> int:
+    """Re-score stale jobs for this target on the pooled async service client.
+    Returns count scored.
+
+    Only fetches jobs whose ``scores`` row's ``scored_profile_version`` is behind
+    the target's current ``profile_version`` (lazy re-scoring). Serves the
+    operator ``/rescore`` endpoint and the interactive feedback learner's
+    follow-on re-score when a target's profile changes.
+
+    Skips non-pipeline-active targets entirely. Pipeline-active = ``app_active``
+    (instance floor) OR any active membership — the derived predicate
+    (:func:`_is_pipeline_active_async`; the trigger-cached flag is gone, schema
+    audit P0). If neither arm holds, the re-score would just burn LLM/CPU on rows
+    nobody will see.
+
+    Streams the stale rows page-by-page (peak memory O(page), not O(catalog)):
+    each iteration re-reads the FIRST page, since the prior page's upsert bumps
+    ``scored_profile_version`` out of the ``.lt()`` predicate so the next slice of
+    still-stale rows shifts into its place (audit #29). Scoring math is
+    :func:`_rescore_page_rows`; the ``scores`` / ``jobs`` reads and the upsert are
+    awaited on the loop, and the heavy per-page keyword compute is off-loaded to a
+    thread (#107) rather than run inline."""
+    if not await _is_pipeline_active_async(supabase, target.id):
         logger.info(
-            "bulk_score_for_target: skipping inactive target %s (%s)",
+            "bulk_score_for_target: skipping non-pipeline-active target %s (%s)",
             target.id,
             target.label,
         )
@@ -448,21 +468,8 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
 
     batch_size = _RESCORE_BATCH_SIZE
     total_scored = 0
-
-    # Stream the stale ``scores`` rows page-by-page and fully process each
-    # page (fetch JDs → score → upsert → recompute global scores) before
-    # reading the next, so peak memory is O(batch) rather than O(catalog)
-    # — we never hold the entire catalog's stale ids in one list (audit
-    # #29). Each page's upsert bumps ``scored_profile_version`` up to the
-    # target's current version, so those rows immediately drop out of the
-    # ``.lt(scored_profile_version, profile_version)`` predicate. We
-    # therefore always re-read the *first* page (offset 0): the next page
-    # of still-stale rows shifts into its place, and every stale row is
-    # processed exactly once with no ever-growing offset and no rows
-    # skipped. The ``promising`` verdict rides along in the same select so
-    # the Phase 1 floor is preserved without a separate per-batch lookup.
     while True:
-        resp = (
+        resp = await (
             supabase.table(TABLE)
             .select("job_posting_id, promising")
             .eq("target_id", target.id)
@@ -474,24 +481,15 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
         if not stale_rows:
             break
 
-        # Existing ``promising`` verdicts for this page, keyed by job id.
-        # promising=False -> excluded stays True regardless of the scorer;
-        # promising=True/None -> rely on the scorer's own ``excluded``.
-        # Preserving this stops a ``profile_version`` bump (feedback
-        # learner, manual /rescore) from re-admitting jobs Phase 1 dropped.
         existing_promising_by_job: dict[str, bool | None] = {
             r["job_posting_id"]: r.get("promising") for r in stale_rows
         }
         batch_ids = list(existing_promising_by_job.keys())
 
-        # Chunk the id filter. A single ``.in_`` of up to _RESCORE_BATCH_SIZE
-        # (500) ids builds a ~19 KB URL that 414s past PostgREST's URL-safe
-        # bound — and here the 414 is swallowed, so a feedback thumbs-down or a
-        # manual /rescore on a heavy target would silently fail to re-score.
-        # Reuse the same _BATCH_CHUNK_SIZE the aggregate loops below use.
+        # Chunk the id filter (414-guard) — same bound the sync path uses.
         jobs: list[dict[str, Any]] = []
         for i in range(0, len(batch_ids), _BATCH_CHUNK_SIZE):
-            resp = (
+            resp = await (
                 supabase.table("jobs")
                 .select("id, title, description_html")
                 .in_("id", batch_ids[i : i + _BATCH_CHUNK_SIZE])
@@ -499,85 +497,73 @@ def bulk_score_for_target(supabase: Client, target: JobTarget) -> int:
             )
             jobs.extend(cast(list[dict[str, Any]], resp.data or []))
         if not jobs:
-            # No backing ``jobs`` rows for this page (e.g. deleted). Without
-            # an upsert these stale ``scores`` rows would keep matching the
-            # ``.lt()`` filter and the first-page re-read would loop forever.
-            # They aren't scorable, so stop.
             break
 
-        rows_to_upsert: list[dict[str, Any]] = []
-        now = datetime.now(UTC).isoformat()
-        for job in jobs:
-            description_html = job.get("description_html") or ""
-            parsed = parse_jd(description_html)
-            result = score_job_with_profile(
-                job["title"],
-                description_html,
-                target.scoring_profile,
-                parsed_jd=parsed,
-                search_keywords=target.search_keywords,
-            )
-            existing_promising = existing_promising_by_job.get(job["id"])
-            excluded_by_prefilter = existing_promising is False
-            row: dict[str, Any] = {
-                "job_posting_id": job["id"],
-                "target_id": target.id,
-                "score": result.score,
-                "score_breakdown": result.breakdown.model_dump(),
-                "matched_keywords": result.matched_keywords,
-                "excluded": result.excluded or excluded_by_prefilter,
-                "scoring_status": "stage2",
-                "scored_profile_version": target.profile_version,
-                # Reset recency_score to the new raw score; the next poll
-                # cycle's refresh pass re-applies age decay (see
-                # ``_upsert_score`` and ``app/services/recency.py``).
-                "recency_score": result.score,
-                "updated_at": now,
-            }
-            # Pass-through ``promising`` only when it's set on the
-            # existing row; ``None`` leaves the column unchanged on
-            # this upsert (preserving the legacy/null state).
-            if existing_promising is not None:
-                row["promising"] = existing_promising
-            rows_to_upsert.append(row)
-
+        # Heavy per-page keyword scoring stays off the event loop (#107).
+        rows_to_upsert = await asyncio.to_thread(
+            _rescore_page_rows, jobs, target, existing_promising_by_job
+        )
         if not rows_to_upsert:
             break
 
-        supabase.table(TABLE).upsert(
-            rows_to_upsert, on_conflict="job_posting_id,target_id"
-        ).execute()
+        await (
+            supabase.table(TABLE)
+            .upsert(rows_to_upsert, on_conflict="job_posting_id,target_id")
+            .execute()
+        )
         total_scored += len(rows_to_upsert)
-
-        scored_ids = [r["job_posting_id"] for r in rows_to_upsert]
-        batch_update_global_scores(supabase, scored_ids)
 
     return total_scored
 
+
+_BATCH_CHUNK_SIZE = 100  # chunk bound for .in_() reads (414-guard)
 
 # Page size for the retro-score title sweep over the whole ``jobs`` table —
 # same 500 as the re-score pager; a narrow ``id, title`` select, keyset-paged.
 _RETRO_TITLE_BATCH_SIZE = 500
 
 
-def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
-    """Stage-1 title-score every posting in ``jobs`` against ``target``,
-    writing matches in bulk. Returns the number of score rows written.
+def _title_score_page_rows(rows: list[dict[str, Any]], target: JobTarget) -> list[dict[str, Any]]:
+    """Stage-1 title-score one page of ``jobs`` rows for ``target`` and build the
+    ``scores`` upsert rows. The pure compute of
+    :func:`bulk_title_score_for_target` — the title-scoring math kept in one
+    place. No IO — the caller owns the read/write round-trips (and off-loads this
+    to a thread, #107)."""
+    rows_to_upsert: list[dict[str, Any]] = []
+    for row in rows:
+        result = _title_score_result(row["title"], target)
+        if result is None:
+            continue
+        rows_to_upsert.append(
+            _score_row_payload(
+                job_posting_id=row["id"],
+                target_id=target.id,
+                score=result.score,
+                breakdown=result.breakdown,
+                matched_keywords=result.matched_keywords,
+                excluded=result.excluded,
+                scoring_status="stage1",
+                scored_profile_version=target.profile_version,
+            )
+        )
+    return rows_to_upsert
 
-    Used at target activation so postings that pre-date the target still
-    appear under it. Replaces the per-row-upsert N+1 the activation path used
-    to run: matched rows are accumulated per page and written with a SINGLE
-    ``.upsert(...)``, then one :func:`batch_update_global_scores` recomputes
-    ``jobs.score`` for the page — the old retro path never recomputed the
-    global score, so jobs it newly matched kept a stale ``jobs.score`` until
-    the next poll happened to touch them (a secondary correctness gap).
 
-    Keyset-paginated by ``id ASC``, not OFFSET: the old ``.range(offset, …)``
-    had no ``ORDER BY``, so a concurrent poller insert could shift the window
-    and make it skip / re-visit rows, and OFFSET deepens to O(N²/page) scan
-    cost. Mirrors the batch shape :func:`bulk_score_for_target` already uses
-    (upsert the page, then one global-score recompute per page).
-    """
+async def bulk_title_score_for_target(supabase: AsyncClient, target: JobTarget) -> int:
+    """Stage-1 title-score every posting in ``jobs`` against ``target`` on the
+    pooled async service client, writing matches in bulk. Returns the number of
+    score rows written.
+
+    Runs at target activation so postings that pre-date the target still appear
+    under it. Matched rows are accumulated per page and written with a SINGLE
+    upsert per page (not the per-row-upsert N+1 the activation path once ran).
+
+    Keyset-paginated by ``id ASC``, not OFFSET: an OFFSET scan has no stable
+    ``ORDER BY`` (a concurrent poller insert could shift the window and skip /
+    re-visit rows) and deepens to O(N²/page). Scoring math is
+    :func:`_title_score_page_rows`; the ``jobs`` read and the ``scores`` upsert
+    are awaited on the loop, and the per-page keyword compute is off-loaded to a
+    thread (#107)."""
     written = 0
     after_id: str | None = None
     while True:
@@ -586,35 +572,19 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
         )
         if after_id is not None:
             query = query.gt("id", after_id)
-        resp = query.execute()
+        resp = await query.execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
         if not rows:
             break
 
-        rows_to_upsert: list[dict[str, Any]] = []
-        for row in rows:
-            result = _title_score_result(row["title"], target)
-            if result is None:
-                continue
-            rows_to_upsert.append(
-                _score_row_payload(
-                    job_posting_id=row["id"],
-                    target_id=target.id,
-                    score=result.score,
-                    breakdown=result.breakdown,
-                    matched_keywords=result.matched_keywords,
-                    excluded=result.excluded,
-                    scoring_status="stage1",
-                    scored_profile_version=target.profile_version,
-                )
-            )
-
+        rows_to_upsert = await asyncio.to_thread(_title_score_page_rows, rows, target)
         if rows_to_upsert:
-            supabase.table(TABLE).upsert(
-                rows_to_upsert, on_conflict="job_posting_id,target_id"
-            ).execute()
+            await (
+                supabase.table(TABLE)
+                .upsert(rows_to_upsert, on_conflict="job_posting_id,target_id")
+                .execute()
+            )
             written += len(rows_to_upsert)
-            batch_update_global_scores(supabase, [r["job_posting_id"] for r in rows_to_upsert])
 
         if len(rows) < _RETRO_TITLE_BATCH_SIZE:
             break
@@ -623,8 +593,8 @@ def bulk_title_score_for_target(supabase: Client, target: JobTarget) -> int:
     return written
 
 
-def get_target_scores(
-    supabase: Client,
+async def get_target_scores(
+    supabase: AsyncClient,
     target_id: str,
     job_posting_ids: list[str] | None = None,
 ) -> dict[str, JobTargetScore]:
@@ -641,193 +611,17 @@ def get_target_scores(
     SELECT.
     """
     if job_posting_ids is None:
-        resp = supabase.table(TABLE).select("*").eq("target_id", target_id).execute()
+        resp = await supabase.table(TABLE).select("*").eq("target_id", target_id).execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
         return {r["job_posting_id"]: _parse_score(r) for r in rows}
 
     if not job_posting_ids:
         return {}
 
-    resp = supabase.rpc(
+    resp = await supabase.rpc(
         "get_target_scores_by_ids",
         {"p_target_id": target_id, "p_ids": job_posting_ids},
     ).execute()
     return {
         r["job_posting_id"]: _parse_score(r) for r in cast(list[dict[str, Any]], resp.data or [])
     }
-
-
-# ---- Global score aggregation ----------------------------------------------
-
-# A row is a real (LLM) fit grade only once its scoring_status is "complete";
-# stage1/stage2 rows carry a cheap keyword *placeholder* on a different scale.
-# Mirrors the read-side split in routers/jobs.py (`_is_pending`).
-_GRADED_STATUS = "complete"
-
-
-def _aggregate_global_score(rows: list[dict[str, Any]]) -> int:
-    """Aggregate a job's target-score rows into a single ``jobs.score``.
-
-    ``scores.score`` holds a cheap keyword *placeholder* (0–30 band) while a
-    row is ``stage1``/``stage2`` and the real LLM fit score (0–100 rubric) once
-    it's ``complete``. The two scales are not comparable, so averaging them
-    corrupts the global ranking whenever a job carries both (#194/#47). Instead:
-
-    - drop ``excluded`` rows,
-    - average the **graded** (``complete``) rows when any exist,
-    - fall back to the keyword placeholders only until the job is graded.
-
-    This mirrors exactly what the ``/jobs`` list-view split does at read time
-    (``_is_pending``). Returns 0 when there are no usable rows.
-    """
-    usable = [r for r in rows if not r.get("excluded", False)]
-    if not usable:
-        return 0
-    graded = [int(r["score"]) for r in usable if r.get("scoring_status") == _GRADED_STATUS]
-    scores = graded or [int(r["score"]) for r in usable]
-    return round(sum(scores) / len(scores))
-
-
-def update_global_score(supabase: Client, job_posting_id: str) -> None:
-    """Recompute jobs.score from this job's active-target scores.
-
-    Called after any stage updates a target score. Graded (LLM ``complete``)
-    rows define the global score when any exist; keyword placeholders are used
-    only until the job is graded — see :func:`_aggregate_global_score` (#194).
-    """
-    resp = (
-        supabase.table(TABLE)
-        .select("score, excluded, scoring_status")
-        .eq("job_posting_id", job_posting_id)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    if not rows:
-        return
-
-    avg_score = _aggregate_global_score(rows)
-    supabase.table("jobs").update({"score": avg_score}).eq("id", job_posting_id).execute()
-
-
-_BATCH_CHUNK_SIZE = 100
-
-# Columns the batch global-score recompute reads per target-score row.
-_BATCH_SCORE_COLUMNS = "job_posting_id, score, excluded, scoring_status"
-
-
-def _global_score_updates(
-    unique_ids: list[str], all_score_rows: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Group fetched score rows by job and aggregate each into a
-    ``bulk_update_scores`` update entry (graded-first — #194). Pure; shared
-    by :func:`batch_update_global_scores` and its poll twin so the two
-    aggregation paths can't drift (#57)."""
-    # Group rows by job_posting_id, then aggregate each (graded-first).
-    from collections import defaultdict
-
-    rows_by_job: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in all_score_rows:
-        rows_by_job[row["job_posting_id"]].append(row)
-
-    return [
-        {"id": job_id, "score": _aggregate_global_score(rows_by_job.get(job_id, []))}
-        for job_id in unique_ids
-    ]
-
-
-def batch_update_global_scores(supabase: Client, job_posting_ids: list[str]) -> None:
-    """Recompute jobs.score for many jobs in fewer DB round-trips.
-
-    Fetches all target scores for the given IDs in one query (chunked to
-    avoid URL length limits), aggregates each job in Python via
-    :func:`_aggregate_global_score` (graded rows win over keyword
-    placeholders — #194), then writes every new score in a single
-    `bulk_update_scores` RPC instead of one UPDATE per job.
-    """
-    if not job_posting_ids:
-        return
-
-    # Deduplicate
-    unique_ids = list(set(job_posting_ids))
-
-    # Fetch all target scores in chunks
-    all_score_rows: list[dict[str, Any]] = []
-    for i in range(0, len(unique_ids), _BATCH_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _BATCH_CHUNK_SIZE]
-        resp = (
-            supabase.table(TABLE)
-            .select(_BATCH_SCORE_COLUMNS)
-            .in_("job_posting_id", chunk)
-            .execute()
-        )
-        all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
-
-    updates = _global_score_updates(unique_ids, all_score_rows)
-    if updates:
-        supabase.rpc("bulk_update_scores", {"p_updates": updates}).execute()
-
-
-async def batch_update_global_scores_poll(supabase: Client, job_posting_ids: list[str]) -> None:
-    """The poller's seam twin of :func:`batch_update_global_scores` (#57
-    slice 2): the same chunked reads + graded-first aggregation
-    (:func:`_global_score_updates`), routed through
-    :func:`app.services.db_write.poll_db_read` / ``poll_db_write`` — see
-    their docstrings for backend selection. Slice 4 (#57) collapses the pair
-    once the sync callers migrate.
-    """
-    if not job_posting_ids:
-        return
-
-    # Deduplicate
-    unique_ids = list(set(job_posting_ids))
-
-    # Fetch all target scores in chunks
-    all_score_rows: list[dict[str, Any]] = []
-    for i in range(0, len(unique_ids), _BATCH_CHUNK_SIZE):
-        chunk = unique_ids[i : i + _BATCH_CHUNK_SIZE]
-        resp = await poll_db_read(
-            supabase,
-            lambda c, ids=chunk: (
-                c.table(TABLE).select(_BATCH_SCORE_COLUMNS).in_("job_posting_id", ids)
-            ),
-            label="global-score batch read",
-        )
-        all_score_rows.extend(cast(list[dict[str, Any]], resp.data or []))
-
-    # Aggregation is pure-Python over every fetched score row — off-loop for
-    # the same reason as the scoring compute in the ``*_poll`` twins.
-    updates = await asyncio.to_thread(_global_score_updates, unique_ids, all_score_rows)
-    if updates:
-        await poll_db_write(
-            supabase,
-            lambda c: c.rpc("bulk_update_scores", {"p_updates": updates}),
-            label="global-score bulk update",
-        )
-
-
-def mark_complete(supabase: Client, job_posting_id: str) -> None:
-    """Mark all target scores for a job as scoring_status='complete'.
-
-    Called after stage 3 (LLM scoring) finishes for a job.
-    """
-    supabase.table(TABLE).update({"scoring_status": "complete"}).eq(
-        "job_posting_id", job_posting_id
-    ).execute()
-
-
-async def mark_complete_poll(supabase: Client, job_posting_id: str) -> None:
-    """The poller's seam twin of :func:`mark_complete` (#57 slice 2): the
-    same stable-WHERE UPDATE, routed through
-    :func:`app.services.db_write.poll_db_write` — see that docstring for
-    backend selection. Slice 4 (#57) collapses the pair once the sync
-    callers migrate.
-    """
-    await poll_db_write(
-        supabase,
-        lambda c: (
-            c.table(TABLE)
-            .update({"scoring_status": "complete"})
-            .eq("job_posting_id", job_posting_id)
-        ),
-        label="scores mark-complete",
-    )

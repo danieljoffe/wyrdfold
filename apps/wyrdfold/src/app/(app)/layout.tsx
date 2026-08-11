@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import WyrdfoldSidebar from './WyrdfoldSidebar';
+import AppShell from './AppShell';
 
 // Auth gating for /(app)/* lives entirely in proxy.ts middleware, which runs
 // on every matched request (including RSC navigations) and redirects to
@@ -10,26 +10,10 @@ import WyrdfoldSidebar from './WyrdfoldSidebar';
 // Dynamic-rendering is signalled at the leaf via `await connection()` inside
 // `createAuthServerClient` (see lib/supabase/auth-server.ts). Pages calling
 // auth opt-in there; the layout itself stays cacheable.
+//
+// The shell markup itself lives in `AppShell` — shared with the auth-adaptive
+// `/search` route so a signed-in visitor sees the identical sidebar there.
 
 export default function AppLayout({ children }: { children: ReactNode }) {
-  return (
-    <div className='flex min-h-screen'>
-      <WyrdfoldSidebar />
-      {/*
-        Mobile bottom-nav is `position: fixed` at viewport bottom (h-14 + iOS
-        safe-area). The earlier "trailing clearance div" approach didn't bite
-        for sticky / scroll-end content (pagination on /jobs sat under the
-        nav; 4th target card on /targets was clipped). Layout-level padding
-        on `<main>` is the defensive fix — anything sticky-bottom inside main
-        will dock above the nav, and natural scroll bottoms get the same
-        clearance for free.
-      */}
-      <main
-        id='main-content'
-        className='flex-1 overflow-x-hidden p-4 pb-[calc(theme(spacing.16)+env(safe-area-inset-bottom)+1rem)] md:p-6'
-      >
-        {children}
-      </main>
-    </div>
-  );
+  return <AppShell>{children}</AppShell>;
 }

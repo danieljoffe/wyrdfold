@@ -1,35 +1,23 @@
-"""Cosine-gate decision for the pre-scan (#60, Phase 3 — SHADOW MODE).
+"""Cosine(job, target) scores for Phase-2 grade-queue ORDERING.
 
-Phase 1 (``job_embeddings.py``) caches one vector per JOB; Phase 2
-(``target_embeddings.py`` + ``targets.prescan_cosine_threshold``) caches one
-vector per TARGET plus a per-target cutoff. This module reads BOTH and computes
-the would-be gate verdict — admit a job to the expensive per-target LLM grade
-iff ``cosine(job_vec, target_vec) >= target.prescan_cosine_threshold``.
+What remains of the #60/#89/#90 pre-scan apparatus after the gate was
+retired (R2, 2026-07-31 — see docs/decisions.md "retired by its own shadow
+data"): live grades showed cosine is the strongest cheap predictor of the
+eventual fit score (avg fit ~7→67 monotone), so the per-candidate cosine
+still orders the daily grade cap; the ADMISSION gate, its per-target
+thresholds, holdout, and shadow recorder are gone.
 
-In THIS phase the verdict is OBSERVED ONLY: the poller logs it into
-``prescan_shadow`` alongside the live keyword decision (the disagreement matrix,
-#68) but keeps the keyword gate driving admission. Making cosine actually drive
-admission (the "flip") is a LATER phase informed by the shadow data and is NOT
-built here.
-
-Fail-soft by construction: a missing job vector, a target with no embedding, or
-a NULL ``prescan_cosine_threshold`` all yield ``(None, None)`` — "no opinion".
-The shadow writer records that as a NULL cosine side, and a future flip MUST
-treat a ``None`` verdict as admit-all (today's behavior), so an un-populated
-spine never silently drops jobs. Reuses the ``cosine`` helper from
-``prescan_calibration`` (the same math the calibration script uses).
+Reads are best-effort and fail open: a missing vector or read error only
+degrades priority order — it can never change what gets admitted or spent.
 """
 
 from __future__ import annotations
 
 import ast
-import asyncio
-import hashlib
 import logging
-from dataclasses import dataclass
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.models.embeddings import EmbeddingModelId
 from app.models.targets import JobTarget
@@ -69,17 +57,17 @@ def parse_vector(raw: Any) -> list[float] | None:
     return None
 
 
-async def _fetch_job_vector(supabase: Client, *, job_id: str, model: str) -> list[float] | None:
+async def _fetch_job_vector(
+    supabase: AsyncClient, *, job_id: str, model: str
+) -> list[float] | None:
     """The cached vector for (job, model) from ``job_embeddings``, or None."""
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(JOB_EMBEDDINGS_TABLE)
-            .select("embedding")
-            .eq("job_posting_id", job_id)
-            .eq("model", model)
-            .limit(1)
-            .execute()
-        )
+    resp = await (
+        supabase.table(JOB_EMBEDDINGS_TABLE)
+        .select("embedding")
+        .eq("job_posting_id", job_id)
+        .eq("model", model)
+        .limit(1)
+        .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
@@ -87,79 +75,19 @@ async def _fetch_job_vector(supabase: Client, *, job_id: str, model: str) -> lis
     return parse_vector(rows[0].get("embedding"))
 
 
-async def _fetch_target_gate(
-    supabase: Client, *, target_id: str
-) -> tuple[list[float] | None, float | None]:
-    """The target's ``(embedding, prescan_cosine_threshold)`` from ``targets``.
+async def _fetch_target_vector(supabase: AsyncClient, *, target_id: str) -> list[float] | None:
+    """The target's query ``embedding`` from ``targets`` (None = not embedded).
 
-    Read from the DB rather than the :class:`JobTarget` model because the model
-    does not carry these pre-scan columns. Either part may be None (target not
-    yet embedded / not yet calibrated).
+    Read from the DB rather than the :class:`JobTarget` model because the
+    model does not carry the embedding column.
     """
-    resp = await asyncio.to_thread(
-        lambda: (
-            supabase.table(TARGETS_TABLE)
-            .select("embedding, prescan_cosine_threshold")
-            .eq("id", target_id)
-            .limit(1)
-            .execute()
-        )
+    resp = await (
+        supabase.table(TARGETS_TABLE).select("embedding").eq("id", target_id).limit(1).execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
-        return None, None
-    vec = parse_vector(rows[0].get("embedding"))
-    raw_thr = rows[0].get("prescan_cosine_threshold")
-    threshold = float(raw_thr) if raw_thr is not None else None
-    return vec, threshold
-
-
-async def cosine_gate_decision(
-    supabase: Client,
-    *,
-    job_id: str,
-    target: JobTarget,
-    model: EmbeddingModelId = DEFAULT_MODEL,
-) -> tuple[float | None, bool | None]:
-    """Compute the would-be cosine gate decision for one (job, target).
-
-    Fetches the job's cached vector from ``job_embeddings``, the target's vector
-    and ``prescan_cosine_threshold`` from ``targets``, and returns
-    ``(cosine, admit)`` where ``admit = cosine >= threshold``.
-
-    Fail-soft: returns ``(None, None)`` whenever the job vector, the target
-    embedding, or the threshold is missing — i.e. the gate has "no opinion" and
-    the shadow row's cosine side is NULL. Any unexpected error is swallowed and
-    also yields ``(None, None)`` so the (best-effort) shadow caller can never be
-    broken by this computation.
-
-    OBSERVED ONLY in this phase — the returned verdict does not drive admission.
-    """
-    try:
-        job_vec = await _fetch_job_vector(supabase, job_id=job_id, model=model)
-        if job_vec is None:
-            return None, None
-
-        target_vec, threshold = await _fetch_target_gate(supabase, target_id=target.id)
-        if target_vec is None or threshold is None:
-            return None, None
-
-        if len(job_vec) != len(target_vec):
-            # Dimension mismatch (e.g. a stale model swap) — no usable verdict.
-            logger.warning(
-                "Pre-scan cosine gate: vector dim mismatch job=%s (%d) target=%s (%d)",
-                job_id,
-                len(job_vec),
-                target.id,
-                len(target_vec),
-            )
-            return None, None
-
-        sim = cosine(job_vec, target_vec)
-        return sim, sim >= threshold
-    except Exception:
-        logger.exception("Pre-scan cosine gate failed for job %s / target %s", job_id, target.id)
-        return None, None
+        return None
+    return parse_vector(rows[0].get("embedding"))
 
 
 # ``.in_()`` id lists ride the request URL, so the vectors read must chunk:
@@ -171,7 +99,7 @@ _VECTOR_READ_CHUNK_SIZE = 150
 
 
 async def _fetch_job_vectors_batch(
-    supabase: Client, *, job_ids: list[str], model: str
+    supabase: AsyncClient, *, job_ids: list[str], model: str
 ) -> dict[str, list[float]]:
     """Cached vectors for many jobs, keyed by id (missing omitted).
 
@@ -183,17 +111,13 @@ async def _fetch_job_vectors_batch(
     out: dict[str, list[float]] = {}
     for i in range(0, len(job_ids), _VECTOR_READ_CHUNK_SIZE):
         chunk = job_ids[i : i + _VECTOR_READ_CHUNK_SIZE]
-
-        def _read(ids: list[str] = chunk) -> Any:
-            return (
-                supabase.table(JOB_EMBEDDINGS_TABLE)
-                .select("job_posting_id, embedding")
-                .in_("job_posting_id", ids)
-                .eq("model", model)
-                .execute()
-            )
-
-        resp = await asyncio.to_thread(_read)
+        resp = await (
+            supabase.table(JOB_EMBEDDINGS_TABLE)
+            .select("job_posting_id, embedding")
+            .in_("job_posting_id", chunk)
+            .eq("model", model)
+            .execute()
+        )
         for r in cast(list[dict[str, Any]], resp.data or []):
             vec = parse_vector(r.get("embedding"))
             if vec is not None:
@@ -201,75 +125,8 @@ async def _fetch_job_vectors_batch(
     return out
 
 
-@dataclass(frozen=True)
-class GateBatch:
-    """One-fetch gate + ordering data for a target's Phase-2 candidates.
-
-    ``cosines`` carries every candidate with a usable vector (missing key =
-    the job has no vector / a dim mismatch — DATA absence). ``threshold`` is
-    the target's calibrated cutoff, ``None`` when the target isn't calibrated.
-    ``admit`` distinguishes the two kinds of "yes":
-
-    - ``True``/``False`` — a real gate verdict (cosine vs threshold).
-    - ``None`` — no opinion, from data absence only. Callers MUST treat it as
-      admit: an unpopulated spine never silently drops jobs.
-
-    What this type deliberately does NOT model is an infrastructure error —
-    :func:`cosine_gate_batch` RAISES on those instead of manufacturing a batch
-    of Nones. The 2026-07-12 gated-cycle audit showed why: under disk-IO
-    throttling the old error→all-None fail-open converted every timed-out
-    vector read into a full batch of UNGATED Sonnet grades (~20% of a 48h
-    sample graded ungated). Errors must defer, not spend.
-    """
-
-    cosines: dict[str, float]
-    threshold: float | None
-
-    def admit(self, job_id: str) -> bool | None:
-        if self.threshold is None:
-            return None
-        cos = self.cosines.get(job_id)
-        if cos is None:
-            return None
-        return cos >= self.threshold
-
-
-async def cosine_gate_batch(
-    supabase: Client,
-    target: JobTarget,
-    job_ids: list[str],
-    *,
-    model: EmbeddingModelId = DEFAULT_MODEL,
-) -> GateBatch:
-    """Fetch gate verdicts AND ordering cosines in one pass — the #90 flip.
-
-    One target read + one job-vectors read for the whole candidate batch; the
-    same cosines drive both admission (vs ``threshold``) and the runner's
-    fit-probability ordering, so the enforced path costs half the vector IO
-    of the old two-call shape (separate gate + ordering fetches).
-
-    FAIL-CLOSED on infrastructure errors: any exception from the reads
-    propagates to the caller, which should DEFER the batch to the next cycle
-    (same "defer, never admit-blind" contract as the Phase-1 budget gate).
-    Data absence still fails open per-job via ``GateBatch.admit`` — a job
-    with no vector or a target with no threshold is admitted, never dropped.
-    """
-    ids = list(dict.fromkeys(j for j in job_ids if j))
-    if not ids:
-        return GateBatch(cosines={}, threshold=None)
-    target_vec, threshold = await _fetch_target_gate(supabase, target_id=target.id)
-    if target_vec is None:
-        # Target not embedded → no cosines derivable, no verdicts (admit-all).
-        return GateBatch(cosines={}, threshold=None)
-    job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
-    cosines = {
-        jid: cosine(jv, target_vec) for jid, jv in job_vecs.items() if len(jv) == len(target_vec)
-    }
-    return GateBatch(cosines=cosines, threshold=threshold)
-
-
 async def cosine_scores_batch(
-    supabase: Client,
+    supabase: AsyncClient,
     target: JobTarget,
     job_ids: list[str],
     *,
@@ -278,10 +135,9 @@ async def cosine_scores_batch(
     """Cosine(job, target) VALUES for many jobs of ONE target — for
     fit-predictive Phase-2 grading priority (#9).
 
-    Same two reads as :func:`cosine_gate_admits_batch` (one target vector, one
-    job-vectors batch), but returns the raw similarity per job instead of the
-    gate verdict, so the runner can order the daily grade quota by the signal
-    that actually predicts fit: live grades show avg fit climbing monotonically
+    One target-vector read + one job-vectors batch read, returning the raw
+    similarity per job so the runner can order the daily grade quota by the
+    signal that actually predicts fit: live grades show avg fit climbing monotonically
     with cosine, while ``phase1_confidence`` does not correlate. A missing job
     vector, an un-embedded target, or a dim mismatch omits that job — the caller
     treats an absent score as lowest priority. Never raises (best-effort
@@ -291,7 +147,7 @@ async def cosine_scores_batch(
     if not ids:
         return {}
     try:
-        target_vec, _threshold = await _fetch_target_gate(supabase, target_id=target.id)
+        target_vec = await _fetch_target_vector(supabase, target_id=target.id)
         if target_vec is None:
             return {}
         job_vecs = await _fetch_job_vectors_batch(supabase, job_ids=ids, model=model)
@@ -304,21 +160,3 @@ async def cosine_scores_batch(
     except Exception:
         logger.exception("Pre-scan cosine scores failed for target %s", target.id)
         return {}
-
-
-def in_prescan_holdout(job_id: str, target_id: str, fraction: float) -> bool:
-    """Deterministic membership in the #90 exploration holdout.
-
-    A stable ~``fraction`` slice of (job, target) pairs, so a below-threshold
-    job the gate would DROP is instead kept for grading — letting us measure the
-    gate's false-negative rate (does a dropped job ever grade high?) against the
-    shadow log. Deterministic (hash of the pair) so the same pair is always
-    in/out — no per-cycle churn that would re-pay grades. ``fraction <= 0`` →
-    never; ``>= 1`` → always.
-    """
-    if fraction <= 0:
-        return False
-    if fraction >= 1:
-        return True
-    digest = hashlib.sha256(f"{job_id}:{target_id}".encode()).hexdigest()
-    return (int(digest[:8], 16) / 0xFFFFFFFF) < fraction

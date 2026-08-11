@@ -1,6 +1,7 @@
 // Pure presentational component — no hooks, no event handlers, no browser APIs.
 // Renders as a server component to keep the dashboard shell streaming.
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import {
   ArrowRight,
   Award,
@@ -19,6 +20,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import LinkButton from '@/components/kit/LinkButton';
 import ScoreBadge from '@/components/ScoreBadge';
 import type { JobPosting } from './jobs/types';
+import { formatLocation } from '@/lib/formatLocation';
 
 export interface DashboardInitial {
   topMatches: JobPosting[];
@@ -234,8 +236,10 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                     variant='caption'
                     className='truncate text-text-secondary'
                   >
-                    {posting.company_name}
-                    {posting.location ? ` · ${posting.location}` : ''}
+                    {formatCompanyName(posting.company_name)}
+                    {formatLocation(posting)
+                      ? ` · ${formatLocation(posting)}`
+                      : ''}
                   </Text>
                 </div>
               </Link>

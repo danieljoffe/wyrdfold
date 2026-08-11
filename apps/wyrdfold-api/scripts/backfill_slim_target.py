@@ -46,7 +46,7 @@ from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE,
     derive_profile_from_label,
 )
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("backfill_slim_target")
@@ -153,8 +153,7 @@ async def backfill_target(supabase: Any, target: JobTarget, llm: Any, *, dry_run
 
 
 async def backfill(*, dry_run: bool, target_id: str | None) -> int:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
 

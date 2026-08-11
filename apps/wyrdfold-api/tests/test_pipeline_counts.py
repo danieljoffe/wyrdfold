@@ -9,7 +9,7 @@ deduplicated by job, grouped by the caller's per-user status
 
 import logging
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -18,6 +18,10 @@ from app.routers.jobs import (
     _pipeline_counts_python,
     pipeline_counts,
 )
+
+# The pipeline-counts read path is async now (#57 slice 3): the handler + both
+# grouped/python helpers await the DB on the async user client.
+pytestmark = pytest.mark.asyncio
 
 
 class _Resp:
@@ -51,11 +55,11 @@ class _Chain:
     def gte(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
-    def execute(self) -> _Resp:
+    async def execute(self) -> _Resp:
         return self._resp
 
 
-def test_python_fallback_dedups_jobs_across_targets() -> None:
+async def test_python_fallback_dedups_jobs_across_targets() -> None:
     # j1 scored against two targets — must count once. Status now comes
     # from per-user user_jobs rows: j2 is 'saved'; j1 has no user_jobs
     # row, so it resolves to 'new'.
@@ -80,21 +84,25 @@ def test_python_fallback_dedups_jobs_across_targets() -> None:
     sb = MagicMock()
     sb.table.side_effect = _table
 
-    counts = _pipeline_counts_python(sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1")
+    counts = await _pipeline_counts_python(
+        sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
+    )
     assert counts == {"new": 1, "saved": 1}
 
 
-def test_grouped_uses_rpc_result() -> None:
+async def test_grouped_uses_rpc_result() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.return_value = _Resp(
-        [
-            {"status": "new", "count": 12},
-            {"status": "applied", "count": 5},
-        ]
+    sb.rpc.return_value.execute = AsyncMock(
+        return_value=_Resp(
+            [
+                {"status": "new", "count": 12},
+                {"status": "applied", "count": 5},
+            ]
+        )
     )
     # All counts take the RPC fast path — floored ones included, since the RPC
     # learned the Pending floor exemption (see test_jobs_pending_floor). #47
-    counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
+    counts = await _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
     assert counts == {"new": 12, "applied": 5}
     sb.rpc.assert_called_once_with(
         "pipeline_counts",
@@ -102,9 +110,9 @@ def test_grouped_uses_rpc_result() -> None:
     )
 
 
-def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -> None:
+async def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute.side_effect = Exception("function not found")
+    sb.rpc.return_value.execute = AsyncMock(side_effect=Exception("function not found"))
 
     def _table(name: str) -> _Chain:
         if name == "scores":
@@ -116,7 +124,7 @@ def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -
 
     sb.table.side_effect = _table
     with caplog.at_level(logging.WARNING, logger="app.routers.jobs"):
-        counts = _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
+        counts = await _pipeline_counts_grouped(sb, target_ids={"t1"}, min_score=None, user_id="u1")
     assert counts == {"interviewing": 1}
     # audit 2026-07-18 PERF-M / silent-degrade: a genuine RPC failure must
     # degrade LOUDLY — a WARNING carrying the traceback — so silent reversion of
@@ -127,18 +135,18 @@ def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixture) -
     assert any(r.exc_info for r in warned), "the WARNING must carry exc_info (the traceback)"
 
 
-def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
+async def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
     import app.routers.jobs as jobs_mod
 
-    monkeypatch.setattr(jobs_mod, "get_user_target_ids", lambda _sb, _uid: {"t1"})
-    monkeypatch.setattr(jobs_mod, "_default_min_score_for_user", lambda _sb, _uid: None)
+    monkeypatch.setattr(jobs_mod, "_active_target_ids", AsyncMock(return_value={"t1"}))
+    monkeypatch.setattr(jobs_mod, "_default_min_score_for_user", AsyncMock(return_value=None))
     monkeypatch.setattr(
         jobs_mod,
         "_pipeline_counts_grouped",
-        lambda _sb, *, target_ids, min_score, user_id: {"new": 3, "offer": 1},
+        AsyncMock(return_value={"new": 3, "offer": 1}),
     )
 
-    counts = pipeline_counts(supabase=MagicMock(), user_id="u1")
+    counts = await pipeline_counts(supabase=MagicMock(), user_id="u1")
     assert counts["new"] == 3
     assert counts["offer"] == 1
     # Statuses with no rows are present and zero — the dashboard reads
@@ -155,33 +163,33 @@ def test_endpoint_zero_fills_all_statuses(monkeypatch) -> None:
         assert counts[st] == 0
 
 
-def test_endpoint_no_targets_short_circuits() -> None:
+async def test_endpoint_no_targets_short_circuits() -> None:
     from unittest.mock import patch
 
     import app.routers.jobs as jobs_mod
 
     sb = MagicMock()
-    with patch.object(jobs_mod, "get_user_target_ids", return_value=set()):
-        counts = pipeline_counts(supabase=sb, user_id="u-none")
+    with patch.object(jobs_mod, "_active_target_ids", new=AsyncMock(return_value=set())):
+        counts = await pipeline_counts(supabase=sb, user_id="u-none")
     assert all(v == 0 for v in counts.values())
     sb.rpc.assert_not_called()
 
 
-def test_endpoint_caches_per_user() -> None:
+async def test_endpoint_caches_per_user() -> None:
     from unittest.mock import patch
 
     import app.routers.jobs as jobs_mod
 
-    grouped = MagicMock(return_value={"new": 2})
+    grouped = AsyncMock(return_value={"new": 2})
     with (
-        patch.object(jobs_mod, "get_user_target_ids", return_value={"t1"}),
-        patch.object(jobs_mod, "_default_min_score_for_user", return_value=None),
+        patch.object(jobs_mod, "_active_target_ids", new=AsyncMock(return_value={"t1"})),
+        patch.object(jobs_mod, "_default_min_score_for_user", new=AsyncMock(return_value=None)),
         patch.object(jobs_mod, "_pipeline_counts_grouped", grouped),
     ):
-        first = pipeline_counts(supabase=MagicMock(), user_id="u1")
-        second = pipeline_counts(supabase=MagicMock(), user_id="u1")
+        first = await pipeline_counts(supabase=MagicMock(), user_id="u1")
+        second = await pipeline_counts(supabase=MagicMock(), user_id="u1")
         # Different user must not share the cache entry.
-        pipeline_counts(supabase=MagicMock(), user_id="u2")
+        await pipeline_counts(supabase=MagicMock(), user_id="u2")
 
     assert first == second
     assert grouped.call_count == 2  # u1 once (cached), u2 once

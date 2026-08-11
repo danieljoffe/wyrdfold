@@ -122,14 +122,22 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
               Beta
             </span>
           </Link>
-          <LinkButton
-            name='wyrdfold-public-header-sign-in'
-            href='/login'
-            variant='outline'
-            size='sm'
-          >
-            Sign in
-          </LinkButton>
+          <div className='flex items-center gap-3 sm:gap-4'>
+            <Link
+              href='/search'
+              className='rounded-md text-sm font-medium text-text-secondary transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
+            >
+              Search jobs
+            </Link>
+            <LinkButton
+              name='wyrdfold-public-header-sign-in'
+              href='/login'
+              variant='outline'
+              size='sm'
+            >
+              Sign in
+            </LinkButton>
+          </div>
         </div>
       </header>
       <main id='main-content' className='flex-1'>

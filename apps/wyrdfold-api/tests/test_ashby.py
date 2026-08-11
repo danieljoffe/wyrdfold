@@ -44,7 +44,6 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
                 "id": "ashby-001",
                 "title": "Senior Frontend Engineer",
                 "location": "Remote",
-                "department": "Engineering",
                 "descriptionHtml": "<p>desc</p>",
                 "publishedAt": "2024-01-01T00:00:00Z",
                 "jobUrl": "https://jobs.ashbyhq.com/acme/ashby-001",
@@ -60,7 +59,6 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
     assert job.external_id == "ashby-001"
     assert job.title == "Senior Frontend Engineer"
     assert job.location_name == "Remote"
-    assert job.department == "Engineering"
     assert job.absolute_url == "https://jobs.ashbyhq.com/acme/ashby-001"
 
 
@@ -78,5 +76,4 @@ async def test_fetch_missing_fields(mock_http_client):
     mock_http_client.get = AsyncMock(return_value=resp)
     result = await fetch_ashby_jobs("co")
     assert result[0].location_name is None
-    assert result[0].department is None
     assert result[0].content == ""

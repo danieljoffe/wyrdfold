@@ -17,6 +17,46 @@ def test_strip_html_handles_empty():
     assert strip_html("") == ""
 
 
+# The verbatim shape of the prod Reddit row's pay-transparency region (2026-07-26
+# bug report): HTML-ESCAPED markup + a DOUBLE-escaped &amp;mdash; BETWEEN the two
+# amounts. Rows stored before the greenhouse ingestion unescape (services/
+# greenhouse.py) look like this.
+_ESCAPED_PAY_RANGE = (
+    "&lt;div class=&quot;title&quot;&gt;The base salary range for this position is:"
+    "&lt;/div&gt;&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$190,800&lt;/span&gt;"
+    "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+    "&lt;span&gt;$267,100 USD&lt;/span&gt;&lt;/div&gt;"
+)
+
+
+def test_strip_html_double_strips_stored_escaped_html():
+    """Stored-escaped rows must yield a CLEAN token stream — the first pass
+    unescapes the entities into tag-looking text; the bounded second pass
+    strips it. This is the shared fix behind the tag-soup snippets AND the
+    null-salary misses (markup between the pay-range amounts)."""
+    text = strip_html(_ESCAPED_PAY_RANGE)
+    assert "<" not in text and ">" not in text
+    assert "&mdash;" not in text and "&quot;" not in text
+    assert "The base salary range for this position is: $190,800" in text
+
+
+def test_strip_html_escaped_pay_range_is_salary_extractable():
+    """End-to-end regression for the Reddit null-salary bug: the poller's
+    exact pipeline (strip_html -> extract_salary_from_text) must recover the
+    range from a stored-escaped pay-transparency div."""
+    from app.services.extract import extract_salary_from_text
+
+    salary = extract_salary_from_text(strip_html(_ESCAPED_PAY_RANGE))
+    assert salary is not None
+    assert "$190,800" in salary and "$267,100" in salary
+
+
+def test_strip_html_keeps_stray_lt_in_prose():
+    """A literal '<' in prose is NOT a tag shape — the second pass must not
+    fire and eat legitimate text (comp ranges, code mentions)."""
+    assert strip_html("<p>Comp &lt; $200k, equity &gt; 0.1%</p>") == ("Comp < $200k, equity > 0.1%")
+
+
 def test_strip_html_preserves_plain_text():
     assert strip_html("no tags here") == "no tags here"
 
@@ -280,3 +320,44 @@ def test_incidental_single_word_title_hit_scores_below_true_match() -> None:
     # lone "engineer" (half), so it ranks strictly lower.
     assert true_match.breakdown.role_titles == off_role.breakdown.role_titles * 2
     assert true_match.score > off_role.score
+
+
+# -- #503 item 5: keyword-normalizer audit findings ---------------------------
+# 273 live prod JDs write "front-end" and 362 "full-stack" (2026-07-29);
+# the owner's active targets carry multi-word hyphenated keywords
+# ("Cross-Functional Collaboration", "Order-to-Cash Workflows") that JDs
+# hyphenate/space freely. These pin the two fixes: role-compound aliases
+# and the general separator-variant fallback.
+
+
+class TestKeywordSeparatorDrift:
+    def test_frontend_matches_hyphenated_jd(self) -> None:
+        from app.services.scoring import _keyword_or_alias_in_text
+
+        assert _keyword_or_alias_in_text("frontend", "our front-end architecture")
+        assert _keyword_or_alias_in_text("frontend", "the front end team")
+        assert _keyword_or_alias_in_text("fullstack", "a full-stack engineer")
+        assert _keyword_or_alias_in_text("backend", "back-end services")
+
+    def test_hyphenated_keyword_matches_joined_and_spaced_jd(self) -> None:
+        from app.services.scoring import _keyword_or_alias_in_text
+
+        assert _keyword_or_alias_in_text("front-end", "frontend platform work")
+        assert _keyword_or_alias_in_text(
+            "cross-functional collaboration",
+            "strong cross functional collaboration skills",
+        )
+        assert _keyword_or_alias_in_text(
+            "order-to-cash workflows", "owning order to cash workflows end to end"
+        )
+        assert _keyword_or_alias_in_text(
+            "data driven decision making", "a data-driven decision-making culture"
+        )
+
+    def test_word_boundaries_still_hold(self) -> None:
+        from app.services.scoring import _keyword_or_alias_in_text
+
+        # The separator fallback must not reintroduce substring false
+        # positives for plain single words.
+        assert not _keyword_or_alias_in_text("lead", "thought leadership")
+        assert not _keyword_or_alias_in_text("rep", "our repository")

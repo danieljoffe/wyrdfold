@@ -21,6 +21,12 @@ def _row(**logistics: object) -> dict[str, object]:
     return {"id": "j", "logistics_filters": dict(logistics) if logistics else None}
 
 
+def _p(logistics: dict[str, object] | None) -> dict[str, object]:
+    """A minimal posting row carrying only LLM logistics (no structured
+    salary columns) — exercises the fallback path."""
+    return {"id": "j", "logistics_filters": logistics}
+
+
 # ---- active flag -----------------------------------------------------------
 
 
@@ -42,12 +48,12 @@ def test_active_when_any_param_set() -> None:
 
 def test_remote_only_keeps_remote_drops_everything_else() -> None:
     f = _LogisticsFilter(remote_only=True)
-    assert _logistics_passes({"remote_status": "remote"}, f) is True
+    assert _logistics_passes(_p({"remote_status": "remote"}), f) is True
     for status in ("hybrid", "onsite", "unspecified"):
-        assert _logistics_passes({"remote_status": status}, f) is False
+        assert _logistics_passes(_p({"remote_status": status}), f) is False
     # No logistics data at all → dropped (strict; user asked for remote).
-    assert _logistics_passes(None, f) is False
-    assert _logistics_passes({}, f) is False
+    assert _logistics_passes(_p(None), f) is False
+    assert _logistics_passes(_p({}), f) is False
 
 
 # ---- min_salary (STRICT) ---------------------------------------------------
@@ -55,11 +61,11 @@ def test_remote_only_keeps_remote_drops_everything_else() -> None:
 
 def test_min_salary_keeps_at_or_above_drops_below_and_unknown() -> None:
     f = _LogisticsFilter(min_salary=150_000)
-    assert _logistics_passes({"salary_max": 150_000}, f) is True  # inclusive
-    assert _logistics_passes({"salary_max": 200_000}, f) is True
-    assert _logistics_passes({"salary_max": 120_000}, f) is False
-    assert _logistics_passes({"salary_max": None}, f) is False  # undisclosed → drop
-    assert _logistics_passes(None, f) is False
+    assert _logistics_passes(_p({"salary_max": 150_000}), f) is True  # inclusive
+    assert _logistics_passes(_p({"salary_max": 200_000}), f) is True
+    assert _logistics_passes(_p({"salary_max": 120_000}), f) is False
+    assert _logistics_passes(_p({"salary_max": None}), f) is False  # undisclosed → drop
+    assert _logistics_passes(_p(None), f) is False
 
 
 # ---- country (LENIENT) -----------------------------------------------------
@@ -67,12 +73,12 @@ def test_min_salary_keeps_at_or_above_drops_below_and_unknown() -> None:
 
 def test_country_matches_case_insensitive_and_null_passes() -> None:
     f = _LogisticsFilter(country="US")
-    assert _logistics_passes({"location_country": "US"}, f) is True
-    assert _logistics_passes({"location_country": "us"}, f) is True  # case-insensitive
-    assert _logistics_passes({"location_country": "CA"}, f) is False  # mismatch
+    assert _logistics_passes(_p({"location_country": "US"}), f) is True
+    assert _logistics_passes(_p({"location_country": "us"}), f) is True  # case-insensitive
+    assert _logistics_passes(_p({"location_country": "CA"}), f) is False  # mismatch
     # Absent country anchor passes (lenient — a remote role may have none).
-    assert _logistics_passes({"location_country": None}, f) is True
-    assert _logistics_passes(None, f) is True
+    assert _logistics_passes(_p({"location_country": None}), f) is True
+    assert _logistics_passes(_p(None), f) is True
 
 
 # ---- composition -----------------------------------------------------------
@@ -81,13 +87,13 @@ def test_country_matches_case_insensitive_and_null_passes() -> None:
 def test_all_three_compose_as_conjunction() -> None:
     f = _LogisticsFilter(remote_only=True, min_salary=150_000, country="US")
     ok = {"remote_status": "remote", "salary_max": 180_000, "location_country": "US"}
-    assert _logistics_passes(ok, f) is True
+    assert _logistics_passes(_p(ok), f) is True
     # Fails any single leg → dropped.
-    assert _logistics_passes({**ok, "remote_status": "hybrid"}, f) is False
-    assert _logistics_passes({**ok, "salary_max": 100_000}, f) is False
-    assert _logistics_passes({**ok, "location_country": "CA"}, f) is False
+    assert _logistics_passes(_p({**ok, "remote_status": "hybrid"}), f) is False
+    assert _logistics_passes(_p({**ok, "salary_max": 100_000}), f) is False
+    assert _logistics_passes(_p({**ok, "location_country": "CA"}), f) is False
     # country still lenient inside the conjunction (null country leg passes).
-    assert _logistics_passes({**ok, "location_country": None}, f) is True
+    assert _logistics_passes(_p({**ok, "location_country": None}), f) is True
 
 
 def test_apply_filters_a_list() -> None:
@@ -99,3 +105,157 @@ def test_apply_filters_a_list() -> None:
         {"id": "empty", "logistics_filters": None},
     ]
     assert [p["id"] for p in _apply_logistics_filter(rows, f)] == ["keep"]
+
+
+# ---- min_salary prefers the deterministic jobs-level columns ----------------
+
+
+def test_min_salary_uses_structured_columns_when_present() -> None:
+    f = _LogisticsFilter(min_salary=150_000)
+    # Structured yearly-USD row passes on its own columns — NO logistics needed
+    # (before the columns existed, every ungraded row was silently dropped).
+    row = {
+        "id": "j",
+        "salary_min": 120_000,
+        "salary_max": 180_000,
+        "salary_currency": "USD",
+        "salary_period": "yearly",
+        "logistics_filters": None,
+    }
+    assert _logistics_passes(row, f) is True
+    # Deterministic data WINS over the LLM guess: columns below the floor drop
+    # the row even when stale logistics claims a higher salary.
+    row_low = {
+        **row,
+        "salary_max": 120_000,
+        "logistics_filters": {"salary_max": 999_000},
+    }
+    assert _logistics_passes(row_low, f) is False
+    # Min-only structured rows count (max NULL, min clears the floor).
+    row_min_only = {**row, "salary_max": None, "salary_min": 250_000}
+    assert _logistics_passes(row_min_only, f) is True
+
+
+def test_min_salary_falls_back_to_logistics_for_non_yearly_usd() -> None:
+    f = _LogisticsFilter(min_salary=150_000)
+    # Hourly structured data isn't yearly-comparable → the LLM's (annualized)
+    # logistics value decides.
+    hourly = {
+        "id": "j",
+        "salary_min": 40.0,
+        "salary_max": 60.0,
+        "salary_currency": "USD",
+        "salary_period": "hourly",
+        "logistics_filters": {"salary_max": 160_000},
+    }
+    assert _logistics_passes(hourly, f) is True
+    hourly_low = {**hourly, "logistics_filters": {"salary_max": 90_000}}
+    assert _logistics_passes(hourly_low, f) is False
+    # No structured columns at all → pure fallback (the pre-columns behavior).
+    assert _logistics_passes(_p({"salary_max": 200_000}), f) is True
+
+
+class TestIncludeUnknownSalaryPref:
+    """pref_include_unknown_salary wired (2026-07-31): relaxes ONLY the
+    strict unknown-salary drop under a min_salary floor. A KNOWN salary below
+    the floor drops regardless; api-key/global paths (no pref context) keep
+    the strict pre-wiring default."""
+
+    def _floor(self) -> _LogisticsFilter:
+        from app.routers.jobs import _LogisticsFilter
+
+        return _LogisticsFilter(min_salary=150_000)
+
+    def test_unknown_salary_kept_when_pref_true(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {"logistics_filters": None}  # no salary anywhere
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=True) is True
+
+    def test_unknown_salary_dropped_when_pref_false(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {"logistics_filters": None}
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=False) is False
+
+    def test_known_below_floor_drops_regardless_of_pref(self) -> None:
+        from app.routers.jobs import _logistics_passes
+
+        row = {
+            "salary_currency": "USD",
+            "salary_period": "yearly",
+            "salary_max": 100_000,
+            "logistics_filters": None,
+        }
+        assert _logistics_passes(row, self._floor(), include_unknown_salary=True) is False
+
+    def test_default_stays_strict(self) -> None:
+        """Callers without pref context (api-key/global) keep the old drop."""
+        from app.routers.jobs import _logistics_passes
+
+        assert _logistics_passes({"logistics_filters": None}, self._floor()) is False
+
+    def test_apply_filter_resolves_per_row(self) -> None:
+        from app.routers.jobs import _apply_logistics_filter
+
+        rows = [
+            {"id": "keep-me", "logistics_filters": None},
+            {"id": "drop-me", "logistics_filters": None},
+        ]
+        out = _apply_logistics_filter(
+            rows, self._floor(), include_unknown_salary_for=lambda p: p["id"] == "keep-me"
+        )
+        assert [p["id"] for p in out] == ["keep-me"]
+
+
+# ---- country: prefer the deterministic jobs.country column -----------------
+#
+# Regression for the 2026-08-08 prod defect: the filter read ONLY the Phase-2
+# grader's ``logistics_filters.location_country``, which exists on ~4% of scores
+# rows. Combined with "absent ⇒ keep", that admitted the other 96% and made the
+# filter inert — selecting Canada in the UI returned a full page of US jobs.
+# ``jobs.country`` covers ~80% of the live corpus and is now preferred, exactly
+# as the salary bound already prefers the deterministic salary columns.
+
+
+def test_country_uses_the_posting_column_when_the_grader_field_is_absent() -> None:
+    f = _LogisticsFilter(country="CA")
+    us_posting = {"id": "j", "logistics_filters": None, "country": "US"}
+    assert _logistics_passes(us_posting, f) is False, (
+        "a US posting must not survive a Canada filter just because the "
+        "grader never wrote location_country for it"
+    )
+
+
+def test_country_keeps_a_matching_posting_column() -> None:
+    f = _LogisticsFilter(country="CA")
+    ca_posting = {"id": "j", "logistics_filters": None, "country": "ca"}
+    assert _logistics_passes(ca_posting, f) is True  # case-insensitive
+
+
+def test_country_posting_column_wins_over_a_stale_grader_field() -> None:
+    f = _LogisticsFilter(country="CA")
+    conflicted = {
+        "id": "j",
+        "logistics_filters": {"location_country": "CA"},
+        "country": "US",
+    }
+    assert _logistics_passes(conflicted, f) is False
+
+
+def test_country_falls_back_to_the_grader_field_when_the_column_is_null() -> None:
+    f = _LogisticsFilter(country="CA")
+    graded_only = {
+        "id": "j",
+        "logistics_filters": {"location_country": "CA"},
+        "country": None,
+    }
+    assert _logistics_passes(graded_only, f) is True
+
+
+def test_country_stays_lenient_only_when_genuinely_unknown() -> None:
+    """The documented leniency is for a remote role with no country anchor —
+    not a licence to keep every ungraded row."""
+    f = _LogisticsFilter(country="CA")
+    unknown = {"id": "j", "logistics_filters": None, "country": None}
+    assert _logistics_passes(unknown, f) is True

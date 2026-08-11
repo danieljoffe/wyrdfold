@@ -45,24 +45,19 @@ def _service_role_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "supabase_anon_key", "test-anon-key")
 
 
-def test_service_role_singleton_is_http1(_service_role_settings: None) -> None:
-    sp.init_supabase()
+def test_service_role_client_is_http1(_service_role_settings: None) -> None:
+    # The one-off sync service client that scripts build (create_service_client)
+    # must also speak HTTP/1.1 — the same concurrency-safety pin as the pooled
+    # clients. #57 PR-G2e-8 replaced the init_supabase / get_supabase_pool
+    # singleton with this on-demand factory once the request path stopped
+    # needing a sync service client.
+    client = sp.create_service_client()
     try:
-        client = sp.get_supabase_pool()
-        assert client is not None
-        # The actual regression assertion: the shared service-role client's
-        # postgrest transport must NOT be HTTP/2.
+        # The actual regression assertion: the service-role client's postgrest
+        # transport must NOT be HTTP/2.
         assert _pool_http2(client) is False
     finally:
-        sp.close_supabase()
-
-
-def test_per_request_user_client_is_http1(_service_role_settings: None) -> None:
-    try:
-        client = sp.get_user_client("fake-jwt")
-        assert _pool_http2(client) is False
-    finally:
-        sp.close_supabase()
+        client.postgrest.session.close()
 
 
 def test_default_supabase_client_would_be_http2() -> None:

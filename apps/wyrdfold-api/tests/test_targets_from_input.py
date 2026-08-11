@@ -3,7 +3,7 @@
 The inline path (``from_manual`` / ``from_url``) only runs the normalize
 LLM call (manual) or no LLM call (URL) before linking the user and
 returning. The expensive ``derive_profile_*`` + ``derive_fit_score`` work
-is scheduled onto a ``BackgroundTask`` — these tests assert both halves:
+is spawned as a DETACHED loop task — these tests assert both halves:
 
 * the inline path links + schedules the right background function without
   touching derive/fit, and
@@ -11,20 +11,30 @@ is scheduled onto a ``BackgroundTask`` — these tests assert both halves:
   ``derive_url_target_bg``) derive the profile, flip the activation status,
   and upsert the fit score — marking the target ``error`` on failure.
 
-The LLM and crud helpers are monkeypatched so the focus stays on
-orchestration — the underlying pieces have their own dedicated tests.
+#57 PR-G2b: ``from_input`` runs on the pooled async service client. Its crud
+reads/writes are module-inline async helpers (``_create_and_link`` / ``_update`` /
+``_link`` / ``_get`` / ``_add_reference_jd`` / ``_list_reference_jds`` /
+``_count_user_reference_jds``), the cost ledger is ``cost_log.record_async``,
+the #191 merge is ``apply_profile_merge_rpc_async``, and the deferred work is
+spawned via ``spawn_detached`` (not starlette ``BackgroundTasks``). #57 PR-G2e-4/5:
+``derive_profile_from_jd`` (async cache path), ``materialize_and_score_job``, the
+``_upsert_user_job_async`` inline, and now ``resolve_current_payload`` (in
+``_apply_fit_score``) + ``register_source_from_url`` (in ``from_url``) all ride the
+async service client — the module holds no sync client. All are monkeypatched so
+the focus stays on orchestration.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import BackgroundTasks
 
+from app.config import settings
 from app.models.experience import OptimizedPayload
 from app.models.llm import LLMResult, LLMUsage
 from app.models.targets import (
@@ -38,7 +48,7 @@ from app.models.targets import (
     UserTarget,
 )
 from app.services.llm import cost_log
-from app.services.targets import crud, from_input
+from app.services.targets import from_input
 from app.services.targets.fit_score import FitScoreResult
 
 # ---- Helpers ----------------------------------------------------------------
@@ -72,7 +82,7 @@ def _target(
         search_keywords=["frontend"],
         activation_status=activation_status,
         profile_version=profile_version,
-        is_active=False,
+        app_active=False,
         created_at=now,
         updated_at=now,
     )
@@ -131,7 +141,8 @@ def recorder() -> _Recorder:
 
 @pytest.fixture
 def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder:
-    """Stub all LLM-driven helpers and cost_log so the orchestration runs offline."""
+    """Stub all LLM-driven helpers, cost_log, and the deep sync services so the
+    orchestration runs offline."""
 
     async def fake_normalize(llm, *, label, description, payload):  # type: ignore[no-untyped-def]
         recorder.record("normalize", label=label, description=description)
@@ -168,22 +179,51 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
         recorder.record("fit_score", target_id=target.id)
         return FitScoreResult(fit_score=82, reasoning="Strong fit."), _llm_result()
 
-    def fake_cost_record(supabase, **kwargs):  # type: ignore[no-untyped-def]
+    # _apply_fit_score resolves a payload fresh vs. the current master doc
+    # (BUG 2 seam) before scoring; stub it so the fit path has an experience
+    # payload without hitting the real prose/optimized reads.
+    async def fake_resolve(supabase, llm, *, cost_supabase, user_id):  # type: ignore[no-untyped-def]
+        recorder.record("resolve_payload", user_id=user_id)
+        # (payload, prose_doc_id) — the id is the E2 fit-score version marker.
+        return OptimizedPayload(), "prose-doc-1"
+
+    async def fake_cost_record_async(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("cost_log", **kwargs)
+
+    # The from-url flow now materializes the posting as a job (job_ingest) +
+    # saves it (user_jobs). Stub both so the orchestration tests stay offline;
+    # they record so tests can assert the posting was materialized + saved.
+    async def fake_materialize(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        recorder.record(
+            "materialize_job",
+            title=kwargs.get("title"),
+            company_name=kwargs.get("company_name"),
+            target_ids=[t.id for t in kwargs.get("targets", [])],
+        )
+        return "posting-1"
+
+    async def fake_upsert_user_job(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        recorder.record("user_job", **kwargs)
 
     monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
     monkeypatch.setattr(from_input, "derive_profile_from_label", fake_derive_label)
     monkeypatch.setattr(from_input, "derive_profile_from_jd", fake_derive_jd)
     monkeypatch.setattr(from_input, "derive_fit_score", fake_fit_score)
-    monkeypatch.setattr(cost_log, "record", fake_cost_record)
+    monkeypatch.setattr(from_input, "resolve_current_payload", fake_resolve)
+    monkeypatch.setattr(from_input, "materialize_and_score_job", fake_materialize)
+    # #57 PR-G2e-4: the ``user_jobs`` write is the async ``_upsert_user_job_async``
+    # inline now (``persistence.upsert_user_job`` no longer imported here).
+    monkeypatch.setattr(from_input, "_upsert_user_job_async", fake_upsert_user_job)
+    monkeypatch.setattr(cost_log, "record_async", fake_cost_record_async)
     return recorder
 
 
 @pytest.fixture
 def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder:
-    """Stub crud link/update; specific tests override create/get as needed."""
+    """Stub the inline async link/update helpers; specific tests override
+    create/get/add-ref/list-ref as needed."""
 
-    def fake_link(supabase, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_link(supabase, **kwargs):  # type: ignore[no-untyped-def]
         recorder.record("link", **kwargs)
         return _user_target(
             user_id=kwargs["user_id"],
@@ -191,7 +231,7 @@ def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder
             fit_score=kwargs.get("fit_score"),
         )
 
-    def fake_update(supabase, target_id, body):  # type: ignore[no-untyped-def]
+    async def fake_update(supabase, target_id, body):  # type: ignore[no-untyped-def]
         recorder.record("update", target_id=target_id, body=body)
         return _target(
             id=target_id,
@@ -199,14 +239,53 @@ def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder
             profile_version=body.profile_version or 1,
         )
 
-    monkeypatch.setattr(crud, "link_user_to_target", fake_link)
-    monkeypatch.setattr(crud, "update", fake_update)
+    # Default the URL corpus path under the per-user reference-JD cap; the
+    # cap-specific test overrides this. Only derive_url_target_bg reads it.
+    monkeypatch.setattr(from_input, "_count_user_reference_jds", AsyncMock(return_value=0))
+
+    monkeypatch.setattr(from_input, "_link", fake_link)
+    monkeypatch.setattr(from_input, "_update", fake_update)
     return recorder
 
 
-def _scheduled(bg: BackgroundTasks) -> list[tuple[Any, dict[str, Any]]]:
-    """(func, kwargs) for each task queued on a BackgroundTasks instance."""
-    return [(t.func, t.kwargs) for t in bg.tasks]
+@pytest.fixture
+def sched(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Capture ``spawn_detached`` scheduling for the inline-path tests.
+
+    The deferred entrypoints are replaced with recording stubs (so we can assert
+    WHICH was scheduled + with what kwargs) and ``spawn_detached`` is patched to
+    swallow the coroutine so nothing actually runs. Only inline-path tests use
+    this — the background-path tests exercise the real derive functions.
+    """
+    calls: dict[str, dict[str, Any]] = {}
+    names: list[str] = []
+
+    def _record(fn_name: str):  # type: ignore[no-untyped-def]
+        def _inner(*_a: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+            calls[fn_name] = kwargs
+
+            async def _noop() -> None:
+                return None
+
+            return _noop()
+
+        return _inner
+
+    for fn_name in (
+        "derive_manual_target_bg",
+        "derive_url_target_bg",
+        "_apply_fit_score",
+        "register_source_from_url",
+    ):
+        monkeypatch.setattr(from_input, fn_name, _record(fn_name))
+
+    def _fake_spawn(coro: Any, *, name: str) -> Any:
+        names.append(name)
+        coro.close()  # never run — this is the inline-path assertion, not the bg run
+        return MagicMock()
+
+    monkeypatch.setattr(from_input, "spawn_detached", _fake_spawn)
+    return SimpleNamespace(calls=calls, names=names)
 
 
 # ---- from_manual: inline path -----------------------------------------------
@@ -217,24 +296,26 @@ async def test_from_manual_matched_links_inline_defers_fit_score(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
     """Matched → link inline (no fit yet), schedule the fit-score task only."""
     supabase = MagicMock()
     matched = _target(id="existing")
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
 
     create_calls: list[TargetCreate] = []
-    monkeypatch.setattr(
-        crud,
-        "create",
-        lambda _s, *, payload: create_calls.append(payload) or matched,  # type: ignore[func-returns-value]
-    )
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    bg = BackgroundTasks()
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        create_calls.append(payload)
+        return matched, _user_target(target_id=matched.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
     result = await from_input.from_manual(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         label="sr fe eng",
         description=None,
@@ -254,12 +335,10 @@ async def test_from_manual_matched_links_inline_defers_fit_score(
     assert link_kwargs["target_id"] == "existing"
     assert link_kwargs.get("fit_score") is None
     # Deferred: fit-score task only.
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    func, kwargs = scheduled[0]
-    assert func is from_input._apply_fit_score
-    assert kwargs["target"].id == "existing"
-    assert kwargs["user_id"] == "user-1"
+    assert "_apply_fit_score" in sched.calls
+    assert "derive_manual_target_bg" not in sched.calls
+    assert sched.calls["_apply_fit_score"]["target"].id == "existing"
+    assert sched.calls["_apply_fit_score"]["user_id"] == "user-1"
 
 
 @pytest.mark.asyncio
@@ -267,24 +346,34 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
     """New → create in 'deriving', link inline, schedule full derivation."""
     supabase = MagicMock()
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: None)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=None))
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
-    monkeypatch.setattr(
-        crud,
-        "create",
-        lambda _s, *, payload: create_calls.append(payload) or created,  # type: ignore[func-returns-value]
-    )
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    bg = BackgroundTasks()
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        create_calls.append(payload)
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
     result = await from_input.from_manual(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         label="sr fe eng",
         description="frontend roles at growth-stage companies",
@@ -305,20 +394,25 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
     assert create_calls[0].description == "Canonical description."
     assert create_calls[0].search_keywords == []
     # Status flipped to 'deriving' inline.
-    update_call = stub_crud.by_name("update")[0]
-    assert update_call["body"].activation_status == "deriving"
-    # Linked inactive, no fit score yet.
-    link_kwargs = stub_crud.by_name("link")[0]
-    assert link_kwargs["target_id"] == "new"
-    assert link_kwargs["is_active"] is False
-    assert link_kwargs.get("fit_score") is None
+    # 'deriving' is requested in the SAME atomic call as the insert — there is
+    # no separate status round-trip to assert on any more (#667). Asserting the
+    # request (not just the returned row) keeps this honest: the stub echoes
+    # what it was given, so only this line proves the caller asked for it.
+    assert create_statuses == ["deriving"]
+    # Linked inside the same atomic call — no separate link round-trip to
+    # inspect. The membership is always is_active False there (following never
+    # trips the active cap) and carries no fit score yet; the RPC enforces both,
+    # and tests/integration/test_create_target_and_link.py proves it against a
+    # real Postgres.
+    assert create_users == ["user-1"]
+    assert result.user_target.target_id == "new"
+    assert result.user_target.is_active is False
+    assert result.user_target.fit_score is None
     # Deferred: the manual derivation task.
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    func, kwargs = scheduled[0]
-    assert func is from_input.derive_manual_target_bg
-    assert kwargs["target_id"] == "new"
-    assert kwargs["label"] == "Senior Frontend Engineer"
+    assert "derive_manual_target_bg" in sched.calls
+    assert "_apply_fit_score" not in sched.calls
+    assert sched.calls["derive_manual_target_bg"]["target_id"] == "new"
+    assert sched.calls["derive_manual_target_bg"]["label"] == "Senior Frontend Engineer"
 
 
 @pytest.mark.asyncio
@@ -348,14 +442,13 @@ async def test_from_manual_malformed_llm_output_raises_clean_502(
     monkeypatch.setattr(
         from_input,
         "find_matching_target",
-        lambda *_a, **_kw: pytest.fail("should not reach matching on malformed LLM"),
+        AsyncMock(side_effect=AssertionError("should not reach matching on malformed LLM")),
     )
 
     with pytest.raises(HTTPException) as exc_info:
         await from_input.from_manual(
             MagicMock(),
             MagicMock(),
-            BackgroundTasks(),
             user_id="user-1",
             label="sr fe eng",
             description=None,
@@ -417,7 +510,7 @@ async def test_derive_manual_target_bg_marks_error_on_failure(
     """A failing derive flips the target to 'error' and never links a fit."""
     supabase = MagicMock()
 
-    async def boom(llm, *, label, payload):  # type: ignore[no-untyped-def]
+    async def boom(llm, *, label):  # type: ignore[no-untyped-def]
         raise RuntimeError("LLM down")
 
     monkeypatch.setattr(from_input, "derive_profile_from_label", boom)
@@ -448,7 +541,7 @@ async def test_derive_manual_target_bg_marks_error_on_timeout(
     # Shrink the ceiling so the test doesn't actually wait.
     monkeypatch.setattr(from_input, "DERIVATION_TIMEOUT_S", 0.05)
 
-    async def hang(llm, *, label, payload):  # type: ignore[no-untyped-def]
+    async def hang(llm, *, label):  # type: ignore[no-untyped-def]
         await asyncio.sleep(1)
         raise AssertionError("should have timed out")
 
@@ -479,25 +572,35 @@ async def test_from_suggestion_new_creates_without_normalize_call(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
     """New suggestion → create in 'deriving' + link + defer derivation, and —
     unlike from_manual — NO inline normalize LLM call (label already canonical)."""
     supabase = MagicMock()
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: None)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=None))
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
-    monkeypatch.setattr(
-        crud,
-        "create",
-        lambda _s, *, payload: create_calls.append(payload) or created,  # type: ignore[func-returns-value]
-    )
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    bg = BackgroundTasks()
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        create_calls.append(payload)
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
     result = await from_input.from_suggestion(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         label="Senior Frontend Engineer",
         description="Frontend roles.",
@@ -511,11 +614,11 @@ async def test_from_suggestion_new_creates_without_normalize_call(
     # Created straight from the (already-canonical) label + description.
     assert create_calls[0].label == "Senior Frontend Engineer"
     assert create_calls[0].description == "Frontend roles."
-    link_kwargs = stub_crud.by_name("link")[0]
-    assert link_kwargs["is_active"] is False  # never trips the active cap
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    assert scheduled[0][0] is from_input.derive_manual_target_bg
+    # The link is created inside the atomic call now; it is always is_active
+    # False there (following never trips the active cap), enforced by the RPC.
+    assert create_users == ["user-1"]
+    assert create_statuses == ["deriving"]
+    assert "derive_manual_target_bg" in sched.calls
 
 
 @pytest.mark.asyncio
@@ -523,21 +626,20 @@ async def test_from_suggestion_matched_dedups_to_existing_row(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
     """A suggestion whose label matches an existing catalog row LINKS it instead
     of creating a duplicate — the server-side dedup that a stale client
     ``is_new`` can't defeat."""
     supabase = MagicMock()
     matched = _target(id="existing")
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
-    create_spy = MagicMock()
-    monkeypatch.setattr(crud, "create", create_spy)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
+    create_spy = AsyncMock()
+    monkeypatch.setattr(from_input, "_create_and_link", create_spy)
 
-    bg = BackgroundTasks()
     result = await from_input.from_suggestion(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         label="Senior Frontend Engineer",
         description="Frontend roles.",
@@ -548,9 +650,7 @@ async def test_from_suggestion_matched_dedups_to_existing_row(
     assert result.target.id == "existing"
     create_spy.assert_not_called()  # NO duplicate row minted
     # Fit-score deferred (we have a profile).
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    assert scheduled[0][0] is from_input._apply_fit_score
+    assert "_apply_fit_score" in sched.calls
 
 
 @pytest.mark.asyncio
@@ -558,19 +658,18 @@ async def test_from_suggestion_no_profile_skips_fit_score(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
     """payload=None (user has no experience profile): a matched suggestion links
     but schedules NO fit-score task (fit needs the profile). Profile-independent
     is the whole point of the search fallback."""
     supabase = MagicMock()
     matched = _target(id="existing")
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
 
-    bg = BackgroundTasks()
     result = await from_input.from_suggestion(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         label="Senior Frontend Engineer",
         description=None,
@@ -580,7 +679,8 @@ async def test_from_suggestion_no_profile_skips_fit_score(
     assert result.was_matched is True
     # Linked, but NO fit-score task — nothing to score against.
     assert stub_crud.by_name("link")[0]["is_active"] is False
-    assert _scheduled(bg) == []
+    assert sched.calls == {}
+    assert sched.names == []
 
 
 @pytest.mark.asyncio
@@ -618,22 +718,23 @@ async def test_from_url_matched_links_inline_defers_derivation(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
-    """Matched URL → link inline, schedule corpus-building derivation (is_new=False)."""
+    """Matched URL → link inline, schedule corpus-building derivation."""
     supabase = MagicMock()
     matched = _target(id="existing", profile_version=4)
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: matched)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
 
-    bg = BackgroundTasks()
     result = await from_input.from_url(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         final_url="https://example.com/jobs/123",
         extracted_title="Senior Frontend Engineer",
         jd_text="x" * 200,
-        label_override=None,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -645,13 +746,12 @@ async def test_from_url_matched_links_inline_defers_derivation(
     link_kwargs = stub_crud.by_name("link")[0]
     assert link_kwargs["target_id"] == "existing"
     assert link_kwargs["is_active"] is False
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    func, kwargs = scheduled[0]
-    assert func is from_input.derive_url_target_bg
-    assert kwargs["is_new"] is False
-    assert kwargs["target_id"] == "existing"
-    assert kwargs["jd_text"] == "x" * 200
+    # Two bg tasks: the profile derive, then the source registration.
+    assert sched.calls["derive_url_target_bg"]["target_id"] == "existing"
+    assert sched.calls["derive_url_target_bg"]["jd_text"] == "x" * 200
+    # Source registration is scheduled AFTER derive, carrying the pasted URL.
+    assert sched.calls["register_source_from_url"]["final_url"] == "https://example.com/jobs/123"
+    assert sched.names == ["derive-url-existing", "register-source-existing"]
 
 
 @pytest.mark.asyncio
@@ -659,29 +759,41 @@ async def test_from_url_new_creates_deriving_and_schedules(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
+    sched: Any,
 ) -> None:
-    """New URL → create in 'deriving', link, schedule derivation (is_new=True)."""
+    """New URL → create in 'deriving', link, schedule derivation."""
     supabase = MagicMock()
-    monkeypatch.setattr(from_input, "find_matching_target", lambda _s, _l: None)
+    monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=None))
 
     created = _target(id="new", label="Senior Frontend Engineer")
     create_calls: list[TargetCreate] = []
-    monkeypatch.setattr(
-        crud,
-        "create",
-        lambda _s, *, payload: create_calls.append(payload) or created,  # type: ignore[func-returns-value]
-    )
+    create_statuses: list[str | None] = []
+    create_users: list[str] = []
 
-    bg = BackgroundTasks()
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        create_calls.append(payload)
+        create_statuses.append(activation_status)
+        create_users.append(user_id)
+        # The RPC sets activation_status in the SAME statement as the insert, so
+        # the row it returns already carries it — a stub that returned the
+        # pre-update row would model a state the DB never emits.
+        target = created.model_copy(
+            update={"activation_status": activation_status or created.activation_status}
+        )
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
     result = await from_input.from_url(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         final_url="https://example.com/jobs/abc",
         extracted_title="Senior Frontend Engineer",
         jd_text="x" * 200,
-        label_override=None,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -691,51 +803,56 @@ async def test_from_url_new_creates_deriving_and_schedules(
     assert "derive_from_jd" not in stub_llm_helpers.names()
     assert len(create_calls) == 1
     assert create_calls[0].label == "Senior Frontend Engineer"
-    scheduled = _scheduled(bg)
-    assert len(scheduled) == 1
-    func, kwargs = scheduled[0]
-    assert func is from_input.derive_url_target_bg
-    assert kwargs["is_new"] is True
-    assert kwargs["target_id"] == "new"
+    assert sched.calls["derive_url_target_bg"]["target_id"] == "new"
+    assert sched.calls["register_source_from_url"]["final_url"] == "https://example.com/jobs/abc"
+    assert sched.names == ["derive-url-new", "register-source-new"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("label_override", "extracted_title", "expected"),
+    ("extracted_title", "expected"),
     [
-        ("My Custom Label", "Different Extracted Title", "My Custom Label"),
-        (None, "Extracted Title", "Extracted Title"),
-        (None, None, "Untitled Target"),
+        ("Extracted Title", "Extracted Title"),
+        ("  Spaced Title  ", "Spaced Title"),  # trimmed
+        (None, "Untitled Target"),
+        ("   ", "Untitled Target"),  # whitespace-only → fallback
     ],
 )
 async def test_from_url_label_resolution(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
-    label_override: str | None,
+    sched: Any,
     extracted_title: str | None,
     expected: str,
 ) -> None:
-    """Label precedence: override > extracted title > 'Untitled Target'."""
+    """Label always derives from the posting title (there is no user override) —
+    trimmed, with a blank/whitespace-only title falling back to 'Untitled Target'."""
     supabase = MagicMock()
     seen_labels: list[str] = []
-    monkeypatch.setattr(
-        from_input,
-        "find_matching_target",
-        lambda _s, label: seen_labels.append(label) or None,  # type: ignore[func-returns-value]
-    )
-    monkeypatch.setattr(crud, "create", lambda _s, *, payload: _target(id="new", label=expected))
 
-    bg = BackgroundTasks()
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        seen_labels.append(label)
+        return None
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=expected)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
     await from_input.from_url(
         supabase,
         MagicMock(),
-        bg,
         user_id="user-1",
         final_url="https://example.com/jobs/x",
         extracted_title=extracted_title,
         jd_text="x" * 200,
-        label_override=label_override,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
     )
 
@@ -746,25 +863,37 @@ async def test_from_url_label_resolution(
 
 
 @pytest.mark.asyncio
-async def test_derive_url_target_bg_new_does_not_bump_version(
+async def test_derive_url_target_bg_new_attributes_and_rpc_merges(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """New URL target: derive JD → add ref → merge → status idle, version untouched."""
+    """New URL target: the JD is attributed to the contributor and the shared
+    profile is written through the #191 merge RPC (not a raw ``.update()``),
+    then the status flips idle and the fit score follows (SEC-1)."""
     supabase = MagicMock()
 
     add_ref_calls: list[dict[str, Any]] = []
+
+    async def fake_add(_s, **kw):  # type: ignore[no-untyped-def]
+        add_ref_calls.append(kw)
+        return _ref_jd(target_id=kw["target_id"], jd_url=kw["jd_url"])
+
+    monkeypatch.setattr(from_input, "_add_reference_jd", fake_add)
     monkeypatch.setattr(
-        crud,
-        "add_reference_jd",
-        lambda _s, **kw: (
-            add_ref_calls.append(kw) or _ref_jd(target_id=kw["target_id"], jd_url=kw["jd_url"])
-        ),  # type: ignore[func-returns-value]
+        from_input, "_list_reference_jds", AsyncMock(return_value=[_ref_jd(target_id="new")])
     )
-    monkeypatch.setattr(crud, "list_reference_jds", lambda _s, _t: [_ref_jd(target_id="new")])
-    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="new"))
-    monkeypatch.setattr(from_input, "merge_profiles", lambda _p: ScoringProfile())
+    monkeypatch.setattr(
+        from_input, "_get", AsyncMock(return_value=_target(id="new", profile_version=1))
+    )
+
+    rpc_calls: list[dict[str, Any]] = []
+
+    async def fake_rpc(_s, **kw):  # type: ignore[no-untyped-def]
+        rpc_calls.append(kw)
+        return ("applied", 2)
+
+    monkeypatch.setattr(from_input, "apply_profile_merge_rpc_async", fake_rpc)
 
     await from_input.derive_url_target_bg(
         supabase,
@@ -773,36 +902,52 @@ async def test_derive_url_target_bg_new_does_not_bump_version(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     assert "derive_from_jd" in stub_llm_helpers.names()
-    assert add_ref_calls and add_ref_calls[0]["target_id"] == "new"
+    # JD attributed to the contributor (enables the #5 contributor de-bias + #47 cap).
+    assert add_ref_calls and add_ref_calls[0]["user_id"] == "user-1"
+    # Shared-profile write went through the version-checked merge RPC, not .update().
+    assert rpc_calls and rpc_calls[0]["user_id"] == "user-1"
+    assert rpc_calls[0]["expected_version"] == 1
+    # Status flip (non-shared column) + fit score still happen.
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
-    assert update_body.profile_version is None  # new → no bump
-    # Fit score follows.
     assert stub_crud.by_name("link")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
-async def test_derive_url_target_bg_matched_bumps_version(
+async def test_derive_url_target_bg_matched_merges_via_rpc(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """Matched URL target: profile_version bumps from the current value."""
+    """Matched (corpus-building) URL target: the merge RPC is version-checked
+    against the target's current profile_version (SEC-1)."""
     supabase = MagicMock()
 
-    monkeypatch.setattr(crud, "add_reference_jd", lambda _s, **kw: _ref_jd())
+    monkeypatch.setattr(from_input, "_add_reference_jd", AsyncMock(return_value=_ref_jd()))
     monkeypatch.setattr(
-        crud,
-        "list_reference_jds",
-        lambda _s, _t: [_ref_jd(target_id="existing"), _ref_jd(target_id="existing")],
+        from_input,
+        "_list_reference_jds",
+        AsyncMock(return_value=[_ref_jd(target_id="existing"), _ref_jd(target_id="existing")]),
     )
-    monkeypatch.setattr(crud, "get", lambda _s, _id: _target(id="existing", profile_version=4))
-    monkeypatch.setattr(from_input, "merge_profiles", lambda _p: ScoringProfile())
+    monkeypatch.setattr(
+        from_input, "_get", AsyncMock(return_value=_target(id="existing", profile_version=4))
+    )
+
+    rpc_calls: list[dict[str, Any]] = []
+
+    async def fake_rpc(_s, **kw):  # type: ignore[no-untyped-def]
+        rpc_calls.append(kw)
+        return ("applied", 5)
+
+    monkeypatch.setattr(from_input, "apply_profile_merge_rpc_async", fake_rpc)
 
     await from_input.derive_url_target_bg(
         supabase,
@@ -811,13 +956,119 @@ async def test_derive_url_target_bg_matched_bumps_version(
         target_id="existing",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/123",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
-        is_new=False,
     )
 
+    assert rpc_calls and rpc_calls[0]["expected_version"] == 4  # version-checked
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
-    assert update_body.profile_version == 5  # bumped from 4
     assert update_body.activation_status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_derive_url_target_bg_materializes_and_saves_posting(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """The URL posting itself becomes a real, tailorable job: scored against the
+    freshly-derived target (``targets=[target]``) and saved to the user's pipeline
+    (``status='saved'``). This is the gap the from-url flow used to have — the JD
+    was dissolved into the profile as a reference JD and never became a job, so no
+    resume/cover letter could be generated for it."""
+    supabase = MagicMock()
+    monkeypatch.setattr(
+        from_input, "_add_reference_jd", AsyncMock(return_value=_ref_jd(target_id="new"))
+    )
+    monkeypatch.setattr(
+        from_input, "_list_reference_jds", AsyncMock(return_value=[_ref_jd(target_id="new")])
+    )
+    monkeypatch.setattr(
+        from_input, "_get", AsyncMock(return_value=_target(id="new", profile_version=1))
+    )
+    monkeypatch.setattr(
+        from_input, "apply_profile_merge_rpc_async", AsyncMock(return_value=("applied", 2))
+    )
+
+    await from_input.derive_url_target_bg(
+        supabase,
+        MagicMock(),
+        user_id="user-1",
+        target_id="new",
+        jd_text="x" * 200,
+        final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    # Posting scored against the just-derived target (the re-read canonical row).
+    mat = stub_llm_helpers.by_name("materialize_job")
+    assert mat and mat[0]["target_ids"] == ["new"]
+    assert mat[0]["title"] == "Senior Frontend Engineer"
+    # ...and saved to the user's pipeline so it shows in /jobs + is tailorable.
+    saved = stub_llm_helpers.by_name("user_job")
+    assert saved and saved[0]["status"] == "saved"
+    assert saved[0]["job_posting_id"] == "posting-1"
+
+
+@pytest.mark.asyncio
+async def test_derive_url_target_bg_over_cap_skips_shared_write(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+) -> None:
+    """A contributor already at the per-user reference-JD cap makes NO change to
+    the shared profile — no JD stored, no merge RPC — but still gets a fit score
+    against the existing profile (SEC-1 cap)."""
+    supabase = MagicMock()
+    monkeypatch.setattr(
+        from_input,
+        "_count_user_reference_jds",
+        AsyncMock(return_value=settings.reference_jd_max_per_user_per_target),
+    )
+    add_ref_calls: list[dict[str, Any]] = []
+
+    async def fake_add(_s, **kw):  # type: ignore[no-untyped-def]
+        add_ref_calls.append(kw)
+        return _ref_jd()
+
+    monkeypatch.setattr(from_input, "_add_reference_jd", fake_add)
+    rpc_calls: list[dict[str, Any]] = []
+
+    async def fake_rpc(_s, **kw):  # type: ignore[no-untyped-def]
+        rpc_calls.append(kw)
+        return ("applied", 2)
+
+    monkeypatch.setattr(from_input, "apply_profile_merge_rpc_async", fake_rpc)
+    monkeypatch.setattr(
+        from_input, "_get", AsyncMock(return_value=_target(id="existing", profile_version=4))
+    )
+
+    await from_input.derive_url_target_bg(
+        supabase,
+        MagicMock(),
+        user_id="user-1",
+        target_id="existing",
+        jd_text="x" * 200,
+        final_url="https://example.com/jobs/123",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    # Over cap → no shared-profile mutation at all.
+    assert add_ref_calls == []
+    assert rpc_calls == []
+    # But the user still gets their fit score.
+    assert stub_crud.by_name("link")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -828,7 +1079,7 @@ async def test_derive_url_target_bg_marks_error_on_failure(
 ) -> None:
     supabase = MagicMock()
 
-    async def boom(llm, *, jd_text):  # type: ignore[no-untyped-def]
+    async def boom(llm, *, jd_text, supabase):  # type: ignore[no-untyped-def]
         raise RuntimeError("LLM down")
 
     monkeypatch.setattr(from_input, "derive_profile_from_jd", boom)
@@ -840,8 +1091,11 @@ async def test_derive_url_target_bg_marks_error_on_failure(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     update_bodies = [c["body"] for c in stub_crud.by_name("update")]
@@ -859,7 +1113,7 @@ async def test_derive_url_target_bg_marks_error_on_timeout(
     supabase = MagicMock()
     monkeypatch.setattr(from_input, "DERIVATION_TIMEOUT_S", 0.05)
 
-    async def hang(llm, *, jd_text):  # type: ignore[no-untyped-def]
+    async def hang(llm, *, jd_text, supabase):  # type: ignore[no-untyped-def]
         await asyncio.sleep(1)
         raise AssertionError("should have timed out")
 
@@ -872,8 +1126,11 @@ async def test_derive_url_target_bg_marks_error_on_timeout(
         target_id="new",
         jd_text="x" * 200,
         final_url="https://example.com/jobs/abc",
+        extracted_title="Senior Frontend Engineer",
+        company_name="Acme",
+        location=None,
+        salary_text=None,
         payload=OptimizedPayload(),
-        is_new=True,
     )
 
     update_bodies = [c["body"] for c in stub_crud.by_name("update")]

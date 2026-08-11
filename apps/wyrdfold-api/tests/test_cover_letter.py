@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from docx import Document
@@ -149,9 +149,14 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
 
 def _make_supabase_mock(*, insert_data: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    supabase.table.return_value.insert.return_value.execute.return_value.data = insert_data
-    supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = []
-    supabase.storage.from_.return_value.upload.return_value = None
+    tbl = supabase.table.return_value
+    tbl.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=insert_data))
+    tbl.update.return_value.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    tbl.select.return_value.eq.return_value.order.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    supabase.storage.from_.return_value.upload = AsyncMock(return_value=None)
     return supabase
 
 
@@ -433,7 +438,7 @@ async def test_pipeline_success_returns_record_and_uploads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(scripted={DEFAULT_COVER_LETTER_PURPOSE: _valid_letter_json()})
     result = await run_cover_letter_pipeline(
@@ -454,8 +459,8 @@ async def test_pipeline_cost_logs_under_tailor_cover_letter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    cost_record = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", cost_record)
+    cost_record = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", cost_record)
 
     llm = MockLLMClient(scripted={DEFAULT_COVER_LETTER_PURPOSE: _valid_letter_json()})
     await run_cover_letter_pipeline(
@@ -475,7 +480,7 @@ async def test_pipeline_preferences_are_passed_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     seen: dict[str, str] = {}
 
@@ -503,11 +508,15 @@ async def test_pipeline_preferences_are_passed_through(
     assert "lead with performance" in seen["latest"]
 
 
-async def test_pipeline_lint_failure_does_not_persist(
+async def test_pipeline_lint_failure_persists_flagged_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    supabase = _make_supabase_mock(insert_data=[])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    """Cover letters get the resume's flagged-draft treatment: a letter that
+    fails ATS lint is PERSISTED with its violations, not discarded. They run
+    the same linter and cost the same daily-cap slot, so the earlier
+    resume-only carve-out had no rationale left."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     def fake_lint(_b: bytes, *, document_type: str = "resume") -> LintResult:
         return LintResult(
@@ -534,7 +543,19 @@ async def test_pipeline_lint_failure_does_not_persist(
         contact=_contact(),
     )
     assert isinstance(result, CoverLetterPipelineLintFailure)
-    supabase.table.return_value.insert.assert_not_called()
+    # The row was written, flagged with what failed.
+    rows = [
+        c.args[0]
+        for c in supabase.table.return_value.insert.call_args_list
+        if isinstance(c.args[0], dict) and "jd_snapshot" in c.args[0]
+    ]
+    assert len(rows) == 1, f"expected one documents insert, got {len(rows)}"
+    assert [v["code"] for v in rows[0]["lint_violations"]] == ["no_tables"]
+    assert rows[0]["document_type"] == "cover_letter"
+    assert rows[0]["payload_md"], "the flagged draft keeps its markdown to edit"
+    assert result.record.id
+    # No .docx uploaded for a flagged draft — download re-renders lazily.
+    supabase.storage.from_.return_value.upload.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

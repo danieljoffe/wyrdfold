@@ -15,23 +15,26 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 VOTES_TABLE = "contribution_votes"
 
 
-def set_user_vote(user_client: Client, *, reference_jd_id: str, user_id: str, value: int) -> None:
-    """Record (or clear) the caller's vote via their RLS client.
+async def set_user_vote(
+    user_client: AsyncClient, *, reference_jd_id: str, user_id: str, value: int
+) -> None:
+    """Record (or clear) the caller's vote via their async RLS client (#57 PR-F).
 
     ``value`` 0 deletes the caller's vote; -1/+1 upserts it. RLS's WITH CHECK
     (``auth.uid() = user_id``) guarantees a caller can only write their own row.
+    Awaited on the pooled async user client so the write never blocks the loop.
     """
     if value == 0:
-        user_client.table(VOTES_TABLE).delete().eq("reference_jd_id", reference_jd_id).eq(
+        await user_client.table(VOTES_TABLE).delete().eq("reference_jd_id", reference_jd_id).eq(
             "user_id", user_id
         ).execute()
         return
-    user_client.table(VOTES_TABLE).upsert(
+    await user_client.table(VOTES_TABLE).upsert(
         {
             "reference_jd_id": reference_jd_id,
             "user_id": user_id,
@@ -55,8 +58,8 @@ def get_user_vote(user_client: Client, *, reference_jd_id: str, user_id: str) ->
     return int(rows[0]["value"]) if rows else 0
 
 
-def recompute_suppression(
-    service_client: Client, *, reference_jd_id: str, quorum: int
+async def recompute_suppression(
+    service_client: AsyncClient, *, reference_jd_id: str, quorum: int
 ) -> tuple[bool, bool]:
     """Atomically tally all votes and reconcile ``suppressed`` (service-role).
 
@@ -71,9 +74,10 @@ def recompute_suppression(
     un/re-suppress a contribution everyone merges (audit #29 lost-update race).
     The function is granted to ``service_role`` only, so it must be called on the
     service-role client (the tally reads every user's vote, hidden from any single
-    caller by RLS).
+    caller by RLS). Awaited on the pooled async service client (#57 PR-G2e-5) so
+    the tally round-trip never blocks the loop.
     """
-    resp = service_client.rpc(
+    resp = await service_client.rpc(
         "recompute_contribution_suppression",
         {"p_reference_jd_id": reference_jd_id, "p_quorum": quorum},
     ).execute()

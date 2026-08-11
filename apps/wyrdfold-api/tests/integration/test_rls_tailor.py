@@ -1,6 +1,6 @@
 """RLS gate for Phase 1 — tailor documents.
 
-The tailor read/write endpoints now use `get_user_supabase`. `documents` has an
+The tailor read/write endpoints now use `get_async_user_supabase`. `documents` has an
 `auth.uid() = user_id` policy (same shape as experience_optimized_docs) and
 `document_versions` is parent-scoped (same shape as experience_chunks). Prove
 both scope to the caller on the live stack.

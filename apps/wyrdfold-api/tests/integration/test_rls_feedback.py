@@ -4,7 +4,7 @@ Proves what the mock suite can't: with NO Python ``user_id`` filter, a
 JWT-bound user client reading ``job_feedback`` sees only its own rows —
 Postgres RLS (``job_feedback_self_select``) is the control. If
 ``list_feedback`` ever drops its filter, or the policy regresses, this
-fails. The route migration to the user client (``get_user_supabase``) is
+fails. The route migration to the user client (``get_async_user_supabase``) is
 what makes RLS the backstop instead of hand-written Python.
 """
 

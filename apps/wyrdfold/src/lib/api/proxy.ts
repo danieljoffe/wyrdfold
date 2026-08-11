@@ -30,22 +30,62 @@ export const LLM_TIMEOUT_MS = 120_000;
  * `getUser()` first; cheap because `cache()` dedupes within a request
  * so multiple proxy helpers in the same handler share one verification.
  */
+/**
+ * Retry budget for TRANSIENT auth-server failures — see below. Mirrors the
+ * upstream-fetch retry a few lines down; same reasoning, same shape.
+ */
+const _AUTH_RETRIES = 1;
+const _AUTH_RETRY_BACKOFF_MS = 100;
+
 export const getAccessToken = cache(async (): Promise<string | null> => {
-  try {
-    const supabase = await createAuthServerClient();
-    const {
-      data: { user },
-      error,
-    } = await supabase.auth.getUser();
-    if (error || !user) return null;
-    // Now safe to read the (verified) session for its access_token.
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    return session?.access_token ?? null;
-  } catch {
-    return null;
+  // WHY THIS RETRIES (red team, 2026-08-08): this helper used to collapse every
+  // failure into `null`, and `null` means 401 to all three callers below. That
+  // conflated two very different things — "this token is not valid" and "the
+  // auth server just had a bad moment" — and the second one logged the user out.
+  //
+  // Measured against prod: 0/25 serial requests 401'd, 0/20 concurrent, but
+  // **2/40 concurrent** did, and the very next serial request succeeded. The
+  // session was fine the whole time. `getUser()` calls Supabase Auth on every
+  // request (#851 S1) and React `cache()` only dedupes WITHIN one request, so a
+  // burst of N requests makes N calls to GoTrue — which this project caps at 10
+  // connections (Supabase advisor `auth_db_connections_absolute`). Under a burst
+  // it sheds load, and a shed connection was indistinguishable from a forged JWT.
+  //
+  // Retrying keeps the security posture exactly as it was: a genuine 4xx from
+  // the auth server is terminal and still returns null, and a total failure
+  // still returns null. It never fails open.
+  for (let attempt = 0; attempt <= _AUTH_RETRIES; attempt++) {
+    try {
+      const supabase = await createAuthServerClient();
+      const {
+        data: { user },
+        error,
+      } = await supabase.auth.getUser();
+
+      if (!error) {
+        if (!user) return null; // verified: genuinely no session
+        // Now safe to read the (verified) session for its access_token.
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        return session?.access_token ?? null;
+      }
+
+      // A 4xx IS the answer — the token is bad. Do not retry, do not let a
+      // rejected credential linger into a second attempt.
+      const status = (error as { status?: number }).status;
+      if (typeof status === 'number' && status >= 400 && status < 500) {
+        return null;
+      }
+      // Anything else (5xx, no status at all, connection shed) is infrastructure.
+      if (attempt === _AUTH_RETRIES) return null;
+    } catch {
+      // Network / abort / timeout reaching the auth server — transient.
+      if (attempt === _AUTH_RETRIES) return null;
+    }
+    await new Promise(r => setTimeout(r, _AUTH_RETRY_BACKOFF_MS));
   }
+  return null;
 });
 
 /**
@@ -206,42 +246,65 @@ export async function proxyToWyrdfoldAPI(
   const qs = searchParams ? `?${searchParams.toString()}` : '';
   const url = `${apiBaseUrl()}${path}${qs}`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Transient-failure retry for idempotent reads only (#604). Railway
+  // connection drops surface here as fetch rejections while the upstream
+  // finishes the request and logs 200 into a dead socket — the 2026-08-05
+  // drive correlated every browser-visible /api/jobs 503 with a slow-but-OK
+  // Railway response. One re-issue absorbs those, mirroring
+  // ``fetchJsonFromWyrdfoldAPI``. Writes are never re-issued: they aren't
+  // idempotent, and a duplicated POST (analysis, tailor) double-spends.
+  const attempts = method === 'GET' ? 1 + _DEFAULT_RETRIES : 1;
+  let lastErr: unknown;
 
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : null,
-      signal: controller.signal,
-    });
-
-    if (binary) {
-      const buffer = await res.arrayBuffer();
-      const headers: Record<string, string> = {
-        'Content-Type':
-          res.headers.get('Content-Type') ?? 'application/octet-stream',
-      };
-      const disposition = res.headers.get('Content-Disposition');
-      if (disposition) headers['Content-Disposition'] = disposition;
-      return new NextResponse(buffer, { status: res.status, headers });
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, _RETRY_BACKOFF_MS));
     }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    const rawBody = await res.text();
     try {
-      return NextResponse.json(JSON.parse(rawBody), { status: res.status });
-    } catch {
-      return nonJsonUpstream(rawBody, res.status);
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : null,
+        signal: controller.signal,
+      });
+
+      // Retry an intermediate upstream 5xx the same as a network drop; the
+      // final attempt's response is forwarded as-is either way.
+      if (res.status >= 500 && attempt < attempts - 1) {
+        continue;
+      }
+
+      if (binary) {
+        const buffer = await res.arrayBuffer();
+        const headers: Record<string, string> = {
+          'Content-Type':
+            res.headers.get('Content-Type') ?? 'application/octet-stream',
+        };
+        const disposition = res.headers.get('Content-Disposition');
+        if (disposition) headers['Content-Disposition'] = disposition;
+        return new NextResponse(buffer, { status: res.status, headers });
+      }
+
+      const rawBody = await res.text();
+      try {
+        return NextResponse.json(JSON.parse(rawBody), { status: res.status });
+      } catch {
+        return nonJsonUpstream(rawBody, res.status);
+      }
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts - 1) return unavailable(err);
+    } finally {
+      clearTimeout(timer);
     }
-  } catch (err) {
-    return unavailable(err);
-  } finally {
-    clearTimeout(timer);
   }
+  return unavailable(lastErr);
 }
 
 /**

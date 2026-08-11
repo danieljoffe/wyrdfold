@@ -94,7 +94,7 @@ def _target(
             domain=DomainProfile(signals=domain, weight=0.5),
             negative=NegativeProfile(keywords=["intern", "junior"], weight=-10.0),
         ),
-        is_active=True,
+        app_active=True,
         created_at=_TS,
         updated_at=_TS,
         seniority_hint=seniority_hint,  # type: ignore[arg-type]

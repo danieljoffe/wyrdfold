@@ -14,6 +14,7 @@ from typing import Any
 
 from app.constants import SYSTEM_USER_ID
 from app.models.targets import JobTarget, ScoringProfile
+from app.services.embeddings.job_embeddings import EMBED_DIMENSIONS
 from app.services.embeddings.mock import MockEmbeddingsClient
 from app.services.embeddings.target_embeddings import (
     TARGET_EMBED_PURPOSE,
@@ -38,7 +39,7 @@ def _target(
         description=description,
         scoring_profile=ScoringProfile(),
         search_keywords=keywords if keywords is not None else ["React", "TypeScript"],
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -174,7 +175,7 @@ async def test_new_target_is_embedded_as_query_and_written() -> None:
     assert len(sb.targets.writes) == 1
     row = sb.targets.writes[0]
     assert row["embedding_text_hash"] == content_hash(embed_text_for_target(_target()))
-    assert len(row["embedding"]) == 1024
+    assert len(row["embedding"]) == EMBED_DIMENSIONS  # shared 512-d space with job vectors
     # Cost row logged under the pre-scan purpose, instance key.
     assert len(sb.llm_costs.writes) == 1
     assert sb.llm_costs.writes[0]["purpose"] == TARGET_EMBED_PURPOSE

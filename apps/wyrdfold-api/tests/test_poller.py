@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -30,7 +30,7 @@ def _make_target(core_keywords: dict[str, int]) -> JobTarget:
             seniority=SeniorityProfile(signals=["senior", "staff", "lead"]),
         ),
         search_keywords=[],
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -187,7 +187,7 @@ def _search_kw_target(search_keywords: list[str], core: dict[str, int]) -> JobTa
             seniority=SeniorityProfile(signals=["senior", "staff", "lead"]),
         ),
         search_keywords=search_keywords,
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -198,9 +198,8 @@ def _us_job(title: str) -> StandardJob:
         external_id="e1",
         title=title,
         location_name="New York, NY",
-        department=None,
         content="",
-        updated_at="2026-01-01",
+        posted_at="2026-01-01",
         absolute_url="https://example.com/j/1",
     )
 
@@ -325,7 +324,7 @@ def _target_with_keywords(
             seniority=SeniorityProfile(signals=["director", "head of"]),
         ),
         search_keywords=search_keywords,
-        is_active=True,
+        app_active=True,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
@@ -376,7 +375,7 @@ def test_and_semantics_admits_excluded_for_audit():
 # ---- poll_sources_for_target: inactive-target guard -----------------------
 
 
-def _full_target(*, is_active: bool, search_keywords: list[str]) -> JobTarget:
+def _full_target(*, app_active: bool, search_keywords: list[str]) -> JobTarget:
     """Build a target with a real search_keywords list so the inactive
     guard is exercised in isolation from the 'empty keywords' guard.
     """
@@ -390,27 +389,32 @@ def _full_target(*, is_active: bool, search_keywords: list[str]) -> JobTarget:
             seniority=SeniorityProfile(signals=["staff"]),
         ),
         search_keywords=search_keywords,
-        is_active=is_active,
+        app_active=app_active,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
 
 
-def test_poll_sources_for_target_skips_inactive_target() -> None:
-    """Inactive targets short-circuit before any sources query.
+def test_poll_sources_for_target_skips_inactive_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-pipeline-active targets short-circuit before any sources query.
 
-    ``targets.is_active=False`` means no user currently has the target
-    enabled (trigger OR across user_targets). Fanning out a per-target
-    poll across every ATS source for a target nobody will see is pure
-    waste — return an empty PollResult immediately.
+    Pipeline-active = ``app_active`` floor OR any active membership,
+    checked live via ``crud.is_pipeline_active`` (P0 re-semantics — the
+    trigger-cached flag is gone). Fanning out a per-target poll across
+    every ATS source for a target nobody will see is pure waste —
+    return an empty PollResult immediately.
     """
     import asyncio
     from unittest.mock import MagicMock
 
+    import app.services.poller as poller_mod
     from app.services.poller import poll_sources_for_target
 
+    monkeypatch.setattr(poller_mod, "_is_pipeline_active", AsyncMock(return_value=False))
     supabase = MagicMock()
-    target = _full_target(is_active=False, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=False, search_keywords=["frontend engineer"])
 
     result = asyncio.run(poll_sources_for_target(supabase, target))
 
@@ -437,6 +441,13 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
     # Admit path (e.g. the budget re-check tests): a triaged-in job upserts,
     # so default jobs.upsert to "no rows" rather than a bare MagicMock.
     jobs_table.upsert.return_value.execute.return_value.data = []
+    # #514: the poller reads the source's FULL external_id set (engaged and
+    # archived rows included) for Phase-1 admission scoping. Default it to
+    # the same ids as the RPC's live-unengaged view; tests that need the
+    # wider set (engaged rows) override this chain.
+    jobs_table.select.return_value.eq.return_value.execute.return_value.data = [
+        {"external_id": r.get("external_id")} for r in existing_rows
+    ]
 
     sources_table = MagicMock()
     # Stage-3 junction, empty (no subscribed users) so the post-triage
@@ -446,11 +457,18 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
     (
         user_targets_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
+    # #514: Stage 2 reads the persisted ``promising`` floor for refreshed
+    # known rows. Empty by default; floor tests override.
+    scores_table = MagicMock()
+    (
+        scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
+    ) = []
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
         "user_targets": user_targets_table,
+        "scores": scores_table,
     }[name]
 
     # #93: both the existing-rows read and the stale-archive write are
@@ -502,7 +520,7 @@ async def test_zero_job_fetch_with_existing_rows_skips_archiving(monkeypatch):
         return []
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", empty_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -533,15 +551,14 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
                 external_id="live-1",
                 title="Director of CX",
                 location_name="London, United Kingdom",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -584,15 +601,14 @@ async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
                 external_id="live-1",
                 title="Director of CX",
                 location_name="London, United Kingdom",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -633,18 +649,16 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
                 external_id="known-1",
                 title="Old Role",
                 location_name="Remote",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             ),
             StandardJob(
                 external_id="new-1",
                 title="Brand New Role",
                 location_name="Remote",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/2",
             ),
         ]
@@ -659,8 +673,8 @@ async def test_phase1_triage_skips_known_external_ids(monkeypatch):
     fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two_job_fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     # Permissive payer-budget gate — this test is about triage scoping,
@@ -700,17 +714,16 @@ async def _run_triage_with_budget(monkeypatch, *, exhausted, fake_triage) -> tup
                 external_id="new-1",
                 title="Brand New Role",
                 location_name="Remote",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/2",
             )
         ]
 
     target = _target_with_keywords({"brand": 3}, ["brand new role"])
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [target])
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", exhausted)
 
@@ -734,7 +747,7 @@ async def test_phase1_triage_defers_when_global_budget_exhausted(monkeypatch):
 
     fake_triage = AsyncMock()  # must NOT be awaited
     summary, jobs_table = await _run_triage_with_budget(
-        monkeypatch, exhausted=lambda _sb: True, fake_triage=fake_triage
+        monkeypatch, exhausted=AsyncMock(return_value=True), fake_triage=fake_triage
     )
 
     assert summary["error"] is None
@@ -757,7 +770,7 @@ async def test_phase1_triage_fails_open_on_budget_read_error(monkeypatch):
     from app.models.llm import LLMResult, LLMUsage
     from app.services.relevance.title_triage import TitleVerdict
 
-    def boom(_sb: object) -> bool:
+    async def boom(_sb: object) -> bool:
         raise RuntimeError("spend meter unreachable")
 
     # A real result (not None): the read error doesn't stop the LLM call, which
@@ -785,7 +798,7 @@ async def test_phase1_triage_defers_when_the_llm_call_fails(monkeypatch):
 
     fake_triage = AsyncMock(return_value=({}, None))  # attempted, but FAILED
     summary, jobs_table = await _run_triage_with_budget(
-        monkeypatch, exhausted=lambda _sb: False, fake_triage=fake_triage
+        monkeypatch, exhausted=AsyncMock(return_value=False), fake_triage=fake_triage
     )
 
     assert summary["error"] is None
@@ -845,28 +858,6 @@ async def test_load_alert_rows_no_ids_short_circuits():
 
 
 @pytest.mark.asyncio
-async def test_batch_fetch_job_scores_uses_rpc_body() -> None:
-    """A large score lookup is ONE ``get_job_scores_by_ids`` RPC with the
-    full id list in the jsonb body (no URL ``.in_()`` chunking), folded into
-    the same ``{id: score}`` dict the chunked read produced."""
-    from app.services.poller import _batch_fetch_job_scores
-
-    job_ids = [f"job-{i}" for i in range(450)]
-    rpc_rows = [{"id": jid, "score": idx} for idx, jid in enumerate(job_ids)]
-
-    supabase = MagicMock()
-    supabase.rpc.return_value.execute.return_value.data = rpc_rows
-
-    scores = await _batch_fetch_job_scores(supabase, job_ids)
-
-    supabase.rpc.assert_called_once_with("get_job_scores_by_ids", {"p_ids": job_ids})
-    # Every id keyed once, identical to the old single-query result.
-    assert len(scores) == 450
-    assert scores["job-0"] == 0
-    assert scores["job-449"] == 449
-
-
-@pytest.mark.asyncio
 async def test_load_alert_rows_uses_rpc_body() -> None:
     """A large alert refresh is ONE ``get_jobs_by_ids`` RPC with the full id
     list in the jsonb body (no URL ``.in_()`` chunking); the returned rows
@@ -895,9 +886,8 @@ def _job(external_id: str, title: str, location: str) -> StandardJob:
         external_id=external_id,
         title=title,
         location_name=location,
-        department=None,
         content="",
-        updated_at="2026-01-01",
+        posted_at="2026-01-01",
         absolute_url=f"https://example.com/j/{external_id}",
     )
 
@@ -929,7 +919,7 @@ async def test_phase1_triage_only_sees_free_gate_survivors(monkeypatch):
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -996,7 +986,7 @@ async def test_phase1_verdicts_keyed_by_original_indices_after_free_gates(monkey
     )
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     open_gate = MagicMock()
@@ -1030,16 +1020,25 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
     """
     jobs_table = MagicMock()
     jobs_table.upsert.return_value.execute.return_value.data = []
+    # #514: known-external-id read for Phase-1 admission scoping (this path
+    # has no live-unengaged RPC read). Empty by default; override per test.
+    jobs_table.select.return_value.eq.return_value.execute.return_value.data = []
     sources_table = MagicMock()
     user_targets_table = MagicMock()
     (
         user_targets_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
+    ) = []
+    # #514: Stage-2 persisted-``promising`` floor read for refreshed rows.
+    scores_table = MagicMock()
+    (
+        scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
         "user_targets": user_targets_table,
+        "scores": scores_table,
     }[name]
     # #93: the legacy Stage 3 score pre-fetch (``_batch_fetch_job_scores``)
     # is the ``get_job_scores_by_ids`` RPC now, not ``jobs.select().in_()``.
@@ -1070,11 +1069,11 @@ async def test_targeted_triage_only_sees_free_gate_survivors(monkeypatch):
             _job("k3", "Staff Frontend Engineer", "Remote"),  # survivor
         ]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     fake_triage = AsyncMock(return_value=({}, None))
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
 
     summary = await poller_mod._poll_one_source_for_target(
@@ -1122,7 +1121,7 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     async def fetch(_token: str) -> list[StandardJob]:
         return [_job("k3", "Staff Frontend Engineer", "Remote")]
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
     doc = MagicMock()
     doc.payload = {"profile": "stub"}
 
@@ -1130,15 +1129,13 @@ def _wire_targeted_stage3(monkeypatch, *, phase2_enabled: bool):
     fake_legacy = AsyncMock()
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_llm_client", lambda *_a, **_k: MagicMock())
-    monkeypatch.setattr(poller_mod, "get_latest_optimized", lambda _sb, _uid: doc)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "_latest_optimized", AsyncMock(return_value=doc))
     # The scoring helpers are the async ``*_poll`` seam variants now (#57) —
     # the poller awaits them directly, so their stand-ins must be awaitable.
     monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
     monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
-    monkeypatch.setattr(poller_mod, "batch_update_global_scores", AsyncMock())
     monkeypatch.setattr(poller_mod, "run_phase2_for_jobs", fake_phase2)
-    monkeypatch.setattr(poller_mod, "_run_llm_scoring_for_row", fake_legacy)
 
     return supabase, fake_phase2, fake_legacy, target
 
@@ -1168,38 +1165,22 @@ async def test_targeted_stage3_uses_phase2_when_flag_on(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_targeted_stage3_legacy_fallback_when_flag_off(monkeypatch):
-    """Flag off → the legacy Stage 3 path runs unchanged."""
-    from app.services import poller as poller_mod
-
-    supabase, fake_phase2, fake_legacy, target = _wire_targeted_stage3(
-        monkeypatch, phase2_enabled=False
-    )
-
-    summary = await poller_mod._poll_one_source_for_target(
-        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
-    )
-
-    assert summary["error"] is None
-    assert fake_legacy.await_count == 1
-    fake_phase2.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_targeted_grading_uses_payer_byok_key(monkeypatch):
     """#5 P3: background grading resolves the LLM client on the payer's own
-    OpenRouter key (``get_client(supabase, payer)``), not the instance key."""
+    OpenRouter key (``get_client_async(supabase, payer)``), not the instance
+    key."""
     from app.services import poller as poller_mod
 
     supabase, fake_phase2, _fake_legacy, target = _wire_targeted_stage3(
         monkeypatch, phase2_enabled=True
     )
     seen_payers: list[str | None] = []
-    monkeypatch.setattr(
-        poller_mod,
-        "get_llm_client",
-        lambda _sb, user_id: seen_payers.append(user_id) or MagicMock(),
-    )
+
+    async def _fake_resolve(_sb, user_id):
+        seen_payers.append(user_id)
+        return MagicMock()
+
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _fake_resolve)
 
     summary = await poller_mod._poll_one_source_for_target(
         dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
@@ -1222,10 +1203,10 @@ async def test_targeted_grading_deferred_when_payer_has_no_byok_key(monkeypatch)
         monkeypatch, phase2_enabled=True
     )
 
-    def _no_key(_sb, _uid):
+    async def _no_key(_sb, _uid):
         raise MissingUserKeyError("openrouter")
 
-    monkeypatch.setattr(poller_mod, "get_llm_client", _no_key)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", _no_key)
 
     summary = await poller_mod._poll_one_source_for_target(
         dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
@@ -1257,9 +1238,8 @@ async def test_last_candidate_at_stamped_when_candidates_upserted(monkeypatch):
                 external_id="c-1",
                 title="Brand New Role",
                 location_name="Remote",
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
@@ -1302,15 +1282,14 @@ async def test_no_candidates_leaves_last_candidate_at_unstamped(monkeypatch):
                 external_id="c-1",
                 title="Director of CX",
                 location_name="London, United Kingdom",  # dropped at the US gate
-                department=None,
                 content="",
-                updated_at="2026-01-01",
+                posted_at="2026-01-01",
                 absolute_url="https://example.com/j/1",
             )
         ]
 
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
-    monkeypatch.setattr(poller_mod, "get_active_target", lambda _sb: [])
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[]))
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
@@ -1439,9 +1418,7 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
     monkeypatch.setattr(live_settings, "validate_poll_urls", False)
     monkeypatch.setattr(live_settings, "qualification_enabled", False)
     monkeypatch.setattr(live_settings, "prescan_embed_enabled", False)
-    monkeypatch.setattr(live_settings, "prescan_shadow_enabled", False)
     monkeypatch.setattr(live_settings, "recency_decay_enabled", False)
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
 
     async_client = _AsyncSeamClient()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
@@ -1461,7 +1438,7 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
         MagicMock(send_alerts_for_new_jobs=AsyncMock(), send_sms_alerts_for_new_jobs=AsyncMock()),
     )
 
-    target = _full_target(is_active=True, search_keywords=["frontend engineer", "react"])
+    target = _full_target(app_active=True, search_keywords=["frontend engineer", "react"])
     sync_client = _SyncClientForbidden()
 
     summary = await poller_mod._poll_one_source(
@@ -1494,9 +1471,6 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
     ]
     assert len(score_upserts) == 4
 
-    # Global-score aggregation RPC ran on the async client too.
-    assert async_client.chains("rpc", "bulk_update_scores")
-
     # Mark-polled update landed on sources via the async client.
     source_updates = [
         ops
@@ -1504,3 +1478,761 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
         if any(o[0] == "update" for o in ops[1:])
     ]
     assert source_updates, "mark-polled update must ride the async client"
+
+
+# ---- #514: known jobs must survive the Phase-1 admit gate -------------------
+
+
+@pytest.mark.asyncio
+async def test_known_job_refreshes_when_phase1_rejects_a_candidate(monkeypatch):
+    """#514 regression — the prod starvation. A cycle that triages ≥1 NEW
+    candidate must still conflict-update already-known rows: the #285
+    budget-defer rule treated a known job (never a triage candidate, so no
+    attempt entry) as budget-deferred and dropped it from the upsert. Any
+    source with a standing rejected candidate therefore never refreshed
+    its known rows — board-side JD edits, the escaped-HTML heal, and
+    salary re-extraction all silently stopped propagating."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    existing = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        }
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-1",
+                title="Brand New Role",
+                location_name="Remote",
+                content="<p>edited JD with a shiny new $100k salary</p>",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/1",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/2",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    # The single candidate (the NEW job) is rejected → verdicts are
+    # non-empty, which is exactly the state that starved known rows.
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+    )
+
+    assert summary["error"] is None
+    # Known title never re-triaged (unchanged behavior).
+    assert fake_triage.await_args.kwargs["titles"] == ["Brand New Role II"]
+    # THE fix: the known row is refreshed; the rejected candidate stays out.
+    jobs_table.upsert.assert_called_once()
+    payload = jobs_table.upsert.call_args.args[0]
+    assert [r["external_id"] for r in payload] == ["known-1"]
+    # Every upsert row carries the structured salary columns (the
+    # ``salary_columns`` spread) so text and parts can never diverge.
+    assert {"salary_min", "salary_max", "salary_currency", "salary_period"} <= set(payload[0])
+
+
+@pytest.mark.asyncio
+async def test_engaged_job_refreshes_despite_missing_from_unengaged_view(monkeypatch):
+    """#514: admission scoping keys on the source's FULL external_id set,
+    not the live-unengaged RPC view — a saved/applied (engaged) row is
+    still a known row. Before the widening it re-entered triage as a
+    candidate and could be starved by a rejecting verdict exactly like the
+    unengaged case."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    # Unengaged view is EMPTY — the engaged row only appears in the full set.
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+    jobs_table.select.return_value.eq.return_value.execute.return_value.data = [
+        {"external_id": "engaged-1"}
+    ]
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="engaged-1",
+                title="Brand New Role",
+                location_name="Remote",
+                content="<p>fresh content for the row the user saved</p>",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/1",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/2",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+    )
+
+    assert summary["error"] is None
+    # The engaged title is known → not a triage candidate (LLM sees only
+    # the genuinely new title).
+    assert fake_triage.await_args.kwargs["titles"] == ["Brand New Role II"]
+    jobs_table.upsert.assert_called_once()
+    payload = jobs_table.upsert.call_args.args[0]
+    assert [r["external_id"] for r in payload] == ["engaged-1"]
+
+
+@pytest.mark.asyncio
+async def test_known_job_stage2_preserves_phase1_floor(monkeypatch):
+    """#514: Stage 2 must not re-litigate Phase 1 for a refreshed known row.
+    The persisted ``promising`` verdict is the floor (False → the
+    (job, target) pair stays excluded, mirroring bulk_score_for_target's
+    re-score contract); the stored verdict/confidence columns are left
+    untouched (None args). A True/NULL floor scores un-floored."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    existing = [
+        {
+            "id": "job-a",
+            "external_id": "known-a",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        },
+        {
+            "id": "job-b",
+            "external_id": "known-b",
+            "title": "Brand New Role Live",
+            "company_name": "Acme",
+        },
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+    # The conflict-update touches both known rows. job-b deliberately has
+    # created_at == updated_at: a conflict-update never bumps
+    # jobs.updated_at (no trigger, not in the payload), so EVERY refreshed
+    # row keeps equal timestamps — known-ness must key on the pre-upsert
+    # external_id set, or refreshed rows get misclassified as new and
+    # defer-excluded on any cycle with verdicts.
+    jobs_table.upsert.return_value.execute.return_value.data = [
+        {
+            "id": "job-a",
+            "external_id": "known-a",
+            "title": "Brand New Role",
+            "description_html": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+        },
+        {
+            "id": "job-b",
+            "external_id": "known-b",
+            "title": "Brand New Role Live",
+            "description_html": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+    ]
+    # Persisted Phase-1 verdicts: job-a was rejected for this target,
+    # job-b admitted.
+    scores_table = supabase.table("scores")
+    (
+        scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
+    ) = [
+        {"job_posting_id": "job-a", "promising": False},
+        {"job_posting_id": "job-b", "promising": True},
+    ]
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-a",
+                title="Brand New Role",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/1",
+            ),
+            StandardJob(
+                external_id="known-b",
+                title="Brand New Role Live",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/2",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/3",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, None))
+    fake_stage2 = AsyncMock()
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "target_score_and_upsert", fake_stage2)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+    )
+
+    assert summary["error"] is None
+    by_job = {c.kwargs["job_posting_id"]: c.kwargs for c in fake_stage2.await_args_list}
+    assert set(by_job) == {"job-a", "job-b"}
+    # promising=False floor → stays excluded; verdict columns untouched.
+    assert by_job["job-a"]["excluded_by_prefilter"] is True
+    assert by_job["job-a"]["promising"] is None
+    assert by_job["job-a"]["phase1_confidence"] is None
+    # promising=True floor → scores un-floored; columns untouched.
+    assert by_job["job-b"]["excluded_by_prefilter"] is False
+    assert by_job["job-b"]["promising"] is None
+
+
+@pytest.mark.asyncio
+async def test_targeted_poll_ingests_fail_open_when_payer_over_budget(monkeypatch):
+    """#514: the targeted path documents over-budget as 'skip Phase-1 spend
+    while still ingesting fail-open' — but with triage enabled and no LLM
+    (``phase1_attempted`` empty) the gate dropped EVERY job, fail-closed.
+    Free-gate survivors must ingest; grading defers."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    supabase, jobs_table, _user_targets = _make_targeted_poll_supabase()
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [_job("k3", "Staff Frontend Engineer", "Remote")]
+
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+
+    summary = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE),
+        supabase,
+        target,
+        payer_user_id="payer-1",
+        payer_over_budget=True,
+    )
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_called_once()
+    payload = jobs_table.upsert.call_args.args[0]
+    assert [r["external_id"] for r in payload] == ["k3"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_poll_known_job_bypasses_triage_and_refreshes(monkeypatch):
+    """#514: the targeted path re-triaged KNOWN titles every cycle (pure
+    LLM waste — the shared path's comment calls this out) and let a
+    flipped verdict starve the row. Known external_ids are excluded from
+    its candidates and bypass the admit gate, same as the shared path."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.models.llm import LLMResult, LLMUsage
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    supabase, jobs_table, _user_targets = _make_targeted_poll_supabase()
+    jobs_table.select.return_value.eq.return_value.execute.return_value.data = [
+        {"external_id": "k-known"}
+    ]
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            _job("k-known", "Staff Frontend Engineer", "Remote"),
+            _job("k-new", "Senior Frontend Engineer", "Remote"),
+        ]
+
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
+    # The one candidate (the NEW title) is rejected via a REAL LLM result —
+    # a None result means a failed call, whose candidates defer un-attempted.
+    ok = LLMResult(
+        content="{}", model="claude-haiku-4-5", usage=LLMUsage(), cost_usd=0.0, latency_ms=1
+    )
+    fake_triage = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=False)}, ok))
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    summary = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+
+    assert summary["error"] is None
+    # The LLM only ever sees the genuinely new title.
+    assert fake_triage.await_args.kwargs["titles"] == ["Senior Frontend Engineer"]
+    # The known row refreshes; the rejected candidate stays out.
+    jobs_table.upsert.assert_called_once()
+    payload = jobs_table.upsert.call_args.args[0]
+    assert [r["external_id"] for r in payload] == ["k-known"]
+
+
+@pytest.mark.asyncio
+async def test_refreshed_known_row_does_not_realert(monkeypatch):
+    """#514 guard: refreshed known rows must never re-enter the new-job
+    alert path. ``jobs.updated_at`` is not bumped by a conflict-update, so
+    the old created==updated split classified EVERY refresh as new — with
+    known rows now flowing again, that would have re-fired email/SMS
+    alerts for the same job on every poll cycle. New-ness keys on the
+    pre-upsert external_id set instead."""
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    existing = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        }
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+    # The refreshed row comes back with created == updated (the real
+    # conflict-update shape); the fresh row is genuinely new.
+    jobs_table.upsert.return_value.execute.return_value.data = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "description_html": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "id": "job-new",
+            "external_id": "new-1",
+            "title": "Brand New Role II",
+            "description_html": "",
+            "created_at": "2026-01-02T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+        },
+    ]
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-1",
+                title="Brand New Role",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/1",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/2",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    fake_email = AsyncMock()
+    fake_sms = AsyncMock()
+    fake_load = AsyncMock(side_effect=lambda _sb, rows: rows)
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "target_score_and_upsert", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_load_alert_rows", fake_load)
+    monkeypatch.setattr(poller_mod.notify, "send_alerts_for_new_jobs", fake_email)
+    monkeypatch.setattr(poller_mod.notify, "send_sms_alerts_for_new_jobs", fake_sms)
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
+
+    assert summary["error"] is None
+    assert summary["new"] == 1
+    assert summary["updated"] == 1
+    # Only the genuinely new row reaches the alert path.
+    alerted = [r["external_id"] for r in fake_email.await_args.args[1]]
+    assert alerted == ["new-1"]
+    assert fake_sms.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_url_validation_skips_known_rows(monkeypatch):
+    """#514 guard: with ``validate_poll_urls`` on, only NEW rows hit the
+    URL validator — a known row's URL was validated at ingest and is
+    url_health-monitored; re-validating per cycle is a HEAD storm and a
+    transient upstream blip would null a working absolute_url."""
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", True)
+
+    existing = [
+        {
+            "id": "job-known",
+            "external_id": "known-1",
+            "title": "Brand New Role",
+            "company_name": "Acme",
+        }
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="known-1",
+                title="Brand New Role",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/known",
+            ),
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role II",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-02",
+                absolute_url="https://example.com/j/new",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    seen_urls: list[str] = []
+
+    class _Valid:
+        def __init__(self, url: str) -> None:
+            self.is_valid = True
+            self.warnings: list[str] = []
+            self.final_url = url
+
+    async def fake_validate(url: str) -> object:
+        seen_urls.append(url)
+        return _Valid(url)
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "validate_job_url", fake_validate)
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
+
+    assert summary["error"] is None
+    # Only the NEW row's URL was validated; both rows still upserted.
+    assert seen_urls == ["https://example.com/j/new"]
+    payload = jobs_table.upsert.call_args.args[0]
+    assert sorted(r["external_id"] for r in payload) == ["known-1", "new-1"]
+
+
+# ---- Phase 1 negative-verdict cache (#514 residual) -------------------------
+
+
+def _rejecting_triage():
+    """Triage stub that rejects every submitted title, with a REAL (non-None)
+    result object so the titles count as attempted — the cache must only ever
+    hold verdicts the LLM actually returned."""
+    from unittest.mock import AsyncMock
+
+    from app.services.relevance.title_triage import TitleVerdict
+
+    async def _reject(_llm, *, target, titles):
+        verdicts = {i + 1: TitleVerdict(id=i + 1, promising=False) for i in range(len(titles))}
+        return verdicts, MagicMock()
+
+    return AsyncMock(side_effect=_reject)
+
+
+def _wire_rejection_cache_poll(monkeypatch, *, ttl_hours: float):
+    """Shared setup for the scheduled-path cache tests: one NEW job that
+    passes the free gates, an LLM that rejects it. Returns
+    ``(supabase, fake_triage, target, run)`` where ``run()`` awaits one poll
+    cycle."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", ttl_hours)
+
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+    fake_triage = _rejecting_triage()
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    async def one_new_job(_token: str) -> list[StandardJob]:
+        return [_job("new-1", "Brand New Role", "Remote")]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+
+    async def run() -> dict:
+        return await poller_mod._poll_one_source(
+            dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+        )
+
+    return supabase, fake_triage, target, run
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_skips_llm_on_next_cycle(monkeypatch):
+    """A title the LLM rejected must NOT be re-sent on the next cycle while
+    the TTL holds: the cache re-injects a synthetic reject, so the job is
+    still dropped from the upsert (rejected, not budget-deferred) but the
+    verdict is free the second time."""
+    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    first = await run()
+    assert first["error"] is None
+    assert fake_triage.await_count == 1
+    assert fake_triage.await_args.kwargs["titles"] == ["Brand New Role"]
+    assert first["new"] == 0  # rejected → never ingested
+
+    second = await run()
+    assert second["error"] is None
+    assert fake_triage.await_count == 1  # cache hit — LLM not consulted again
+    assert second["new"] == 0  # still rejected, still not ingested
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_disabled_at_zero_ttl(monkeypatch):
+    """``phase1_rejection_ttl_hours=0`` restores the legacy behavior: every
+    cycle re-pays the verdict."""
+    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
+
+    await run()
+    await run()
+    assert fake_triage.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase1_rejection_cache_keyed_on_profile_version(monkeypatch):
+    """A profile edit bumps ``profile_version``; cached rejections under the
+    old profile must not gag the new one — the title is re-judged."""
+    from app.services import poller as poller_mod
+
+    _supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    await run()
+    assert fake_triage.await_count == 1
+
+    edited = target.model_copy(update={"profile_version": target.profile_version + 1})
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[edited]))
+    await run()
+    assert fake_triage.await_count == 2  # new profile → fresh verdict
+
+
+@pytest.mark.asyncio
+async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
+    """Same cache on the activation path (``_poll_one_source_for_target``):
+    the second pass over an unchanged board sends nothing to the LLM."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    supabase, _jobs_table, _user_targets = _make_targeted_poll_supabase()
+    fake_triage = _rejecting_triage()
+    target = _full_target(app_active=True, search_keywords=["frontend engineer"])
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [_job("k3", "Staff Frontend Engineer", "Remote")]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake_triage)
+
+    first = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+    assert first["error"] is None
+    assert fake_triage.await_count == 1
+
+    second = await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+    )
+    assert second["error"] is None
+    assert fake_triage.await_count == 1  # cached rejection — no second call
+
+
+def test_phase1_rejection_helpers_roundtrip(monkeypatch):
+    """Unit contract of the cache helpers: keyed per (target, profile_version,
+    normalized title); an expired entry stops matching; TTL=0 records nothing."""
+    import time as time_mod
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    poller_mod._phase1_record_rejection(target, "Brand  New Role")
+    # Whitespace/case-normalized title matches; other titles don't.
+    assert poller_mod._phase1_cached_rejection(target, "brand new role") is True
+    assert poller_mod._phase1_cached_rejection(target, "Other Role") is False
+    # Same title under a bumped profile_version is a different key.
+    edited = target.model_copy(update={"profile_version": target.profile_version + 1})
+    assert poller_mod._phase1_cached_rejection(edited, "brand new role") is False
+
+    # Force-expire the stored entry: it must stop matching.
+    key = poller_mod._phase1_rejection_key(target, "brand new role")
+    poller_mod._PHASE1_REJECTIONS[key] = time_mod.monotonic() - 1.0
+    assert poller_mod._phase1_cached_rejection(target, "brand new role") is False
+
+    # TTL=0: nothing is recorded, nothing matches.
+    poller_mod._PHASE1_REJECTIONS.clear()
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 0.0)
+    poller_mod._phase1_record_rejection(target, "brand new role")
+    assert poller_mod._PHASE1_REJECTIONS == {}
+
+
+def test_phase1_rejection_cache_size_bound(monkeypatch):
+    """At the hard cap the cache prunes expired entries first, and clears
+    outright when still full — it can grow stale-heavy but never unbounded."""
+    import time as time_mod
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
+    monkeypatch.setattr(poller_mod, "_PHASE1_REJECTIONS_CAP", 2)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    # Full of EXPIRED entries → pruned, then the new entry lands.
+    poller_mod._PHASE1_REJECTIONS.update(
+        {("t", 1, "a"): time_mod.monotonic() - 1, ("t", 1, "b"): time_mod.monotonic() - 1}
+    )
+    poller_mod._phase1_record_rejection(target, "fresh title")
+    assert list(poller_mod._PHASE1_REJECTIONS) == [
+        poller_mod._phase1_rejection_key(target, "fresh title")
+    ]
+
+    # Full of LIVE entries → blunt clear, then the new entry lands alone.
+    poller_mod._PHASE1_REJECTIONS.update(
+        {("t", 1, "a"): time_mod.monotonic() + 999, ("t", 1, "b"): time_mod.monotonic() + 999}
+    )
+    poller_mod._phase1_record_rejection(target, "another title")
+    assert list(poller_mod._PHASE1_REJECTIONS) == [
+        poller_mod._phase1_rejection_key(target, "another title")
+    ]
+
+
+def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#638 regression (2026-08-06 incident): the fan-out checked
+    pipeline-active ONCE at entry, so deactivating the target mid-run
+    changed nothing — a sweep-activated target ground the full catalog
+    for 3+ hours after deactivation and saturated Supabase into gateway
+    504s. The watcher must abort remaining sources within one re-check
+    interval; drained workers report unpolled."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    import app.services.poller as poller_mod
+    from app.services.poller import poll_sources_for_target
+
+    # Active at entry, inactive on every re-check.
+    checks = {"n": 0}
+
+    async def _active(_sb, _tid):
+        checks["n"] += 1
+        return checks["n"] == 1
+
+    monkeypatch.setattr(poller_mod, "_is_pipeline_active", _active)
+    monkeypatch.setattr(poller_mod, "_ACTIVE_RECHECK_S", 0.02)
+    monkeypatch.setattr(
+        poller_mod, "_read_enabled_sources", AsyncMock(return_value=[{"id": f"s-{i}"} for i in range(40)])
+    )
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=MagicMock(
+        payer_for=lambda _tid: None, target_blocked=lambda _tid: False,
+    )))
+
+    polled: list[str] = []
+
+    async def _slow_source(source, _sb, _target, **_kw):
+        polled.append(source["id"])
+        await asyncio.sleep(0.05)
+        return {"polled": True, "new": 0, "updated": 0, "error": None}
+
+    monkeypatch.setattr(poller_mod, "_poll_one_source_for_target", _slow_source)
+
+    target = _full_target(app_active=True, search_keywords=["frontend"])
+    result = asyncio.run(poll_sources_for_target(MagicMock(), target))
+
+    # The watcher fired within ~one interval — most of the 40 sources were
+    # drained as no-ops rather than polled.
+    assert result.sources_polled < 40, "fan-out never aborted"
+    assert len(polled) < 40
+    assert any("deactivated mid-run" in e for e in result.errors)

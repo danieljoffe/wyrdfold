@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.routers.jobs import _list_jobs_for_target_two_query, _LogisticsFilter
 
@@ -82,9 +82,9 @@ def seeded_logistics(service_client: Client) -> Iterator[tuple[str, dict[str, st
         service_client.table("targets").delete().eq("id", target_id).execute()
 
 
-def _ids(service_client: Client, target_id: str, f: _LogisticsFilter) -> set[str]:
-    result = _list_jobs_for_target_two_query(
-        service_client,
+async def _ids(client: AsyncClient, target_id: str, f: _LogisticsFilter) -> set[str]:
+    result = await _list_jobs_for_target_two_query(
+        client,
         target_id=target_id,
         page_size=50,
         sort="score",
@@ -101,50 +101,60 @@ def _ids(service_client: Client, target_id: str, f: _LogisticsFilter) -> set[str
     return {p["title"] for p in result["postings"]}
 
 
-def test_remote_only_drops_onsite(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_remote_only_drops_onsite(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     target_id, _ = seeded_logistics
-    got = _ids(service_client, target_id, _LogisticsFilter(remote_only=True))
+    got = await _ids(async_service_client, target_id, _LogisticsFilter(remote_only=True))
     assert got == {"remote_hi", "remote_lo", "remote_ca"}  # onsite dropped
 
 
-def test_min_salary_drops_below(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_min_salary_drops_below(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     target_id, _ = seeded_logistics
-    got = _ids(service_client, target_id, _LogisticsFilter(min_salary=150000))
+    got = await _ids(async_service_client, target_id, _LogisticsFilter(min_salary=150000))
     assert got == {"remote_hi", "onsite_hi", "remote_ca"}  # $90k dropped
 
 
-def test_country_drops_mismatch_lenient_on_null(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_country_drops_mismatch_lenient_on_null(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     target_id, _ = seeded_logistics
-    got = _ids(service_client, target_id, _LogisticsFilter(country="us"))  # case-insensitive
+    got = await _ids(async_service_client, target_id, _LogisticsFilter(country="us"))  # case-insensitive
     assert got == {"remote_hi", "onsite_hi", "remote_lo"}  # CA dropped
 
 
-def test_filters_compose(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_filters_compose(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     target_id, _ = seeded_logistics
-    got = _ids(
-        service_client,
+    got = await _ids(
+        async_service_client,
         target_id,
         _LogisticsFilter(remote_only=True, min_salary=150000, country="US"),
     )
     assert got == {"remote_hi"}  # only the remote, US, >=150k job survives all three
 
 
-def test_no_filter_returns_all_with_logistics_overlaid(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_no_filter_returns_all_with_logistics_overlaid(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     """Sanity: with no filter every row returns AND carries its logistics_filters
     (proving the SELECT + overlay wiring, not just the drop logic)."""
     target_id, _ = seeded_logistics
-    result = _list_jobs_for_target_two_query(
-        service_client,
+    result = await _list_jobs_for_target_two_query(
+        async_service_client,
         target_id=target_id,
         page_size=50,
         sort="score",
@@ -164,8 +174,10 @@ def test_no_filter_returns_all_with_logistics_overlaid(
     assert by_title["onsite_hi"]["logistics_filters"]["salary_max"] == 200000
 
 
-def test_rpc_fast_path_also_returns_logistics(
-    service_client: Client, seeded_logistics: tuple[str, dict[str, str]]
+async def test_rpc_fast_path_also_returns_logistics(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    seeded_logistics: tuple[str, dict[str, str]]
 ) -> None:
     """The keyset RPC fast path (non-score sort, no floor) now carries
     logistics_filters too (#86), so chips render on created_at/title/company
@@ -173,8 +185,8 @@ def test_rpc_fast_path_also_returns_logistics(
     from app.routers.jobs import _list_jobs_for_target_rpc
 
     target_id, _ = seeded_logistics
-    result = _list_jobs_for_target_rpc(
-        service_client,
+    result = await _list_jobs_for_target_rpc(
+        async_service_client,
         target_id=target_id,
         page_size=50,
         sort="created_at",

@@ -16,15 +16,17 @@ tuple. Bump PROMPT_VERSION whenever SYSTEM_PROMPT changes — per the
 miss-then-rewrite, not return stale output.
 """
 
+import asyncio
 import hashlib
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.llm import LLMResult, LLMUsage, Message, ModelId
 from app.models.targets import DerivedTarget
+from app.services.db_read import fetch_one, fetch_one_sync
 from app.services.llm.client import LLMClient, complete_json
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
@@ -190,16 +192,29 @@ def _cache_hit_result(model: ModelId) -> LLMResult:
     )
 
 
-def _get_cached(supabase: Client, key: str) -> DerivedTarget | None:
-    """Return the cached DerivedTarget for ``key``, or None on miss."""
+async def _get_cached(supabase: Client | AsyncClient, key: str) -> DerivedTarget | None:
+    """Return the cached DerivedTarget for ``key``, or None on miss.
+
+    Accepts either client (#57 PR-G2e-4): an ``AsyncClient`` round-trip is awaited
+    on the loop; a sync ``Client`` is off-loaded to a thread so it never blocks the
+    caller's event loop."""
     try:
-        resp = (
-            supabase.table(_CACHE_TABLE)
-            .select("derived_payload")
-            .eq("jd_hash", key)
-            .limit(1)
-            .execute()
-        )
+        if isinstance(supabase, AsyncClient):
+            resp = await (
+                supabase.table(_CACHE_TABLE)
+                .select("derived_payload")
+                .eq("jd_hash", key)
+                .limit(1)
+                .execute()
+            )
+        else:
+            resp = await asyncio.to_thread(
+                lambda: supabase.table(_CACHE_TABLE)
+                .select("derived_payload")
+                .eq("jd_hash", key)
+                .limit(1)
+                .execute()
+            )
     except Exception:
         # Cache layer is best-effort — a Supabase outage must not break
         # the LLM-derive path. Fall through to a fresh LLM call.
@@ -217,26 +232,49 @@ def _get_cached(supabase: Client, key: str) -> DerivedTarget | None:
         return None
 
 
-def _record_cache_hit(supabase: Client, key: str) -> None:
-    """Best-effort hit_count + last_hit_at bump. Failures are swallowed."""
+async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
+    """Best-effort hit_count + last_hit_at bump. Failures are swallowed. Awaits an
+    async client; off-loads a sync client to a thread (#57 PR-G2e-4)."""
     try:
-        current = (
-            supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key).single().execute()
-        )
-        row = cast(dict[str, Any], current.data or {})
-        next_count = int(row.get("hit_count", 0)) + 1
-        supabase.table(_CACHE_TABLE).update(
-            {
-                "hit_count": next_count,
-                "last_hit_at": datetime.now(UTC).isoformat(),
-            }
-        ).eq("jd_hash", key).execute()
+        if isinstance(supabase, AsyncClient):
+            # fetch_one, not .single(): the outer try/except made the raise
+            # harmless, but it still turned every cache-row miss into a thrown
+            # (and swallowed) exception rather than a plain empty read.
+            row = await fetch_one(
+                supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+            ) or {}
+            next_count = int(row.get("hit_count", 0)) + 1
+            await (
+                supabase.table(_CACHE_TABLE)
+                .update(
+                    {
+                        "hit_count": next_count,
+                        "last_hit_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                .eq("jd_hash", key)
+                .execute()
+            )
+        else:
+            def _bump() -> None:
+                row = fetch_one_sync(
+                    supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+                ) or {}
+                next_count = int(row.get("hit_count", 0)) + 1
+                supabase.table(_CACHE_TABLE).update(
+                    {
+                        "hit_count": next_count,
+                        "last_hit_at": datetime.now(UTC).isoformat(),
+                    }
+                ).eq("jd_hash", key).execute()
+
+            await asyncio.to_thread(_bump)
     except Exception:
         logger.debug("derive-jd cache hit-count bump failed", exc_info=True)
 
 
-def _persist_cache(
-    supabase: Client,
+async def _persist_cache(
+    supabase: Client | AsyncClient,
     *,
     key: str,
     prompt_version: str,
@@ -245,17 +283,23 @@ def _persist_cache(
 ) -> None:
     """Best-effort cache write. Failures are swallowed (the derive call
     has already succeeded; we don't want to fail the user-facing request
-    because the cache row didn't persist)."""
+    because the cache row didn't persist). Awaits an async client; off-loads a
+    sync client to a thread (#57 PR-G2e-4)."""
+    payload: dict[str, Any] = {
+        "jd_hash": key,
+        "prompt_version": prompt_version,
+        "model": model,
+        "derived_payload": derived.model_dump(mode="json"),
+    }
     try:
-        supabase.table(_CACHE_TABLE).upsert(
-            {
-                "jd_hash": key,
-                "prompt_version": prompt_version,
-                "model": model,
-                "derived_payload": derived.model_dump(mode="json"),
-            },
-            on_conflict="jd_hash",
-        ).execute()
+        if isinstance(supabase, AsyncClient):
+            await supabase.table(_CACHE_TABLE).upsert(payload, on_conflict="jd_hash").execute()
+        else:
+            await asyncio.to_thread(
+                lambda: supabase.table(_CACHE_TABLE)
+                .upsert(payload, on_conflict="jd_hash")
+                .execute()
+            )
     except Exception:
         logger.warning("derive-jd cache write failed", exc_info=True)
 
@@ -266,7 +310,7 @@ async def derive_profile_from_jd(
     jd_text: str,
     model: ModelId = DEFAULT_MODEL,
     purpose: str = DEFAULT_PURPOSE,
-    supabase: Client | None = None,
+    supabase: Client | AsyncClient | None = None,
 ) -> tuple[DerivedTarget, LLMResult]:
     """Extract a ScoringProfile + search keywords from a job description.
 
@@ -296,9 +340,9 @@ async def derive_profile_from_jd(
 
     if supabase is not None:
         key = _cache_key(jd_text, model=model, prompt_version=PROMPT_VERSION)
-        cached = _get_cached(supabase, key)
+        cached = await _get_cached(supabase, key)
         if cached is not None:
-            _record_cache_hit(supabase, key)
+            await _record_cache_hit(supabase, key)
             return cached, _cache_hit_result(model)
 
     # The JD is scraped text that feeds the SHARED target profile — fence it so
@@ -319,7 +363,7 @@ async def derive_profile_from_jd(
     )
 
     if supabase is not None:
-        _persist_cache(
+        await _persist_cache(
             supabase,
             key=_cache_key(jd_text, model=model, prompt_version=PROMPT_VERSION),
             prompt_version=PROMPT_VERSION,

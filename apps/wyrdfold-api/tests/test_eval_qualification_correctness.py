@@ -96,7 +96,6 @@ def test_report_names_the_is_us_miss() -> None:
     rep = _report(cases, preds)
     assert rep["is_us"]["confusion"]["fn"] == 1
     assert rep["is_us_misses"][0]["title"] == "React Eng"
-    assert rep["is_us_misses"][0]["us_confidence"] == 95
     assert rep["role_family"]["accuracy"] == 1.0
 
 

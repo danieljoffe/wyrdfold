@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
@@ -13,9 +14,11 @@ from app.config import Settings
 from app.dependencies import (
     _api_key_matches,
     enforce_llm_budget,
+    get_async_supabase_for_caller,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase_for_caller,
+    refresh_jwks_cache,
+    try_decode_jwt_sub_cache_only,
     verify_api_key,
     verify_api_key_or_jwt,
     verify_supabase_jwt,
@@ -104,7 +107,14 @@ def _make_request(headers: dict[str, str] | None = None) -> Request:
 
 
 def _settings(api_key: str = "testkey", supabase_url: str = TEST_SUPABASE_URL) -> Settings:
-    return Settings(wyrdfold_api_key=api_key, supabase_url=supabase_url)
+    # activity_tracking off: these exercise identity extraction, not the
+    # last-seen stamp (owned by test_lifecycle) — so the async auth deps don't
+    # spawn a detached DB write during these unit tests.
+    return Settings(
+        wyrdfold_api_key=api_key,
+        supabase_url=supabase_url,
+        activity_tracking_enabled=False,
+    )
 
 
 def _mint(
@@ -345,54 +355,54 @@ def test_cron_key_unset_changes_nothing():
         verify_api_key(key="", s=s)
 
 
-def test_get_current_user_id_returns_jwt_sub():
+async def test_get_current_user_id_returns_jwt_sub():
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_current_user_id(req, s=_settings()) == USER_SUB
+    assert await get_current_user_id(req, s=_settings()) == USER_SUB
 
 
-def test_get_current_user_id_rejects_api_key_only():
+async def test_get_current_user_id_rejects_api_key_only():
     """get_current_user_id is JWT-required — api-key callers must use
     get_current_user_id_optional or a cron-only auth dep instead.
     """
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_current_user_id(req, s=_settings())
+        await get_current_user_id(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_get_current_user_id_rejects_unauthenticated():
+async def test_get_current_user_id_rejects_unauthenticated():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_current_user_id(req, s=_settings())
+        await get_current_user_id(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_get_current_user_id_optional_returns_jwt_sub():
+async def test_get_current_user_id_optional_returns_jwt_sub():
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_current_user_id_optional(req, key=None, s=_settings()) == USER_SUB
+    assert await get_current_user_id_optional(req, key=None, s=_settings()) == USER_SUB
 
 
-def test_get_current_user_id_optional_returns_none_for_api_key():
+async def test_get_current_user_id_optional_returns_none_for_api_key():
     """API-key callers (cron/poller/batch) get None — services map None to
     the legacy NULL-user_id rows, preserving single-tenant behavior.
     """
     req = _make_request()
-    assert get_current_user_id_optional(req, key="testkey", s=_settings()) is None
+    assert await get_current_user_id_optional(req, key="testkey", s=_settings()) is None
 
 
-def test_get_current_user_id_optional_rejects_unauthenticated():
+async def test_get_current_user_id_optional_rejects_unauthenticated():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_current_user_id_optional(req, key=None, s=_settings())
+        await get_current_user_id_optional(req, key=None, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_get_current_user_id_optional_prefers_jwt_over_api_key():
+async def test_get_current_user_id_optional_prefers_jwt_over_api_key():
     """If both a valid JWT and a valid API key are present, prefer the JWT
     so the request runs under the user's identity, not the cron path.
     """
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_current_user_id_optional(req, key="testkey", s=_settings()) == USER_SUB
+    assert await get_current_user_id_optional(req, key="testkey", s=_settings()) == USER_SUB
 
 
 def _budget_settings(daily: float = 5.0, hourly: float = 1.0, monthly: float = 5.0) -> Settings:
@@ -405,7 +415,7 @@ def _budget_settings(daily: float = 5.0, hourly: float = 1.0, monthly: float = 5
     )
 
 
-def test_enforce_llm_budget_apikey_caller_bypasses(monkeypatch):
+async def test_enforce_llm_budget_apikey_caller_bypasses(monkeypatch):
     """API-key callers (user_id=None) skip the budget check entirely — no
     supabase round-trip, no spend lookup. System paths are trusted.
     """
@@ -413,21 +423,21 @@ def test_enforce_llm_budget_apikey_caller_bypasses(monkeypatch):
 
     called = False
 
-    def _spy(*a, **kw):
+    async def _spy(*a, **kw):
         nonlocal called
         called = True
 
-    monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
-    enforce_llm_budget(user_id=None, supabase=MagicMock(), s=_budget_settings())
+    monkeypatch.setattr(budget_mod, "check_user_budget_async", _spy)
+    await enforce_llm_budget(user_id=None, supabase=MagicMock(), s=_budget_settings())
     assert called is False
 
 
-def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
+async def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
     from app.services.llm import budget as budget_mod
 
     captured: dict = {}
 
-    def _spy(
+    async def _spy(
         supabase,
         *,
         user_id,
@@ -446,16 +456,16 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
             rail_excluded_purposes=rail_excluded_purposes,
         )
 
-    monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
+    monkeypatch.setattr(budget_mod, "check_user_budget_async", _spy)
+
     # The dep resolves the quota (tier/override/default) before the check
     # — stub it so no Supabase round-trip happens. The resolution logic
     # itself is pinned in tests/test_entitlements_tiers.py.
-    monkeypatch.setattr(
-        budget_mod,
-        "resolve_llm_quota",
-        lambda supabase, *, user_id: budget_mod.ResolvedQuota(9.0, True, None),
-    )
-    enforce_llm_budget(
+    async def _resolve(supabase, *, user_id):
+        return budget_mod.ResolvedQuota(9.0, True, None)
+
+    monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
+    await enforce_llm_budget(
         user_id=USER_SUB,
         supabase=MagicMock(),
         s=_budget_settings(daily=7.0, hourly=2.0, monthly=9.0),
@@ -474,7 +484,7 @@ def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
     }
 
 
-def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
+async def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
     """The dep forwards whatever the resolver decided — cap AND the
     managed-tier exclusion set — without re-deriving anything. (The
     override-wins/tier logic itself is pinned in
@@ -483,18 +493,16 @@ def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
 
     captured: dict = {}
 
-    def _spy(supabase, **kw):
+    async def _spy(supabase, **kw):
         captured.update(kw)
 
-    monkeypatch.setattr(budget_mod, "check_user_budget", _spy)
-    monkeypatch.setattr(
-        budget_mod,
-        "resolve_llm_quota",
-        lambda supabase, *, user_id: budget_mod.ResolvedQuota(
-            25.0, True, ("fit.job", "poll_scoring")
-        ),
-    )
-    enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0))
+    monkeypatch.setattr(budget_mod, "check_user_budget_async", _spy)
+
+    async def _resolve(supabase, *, user_id):
+        return budget_mod.ResolvedQuota(25.0, True, ("fit.job", "poll_scoring"))
+
+    monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
+    await enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0))
     assert captured["monthly_limit_usd"] == 25.0
     assert captured["monthly_excluded_purposes"] == ("fit.job", "poll_scoring")
     # The hourly/daily rails must meter interactive spend only — the
@@ -505,60 +513,75 @@ def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
     assert captured["rail_excluded_purposes"] == NON_BILLABLE_PURPOSES
 
 
-def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
+async def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
     """The operator kill-switch blocks before any spend math runs."""
     from app.services.llm import budget as budget_mod
 
-    monkeypatch.setattr(
-        budget_mod,
-        "resolve_llm_quota",
-        lambda supabase, *, user_id: budget_mod.ResolvedQuota(5.0, False, None),
-    )
+    async def _resolve(supabase, *, user_id):
+        return budget_mod.ResolvedQuota(5.0, False, None)
+
+    monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
     check_spy = MagicMock()
-    monkeypatch.setattr(budget_mod, "check_user_budget", check_spy)
+
+    async def _check(*a, **kw):
+        check_spy(*a, **kw)
+
+    monkeypatch.setattr(budget_mod, "check_user_budget_async", _check)
 
     with pytest.raises(HTTPException) as exc:
-        enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings())
+        await enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings())
     assert exc.value.status_code == 403
     assert exc.value.detail["code"] == "llm_disabled"
     check_spy.assert_not_called()
 
 
-def test_enforce_llm_budget_propagates_429(monkeypatch):
+async def test_enforce_llm_budget_propagates_429(monkeypatch):
     """If the underlying check raises 429, the dep surfaces it unchanged."""
     from app.services.llm import budget as budget_mod
 
-    def _raise(*a, **kw):
+    async def _resolve(supabase, *, user_id):
+        return budget_mod.ResolvedQuota(9.0, True, None)
+
+    monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
+
+    async def _raise(*a, **kw):
         raise HTTPException(
             status_code=429, detail={"code": "llm_budget_exceeded", "scope": "hourly"}
         )
 
-    monkeypatch.setattr(budget_mod, "check_user_budget", _raise)
+    monkeypatch.setattr(budget_mod, "check_user_budget_async", _raise)
     with pytest.raises(HTTPException) as exc:
-        enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings())
+        await enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings())
     assert exc.value.status_code == 429
     assert exc.value.detail["scope"] == "hourly"
 
 
-# ---- get_supabase_for_caller (dual-auth client selection, #79 Phase 2) ----
+# ---- get_async_supabase_for_caller (dual-auth client selection, #79 P2 / #57) --
+# The sync ``get_supabase_for_caller`` was retired in #57 PR-F; these exercise the
+# async replacement (same JWT-only, RLS-scoped contract), so they ``await`` and
+# patch the async ``get_async_user_client``.
 
 
-def test_caller_client_jwt_returns_user_client(monkeypatch):
-    """A valid JWT -> the per-request RLS-enforced user client."""
+async def test_caller_client_jwt_returns_user_client(monkeypatch):
+    """A valid JWT -> the per-request RLS-enforced async user client."""
     import app.supabase_pool as pool
 
     sentinel = MagicMock()
-    monkeypatch.setattr(pool, "get_user_client", lambda token: sentinel)
+
+    async def _fake(token: str) -> MagicMock:
+        return sentinel
+
+    monkeypatch.setattr(pool, "get_async_user_client", _fake)
     s = Settings(
         wyrdfold_api_key="testkey",
         supabase_url=TEST_SUPABASE_URL,
         supabase_anon_key="anon",
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert get_supabase_for_caller(req, s=s) is sentinel
+    assert await get_async_supabase_for_caller(req, s=s) is sentinel
 
 
-def test_caller_client_jwt_without_anon_key_503():
+async def test_caller_client_jwt_without_anon_key_503():
     """Valid JWT but the user client isn't configured -> 503, never a
     silent fall-back to the service-role client (that would bypass RLS)."""
     s = Settings(
@@ -568,35 +591,149 @@ def test_caller_client_jwt_without_anon_key_503():
     )
     req = _make_request({"authorization": f"Bearer {_mint()}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=s)
+        await get_async_supabase_for_caller(req, s=s)
     assert exc.value.status_code == 503
 
 
-def test_caller_client_api_key_rejected(monkeypatch):
+async def test_caller_client_api_key_rejected():
     """#192 defense-in-depth: an api-key caller (no bearer) gets NO client —
     401, never the service-role client. A leaked shared key can't obtain an
     RLS-bypassing client on a user route."""
-    import app.supabase_pool as pool
-
-    monkeypatch.setattr(pool, "get_supabase_pool", lambda: MagicMock())
     req = _make_request()  # x-api-key is no longer even read by this dep
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_caller_client_invalid_jwt_401():
+async def test_caller_client_invalid_jwt_401():
     """A bearer that fails verification 401s — there is no api-key fall-back
     anymore (the user-data gate is JWT-only)."""
     bad = _mint(private_pem=_OTHER_PRIVATE_PEM)  # wrong signature
     req = _make_request({"authorization": f"Bearer {bad}"})
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
 
 
-def test_caller_client_no_auth_401():
+async def test_caller_client_no_auth_401():
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
-        get_supabase_for_caller(req, s=_settings())
+        await get_async_supabase_for_caller(req, s=_settings())
     assert exc.value.status_code == 401
+
+
+# ---- Warm JWKS cache / on-loop rate-limit key_func (Perf-F1) -----------------
+
+
+class _FakePyJWK:
+    """PyJWK-shaped: a key id + the verifying key."""
+
+    def __init__(self, kid: Any, key: Any) -> None:
+        self.key_id = kid
+        self.key = key
+
+
+class _FakeJWKSet:
+    def __init__(self, keys: list[Any]) -> None:
+        self.keys = keys
+
+
+class _JWKSClientWithSet:
+    """Fake PyJWKClient exposing get_jwk_set (what refresh_jwks_cache calls)."""
+
+    def __init__(self, keys: list[Any]) -> None:
+        self._keys = keys
+        self.fetches = 0
+
+    def get_jwk_set(self, refresh: bool = False) -> _FakeJWKSet:
+        self.fetches += 1
+        return _FakeJWKSet(self._keys)
+
+
+class _ExplodingJWKSClient:
+    """Any use is a blocking fetch we must never make on the event loop."""
+
+    def get_jwk_set(self, refresh: bool = False) -> Any:
+        raise AssertionError("cache-only path must not fetch JWKS")
+
+    def get_signing_key_from_jwt(self, token: str) -> Any:
+        raise AssertionError("cache-only path must not fetch JWKS")
+
+
+@pytest.fixture
+def warm_cache() -> Iterator[None]:
+    """Clear the module-level warm key set around each test (it's global)."""
+    from app import dependencies
+
+    dependencies._jwks_keys.clear()
+    yield
+    dependencies._jwks_keys.clear()
+
+
+def test_refresh_jwks_cache_populates_warm_set(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    client = _JWKSClientWithSet([_FakePyJWK(TEST_KID, _PUBLIC_KEY), _FakePyJWK(None, _PUBLIC_KEY)])
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: client)
+
+    n = refresh_jwks_cache(_settings())
+
+    # The keyless entry is skipped; the kid'd one lands in the warm set.
+    assert n == 1
+    assert dependencies._jwks_keys[TEST_KID].key is _PUBLIC_KEY
+
+
+def test_cache_only_decode_returns_sub_for_cached_kid(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    dependencies._jwks_keys[TEST_KID] = _FakeSigningKey(_PUBLIC_KEY)
+    # Prove no fetch: any JWKS network use raises.
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    req = _make_request({"authorization": f"Bearer {_mint()}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) == USER_SUB
+
+
+def test_cache_only_decode_unknown_kid_returns_none_without_fetch(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    # Warm set has a DIFFERENT kid — the token's kid is unknown.
+    dependencies._jwks_keys["some-other-kid"] = _FakeSigningKey(_PUBLIC_KEY)
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    req = _make_request({"authorization": f"Bearer {_mint(kid='attacker-kid')}"})
+    # None → the key_func falls back to IP keying instead of blocking on a fetch.
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_cold_cache_returns_none(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+    req = _make_request({"authorization": f"Bearer {_mint()}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_rejects_wrong_signature(
+    monkeypatch: pytest.MonkeyPatch, warm_cache: None
+) -> None:
+    from app import dependencies
+
+    dependencies._jwks_keys[TEST_KID] = _FakeSigningKey(_PUBLIC_KEY)
+    monkeypatch.setattr(dependencies, "_get_jwks_client", lambda s: _ExplodingJWKSClient())
+
+    # Signed by the other key → signature check against the cached key fails.
+    req = _make_request({"authorization": f"Bearer {_mint(private_pem=_OTHER_PRIVATE_PEM)}"})
+    assert try_decode_jwt_sub_cache_only(req, _settings()) is None
+
+
+def test_cache_only_decode_no_bearer_returns_none(warm_cache: None) -> None:
+    assert try_decode_jwt_sub_cache_only(_make_request(), _settings()) is None

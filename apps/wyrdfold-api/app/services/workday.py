@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.http_client import FetchExhaustedError, request_with_retry
 from app.services.standard_job import StandardJob
@@ -12,6 +13,52 @@ PAGE_SIZE = 20
 # Cap on per-posting detail fetches in flight so a 200-posting board doesn't
 # slam Workday's CXS endpoint. Five mirrors the SmartRecruiters fan-out.
 _DETAIL_CONCURRENCY = 5
+
+# Cap on requests in flight to ONE Workday POD, across every tenant the
+# poller is working concurrently (#646).
+#
+# Workday rate-limits at the pod edge, not per tenant: tenants share hosts
+# (``<tenant>.wd5.myworkdayjobs.com``), and the enabled catalog is heavily
+# pod-concentrated (wd1 373 tenants, wd5 252, wd3 149 of 903). The poller
+# runs POLL_CONCURRENCY sources at once and each Workday source fans out
+# ``_DETAIL_CONCURRENCY`` detail fetches, so several same-pod tenants
+# routinely stacked 15-20 requests on one host — producing the observed
+# 429 storms (whole bursts of cisco/msd/usfca/zillow 429ing in the same
+# second). The per-source cap can't see that: it's per fetch call.
+#
+# The cost was silent: a detail fetch that exhausts its retries DROPS the
+# posting (see the gather loop below), so 429 storms quietly under-ingest
+# Workday boards. Throttling to the pod's real budget also RECLAIMS time —
+# a 429'd request burns three attempts with backoff sleeps before failing.
+_POD_CONCURRENCY = 4
+# Keyed by (event loop id, pod host): an asyncio.Semaphore binds to the loop
+# that first awaits it, so a module-global one would raise across loops
+# (every pytest-asyncio test gets a fresh loop). Keying on the running loop
+# keeps one real gate per pod per loop.
+_pod_gates: dict[tuple[int, str], asyncio.Semaphore] = {}
+
+
+def _pod_host(base_url: str) -> str:
+    """``https://cisco.wd5.myworkdayjobs.com`` → ``wd5.myworkdayjobs.com``.
+
+    Strips the tenant label so every tenant on a pod shares one gate. A
+    host with no tenant prefix (or an unparseable base) gates on itself —
+    conservative, never wider than the real host.
+    """
+    host = urlsplit(base_url).netloc.lower()
+    if not host:
+        return base_url.lower()
+    parts = host.split(".")
+    return ".".join(parts[1:]) if len(parts) > 2 else host
+
+
+def _pod_gate(base_url: str) -> asyncio.Semaphore:
+    key = (id(asyncio.get_running_loop()), _pod_host(base_url))
+    gate = _pod_gates.get(key)
+    if gate is None:
+        gate = asyncio.Semaphore(_POD_CONCURRENCY)
+        _pod_gates[key] = gate
+    return gate
 
 
 async def _fetch_one_posting_detail(
@@ -28,7 +75,8 @@ async def _fetch_one_posting_detail(
     """
     url = f"{base_url}/wday/cxs/{tenant}/{site}{external_path}"
     try:
-        resp = await request_with_retry("GET", url)
+        async with _pod_gate(base_url):
+            resp = await request_with_retry("GET", url)
     except FetchExhaustedError as exc:
         logger.warning(
             "workday detail fetch exhausted retries for %s%s: %s",
@@ -85,16 +133,20 @@ async def fetch_workday_jobs(board_token: str) -> list[StandardJob]:
     offset = 0
     while offset < MAX_JOBS:
         try:
-            resp = await request_with_retry(
-                "POST",
-                list_url,
-                json={
-                    "appliedFacets": {},
-                    "limit": PAGE_SIZE,
-                    "offset": offset,
-                    "searchText": "",
-                },
-            )
+            # Same pod gate as the detail fan-out: the list POSTs 429'd too
+            # (becu / asurion / markelcorp / mpc / icf in the observed storm),
+            # and a list failure loses the WHOLE board for the cycle.
+            async with _pod_gate(base_url):
+                resp = await request_with_retry(
+                    "POST",
+                    list_url,
+                    json={
+                        "appliedFacets": {},
+                        "limit": PAGE_SIZE,
+                        "offset": offset,
+                        "searchText": "",
+                    },
+                )
         except FetchExhaustedError as exc:
             logger.warning(
                 "workday list fetch exhausted retries for %s (offset %d): %s",
@@ -175,9 +227,8 @@ async def fetch_workday_jobs(board_token: str) -> list[StandardJob]:
                 external_id=external_path or str(list_item.get("bulletFields", [""])[0]),
                 title=detail_result.get("title", list_item.get("title", "")),
                 location_name=list_item.get("locationsText"),
-                department=None,
                 content=detail_result.get("jobDescription", ""),
-                updated_at=detail_result.get("postedOn", list_item.get("postedOn", "")),
+                posted_at=detail_result.get("postedOn", list_item.get("postedOn", "")),
                 absolute_url=absolute_url,
             )
         )

@@ -10,9 +10,29 @@ from app.services.jd_parser import ParsedJD, parse_jd
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# A real tag shape (`<div …>`, `</p>`, `<!--`), NOT a stray "<" in prose like
+# "comp < $200k" — decides whether strip_html's second pass is needed.
+_TAGGY_RE = re.compile(r"<[a-zA-Z!/][^>]*>")
+
 
 def strip_html(html: str) -> str:
+    """HTML → collapsed plain text: THE token stream behind keyword scoring,
+    salary extraction (poller + backfill), and the search snippets.
+
+    Defensive double-strip: some boards deliver the JD HTML-**escaped**
+    (Greenhouse's Job Board API — ingestion now unescapes at the source, see
+    ``services/greenhouse.py``), so rows stored before that fix hold
+    ``&lt;div&gt;…`` — the first ``get_text`` pass *unescapes* those entities
+    into text that still LOOKS like markup, polluting every consumer above
+    (the 2026-07-26 prod bugs: tag soup on the search cards, and null
+    ``salary_text`` whenever markup sat between the two amounts of a
+    Greenhouse pay-transparency range). When, and only when, the first pass
+    leaves a real tag shape behind, one bounded second pass strips it; plain
+    prose containing a stray ``<`` is left untouched.
+    """
     text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+    if _TAGGY_RE.search(text):
+        text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
@@ -44,6 +64,12 @@ def _keyword_in_text(keyword: str, text: str) -> bool:
 
 # Canonical keyword → common variations found in JDs.
 _KEYWORD_ALIASES_RAW: dict[str, list[str]] = {
+    # Role-family compounds — JDs hyphenate/space these freely ("front-end
+    # architecture", "full stack engineer"); 273 live prod JDs say
+    # "front-end" and 362 say "full-stack" (sampled 2026-07-29, #503).
+    "frontend": ["front-end", "front end"],
+    "backend": ["back-end", "back end"],
+    "fullstack": ["full-stack", "full stack"],
     # Frontend frameworks
     "react": ["reactjs", "react.js"],
     "next.js": ["nextjs", "next"],
@@ -146,7 +172,15 @@ def _keyword_or_alias_in_text(keyword: str, text: str) -> bool:
             if alias != kw_lower and _keyword_in_text(alias, text):
                 return True
 
-    return False
+    # Hyphen/space drift (#503): compound keywords appear in JDs with the
+    # separators mixed freely — keyword "data driven decision making" vs JD
+    # "data-driven decision-making". Enumerating swapped variants can't
+    # cover the 2^(n-1) mixed forms, so collapse hyphens to spaces on BOTH
+    # sides and substring-match once. Single-word keywords never take this
+    # path, so the word-boundary guarantees above are untouched.
+    return ("-" in kw_lower or " " in kw_lower) and kw_lower.replace("-", " ") in text.replace(
+        "-", " "
+    )
 
 
 def _count_keyword_occurrences(keyword: str, text_lower: str) -> int:
@@ -171,7 +205,7 @@ def _count_keyword_occurrences(keyword: str, text_lower: str) -> int:
 # ---- Target-based scoring (#495) -------------------------------------------
 
 # Map dynamic category names to existing ScoreBreakdown fields.
-# Pragmatic for v1: avoids migrating jobs.score_breakdown.
+# Pragmatic for v1 (the legacy jobs.score_breakdown column is gone — R2).
 _CATEGORY_TO_FIELD: dict[str, str] = {
     "core_skills": "technologies",
     "secondary_skills": "domain_skills",
@@ -180,6 +214,20 @@ _CATEGORY_TO_FIELD: dict[str, str] = {
 
 _SENIORITY_SIGNAL_WEIGHT = 2.0
 _TITLE_WEIGHT = 2.0
+
+# Per-item credit ceiling for stage-2 scoring (#609). "Full credit" for a
+# keyword/signal = named in the TITLE and in a requirements-grade section
+# once (title 2.0 + requirements 2.0). Anything beyond — repeat mentions,
+# extra sections — adds nothing past the ceiling. Before this cap, one
+# keyword could earn ~16x the weight `_calc_max_possible` assumed for it
+# (title 2 + requirements 2x3occ + default 1x3 + ...), so `raw` routinely
+# hit 200-800%% of "max possible" and `min(100, ...)` clamped ~2,600 of
+# ~9,300 prod rows to exactly 100 — the score column carried no signal at
+# the top and every fit grade re-shuffled the list. With per-item awards
+# capped at the SAME ceiling the normalizer sums, the score is a true
+# percentage of the target's own maximum and saturation is structurally
+# impossible rather than merely clamped.
+_FULL_CREDIT_MULTIPLIER = 4.0  # _TITLE_WEIGHT + SECTION_WEIGHTS["requirements"]
 _DEFAULT_NORMALIZER = 30.0
 # Per-target ``search_keywords`` are the user's role-title intent (e.g.
 # "director of customer experience"). A title that hits any of them is
@@ -389,9 +437,15 @@ def _calc_max_possible(profile: ScoringProfile, search_keywords: list[str] | Non
     total = 0.0
     for cat_profile in profile.categories.values():
         for kw_weight in cat_profile.keywords.values():
-            total += kw_weight * cat_profile.weight
-    total += len(profile.seniority.signals) * _SENIORITY_SIGNAL_WEIGHT
-    total += len(profile.domain.signals) * profile.domain.weight
+            total += kw_weight * cat_profile.weight * _FULL_CREDIT_MULTIPLIER
+    total += (
+        len(profile.seniority.signals)
+        * _SENIORITY_SIGNAL_WEIGHT
+        * _FULL_CREDIT_MULTIPLIER
+    )
+    total += (
+        len(profile.domain.signals) * profile.domain.weight * _FULL_CREDIT_MULTIPLIER
+    )
     if search_keywords:
         total += _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT
     return total
@@ -454,6 +508,10 @@ def score_job_with_profile(
                     matched = True
 
             if matched:
+                keyword_points = min(
+                    keyword_points,
+                    kw_weight * cat_profile.weight * _FULL_CREDIT_MULTIPLIER,
+                )
                 current = getattr(breakdown, field_name)
                 setattr(breakdown, field_name, current + keyword_points)
                 all_matched.append(keyword)
@@ -473,7 +531,9 @@ def score_job_with_profile(
                 matched = True
 
         if matched:
-            breakdown.seniority_signals += signal_points
+            breakdown.seniority_signals += min(
+                signal_points, _SENIORITY_SIGNAL_WEIGHT * _FULL_CREDIT_MULTIPLIER
+            )
             all_matched.append(signal)
 
     # ---- Domain signals ----
@@ -491,7 +551,9 @@ def score_job_with_profile(
                 matched = True
 
         if matched:
-            breakdown.domain_skills += signal_points
+            breakdown.domain_skills += min(
+                signal_points, profile.domain.weight * _FULL_CREDIT_MULTIPLIER
+            )
             all_matched.append(signal)
 
     # ---- Role-title intent (search_keywords) ----
@@ -558,6 +620,21 @@ def score_job_with_profile(
     score = max(0, min(100, round((raw / normalizer) * 100)))
     if excluded:
         score = 0
+
+    # Store breakdown components as percentage-point contributions on the
+    # same 0-100 scale as the score (#609): the axes now sum to the score
+    # (before the negative deduction and rounding) instead of surfacing raw
+    # internal sums like "+124.2" beside a 0-100 number.
+    for axis in (
+        "role_titles",
+        "technologies",
+        "domain_skills",
+        "seniority_signals",
+        "negative",
+    ):
+        setattr(
+            breakdown, axis, round(getattr(breakdown, axis) / normalizer * 100, 1)
+        )
 
     return ScoreResult(
         score=score,

@@ -194,8 +194,8 @@ class TestDeriveEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: cached)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=cached))
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         result = await exp_router.derive_optimized(
@@ -243,21 +243,15 @@ class TestDeriveEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest",
-            lambda *a, **kw: previous_user_edit,
-        )
-        monkeypatch.setattr(
-            "app.services.experience.optimized.create_version",
-            lambda *a, **kw: new_doc,
-        )
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=previous_user_edit))
+        monkeypatch.setattr(exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc))
 
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None
 
         monkeypatch.setattr("app.services.experience.chunks.upsert_for_optimized", fake_upsert)
-        monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
+        monkeypatch.setattr("app.services.llm.cost_log.record_async", AsyncMock())
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         result = await exp_router.derive_optimized(
@@ -325,7 +319,7 @@ class TestDeriveStreamEndpoint:
 
         from app.routers import experience as exp_router
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: None)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=None))
 
         with pytest.raises(HTTPException) as exc_info:
             await exp_router.derive_optimized_stream(
@@ -361,8 +355,8 @@ class TestDeriveStreamEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: cached)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=cached))
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
@@ -405,18 +399,15 @@ class TestDeriveStreamEndpoint:
             created_at=datetime.now(UTC),
         )
 
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
-        monkeypatch.setattr(
-            "app.services.experience.optimized.create_version",
-            lambda *a, **kw: new_doc,
-        )
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=None))
+        monkeypatch.setattr(exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc))
 
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None
 
         monkeypatch.setattr("app.services.experience.chunks.upsert_for_optimized", fake_upsert)
-        monkeypatch.setattr("app.services.llm.cost_log.record", MagicMock())
+        monkeypatch.setattr("app.services.llm.cost_log.record_async", AsyncMock())
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
@@ -455,10 +446,10 @@ class TestDeriveStreamEndpoint:
             content="some prose",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
-        create = MagicMock()
-        monkeypatch.setattr("app.services.experience.optimized.create_version", create)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=None))
+        create = AsyncMock()
+        monkeypatch.setattr(exp_router, "_optimized_create_version", create)
 
         llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _sample_payload_json()})
         response = await exp_router.derive_optimized_stream(
@@ -486,8 +477,8 @@ class TestDeriveStreamEndpoint:
             content="some prose",
             created_at=datetime.now(UTC),
         )
-        monkeypatch.setattr("app.services.experience.prose.get_latest", lambda *a, **kw: prose_doc)
-        monkeypatch.setattr("app.services.experience.optimized.get_latest", lambda *a, **kw: None)
+        monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
+        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=None))
 
         response = await exp_router.derive_optimized_stream(
             request=_request(),

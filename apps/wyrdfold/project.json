@@ -4,7 +4,18 @@
   "sourceRoot": "apps/wyrdfold",
   "projectType": "application",
   "tags": ["scope:wyrdfold", "type:app"],
-  "// content-build": "WyrdFold ships no MDX — no validate-content/generate-search-index chain (cf. apps/root). All targets are inferred by @nx/next/plugin.",
-  "// targets": "to see all targets run: nx show project wyrdfold --web",
-  "targets": {}
+  "// content-build": "WyrdFold ships no MDX — no validate-content/generate-search-index chain (cf. apps/root).",
+  "// targets": "to see all targets run: nx show project wyrdfold --web. Everything except `typecheck` is inferred by @nx/next/plugin.",
+  "// typecheck": "Declared explicitly because nothing infers it here: @nx/js/typescript skips this project, so before this target the app's ONLY TypeScript gate was the check inside `next build`. That gate is silent about what it does not look at — Next <=16.2 did not check `src/**/__tests__/*.spec.tsx`, and 23 type errors accumulated there unnoticed until the 16.3 bump started checking them. Runs standalone: the app declares its own route prop types, so it does NOT need `.next/types` from a prior build.",
+  "// typecheck-coverage": "Covers EVERY spec: tsconfig.json no longer excludes `src/**/*.spec.ts` / `*.test.ts`, so all 132 spec files are checked, not just the 83 `.tsx` ones. Keep it that way — the exclude is what let 23 errors accumulate unseen. A spec that will not typecheck is a spec whose fixtures have drifted from the types they claim.",
+  "targets": {
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default", "{workspaceRoot}/tsconfig.base.json"],
+      "options": {
+        "command": "tsc -p apps/wyrdfold/tsconfig.json --noEmit"
+      }
+    }
+  }
 }

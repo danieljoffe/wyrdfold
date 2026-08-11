@@ -6,7 +6,7 @@
       "target": {
         "id": "t-frontend",
         "label": "Senior Frontend Engineer",
-        "is_active": true,
+        "app_active": true,
         "created_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
         "scoring_profile": {
@@ -61,7 +61,7 @@
       "target": {
         "id": "t-cx",
         "label": "Director of Customer Experience Operations",
-        "is_active": true,
+        "app_active": true,
         "created_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
         "scoring_profile": {

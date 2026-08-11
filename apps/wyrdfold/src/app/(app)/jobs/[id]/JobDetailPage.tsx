@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { formatJobSalary } from '@/lib/formatSalary';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft, ExternalLink, Trash2 } from 'lucide-react';
@@ -11,6 +13,7 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
+import { formatLocation } from '@/lib/formatLocation';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
@@ -243,7 +246,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
           <div className='mt-1 flex flex-col gap-0.5 text-text-secondary'>
             <div className='flex flex-wrap items-center gap-2'>
               <Text variant='caption' className='text-text-secondary'>
-                {posting.company_name}
+                {formatCompanyName(posting.company_name)}
               </Text>
               {isManual && (
                 <Badge variant='default' size='sm'>
@@ -251,14 +254,14 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
                 </Badge>
               )}
             </div>
-            {posting.location && (
+            {formatLocation(posting) && (
               <Text variant='caption' className='text-text-secondary'>
-                {posting.location}
+                {formatLocation(posting)}
               </Text>
             )}
-            {posting.salary_text && (
+            {formatJobSalary(posting) && (
               <Text variant='caption' className='text-text-secondary'>
-                {posting.salary_text}
+                {formatJobSalary(posting)}
               </Text>
             )}
           </div>

@@ -37,6 +37,19 @@ You'll want:
 pnpm pom            # typecheck + lint:fix + format + test + python suite
 ```
 
+**Touched frontend files? Also run a real build before pushing:**
+
+```sh
+cd apps/wyrdfold && npx next build
+```
+
+The FE app's types are ONLY checked by `next build` — the workspace
+`typecheck` target covers `wyrdfold-api` + `wyrdfold-e2e`, nx `build` can
+cache-hit past it, and jest transpiles without checking. Two CI-red PRs
+(#616, and the R2 rename fossilizing dead columns in 13 spec fixtures)
+came from exactly this gap. Note `next build` still excludes `*.spec.tsx`
+— keep spec fixtures honest by hand; they typecheck nowhere.
+
 CI will run:
 
 - `pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api`

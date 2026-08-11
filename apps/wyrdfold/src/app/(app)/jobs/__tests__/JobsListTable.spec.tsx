@@ -26,9 +26,9 @@ function makeJob(overrides: Partial<JobPosting> = {}): JobPosting {
     scoring_status: 'complete',
     status: 'new',
     salary_text: null,
-    greenhouse_updated_at: null,
-    first_seen_at: '2026-01-01',
-    created_at: '2026-01-01',
+    source_posted_at: null,
+
+    cataloged_at: '2026-01-01',
     ...overrides,
   };
 }
@@ -279,5 +279,174 @@ describe('JobsListTable', () => {
       name: /senior frontend engineer at acme/i,
     });
     expect(within(row).getByText(/discovered/i)).toBeInTheDocument();
+  });
+});
+
+describe('JobsListTable score cell (issue #603)', () => {
+  // Prod regression 2026-08-05: the API marks fully-graded rows
+  // `pending: false` but stamps scoring_status values like 'stage2';
+  // the table omitted the authoritative `pending` prop, so ScoreBadge's
+  // status heuristic classified every graded row as still scoring —
+  // "·" placeholder + infinite spinner across the whole grid.
+  it('renders the numeric score for a fit-graded row whose scoring_status is not "complete"', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({ score: 100, scoring_status: 'stage2', pending: false }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByLabelText('Match score 100')).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/scoring in progress/i)
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/fit score pending/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps the pending placeholder for a row the API marks pending', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({ score: 61, scoring_status: 'stage2', pending: true }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Match score 61')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobsListTable expanded-row pinning (issue #602)', () => {
+  // Prod regression 2026-08-05: the panel's own onAnalysisComplete refetch
+  // re-sorts the list; a negative fit grade drops the job off the page and
+  // the open panel unmounted mid-read (twice observed, once mid resume
+  // generation). The table now pins a snapshot of the expanded posting
+  // until the user closes it.
+  const jobA = () =>
+    makeJob({ id: 'j-a', title: 'Vanishing Role', company_name: 'Acme' });
+  const jobB = () =>
+    makeJob({ id: 'j-b', title: 'Other Role', company_name: 'Beta' });
+
+  function renderTable(postings: JobPosting[]) {
+    const utils = render(
+      <JobsListTable
+        {...baseProps}
+        postings={postings}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    const rerenderWith = (next: JobPosting[]) =>
+      utils.rerender(
+        <JobsListTable
+          {...baseProps}
+          postings={next}
+          loading={false}
+          selectedIds={new Set()}
+          onSelectionChange={() => undefined}
+        />
+      );
+    return { ...utils, rerenderWith };
+  }
+
+  it('keeps the expanded row and panel mounted when a refetch drops the job from the page', async () => {
+    const user = userEvent.setup();
+    const { rerenderWith } = renderTable([jobA(), jobB()]);
+
+    await user.click(
+      screen.getByRole('row', { name: /vanishing role at acme/i })
+    );
+    expect(screen.getByTestId('job-detail-panel-stub')).toBeInTheDocument();
+
+    rerenderWith([jobB()]);
+
+    expect(
+      screen.getByRole('row', { name: /vanishing role at acme/i })
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('job-detail-panel-stub')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /re-ranked out of the current list/i
+    );
+  });
+
+  it('drops the pinned row once the user collapses it', async () => {
+    const user = userEvent.setup();
+    const { rerenderWith } = renderTable([jobA(), jobB()]);
+
+    await user.click(
+      screen.getByRole('row', { name: /vanishing role at acme/i })
+    );
+    rerenderWith([jobB()]);
+
+    await user.click(
+      screen.getByRole('row', { name: /vanishing role at acme/i })
+    );
+
+    expect(
+      screen.queryByRole('row', { name: /vanishing role at acme/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId('job-detail-panel-stub')
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows no pin notice while the expanded job is still on the page', async () => {
+    const user = userEvent.setup();
+    renderTable([jobA(), jobB()]);
+
+    await user.click(
+      screen.getByRole('row', { name: /vanishing role at acme/i })
+    );
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+});
+
+describe('JobsListTable load-error state (issue #604)', () => {
+  it('renders the load-error state, not "No jobs found", when the fetch failed', async () => {
+    const user = userEvent.setup();
+    const onRefetch = jest.fn();
+    render(
+      <JobsListTable
+        {...baseProps}
+        onRefetch={onRefetch}
+        postings={[]}
+        loading={false}
+        loadError='Failed to load. Please try again.'
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/loading problem/i);
+    expect(screen.queryByText(/no jobs found/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(onRefetch).toHaveBeenCalled();
+  });
+
+  it('still renders the empty state for a genuinely empty result', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByText(/no jobs found/i)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

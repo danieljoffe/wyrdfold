@@ -10,14 +10,14 @@ api-key/operator → the instance-wide view.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -31,7 +31,7 @@ def _target(tid: str, label: str) -> JobTarget:
         id=tid,
         label=label,
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -40,12 +40,14 @@ def _target(tid: str, label: str) -> JobTarget:
 def test_jwt_caller_gets_only_their_active_targets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    global_spy = MagicMock(return_value=[_target("t-other", "Someone Else's Role")])
-    per_user_spy = MagicMock(return_value=[_target("t-mine", "My Role")])
-    monkeypatch.setattr(router_mod.crud, "get_active", global_spy)
-    monkeypatch.setattr(router_mod.crud, "get_active_for_user", per_user_spy)
+    # #57 slice 3: the handler inlines the crud reads as async helpers.
+    global_spy = AsyncMock(return_value=[_target("t-other", "Someone Else's Role")])
+    per_user_spy = AsyncMock(return_value=[_target("t-mine", "My Role")])
+    monkeypatch.setattr(router_mod, "_active_targets", global_spy)
+    monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
     app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
     try:
@@ -64,12 +66,13 @@ def test_jwt_caller_gets_only_their_active_targets(
 def test_api_key_caller_gets_instance_wide_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    global_spy = MagicMock(return_value=[_target("t-1", "Role A"), _target("t-2", "Role B")])
-    per_user_spy = MagicMock()
-    monkeypatch.setattr(router_mod.crud, "get_active", global_spy)
-    monkeypatch.setattr(router_mod.crud, "get_active_for_user", per_user_spy)
+    global_spy = AsyncMock(return_value=[_target("t-1", "Role A"), _target("t-2", "Role B")])
+    per_user_spy = AsyncMock()
+    monkeypatch.setattr(router_mod, "_active_targets", global_spy)
+    monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
 
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "api-key"
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     try:

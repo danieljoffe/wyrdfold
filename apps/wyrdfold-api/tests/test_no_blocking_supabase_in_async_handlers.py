@@ -28,25 +28,38 @@ PERF-M): FastAPI threadpools a *sync def* handler, but a sync helper called
 from an ``async def`` runs on the event loop — it is NOT threadpooled just for
 being a plain ``def``. Both forms are caught here.
 
-A call is treated as safe when it is **awaited** (an async call yields the loop)
-or **lexically offloaded** inside ``asyncio.to_thread`` / ``spawn_detached`` /
-``create_task`` / ``ensure_future`` / ``BackgroundTasks.add_task``. So these do
-not false-positive:
+A call is treated as safe when it is **awaited** (an async call — or a single
+``await asyncio.to_thread(...)`` — yields the loop) or handed to a **detached-async**
+scheduler (``spawn_detached`` / ``create_task`` / ``ensure_future`` /
+``BackgroundTasks.add_task``), which runs a coroutine on the async client off the
+request's critical path. So these do not false-positive:
 
 - plain ``def`` handlers (FastAPI threadpools them — only ``async def`` handlers
   are scanned), or
-- ``await asyncio.to_thread(lambda: ...execute())`` /
-  ``await asyncio.to_thread(crud.get, supabase, …)`` wrapped calls, or
-- ``await some_async_helper(supabase, …)`` (async, yields the loop), or
+- ``await asyncio.to_thread(lambda: ...execute())`` (a bare ``.execute()`` offloaded
+  to a thread — form 1), or
+- ``await some_async_helper(supabase, …)`` / ``await asyncio.to_thread(crud.get,
+  supabase, …)`` (awaited → yields the loop), or
 - a coroutine handed to ``spawn_detached(...)`` / ``add_task(...)``.
+
+**#57 PR-H (fully-async posture).** Now that every DB path has an async client, a
+*non-awaited threaded fan-out* of a client-passing helper is no longer waved
+through: ``asyncio.gather(asyncio.to_thread(crud.get, supabase), …)``,
+``pool.submit(fn, supabase)``, ``loop.run_in_executor(None, fn, supabase)``. Sync
+helpers on the thread pool are the thread-pool-bound blocking the migration
+removed — parallelism is ``asyncio.gather`` over async calls. (The bare-``.execute()``
+``to_thread`` offload in form 1 is unchanged; the single ``await asyncio.to_thread``
+escape hatch stays, permitted by the awaited check.)
 """
 
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from pathlib import Path
 
-ROUTERS_DIR = Path(__file__).resolve().parent.parent / "app" / "routers"
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
+ROUTERS_DIR = APP_DIR / "routers"
 
 
 def _is_router_handler(node: ast.AsyncFunctionDef) -> bool:
@@ -127,18 +140,25 @@ _CLIENT_ARG_NAMES = {
     "caller_supabase",
     "cost_supabase",
     "service_supabase",
+    "sync_supabase",
     "user_supabase",
 }
+# Only the **detached-async** schedulers wave a client-passing call through: each
+# runs a *coroutine* (on the async client) off the request's critical path. The
+# **threaded** wrappers — ``to_thread`` / ``submit`` / ``run_in_executor`` — were
+# removed in #57 PR-H: a sync helper on the thread pool is exactly the
+# thread-pool-bound DB the async migration eliminated. The one legitimate
+# ``await asyncio.to_thread(crud.get, supabase, …)`` escape hatch is still allowed,
+# but by the *awaited* check in ``_blocking_client_call_lines`` (an await yields the
+# loop), not by wrapper name — so a *non-awaited* threaded fan-out
+# (``gather(asyncio.to_thread(fn, supabase), …)``, ``pool.submit(fn, supabase)``)
+# is now flagged. Every DB path has an async client; parallelism is
+# ``asyncio.gather`` over async calls, not a sync helper on the thread pool.
 _OFFLOAD_WRAPPERS = {
-    "to_thread",
     "spawn_detached",
     "create_task",
     "ensure_future",
     "add_task",
-    # ThreadPoolExecutor.submit(fn, supabase, …) / loop.run_in_executor(...) also
-    # run the callable off the loop — a deliberate parallel-DB-fan-out pattern.
-    "submit",
-    "run_in_executor",
 }
 
 
@@ -197,13 +217,21 @@ def _blocking_client_call_lines(handler: ast.AsyncFunctionDef) -> list[int]:
     return sorted(offenders)
 
 
-def _scan_source(source: str) -> list[tuple[str, int, list[int]]]:
-    """Return ``(handler_name, def_lineno, offending_lines)`` — both a bare
-    ``.execute()`` on the loop and a blocking client-passing helper call."""
+def _scan_source(
+    source: str,
+    should_scan: Callable[[ast.AsyncFunctionDef], bool] = _is_router_handler,
+) -> list[tuple[str, int, list[int]]]:
+    """Return ``(fn_name, def_lineno, offending_lines)`` — both a bare
+    ``.execute()`` on the loop and a blocking client-passing helper call.
+
+    ``should_scan`` selects which ``async def``s to check. It defaults to router
+    handlers; the background-task scan (below) passes a name predicate to reuse
+    the exact same blocking-call detection on service-layer bg functions.
+    """
     tree = ast.parse(source)
     offenders: list[tuple[str, int, list[int]]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and _is_router_handler(node):
+        if isinstance(node, ast.AsyncFunctionDef) and should_scan(node):
             lines = sorted(
                 set(_unwrapped_execute_lines(node)) | set(_blocking_client_call_lines(node))
             )
@@ -229,6 +257,52 @@ def test_no_blocking_supabase_execute_in_async_handlers() -> None:
             )
 
     assert not failures, "Blocking supabase call(s) on the event loop:\n" + "\n".join(failures)
+
+
+# ---- Form (3): async background-task functions (add_task / spawn_detached
+# ---- targets). FastAPI *awaits* an async bg task on the event loop rather than
+# ---- threadpooling it (only a plain `def` bg task is threadpooled), so a
+# ---- blocking supabase call inside one freezes every concurrent request — the
+# ---- same failure as an async route handler, but in app/services where the
+# ---- router scan above never looks. The detection is identical; only the set
+# ---- of scanned functions differs.
+#
+# Scoped, for now, to the target-derivation module's bg functions (the ones the
+# 2026-07-21 hardening review threaded). The post-feedback learner chain is now
+# threaded too (``services.feedback.run_learner_and_rescore_off_loop``, #57
+# PR-G2d-a). Broadening to the poll / discovery bg tasks (run_force_poll_locked,
+# run_discovery_all_targets_locked) needs each audited/threaded first, so it's a
+# follow-up — adding them here before that would just flip this guard red.
+_BG_TASK_MODULES: dict[Path, frozenset[str]] = {
+    APP_DIR / "services" / "targets" / "from_input.py": frozenset(
+        {"derive_url_target_bg", "derive_manual_target_bg", "_apply_fit_score"}
+    ),
+}
+
+
+def _async_def_names(source: str) -> set[str]:
+    return {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.AsyncFunctionDef)}
+
+
+def test_no_blocking_supabase_in_background_tasks() -> None:
+    failures: list[str] = []
+    for path, names in _BG_TASK_MODULES.items():
+        assert path.exists(), f"bg-task module moved? {path}"
+        source = path.read_text()
+        # Guard the guard: if a tracked function is renamed/removed, fail loudly
+        # rather than silently covering nothing (offender-only scans can't do this,
+        # since a correctly-threaded function has no offending lines to report).
+        missing = names - _async_def_names(source)
+        assert not missing, f"tracked bg functions not found in {path.name}: {sorted(missing)}"
+        for name, def_line, exec_lines in _scan_source(source, lambda n, ns=names: n.name in ns):
+            failures.append(
+                f"{path.name}:{def_line} async def {name}() runs a blocking supabase "
+                f"round-trip on the event loop (lines {exec_lines}). It is an async "
+                f"BackgroundTask (add_task awaits it on the loop), so wrap each blocking "
+                f"call in `await asyncio.to_thread(...)`. See #107."
+            )
+
+    assert not failures, "Blocking supabase call(s) in background tasks:\n" + "\n".join(failures)
 
 
 # ---- Self-tests: prove the scanner catches the regression and doesn't
@@ -387,7 +461,37 @@ def test_scanner_passes_background_task_add() -> None:
     assert _scan_source(_BACKGROUND_TASK_OK) == []
 
 
-_THREADPOOL_SUBMIT_OK = """
+# ---- Form (3) self-test: the bg-task function scan (name predicate) -----------
+
+_BG_TASK_SOURCE = """
+import asyncio
+
+async def worker_bg(supabase, llm):
+    await llm.call()
+    crud.update(supabase, "t", body)                       # blocks the loop
+
+async def clean_bg(supabase, llm):
+    await llm.call()
+    await asyncio.to_thread(crud.update, supabase, "t", body)   # offloaded — safe
+
+async def not_tracked_bg(supabase):
+    crud.update(supabase, "t", body)                       # blocks, but not scanned
+"""
+
+
+def test_bg_scan_flags_blocking_call_only_in_tracked_functions() -> None:
+    tracked = {"worker_bg", "clean_bg"}
+    offenders = {
+        name for name, _l, _e in _scan_source(_BG_TASK_SOURCE, lambda n: n.name in tracked)
+    }
+    # worker_bg blocks and is tracked → flagged; clean_bg is threaded → clean;
+    # not_tracked_bg blocks but is outside the tracked set → not scanned.
+    assert offenders == {"worker_bg"}
+
+
+# #57 PR-H: a non-awaited threaded fan-out of a client-passing helper via
+# ``ThreadPoolExecutor.submit`` is thread-pool-bound DB — no longer waved through.
+_THREADPOOL_SUBMIT_FLAGGED = """
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter
 router = APIRouter()
@@ -396,13 +500,48 @@ router = APIRouter()
 async def usage(supabase, llm):
     await llm.call()
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f = pool.submit(cost_log.total_spend, supabase, user_id="u")   # off-loop
+        f = pool.submit(cost_log.total_spend, supabase, user_id="u")   # thread-pool DB
         return f.result()
 """
 
 
-def test_scanner_passes_threadpool_submit() -> None:
-    assert _scan_source(_THREADPOOL_SUBMIT_OK) == []
+def test_scanner_flags_nonawaited_threadpool_submit() -> None:
+    offenders = _scan_source(_THREADPOOL_SUBMIT_FLAGGED)
+    assert len(offenders) == 1
+    name, _def_line, lines = offenders[0]
+    assert name == "usage"
+    assert lines  # the pool.submit(..., supabase, ...) line was reported
+
+
+# #57 PR-H: a ``gather`` of ``asyncio.to_thread(helper, supabase)`` — the individual
+# to_thread calls are NOT awaited (only the gather is), so they run the sync helper
+# on the thread pool. Flagged: use ``asyncio.gather`` over *async* helpers instead.
+_GATHER_TO_THREAD_DB_FLAGGED = """
+import asyncio
+from fastapi import APIRouter
+router = APIRouter()
+
+@router.get("/x")
+async def fanout(supabase):
+    a, b = await asyncio.gather(
+        asyncio.to_thread(crud.get, supabase, "a"),
+        asyncio.to_thread(crud.get, supabase, "b"),
+    )
+    return [a, b]
+"""
+
+
+def test_scanner_flags_gather_of_to_thread_db() -> None:
+    offenders = _scan_source(_GATHER_TO_THREAD_DB_FLAGGED)
+    assert len(offenders) == 1
+    assert offenders[0][0] == "fanout"
+    assert len(offenders[0][2]) == 2  # both to_thread(crud.get, supabase, …) lines
+
+
+# The single ``await asyncio.to_thread(crud.get, supabase, …)`` escape hatch is
+# STILL permitted — the awaited check yields the loop (see _FIXED_HELPER_TO_THREAD /
+# test_scanner_passes_to_thread_wrapped_helper above). PR-H only tightens the
+# *non-awaited* threaded fan-out, not the awaited single-call offload.
 
 
 _NESTED_DEF_VIA_TO_THREAD_OK = """

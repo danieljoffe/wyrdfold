@@ -94,17 +94,21 @@ def test_z_suffix_iso_timestamp_parses() -> None:
 
 
 def _supabase_returning(rows: list[dict[str, Any]]) -> MagicMock:
-    """Build a Supabase-table-builder mock that returns ``rows`` from
-    .select(...).eq(...).execute(). Only the chain used by
-    poll_due_sources is stubbed — everything else stays a MagicMock."""
+    """Build a Supabase-table-builder mock that returns ``rows`` from the
+    paginated .select(...).eq(...).order(...).range(...).execute() chain
+    (self-chaining, so filter/order/range in any arrangement resolve to the
+    same terminal response). Keep rows under the 500-row page size or the
+    pagination loop in ``_read_enabled_sources`` would request page 2 of the
+    same canned response forever."""
     table = MagicMock()
-    select = MagicMock()
-    eq = MagicMock()
+    chain = MagicMock()
     response = MagicMock()
     response.data = rows
-    eq.execute.return_value = response
-    select.eq.return_value = eq
-    table.select.return_value = select
+    chain.eq.return_value = chain
+    chain.order.return_value = chain
+    chain.range.return_value = chain
+    chain.execute.return_value = response
+    table.select.return_value = chain
 
     supabase = MagicMock()
     supabase.table.return_value = table
@@ -116,7 +120,7 @@ async def test_poll_due_sources_skips_when_nothing_due() -> None:
     just_now = datetime.now(UTC).isoformat()
     supabase = _supabase_returning([_src(last_polled_at=just_now, poll_interval_minutes=240)])
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         patch("app.services.poller._poll_one_source") as poll_one,
     ):
         get_opt.return_value = None
@@ -136,9 +140,9 @@ async def test_poll_due_sources_polls_only_due_rows() -> None:
     supabase = _supabase_returning([due, fresh])
 
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         # Cycle-level prefetch — irrelevant to the due-filter under test.
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         get_opt.return_value = None
@@ -171,9 +175,9 @@ async def test_poll_due_sources_aggregates_errors() -> None:
     )
 
     with (
-        patch("app.services.poller.get_latest_optimized") as get_opt,
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
         # Cycle-level prefetch — irrelevant to the error aggregation under test.
-        patch("app.services.poller.get_active_target", return_value=[]),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
         patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
     ):
         get_opt.return_value = None
@@ -194,6 +198,46 @@ async def test_poll_due_sources_aggregates_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_poll_due_sources_partial_progress_survives_cancellation() -> None:
+    """The caller-owned ``progress`` accumulator must hold every FINISHED
+    source's counts when the cycle is cancelled mid-gather (the scheduler's
+    watchdog abort) — accumulation happens per-worker as each source lands,
+    not after the gather (which a cancel would wipe). Found live 2026-08-05:
+    overnight watchdog aborts reported nothing and never invalidated the
+    list cache despite ~75 sources/cycle finishing."""
+    import asyncio
+
+    from app.models.schemas import PollResult
+
+    long_ago = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    supabase = _supabase_returning(
+        [
+            _src(last_polled_at=long_ago, company="Fast"),
+            _src(last_polled_at=long_ago, company="Wedged"),
+        ]
+    )
+
+    async def _fast_then_hang(source: dict, *a: object, **k: object) -> dict:
+        if source["company_name"] == "Fast":
+            return {"polled": True, "new": 3, "updated": 1, "archived": 0, "error": None}
+        await asyncio.Event().wait()  # the 429-storm board that never returns
+        raise AssertionError("unreachable")
+
+    progress = PollResult(sources_polled=0, new_jobs=0, updated_jobs=0, archived_jobs=0, errors=[])
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", _fast_then_hang),
+    ):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(poll_due_sources(supabase, progress=progress), timeout=0.3)
+
+    assert progress.sources_polled == 1
+    assert progress.new_jobs == 3
+    assert progress.updated_jobs == 1
+
+
+@pytest.mark.asyncio
 async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPatch) -> None:
     """#285 regression: the untagged-backlog sweep must run every cycle —
     including one where no source is due. It's independent of source polling and
@@ -207,7 +251,7 @@ async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPat
     supabase = _supabase_returning([_src(last_polled_at=just_now, poll_interval_minutes=240)])
 
     with (
-        patch("app.services.poller.get_latest_optimized", return_value=None),
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
         patch("app.services.poller._poll_one_source") as poll_one,
         patch("app.services.poller._backfill_qualify_stale", new_callable=AsyncMock) as backfill,
     ):
@@ -218,3 +262,81 @@ async def test_backfill_runs_even_when_nothing_due(monkeypatch: pytest.MonkeyPat
     backfill.assert_awaited_once()  # ...but the sweep still ran
     assert backfill.await_args is not None
     assert backfill.await_args.args[1] == 50  # with the configured batch
+
+
+# ---- per-cycle source cap (#514 residual) ----------------------------------
+
+
+def _three_due_sources() -> list[dict[str, Any]]:
+    """Three due sources, deliberately listed in NON-overdue order so the
+    cap's most-overdue-first sort (never-polled at the very front) is
+    observable, not an accident of input order."""
+    ten_h = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    six_h = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
+    return [
+        _src(last_polled_at=six_h, poll_interval_minutes=240, company="Newer Co"),
+        _src(last_polled_at=ten_h, poll_interval_minutes=240, company="Oldest Co"),
+        _src(last_polled_at=None, poll_interval_minutes=240, company="Never Co"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_caps_batch_most_overdue_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With more due sources than ``poll_max_sources_per_cycle``, only the cap
+    is polled this tick — and it's the MOST overdue slice (never-polled first,
+    then oldest ``last_polled_at``), so a backlog drains oldest-first instead
+    of re-attempting the whole fleet and tripping the cycle watchdog."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "poll_max_sources_per_cycle", 2)
+    supabase = _supabase_returning(_three_due_sources())
+
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        result = await poll_due_sources(supabase)
+
+    assert poll_one.await_count == 2
+    polled = {call.args[0]["company_name"] for call in poll_one.await_args_list}
+    assert polled == {"Never Co", "Oldest Co"}  # the 6h-overdue one waits a tick
+    assert result.sources_polled == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_cap_zero_is_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``poll_max_sources_per_cycle=0`` keeps the legacy poll-everything-due
+    behavior."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "poll_max_sources_per_cycle", 0)
+    supabase = _supabase_returning(_three_due_sources())
+
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock, return_value=None),
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        result = await poll_due_sources(supabase)
+
+    assert poll_one.await_count == 3
+    assert result.sources_polled == 3

@@ -40,7 +40,7 @@ from app.services.embeddings.prescan_calibration import (
     calibrate_threshold,
     cosine,
 )
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("calibrate_prescan")
@@ -140,8 +140,7 @@ def calibrate(
     positive_cutoff: float,
     target_recall: float,
 ) -> dict[str, CalibrationResult]:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise SystemExit("Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)")
 

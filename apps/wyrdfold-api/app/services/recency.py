@@ -31,7 +31,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.config import settings
 from app.services.db_write import poll_db_read, poll_db_write
@@ -65,7 +65,9 @@ _RECENCY_SWEEP_PAGE_SIZE = 1000
 def compute_recency_multiplier(age_days: float) -> float:
     """Return the age-decay multiplier in ``[RECENCY_FLOOR, 1.0]``.
 
-    ``age_days`` is the posting's age (now - first_seen_at) in days.
+    ``age_days`` is the posting's age in days — since R2, now minus the
+    provider posted date (``source_posted_at``), falling back to
+    ``cataloged_at`` when the provider gave none.
     Negative ages (clock skew on a just-ingested row) clamp to the full
     multiplier. The floor means a very old posting never drops to zero —
     a strong match stays findable, just demoted.
@@ -83,32 +85,32 @@ def compute_recency_score(score: int, age_days: float, *, enabled: bool) -> int:
     return round(score * compute_recency_multiplier(age_days))
 
 
-def display_recency_score(score: int, first_seen_at: Any, now: datetime) -> int:
-    """Age-decay a *displayed* score from a raw ``first_seen_at`` value.
+def display_recency_score(score: int, posted_at: Any, now: datetime) -> int:
+    """Age-decay a *displayed* score from a raw posted-date value.
 
     Read-time counterpart to the stored ``recency_score``: the /jobs list
     shows this (so a stale posting visibly fades) while ``raw_score`` keeps
-    the undecayed fit. Because it's derived from ``first_seen_at`` on each
+    the undecayed fit. Because it's derived from the posted date on each
     request, it never freezes — unlike the stored column, which only
     refreshes when the poller re-touches a job, so a posting that ages off
     the boards keeps whatever decay it had at its last refresh. ``now`` is
     passed in so a whole page shares one clock read. Always decays; callers
     gate on ``settings.recency_decay_enabled``.
     """
-    return compute_recency_score(score, _age_days(first_seen_at, now), enabled=True)
+    return compute_recency_score(score, _age_days(posted_at, now), enabled=True)
 
 
-def _age_days(first_seen_at: Any, now: datetime) -> float:
-    """Days between ``first_seen_at`` and ``now``. Unparseable / missing
+def _age_days(posted_at: Any, now: datetime) -> float:
+    """Days between the posted date and ``now``. Unparseable / missing
     timestamps return 0.0 (treat as fresh — no decay) so a bad row never
     crashes the refresh pass."""
-    if not first_seen_at:
+    if not posted_at:
         return 0.0
     try:
-        if isinstance(first_seen_at, str):
-            seen = datetime.fromisoformat(first_seen_at.replace("Z", "+00:00"))
+        if isinstance(posted_at, str):
+            seen = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
         else:
-            seen = first_seen_at
+            seen = posted_at
         if seen.tzinfo is None:
             seen = seen.replace(tzinfo=UTC)
     except (TypeError, ValueError):
@@ -116,10 +118,10 @@ def _age_days(first_seen_at: Any, now: datetime) -> float:
     return max(0.0, (now - seen).total_seconds() / 86400.0)
 
 
-async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[str]) -> int:
+async def refresh_recency_scores_poll(supabase: AsyncClient, job_posting_ids: list[str]) -> int:
     """Recompute ``recency_score`` for every scores row of the given jobs.
 
-    Reads each job's ``first_seen_at`` to derive its age, then writes
+    Reads each job's posted date (coalesced) to derive its age, then writes
     ``score * decay`` back to each (job, target) scores row via the
     ``bulk_update_recency_scores`` RPC. Called by the poller after the
     cycle's fit scores are settled (keyword and/or Phase 2), so the
@@ -150,14 +152,17 @@ async def refresh_recency_scores_poll(supabase: Client, job_posting_ids: list[st
         try:
             resp = await poll_db_read(
                 supabase,
-                lambda c, chunk=chunk: c.table("jobs").select("id, first_seen_at").in_("id", chunk),
+                lambda c, chunk=chunk: (
+                    c.table("jobs").select("id, source_posted_at, cataloged_at").in_("id", chunk)
+                ),
                 label="recency jobs read",
             )
         except Exception:
             logger.exception("refresh_recency_scores_poll: jobs fetch failed")
             return 0
         for row in cast(list[dict[str, Any]], resp.data or []):
-            age_by_job[row["id"]] = _age_days(row.get("first_seen_at"), now)
+            posted = row.get("source_posted_at") or row.get("cataloged_at")
+            age_by_job[row["id"]] = _age_days(posted, now)
 
     # 2. Per-(job, target) score rows → recency_score updates.
     updates: list[dict[str, Any]] = []
@@ -252,7 +257,7 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
         try:
             resp = await (
                 supabase.table("jobs")
-                .select("id, first_seen_at")
+                .select("id, source_posted_at, cataloged_at")
                 .is_("archived_at", "null")
                 .order("id")
                 .range(start, start + _RECENCY_SWEEP_PAGE_SIZE - 1)
@@ -263,7 +268,8 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
             return 0
         rows = cast(list[dict[str, Any]], resp.data or [])
         for row in rows:
-            age_by_job[row["id"]] = _age_days(row.get("first_seen_at"), now)
+            posted = row.get("source_posted_at") or row.get("cataloged_at")
+            age_by_job[row["id"]] = _age_days(posted, now)
         if len(rows) < _RECENCY_SWEEP_PAGE_SIZE:
             break
         start += _RECENCY_SWEEP_PAGE_SIZE

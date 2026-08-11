@@ -149,7 +149,6 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
         country = location.get("country", "")
         location_str = f"{city}, {country}".strip(", ") if city or country else None
 
-        department = detail.get("department", {}) or {}
 
         # Prefer ``postingUrl`` — that's the human-facing apply page
         # (``jobs.smartrecruiters.com/{company}/{id}-{slug}``). Fall back
@@ -163,9 +162,8 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
                 external_id=str(detail.get("id", list_id)),
                 title=detail.get("name", item.get("name", "")),
                 location_name=location_str,
-                department=department.get("label") if department else None,
                 content=_build_content(detail),
-                updated_at=detail.get("releasedDate", item.get("releasedDate", "")),
+                posted_at=detail.get("releasedDate", item.get("releasedDate", "")),
                 absolute_url=absolute_url,
             )
         )

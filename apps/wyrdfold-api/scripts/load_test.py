@@ -14,19 +14,38 @@ before/after rig:
   p95 while the poll's DB write herd runs — the exact regression #57 targets.
   Run it with the sync build (baseline) and again with ``POLLER_ASYNC_DB=true``
   (after) and compare the p95 rows.
+- **``--sample`` resource gate.** Samples DB connections (``pg_stat_activity``,
+  incl. the PostgREST-attributed count) + the API process RSS/FDs during the run
+  and prints peaks — the "bounded pooler connections + stable memory / no FD
+  leak" evidence the #57 acceptance criteria need (async fans out harder than the
+  threadpool). Pass ``--api-pid`` (the host uvicorn PID) for RSS/FDs. No new
+  dependency — shells out to ``psql`` / ``ps`` / ``lsof``.
 
-Run the API via host ``uvicorn`` against the local stack (NOT the Docker image:
-on Mac the container's JWT ``iss`` pins it to 127.0.0.1:54321 + host networking
-doesn't expose the port back — the executor/threading behavior under test is
-identical either way, so host uvicorn is representative here):
+Seed realistic local data first (``scripts/seed_load_test.py``: mock sources +
+user + active target + jobs/scores), then run the API via host ``uvicorn``
+against the local stack (NOT the Docker image: on Mac the container's JWT ``iss``
+pins it to 127.0.0.1:54321 + host networking doesn't expose the port back — the
+executor/threading behavior under test is identical either way, so host uvicorn
+is representative here):
 
-    SUPABASE_URL=http://127.0.0.1:54321 LLM_PROVIDER=mock \
+    SUPABASE_URL=http://127.0.0.1:54321 \
+    SUPABASE_SERVICE_ROLE_KEY=<LOCAL_SR_KEY> \
+      uv run python scripts/seed_load_test.py
+
+    ALLOWED_HOSTS='*' LLM_PROVIDER=mock EMBEDDINGS_PROVIDER=mock \
+    MOCK_FETCHER_ENABLED=true WYRDFOLD_API_KEY=<POLL_KEY> \
+    SUPABASE_URL=http://127.0.0.1:54321 SUPABASE_SERVICE_ROLE_KEY=<LOCAL_SR_KEY> \
+    SUPABASE_ANON_KEY=<LOCAL_ANON_KEY> \
       uv run uvicorn app.main:app --port 8001 &
 
-    uv run python scripts/load_test.py --duration 30 --vus 25 \
+    uv run python scripts/load_test.py --duration 45 --vus 25 \
       --supabase-url http://127.0.0.1:54321 --service-role <LOCAL_SR_KEY> \
       --user-email loadtest@example.com \
-      --with-poll --poll-key <WYRDFOLD_API_KEY>
+      --with-poll --poll-key <POLL_KEY> \
+      --sample --api-pid "$(pgrep -f 'uvicorn app.main' | tail -1)"
+
+Baseline = the default build (POLLER_ASYNC_DB off); the "after" sets
+``POLLER_ASYNC_DB=true`` on the uvicorn env — compare the p95 + resource rows.
 
 Inspect hot queries after a run:
 
@@ -68,6 +87,31 @@ class EndpointStats:
     durations_ms: list[float] = field(default_factory=list)
     statuses: dict[int, int] = field(default_factory=dict)
     errors: int = 0
+
+
+@dataclass
+class DbConn:
+    host: str
+    port: int
+    user: str
+    name: str
+    password: str
+
+
+@dataclass
+class SampleConfig:
+    db: DbConn
+    interval: float
+    api_pid: int | None
+
+
+@dataclass
+class ResourceSample:
+    t: float
+    pg_total: int  # all backends on the target db
+    pg_pgrst: int  # backends attributed to PostgREST (the API's DB pool)
+    rss_mb: float | None  # API process RSS
+    fds: int | None  # API process open file descriptors
 
 
 async def mint_local_jwt(supabase_url: str, service_role: str, email: str) -> str:
@@ -149,6 +193,74 @@ async def _poll_burst_loop(
             await asyncio.sleep(interval)
 
 
+async def _run_cmd(*args: str, env: dict[str, str] | None = None) -> str:
+    """Run a short command; return stdout, or "" on any failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        out, _ = await proc.communicate()
+    except (OSError, ValueError):
+        return ""
+    return out.decode(errors="replace")
+
+
+async def _sample_pg(db: DbConn) -> tuple[int, int]:
+    """(total backends, PostgREST-attributed backends) on the target db.
+
+    PostgREST is the API's only path to Postgres (Kong -> PostgREST -> its own
+    bounded pool), so its attributed count is the real "is the API's DB pool
+    bounded" signal; total is the coarse pooler-pressure proxy. Note the
+    sampler's own psql connection is one of the totals.
+    """
+    sql = (
+        "select count(*), "
+        "count(*) filter (where application_name ilike '%postgrest%') "
+        "from pg_stat_activity where datname = current_database()"
+    )
+    out = await _run_cmd(
+        "psql", "-h", db.host, "-p", str(db.port), "-U", db.user, "-d", db.name,
+        "-tAc", sql,
+        env={**os.environ, "PGPASSWORD": db.password},
+    )
+    line = out.strip().splitlines()[0] if out.strip() else ""
+    total_s, _, pgrst_s = line.partition("|")
+    try:
+        return int(total_s), int(pgrst_s)
+    except ValueError:
+        return 0, 0
+
+
+async def _sample_proc(pid: int) -> tuple[float | None, int | None]:
+    """(RSS MB, open FD count) for pid via ps/lsof — no psutil dependency."""
+    rss_out = (await _run_cmd("ps", "-o", "rss=", "-p", str(pid))).strip()
+    rss_mb = int(rss_out) / 1024.0 if rss_out.isdigit() else None  # ps rss is KB
+    fd_out = await _run_cmd("lsof", "-p", str(pid))
+    fds: int | None = None
+    if fd_out:
+        rows = [ln for ln in fd_out.splitlines() if ln.strip()]
+        fds = max(0, len(rows) - 1)  # drop the header row
+    return rss_mb, fds
+
+
+async def _resource_sampler_loop(
+    cfg: SampleConfig, deadline: float, samples: list[ResourceSample]
+) -> None:
+    """Sample DB connections + API RSS/FDs every ``cfg.interval`` s until the
+    deadline — the "bounded pooler / stable memory / no FD leak" evidence the
+    #57 acceptance gate needs (async fans out harder than the threadpool)."""
+    while time.monotonic() < deadline:
+        pg_total, pg_pgrst = await _sample_pg(cfg.db)
+        rss_mb = fds = None
+        if cfg.api_pid is not None:
+            rss_mb, fds = await _sample_proc(cfg.api_pid)
+        samples.append(ResourceSample(time.monotonic(), pg_total, pg_pgrst, rss_mb, fds))
+        await asyncio.sleep(cfg.interval)
+
+
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -188,6 +300,30 @@ def _print_report(stats: dict[str, EndpointStats], elapsed: float, vus: int, pol
     print("=" * 96)
 
 
+def _print_resource_report(samples: list[ResourceSample]) -> None:
+    if not samples:
+        return
+    pg_totals = [s.pg_total for s in samples]
+    pg_pgrst = [s.pg_pgrst for s in samples]
+    rss = [s.rss_mb for s in samples if s.rss_mb is not None]
+    fds = [s.fds for s in samples if s.fds is not None]
+    print(f"  RESOURCES  (n={len(samples)} samples)")
+    print("-" * 96)
+    print(f"    pg backends       peak={max(pg_totals):>4}  median={int(statistics.median(pg_totals)):>4}")
+    if any(pg_pgrst):
+        print(f"    postgREST conns   peak={max(pg_pgrst):>4}  median={int(statistics.median(pg_pgrst)):>4}")
+    if rss:
+        span_min = (samples[-1].t - samples[0].t) / 60.0
+        slope = (rss[-1] - rss[0]) / span_min if span_min > 0 else 0.0
+        print(
+            f"    api RSS (MB)      peak={max(rss):>6.0f}  start={rss[0]:>6.0f}  "
+            f"end={rss[-1]:>6.0f}  slope={slope:>+6.1f} MB/min"
+        )
+    if fds:
+        print(f"    api open FDs      peak={max(fds):>4}  start={fds[0]:>4}  end={fds[-1]:>4}")
+    print("=" * 96)
+
+
 async def _run(
     base_url: str,
     token: str,
@@ -195,12 +331,14 @@ async def _run(
     vus: int,
     poll_key: str | None,
     poll_interval: float,
+    sample_cfg: SampleConfig | None = None,
 ) -> None:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     stats = {f"{m} {p}": EndpointStats(method=m, path=p) for m, p in ENDPOINTS}
     deadline = time.monotonic() + duration
     started = time.monotonic()
     polls = [0]
+    samples: list[ResourceSample] = []
 
     async with httpx.AsyncClient(
         base_url=base_url,
@@ -215,9 +353,14 @@ async def _run(
                     _poll_burst_loop(base_url, poll_key, deadline, poll_interval, polls)
                 )
             )
+        if sample_cfg is not None:
+            tasks.append(
+                asyncio.create_task(_resource_sampler_loop(sample_cfg, deadline, samples))
+            )
         await asyncio.gather(*tasks)
 
     _print_report(stats, time.monotonic() - started, vus, polls[0])
+    _print_resource_report(samples)
 
 
 def main() -> None:
@@ -245,6 +388,23 @@ def main() -> None:
         help="operator key for POST /poll (required with --with-poll)",
     )
     parser.add_argument("--poll-interval", type=float, default=8.0)
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="sample DB connections + API RSS/FDs during the run (the resource gate)",
+    )
+    parser.add_argument(
+        "--api-pid",
+        type=int,
+        default=None,
+        help="PID of the API (host uvicorn) to sample RSS/FDs; omit to sample DB only",
+    )
+    parser.add_argument("--sample-interval", type=float, default=2.0)
+    parser.add_argument("--db-host", default=os.environ.get("PGHOST", "127.0.0.1"))
+    parser.add_argument("--db-port", type=int, default=int(os.environ.get("PGPORT", "54322")))
+    parser.add_argument("--db-user", default=os.environ.get("PGUSER", "postgres"))
+    parser.add_argument("--db-name", default=os.environ.get("PGDATABASE", "postgres"))
+    parser.add_argument("--db-password", default=os.environ.get("PGPASSWORD", "postgres"))
     args = parser.parse_args()
 
     token = args.token
@@ -263,7 +423,31 @@ def main() -> None:
     if args.with_poll and not poll_key:
         parser.error("--with-poll requires --poll-key (or WYRDFOLD_API_KEY)")
 
-    asyncio.run(_run(args.base_url, token, args.duration, args.vus, poll_key, args.poll_interval))
+    sample_cfg = None
+    if args.sample:
+        sample_cfg = SampleConfig(
+            db=DbConn(
+                host=args.db_host,
+                port=args.db_port,
+                user=args.db_user,
+                name=args.db_name,
+                password=args.db_password,
+            ),
+            interval=args.sample_interval,
+            api_pid=args.api_pid,
+        )
+
+    asyncio.run(
+        _run(
+            args.base_url,
+            token,
+            args.duration,
+            args.vus,
+            poll_key,
+            args.poll_interval,
+            sample_cfg,
+        )
+    )
 
 
 if __name__ == "__main__":

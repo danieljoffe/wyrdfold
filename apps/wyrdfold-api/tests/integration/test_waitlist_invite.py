@@ -9,14 +9,17 @@ is a clean 409 (the user now exists).
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
-from supabase import Client
+from supabase import AsyncClient, Client, acreate_client
+from supabase.lib.client_options import AsyncClientOptions
 
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.main import app
+from tests.integration.conftest import LOCAL_URL, SERVICE_KEY
 
 pytestmark = pytest.mark.integration
 
@@ -37,9 +40,33 @@ def seeded_signup(service_client: Client) -> Iterator[str]:
         service_client.table("waitlist_signups").delete().eq("email", email).execute()
 
 
+async def _async_service_override() -> AsyncIterator[AsyncClient]:
+    """A fresh async service client per request (#57 PR-G2a).
+
+    ``invite_from_waitlist`` is now an ``async def`` on the async service client,
+    and its ``auth.admin.invite_user_by_email`` is awaited. Building the client
+    inside the dependency means its httpx pool binds to the TestClient portal's
+    loop (a new loop per request) rather than a stale one — so this exercises the
+    REAL async auth-admin invite against the live stack, the whole point of this
+    gate.
+
+    Async-generator dependency (not a plain ``return``) so FastAPI closes the
+    per-request httpx pool after the request — a fresh ``acreate_client`` each
+    request otherwise leaks connections/FDs across the run (Copilot, #575). The
+    postgrest and auth-admin sub-clients share the one passed httpx, so closing
+    it closes both (mirrors ``supabase_pool.close_async_supabase``).
+    """
+    http = httpx.AsyncClient()
+    client = await acreate_client(LOCAL_URL, SERVICE_KEY, AsyncClientOptions(httpx_client=http))
+    try:
+        yield client
+    finally:
+        await http.aclose()
+
+
 def _client(service_client: Client) -> TestClient:
     app.dependency_overrides[verify_api_key] = lambda: None
-    app.dependency_overrides[get_supabase] = lambda: service_client
+    app.dependency_overrides[get_async_service_supabase] = _async_service_override
     return TestClient(app)
 
 

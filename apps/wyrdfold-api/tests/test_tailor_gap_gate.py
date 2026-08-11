@@ -1,14 +1,14 @@
 """Tests for the structural gap gate on resume/cover-letter generation (#498)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -103,15 +103,16 @@ class TestGapGateResume:
     @pytest.fixture(autouse=True)
     def _overrides(self):
         app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-        app.dependency_overrides[get_supabase] = lambda: MagicMock()
+        app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+        app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
         app.dependency_overrides[get_current_user_id_optional] = lambda: None
         app.dependency_overrides[get_current_user_id] = lambda: "test-user"
         yield
         app.dependency_overrides.clear()
 
-    @patch("app.routers.tailor.optimized")
-    def test_resume_blocked_when_no_roles(self, mock_opt: MagicMock) -> None:
-        mock_opt.get_latest.return_value = _optimized_doc(_no_roles_payload())
+    @patch("app.routers.tailor._optimized_latest", new_callable=AsyncMock)
+    def test_resume_blocked_when_no_roles(self, mock_opt: AsyncMock) -> None:
+        mock_opt.return_value = _optimized_doc(_no_roles_payload())
         resp = client.post(
             "/tailor/resume",
             json={"job_description": "Build things.", "contact": {"name": "Test"}},
@@ -121,9 +122,9 @@ class TestGapGateResume:
         assert detail["code"] == "gap_gate"
         assert detail["reason"] == "no_roles"
 
-    @patch("app.routers.tailor.optimized")
-    def test_resume_blocked_when_insufficient_outcomes(self, mock_opt: MagicMock) -> None:
-        mock_opt.get_latest.return_value = _optimized_doc(_insufficient_outcomes_payload())
+    @patch("app.routers.tailor._optimized_latest", new_callable=AsyncMock)
+    def test_resume_blocked_when_insufficient_outcomes(self, mock_opt: AsyncMock) -> None:
+        mock_opt.return_value = _optimized_doc(_insufficient_outcomes_payload())
         resp = client.post(
             "/tailor/resume",
             json={"job_description": "Build things.", "contact": {"name": "Test"}},
@@ -141,9 +142,9 @@ class TestGapGateResume:
         assert gap_health(payload).gap_pct > 25
         assert can_generate(payload).ok
 
-    @patch("app.routers.tailor.optimized")
-    def test_cover_letter_blocked_when_no_roles(self, mock_opt: MagicMock) -> None:
-        mock_opt.get_latest.return_value = _optimized_doc(_no_roles_payload())
+    @patch("app.routers.tailor._optimized_latest", new_callable=AsyncMock)
+    def test_cover_letter_blocked_when_no_roles(self, mock_opt: AsyncMock) -> None:
+        mock_opt.return_value = _optimized_doc(_no_roles_payload())
         resp = client.post(
             "/tailor/cover-letter",
             json={

@@ -104,9 +104,8 @@ async def fetch_mock_jobs(board_token: str) -> list[StandardJob]:
                 external_id=f"{token}-{i}",
                 title=title,
                 location_name=_LOCATIONS[i % len(_LOCATIONS)],
-                department="Customer Experience",
                 content=_DESCRIPTION_TEMPLATE.format(title=title, index=i, token=token),
-                updated_at="2026-07-01T00:00:00Z",
+                posted_at="2026-07-01T00:00:00Z",
                 absolute_url=f"https://example.com/{token}/jobs/{i}",
             )
         )

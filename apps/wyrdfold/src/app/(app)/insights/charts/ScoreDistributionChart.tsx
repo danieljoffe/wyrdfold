@@ -59,7 +59,20 @@ export default function ScoreDistributionChart({
     );
   }
 
-  const drillBuckets = data.filter(b => b.count > 0);
+  // "At least N" chips must be cumulative (#605): the counts previously
+  // showed per-bucket totals against an at-least label/link, so the series
+  // read as nonsense (0+ smaller than 90+). Each chip now counts every
+  // scored job at or above its threshold — matching what the link filters.
+  // A chip still only renders when its own bucket has jobs; an empty
+  // bucket's threshold selects the same set as the next chip up.
+  const drillBuckets = data
+    .filter(row => row.count > 0)
+    .map(row => ({
+      low: bucketLow(row.bucket),
+      cumulative: data
+        .filter(other => bucketLow(other.bucket) >= bucketLow(row.bucket))
+        .reduce((sum, other) => sum + other.count, 0),
+    }));
 
   return (
     <>
@@ -100,12 +113,15 @@ export default function ScoreDistributionChart({
           </span>
           {drillBuckets.map(row => (
             <Link
-              key={row.bucket}
-              href={`/jobs?minScore=${bucketLow(row.bucket)}`}
+              key={row.low}
+              // ``score`` is the jobs page's URL key for the min-score
+              // filter (jobsFilterFields.ts) — the old ``minScore`` param
+              // was silently ignored, so these chips filtered nothing.
+              href={`/jobs?score=${row.low}`}
               prefetch={false}
               className={DRILL_LINK_CLASS}
             >
-              {bucketLow(row.bucket)}+ ({row.count})
+              {row.low}+ ({row.cumulative})
             </Link>
           ))}
         </nav>

@@ -12,6 +12,25 @@ concurrency:
 permissions:
   contents: read
 
+# ⚠️ RENAMING A JOB BELOW IS A BREAKING CHANGE. Each of these six `name:`
+# values is a required status check *context* in BOTH branch rulesets —
+# protect:develop (id 17940940) and protect:main (id 17940939):
+#
+#   JS — lint, typecheck, test, build
+#   Python — wyrdfold-api
+#   E2E — public + authed specs (Playwright)
+#   Lighthouse — public CWV / a11y
+#   Image scan — Trivy
+#   RLS — integration (live Supabase)
+#
+# GitHub matches contexts by display name, so a rename here must land together
+# with the matching `context` edit in BOTH rulesets — otherwise every PR blocks
+# forever on a check that never reports, and any PR opened before the rename
+# stays blocked until its branch is updated. Read the live contexts with:
+#
+#   env -u GITHUB_TOKEN gh api repos/danieljoffe/wyrdfold/rulesets/17940940 \
+#     -q '.rules[]? | select(.type=="required_status_checks")
+#         | .parameters.required_status_checks[].context'
 jobs:
   # Detect whether the PR touches anything other than docs (*.md / docs/ /
   # .claude/). The heavy jobs below gate on this, so a docs-only PR skips the
@@ -28,7 +47,7 @@ jobs:
     outputs:
       code: ${{ steps.detect.outputs.code }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
@@ -77,13 +96,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -104,7 +123,9 @@ jobs:
           curl -sSL -o /tmp/osv-scanner \
             https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64
           chmod +x /tmp/osv-scanner
-          /tmp/osv-scanner --lockfile=pnpm-lock.yaml
+          # --config: osv-scanner.toml carries the (rare) suppressions for
+          # advisories with NO fixed version at any version. See that file.
+          /tmp/osv-scanner --config=osv-scanner.toml --lockfile=pnpm-lock.yaml
 
       # run-many (not affected) — only 3 projects; local Nx cache plus the
       # pnpm store cache keep this fast. wyrdfold-api is Python; it runs
@@ -113,10 +134,11 @@ jobs:
         run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
 
   e2e:
-    # NOTE: the job name is a required check in the protect:develop ruleset —
-    # renaming it needs a ruleset edit first. It now runs the FULL tier
-    # (public + authed) despite the name.
-    name: E2E — public specs (Playwright)
+    # Runs the FULL Playwright tier: 17 public-chromium tests plus `setup` +
+    # 17 authed-chromium tests, against the throwaway local Supabase stack
+    # booted below. The old name ("E2E — public specs") predated the authed
+    # tier and misled a release review into thinking authed specs were ungated.
+    name: E2E — public + authed specs (Playwright)
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
@@ -124,13 +146,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -151,7 +173,7 @@ jobs:
       # public dev defaults, the test user is created per-run, and the
       # whole stack dies with the runner.
       - name: Install uv (for the wyrdfold-api server)
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -267,13 +289,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -313,7 +335,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
@@ -321,12 +343,12 @@ jobs:
 
       # 3.14 to match the production Dockerfile (python:3.14-slim, #273) — test
       # what we ship.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -402,18 +424,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -487,7 +509,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: tree:0
           fetch-depth: 0

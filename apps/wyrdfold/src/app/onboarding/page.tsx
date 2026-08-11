@@ -32,6 +32,13 @@ export default async function OnboardingPage() {
     current_step: string | null;
   }>('/profile/onboarding');
 
+  // Already-onboarded guard (#607): the wizard is for first runs and
+  // resumed drop-outs; a completed profile re-entering /onboarding gets
+  // the dashboard instead of a restartable setup flow.
+  if (onboarding?.completed_at) {
+    redirect('/dashboard');
+  }
+
   return (
     <OnboardingWizard
       initialPath={onboarding?.path ?? null}

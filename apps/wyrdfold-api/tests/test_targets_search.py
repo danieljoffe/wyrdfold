@@ -10,14 +10,14 @@ dumps the catalog.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    get_async_service_supabase,
     get_current_user_id,
-    get_supabase,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -31,7 +31,7 @@ def _target(tid: str, label: str, description: str | None = None) -> JobTarget:
         label=label,
         description=description,
         scoring_profile=ScoringProfile(),
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -44,7 +44,10 @@ def _clear_overrides():
 
 
 def _client(user_id: str = "user-1") -> TestClient:
-    app.dependency_overrides[get_supabase] = lambda: MagicMock()
+    # #57 slice 3: the handler now holds the async service client + inlines the
+    # crud reads, so override the async dep (the sync one is kept harmlessly).
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: user_id
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: user_id
     return TestClient(app)
@@ -55,15 +58,19 @@ def test_search_marks_which_results_the_caller_already_follows(
 ) -> None:
     from app.routers import targets as mod
 
+    # The handler inlines the crud reads as async helpers (#57 slice 3), so
+    # monkeypatch those with AsyncMocks rather than the sync crud twins.
     monkeypatch.setattr(
-        mod.crud,
-        "search_by_label",
-        lambda *_a, **_k: [
-            _target("t-1", "Senior Frontend Engineer", "react roles"),
-            _target("t-2", "Staff Frontend Engineer"),
-        ],
+        mod,
+        "_search_targets_by_label",
+        AsyncMock(
+            return_value=[
+                _target("t-1", "Senior Frontend Engineer", "react roles"),
+                _target("t-2", "Staff Frontend Engineer"),
+            ]
+        ),
     )
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", lambda *_a, **_k: {"t-1"})
+    monkeypatch.setattr(mod, "_user_target_ids", AsyncMock(return_value={"t-1"}))
 
     # Resolving at all proves /search is declared before /{target_id} (else it
     # would be captured as get_target("search") and 404 on ownership).
@@ -89,9 +96,9 @@ def test_search_no_matches_returns_empty_and_skips_link_lookup(
 ) -> None:
     from app.routers import targets as mod
 
-    monkeypatch.setattr(mod.crud, "search_by_label", lambda *_a, **_k: [])
-    link_spy = MagicMock()
-    monkeypatch.setattr(mod.crud, "get_user_target_ids", link_spy)
+    monkeypatch.setattr(mod, "_search_targets_by_label", AsyncMock(return_value=[]))
+    link_spy = AsyncMock()
+    monkeypatch.setattr(mod, "_user_target_ids", link_spy)
 
     resp = _client().get("/targets/search", params={"q": "zznomatch"})
 

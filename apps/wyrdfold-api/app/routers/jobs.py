@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import re
@@ -15,16 +14,16 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache, jobs_cache_prefix, make_cache_key
 from app.config import settings
 from app.dependencies import (
+    get_async_service_supabase,
+    get_async_supabase_for_caller,
+    get_async_user_supabase,
     get_current_user_id,
     get_current_user_id_optional,
-    get_supabase,
-    get_supabase_for_caller,
-    get_user_supabase,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -34,41 +33,40 @@ from app.http_client import (
     get_with_size_cap,
 )
 from app.models.schemas import (
+    AddToTargetRequest,
+    AddToTargetResponse,
     ManualJobRequest,
     ManualJobResponse,
     UrlValidateRequest,
     UrlValidateResponse,
 )
-from app.models.targets import SENIORITY_ORDER, AxisWeights, TargetPreferences
+from app.models.targets import (
+    SENIORITY_ORDER,
+    AxisWeights,
+    JobTarget,
+    TargetPreferences,
+    UserTarget,
+)
 from app.rate_limit import limiter
 from app.services.extract import (
-    MANUAL_SOURCE_ID,
-    MANUAL_SOURCE_ROW,
     ExtractionResult,
     _extract_from_firecrawl,
     extract_job_from_html,
-    extract_salary_from_text,
+    extract_salary_from_html,
+    salary_columns,
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
-from app.services.jd_parser import parse_jd
+from app.services.job_ingest import materialize_and_score_job
+from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
-from app.services.sanitize import sanitize_html
-from app.services.scoring import strip_html
-from app.services.tailor import persistence
+from app.services.supabase_retry import execute_with_retry
 from app.services.target_scoring import (
     bulk_score_for_target,
-    update_global_score,
+    score_and_upsert_async,
 )
-from app.services.target_scoring import (
-    score_and_upsert as target_score_and_upsert,
-)
-from app.services.targets.crud import get as get_target
-from app.services.targets.crud import get_active as get_active_target
 from app.services.targets.crud import (
-    get_active_for_user,
-    get_user_target,
-    get_user_target_ids,
-    list_user_targets,
+    _parse_target,
+    _parse_user_target,
     preferences_from_user_target,
 )
 from app.services.validate import (
@@ -112,9 +110,15 @@ router = APIRouter(
 )
 
 _JP_SELECT_COLS = (
-    "id, external_id, source_id, title, company_name, location, department, "
-    "absolute_url, score, score_breakdown, salary_text, "
-    "greenhouse_updated_at, first_seen_at, created_at"
+    "id, external_id, source_id, title, company_name, location, "
+    "city, state, country, location_remote, "
+    "absolute_url, salary_text, "
+    "salary_min, salary_max, salary_currency, salary_period, "
+    # Firewall tag columns (#524 tagger): serving them is what makes the
+    # per-target preference filters real — they were written-but-never-
+    # selected for a year ("starved tags", schema audit Group B addendum).
+    "employment_type, seniority, metro, is_remote, "
+    "source_posted_at, cataloged_at"
 )
 
 # Detail-view projection — adds ``description_html`` (and anything else
@@ -122,24 +126,6 @@ _JP_SELECT_COLS = (
 # UI can render the JD body in the detail panel; analysis/tailor flows
 # already read ``description_html`` directly off ``jobs``.
 _JP_DETAIL_SELECT_COLS = _JP_SELECT_COLS + ", description_html"
-
-
-def _ensure_manual_source(supabase: Client) -> None:
-    """Idempotently ensure the "manual" pseudo-source row exists.
-
-    Jobs added via POST /jobs/manual are filed under a fixed pseudo-source
-    (``MANUAL_SOURCE_ID``) to satisfy the NOT-NULL ``job_postings.source_id``
-    FK. A seed migration creates this row, but if it's ever missing (fresh DB
-    that skipped the seed, a manual wipe, etc.) the job upsert violates the FK
-    and 500s. This upserts the row first so the path self-heals.
-
-    ``on_conflict="id"`` makes it a no-op when the row already exists — the
-    common case — so this adds one cheap round-trip and never overwrites an
-    operator's edits to the row.
-    """
-    supabase.table("sources").upsert(
-        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
-    ).execute()
 
 
 def _tokenize_search(raw: str | None) -> list[str]:
@@ -174,7 +160,58 @@ def _tokenize_search(raw: str | None) -> list[str]:
 _IN_CHUNK_SIZE = 200
 
 
-def _default_min_score_for_user(supabase: Client, user_id: str) -> int | None:
+# ── Async inlines of shared crud reads (#57 slice 3) ─────────────────────────
+# The jobs read handlers are now `async def` and hold the async user client.
+# ``crud.get_active_target_ids`` / ``get_user_target`` / ``list_user_targets``
+# stay SYNC for their sync callers (the add-to-target write handler, the targets
+# router, crud internals, and their direct unit + RLS-integration tests), so the
+# read path can't hand them the async client. Inline the same query natively
+# here (mirrors ``routers/insights.py::_user_target_ids``); the row→model parse
+# is reused from crud so the shape stays identical.
+
+
+async def _active_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
+    """Async inline of ``crud.get_active_target_ids``: the /jobs serving scope —
+    the user's ACTIVE (non-paused) target memberships."""
+    resp = (
+        await supabase.table("user_targets")
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+async def _get_user_target_async(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> UserTarget | None:
+    """Async inline of ``crud.get_user_target`` — the (user, target) junction row."""
+    resp = (
+        await supabase.table("user_targets")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_user_target(rows[0]) if rows else None
+
+
+async def _list_user_targets_async(supabase: AsyncClient, user_id: str) -> list[UserTarget]:
+    """Async inline of ``crud.list_user_targets`` — all of the user's junction rows."""
+    resp = (
+        await supabase.table("user_targets")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return [_parse_user_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _default_min_score_for_user(supabase: AsyncClient, user_id: str) -> int | None:
     """Return the effective default list floor when no ``min_score`` chip is set.
 
     Resolution:
@@ -196,7 +233,7 @@ def _default_min_score_for_user(supabase: Client, user_id: str) -> int | None:
     system_default = settings.default_list_min_score or None
 
     resp = (
-        supabase.table("user_profiles")
+        await supabase.table("user_profiles")
         .select("list_min_score")
         .eq("user_id", user_id)
         .maybe_single()
@@ -231,8 +268,8 @@ def _gate_live_us(query: Any) -> Any:
     return query.is_("archived_at", "null").not_.is_("is_us", "false")
 
 
-def _fetch_jobs_chunked(
-    supabase: Client,
+async def _fetch_jobs_chunked(
+    supabase: AsyncClient,
     page_ids: list[str],
     *,
     user_id: str | None,
@@ -283,7 +320,7 @@ def _fetch_jobs_chunked(
         if company:
             q = q.eq("company_name", company)
         q = _apply_title_search(q, search)
-        resp = q.execute()
+        resp = await q.execute()
         rows = cast(list[dict[str, Any]], resp.data or [])
 
         # Resolve per-user status: jobs the user hasn't touched (no
@@ -292,7 +329,7 @@ def _fetch_jobs_chunked(
         status_map: dict[str, str] = {}
         if user_id is not None and rows:
             uj_resp = (
-                supabase.table("user_jobs")
+                await supabase.table("user_jobs")
                 .select("job_posting_id,status")
                 .eq("user_id", user_id)
                 .in_("job_posting_id", chunk)
@@ -402,8 +439,8 @@ def _offset_next_cursor(offset: int, page_size: int, total: int) -> str | None:
     return _encode_cursor({"o": nxt}) if nxt < total else None
 
 
-def _list_jobs_for_target_rpc(
-    supabase: Client,
+async def _list_jobs_for_target_rpc(
+    supabase: AsyncClient,
     *,
     target_id: str,
     page_size: int,
@@ -447,7 +484,7 @@ def _list_jobs_for_target_rpc(
         )
     """List jobs via server-side keyset RPC (single round-trip)."""
     after_value = cursor.get("v")
-    resp = supabase.rpc(
+    resp = await supabase.rpc(
         "get_target_jobs",
         {
             "p_target_id": target_id,
@@ -482,10 +519,11 @@ def _list_jobs_for_target_rpc(
     return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
-def _first_seen_lookup(
-    supabase: Client, job_ids: list[str], *, force: bool = False
+async def _posted_at_lookup(
+    supabase: AsyncClient, job_ids: list[str], *, force: bool = False
 ) -> dict[str, Any]:
-    """``job_posting_id`` → ``first_seen_at``, for recency-aware ordering.
+    """``job_posting_id`` → posted date (``source_posted_at`` falling back to
+    ``cataloged_at``), for recency-aware ordering.
 
     Two callers need it: the recency-decay display value (when decay is on), and
     the Pending-tier recency sort (``force=True``, used on the score sort so fresh
@@ -498,9 +536,14 @@ def _first_seen_lookup(
         return lookup
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
-        resp = supabase.table("jobs").select("id, first_seen_at").in_("id", chunk).execute()
+        resp = (
+            await supabase.table("jobs")
+            .select("id, source_posted_at, cataloged_at")
+            .in_("id", chunk)
+            .execute()
+        )
         for r in cast(list[dict[str, Any]], resp.data or []):
-            lookup[r["id"]] = r.get("first_seen_at")
+            lookup[r["id"]] = r.get("source_posted_at") or r.get("cataloged_at")
     return lookup
 
 
@@ -508,21 +551,45 @@ def _display_sort_value(
     ts: dict[str, Any],
     *,
     weights: AxisWeights | None,
-    first_seen_at: Any,
+    posted_at: Any,
     now: datetime,
 ) -> int:
-    """The score a row will actually DISPLAY: the axis-weighted blend, then
-    read-time recency decay. Sorting the list on this — rather than the stored,
-    un-weighted ``recency_score`` (which also freezes for jobs the poller stops
-    re-touching) — keeps the dashboard order matching the visible numbers (#47).
-    ``_apply_display_recency`` later sets each shown ``score`` to exactly this.
+    """THE score for a row — the one number the list filters, sorts AND shows.
+
+    #665: a wyrdfold score means "good match AND still fresh". Decay is not
+    cosmetic ageing, it encodes the probability the role is still open, so the
+    aged number is the real one and there is no second number to reconcile.
+
+    The source is the stored ``recency_score`` column, not a read-time
+    computation. That is what ``recency.py``'s design note prescribes, and the
+    objection that once justified computing it per request — that the column
+    "freezes for jobs the poller stops re-touching" — has been false since
+    ``scheduler.refresh_all_recency_scores`` started rewriting every live row on
+    a tick (prod 2026-08-08: pending 100% within +/-1 of a fresh calc, graded
+    98%). Keeping the read-time copy around is what let the displayed number
+    drift away from the floor in the first place.
+
+    It is also the only form the DB can index: ``get_cross_target_jobs`` floors
+    on ``s.recency_score`` and needs it in the covering index to stay on an
+    Index Only Scan.
+
+    CUSTOM AXIS WEIGHTS are the one exception. ``recency_score`` is derived from
+    ``score``, not from the per-membership weighted blend, so that path still
+    decays at read time — mirroring ``v_gk`` in the RPC. Keep the two in step.
     """
+    if weights is None:
+        stored = ts.get("recency_score")
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
+        # Older/stub rows fetched without the column: fall back to the raw fit
+        # rather than reporting 0, which would sink the row to the bottom.
+        return int(ts.get("score") or 0)
     weighted = display_score_or_passthrough(
         ts.get("axis_scores"), int(ts.get("score") or 0), weights
     )
     if not settings.recency_decay_enabled:
         return weighted
-    return display_recency_score(weighted, first_seen_at, now)
+    return display_recency_score(weighted, posted_at, now)
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +655,14 @@ _SCORE_ROW_COLS = (
 
 
 # The liveness inner-join doubles as a column ride-along: role_family feeds
-# the off-family gate and first_seen_at the Pending-tier recency sort —
+# the off-family gate and the posted date the Pending-tier recency sort —
 # columns these paths used to re-fetch in up to ~20 sequential chunked reads
 # per request (the 4-8s /jobs + dashboard latencies, 2026-07-16). One join,
 # zero extra round-trips.
-_JOBS_EMBED = ", jobs!inner(id, role_family, first_seen_at)"
+_JOBS_EMBED = (
+    ", jobs!inner(id, role_family, source_posted_at, cataloged_at, "
+    "salary_min, salary_max, salary_currency, salary_period, country)"
+)
 
 
 def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
@@ -630,14 +700,42 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     """Apply the fit-score floor, exempting Pending rows (#47).
 
     The floor is a fit-quality bar, so it only applies to rows that actually
-    have a fit score (``scoring_status = 'complete'``). Pending rows hold only a
-    keyword placeholder, so flooring them would hide promising jobs purely
-    because the grading cap hasn't reached them yet — instead they always pass
-    and the list marks them Pending. ``min_score`` is a validated int, so the
+    have a fit score. Pending rows hold only a keyword placeholder, so flooring
+    them would hide promising jobs purely because the grading cap hasn't reached
+    them yet — instead they always pass and the list marks them Pending.
+
+    THE EXEMPTION MUST USE THE SAME SIGNAL AS ``_is_pending`` (2026-08-08).
+    This predicate used to key on ``scoring_status != 'complete'``, which
+    ``_is_pending``'s own docstring already warns is unreliable — and the two
+    disagreed on **5,130 prod rows** (3,265 ``stage2`` + 1,865 ``stage1`` rows
+    that carry real ``axis_scores``). Those rows were exempted from the floor
+    while the list rendered them as ordinary graded results with a numeric
+    badge and no Pending marker, so "Score 85+" returned rows scored 62. Worse,
+    the exemption is *load-bearing in the wrong direction*: it also excluded the
+    genuinely-complete high scorers, so raising the bar made the list visibly
+    worse. Keying on ``axis_scores`` — Phase 2's atomic write and
+    ``_is_pending``'s primary signal — makes the floor exactly agree with the
+    badge the user sees.
+
+    ``axis_scores IS NULL`` is an exact match for ``_is_pending``'s
+    ``isinstance(axes, dict) and axes`` rung: prod carries **zero** rows with
+    ``axis_scores = '{}'`` (verified 2026-08-08), so the empty-dict case has no
+    population to diverge on.
+
+    THE FLOOR JUDGES ``recency_score``, NOT ``score`` (#665). A wyrdfold score
+    means "good match AND still fresh" — decay encodes the probability the role
+    is still open — so the aged number is the one the user sees and the one the
+    chip must judge. Flooring the raw fit while displaying the aged value is
+    what made "Score 70+" render a card reading 56 in prod.
+
+    Keep ``supabase/migrations/20260809090000_one_score_recency_everywhere.sql``
+    in step — ``pipeline_counts`` and ``get_cross_target_jobs`` mirror this
+    predicate server-side, and a divergence means the dashboard tiles and the
+    list disagree about the same floor. ``min_score`` is a validated int, so the
     interpolation below carries no injection surface."""
     if not min_score or min_score <= 0:
         return query
-    return query.or_(f"scoring_status.is.null,scoring_status.neq.complete,score.gte.{min_score}")
+    return query.or_(f"axis_scores.is.null,recency_score.gte.{min_score}")
 
 
 def _rank_graded_first(
@@ -649,7 +747,7 @@ def _rank_graded_first(
 ) -> list[dict[str, Any]]:
     """Order ``rows`` for the score sort so graded rows always precede Pending
     ones. Graded rows sort by ``value`` (the display fit score); Pending rows
-    sort by ``pending_value`` when supplied — recency (first_seen_at), so fresh
+    sort by ``pending_value`` when supplied — recency (posted date), so fresh
     ungraded postings surface at the top of the Pending tier instead of being
     ranked by the hidden keyword placeholder ``value`` returns for them. Falls
     back to ``value`` for Pending when ``pending_value`` is None (#47 f/u).
@@ -668,12 +766,28 @@ def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> boo
     """Whether ``candidate`` is a better per-job representative than ``current``
     in the untargeted (cross-target) view. A graded row beats a Pending one — a
     real fit score over a keyword placeholder (#47); among rows of the same
-    gradedness, the higher raw score wins."""
+    gradedness, the higher ``recency_score`` wins.
+
+    MIRRORS ``get_cross_target_jobs``'s ``DISTINCT ON ... ORDER BY
+    s.recency_score DESC`` — this is the same rule implemented twice (once here
+    for the two-query path, once in SQL for the RPC), so the two MUST change
+    together or the same job gets attributed to different targets depending on
+    which path served the request. ``tests/test_score_floor_sites_agree.py``
+    pins them."""
     cand_graded = not _is_pending(candidate)
     cur_graded = not _is_pending(current)
     if cand_graded != cur_graded:
         return cand_graded
-    return int(candidate.get("score") or 0) > int(current.get("score") or 0)
+    return _representative_value(candidate) > _representative_value(current)
+
+
+def _representative_value(row: dict[str, Any]) -> int:
+    """The number ``_prefer_score_row`` compares — ``recency_score`` when the
+    row carries it, else the raw fit (older stubs / selects without it)."""
+    stored = row.get("recency_score")
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+        return int(stored)
+    return int(row.get("score") or 0)
 
 
 @dataclass(frozen=True)
@@ -690,8 +804,8 @@ class _LogisticsFilter:
         return self.remote_only or self.min_salary is not None or bool(self.country)
 
 
-def _gate_off_family(
-    supabase: Client, by_id: dict[str, dict[str, Any]]
+async def _gate_off_family(
+    supabase: AsyncClient, by_id: dict[str, dict[str, Any]]
 ) -> dict[str, dict[str, Any]]:
     """Drop matches whose job ``role_family`` mismatches its target's family.
 
@@ -701,11 +815,10 @@ def _gate_off_family(
     Python and the check is RELATIONAL (job's family vs the family of the target
     its score belongs to), so it can't be a column filter like ``_gate_live_us``.
 
-    Strict, keep-null (mirrors #277): keep a match only when the job's family
-    EQUALS the target's, the job is untagged (``role_family`` NULL — benefit of
-    the doubt, like ``is_us IS NOT FALSE``), or the target is unclassified
-    (family NULL → ungated). ``by_id`` maps job_posting_id -> the winning
-    ``scores`` row (carrying ``target_id``).
+    Semantics live in ``services.qualification.family_gate`` (strict,
+    keep-null — the #277 rule, shared with the target-membership badge).
+    ``by_id`` maps job_posting_id -> the winning ``scores`` row (carrying
+    ``target_id``).
 
     Cheap: one ``targets`` read + chunked ``jobs.role_family`` reads, then an
     in-memory filter — no per-row round-trips. #60 / #278.
@@ -715,7 +828,12 @@ def _gate_off_family(
     target_ids = {r["target_id"] for r in by_id.values() if r.get("target_id")}
     if not target_ids:
         return by_id
-    tf = supabase.table("targets").select("id, role_family").in_("id", list(target_ids)).execute()
+    tf = (
+        await supabase.table("targets")
+        .select("id, role_family")
+        .in_("id", list(target_ids))
+        .execute()
+    )
     target_family: dict[str, str | None] = {
         r["id"]: r.get("role_family") for r in cast(list[dict[str, Any]], tf.data or [])
     }
@@ -738,7 +856,7 @@ def _gate_off_family(
             missing.append(pid)
     for i in range(0, len(missing), _IN_CHUNK_SIZE):
         chunk = missing[i : i + _IN_CHUNK_SIZE]
-        jf = supabase.table("jobs").select("id, role_family").in_("id", chunk).execute()
+        jf = await supabase.table("jobs").select("id, role_family").in_("id", chunk).execute()
         for r in cast(list[dict[str, Any]], jf.data or []):
             job_family[r["id"]] = r.get("role_family")
 
@@ -747,13 +865,13 @@ def _gate_off_family(
         tid = s.get("target_id")
         tfam = target_family.get(tid) if tid is not None else None
         jfam = job_family.get(pid)
-        if tfam is None or jfam is None or jfam == tfam:
+        if passes_family_gate(tfam, jfam):
             gated[pid] = s
     return gated
 
 
-def _assemble_jobs_page(
-    supabase: Client,
+async def _assemble_jobs_page(
+    supabase: AsyncClient,
     *,
     by_id: dict[str, dict[str, Any]],
     weights_for_row: Callable[[dict[str, Any]], AxisWeights | None],
@@ -770,6 +888,7 @@ def _assemble_jobs_page(
     preferences: TargetPreferences | None,
     user_id: str | None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Shared tail of both two-query list paths (per-target + cross-target).
 
@@ -785,7 +904,23 @@ def _assemble_jobs_page(
     # Off-role-family gate (#60/#278): drop matches whose job family mismatches
     # its target's family BEFORE ranking/paginating — a post-fetch drop would
     # render short pages. Mirrors the get_target_jobs SQL gate for these paths.
-    by_id = _gate_off_family(supabase, by_id)
+    by_id = await _gate_off_family(supabase, by_id)
+
+    def _include_unknown_salary(p: dict[str, Any]) -> bool:
+        """Per-row ``pref_include_unknown_salary`` (wired 2026-07-31).
+
+        Single-target path: the one ``preferences`` object. Cross-target: the
+        row's winning target's pref from ``include_unknown_salary_by_target``
+        (absent target → the model default, True). api-key/global paths pass
+        neither → strict False, the pre-wiring behavior.
+        """
+        if preferences is not None:
+            return preferences.pref_include_unknown_salary
+        if include_unknown_salary_by_target is None:
+            return False
+        ts = by_id.get(p["id"])
+        tid = ts.get("target_id") if ts else None
+        return include_unknown_salary_by_target.get(str(tid), True) if tid else True
 
     has_location_filter = bool(exclude_terms or only_terms)
     # Per-user preference filters (employment-type / seniority / location) are
@@ -794,32 +929,86 @@ def _assemble_jobs_page(
     # pre-filter total and render short. The score cutoff is NOT here — it's
     # already folded into min_score at the query layer.
     has_pref_filter = _preferences_have_post_fetch_filter(preferences)
-    has_logistics_filter = logistics is not None and logistics.active
+    def _include_unknown_salary_for_row(row: dict[str, Any]) -> bool:
+        """``_include_unknown_salary`` for a scores row (no hydrated posting
+        exists yet at pre-filter time). Same precedence: explicit per-target
+        preferences win; the cross-target path falls back to the row's winning
+        target's pref; api-key/global paths stay strict."""
+        if preferences is not None:
+            return preferences.pref_include_unknown_salary
+        if include_unknown_salary_by_target is None:
+            return False
+        tid = row.get("target_id")
+        return include_unknown_salary_by_target.get(str(tid), True) if tid else True
+
+    # ---- #654: logistics filtering moves BEFORE pagination ----------------
+    # remote/salary/country used to be post-fetch, which forced
+    # ``page_ids = list(by_id.keys())`` — every candidate hydrated through
+    # chunked IN() reads just to return one page. Measured on prod: ~11,966
+    # rows fetched over dozens of round-trips to serve 20, i.e. the 2.1-2.7s
+    # ``/jobs?...&min_salary=`` requests (a plain score sort never tripped the
+    # slow-request threshold at all).
+    #
+    # Both inputs are already on the scores row — ``logistics_filters`` is in
+    # _SCORE_ROW_COLS and the deterministic salary columns ride the EXISTING
+    # jobs!inner join — so evaluating here costs no extra reads and lets the
+    # scores layer paginate again. The archived view fetches without the embed
+    # (no salary columns), so it keeps the post-fetch path unchanged.
+    logistics_prefiltered = False
+    if (
+        logistics is not None
+        and logistics.active
+        and by_id
+        # ALL, not any: the pre-filter may only engage when EVERY row can be
+        # evaluated correctly. A row without the embed has no deterministic
+        # salary columns, so read here it looks like "unknown salary" and the
+        # strict default would silently DROP it. Shapes are uniform per query
+        # today (the select is chosen once), so this is latent — but the
+        # failure mode is silent data loss, and the fallback is merely the
+        # slower post-fetch path. Fail safe, not fast.
+        and all(_embedded_jobs_field(r, "id") is not None for r in by_id.values())
+    ):
+        by_id = {
+            pid: row
+            for pid, row in by_id.items()
+            if _score_row_passes_logistics(
+                row,
+                logistics,
+                include_unknown_salary=_include_unknown_salary_for_row(row),
+            )
+        }
+        logistics_prefiltered = True
+
+    has_logistics_filter = (
+        logistics is not None and logistics.active and not logistics_prefiltered
+    )
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
-    # Force the first-seen fetch on the score sort even with decay off — the
+    # Force the posted-date fetch on the score sort even with decay off — the
     # Pending-tier recency sort keys on it (#47 f/u). The live-path scores
-    # fetch embeds jobs(first_seen_at), so this is normally a pure harvest;
-    # only embed-less rows (archived view) still pay the chunked reads.
+    # fetch embeds jobs(source_posted_at, cataloged_at), so this is normally a
+    # pure harvest; only embed-less rows (archived view) still pay the reads.
     fs_lookup: dict[str, Any] = {}
     fs_missing: list[str] = []
     for pid, s in by_id.items():
         embedded = s.get("jobs")
-        if isinstance(embedded, dict) and "first_seen_at" in embedded:
-            fs_lookup[pid] = embedded.get("first_seen_at")
+        if isinstance(embedded, dict) and "cataloged_at" in embedded:
+            fs_lookup[pid] = embedded.get("source_posted_at") or embedded.get("cataloged_at")
         else:
             fs_missing.append(pid)
     if fs_missing:
         fs_lookup.update(
-            _first_seen_lookup(supabase, fs_missing, force=(sort == "score" or sort_col == "score"))
+            await _posted_at_lookup(
+                supabase, fs_missing, force=(sort == "score" or sort_col == "score")
+            )
         )
 
     def _display(row: dict[str, Any]) -> int:
         return _display_sort_value(
             row,
             weights=weights_for_row(row),
-            first_seen_at=fs_lookup.get(row["job_posting_id"]),
+            posted_at=fs_lookup.get(row["job_posting_id"]),
             now=now,
         )
 
@@ -839,7 +1028,7 @@ def _assemble_jobs_page(
             value=lambda r: (_display(r), r["job_posting_id"]),
             ascending=ascending,
             # Pending rows have no real fit score; order them by recency
-            # (first_seen_at) so fresh ungraded jobs surface, not by the hidden
+            # (posted date) so fresh ungraded jobs surface, not by the hidden
             # keyword placeholder _display returns for them (#47 f/u).
             pending_value=lambda r: (
                 fs_lookup.get(r["job_posting_id"]) or "",
@@ -855,7 +1044,7 @@ def _assemble_jobs_page(
     if not page_ids:
         return {"postings": [], "next_cursor": None, "total": total or 0}
 
-    postings: list[dict[str, Any]] = _fetch_jobs_chunked(
+    postings: list[dict[str, Any]] = await _fetch_jobs_chunked(
         supabase,
         page_ids,
         user_id=user_id,
@@ -864,17 +1053,23 @@ def _assemble_jobs_page(
         search=search,
     )
 
-    # Overlay the displayed score (axis-weighted when weights are set, else the
-    # raw Sonnet score), keeping ``raw_score`` alongside and flagging Pending.
+    # Overlay THE score — the same value ``_display`` sorts by, so the number
+    # shown is the number ranked and floored on (#665). ``raw_score`` keeps the
+    # undecayed fit for debugging and for the e2e guards.
     for p in postings:
         ts = by_id.get(p["id"])
         if ts:
             raw_score = int(ts["score"])
-            p["score"] = display_score_or_passthrough(
-                ts.get("axis_scores"), raw_score, weights_for_row(ts)
-            )
+            p["score"] = _display(ts)
             p["raw_score"] = raw_score
             p["score_breakdown"] = ts.get("score_breakdown")
+            # Graded rows explain their score with the fit AXES, not the
+            # keyword components (#609 follow-up): ship them so the panel
+            # can render the breakdown that actually averages to the score.
+            # The RPC list paths can't carry this column until R3 touches
+            # their RETURNS TABLE — the panel lazily falls back to the
+            # detail GET there.
+            p["axis_scores"] = ts.get("axis_scores")
             p["scoring_status"] = ts.get("scoring_status", "stage1")
             p["pending"] = _is_pending(ts)
             # Filter-only logistics (remote/salary/location) — never affects
@@ -889,19 +1084,24 @@ def _assemble_jobs_page(
         if has_pref_filter:
             postings = _apply_preferences_filter(postings, preferences)
         if logistics is not None and logistics.active:
-            postings = _apply_logistics_filter(postings, logistics)
+            postings = _apply_logistics_filter(
+                postings, logistics, include_unknown_salary_for=_include_unknown_salary
+            )
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
                 # Same DISPLAY value the scores-layer sort uses (#47).
                 ts = by_id.get(p["id"])
                 return _display(ts) if ts else 0
-            val = p.get(sort)
+            # 'created_at' is the stable WIRE token; the row key is the
+            # renamed cataloged_at (R2 two-timestamp model).
+            row_key = "cataloged_at" if sort == "created_at" else sort
+            val = p.get(row_key)
             return "" if val is None else val
 
         if sort == "score":
             # Pending below graded (#47); graded by display value, Pending by
-            # recency (first_seen_at) so fresh ungraded jobs surface (#47 f/u).
+            # recency (posted date) so fresh ungraded jobs surface (#47 f/u).
             postings = _rank_graded_first(
                 postings,
                 value=_sort_key,
@@ -924,8 +1124,8 @@ def _assemble_jobs_page(
     return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
-def _list_jobs_for_target_two_query(
-    supabase: Client,
+async def _list_jobs_for_target_two_query(
+    supabase: AsyncClient,
     *,
     target_id: str,
     page_size: int,
@@ -967,7 +1167,7 @@ def _list_jobs_for_target_two_query(
     )
     ts_query = _scores_live_join(ts_query, archived_view=archived_view)
     ts_query = _apply_score_floor(ts_query, min_score)
-    ts_rows = cast(list[dict[str, Any]], ts_query.execute().data or [])
+    ts_rows = cast(list[dict[str, Any]], (await ts_query.execute()).data or [])
 
     if not ts_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -975,7 +1175,7 @@ def _list_jobs_for_target_two_query(
     score_lookup = {r["job_posting_id"]: r for r in ts_rows}
 
     # Single-target: the same axis weights apply to every row.
-    return _assemble_jobs_page(
+    return await _assemble_jobs_page(
         supabase,
         by_id=score_lookup,
         weights_for_row=lambda _row: axis_weights,
@@ -995,8 +1195,8 @@ def _list_jobs_for_target_two_query(
     )
 
 
-def _list_jobs_for_target(
-    supabase: Client,
+async def _list_jobs_for_target(
+    supabase: AsyncClient,
     *,
     target_id: str,
     page_size: int,
@@ -1021,10 +1221,12 @@ def _list_jobs_for_target(
     The two-query path also takes over when location filters are active, since
     the RPC paginates server-side with no knowledge of the location filter.
 
-    When ``axis_weights`` is set we skip the RPC and use the two-query path —
-    the RPC doesn't return ``axis_scores`` so it can't apply the overlay. This
-    keeps the v1 behaviour: the displayed ``score`` is the weighted blend,
-    sort order is unchanged (still raw / recency).
+    When ``axis_weights`` is set, the SCORE sort routes through the cross-target
+    RPC (restricted to this target), which now computes the weighted blend
+    DB-side (#457) — so a custom-weight target no longer scans everything into
+    Python to rank. NON-score sorts with weights still take the two-query path:
+    their keyset RPC (``get_target_jobs``) returns the raw score, so only the
+    Python overlay shows the weighted number.
 
     ``preferences`` is the caller's per-(user, target) read-time filter (#60).
     The score cutoff is folded into ``min_score`` by the caller (server-side);
@@ -1052,13 +1254,16 @@ def _list_jobs_for_target(
     # SQL, so only the two-query path can surface globally-archived rows
     # (UX/IA §5 Stage 1 "still reachable").
     has_logistics = logistics is not None and logistics.active
+    # A weighted SCORE sort no longer forces the scan — it routes through the
+    # cross-target RPC below, which blends DB-side (#457). Weighted NON-score
+    # sorts still need the two-query overlay (their keyset RPC returns raw score).
     if (
-        axis_weights is not None
+        (axis_weights is not None and sort != "score")
         or _preferences_have_post_fetch_filter(preferences)
         or has_logistics
         or status == "archived"
     ):
-        return _list_jobs_for_target_two_query(
+        return await _list_jobs_for_target_two_query(
             supabase,
             axis_weights=axis_weights,
             preferences=preferences,
@@ -1080,7 +1285,7 @@ def _list_jobs_for_target(
     is_multiword_search = bool(search and len(_tokenize_search(search)) > 1)
     if sort == "score" and not has_location_filter and not is_multiword_search:
         try:
-            return _list_jobs_across_user_targets_rpc(
+            return await _list_jobs_across_user_targets_rpc(
                 supabase,
                 user_target_ids={target_id},
                 page_size=page_size,
@@ -1091,6 +1296,8 @@ def _list_jobs_for_target(
                 company=company,
                 search=search,
                 cursor=cursor,
+                # #457: the RPC blends this target's custom weights DB-side.
+                weights_by_target=({target_id: axis_weights} if axis_weights is not None else None),
                 user_id=user_id,
             )
         except _RpcIneligibleError as exc:
@@ -1104,11 +1311,18 @@ def _list_jobs_for_target(
                 "the slower two-query path",
                 exc_info=True,
             )
-        return _list_jobs_for_target_two_query(
-            supabase, preferences=preferences, logistics=logistics, **kwargs
+        # Reached for a weighted score sort with a location / multi-word filter
+        # (the RPC can't express those) — keep axis_weights so the overlay still
+        # shows the blend, not the raw score.
+        return await _list_jobs_for_target_two_query(
+            supabase,
+            axis_weights=axis_weights,
+            preferences=preferences,
+            logistics=logistics,
+            **kwargs,
         )
     try:
-        return _list_jobs_for_target_rpc(supabase, **kwargs)
+        return await _list_jobs_for_target_rpc(supabase, **kwargs)
     except _RpcIneligibleError as exc:
         logger.debug("get_target_jobs ineligible (%s); using two-query path", exc)
     except Exception:
@@ -1116,13 +1330,19 @@ def _list_jobs_for_target(
             "get_target_jobs RPC FAILED; degrading to the slower two-query path",
             exc_info=True,
         )
-    return _list_jobs_for_target_two_query(
-        supabase, preferences=preferences, logistics=logistics, **kwargs
+    # Non-score keyset fallback: axis_weights is None here (weighted non-score
+    # sorts bail to two-query above), passed for consistency / future-proofing.
+    return await _list_jobs_for_target_two_query(
+        supabase,
+        axis_weights=axis_weights,
+        preferences=preferences,
+        logistics=logistics,
+        **kwargs,
     )
 
 
-def _list_jobs_across_user_targets_rpc(
-    supabase: Client,
+async def _list_jobs_across_user_targets_rpc(
+    supabase: AsyncClient,
     *,
     user_target_ids: set[str],
     page_size: int,
@@ -1133,6 +1353,7 @@ def _list_jobs_across_user_targets_rpc(
     company: str | None,
     search: str | None,
     cursor: dict[str, Any],
+    weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
     """Untargeted list via the server-side dedup+sort+paginate RPC (#365).
@@ -1145,11 +1366,21 @@ def _list_jobs_across_user_targets_rpc(
     statement-timeout path, #365). Offset-paginated to match the two-query
     cursor contract. Raises to fall back to the two-query path for the shapes
     the RPC can't express DB-side (the dispatcher gates most; multi-word search
-    is caught here since it uses OR semantics the RPC's single ILIKE can't)."""
+    is caught here since it uses OR semantics the RPC's single ILIKE can't).
+
+    ``weights_by_target`` (#457): per-target custom axis weights. When present
+    the RPC computes the weighted display blend DB-side (``p_weights``), so a
+    custom-weight view uses this fast path instead of the scan-everything
+    two-query fallback. Empty/None ⇒ the RPC ranks + returns the raw score
+    exactly as before (index-only)."""
     if search and len(_tokenize_search(search)) > 1:
         raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     offset = _offset_from_cursor(cursor)
-    resp = supabase.rpc(
+    # target_id -> axis-weight object, the JSONB map the RPC blends by. Only
+    # genuinely-customized weights reach here (defaults persist as NULL), so this
+    # is empty for the common case and the RPC stays on its index-only plan.
+    p_weights = {tid: w.model_dump() for tid, w in (weights_by_target or {}).items()}
+    resp = await supabase.rpc(
         "get_cross_target_jobs",
         {
             "p_target_ids": list(user_target_ids),
@@ -1165,10 +1396,12 @@ def _list_jobs_across_user_targets_rpc(
             "p_limit": page_size + 1,
             "p_offset": offset,
             "p_user_id": user_id,
-            # Decay-aware graded sort key when read-time recency decay is on
-            # (prod). The shared _apply_display_recency post-step still sets the
-            # shown number; the RPC only needs the ORDER to match.
+            # Only the CUSTOM-WEIGHTS branch still decays at read time (#665):
+            # ``recency_score`` is derived from ``score``, not from the weighted
+            # blend, so the RPC recomputes it there. The un-weighted path reads
+            # the stored column and ignores this flag entirely.
             "p_recency_decay": settings.recency_decay_enabled,
+            "p_weights": p_weights,
         },
     ).execute()
     if not isinstance(resp.data, list):
@@ -1182,8 +1415,8 @@ def _list_jobs_across_user_targets_rpc(
     return {"postings": postings, "next_cursor": next_cursor, "total": None}
 
 
-def _list_jobs_across_user_targets(
-    supabase: Client,
+async def _list_jobs_across_user_targets(
+    supabase: AsyncClient,
     *,
     user_target_ids: set[str],
     page_size: int,
@@ -1199,6 +1432,7 @@ def _list_jobs_across_user_targets(
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — the union of jobs scored against any of the user's
     active targets, deduplicated by job id.
@@ -1206,17 +1440,18 @@ def _list_jobs_across_user_targets(
     Tries the server-side ``get_cross_target_jobs`` RPC first (single
     round-trip, DB-side status filter + dedup + rank + paginate — #365), then
     falls back to the two-query Python path. The RPC is skipped for shapes it
-    can't express: custom axis weights (the displayed score — hence the sort —
-    is a per-target blend the RPC can't reproduce), post-fetch location /
-    logistics filters (the RPC paginates with no knowledge of them, so its page
-    would carry pre-filter rows), and the archived view (the RPC gates to live
-    rows). Read-time recency decay is NOT a skip — the RPC ranks by the decayed
-    score DB-side (``p_recency_decay``). Those exceptions keep the two-query
-    path."""
+    can't express: post-fetch location / logistics filters (the RPC paginates
+    with no knowledge of them, so its page would carry pre-filter rows), and the
+    archived view (the RPC gates to live rows). Custom axis weights are NO LONGER
+    a skip (#457) — the RPC computes the per-target weighted blend DB-side
+    (``p_weights``), so custom-weight views take this fast path instead of the
+    scan-everything two-query fallback. Read-time recency decay is likewise not a
+    skip — the RPC ranks by the decayed score DB-side (``p_recency_decay``).
+    Those exceptions keep the two-query path."""
     has_location_filter = bool(exclude_terms or only_terms)
     has_logistics = logistics is not None and logistics.active
-    if weights_by_target or has_location_filter or has_logistics or status == "archived":
-        return _list_jobs_across_user_targets_two_query(
+    if has_location_filter or has_logistics or status == "archived":
+        return await _list_jobs_across_user_targets_two_query(
             supabase,
             user_target_ids=user_target_ids,
             page_size=page_size,
@@ -1232,9 +1467,10 @@ def _list_jobs_across_user_targets(
             weights_by_target=weights_by_target,
             user_id=user_id,
             logistics=logistics,
+            include_unknown_salary_by_target=include_unknown_salary_by_target,
         )
     try:
-        return _list_jobs_across_user_targets_rpc(
+        return await _list_jobs_across_user_targets_rpc(
             supabase,
             user_target_ids=user_target_ids,
             page_size=page_size,
@@ -1245,6 +1481,7 @@ def _list_jobs_across_user_targets(
             company=company,
             search=search,
             cursor=cursor,
+            weights_by_target=weights_by_target,
             user_id=user_id,
         )
     except _RpcIneligibleError as exc:
@@ -1254,7 +1491,7 @@ def _list_jobs_across_user_targets(
             "get_cross_target_jobs RPC FAILED; degrading to the slower two-query path",
             exc_info=True,
         )
-    return _list_jobs_across_user_targets_two_query(
+    return await _list_jobs_across_user_targets_two_query(
         supabase,
         user_target_ids=user_target_ids,
         page_size=page_size,
@@ -1270,11 +1507,12 @@ def _list_jobs_across_user_targets(
         weights_by_target=weights_by_target,
         user_id=user_id,
         logistics=logistics,
+        include_unknown_salary_by_target=include_unknown_salary_by_target,
     )
 
 
-def _list_jobs_across_user_targets_two_query(
-    supabase: Client,
+async def _list_jobs_across_user_targets_two_query(
+    supabase: AsyncClient,
     *,
     user_target_ids: set[str],
     page_size: int,
@@ -1290,6 +1528,7 @@ def _list_jobs_across_user_targets_two_query(
     weights_by_target: dict[str, AxisWeights] | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    include_unknown_salary_by_target: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -1320,7 +1559,17 @@ def _list_jobs_across_user_targets_two_query(
     )
     score_query = _scores_live_join(score_query, archived_view=archived_view)
     score_query = _apply_score_floor(score_query, min_score)
-    score_resp = score_query.execute()
+    # This fallback exists because the cross-target RPC hit a statement
+    # timeout — under the same contention its own scores read dies of the
+    # identical 57014 (observed unhandled on the dashboard top-matches read,
+    # 2026-08-05 #604). One backoff retry lets the fallback actually absorb
+    # the failure it was built for; if it still times out, the app-wide
+    # APIError handler turns 57014 into a clean 503.
+    score_resp = await execute_with_retry(
+        score_query.execute,
+        label="jobs/cross_target_two_query_scores",
+        retry_statement_timeout=True,
+    )
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
 
     if not score_rows:
@@ -1345,7 +1594,7 @@ def _list_jobs_across_user_targets_two_query(
         tid = cast(str | None, row.get("target_id"))
         return weights_by_target.get(tid) if tid else None
 
-    return _assemble_jobs_page(
+    return await _assemble_jobs_page(
         supabase,
         by_id=best,
         weights_for_row=_weights_for,
@@ -1362,12 +1611,13 @@ def _list_jobs_across_user_targets_two_query(
         preferences=None,  # untargeted view has no per-target preference filter
         user_id=user_id,
         logistics=logistics,
+        include_unknown_salary_by_target=include_unknown_salary_by_target,
     )
 
 
-# Sync `def` so FastAPI runs each request in a threadpool worker. The body
-# makes multiple blocking supabase `.execute()` calls; `async def` would block
-# the event loop and serialize concurrent /jobs reads.
+# `list_jobs` is `async def` since #57 slice 3: its DB reads await natively on the
+# pooled async user client, so a /jobs request no longer ties up a threadpool
+# worker for the duration of each supabase round-trip.
 
 
 def _parse_location_list(raw: str | None) -> list[str]:
@@ -1464,35 +1714,112 @@ def _apply_location_filter(
     ]
 
 
-def _logistics_passes(logistics: dict[str, Any] | None, f: _LogisticsFilter) -> bool:
-    """One posting's ``logistics_filters`` dict against the active filters.
+def _logistics_passes(
+    posting: dict[str, Any], f: _LogisticsFilter, *, include_unknown_salary: bool = False
+) -> bool:
+    """One posting against the active logistics filters.
 
     Semantics per plan-wyrdfold-logistics-chips.md:
     - ``remote_only`` — STRICT: keep only ``remote_status == "remote"`` (an
       unknown/``unspecified`` status is dropped; the user explicitly asked for
       remote, so surfacing unknowns would dilute the filter).
-    - ``min_salary`` — STRICT: keep only when ``salary_max`` is present and
-      ``>= min_salary`` (an undisclosed salary is dropped).
-    - ``country`` — LENIENT: keep when ``location_country`` matches
-      (case-insensitive) OR is absent (a remote role with no country anchor
-      still passes).
+    - ``min_salary`` — STRICT by default: an undisclosed salary is dropped.
+      ``include_unknown_salary`` (the per-(user, target)
+      ``pref_include_unknown_salary``, wired 2026-07-31) relaxes exactly that
+      unknown-drop — a KNOWN salary below the floor is dropped either way. The
+      api-key/global paths keep the strict default. The bound
+      PREFERS the deterministic jobs-level columns (``salary_max``/``salary_min``
+      parsed from the posting's own salary text — present for the whole corpus,
+      yearly-USD gated) and falls back to the Phase-2 grader's
+      ``logistics_filters.salary_max`` (per-target LLM output, graded rows
+      only) when the posting carries no structured yearly-USD salary. Before
+      the columns existed this filter silently dropped every ungraded row.
+    - ``country`` — LENIENT, but only where the country is genuinely unknown.
+      PREFERS the deterministic ``jobs.country`` column (present on ~80% of the
+      live corpus) and falls back to the Phase-2 grader's
+      ``logistics_filters.location_country`` (graded rows only, ~4%) when the
+      posting carries no country. Only when BOTH are absent does the row pass
+      unfiltered — that's the real intent of the leniency (a remote role with no
+      country anchor), not "keep everything".
     """
-    log = logistics or {}
+    return _logistics_core(
+        f,
+        log=posting.get("logistics_filters") or {},
+        salary_currency=posting.get("salary_currency"),
+        salary_period=posting.get("salary_period"),
+        salary_max=posting.get("salary_max"),
+        salary_min=posting.get("salary_min"),
+        posting_country=posting.get("country"),
+        include_unknown_salary=include_unknown_salary,
+    )
+
+
+def _logistics_core(
+    f: _LogisticsFilter,
+    *,
+    log: dict[str, Any],
+    salary_currency: Any,
+    salary_period: Any,
+    salary_max: Any,
+    salary_min: Any,
+    posting_country: Any = None,
+    include_unknown_salary: bool,
+) -> bool:
+    """The one logistics predicate. Both callers — the posting-level filter
+    and the scores-row pre-filter (#654) — route through here so the two
+    layers cannot drift; a divergence would silently change which jobs a
+    filter returns depending on which path a request happened to take."""
     if f.remote_only and log.get("remote_status") != "remote":
         return False
     if f.min_salary is not None:
-        salary_max = log.get("salary_max")
-        if salary_max is None or salary_max < f.min_salary:
+        if salary_currency == "USD" and salary_period == "yearly":
+            bound = salary_max or salary_min
+        else:
+            bound = log.get("salary_max")
+        if bound is None:
+            if not include_unknown_salary:
+                return False
+        elif bound < f.min_salary:
             return False
     if f.country:
-        country = log.get("location_country")
+        # Prefer the deterministic jobs-level column; fall back to the Phase-2
+        # grader's field only when the posting has no country of its own. The
+        # old order read ONLY the grader's field, which exists on ~4% of scores
+        # rows — so "absent ⇒ keep" admitted the other 96% and the filter was
+        # inert (selecting Canada returned a full page of US jobs, 2026-08-08).
+        country = posting_country if posting_country is not None else log.get("location_country")
         if country is not None and str(country).upper() != f.country.upper():
             return False
     return True
 
 
+def _score_row_passes_logistics(
+    row: dict[str, Any], f: _LogisticsFilter, *, include_unknown_salary: bool
+) -> bool:
+    """The same predicate, evaluated against a SCORES row instead of a
+    hydrated posting — the whole point of #654.
+
+    Both inputs are already in hand at that layer: ``logistics_filters`` is
+    part of ``_SCORE_ROW_COLS``, and the deterministic salary columns ride
+    the existing ``jobs!inner`` join. Filtering here lets pagination stay at
+    the scores layer, so hydration costs one page instead of the entire
+    candidate set."""
+    return _logistics_core(
+        f,
+        log=row.get("logistics_filters") or {},
+        salary_currency=_embedded_jobs_field(row, "salary_currency"),
+        salary_period=_embedded_jobs_field(row, "salary_period"),
+        salary_max=_embedded_jobs_field(row, "salary_max"),
+        salary_min=_embedded_jobs_field(row, "salary_min"),
+        posting_country=_embedded_jobs_field(row, "country"),
+        include_unknown_salary=include_unknown_salary,
+    )
+
+
 def _apply_logistics_filter(
-    postings: list[dict[str, Any]], f: _LogisticsFilter
+    postings: list[dict[str, Any]],
+    f: _LogisticsFilter,
+    include_unknown_salary_for: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Drop postings failing the logistics filters (#86), reading each row's
     overlaid ``logistics_filters`` dict. Post-fetch like the location filter, so
@@ -1501,7 +1828,12 @@ def _apply_logistics_filter(
     it)."""
     if not f.active:
         return postings
-    return [p for p in postings if _logistics_passes(p.get("logistics_filters"), f)]
+    resolve = include_unknown_salary_for or (lambda _p: False)
+    return [
+        p
+        for p in postings
+        if _logistics_passes(p, f, include_unknown_salary=resolve(p))
+    ]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -1509,12 +1841,14 @@ def _apply_logistics_filter(
 #
 # Score cutoff is pushed into ``min_score`` (server-side, exact, keeps
 # pagination correct). The remaining filters (employment_type / seniority /
-# location-via-metro-or-text) are POST-FETCH, mirroring how the location chip
-# already works — they read the job's firewall tag columns when present and are
-# LENIENT on absence: the tag columns (employment_type / seniority / metro /
-# is_remote) are added by a separate firewall PR and are not backfilled, so a
-# missing-or-NULL tag means "unknown" and the job is KEPT. This makes the
-# filters inert until the firewall lands without coupling this PR to it.
+# location-via-metro-or-text) are POST-FETCH and read the job's firewall tag
+# columns. The tags are SERVED as of the R2 release (added to
+# ``_JP_SELECT_COLS`` here; to the list RPCs in the R2 migration) — before
+# that they were written by the tagger but never selected, so these filters
+# silently passed everything ("starved tags", schema audit 2026-07-30).
+# Still LENIENT on absence: the tagger doesn't backfill, so a missing/NULL
+# tag means "unknown" and the job is KEPT — only a KNOWN tag outside the
+# preference drops it.
 
 
 def _job_tag(posting: dict[str, Any], column: str) -> str | None:
@@ -1677,221 +2011,28 @@ def _apply_preferences_filter(
     ]
 
 
-def _apply_display_recency(postings: list[dict[str, Any]]) -> None:
-    """Decay each posting's *displayed* ``score`` by its age at read time.
-
-    The score overlay sets ``score`` to the fit/axis-weighted blend and
-    preserves the undecayed fit in ``raw_score``. Users also expect a stale
-    posting to visibly fade, so we multiply the displayed score by the age
-    decay derived from ``first_seen_at`` *now* — not the stored
-    ``recency_score`` (which the poller only refreshes for jobs it re-touches,
-    so it freezes for postings that age off the boards). ``raw_score`` is left
-    intact — set by the overlay, and defaulted here for any row the overlay
-    didn't touch — so the pure fit stays available to the UI/debugging.
-
-    In-place mutation of the ``postings`` list. No-op when the recency flag is
-    off (the displayed score is then the raw fit, exactly as before). Only the
-    two JWT list paths call this; the operator/api-key view keeps raw scores.
-    """
-    if not settings.recency_decay_enabled:
-        return
-    now = datetime.now(UTC)
-    for p in postings:
-        score = p.get("score")
-        # ``bool`` is an ``int`` subclass — guard so a stray True/False
-        # never gets treated as a score.
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            continue
-        score_int = int(score)
-        p.setdefault("raw_score", score_int)
-        p["score"] = display_recency_score(score_int, p.get("first_seen_at"), now)
-
-
-@router.get("")
-def list_jobs(
-    cursor: str | None = Query(None),
-    page_size: int = Query(20, ge=1, le=100),
-    sort: str = Query("score", pattern="^(score|created_at|company_name|title)$"),
-    order: str = Query("desc", pattern="^(asc|desc)$"),
-    min_score: int | None = Query(None, ge=0, le=100),
-    status: str | None = Query(
-        None,
-        pattern="^(new|saved|resume_draft|resume_ready|applied|interviewing|offer|rejected|archived)$",
-    ),
-    company: str | None = Query(None, max_length=200),
-    search: str | None = Query(None, max_length=200),
-    target_id: str | None = Query(None),
-    exclude_locations: str | None = Query(None, max_length=500),
-    only_locations: str | None = Query(None, max_length=500),
-    remote_only: bool = Query(False),
-    min_salary: int | None = Query(None, ge=0),
-    country: str | None = Query(None, max_length=4),
-    # #88 dual-auth: JWT callers ride the RLS user client (jobs/scores/targets
-    # are SELECT-true; user_jobs/user_targets/user_profiles self-scoped, and
-    # the get_target_jobs RPC is SECURITY INVOKER with an authenticated EXECUTE
-    # grant, so RLS still governs inside it). Api-key callers (user_id None,
-    # the operator view below) get the service-role client — they have no JWT
-    # to bind. The client choice mirrors get_current_user_id_optional.
-    supabase: Client = Depends(get_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+async def _list_jobs_operator(
+    supabase: AsyncClient,
+    *,
+    cursor_data: dict[str, Any],
+    page_size: int,
+    sort: str,
+    ascending: bool,
+    min_score: int | None,
+    status: str | None,
+    company: str | None,
+    search: str | None,
+    exclude_terms: list[str],
+    only_terms: list[str],
 ) -> dict[str, Any]:
-    exclude_terms = _parse_location_list(exclude_locations)
-    only_terms = _parse_location_list(only_locations)
-    # Logistics filters (#86) — over the grader's scores.logistics_filters data.
-    logistics = _LogisticsFilter(remote_only=remote_only, min_salary=min_salary, country=country)
-    cursor_data = _decode_cursor(cursor)
-    ascending = order == "asc"
+    """Operator/global list path (api-key, no JWT): full ``jobs`` table view,
+    no target scoping. The operator/global view only distinguishes live vs
+    archived; per-user statuses (saved/applied/…) don't apply without a user,
+    so it derives a ``status`` of "archived"/"new" from ``archived_at``.
 
-    # Check cache (60s TTL — data only changes on poll/manual-add cycles).
-    # user_id participates in the key so per-user views (saved/dismissed,
-    # future filtering) never cross-leak between accounts.
-    cache_key = make_cache_key(
-        jobs_cache_prefix(target_id=target_id),
-        cursor=cursor,
-        page_size=page_size,
-        sort=sort,
-        order=order,
-        min_score=min_score,
-        status=status,
-        company=company,
-        search=search,
-        # Comma-joined here so two callers with the same set of terms in
-        # different order share a cache entry. Terms are already lowercased
-        # by ``_parse_location_list``.
-        exclude_locations=",".join(sorted(exclude_terms)) or None,
-        only_locations=",".join(sorted(only_terms)) or None,
-        # Logistics filters vary the result set, so they must vary the key
-        # (country upper-cased since the filter matches case-insensitively).
-        remote_only=remote_only or None,
-        min_salary=min_salary,
-        country=(country or "").upper() or None,
-        user_id=user_id,
-    )
-    cached: dict[str, Any] | None = job_list_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    # JWT callers see only postings whose target_id is in their user_targets.
-    # The api-key path (cron/poller) bypasses scoping — it operates on the
-    # whole table by design (e.g. backfill, rescore-all, cost rollup).
-    user_target_ids: set[str] | None = None
-    if user_id is not None:
-        user_target_ids = get_user_target_ids(supabase, user_id)
-        if not user_target_ids:
-            empty: dict[str, Any] = {
-                "postings": [],
-                "next_cursor": None,
-                "total": 0,
-                "applied_min_score": min_score,
-            }
-            job_list_cache.set(cache_key, empty)
-            return empty
-        if target_id and target_id not in user_target_ids:
-            empty = {
-                "postings": [],
-                "next_cursor": None,
-                "total": 0,
-                "applied_min_score": min_score,
-            }
-            job_list_cache.set(cache_key, empty)
-            return empty
-
-    # When no chip is set, fall back to the user's stored threshold —
-    # historically ``user_profiles.job_score_threshold`` only gated SMS
-    # notifications, so a senior user with threshold 70 still saw 5k+
-    # rows of noise in the list. Caller can pass ``min_score=0`` to
-    # explicitly opt out of the default; ``applied_min_score`` is
-    # echoed in the response so the UI can render a "filtered to ≥N"
-    # chip with a clear affordance.
-    if min_score is None and user_id is not None:
-        min_score = _default_min_score_for_user(supabase, user_id)
-
-    # Target view: sort/paginate by target-specific scores
-    if target_id:
-        # Per-pairing axis weights override the displayed score for this
-        # user's target view. Per-pairing preferences (#60) filter/re-rank
-        # that view at read time. Both are JWT-only — api-key callers get raw
-        # scores + no preference filtering (no user identity to scope by) — and
-        # both are read from the SAME user_targets row, so this is one round-trip.
-        axis_weights: AxisWeights | None = None
-        preferences: TargetPreferences | None = None
-        if user_id is not None:
-            ut = get_user_target(supabase, user_id, target_id)
-            if ut is not None:
-                axis_weights = ut.axis_weights
-                preferences = preferences_from_user_target(ut)
-                # Fold the preference score cutoff into the effective floor.
-                # Take the MAX of any explicit/profile-default min_score and
-                # the cutoff so the stricter bar wins, and so a user who set
-                # min_score=0 to "see everything" still can't drop below a
-                # cutoff they configured. Pushed server-side via min_score —
-                # this is a filter over the shared cached score, not a re-grade.
-                cutoff = preferences.pref_score_cutoff
-                min_score = cutoff if min_score is None else max(min_score, cutoff)
-        result = _list_jobs_for_target(
-            supabase,
-            target_id=target_id,
-            page_size=page_size,
-            sort=sort,
-            ascending=ascending,
-            min_score=min_score,
-            status=status,
-            company=company,
-            search=search,
-            exclude_terms=exclude_terms,
-            only_terms=only_terms,
-            cursor=cursor_data,
-            axis_weights=axis_weights,
-            preferences=preferences,
-            user_id=user_id,
-            logistics=logistics,
-        )
-        # Decay the displayed score by posting age (read-time, never stale).
-        # raw_score keeps the undecayed fit. No-op when the flag is off.
-        _apply_display_recency(result["postings"])
-        result["applied_min_score"] = min_score
-        job_list_cache.set(cache_key, result)
-        return result
-
-    # Untargeted list — for JWT callers, return the union of jobs scored
-    # against any of the user's active targets (deduplicated). For api-key
-    # callers (cron/poller) we keep the old "table scan" path: they need
-    # to operate on the whole table by design (rescore-all, backfill).
-    if user_target_ids is not None:
-        # Build target_id -> AxisWeights map for any pairings that have
-        # custom weights set. Missing entries fall through to raw score.
-        weights_by_target: dict[str, AxisWeights] = {}
-        for ut in list_user_targets(supabase, user_id):  # type: ignore[arg-type]
-            if ut.axis_weights is not None:
-                weights_by_target[ut.target_id] = ut.axis_weights
-        result = _list_jobs_across_user_targets(
-            supabase,
-            user_target_ids=user_target_ids,
-            page_size=page_size,
-            sort=sort,
-            ascending=ascending,
-            min_score=min_score,
-            status=status,
-            company=company,
-            search=search,
-            exclude_terms=exclude_terms,
-            only_terms=only_terms,
-            cursor=cursor_data,
-            weights_by_target=weights_by_target or None,
-            user_id=user_id,
-            logistics=logistics,
-        )
-        # Decay the displayed score by posting age (read-time, never stale).
-        # raw_score keeps the undecayed fit. No-op when the flag is off.
-        _apply_display_recency(result["postings"])
-        result["applied_min_score"] = min_score
-        job_list_cache.set(cache_key, result)
-        return result
-
-    # Operator path (api-key, no JWT): full table view, no target scoping.
-    # The operator/global view only distinguishes live vs archived; per-user
-    # statuses (saved/applied/…) don't apply without a user, so we derive a
-    # ``status`` of "archived"/"new" from ``archived_at`` for the response.
+    Extracted from ``list_jobs`` so the async handler holds no literal
+    ``.execute()`` on the loop (#57 slice 3 / #107) — the two reads await here.
+    """
     query = supabase.table("jobs").select(
         _JP_SELECT_COLS + ", archived_at",
         count=CountMethod.exact,
@@ -1935,7 +2076,7 @@ def list_jobs(
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
         query = query.order(operator_sort, desc=not ascending).limit(_OPERATOR_LOCATION_SCAN_CAP)
-        resp = query.execute()
+        resp = await query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
             logger.warning(
@@ -1948,7 +2089,7 @@ def list_jobs(
             exclude_terms=exclude_terms,
             only_terms=only_terms,
         )
-        operator_result: dict[str, Any] = {
+        return {
             "postings": _finalize_operator_rows(
                 filtered[operator_offset : operator_offset + page_size]
             ),
@@ -1956,18 +2097,219 @@ def list_jobs(
             "total": len(filtered),
             "applied_min_score": min_score,
         }
-    else:
-        query = query.order(operator_sort, desc=not ascending).range(
-            operator_offset, operator_offset + page_size - 1
+    query = query.order(operator_sort, desc=not ascending).range(
+        operator_offset, operator_offset + page_size - 1
+    )
+    resp = await query.execute()
+    operator_total = resp.count or 0
+    return {
+        "postings": _finalize_operator_rows(cast(list[dict[str, Any]], list(resp.data or []))),
+        "next_cursor": _offset_next_cursor(operator_offset, page_size, operator_total),
+        "total": operator_total,
+        "applied_min_score": min_score,
+    }
+
+
+@router.get("")
+async def list_jobs(
+    cursor: str | None = Query(None),
+    page_size: int = Query(20, ge=1, le=100),
+    sort: str = Query("score", pattern="^(score|created_at|company_name|title)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    min_score: int | None = Query(None, ge=0, le=100),
+    status: str | None = Query(
+        None,
+        pattern="^(new|saved|resume_draft|resume_ready|applied|interviewing|offer|rejected|archived)$",
+    ),
+    company: str | None = Query(None, max_length=200),
+    search: str | None = Query(None, max_length=200),
+    target_id: str | None = Query(None),
+    exclude_locations: str | None = Query(None, max_length=500),
+    only_locations: str | None = Query(None, max_length=500),
+    remote_only: bool = Query(False),
+    min_salary: int | None = Query(None, ge=0),
+    country: str | None = Query(None, max_length=4),
+    # #88 dual-auth: JWT callers ride the RLS user client (jobs/scores/targets
+    # are SELECT-true; user_jobs/user_targets/user_profiles self-scoped, and
+    # the get_target_jobs RPC is SECURITY INVOKER with an authenticated EXECUTE
+    # grant, so RLS still governs inside it). Api-key callers (user_id None,
+    # the operator view below) get the service-role client — they have no JWT
+    # to bind. The client choice mirrors get_current_user_id_optional.
+    supabase: AsyncClient = Depends(get_async_supabase_for_caller),
+    user_id: str | None = Depends(get_current_user_id_optional),
+) -> dict[str, Any]:
+    exclude_terms = _parse_location_list(exclude_locations)
+    only_terms = _parse_location_list(only_locations)
+    # Logistics filters (#86) — over the grader's scores.logistics_filters data.
+    logistics = _LogisticsFilter(remote_only=remote_only, min_salary=min_salary, country=country)
+    cursor_data = _decode_cursor(cursor)
+    ascending = order == "asc"
+
+    # Check cache (60s TTL — data only changes on poll/manual-add cycles).
+    # user_id participates in the key so per-user views (saved/dismissed,
+    # future filtering) never cross-leak between accounts.
+    cache_key = make_cache_key(
+        jobs_cache_prefix(target_id=target_id),
+        cursor=cursor,
+        page_size=page_size,
+        sort=sort,
+        order=order,
+        min_score=min_score,
+        status=status,
+        company=company,
+        search=search,
+        # Comma-joined here so two callers with the same set of terms in
+        # different order share a cache entry. Terms are already lowercased
+        # by ``_parse_location_list``.
+        exclude_locations=",".join(sorted(exclude_terms)) or None,
+        only_locations=",".join(sorted(only_terms)) or None,
+        # Logistics filters vary the result set, so they must vary the key
+        # (country upper-cased since the filter matches case-insensitively).
+        remote_only=remote_only or None,
+        min_salary=min_salary,
+        country=(country or "").upper() or None,
+        user_id=user_id,
+    )
+    cached: dict[str, Any] | None = job_list_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # JWT callers see only postings from their ACTIVE memberships — pausing
+    # a target removes its jobs from the list (Group D decision, 2026-07-30;
+    # the link itself and all authz/dedup surfaces stay any-status). The
+    # api-key path (cron/poller) bypasses scoping — it operates on the
+    # whole table by design (e.g. backfill, rescore-all, cost rollup).
+    user_target_ids: set[str] | None = None
+    if user_id is not None:
+        user_target_ids = await _active_target_ids(supabase, user_id)
+        if not user_target_ids:
+            empty: dict[str, Any] = {
+                "postings": [],
+                "next_cursor": None,
+                "total": 0,
+                "applied_min_score": min_score,
+            }
+            job_list_cache.set(cache_key, empty)
+            return empty
+        if target_id and target_id not in user_target_ids:
+            empty = {
+                "postings": [],
+                "next_cursor": None,
+                "total": 0,
+                "applied_min_score": min_score,
+            }
+            job_list_cache.set(cache_key, empty)
+            return empty
+
+    # When no chip is set, fall back to the user's stored threshold —
+    # historically ``user_profiles.job_score_threshold`` only gated SMS
+    # notifications, so a senior user with threshold 70 still saw 5k+
+    # rows of noise in the list. Caller can pass ``min_score=0`` to
+    # explicitly opt out of the default; ``applied_min_score`` is
+    # echoed in the response so the UI can render a "filtered to ≥N"
+    # chip with a clear affordance.
+    if min_score is None and user_id is not None:
+        min_score = await _default_min_score_for_user(supabase, user_id)
+
+    # Target view: sort/paginate by target-specific scores
+    if target_id:
+        # Per-pairing axis weights override the displayed score for this
+        # user's target view. Per-pairing preferences (#60) filter/re-rank
+        # that view at read time. Both are JWT-only — api-key callers get raw
+        # scores + no preference filtering (no user identity to scope by) — and
+        # both are read from the SAME user_targets row, so this is one round-trip.
+        axis_weights: AxisWeights | None = None
+        preferences: TargetPreferences | None = None
+        if user_id is not None:
+            ut = await _get_user_target_async(supabase, user_id, target_id)
+            if ut is not None:
+                axis_weights = ut.axis_weights
+                preferences = preferences_from_user_target(ut)
+                # Fold the preference score cutoff into the effective floor.
+                # Take the MAX of any explicit/profile-default min_score and
+                # the cutoff so the stricter bar wins, and so a user who set
+                # min_score=0 to "see everything" still can't drop below a
+                # cutoff they configured. Pushed server-side via min_score —
+                # this is a filter over the shared cached score, not a re-grade.
+                cutoff = preferences.pref_score_cutoff
+                min_score = cutoff if min_score is None else max(min_score, cutoff)
+        result = await _list_jobs_for_target(
+            supabase,
+            target_id=target_id,
+            page_size=page_size,
+            sort=sort,
+            ascending=ascending,
+            min_score=min_score,
+            status=status,
+            company=company,
+            search=search,
+            exclude_terms=exclude_terms,
+            only_terms=only_terms,
+            cursor=cursor_data,
+            axis_weights=axis_weights,
+            preferences=preferences,
+            user_id=user_id,
+            logistics=logistics,
         )
-        resp = query.execute()
-        operator_total = resp.count or 0
-        operator_result = {
-            "postings": _finalize_operator_rows(cast(list[dict[str, Any]], list(resp.data or []))),
-            "next_cursor": _offset_next_cursor(operator_offset, page_size, operator_total),
-            "total": operator_total,
-            "applied_min_score": min_score,
-        }
+        # No display post-step: both list paths already return THE score —
+        # the RPC selects it, the two-query overlay sets it from _display (#665).
+        result["applied_min_score"] = min_score
+        job_list_cache.set(cache_key, result)
+        return result
+
+    # Untargeted list — for JWT callers, return the union of jobs scored
+    # against any of the user's active targets (deduplicated). For api-key
+    # callers (cron/poller) we keep the old "table scan" path: they need
+    # to operate on the whole table by design (rescore-all, backfill).
+    if user_target_ids is not None:
+        # Build target_id -> AxisWeights map for any pairings that have
+        # custom weights set. Missing entries fall through to raw score.
+        weights_by_target: dict[str, AxisWeights] = {}
+        # Per-target pref_include_unknown_salary (wired 2026-07-31) — rides
+        # the same user_targets read as the weights.
+        include_unknown_salary_by_target: dict[str, bool] = {}
+        for ut in await _list_user_targets_async(supabase, user_id):  # type: ignore[arg-type]
+            if ut.axis_weights is not None:
+                weights_by_target[ut.target_id] = ut.axis_weights
+            include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
+        result = await _list_jobs_across_user_targets(
+            supabase,
+            user_target_ids=user_target_ids,
+            page_size=page_size,
+            sort=sort,
+            ascending=ascending,
+            min_score=min_score,
+            status=status,
+            company=company,
+            search=search,
+            exclude_terms=exclude_terms,
+            only_terms=only_terms,
+            cursor=cursor_data,
+            weights_by_target=weights_by_target or None,
+            user_id=user_id,
+            logistics=logistics,
+            include_unknown_salary_by_target=include_unknown_salary_by_target,
+        )
+        # No display post-step: both list paths already return THE score —
+        # the RPC selects it, the two-query overlay sets it from _display (#665).
+        result["applied_min_score"] = min_score
+        job_list_cache.set(cache_key, result)
+        return result
+
+    # Operator path (api-key, no JWT): full table view, no target scoping.
+    operator_result = await _list_jobs_operator(
+        supabase,
+        cursor_data=cursor_data,
+        page_size=page_size,
+        sort=sort,
+        ascending=ascending,
+        min_score=min_score,
+        status=status,
+        company=company,
+        search=search,
+        exclude_terms=exclude_terms,
+        only_terms=only_terms,
+    )
     job_list_cache.set(cache_key, operator_result)
     return operator_result
 
@@ -1985,8 +2327,8 @@ _JOB_STATUSES = (
 )
 
 
-def _pipeline_counts_python(
-    supabase: Client,
+async def _pipeline_counts_python(
+    supabase: AsyncClient,
     *,
     target_ids: set[str],
     min_score: int | None,
@@ -2005,7 +2347,7 @@ def _pipeline_counts_python(
     )
     # Floor exempts Pending rows so the tab counts match the list (#47).
     score_query = _apply_score_floor(score_query, min_score)
-    score_resp = score_query.execute()
+    score_resp = await score_query.execute()
     job_ids = sorted(
         {cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], score_resp.data or [])}
     )
@@ -2014,7 +2356,9 @@ def _pipeline_counts_python(
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
         # Liveness gate (#75 C3) + non-US gate (#60): count only jobs that are
         # still live AND not confirmed non-US, so the tab totals match the list.
-        live_resp = _gate_live_us(supabase.table("jobs").select("id").in_("id", chunk)).execute()
+        live_resp = await _gate_live_us(
+            supabase.table("jobs").select("id").in_("id", chunk)
+        ).execute()
         live_ids = [cast(str, r["id"]) for r in cast(list[dict[str, Any]], live_resp.data or [])]
         # Resolve per-user status for the chunk; jobs with no user_jobs
         # row — and every job when there's no user identity — count as
@@ -2022,7 +2366,7 @@ def _pipeline_counts_python(
         status_map: dict[str, str] = {}
         if user_id is not None:
             uj_resp = (
-                supabase.table("user_jobs")
+                await supabase.table("user_jobs")
                 .select("job_posting_id,status")
                 .eq("user_id", user_id)
                 .in_("job_posting_id", chunk)
@@ -2038,8 +2382,8 @@ def _pipeline_counts_python(
     return counts
 
 
-def _pipeline_counts_grouped(
-    supabase: Client,
+async def _pipeline_counts_grouped(
+    supabase: AsyncClient,
     *,
     target_ids: set[str],
     min_score: int | None,
@@ -2049,12 +2393,14 @@ def _pipeline_counts_grouped(
     to the client-side chunked variant if the RPC isn't deployed yet.
 
     Floored counts ride the RPC too: since 20260716050000 it mirrors
-    ``_apply_score_floor`` exactly (the floor applies only to rows with
-    ``scoring_status = 'complete'``; Pending rows always pass, #47).
+    ``_apply_score_floor`` exactly — the floor judges only genuinely graded
+    rows (``axis_scores IS NOT NULL``); Pending rows always pass (#47).
+    That exemption keyed on ``scoring_status`` until 20260808040000; see
+    ``_apply_score_floor`` for why that column is not the graded signal.
     Floored users previously forced the Python path — ~1.6–2.6s of chunked
     round-trips inside the dashboard's hottest projection."""
     try:
-        resp = supabase.rpc(
+        resp = await supabase.rpc(
             "pipeline_counts",
             {
                 "p_target_ids": sorted(target_ids),
@@ -2067,7 +2413,7 @@ def _pipeline_counts_grouped(
             "pipeline_counts RPC FAILED; degrading to the slower client-side count",
             exc_info=True,
         )
-        return _pipeline_counts_python(
+        return await _pipeline_counts_python(
             supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
     return {
@@ -2077,12 +2423,12 @@ def _pipeline_counts_grouped(
 
 
 @router.get("/pipeline-counts")
-def pipeline_counts(
+async def pipeline_counts(
     # #88 dual-auth: get_current_user_id is JWT-required, so every caller that
     # reaches the body carries a JWT and rides the RLS user client (the
     # pipeline_counts RPC is SECURITY INVOKER; user_jobs/user_targets/
     # user_profiles are self-scoped, scores/jobs SELECT-true).
-    supabase: Client = Depends(get_supabase_for_caller),
+    supabase: AsyncClient = Depends(get_async_supabase_for_caller),
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, int]:
     """Per-status job counts for the calling user's pipeline.
@@ -2104,10 +2450,11 @@ def pipeline_counts(
         return cached
 
     counts: dict[str, int] = dict.fromkeys(_JOB_STATUSES, 0)
-    target_ids = get_user_target_ids(supabase, user_id)
+    # ACTIVE memberships only — the tab counts must match the list scope.
+    target_ids = await _active_target_ids(supabase, user_id)
     if target_ids:
-        min_score = _default_min_score_for_user(supabase, user_id)
-        grouped = _pipeline_counts_grouped(
+        min_score = await _default_min_score_for_user(supabase, user_id)
+        grouped = await _pipeline_counts_grouped(
             supabase, target_ids=target_ids, min_score=min_score, user_id=user_id
         )
         for status_key, n in grouped.items():
@@ -2137,15 +2484,18 @@ async def validate_url(
 async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
-    supabase: Client = Depends(get_supabase),
-    # #6 R2 step 2: the manual-add scores writes are gated through SECURITY
-    # DEFINER RPCs on the caller's client (user JWT → target ownership enforced
-    # in-DB; api-key/operator → service-role, exempt). Reads + the job insert
-    # stay on the service-role `supabase`.
-    caller_supabase: Client = Depends(get_supabase_for_caller),
     user_id: str | None = Depends(get_current_user_id_optional),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> ManualJobResponse:
-    """Add a job posting by URL. Extracts metadata via cascade."""
+    """Add a job posting by URL. Extracts metadata via cascade.
+
+    The materialize + gated-score path (``materialize_and_score_job`` /
+    ``score_and_upsert_async``) is the service-role scorer shared with the
+    poller-adjacent from-url flow (``targets.from_input``); it now runs on the
+    pooled async service client, awaited on the loop (#57 PR-G2e-4). The
+    caller's active targets are read via async inlines rather than a threadpool
+    hop.
+    """
     warnings: list[str] = []
 
     # Layer 1: Format validation
@@ -2261,136 +2611,36 @@ async def add_manual_job(
             needs_manual_fields=True,
         )
 
-    # Generate external_id from URL — must be numeric (bigint column)
-    external_id = str(int(hashlib.sha256(final_url.encode()).hexdigest()[:15], 16))
-
-    # Extract salary from extraction result or description
-    salary = extraction.salary_text
-    if not salary and description_html:
-        salary = extract_salary_from_text(strip_html(description_html))
-
-    # Upsert into jobs (score starts at 0, updated by target pipeline)
-    row: dict[str, Any] = {
-        "external_id": external_id,
-        "source_id": MANUAL_SOURCE_ID,
-        "title": title,
-        "company_name": company_name,
-        "location": location,
-        "department": None,
-        "description_html": sanitize_html(description_html) if description_html else "",
-        "absolute_url": final_url,
-        "score": 0,
-        "score_breakdown": {},
-        "greenhouse_updated_at": datetime.now(UTC).isoformat(),
-        "salary_text": salary,
-    }
-
-    # Make sure the manual pseudo-source exists before inserting the job —
-    # otherwise the source_id FK fails. Wrap both writes so a DB/PostgREST
-    # error surfaces as a clean 502 instead of leaking the raw Postgres
-    # message (e.g. the FK-violation string) to the client.
+    # Materialize the posting as a real job + score it against the caller's OWN
+    # active targets. Scoping to the caller's targets is a privacy boundary: an
+    # unscoped fan-out would write scores under every user's active target,
+    # surfacing one user's pasted URL in every other user's /jobs list via the
+    # scores→user_targets join. Operator/api-key callers (user_id None) keep the
+    # global fan-out for cron/admin back-compat. Shared with the from-url target
+    # flow via materialize_and_score_job (upsert + score + global + force-include),
+    # all on the async service client injected above.
+    if user_id is not None:
+        active_targets = await _active_targets_for_user_async(supabase, user_id)
+    else:
+        active_targets = await _all_active_targets_async(supabase)
     try:
-
-        def _persist() -> Any:
-            _ensure_manual_source(supabase)
-            return supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
-
-        resp_db = await asyncio.to_thread(_persist)
+        posting_id = await materialize_and_score_job(
+            supabase,
+            final_url=final_url,
+            title=title,
+            company_name=company_name,
+            location=location,
+            description_html=description_html,
+            salary_text=extraction.salary_text,
+            targets=active_targets,
+        )
     except APIError as exc:
+        # A clean 502 rather than leaking the raw Postgres/FK message.
         logger.error("Manual job upsert failed for url=%s: %s", final_url, exc, exc_info=exc)
         raise HTTPException(
             status_code=502,
             detail="Couldn't save this job right now — please try again.",
         ) from exc
-
-    posting_id = None
-    if resp_db.data:
-        data = cast(dict[str, Any], resp_db.data[0])
-        posting_id = data.get("id")
-
-    # Score against the caller's active targets (stages 1+2 inline for manual
-    # entry). Scoping to the JWT caller's targets is a privacy boundary: the
-    # previous global fan-out wrote scores for every user's active target,
-    # surfacing one user's pasted URL in every other user's /jobs list via
-    # the scores→user_targets join. Operator/api-key callers (user_id is None)
-    # retain the global fan-out for back-compat with cron + admin tooling.
-    # Each per-target scoring call is independent and IO-bound (the Supabase
-    # SDK is sync, so we hand each one to the threadpool and gather). For 10
-    # active targets this turns ~10 sequential round-trips into ~1 wall-time.
-    if posting_id and title:
-        if user_id is not None:
-            active_targets = await asyncio.to_thread(get_active_for_user, supabase, user_id)
-        else:
-            active_targets = await asyncio.to_thread(get_active_target, supabase)
-        parsed = parse_jd(description_html)
-        # Score against the caller's OWN active_targets (scoped above), writing
-        # through the gated user_upsert_score RPC on the SERVICE-ROLE client
-        # (SEC-H2): that RPC is now service_role-only, and the ownership scope
-        # is the active_targets set, not a per-call follower check.
-        results = await asyncio.gather(
-            *[
-                asyncio.to_thread(
-                    target_score_and_upsert,
-                    supabase,
-                    job_posting_id=posting_id,
-                    title=title,
-                    description_html=description_html,
-                    target=t,
-                    parsed_jd=parsed,
-                    gated=True,
-                )
-                for t in active_targets
-            ],
-            return_exceptions=True,
-        )
-        for t, result in zip(active_targets, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.error(
-                    "Target scoring failed for manual job %s target %s",
-                    posting_id,
-                    t.id,
-                    exc_info=result,
-                )
-        try:
-            await asyncio.to_thread(update_global_score, supabase, posting_id)
-        except Exception:
-            logger.exception("Global score update failed for manual job %s", posting_id)
-
-        # Force-include this posting in the user's /jobs view regardless of
-        # what the negative-keyword pass decided. The scorer flags
-        # ``excluded=True`` whenever a negative keyword matches in the title
-        # or any "requirements"/"default" section of the JD — perfectly
-        # sensible for the poller (which fires for jobs nobody asked for),
-        # but wrong here: the user explicitly pasted this URL. Mentions of
-        # "mentor junior engineers" or "collaborate with the data analyst
-        # team" silently buried the job. Keep the score breakdown honest
-        # (the negative penalty stays in the breakdown so the badge color
-        # still tells the user this isn't a great fit) but make the row
-        # visible so the user can act on it.
-        # Scoped to the targets scored above: when the posting already
-        # existed (poller ingest or another user's paste), an unscoped
-        # update would also flip rows under OTHER users' targets,
-        # overriding their negative-keyword exclusions (audit #24 F4).
-        scored_target_ids = [t.id for t in active_targets]
-        if scored_target_ids:
-            try:
-                await asyncio.to_thread(
-                    # SEC-H2: service-role client — user_set_scores_included is
-                    # now service_role-only; the target ids are the caller's own
-                    # active_targets (scoped above).
-                    lambda: supabase.rpc(
-                        "user_set_scores_included",
-                        {
-                            "p_job_posting_id": posting_id,
-                            "p_target_ids": scored_target_ids,
-                        },
-                    ).execute()
-                )
-            except Exception:
-                logger.exception("Force-include update failed for manual job %s", posting_id)
-
-    # Invalidate job list cache after adding a new posting
-    job_list_cache.invalidate()
 
     return ManualJobResponse(
         success=True,
@@ -2402,13 +2652,214 @@ async def add_manual_job(
     )
 
 
-# Sync `def` (not `async def`): the bulk re-score is blocking supabase work,
-# so FastAPI runs it in its threadpool and keeps the O(jobs x keywords) DB
-# round-trips off the event loop. See #107.
+async def _get_target_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:
+    """Async inline of ``crud.get`` — one shared-catalog target row by id.
+
+    ``crud.get`` stays sync for the poller / from-url / operator paths, so the
+    ``async def`` add-to-target handler reads the row natively on the pooled async
+    service client here rather than tie up a threadpool worker (#57 PR-G2d-a). The
+    row→model parse is reused from crud so the shape stays identical.
+    """
+    resp = await supabase.table("targets").select("*").eq("id", target_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return _parse_target(rows[0]) if rows else None
+
+
+async def _active_targets_for_user_async(
+    supabase: AsyncClient, user_id: str
+) -> list[JobTarget]:
+    """Async inline of ``crud.get_active_for_user`` — the caller's active
+    memberships as full target rows (``crud`` stays sync for its poller callers,
+    #57 PR-G2e-4). Mirrors ``targets._active_targets_for_user``."""
+    ut_resp = await (
+        supabase.table("user_targets")
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    target_ids = [r["target_id"] for r in cast(list[dict[str, Any]], ut_resp.data or [])]
+    if not target_ids:
+        return []
+    resp = await supabase.table("targets").select("*").in_("id", target_ids).execute()
+    return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+
+
+async def _all_active_targets_async(supabase: AsyncClient) -> list[JobTarget]:
+    """Async inline of ``crud.get_active`` — the derived ``app_active OR
+    EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
+    Python (the operator/api-key manual-add fan-out, #57 PR-G2e-4). Mirrors
+    ``targets._active_targets``."""
+    floor_resp = await (
+        supabase.table("targets").select("*").eq("app_active", True).execute()
+    )
+    member_ids_resp = await (
+        supabase.table("user_targets").select("target_id").eq("is_active", True).execute()
+    )
+    member_ids = {
+        cast(str, r["target_id"])
+        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+    }
+    rows = cast(list[dict[str, Any]], floor_resp.data or [])
+    seen = {cast(str, r["id"]) for r in rows}
+    missing = sorted(member_ids - seen)
+    if missing:
+        member_resp = await (
+            supabase.table("targets").select("*").in_("id", missing).execute()
+        )
+        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
+    return [_parse_target(r) for r in rows]
+
+
+async def _user_set_scores_included_async(
+    supabase: AsyncClient, job_posting_id: str, target_ids: list[str]
+) -> None:
+    """Force-include a posting's scores under specific targets via the
+    ``user_set_scores_included`` RPC, natively on the async service client
+    (#57 PR-G2d-a). Extracted from the handler body so no bare ``.execute()``
+    sits on the loop there (the #107 guard scans handler bodies)."""
+    await supabase.rpc(
+        "user_set_scores_included",
+        {"p_job_posting_id": job_posting_id, "p_target_ids": target_ids},
+    ).execute()
+
+
+async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
+    """Load a LIVE, US posting's scoring inputs (title + JD body) by id, or None.
+
+    Mirrors ``job_search``'s live+US predicate exactly (archived_at IS NULL AND
+    purged_at IS NULL AND is_us IS NOT FALSE) so "addable" ⇔ "searchable": a
+    dead / purged / non-US id 404s instead of letting a caller resurrect a
+    hidden row into their pipeline by guessing its UUID.
+
+    Async (#57 slice 4): read on the caller's pooled async RLS client.
+    """
+    resp = (
+        await supabase.table("jobs")
+        .select("id, title, description_html")
+        .eq("id", job_id)
+        .is_("archived_at", "null")
+        .is_("purged_at", "null")
+        .not_.is_("is_us", "false")
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0] if rows else None
+
+
+@router.post("/{job_id}/add-to-target", response_model=AddToTargetResponse)
+@limiter.limit("30/minute")
+async def add_job_to_target(
+    request: Request,
+    job_id: str,
+    body: AddToTargetRequest,
+    user_id: str = Depends(get_current_user_id),
+    # The RLS-backstopped reads (job load + ownership check) ride the caller's
+    # pooled async user client (#57 slice 4). The SERVICE-ROLE score writes ride
+    # the pooled async service client (#57 PR-G2d-a).
+    caller_supabase: AsyncClient = Depends(get_async_user_supabase),
+    service_supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> AddToTargetResponse:
+    """Score an EXISTING posting (a search result's ``jobs.id``) against one of
+    the caller's own targets and save it to their pipeline (#467 power-action).
+
+    Unlike ``POST /jobs/manual`` this NEVER materializes a new job row — the
+    posting is already in the shared corpus — so it can't create the
+    manual-pseudo-source duplicate that ``materialize_and_score_job`` would.
+    """
+    # Load the posting's scoring inputs. Must be a live+US posting (exactly what
+    # search surfaces); a dead / purged / unknown id 404s.
+    job = await _load_live_job(caller_supabase, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Ownership gate — THE enforcement (targets are a shared catalog, so the
+    # service-role writes below carry no in-DB ownership check). Same 404 for
+    # "target doesn't exist" and "not yours" so the response never leaks another
+    # user's target ids. Read on the caller's client so RLS is the backstop.
+    if await _get_user_target_async(caller_supabase, user_id, body.target_id) is None:
+        raise HTTPException(status_code=404, detail="Target not found for user")
+
+    # SEC-H2 (migration 20260718010000): the user_upsert_score /
+    # user_set_scores_included SECURITY DEFINER RPCs are NOT executable by
+    # `authenticated` — their in-DB check only verifies the caller *follows* the
+    # target, which is insufficient for a SHARED, ownerless target catalog (a
+    # follower could tamper with co-followers' scores). So all score writes go on
+    # the SERVICE-ROLE client (auth.uid() NULL → the functions' service-role-exempt
+    # branch), and OWNERSHIP is enforced in the API above. Every service-role
+    # round-trip here runs natively on the pooled async service client (#57
+    # PR-G2d-a): the target read inlines ``crud.get`` async, and
+    # ``score_and_upsert_async`` is the always-gated async twin of the shared
+    # scorer.
+    target = await _get_target_async(service_supabase, body.target_id)
+    if target is None:  # catalog row vanished between the two reads — defensive
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    # Stage-2 score the existing posting against the chosen target on the
+    # SERVICE-ROLE client. The async twin is always gated — it routes through
+    # user_upsert_score, but with auth.uid() NULL it takes the function's
+    # service-role-exempt branch (the RPC isn't authenticated-executable
+    # post-lockdown — see above).
+    try:
+        result = await score_and_upsert_async(
+            service_supabase,
+            job_posting_id=job_id,
+            title=job["title"] or "",
+            description_html=job["description_html"] or "",
+            target=target,
+        )
+    except APIError as exc:
+        logger.error(
+            "add-to-target scoring failed job=%s target=%s: %s",
+            job_id,
+            body.target_id,
+            exc,
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't add this job right now — please try again.",
+        ) from exc
+
+    # Best-effort bookkeeping AFTER the score row is committed (mirrors
+    # materialize_and_score_job): a transient failure in any of these must not
+    # fail the whole action — the score (the core effect) is already written, so
+    # a 500 here would read as "nothing happened" when the job IS scored and
+    # will show under the target. Each step is independent and logged.
+    #  1. Force-include under THIS one target so a negative-keyword ``excluded``
+    #     flag can't hide a job the user deliberately added — scoped to the single
+    #     target, on the service-role client (audit #24 F4).
+    try:
+        await _user_set_scores_included_async(service_supabase, job_id, [body.target_id])
+    except Exception:
+        logger.exception("add-to-target force-include failed for job %s", job_id)
+    #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
+    #     path (targets/from_input.py): a deliberately-added posting is 'saved',
+    #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
+    try:
+        await _upsert_user_job_async(
+            service_supabase,
+            user_id=user_id,
+            job_posting_id=job_id,
+            status="saved",
+        )
+    except Exception:
+        logger.exception("add-to-target user_job save failed for job %s", job_id)
+    job_list_cache.invalidate()
+
+    return AddToTargetResponse(
+        success=True,
+        job_posting_id=job_id,
+        target_id=body.target_id,
+        score=result.score,
+    )
+
+
 @router.post("/rescore/{target_id}", dependencies=[Depends(verify_api_key)])
-def rescore_for_target(
+async def rescore_for_target(
     target_id: str,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
     """Re-score all jobs against a target's scoring profile.
 
@@ -2417,19 +2868,68 @@ def rescore_for_target(
     DB-heavy re-score by hitting the API directly. Not reachable from
     the wyrdfold FE — only invoked manually from the operator console
     or from CLI scripts that supply the api key.
+
+    Runs ``bulk_score_for_target`` on the pooled async service client, awaited on
+    the loop (#57 PR-G2e-4) — the same re-scorer the feedback learner uses.
     """
-    target = get_target(supabase, target_id)
+    target = await _get_target_async(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    scored = bulk_score_for_target(supabase, target)
+    scored = await bulk_score_for_target(supabase, target)
     job_list_cache.invalidate()
     return {"target_id": target_id, "jobs_scored": scored}
 
 
+def _extract_salary_updates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """CPU-bound salary extraction over one page of ``jobs`` rows — kept out of
+    the event loop (run via ``to_thread``) since it regex-scans each JD body."""
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        html = row.get("description_html") or ""
+        if not html:
+            continue
+        salary = extract_salary_from_html(html)
+        if salary:
+            updates.append({"id": row["id"], "salary_text": salary, **salary_columns(salary)})
+    return updates
+
+
+async def _run_salary_backfill(supabase: AsyncClient) -> int:
+    """The backfill loop, factored out of the handler so its awaited ``.execute``
+    round-trips live in an async helper (the handler body stays execute-free —
+    the #107 guard convention)."""
+    batch_size = 500
+    offset = 0
+    updated = 0
+
+    while True:
+        resp = (
+            await supabase.table("jobs")
+            .select("id, description_html")
+            .is_("salary_text", "null")
+            .range(offset, offset + batch_size - 1)
+            .execute()
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if not rows:
+            break
+
+        updates = await asyncio.to_thread(_extract_salary_updates, rows)
+        if updates:
+            await supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()
+            updated += len(updates)
+
+        if len(rows) < batch_size:
+            break
+        offset += batch_size
+
+    return updated
+
+
 @router.post("/backfill-salary", dependencies=[Depends(verify_api_key)])
-def backfill_salary(
-    supabase: Client = Depends(get_supabase),
+async def backfill_salary(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
     """One-off: extract salary from description_html for jobs missing salary_text.
 
@@ -2441,71 +2941,26 @@ def backfill_salary(
     caller can't trigger a full-table scan + per-row salary extraction.
     Not reachable from the wyrdfold FE.
     """
-    batch_size = 500
-    offset = 0
-    updated = 0
-
-    while True:
-        resp = (
-            supabase.table("jobs")
-            .select("id, description_html")
-            .is_("salary_text", "null")
-            .range(offset, offset + batch_size - 1)
-            .execute()
-        )
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        if not rows:
-            break
-
-        updates: list[dict[str, Any]] = []
-        for row in rows:
-            html = row.get("description_html") or ""
-            if not html:
-                continue
-            salary = extract_salary_from_text(strip_html(html))
-            if salary:
-                updates.append({"id": row["id"], "salary_text": salary})
-
-        if updates:
-            supabase.rpc("bulk_update_salaries", {"p_updates": updates}).execute()
-            updated += len(updates)
-
-        if len(rows) < batch_size:
-            break
-        offset += batch_size
-
+    updated = await _run_salary_backfill(supabase)
     job_list_cache.invalidate()
     return {"updated": updated}
 
 
-def _assert_user_owns_posting(
-    supabase: Client,
+async def _assert_user_owns_posting_async(
+    supabase: AsyncClient,
     posting_id: str,
     user_id: str,
     *,
     include_description: bool = False,
 ) -> dict[str, Any]:
-    """Look up a posting and verify the caller is linked (via
-    ``user_targets``) to at least one target that has scored this
-    posting. 404 on either missing or unowned (don't leak existence of
-    postings outside the user's targets).
-
-    ``include_description=True`` adds ``description_html`` to the
-    projection — needed by the per-posting detail GET, omitted from the
-    other callers (delete, ownership-only checks) so we don't move the
-    full JD body across the wire on every status mutation.
-
-    Ownership is derived through ``scores``: the poller writes
-    ``scores`` rows keyed by ``(job_posting_id, target_id)``, while
-    ``jobs.target_id`` is **not** populated. Checking ``jobs.target_id``
-    directly (the previous shape) always 404'd on real postings. This
-    mirrors the fix applied in ``status.py`` (PR #676) — same root
-    cause, separate copy of the helper.
-    """
+    """Posting-ownership probe for the ``async def`` handlers (``get_job`` +
+    ``delete_job``, #57 slice 3/4): the three reads awaited on the pooled async
+    user client. (The sync twin retired with ``delete_job``'s migration; the
+    ``status`` router keeps its own separate sync copy.)"""
     # 1. Fetch the posting (and projection).
     select_cols = _JP_DETAIL_SELECT_COLS if include_description else _JP_SELECT_COLS
     posting_resp = (
-        supabase.table("jobs").select(select_cols).eq("id", posting_id).limit(1).execute()
+        await supabase.table("jobs").select(select_cols).eq("id", posting_id).limit(1).execute()
     )
     rows = posting_resp.data or []
     if not rows or not isinstance(rows[0], dict):
@@ -2514,26 +2969,25 @@ def _assert_user_owns_posting(
 
     # 2. Resolve the caller's target ids.
     user_targets_resp = (
-        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     )
     user_target_ids = {cast(dict[str, Any], r)["target_id"] for r in user_targets_resp.data or []}
     if not user_target_ids:
         raise HTTPException(status_code=404, detail="Posting not found")
 
-    # 3. Confirm at least one of the user's targets has a score row for
-    # this posting. Exposing the matched target_id on the returned row
-    # so callers can scope cache invalidation, mirroring the old
-    # ``jobs.target_id`` contract. Also pull ``score`` + ``score_breakdown``
-    # so detail callers can overlay them — ``jobs.score`` and
-    # ``jobs.score_breakdown`` are vestigial pre-shared-targets columns
-    # that the poller doesn't update (it writes ``scores``), so reading
-    # them directly off the posting row yields stale ``0`` / ``{}``.
+    # 3. Confirm at least one of the user's targets has a score row for this
+    # posting (ownership via ``scores`` — ``jobs.target_id`` is vestigial), and
+    # carry the best-scoring target's ``score`` / ``score_breakdown`` for the
+    # detail overlay (the ``jobs.score*`` columns are stale). See the sync twin.
     score_resp = (
-        supabase.table("scores")
-        .select("target_id, score, score_breakdown")
+        await supabase.table("scores")
+        .select("target_id, score, recency_score, score_breakdown, axis_scores")
         .eq("job_posting_id", posting_id)
         .in_("target_id", list(user_target_ids))
-        .order("score", desc=True)
+        # Best-scoring target by THE score (#665) — same rule as
+        # ``_prefer_score_row`` and the RPC's DISTINCT ON tiebreak, so the
+        # detail view attributes the job to the same target the list does.
+        .order("recency_score", desc=True)
         .limit(1)
         .execute()
     )
@@ -2542,27 +2996,63 @@ def _assert_user_owns_posting(
         raise HTTPException(status_code=404, detail="Posting not found")
     best = score_rows[0]
     row["target_id"] = best["target_id"]
-    # Stash the live score onto the row under an alias so callers can opt
-    # in to the overlay without changing the existing ``score`` /
-    # ``score_breakdown`` semantics on routes that don't need it.
     row["_target_score"] = best.get("score")
+    row["_target_recency_score"] = best.get("recency_score")
     row["_target_score_breakdown"] = best.get("score_breakdown")
+    row["_target_axis_scores"] = best.get("axis_scores")
     return row
 
 
+async def _user_job_status(supabase: AsyncClient, *, user_id: str, posting_id: str) -> str:
+    """The caller's per-user pipeline status for a posting (#75 C4: ``jobs.status``
+    was dropped). Absent ``user_jobs`` row → ``'new'``. Extracted so the async
+    detail handler holds no literal ``.execute()`` on the loop (#57 slice 3 / #107)."""
+    uj_resp = (
+        await supabase.table("user_jobs")
+        .select("status")
+        .eq("user_id", user_id)
+        .eq("job_posting_id", posting_id)
+        .limit(1)
+        .execute()
+    )
+    uj_rows = cast(list[dict[str, Any]], uj_resp.data or [])
+    return cast(str, uj_rows[0]["status"]) if uj_rows else "new"
+
+
+async def _upsert_user_job_async(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Async inline of ``persistence.upsert_user_job`` — the per-user pipeline
+    status write (``user_jobs``). ``persistence.upsert_user_job`` stays sync for
+    the not-yet-converted routers, so the async handler inlines the same upsert
+    rather than fork a twin (#57 slice 3/4 — mirrors ``persistence.
+    mark_job_resume_draft``)."""
+    await supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
+
+
 @router.get("/{posting_id}")
-def get_job(
+async def get_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     # #88 dual-auth: JWT-required endpoint, so callers ride the RLS user
     # client (ownership probe reads jobs/user_targets/scores — SELECT-true or
     # self-scoped; the status overlay reads the caller's own user_jobs row).
-    supabase: Client = Depends(get_supabase_for_caller),
+    supabase: AsyncClient = Depends(get_async_supabase_for_caller),
 ) -> dict[str, Any]:
     # Detail GET pulls ``description_html`` so the UI can render the JD
     # body. The list endpoint deliberately omits it for payload size, but
     # there's no rendering of a single posting without the JD text.
-    row = _assert_user_owns_posting(supabase, posting_id, user_id, include_description=True)
+    row = await _assert_user_owns_posting_async(
+        supabase, posting_id, user_id, include_description=True
+    )
     # Overlay the live per-target score + breakdown. The ``jobs.score`` /
     # ``jobs.score_breakdown`` columns are vestigial and never updated
     # by the poller — without this, the detail view reads stale ``0`` /
@@ -2571,41 +3061,39 @@ def get_job(
     # across the user's targets (matches the untargeted list view's
     # per-job aggregation).
     target_score = row.pop("_target_score", None)
+    target_recency = row.pop("_target_recency_score", None)
     target_breakdown = row.pop("_target_score_breakdown", None)
+    target_axes = row.pop("_target_axis_scores", None)
     if target_score is not None:
-        row["score"] = target_score
+        # THE score the detail view shows is the same aged number the list
+        # shows and floors on (#665); raw_score keeps the undecayed fit.
+        row["raw_score"] = target_score
+        row["score"] = target_recency if target_recency is not None else target_score
     if target_breakdown is not None:
         row["score_breakdown"] = target_breakdown
-    # Decay the displayed score by posting age so the detail view matches
-    # the (now age-decayed) list score; raw_score keeps the undecayed fit.
-    # No-op when the recency flag is off.
-    _apply_display_recency([row])
+    # Fit axes for graded rows (#609 follow-up): the detail GET is the
+    # panel's fallback source when a list path (the RPC ones) couldn't
+    # carry them. None for ungraded rows — the panel keeps the keyword
+    # components there.
+    row["axis_scores"] = target_axes
     # Drop the helper target_id column we only fetched for ownership.
     row.pop("target_id", None)
     # Overlay the per-user pipeline status (#75 C4: jobs.status was dropped).
     # Postings the user never touched have no user_jobs row and read as 'new'.
-    uj_resp = (
-        supabase.table("user_jobs")
-        .select("status")
-        .eq("user_id", user_id)
-        .eq("job_posting_id", posting_id)
-        .limit(1)
-        .execute()
-    )
-    uj_rows = cast(list[dict[str, Any]], uj_resp.data or [])
-    row["status"] = cast(str, uj_rows[0]["status"]) if uj_rows else "new"
+    row["status"] = await _user_job_status(supabase, user_id=user_id, posting_id=posting_id)
     return row
 
 
 @router.delete("/{posting_id}")
-def delete_job(
+async def delete_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
     # #88 Phase 3: RLS client — the only write is the caller's own user_jobs
     # row (full CRUD self-policy); the ownership probe reads shared-catalog
     # tables (SELECT true). RLS makes the cross-tenant-cascade class of bug
-    # (audit #29 r3 H1) structurally impossible, not just guarded.
-    supabase: Client = Depends(get_user_supabase),
+    # (audit #29 r3 H1) structurally impossible, not just guarded. Async on the
+    # pooled RLS user client (#57 slice 4).
+    supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> dict[str, Any]:
     """Per-user "delete" of a job from the caller's pipeline.
 
@@ -2624,9 +3112,9 @@ def delete_job(
     if ever needed, must be gated behind operator/api-key auth — not a
     follower's JWT. Mirrors the per-user write pattern in ``status.py``.
     """
-    _assert_user_owns_posting(supabase, posting_id, user_id)
+    await _assert_user_owns_posting_async(supabase, posting_id, user_id)
 
-    persistence.upsert_user_job(
+    await _upsert_user_job_async(
         supabase,
         user_id=user_id,
         job_posting_id=posting_id,

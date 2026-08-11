@@ -4,14 +4,15 @@
 the shapes it can express DB-side and falls back to the Python two-query path
 for the rest. These pin that routing decision with spies (the RPC/two-query
 bodies have their own tests), so a future edit can't silently send an
-RPC-ineligible query (custom weights, recency decay, post-fetch filters, the
-archived view) down the fast path — or fail to use the fast path at all."""
+RPC-ineligible query (post-fetch filters, the archived view) down the fast
+path — or fail to use the fast path at all. Custom weights + recency decay are
+NOW expressed DB-side (#457 / #365), so both stay on the fast path."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -24,11 +25,15 @@ from app.routers.jobs import (
     _RpcIneligibleError,
 )
 
+# The untargeted list dispatcher is async now (#57 slice 3): it awaits the
+# RPC / two-query helpers, so the spies are AsyncMocks.
+pytestmark = pytest.mark.asyncio
+
 
 @pytest.fixture
 def spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
-    rpc = MagicMock(return_value={"postings": [], "next_cursor": None, "total": None})
-    two = MagicMock(return_value={"postings": [], "next_cursor": None, "total": 0})
+    rpc = AsyncMock(return_value={"postings": [], "next_cursor": None, "total": None})
+    two = AsyncMock(return_value={"postings": [], "next_cursor": None, "total": 0})
     monkeypatch.setattr(jobs_mod, "_list_jobs_across_user_targets_rpc", rpc)
     monkeypatch.setattr(jobs_mod, "_list_jobs_across_user_targets_two_query", two)
     # Decay off by default (prod posture); individual tests flip it.
@@ -36,7 +41,7 @@ def spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     return {"rpc": rpc, "two": two}
 
 
-def _call(**overrides: Any) -> None:
+async def _call(**overrides: Any) -> None:
     kwargs: dict[str, Any] = {
         "user_target_ids": {"t-1", "t-2"},
         "page_size": 5,
@@ -54,28 +59,47 @@ def _call(**overrides: Any) -> None:
         "logistics": None,
     }
     kwargs.update(overrides)
-    _list_jobs_across_user_targets(MagicMock(), **kwargs)
+    await _list_jobs_across_user_targets(MagicMock(), **kwargs)
 
 
-def test_simple_status_query_uses_rpc(spies: dict[str, MagicMock]) -> None:
-    _call(status="new", sort="score")
+async def test_simple_status_query_uses_rpc(spies: dict[str, MagicMock]) -> None:
+    await _call(status="new", sort="score")
     spies["rpc"].assert_called_once()
     spies["two"].assert_not_called()
 
 
-def test_custom_weights_force_two_query(spies: dict[str, MagicMock]) -> None:
-    _call(weights_by_target={"t-1": AxisWeights()})
+async def test_custom_weights_use_rpc_with_blend(spies: dict[str, MagicMock]) -> None:
+    # #457: custom axis weights are NO LONGER a skip — the RPC now computes the
+    # weighted blend DB-side (p_weights), so a custom-weight view takes the fast
+    # path instead of scanning everything into Python. The weights map threads
+    # through to the RPC helper so the blend can be computed.
+    weights = {"t-1": AxisWeights(title_fit=0.4, skills_fit=0.2, seniority_fit=0.2, domain_fit=0.2)}
+    await _call(weights_by_target=weights)
+    spies["rpc"].assert_called_once()
+    spies["two"].assert_not_called()
+    assert spies["rpc"].call_args.kwargs["weights_by_target"] == weights
+
+
+async def test_custom_weights_plus_post_fetch_filter_still_two_query(
+    spies: dict[str, MagicMock],
+) -> None:
+    # A post-fetch filter (location here) still forces the two-query path even
+    # with weights — the RPC paginates with no knowledge of it. The weights must
+    # ride along so the Python overlay still shows the blend, not the raw score.
+    weights = {"t-1": AxisWeights(title_fit=0.4, skills_fit=0.2, seniority_fit=0.2, domain_fit=0.2)}
+    await _call(weights_by_target=weights, exclude_terms=["remote"])
     spies["two"].assert_called_once()
     spies["rpc"].assert_not_called()
+    assert spies["two"].call_args.kwargs["weights_by_target"] == weights
 
 
-def test_recency_decay_still_uses_rpc(
+async def test_recency_decay_still_uses_rpc(
     spies: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Decay is NOT a skip: the RPC ranks by the decayed score DB-side
     # (p_recency_decay), so the fast path still engages when decay is on (prod).
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
-    _call()
+    await _call()
     spies["rpc"].assert_called_once()
     spies["two"].assert_not_called()
 
@@ -90,15 +114,15 @@ def test_recency_decay_still_uses_rpc(
     ],
     ids=["location-exclude", "location-only", "logistics", "archived-view"],
 )
-def test_post_fetch_and_archived_force_two_query(
+async def test_post_fetch_and_archived_force_two_query(
     spies: dict[str, MagicMock], overrides: dict[str, Any]
 ) -> None:
-    _call(**overrides)
+    await _call(**overrides)
     spies["two"].assert_called_once()
     spies["rpc"].assert_not_called()
 
 
-def test_rpc_error_falls_back_to_two_query(
+async def test_rpc_error_falls_back_to_two_query(
     spies: dict[str, MagicMock], caplog: pytest.LogCaptureFixture
 ) -> None:
     # A GENUINE RPC failure (not a shape it can't express) must degrade LOUDLY —
@@ -107,7 +131,7 @@ def test_rpc_error_falls_back_to_two_query(
     # it logged at DEBUG before, invisible under the INFO root).
     spies["rpc"].side_effect = RuntimeError("RPC unavailable")
     with caplog.at_level(logging.WARNING, logger="app.routers.jobs"):
-        _call()
+        await _call()
     spies["rpc"].assert_called_once()
     spies["two"].assert_called_once()  # graceful fallback
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -115,7 +139,7 @@ def test_rpc_error_falls_back_to_two_query(
     assert any(r.exc_info for r in warned), "the WARNING must carry the traceback"
 
 
-def test_rpc_ineligible_falls_back_quietly(
+async def test_rpc_ineligible_falls_back_quietly(
     spies: dict[str, MagicMock], caplog: pytest.LogCaptureFixture
 ) -> None:
     # An RPC-INELIGIBLE shape (a helper raising _RpcIneligibleError) is an
@@ -123,7 +147,7 @@ def test_rpc_ineligible_falls_back_quietly(
     # channel is reserved for genuine RPC breakage. Same graceful fallback.
     spies["rpc"].side_effect = _RpcIneligibleError("RPC path skipped: shape X")
     with caplog.at_level(logging.DEBUG, logger="app.routers.jobs"):
-        _call()
+        await _call()
     spies["two"].assert_called_once()
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
         "an ineligible shape must not warn: " + caplog.text

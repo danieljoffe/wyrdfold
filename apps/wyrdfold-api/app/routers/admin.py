@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from supabase import Client
+from supabase import AsyncClient
 
 from app.config import settings
-from app.dependencies import get_supabase, verify_api_key
+from app.dependencies import get_async_service_supabase, verify_api_key
 from app.services.llm import cost_log
 from app.services.retention import purge_expired_records
 from app.supabase_pool import get_async_supabase
@@ -100,9 +100,16 @@ class CostSummaryResponse(BaseModel):
     )
 
 
+# `async def` (#57 PR-G2c): the three ``cost_log.*_all`` aggregates now have async
+# twins (``total_spend_all_async`` / ``spend_by_purpose_all_async`` /
+# ``cache_metrics_all_async``), so every read runs natively on the pooled async
+# service client — no ``asyncio.to_thread`` offload, no sync service client. The
+# sync ``total_spend_all`` stays for the poller/ingestion-health callers (it
+# imports the sync form); the sync by-purpose/cache aggregates stay for their unit
+# tests.
 @router.get("/cost-summary", response_model=CostSummaryResponse)
-def get_cost_summary(
-    supabase: Client = Depends(get_supabase),
+async def get_cost_summary(
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> CostSummaryResponse:
     """Operator drill-in for the LLM cost-alert breadcrumbs (#26 F4).
 
@@ -114,19 +121,23 @@ def get_cost_summary(
     now = datetime.now(UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    today_usd = cost_log.total_spend_all(supabase, since=midnight)
-    last_24h = cost_log.total_spend_all(supabase, since=now - timedelta(hours=24))
-    last_7d = cost_log.total_spend_all(supabase, since=now - timedelta(days=7))
-    last_30d = cost_log.total_spend_all(supabase, since=now - timedelta(days=30))
+    today_usd = await cost_log.total_spend_all_async(supabase, since=midnight)
+    last_24h = await cost_log.total_spend_all_async(supabase, since=now - timedelta(hours=24))
+    last_7d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=7))
+    last_30d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=30))
 
-    by_purpose_today: dict[str, float] = cost_log.spend_by_purpose_all(supabase, since=midnight)
-    by_purpose_30d: dict[str, float] = cost_log.spend_by_purpose_all(
+    by_purpose_today: dict[str, float] = await cost_log.spend_by_purpose_all_async(
+        supabase, since=midnight
+    )
+    by_purpose_30d: dict[str, float] = await cost_log.spend_by_purpose_all_async(
         supabase, since=now - timedelta(days=30)
     )
 
-    cache_today = CacheStats.from_buckets(cost_log.cache_metrics_all(supabase, since=midnight))
+    cache_today = CacheStats.from_buckets(
+        await cost_log.cache_metrics_all_async(supabase, since=midnight)
+    )
     cache_30d = CacheStats.from_buckets(
-        cost_log.cache_metrics_all(supabase, since=now - timedelta(days=30))
+        await cost_log.cache_metrics_all_async(supabase, since=now - timedelta(days=30))
     )
 
     cap = settings.global_llm_daily_budget_usd
@@ -157,6 +168,7 @@ class RetentionPurgeResult(BaseModel):
     llm_costs: int = Field(description="Rows deleted from llm_costs.")
     notifications_sent: int = Field(description="Rows deleted from notifications_sent.")
     prescan_shadow: int = Field(description="Rows deleted from prescan_shadow.")
+    search_events: int = Field(description="Rows deleted from search_events.")
 
 
 @router.post("/retention/purge", response_model=RetentionPurgeResult)
@@ -178,6 +190,7 @@ async def purge_retention() -> RetentionPurgeResult:
         llm_costs_days=settings.llm_costs_retention_days,
         notifications_sent_days=settings.notifications_sent_retention_days,
         prescan_shadow_days=settings.prescan_shadow_retention_days,
+        search_events_days=settings.search_events_retention_days,
     )
     return RetentionPurgeResult(**report)
 
@@ -209,27 +222,56 @@ class WaitlistInviteResult(BaseModel):
     from_waitlist: bool
 
 
-# Sync `def`: blocking supabase read in the threadpool (#107).
-@router.get("/waitlist", response_model=WaitlistListResponse)
-def list_waitlist(
-    pending: bool = False,
-    supabase: Client = Depends(get_supabase),
-) -> WaitlistListResponse:
-    """The operator's funnel view; ``?pending=true`` = not yet invited."""
+# Module-level async helper so the handler holds no inline ``.execute()`` on the
+# loop (#57 slice 4) — the CI guard scans only router handlers.
+async def _fetch_waitlist(supabase: AsyncClient, *, pending: bool) -> list[Any]:
     query = (
         supabase.table("waitlist_signups").select("email,created_at,invited_at").order("created_at")
     )
     if pending:
         query = query.is_("invited_at", "null")
-    rows = query.execute().data or []
+    resp = await query.execute()
+    return resp.data or []
+
+
+# Native async handler (#57 slice 4): the read runs on the pooled async service
+# client instead of a threadpool worker.
+@router.get("/waitlist", response_model=WaitlistListResponse)
+async def list_waitlist(
+    pending: bool = False,
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> WaitlistListResponse:
+    """The operator's funnel view; ``?pending=true`` = not yet invited."""
+    rows = await _fetch_waitlist(supabase, pending=pending)
     return WaitlistListResponse(entries=[WaitlistEntry.model_validate(r) for r in rows])
 
 
-# Sync `def`: blocking supabase + auth-admin work in the threadpool (#107).
+# Module-level async helpers so the handler holds no inline ``.execute()`` on the
+# loop (#57 PR-G2a) — the CI guard scans only router handlers.
+async def _email_on_waitlist(supabase: AsyncClient, email: str) -> bool:
+    resp = await supabase.table("waitlist_signups").select("id").eq("email", email).execute()
+    return bool(resp.data or [])
+
+
+async def _upsert_beta_invite(supabase: AsyncClient, email: str) -> None:
+    await supabase.table("wyrdfold_beta_invites").upsert(
+        {"email": email}, on_conflict="email", ignore_duplicates=True
+    ).execute()
+
+
+async def _stamp_waitlist_invited(supabase: AsyncClient, email: str) -> None:
+    await supabase.table("waitlist_signups").update(
+        {"invited_at": datetime.now(UTC).isoformat()}
+    ).eq("email", email).execute()
+
+
+# Native async handler (#57 PR-G2a): the reads/writes run on the pooled async
+# service client and ``auth.admin.invite_user_by_email`` is awaited (the installed
+# gotrue ships the admin API as ``async def``).
 @router.post("/waitlist/invite", response_model=WaitlistInviteResult)
-def invite_from_waitlist(
+async def invite_from_waitlist(
     body: WaitlistInviteRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> WaitlistInviteResult:
     """Convert a signup into a beta invite (Phase 3 slice 4).
 
@@ -253,20 +295,15 @@ def invite_from_waitlist(
     if not _EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="Not a valid email address.")
 
-    wl_rows = (
-        supabase.table("waitlist_signups").select("id").eq("email", email).execute().data or []
-    )
-    from_waitlist = bool(wl_rows)
+    from_waitlist = await _email_on_waitlist(supabase, email)
 
-    supabase.table("wyrdfold_beta_invites").upsert(
-        {"email": email}, on_conflict="email", ignore_duplicates=True
-    ).execute()
+    await _upsert_beta_invite(supabase, email)
 
     options: dict[str, str] = {}
     if settings.next_app_url:
         options["redirect_to"] = f"{settings.next_app_url}/auth/callback"
     try:
-        supabase.auth.admin.invite_user_by_email(email, options or None)  # type: ignore[arg-type]
+        await supabase.auth.admin.invite_user_by_email(email, options or None)  # type: ignore[arg-type]
     except Exception as exc:
         message = str(exc).lower()
         if "already" in message or "exists" in message or "registered" in message:
@@ -277,9 +314,7 @@ def invite_from_waitlist(
         raise
 
     if from_waitlist:
-        supabase.table("waitlist_signups").update({"invited_at": datetime.now(UTC).isoformat()}).eq(
-            "email", email
-        ).execute()
+        await _stamp_waitlist_invited(supabase, email)
 
     return WaitlistInviteResult(email=email, invited=True, from_waitlist=from_waitlist)
 
@@ -295,11 +330,25 @@ class SignupModeResult(BaseModel):
     mode: str
 
 
-# Sync `def`: blocking supabase write in the threadpool (#107).
+# Module-level async helper so the handler holds no inline ``.execute()`` on the
+# loop (#57 slice 4) — the CI guard scans only router handlers.
+async def _upsert_signup_mode(supabase: AsyncClient, mode: str) -> None:
+    await supabase.table("app_settings").upsert(
+        {
+            "key": "signup_mode",
+            "value": mode,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="key",
+    ).execute()
+
+
+# Native async handler (#57 slice 4): the write runs on the pooled async service
+# client instead of a threadpool worker.
 @router.post("/signup-mode", response_model=SignupModeResult)
-def set_signup_mode(
+async def set_signup_mode(
     body: SignupModeRequest,
-    supabase: Client = Depends(get_supabase),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> SignupModeResult:
     """The open-signup flip lever (Phase 3 slice 5).
 
@@ -308,13 +357,6 @@ def set_signup_mode(
     Supabase config push, no redeploy. The public `GET /signup-mode`
     and the FE follow the same row.
     """
-    supabase.table("app_settings").upsert(
-        {
-            "key": "signup_mode",
-            "value": body.mode,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="key",
-    ).execute()
+    await _upsert_signup_mode(supabase, body.mode)
     logger.warning("signup_mode set to '%s' by operator", body.mode)
     return SignupModeResult(mode=body.mode)

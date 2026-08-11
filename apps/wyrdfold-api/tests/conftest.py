@@ -26,13 +26,63 @@ import pytest
 
 from app.cache import job_list_cache
 
+# ---- #515: local test env == CI clean room ---------------------------------
+# WYRDFOLD_API_TESTING=1 (above) suppresses pydantic's env_file source (#28),
+# but real environment VARIABLES outrank the file — and nx loads the
+# workspace/app `.env` values into the process env before running the test
+# target. Ten tests failed locally-but-not-in-CI through that hole (SaaS mode
+# switched on, prescan flags flipped, BYOK require-mode… one billing test
+# reached the REAL Stripe API from a laptop). Scrub every env var that maps
+# to a Settings field — except the ones this conftest deliberately sets —
+# then rebuild the singleton IN PLACE so every `from app.config import
+# settings` importer sees pure defaults, exactly like CI.
+_CONFTEST_OWNED_ENV = {
+    "SUPABASE_URL",
+    "WYRDFOLD_API_KEY",
+    "ALLOWED_HOSTS",
+    "RATE_LIMIT_ENABLED",
+    "ACTIVITY_TRACKING_ENABLED",
+    "WYRDFOLD_API_TESTING",
+}
+
+
+def _scrub_settings_env() -> None:
+    from app.config import Settings, settings
+
+    for field_name in Settings.model_fields:
+        env_name = field_name.upper()
+        if env_name not in _CONFTEST_OWNED_ENV:
+            os.environ.pop(env_name, None)
+    clean = Settings()
+    for field_name in Settings.model_fields:
+        object.__setattr__(settings, field_name, getattr(clean, field_name))
+
+
+_scrub_settings_env()
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
-    """Prevent cross-test cache pollution from the in-memory TTL cache."""
+    """Prevent cross-test cache pollution from in-memory state."""
+    from app.services.analysis import run_registry
+    from app.services.poller import _PHASE1_REJECTIONS
+    from app.services.tailor import run_registry as tailor_run_registry
+
     job_list_cache.invalidate()
+    # The in-flight analysis (#459) and tailor (#656) registries are
+    # module-level dicts; a leaked "running" entry would make the next test's
+    # kick dedup to 202 without spawning (LLM never called).
+    run_registry.clear_all()
+    tailor_run_registry.clear_all()
+    # Phase-1 negative-verdict cache (#514) is a module-level TTL dict; a
+    # rejection leaked from one poller test would silently skip the LLM in
+    # the next one.
+    _PHASE1_REJECTIONS.clear()
     yield
     job_list_cache.invalidate()
+    run_registry.clear_all()
+    tailor_run_registry.clear_all()
+    _PHASE1_REJECTIONS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -127,3 +177,15 @@ def mock_http_client():
     http_mod._client = client
     yield client
     http_mod._client = original
+
+
+@pytest.fixture(autouse=True)
+def _reset_spend_memo():
+    """#642: the day-spend TTL memo is module-global state — reset per test
+    so each test's mocked meter value is actually read (a stale cached value
+    otherwise leaks across tests and breaks budget-gate assertions)."""
+    from app.services import poller as _poller_mod
+
+    _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)
+    yield
+    _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)

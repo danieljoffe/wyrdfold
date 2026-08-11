@@ -8,8 +8,10 @@ import {
   CardHeader,
   CardTitle,
 } from '@danieljoffe/shared-ui/Card';
+import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
+import { LocalDate } from '@/components/LocalFormat';
 
 interface UsageWindow {
   spent_usd: number;
@@ -25,29 +27,15 @@ interface LlmUsage {
   analysis_daily_limit: number;
 }
 
-function UsageBar({ spent, limit }: { spent: number; limit: number }) {
-  const pct = limit > 0 ? Math.min(100, (spent / limit) * 100) : 0;
-  return (
-    <div
-      className='h-2 w-full overflow-hidden rounded-full bg-surface-tertiary'
-      role='progressbar'
-      aria-valuenow={Math.round(pct)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-label='Monthly allowance used'
-    >
-      <div
-        className={
-          pct >= 90
-            ? 'h-full rounded-full bg-error'
-            : pct >= 70
-              ? 'h-full rounded-full bg-warning'
-              : 'h-full rounded-full bg-brand-500'
-        }
-        style={{ width: `${pct}%` }}
-      />
-    </div>
-  );
+/** Amber past 70%, red past 90% — the same tiers the hand-rolled meter used,
+ *  now expressed as the shared ProgressBar's `variant` (accent = the brand fill).
+ *  Exported for unit tests to lock the tier boundaries + the zero-limit case. */
+export function usageVariant(
+  spent: number,
+  limit: number
+): 'accent' | 'warning' | 'error' {
+  const pct = limit > 0 ? (spent / limit) * 100 : 0;
+  return pct >= 90 ? 'error' : pct >= 70 ? 'warning' : 'accent';
 }
 
 export default function LlmUsageCard() {
@@ -101,9 +89,18 @@ export default function LlmUsageCard() {
                 {usage.monthly.limit_usd.toFixed(2)}
               </Text>
             </div>
-            <UsageBar
-              spent={usage.monthly.spent_usd}
-              limit={usage.monthly.limit_usd}
+            <ProgressBar
+              // A 0 limit would make ProgressBar read 100% (value/max → ∞,
+              // clamped to full); the old meter showed an EMPTY bar for a
+              // no-limit account, so pin the zero-limit case to 0%.
+              value={usage.monthly.limit_usd > 0 ? usage.monthly.spent_usd : 0}
+              max={usage.monthly.limit_usd > 0 ? usage.monthly.limit_usd : 100}
+              variant={usageVariant(
+                usage.monthly.spent_usd,
+                usage.monthly.limit_usd
+              )}
+              size='md'
+              aria-label='Monthly allowance used'
             />
             <div className='flex items-baseline justify-between'>
               <Text variant='caption' className='text-text-secondary'>
@@ -116,8 +113,8 @@ export default function LlmUsageCard() {
             {usage.monthly_resets_at && (
               <Text variant='caption' className='text-text-tertiary'>
                 Allowance frees up around{' '}
-                {new Date(usage.monthly_resets_at).toLocaleDateString()} as
-                usage rolls out of the 30-day window.
+                <LocalDate value={usage.monthly_resets_at} /> as usage rolls out
+                of the 30-day window.
               </Text>
             )}
           </>

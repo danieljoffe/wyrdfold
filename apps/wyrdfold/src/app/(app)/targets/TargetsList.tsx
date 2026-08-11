@@ -81,7 +81,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   // Flip THIS user's `user_target.is_active` for one target in local state.
   // `isActive` on the card reads this per-user flag (see TargetCard ~14-27),
-  // distinct from the shared catalog `target.is_active`.
+  // distinct from the shared catalog's `target.app_active` instance floor.
   const setActive = useCallback((id: string, active: boolean) => {
     setTargets(prev =>
       prev.map(t =>
@@ -344,7 +344,9 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const handleSubmitUrl = useCallback(
     (payload: UrlSubmission) => {
-      void runCreate('/api/targets/from-url', payload, payload.label ?? '');
+      // Empty pending label: the title is derived server-side from the posting,
+      // so the optimistic card shows the URL-mode skeleton until it resolves.
+      void runCreate('/api/targets/from-url', payload, '');
     },
     [runCreate]
   );

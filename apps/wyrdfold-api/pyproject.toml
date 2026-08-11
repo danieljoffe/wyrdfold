@@ -7,8 +7,8 @@ readme = "README.md"
 license = { text = "FSL-1.1-ALv2" }
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.139.2",
-  "uvicorn[standard]>=0.51.0",
+  "fastapi>=0.141.1",
+  "uvicorn[standard]>=0.52.1",
   "httpx>=0.28",
   "supabase>=2.13",
   "pydantic-settings>=2.7",
@@ -18,10 +18,10 @@ dependencies = [
   "pdfplumber>=0.11",
   "python-docx>=1.1",
   "python-multipart>=0.0.18",
-  "anthropic>=0.116.0",
+  "anthropic>=0.120.2",
   "voyageai>=0.5.0",
   "twilio>=9.0",
-  "sentry-sdk[fastapi]>=2.66.0",
+  "sentry-sdk[fastapi]>=2.66.1",
   "apscheduler>=3.11",
   "slowapi>=0.1.9",
   "stripe>=15.3.0",
@@ -34,7 +34,7 @@ dev = [
   "pytest-cov>=6.0",
   "ruff>=0.11",
   "mypy>=1.15",
-  "types-bleach>=6.2",
+  "types-bleach>=6.4.0.20260728",
 ]
 
 [tool.ruff]
@@ -96,5 +96,6 @@ testpaths = ["tests"]
 # when the local stack isn't reachable.
 addopts = "--cov=app --cov-report=term-missing --no-cov-on-fail -m 'not integration'"
 markers = [
+    "real_posting_exists: use the real _posting_exists helper, not the module stub",
   "integration: requires a live local Supabase stack (deselected by default)",
 ]

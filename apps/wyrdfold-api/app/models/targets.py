@@ -90,12 +90,15 @@ class JobTarget(BaseModel):
         default="idle",
         description=(
             "Background pipeline state: idle | deriving | polling | ready "
-            "| error. Distinct from is_active, the user-facing toggle for "
-            "whether jobs should be queried for this target."
+            "| error. Distinct from app_active (the instance-sponsorship "
+            "floor) and from user_targets.is_active (the per-user toggle)."
         ),
     )
     profile_version: int = 1
-    is_active: bool
+    # Standing instance-sponsorship floor (app-owned catalog / operator).
+    # NEVER written by user actions; pipeline-active is derived as
+    # app_active OR EXISTS(active membership) — see crud.get_active.
+    app_active: bool
     # Few-shot title pools for the upcoming Phase 1 LLM triage. Seeded
     # at target creation from the same LLM call that derives the
     # scoring profile; later (Phase 1 PR) augmented from user 👍/👎
@@ -223,7 +226,8 @@ class TargetPreferences(BaseModel):
       ``SENIORITY_ORDER`` ladder. ``None`` = open-ended on that end.
     * ``pref_employment_types`` — keep jobs whose ``employment_type`` firewall
       tag is in this set. ``None``/empty = no employment-type filter.
-    * ``pref_include_unknown_salary`` — out of scope for v1 filtering (salary
+    * ``pref_include_unknown_salary`` — WIRED 2026-07-31: relaxes the /jobs
+      min-salary logistics filter's strict unknown-drop for this pairing (salary
       filtering isn't implemented yet); stored so the UI can round-trip the
       toggle. Default True.
 
@@ -405,7 +409,7 @@ class JobTargetSummary(BaseModel):
     normalized_label: str | None = None
     activation_status: str = "idle"
     profile_version: int = 1
-    is_active: bool
+    app_active: bool
     seniority_hint: SeniorityHint | None = None
     keyword_count: int = 0
     category_count: int = 0
@@ -461,7 +465,7 @@ class TargetUpdate(BaseModel):
     scoring_profile: ScoringProfile | None = None
     search_keywords: list[str] | None = None
     activation_status: str | None = None
-    is_active: bool | None = None
+    app_active: bool | None = None
     profile_version: int | None = None
     example_promising_titles: list[str] | None = None
     example_unpromising_titles: list[str] | None = None
@@ -487,12 +491,12 @@ class TargetFromManual(BaseModel):
 class TargetFromUrl(BaseModel):
     """Create a target from a JD URL.
 
-    The label is optional — when omitted, the job title extracted from the
-    page is used. Falls back to "Untitled Target" if neither is available.
+    The label is ALWAYS derived from the posting's own title — there is no
+    user-supplied title (an inaccurate one poisons matching + the shared
+    catalog). Falls back to "Untitled Target" if the page has no title.
     """
 
     jd_url: str = Field(max_length=2048)
-    label: str | None = Field(default=None, max_length=200)
 
 
 class ReferenceJDAdd(BaseModel):

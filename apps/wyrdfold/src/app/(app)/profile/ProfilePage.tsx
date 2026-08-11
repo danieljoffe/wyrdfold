@@ -30,6 +30,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { parsePartialJson } from '@/lib/parsePartialJson';
 import { useToast } from '@/state/Toast/ToastProvider';
 import ConfirmModal from '@/components/ConfirmModal';
+import { LocalDate } from '@/components/LocalFormat';
 import ConversationChatModal from '../../_components/ConversationChatModal';
 import ProfileIdentityCard from './ProfileIdentityCard';
 import type {
@@ -58,6 +59,9 @@ function formatDateRange(start: string, end: string | null): string {
   const fmt = (iso: string) => {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return iso;
+    // local-format-ok: returns a STRING (a range like "Jan 2024 – Present"),
+    // so it cannot carry suppressHydrationWarning itself. The single render
+    // site wraps it in a <span suppressHydrationWarning>. See LocalFormat.tsx.
     return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short' });
   };
   return end
@@ -346,14 +350,20 @@ export default function ProfilePage() {
           variant: 'info',
           title: 'No duplicates found in master document',
         });
+        await fetchData();
       } else {
         const removed = body.chars_before - body.chars_after;
         toast({
           variant: 'success',
           title: `Consolidated — removed ${removed.toLocaleString()} characters of duplicate content`,
         });
+        // Consolidation rewrote the master document, so the derived experience
+        // + skills it feeds are now stale. Chain the re-derive so the panels
+        // (and downstream fit scoring) reflect the consolidated document
+        // instead of silently lagging it. handleDerive streams the refresh and
+        // fetchData()s on its own.
+        await handleDerive();
       }
-      await fetchData();
     } catch (err) {
       toast({
         variant: 'error',
@@ -362,7 +372,7 @@ export default function ProfilePage() {
     } finally {
       setConsolidating(false);
     }
-  }, [fetchData, toast]);
+  }, [fetchData, toast, handleDerive]);
 
   const handleDelete = useCallback(async () => {
     setDeleting(true);
@@ -588,7 +598,7 @@ export default function ProfilePage() {
               {prose && (
                 <Text variant='meta' as='span'>
                   v{prose.version} &middot;{' '}
-                  {new Date(prose.created_at).toLocaleDateString()}
+                  <LocalDate value={prose.created_at} />
                 </Text>
               )}
             </div>
@@ -719,7 +729,10 @@ export default function ProfilePage() {
                       <Text variant='caption' className='text-text-secondary'>
                         {role.company ?? ''}
                         {role.company && dateRange ? ' · ' : ''}
-                        {dateRange}
+                        {/* Locale/timezone-dependent — see LocalFormat.tsx.
+                            A plain string here cannot carry the attribute, so
+                            the wrapper does. */}
+                        <span suppressHydrationWarning>{dateRange}</span>
                       </Text>
                     </div>
                     <div className='flex shrink-0 items-center gap-1.5'>

@@ -94,7 +94,7 @@ def test_target_update_partial():
     u = TargetUpdate(label="Staff Engineer")
     assert u.label == "Staff Engineer"
     assert u.scoring_profile is None
-    assert u.is_active is None
+    assert u.app_active is None
 
 
 # ---- Row models ------------------------------------------------------------
@@ -105,7 +105,7 @@ def test_job_target_from_dict():
         "id": "abc-123",
         "label": "Frontend",
         "scoring_profile": {"categories": {}},
-        "is_active": True,
+        "app_active": True,
         "created_at": "2026-04-24T00:00:00Z",
         "updated_at": "2026-04-24T00:00:00Z",
     }
@@ -142,7 +142,7 @@ def test_job_target_defaults_example_title_pools_to_empty():
         "id": "t-1",
         "label": "Director of CX Operations",
         "scoring_profile": {"categories": {}},
-        "is_active": True,
+        "app_active": True,
         "created_at": "2026-06-01T00:00:00Z",
         "updated_at": "2026-06-01T00:00:00Z",
         # NO example_promising_titles, NO example_unpromising_titles.
@@ -157,7 +157,7 @@ def test_job_target_round_trips_example_title_pools():
         "id": "t-1",
         "label": "Director of CX Operations",
         "scoring_profile": {"categories": {}},
-        "is_active": True,
+        "app_active": True,
         "created_at": "2026-06-01T00:00:00Z",
         "updated_at": "2026-06-01T00:00:00Z",
         "example_promising_titles": [

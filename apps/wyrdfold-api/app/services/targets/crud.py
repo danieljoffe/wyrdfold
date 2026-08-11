@@ -57,7 +57,7 @@ def _parse_target(row: dict[str, Any]) -> JobTarget:
         search_keywords=row.get("search_keywords") or [],
         activation_status=row.get("activation_status") or "idle",
         profile_version=row.get("profile_version", 1),
-        is_active=row["is_active"],
+        app_active=row["app_active"],
         example_promising_titles=row.get("example_promising_titles") or [],
         example_unpromising_titles=row.get("example_unpromising_titles") or [],
         # Slim shape (NULL on legacy rows until PR B backfill).
@@ -85,7 +85,7 @@ def _summarize_target(row: dict[str, Any]) -> JobTargetSummary:
         normalized_label=row.get("normalized_label"),
         activation_status=row.get("activation_status") or "idle",
         profile_version=row.get("profile_version", 1),
-        is_active=row["is_active"],
+        app_active=row["app_active"],
         seniority_hint=row.get("seniority_hint"),
         keyword_count=keyword_count,
         category_count=len(cats),
@@ -164,7 +164,7 @@ def get_by_normalized_label(supabase: Client, normalized_label: str) -> JobTarge
     return _parse_target(rows[0]) if rows else None
 
 
-def create(supabase: Client, payload: TargetCreate) -> JobTarget:
+def create(supabase: Client, payload: TargetCreate, *, app_active: bool = False) -> JobTarget:
     """Find-or-create a shared-catalog target, keyed on ``normalized_label``.
 
     The catalog is shared — one canonical row per role, ownership via
@@ -178,6 +178,19 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
     race-safe: concurrent creators converge on the one committed row. The
     richer exact+fuzzy dedup still lives in the higher-level paths; here we
     align exactly with the DB constraint (exact ``normalized_label``).
+
+    ``app_active`` sponsors the row AT BIRTH and is INTERNAL-ONLY — a keyword
+    argument, deliberately NOT a ``TargetCreate`` field, because that model is
+    bound straight from the ``POST /targets`` request body: exposing it would
+    let any caller self-sponsor a catalog target, which bypasses membership
+    scoping and makes the row permanently un-reapable.
+
+    Only the catalog seed passes it (#667). That script used to create the row
+    unsponsored, run an LLM derive, and only then set ``app_active`` — leaving a
+    window AN LLM CALL WIDE in which a legitimate catalog row was
+    indistinguishable from an orphaned one (``app_active`` false, zero
+    memberships). Sponsoring at insert closes that window instead of asking
+    every cleanup path to guess around it.
     """
     normalized = normalize_label(payload.label)
     row: dict[str, Any] = {
@@ -187,6 +200,8 @@ def create(supabase: Client, payload: TargetCreate) -> JobTarget:
         "scoring_profile": payload.scoring_profile.model_dump(),
         "search_keywords": payload.search_keywords,
     }
+    if app_active:
+        row["app_active"] = True
     # Insert unless the normalized label already exists; ignore_duplicates
     # skips (never overwrites) the existing canonical row.
     resp = (
@@ -243,13 +258,68 @@ def list_all(supabase: Client) -> list[JobTarget]:
 
 
 def get_active(supabase: Client) -> list[JobTarget]:
-    """Return all globally active targets (active for any user).
+    """Return every PIPELINE-ACTIVE target: ``app_active OR EXISTS(active
+    membership)``.
 
-    The trigger on user_targets maintains targets.is_active, so this
-    query works without joining user_targets.
+    ``app_active`` is the standing instance-sponsorship floor (app-owned
+    catalog / operator; zero-membership targets the instance ingests anyway,
+    #543). Membership activity lives in ``user_targets.is_active``. The old
+    single-flag read relied on ``trg_sync_target_active`` keeping a cache in
+    ``targets.is_active`` — that trigger clobbered the catalog floor on any
+    membership event, so it was dropped (schema audit P0, 2026-07-31) and the
+    predicate is now derived here at read time: two indexed reads over tiny
+    tables, deduped in Python.
     """
-    resp = supabase.table(TARGETS_TABLE).select("*").eq("is_active", True).execute()
-    return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
+    floor_resp = supabase.table(TARGETS_TABLE).select("*").eq("app_active", True).execute()
+    # NOTE: both arms ride PostgREST's default 1000-row page. Fine at current
+    # scale (tens of rows); at 1000+ active memberships the derived set would
+    # silently truncate — page the membership read before that ever happens.
+    member_ids_resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("is_active", True)
+        .execute()
+    )
+    member_ids = {
+        cast(str, r["target_id"])
+        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+    }
+    rows = cast(list[dict[str, Any]], floor_resp.data or [])
+    seen = {cast(str, r["id"]) for r in rows}
+    missing = sorted(member_ids - seen)
+    if missing:
+        member_resp = supabase.table(TARGETS_TABLE).select("*").in_("id", missing).execute()
+        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
+    return [_parse_target(r) for r in rows]
+
+
+def is_pipeline_active(supabase: Client, target_id: str) -> bool:
+    """Single-target form of :func:`get_active`'s predicate.
+
+    Used by mid-cycle re-checks (poller / bulk scorer) that guard against a
+    target being deactivated while a batch is in flight. Same two-arm rule:
+    the instance floor OR any active membership.
+    """
+    t_resp = (
+        supabase.table(TARGETS_TABLE)
+        .select("app_active")
+        .eq("id", target_id)
+        .limit(1)
+        .execute()
+    )
+    t_rows = cast(list[dict[str, Any]], t_resp.data or [])
+    if not t_rows:
+        return False
+    if bool(t_rows[0].get("app_active")):
+        return True
+    m_resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("id", count="exact", head=True)  # type: ignore[arg-type]
+        .eq("target_id", target_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    return bool(m_resp.count or 0)
 
 
 def get_all(supabase: Client) -> list[JobTarget]:
@@ -279,8 +349,8 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["search_keywords"] = payload.search_keywords
     if payload.activation_status is not None:
         updates["activation_status"] = payload.activation_status
-    if payload.is_active is not None:
-        updates["is_active"] = payload.is_active
+    if payload.app_active is not None:
+        updates["app_active"] = payload.app_active
     if payload.profile_version is not None:
         updates["profile_version"] = payload.profile_version
     if payload.example_promising_titles is not None:
@@ -307,15 +377,16 @@ def delete(supabase: Client, target_id: str) -> bool:
     return bool(resp.data)
 
 
-def set_active(supabase: Client, target_id: str) -> JobTarget | None:
-    """Directly set targets.is_active = True.
+def set_app_active(supabase: Client, target_id: str) -> JobTarget | None:
+    """Raise the instance-sponsorship floor: ``app_active = True``.
 
-    Prefer link_user_to_target() for multi-user flows — the DB trigger
-    will keep is_active in sync. This is kept for single-user / system use.
+    Operator/system use only (seed script, api-key cron paths without a user
+    identity). User flows activate via ``user_targets`` memberships — the
+    pipeline predicate (:func:`get_active`) ORs the two arms.
     """
     resp = (
         supabase.table(TARGETS_TABLE)
-        .update({"is_active": True, "updated_at": datetime.now(UTC).isoformat()})
+        .update({"app_active": True, "updated_at": datetime.now(UTC).isoformat()})
         .eq("id", target_id)
         .execute()
     )
@@ -323,14 +394,15 @@ def set_active(supabase: Client, target_id: str) -> JobTarget | None:
     return _parse_target(rows[0]) if rows else None
 
 
-def set_inactive(supabase: Client, target_id: str) -> JobTarget | None:
-    """Directly set targets.is_active = False.
+def clear_app_active(supabase: Client, target_id: str) -> JobTarget | None:
+    """Drop the instance-sponsorship floor: ``app_active = False``.
 
-    Prefer unlink/deactivate via user_targets for multi-user flows.
+    Operator/system use only. Does not touch memberships — a target with an
+    active member stays pipeline-active regardless.
     """
     resp = (
         supabase.table(TARGETS_TABLE)
-        .update({"is_active": False, "updated_at": datetime.now(UTC).isoformat()})
+        .update({"app_active": False, "updated_at": datetime.now(UTC).isoformat()})
         .eq("id", target_id)
         .execute()
     )
@@ -380,8 +452,33 @@ def get_active_for_user(supabase: Client, user_id: str) -> list[JobTarget]:
 
 
 def get_user_target_ids(supabase: Client, user_id: str) -> set[str]:
-    """Return the set of target IDs a user is linked to (any status)."""
+    """Return the set of target IDs a user is linked to (any status).
+
+    ANY-status is correct for membership/authz/dedup questions ("does the
+    caller follow this target?", "don't re-offer it in suggestions"). The
+    /jobs list + its pipeline counts use :func:`get_active_target_ids`
+    instead — pausing a target removes its jobs from the list (schema-audit
+    Group D decision, docs/decisions.md 2026-07-30).
+    """
     resp = supabase.table(USER_TARGETS_TABLE).select("target_id").eq("user_id", user_id).execute()
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["target_id"] for r in rows}
+
+
+def get_active_target_ids(supabase: Client, user_id: str) -> set[str]:
+    """Return the target IDs of the user's ACTIVE memberships only.
+
+    The /jobs serving scope: a paused (inactive) membership keeps the link —
+    and every any-status surface above — but its jobs leave the list and the
+    status-tab counts until the user reactivates.
+    """
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 
@@ -532,9 +629,11 @@ def link_user_to_target(
     is_active: bool = True,
     fit_score: int | None = None,
     fit_score_reasoning: str | None = None,
+    fit_score_prose_doc_id: str | None = None,
     enforce_active_limit: bool = True,
 ) -> UserTarget:
-    """Link a user to a target (upsert). The DB trigger syncs targets.is_active.
+    """Link a user to a target (upsert). Membership activity feeds the derived
+    pipeline predicate (see :func:`get_active`); nothing on ``targets`` is written.
 
     Raises ``ActiveTargetLimitError`` when ``is_active=True`` would push
     the user above ``MAX_ACTIVE_TARGETS_PER_USER`` — but ONLY when this
@@ -576,12 +675,66 @@ def link_user_to_target(
         row["fit_score"] = fit_score
     if fit_score_reasoning is not None:
         row["fit_score_reasoning"] = fit_score_reasoning
+    # Stamp the profile version this score was computed against (E2), so a later
+    # profile edit makes it detectably stale. Written alongside the score.
+    if fit_score_prose_doc_id is not None:
+        row["fit_score_prose_doc_id"] = fit_score_prose_doc_id
 
     resp = supabase.table(USER_TARGETS_TABLE).upsert(row, on_conflict="user_id,target_id").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to upsert user_targets row")
     return _parse_user_target(rows[0])
+
+
+def get_fit_score_prose_doc_id(
+    supabase: Client, *, user_id: str, target_id: str
+) -> str | None:
+    """The prose-doc version marker on the user's link (E2), or None if the link
+    is gone or was never scored. Read right before a lazy refresh recomputes, so
+    a concurrent refresh (two quick views) doesn't double-spend the LLM."""
+    resp = (
+        supabase.table(USER_TARGETS_TABLE)
+        .select("fit_score_prose_doc_id")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return rows[0].get("fit_score_prose_doc_id") if rows else None
+
+
+def update_fit_score(
+    supabase: Client,
+    *,
+    user_id: str,
+    target_id: str,
+    fit_score: int,
+    fit_score_reasoning: str | None,
+    fit_score_prose_doc_id: str | None,
+) -> None:
+    """Update ONLY the fit-score columns on an existing link (E2 lazy refresh).
+
+    A targeted UPDATE, not an upsert through ``link_user_to_target`` — that path
+    always writes ``is_active`` and would flip the active flag (and trip the
+    active-target cap) as a side effect of a background rescore. This touches
+    nothing but the score, its reasoning, and the version marker.
+    """
+    (
+        supabase.table(USER_TARGETS_TABLE)
+        .update(
+            {
+                "fit_score": fit_score,
+                "fit_score_reasoning": fit_score_reasoning,
+                "fit_score_prose_doc_id": fit_score_prose_doc_id,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
 
 
 def unlink_user_from_target(supabase: Client, user_id: str, target_id: str) -> bool:
@@ -623,7 +776,7 @@ def list_user_targets(supabase: Client, user_id: str) -> list[UserTarget]:
 
 
 def set_user_target_active(supabase: Client, user_id: str, target_id: str) -> UserTarget | None:
-    """Activate a user's link to a target. The DB trigger syncs targets.is_active."""
+    """Activate a user's link to a target (feeds the derived pipeline predicate)."""
     resp = (
         supabase.table(USER_TARGETS_TABLE)
         .update({"is_active": True, "updated_at": datetime.now(UTC).isoformat()})
@@ -636,7 +789,7 @@ def set_user_target_active(supabase: Client, user_id: str, target_id: str) -> Us
 
 
 def set_user_target_inactive(supabase: Client, user_id: str, target_id: str) -> UserTarget | None:
-    """Deactivate a user's link to a target. The DB trigger syncs targets.is_active."""
+    """Deactivate a user's link to a target (feeds the derived pipeline predicate)."""
     resp = (
         supabase.table(USER_TARGETS_TABLE)
         .update({"is_active": False, "updated_at": datetime.now(UTC).isoformat()})

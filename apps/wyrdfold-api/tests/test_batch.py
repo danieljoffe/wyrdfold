@@ -80,6 +80,18 @@ _RESUME_RECORD = TailoredResumeRecord(
 )
 
 
+def _flagged_record() -> TailoredResumeRecord:
+    """A resume persisted despite failing ATS lint (#656)."""
+    return _RESUME_RECORD.model_copy(
+        update={
+            "id": "rec-flagged",
+            "lint_violations": [
+                LintViolation(code="too_long", message="Page overflow", severity="error")
+            ],
+        }
+    )
+
+
 def _pending_item(jid: str) -> dict[str, Any]:
     return {
         "job_posting_id": jid,
@@ -104,16 +116,17 @@ def _default_batch_data() -> dict[str, Any]:
 
 
 def _set_mock_data(supabase: MagicMock, data: list[Any]) -> None:
-    insert = supabase.table.return_value.insert.return_value
-    insert.execute.return_value.data = data
-    select = supabase.table.return_value.select.return_value
+    tbl = supabase.table.return_value
+    tbl.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
+    tbl.update.return_value.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
+    select = tbl.select.return_value
     # ``get_batch`` (post user_id scoping): select → eq(id) → eq(user_id→SYSTEM) → execute
-    select.eq.return_value.eq.return_value.execute.return_value.data = data
+    select.eq.return_value.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
     # Back-compat for the older single-``eq`` chain (kept for any callers
     # that still go through it during refactoring).
-    select.eq.return_value.execute.return_value.data = data
+    select.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
     # ``create_batch_resumes`` now fetches all postings in one .in_() call.
-    select.in_.return_value.execute.return_value.data = data
+    select.in_.return_value.execute = AsyncMock(return_value=MagicMock(data=data))
 
 
 def _mock_supabase_for_batch(
@@ -173,9 +186,9 @@ class TestBatchModels:
 
 
 class TestBatchPersistence:
-    def test_create_batch(self) -> None:
+    async def test_create_batch(self) -> None:
         supabase = _mock_supabase_for_batch()
-        batch = create_batch(
+        batch = await create_batch(
             supabase,
             user_id=None,
             job_posting_ids=["job-1", "job-2"],
@@ -188,21 +201,22 @@ class TestBatchPersistence:
         # Verify the insert was called on the right table
         supabase.table.assert_any_call(TABLE)
 
-    def test_get_batch(self) -> None:
+    async def test_get_batch(self) -> None:
         supabase = _mock_supabase_for_batch()
-        batch = get_batch(supabase, "batch-1", user_id=None)
+        batch = await get_batch(supabase, "batch-1", user_id=None)
         assert batch is not None
         assert batch.id == "batch-1"
 
-    def test_get_batch_not_found(self) -> None:
+    async def test_get_batch_not_found(self) -> None:
         supabase = MagicMock()
         _set_mock_data(supabase, [])
-        batch = get_batch(supabase, "nonexistent", user_id=None)
+        batch = await get_batch(supabase, "nonexistent", user_id=None)
         assert batch is None
 
-    def test_update_batch(self) -> None:
+    async def test_update_batch(self) -> None:
         supabase = MagicMock()
-        _update_batch(
+        _set_mock_data(supabase, [])
+        await _update_batch(
             supabase,
             "batch-1",
             status="processing",
@@ -253,7 +267,12 @@ class TestBatchProcessing:
             mock_pipeline.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_process_item_lint_failure(self) -> None:
+    async def test_process_item_lint_failure_completes_as_flagged_draft(self) -> None:
+        """#656: a batch item whose resume fails ATS lint now yields a real
+        (flagged) ``documents`` row, so the item COMPLETES carrying its
+        violations rather than being marked failed. Marking it failed would
+        strand a draft the user already paid an LLM call for — and leave
+        ``resume_record_id`` null, with nothing to link them to."""
         supabase = _mock_supabase_for_batch()
         llm = MagicMock()
 
@@ -267,12 +286,21 @@ class TestBatchProcessing:
             resume=_RESUME,
             warnings=[],
             llm_result=_LLM_RESULT,
+            record=_flagged_record(),
+            payload_md="# Flagged draft",
         )
 
-        with patch(
-            "app.services.batch.run_tailor_pipeline",
-            new_callable=AsyncMock,
-            return_value=lint_fail,
+        with (
+            patch(
+                "app.services.batch.run_tailor_pipeline",
+                new_callable=AsyncMock,
+                return_value=lint_fail,
+            ),
+            patch(
+                "app.services.tailor.persistence.mark_job_resume_draft",
+                new_callable=AsyncMock,
+            ) as mock_mark,
+            patch("app.services.batch._update_batch", new_callable=AsyncMock) as mock_update,
         ):
             await process_batch(
                 supabase,
@@ -287,8 +315,15 @@ class TestBatchProcessing:
                 page_budget=2,
             )
 
-        # Batch should still complete (with failures tracked)
-        # The _update_batch calls track the failed item
+        # The flagged draft is reachable and the posting advanced, exactly as
+        # a clean generation would.
+        item = next(
+            c.kwargs["items"][0] for c in mock_update.call_args_list if "items" in c.kwargs
+        )
+        assert item["status"] == "completed"
+        assert item["resume_record_id"] == "rec-flagged"
+        assert item["lint_violations"] == ["Page overflow"]
+        mock_mark.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_item_exception(self) -> None:
@@ -397,7 +432,10 @@ class TestBatchProcessing:
                 new_callable=AsyncMock,
                 return_value=success,
             ),
-            patch("app.services.tailor.persistence.mark_job_resume_draft") as mock_mark,
+            patch(
+                "app.services.tailor.persistence.mark_job_resume_draft",
+                new_callable=AsyncMock,
+            ) as mock_mark,
         ):
             await process_batch(
                 supabase,
@@ -430,10 +468,10 @@ class TestBatchEndpoint:
 
         supabase = MagicMock()
         llm = MagicMock()
-        background = MagicMock()
 
         with patch(
-            "app.services.experience.optimized.get_latest",
+            "app.routers.tailor._optimized_latest",
+            new_callable=AsyncMock,
             return_value=None,
         ):
             with pytest.raises(HTTPException) as exc_info:
@@ -443,7 +481,6 @@ class TestBatchEndpoint:
                         job_posting_ids=["job-1"],
                         contact=_CONTACT,
                     ),
-                    background_tasks=background,
                     supabase=supabase,
                     llm=llm,
                 )
@@ -458,10 +495,10 @@ class TestBatchEndpoint:
         supabase = MagicMock()
         _set_mock_data(supabase, [])
         llm = MagicMock()
-        background = MagicMock()
 
         with patch(
-            "app.services.experience.optimized.get_latest",
+            "app.routers.tailor._optimized_latest",
+            new_callable=AsyncMock,
             return_value=_OPTIMIZED,
         ):
             with pytest.raises(HTTPException) as exc_info:
@@ -471,7 +508,6 @@ class TestBatchEndpoint:
                         job_posting_ids=["nonexistent"],
                         contact=_CONTACT,
                     ),
-                    background_tasks=background,
                     supabase=supabase,
                     llm=llm,
                 )
@@ -486,15 +522,30 @@ class TestBatchEndpoint:
         # Mock jobs lookup
         _set_mock_data(supabase, [{"id": "job-1", "title": "SWE", "description_html": "<p>JD</p>"}])
         llm = MagicMock()
-        background = MagicMock()
+
+        # The endpoint dispatches the batch via ``spawn_detached`` (create_task),
+        # NOT ``BackgroundTasks.add_task`` — the latter deadlocks the pooled async
+        # client under uvloop (see the handler docstring). Capture the dispatch and
+        # close the constructed-but-unrun coroutine to avoid a "never awaited" warning.
+        dispatched: list[str | None] = []
+
+        def _capture(coro: Any, *, name: str | None = None) -> None:
+            coro.close()
+            dispatched.append(name)
+
+        monkeypatch.setattr("app.routers.tailor.spawn_detached", _capture)
 
         monkeypatch.setattr(
-            "app.services.experience.optimized.get_latest",
-            lambda *a, **kw: _OPTIMIZED,
+            "app.routers.tailor._optimized_latest",
+            AsyncMock(return_value=_OPTIMIZED),
         )
         monkeypatch.setattr(
-            "app.services.experience.preferences.get",
-            lambda *a, **kw: None,
+            "app.routers.tailor._preferences_get",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "app.routers.tailor._resolve_target_for_posting",
+            AsyncMock(return_value=None),
         )
 
         batch = BatchJob(
@@ -510,7 +561,7 @@ class TestBatchEndpoint:
         )
         monkeypatch.setattr(
             "app.routers.tailor.create_batch",
-            lambda *a, **kw: batch,
+            AsyncMock(return_value=batch),
         )
 
         result = await tailor_router.create_batch_resumes(
@@ -519,7 +570,6 @@ class TestBatchEndpoint:
                 job_posting_ids=["job-1"],
                 contact=_CONTACT,
             ),
-            background_tasks=background,
             supabase=supabase,
             llm=llm,
         )
@@ -527,7 +577,7 @@ class TestBatchEndpoint:
         assert result.batch_id == "batch-1"
         assert result.total == 1
         assert result.status == "pending"
-        background.add_task.assert_called_once()
+        assert dispatched == ["batch:batch-1"]  # dispatched once, with the batch-id name
 
     @pytest.mark.asyncio
     async def test_get_batch_not_found(self) -> None:
@@ -537,9 +587,9 @@ class TestBatchEndpoint:
 
         supabase = MagicMock()
 
-        with patch("app.routers.tailor.get_batch", return_value=None):
+        with patch("app.routers.tailor.get_batch", new_callable=AsyncMock, return_value=None):
             with pytest.raises(HTTPException) as exc_info:
-                tailor_router.get_batch_status(
+                await tailor_router.get_batch_status(
                     batch_id="nonexistent",
                     supabase=supabase,
                 )
@@ -566,8 +616,8 @@ class TestBatchEndpoint:
             updated_at=_NOW,
         )
 
-        with patch("app.routers.tailor.get_batch", return_value=batch):
-            result = tailor_router.get_batch_status(
+        with patch("app.routers.tailor.get_batch", new_callable=AsyncMock, return_value=batch):
+            result = await tailor_router.get_batch_status(
                 batch_id="batch-1",
                 supabase=supabase,
             )

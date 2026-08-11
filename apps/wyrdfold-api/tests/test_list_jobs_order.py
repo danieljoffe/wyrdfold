@@ -8,7 +8,7 @@ right rows in the wrong order.
 """
 
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -68,7 +68,7 @@ class _Chain:
     def range(self, *_a: Any, **_kw: Any) -> "_Chain":
         return self
 
-    def execute(self) -> _Resp:
+    async def execute(self) -> _Resp:
         return self._resp
 
 
@@ -81,7 +81,7 @@ def _supabase_with(table_resps: dict[str, _Resp]) -> MagicMock:
     return sb
 
 
-def test_target_two_query_restores_score_desc_order() -> None:
+async def test_target_two_query_restores_score_desc_order() -> None:
     # Scores returned in score-desc order (highest first) — this is what
     # Supabase produces because the query chains .order("score", desc=True).
     ts_rows = [
@@ -118,7 +118,7 @@ def test_target_two_query_restores_score_desc_order() -> None:
         {"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings_in_storage_order)}
     )
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
@@ -138,7 +138,57 @@ def test_target_two_query_restores_score_desc_order() -> None:
     assert result["total"] == 3
 
 
-def test_across_user_targets_restores_score_desc_order(
+@pytest.mark.asyncio
+async def test_two_query_emits_axis_scores_for_graded_rows() -> None:
+    """#609 follow-up: graded rows ship their fit axes on the wire so the
+    detail panel can render the breakdown that actually averages to the
+    score; pending rows ship ``axis_scores: None`` (keyword components stay
+    their explanation). A missing key would silently starve the panel back
+    onto its detail-GET fallback for every row."""
+    axes = {"title_fit": 95, "skills_fit": 85, "seniority_fit": 90, "domain_fit": 95}
+    ts_rows = [
+        {
+            "job_posting_id": "j-graded",
+            "score": 91,
+            "score_breakdown": {"role_titles": 24.4},
+            "scoring_status": "complete",
+            "axis_scores": axes,
+            "fit_reasoning": "graded match",
+        },
+        {
+            "job_posting_id": "j-pending",
+            "score": 42,
+            "score_breakdown": {"role_titles": 30.0},
+            "scoring_status": "stage2",
+            "axis_scores": None,
+        },
+    ]
+    postings = [{"id": "j-graded", "title": "a"}, {"id": "j-pending", "title": "b"}]
+    sb = _supabase_with({"scores": _Resp(ts_rows, count=2), "jobs": _Resp(postings)})
+
+    result = await _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        cursor={},
+        page_size=10,
+        sort="score",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+    )
+
+    by_id = {p["id"]: p for p in result["postings"]}
+    assert by_id["j-graded"]["axis_scores"] == axes
+    assert by_id["j-graded"]["pending"] is False
+    assert by_id["j-pending"]["axis_scores"] is None
+    assert by_id["j-pending"]["pending"] is True
+
+
+async def test_across_user_targets_restores_score_desc_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Pin recency decay OFF: this tests raw-score-desc ordering, which the
@@ -180,7 +230,7 @@ def test_across_user_targets_restores_score_desc_order(
     ]
     sb = _supabase_with({"scores": _Resp(score_rows), "jobs": _Resp(postings_in_storage_order)})
 
-    result = _list_jobs_across_user_targets(
+    result = await _list_jobs_across_user_targets(
         sb,
         user_target_ids={"t-1", "t-2"},
         cursor={},
@@ -200,7 +250,7 @@ def test_across_user_targets_restores_score_desc_order(
     assert result["total"] == 3
 
 
-def test_gate_off_family_drops_family_mismatches() -> None:
+async def test_gate_off_family_drops_family_mismatches() -> None:
     """#278: strict off-family gate — keep a match only when the job's family
     equals the target's, the job is untagged (NULL), or the target is
     unclassified. t-1 is engineering, so finance is dropped; eng + untagged
@@ -222,10 +272,10 @@ def test_gate_off_family_drops_family_mismatches() -> None:
             ),
         }
     )
-    assert set(_gate_off_family(sb, by_id)) == {"j-eng", "j-null"}
+    assert set(await _gate_off_family(sb, by_id)) == {"j-eng", "j-null"}
 
 
-def test_gate_off_family_noop_when_target_unclassified() -> None:
+async def test_gate_off_family_noop_when_target_unclassified() -> None:
     """A target with no role_family never hides anything (the safe default)."""
     by_id = {"j-fin": {"job_posting_id": "j-fin", "target_id": "t-1"}}
     sb = _supabase_with(
@@ -234,10 +284,10 @@ def test_gate_off_family_noop_when_target_unclassified() -> None:
             "jobs": _Resp([{"id": "j-fin", "role_family": "finance"}]),
         }
     )
-    assert set(_gate_off_family(sb, by_id)) == {"j-fin"}
+    assert set(await _gate_off_family(sb, by_id)) == {"j-fin"}
 
 
-def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
+async def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
     """Regression: when a location filter is active, ``total`` must reflect
     the post-filter row count — not the pre-filter scores-layer count.
     Previously the API returned ``total=3`` for a query that only matched 1
@@ -272,7 +322,7 @@ def test_target_two_query_location_filter_paginates_post_filter_set() -> None:
     ]
     sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},
@@ -313,7 +363,7 @@ def _rpc_supabase(rows: list[dict[str, Any]], captured: dict[str, Any]) -> Magic
         captured["name"] = name
         captured["params"] = params
         call = MagicMock()
-        call.execute.return_value = _Resp(rows)
+        call.execute = AsyncMock(return_value=_Resp(rows))
         return call
 
     sb.rpc.side_effect = _rpc
@@ -324,7 +374,7 @@ def _rpc_supabase(rows: list[dict[str, Any]], captured: dict[str, Any]) -> Magic
 # the two-query path for Pending-below-graded bucketing, and a min_score floor
 # routes there for Pending exemption (#47). These pin the keyset emit/trim/
 # consume mechanics on a sort the RPC still handles (created_at).
-def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
+async def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     # page_size+1 rows come back → there's a next page; the extra row is
     # dropped and the cursor is the last KEPT row's (sort_value, id).
     rows = [
@@ -333,7 +383,7 @@ def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     ]
     captured: dict[str, Any] = {}
     sb = _rpc_supabase(rows, captured)
-    result = _list_jobs_for_target_rpc(
+    result = await _list_jobs_for_target_rpc(
         sb,
         target_id="t-1",
         page_size=2,
@@ -355,13 +405,13 @@ def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     assert result["total"] is None  # no COUNT on the keyset path
 
 
-def test_rpc_keyset_last_page_has_no_cursor() -> None:
+async def test_rpc_keyset_last_page_has_no_cursor() -> None:
     rows = [
         {"id": "j0", "score": 100, "created_at": "2026-06-30"},
         {"id": "j1", "score": 99, "created_at": "2026-06-29"},  # exactly page_size
     ]
     sb = _rpc_supabase(rows, {})
-    result = _list_jobs_for_target_rpc(
+    result = await _list_jobs_for_target_rpc(
         sb,
         target_id="t-1",
         page_size=2,
@@ -378,10 +428,10 @@ def test_rpc_keyset_last_page_has_no_cursor() -> None:
     assert result["next_cursor"] is None
 
 
-def test_rpc_keyset_consumes_incoming_cursor() -> None:
+async def test_rpc_keyset_consumes_incoming_cursor() -> None:
     captured: dict[str, Any] = {}
     sb = _rpc_supabase([], captured)
-    _list_jobs_for_target_rpc(
+    await _list_jobs_for_target_rpc(
         sb,
         target_id="t-1",
         page_size=2,
@@ -399,14 +449,14 @@ def test_rpc_keyset_consumes_incoming_cursor() -> None:
     assert captured["params"]["p_after_id"] == "j-x"
 
 
-def test_rpc_skips_score_sort_and_floored_queries() -> None:
+async def test_rpc_skips_score_sort_and_floored_queries() -> None:
     # Score sort (Pending bucketing) and any min_score floor (Pending exemption)
     # are handled in the two-query path; the RPC raises so the dispatcher falls
     # back. (#47)
     sb = _rpc_supabase([], {})
     for extra in ({"sort": "score", "min_score": None}, {"sort": "created_at", "min_score": 70}):
         with pytest.raises(RuntimeError):
-            _list_jobs_for_target_rpc(
+            await _list_jobs_for_target_rpc(
                 sb,
                 target_id="t-1",
                 page_size=2,
@@ -421,7 +471,7 @@ def test_rpc_skips_score_sort_and_floored_queries() -> None:
             )
 
 
-def test_two_query_offset_cursor_advances_when_more_rows() -> None:
+async def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     # 3 rows, page_size 2 → first page carries a next-cursor at offset 2.
     # Use a title sort so pagination happens in the Python-slice branch (the
     # score fast-path slices page_ids at the scores layer, which the fluent
@@ -437,7 +487,7 @@ def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     ]
     postings = [{"id": f"j{i}", "title": f"t{i}"} for i in range(3)]
     sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         page_size=2,
@@ -454,7 +504,7 @@ def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     assert [p["id"] for p in result["postings"]] == ["j0", "j1"]
     assert _decode_cursor(result["next_cursor"]) == {"o": 2}
     # Following that cursor yields the last row and no further cursor.
-    result2 = _list_jobs_for_target_two_query(
+    result2 = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         page_size=2,
@@ -532,11 +582,11 @@ def test_rank_graded_first_orders_pending_by_recency_key() -> None:
     assert [r["id"] for r in ranked_fallback] == ["g-hi", "g-lo", "p-old", "p-new"]
 
 
-def test_two_query_pending_sorts_by_recency_not_keyword_score(
+async def test_two_query_pending_sorts_by_recency_not_keyword_score(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end through the score-sorted two-query path: within the Pending
-    tier, fresh ungraded jobs outrank stale ones by first_seen_at — NOT by the
+    tier, fresh ungraded jobs outrank stale ones by posted date — NOT by the
     hidden keyword placeholder. Decay is OFF, so this also exercises the forced
     first-seen fetch (the case the ``force`` flag exists for)."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
@@ -573,14 +623,14 @@ def test_two_query_pending_sorts_by_recency_not_keyword_score(
         },
     ]
     jobs_rows = [
-        {"id": "g-hi", "title": "graded hi", "first_seen_at": "2026-07-05"},
-        {"id": "g-lo", "title": "graded lo", "first_seen_at": "2026-07-04"},
-        {"id": "p-old-hi", "title": "pending old high-keyword", "first_seen_at": "2026-07-01"},
-        {"id": "p-new-lo", "title": "pending new low-keyword", "first_seen_at": "2026-07-09"},
+        {"id": "g-hi", "title": "graded hi", "cataloged_at": "2026-07-05"},
+        {"id": "g-lo", "title": "graded lo", "cataloged_at": "2026-07-04"},
+        {"id": "p-old-hi", "title": "pending old high-keyword", "cataloged_at": "2026-07-01"},
+        {"id": "p-new-lo", "title": "pending new low-keyword", "cataloged_at": "2026-07-09"},
     ]
     sb = _supabase_with({"scores": _Resp(ts_rows, count=4), "jobs": _Resp(jobs_rows)})
 
-    result = _list_jobs_for_target_two_query(
+    result = await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
         cursor={},

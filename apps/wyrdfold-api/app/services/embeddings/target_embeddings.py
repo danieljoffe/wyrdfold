@@ -36,6 +36,7 @@ from supabase import Client
 from app.models.embeddings import EmbeddingModelId
 from app.models.targets import JobTarget
 from app.services.embeddings.client import EmbeddingsClient
+from app.services.embeddings.job_embeddings import EMBED_DIMENSIONS
 from app.services.llm import cost_log
 
 logger = logging.getLogger(__name__)
@@ -124,11 +125,15 @@ async def upsert_target_embedding(
             # Unchanged target text already embedded — skip the spend.
             return "cache_hit"
 
+        # Same Matryoshka size as job vectors (job_embeddings.EMBED_DIMENSIONS)
+        # — cosine requires one shared space; a mismatched pair fails open at
+        # the gate's length guard instead of comparing garbage.
         result = await embeddings_client.embed(
             model=model,
             inputs=[text],
             purpose=TARGET_EMBED_PURPOSE,
             input_type="query",
+            output_dimension=EMBED_DIMENSIONS,
         )
         if not result.embeddings:
             # Defensive: a non-empty input should always yield one vector.

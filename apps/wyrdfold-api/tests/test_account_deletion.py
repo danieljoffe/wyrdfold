@@ -76,7 +76,7 @@ class _FakeTableQuery:
             row.get(c) in vals for c, vals in self._in_filters
         )
 
-    def execute(self) -> SimpleNamespace:
+    async def execute(self) -> SimpleNamespace:
         matched = [r for r in self._rows if self._matches(r)]
         self._log.append((self._op, self.name, dict(self._filters)))
         if self._op == "delete":
@@ -94,10 +94,10 @@ class _FakeBucket:
         self._log = log
         self.removed: list[list[str]] = []
 
-    def list(self, prefix: str) -> list[dict[str, str]]:
+    async def list(self, prefix: str) -> list[dict[str, str]]:
         return [{"name": n} for n in self._objects.get(self.name, {}).get(prefix, [])]
 
-    def remove(self, paths: list[str]) -> list[dict[str, str]]:
+    async def remove(self, paths: list[str]) -> list[dict[str, str]]:
         self._log.append(("storage_remove", self.name, paths))
         self.removed.append(list(paths))
         for p in paths:
@@ -125,9 +125,17 @@ class _FakeAdmin:
         self._log = log
         self.deleted: list[str] = []
 
-    def delete_user(self, user_id: str, should_soft_delete: bool = False) -> None:
+    async def delete_user(self, user_id: str, should_soft_delete: bool = False) -> None:
         self._log.append(("auth_delete", user_id, {}))
         self.deleted.append(user_id)
+
+
+class _FakeRpc:
+    def __init__(self, data: Any) -> None:
+        self._data = data
+
+    async def execute(self) -> SimpleNamespace:
+        return SimpleNamespace(data=self._data)
 
 
 class _FakeSupabase:
@@ -140,15 +148,28 @@ class _FakeSupabase:
         self.log: list = []
         self.storage = _FakeStorage(objects or {}, self.log)
         self.auth = SimpleNamespace(admin=_FakeAdmin(self.log))
+        # Per-RPC canned return; the real reap returns whether a row went.
+        self.rpc_results: dict[str, Any] = {"reap_orphaned_target": True}
 
     def table(self, name: str) -> _FakeTableQuery:
         return _FakeTableQuery(name, self.tables.setdefault(name, []), self.log)
+
+    def rpc(self, name: str, params: dict[str, Any]) -> _FakeRpc:
+        """Erasure calls ``reap_orphaned_target`` (#667).
+
+        The fake NEEDS this: ``_reap_orphaned_target`` is fail-soft, so a
+        ``_FakeSupabase`` without ``rpc`` would raise AttributeError, get
+        swallowed, and every erasure test would pass while the reap never ran —
+        certifying a code path that does nothing.
+        """
+        self.log.append(("rpc", name, params))
+        return _FakeRpc(self.rpc_results.get(name, False))
 
 
 def _seeded() -> _FakeSupabase:
     tables: dict[str, list[dict[str, Any]]] = {
         "documents": [{"user_id": _UID}, {"user_id": _UID}],
-        "user_targets": [{"user_id": _UID}],
+        "user_targets": [{"user_id": _UID, "target_id": "t1"}],
         "job_feedback": [{"user_id": _UID}],
         "user_api_keys": [{"user_id": _UID, "provider": "openrouter"}],
         "contribution_votes": [{"user_id": _UID, "reference_jd_id": "rj1"}],
@@ -177,12 +198,12 @@ def _seeded() -> _FakeSupabase:
 # ---- service ----------------------------------------------------------
 
 
-def test_reference_jds_anonymized_and_votes_deleted() -> None:
+async def test_reference_jds_anonymized_and_votes_deleted() -> None:
     """Erasure deletes the user's anonymous votes, and nulls the user link on
     their shared reference-JD contributions (collective content) rather than
     deleting the rows — never touching another contributor's JDs (#29)."""
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     # Votes deleted; reference_jds anonymized via UPDATE, never DELETE.
     assert ("delete", "contribution_votes", {"user_id": _UID}) in sb.log
@@ -197,9 +218,9 @@ def test_reference_jds_anonymized_and_votes_deleted() -> None:
     assert report["reference_jds_anonymized"] == 1
 
 
-def test_deletes_every_per_user_table_by_user_id() -> None:
+async def test_deletes_every_per_user_table_by_user_id() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     deleted = {(table, frozenset(filt.items())) for op, table, filt in sb.log if op == "delete"}
     expected_filter = frozenset({"user_id": _UID}.items())
@@ -208,26 +229,31 @@ def test_deletes_every_per_user_table_by_user_id() -> None:
         assert table in report
 
 
-def test_notifications_deleted_by_resolved_profile_id() -> None:
+async def test_notifications_deleted_by_resolved_profile_id() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert ("delete", "notifications_sent", {"user_profile_id": _PROFILE_ID}) in sb.log
     assert report["notifications_sent"] == 2
 
 
-def test_shared_catalog_is_never_deleted() -> None:
+async def test_shared_catalog_is_never_deleted() -> None:
     """The multi-tenant safety invariant: erasing one user must not delete
     rows from the shared catalog."""
     sb = _seeded()
-    account_deletion.delete_account(sb, user_id=_UID)
+    await account_deletion.delete_account(sb, user_id=_UID)
     deleted_tables = {table for op, table, _ in sb.log if op == "delete"}
     assert deleted_tables.isdisjoint(_SHARED_TABLES)
-    # And the shared rows are physically still present.
-    assert sb.tables["scores"] == [{"target_id": "t1", "job_posting_id": "j1"}]
+    # And the shared rows are physically still present. The scores row is
+    # SCRUBBED in place (its Phase-2 PII nulled — asserted separately in
+    # test_scrubs_shared_score_pii_for_user_targets); what matters here is that
+    # it was not deleted.
+    assert len(sb.tables["scores"]) == 1
+    assert sb.tables["scores"][0]["target_id"] == "t1"
+    assert sb.tables["scores"][0]["job_posting_id"] == "j1"
     assert sb.tables["jobs"] == [{"id": "j1", "status": "applied"}]
 
 
-def test_scrubs_shared_score_pii_for_user_targets() -> None:
+async def test_scrubs_shared_score_pii_for_user_targets() -> None:
     """Erasure nulls the Phase-2 grader PII on shared ``scores`` rows for
     the user's targets (without deleting the rows), re-opens them to grade,
     and leaves scores for *other* tenants' targets untouched."""
@@ -254,7 +280,7 @@ def test_scrubs_shared_score_pii_for_user_targets() -> None:
         ],
     }
     sb = _FakeSupabase(tables, {})
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
 
     scrubbed = next(r for r in sb.tables["scores"] if r["target_id"] == "t1")
     assert scrubbed["fit_reasoning"] is None
@@ -271,17 +297,85 @@ def test_scrubs_shared_score_pii_for_user_targets() -> None:
     assert "scores" not in {table for op, table, _ in sb.log if op == "delete"}
 
 
-def test_no_targets_skips_score_scrub() -> None:
-    """A user with no target links issues no scores update (no ``.in_([])``)."""
-    sb = _seeded()  # seeded user_targets row carries no target_id
-    report = account_deletion.delete_account(sb, user_id=_UID)
+async def test_erasure_reaps_the_users_targets() -> None:
+    """#667: erasure deletes ``user_targets`` by a different route than the
+    unlink endpoint, and used to leave the shared row behind unreachable.
+
+    Every id the user was linked to is offered to the guarded RPC; the guard
+    (server-side, same snapshot as the delete) decides which actually go, so
+    offering a co-followed target is a no-op rather than a cross-tenant delete.
+    """
+    sb = _seeded()
+
+    report = await account_deletion.delete_account(sb, user_id=_UID)
+
+    reaps = [entry for entry in sb.log if entry[0] == "rpc" and entry[1] == "reap_orphaned_target"]
+    assert [r[2]["p_target_id"] for r in reaps] == ["t1"]
+    assert report["targets_reaped"] == 1
+
+
+async def test_erasure_reap_is_offered_every_linked_target() -> None:
+    """The guard, not the caller, decides. Erasure must hand over every id —
+    filtering client-side would need a membership count it no longer has."""
+    sb = _FakeSupabase(
+        {
+            "user_targets": [{"user_id": _UID, "target_id": t} for t in ("t1", "t2", "t3")],
+            "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+        }
+    )
+    sb.rpc_results["reap_orphaned_target"] = False  # guard refuses them all
+
+    report = await account_deletion.delete_account(sb, user_id=_UID)
+
+    offered = [e[2]["p_target_id"] for e in sb.log if e[0] == "rpc"]
+    assert offered == ["t1", "t2", "t3"]
+    assert report["targets_reaped"] == 0
+
+
+async def test_erasure_completes_when_the_reap_fails() -> None:
+    """Fail-soft. The user's own data is already gone by step 3b; a tidy-up
+    failure must not abort erasure and leave the account half-deleted."""
+
+    class _Exploding(_FakeSupabase):
+        def rpc(self, name: str, params: dict[str, Any]) -> Any:
+            raise RuntimeError("rpc exploded")
+
+    sb = _Exploding(
+        {
+            "user_targets": [{"user_id": _UID, "target_id": "t1"}],
+            "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+        }
+    )
+
+    report = await account_deletion.delete_account(sb, user_id=_UID)
+
+    assert report["targets_reaped"] == 0
+    # Erasure still ran to completion — the auth user is gone.
+    assert any(entry[0] == "auth_delete" for entry in sb.log)
+
+
+async def test_no_targets_skips_score_scrub() -> None:
+    """A user with no target links issues no scores update (no ``.in_([])``).
+
+    Uses a fake with genuinely zero ``user_targets`` rows. This used to lean on
+    the seeded fixture's row having no ``target_id`` — a shape the database
+    cannot produce (the column is NOT NULL), so the test was proving something
+    about a row that never exists.
+    """
+    sb = _FakeSupabase(
+        {
+            "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+            "scores": [{"target_id": "t1", "job_posting_id": "j1"}],
+        }
+    )
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert report["scores_scrubbed"] == 0
     assert ("update", "scores", {}) not in sb.log
 
 
-def test_both_storage_buckets_purged() -> None:
+async def test_both_storage_buckets_purged() -> None:
     sb = _seeded()
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert report["resume_uploads_objects"] == 2
     assert report["tailored_resume_objects"] == 1
     assert sb.storage.buckets["resume-uploads"].removed == [
@@ -290,9 +384,9 @@ def test_both_storage_buckets_purged() -> None:
     assert sb.storage.buckets["tailored-resumes"].removed == [[f"{_UID}/r-1.docx"]]
 
 
-def test_auth_user_deleted_last() -> None:
+async def test_auth_user_deleted_last() -> None:
     sb = _seeded()
-    account_deletion.delete_account(sb, user_id=_UID)
+    await account_deletion.delete_account(sb, user_id=_UID)
     ops = [(op, table) for op, table, _ in sb.log]
     assert ("auth_delete", _UID) in ops
     # auth deletion comes after the profile row delete (data first).
@@ -300,9 +394,9 @@ def test_auth_user_deleted_last() -> None:
     assert sb.auth.admin.deleted == [_UID]
 
 
-def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
+async def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
     sb = _FakeSupabase(tables={"documents": [{"user_id": _UID}]}, objects={})
-    report = account_deletion.delete_account(sb, user_id=_UID)
+    report = await account_deletion.delete_account(sb, user_id=_UID)
     assert "notifications_sent" not in report  # no profile id to resolve
     assert sb.auth.admin.deleted == [_UID]
     assert report["auth_user"] == 1
@@ -311,18 +405,18 @@ def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
 # ---- storage helper ---------------------------------------------------
 
 
-def test_purge_user_objects_empty_prefix_returns_zero() -> None:
+async def test_purge_user_objects_empty_prefix_returns_zero() -> None:
     from app.services.ingest import storage
 
     sb = _FakeSupabase(objects={"resume-uploads": {}})
-    assert storage.purge_user_objects(sb, _UID) == 0
+    assert await storage.purge_user_objects(sb, _UID) == 0
 
 
-def test_purge_user_objects_loops_until_empty() -> None:
+async def test_purge_user_objects_loops_until_empty() -> None:
     from app.services.tailor import persistence
 
     sb = _FakeSupabase(objects={"tailored-resumes": {_UID: ["a.docx", "b.docx"]}})
-    assert persistence.purge_user_objects(sb, _UID) == 2
+    assert await persistence.purge_user_objects(sb, _UID) == 2
     assert sb.storage.buckets["tailored-resumes"]._objects["tailored-resumes"][_UID] == []
 
 
@@ -333,8 +427,8 @@ def test_delete_account_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi.testclient import TestClient
 
     from app.dependencies import (
+        get_async_service_supabase,
         get_current_user_id,
-        get_supabase,
         verify_supabase_jwt,
     )
     from app.main import app
@@ -342,7 +436,7 @@ def test_delete_account_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     sb = _seeded()
     app.dependency_overrides[verify_supabase_jwt] = lambda: _UID
     app.dependency_overrides[get_current_user_id] = lambda: _UID
-    app.dependency_overrides[get_supabase] = lambda: sb
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
     try:
         client = TestClient(app)
         resp = client.delete("/profile/account")

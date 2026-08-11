@@ -2,7 +2,7 @@
 
 Covers:
   1. set_user_target_inactive deactivates via user_targets (so the trigger
-     can sync targets.is_active).
+     fed the old targets.is_active trigger; the flag is now the derived pipeline predicate).
   2. FitScoreResult tolerates reasoning strings up to 1500 chars (the LLM
      occasionally exceeds the original 500 cap, which caused 502s).
 """
@@ -270,3 +270,24 @@ def test_count_active_for_user_uses_exact_count_head() -> None:
     select_args = supabase.table.return_value.select.call_args
     # First positional arg or 'count' kwarg should signal exact-count semantics.
     assert select_args.kwargs.get("count") == "exact"
+
+
+def test_get_active_target_ids_filters_on_membership_activity() -> None:
+    """The /jobs list scope (Group D decision 2026-07-30): ACTIVE memberships
+    only — the query must carry BOTH the user filter and is_active=True, so a
+    paused link's jobs leave the list while every any-status surface
+    (authz/dedup via get_user_target_ids) still sees the link."""
+    supabase = MagicMock()
+    chain = supabase.table.return_value.select.return_value
+    chain.eq.return_value.eq.return_value.execute.return_value.data = [
+        {"target_id": "t-active"}
+    ]
+
+    ids = crud.get_active_target_ids(supabase, "user-1")
+
+    assert ids == {"t-active"}
+    supabase.table.assert_called_with("user_targets")
+    first_eq = chain.eq.call_args_list[0].args
+    second_eq = chain.eq.return_value.eq.call_args_list[0].args
+    assert first_eq == ("user_id", "user-1")
+    assert second_eq == ("is_active", True)

@@ -34,7 +34,7 @@ import logging
 import sys
 from typing import Any, cast
 
-from app.supabase_pool import get_supabase_pool, init_supabase
+from app.supabase_pool import create_service_client
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("wipe")
@@ -64,8 +64,7 @@ def _delete(supabase: Any, table: str, dry_run: bool, **filters: Any) -> int:
 
 
 def wipe(user_id: str, dry_run: bool) -> None:
-    init_supabase()
-    supabase = get_supabase_pool()
+    supabase = create_service_client()
     if supabase is None:
         raise RuntimeError("Supabase not configured — check .env")
     sb: Any = supabase

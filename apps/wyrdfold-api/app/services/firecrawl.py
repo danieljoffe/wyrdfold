@@ -136,9 +136,8 @@ async def fetch_firecrawl_jobs(careers_url: str) -> list[StandardJob]:
                 external_id=_make_external_id(careers_url, title, location),
                 title=title,
                 location_name=location,
-                department=item.get("department", "").strip() or None,
                 content=item.get("description", "").strip(),
-                updated_at="",
+                posted_at="",
                 absolute_url=item.get("url", "").strip(),
             )
         )

@@ -235,3 +235,104 @@ describe('proxy middleware: public legal pages', () => {
     expect(res.headers.get('location')).toContain('/login');
   });
 });
+
+// The auth-adaptive public search surface (#467 §10). Its allowlist entry is
+// the highest-risk part of this feature: a too-broad match would punch a hole in
+// the whole (app)/* gate. These tests pin it shut — /search opens, everything
+// adjacent stays gated.
+describe('proxy middleware: public /search (auth-adaptive surface)', () => {
+  const original: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    original[URL_VAR] = process.env[URL_VAR];
+    original[ANON_VAR] = process.env[ANON_VAR];
+    setEnv(URL_VAR, 'https://proj.supabase.co');
+    setEnv(ANON_VAR, 'anon-key');
+    // Anonymous visitor — the case that matters for the public funnel.
+    mockGetUser.mockResolvedValue({ data: { user: null } });
+  });
+
+  afterEach(() => {
+    setEnv(URL_VAR, original[URL_VAR]);
+    setEnv(ANON_VAR, original[ANON_VAR]);
+    mockGetUser.mockReset();
+  });
+
+  it('serves /search to anonymous visitors without redirecting to /login', async () => {
+    const res = await proxy(new NextRequest('https://app.test/search'));
+    // A public page response carries no redirect Location...
+    expect(res.headers.get('location')).toBeNull();
+    // ...and still ships the enforced CSP like every other route.
+    expect(res.headers.get(ENFORCED_HEADER)).toBeTruthy();
+  });
+
+  it('serves /search WITH a query string to anonymous visitors (no redirect)', async () => {
+    // The URL-synced search state rides the querystring; the pathname match must
+    // still open it.
+    const res = await proxy(
+      new NextRequest('https://app.test/search?q=frontend&posted_within=7')
+    );
+    expect(res.headers.get('location')).toBeNull();
+  });
+
+  it.each(['/jobs', '/settings', '/dashboard', '/targets'])(
+    'STILL redirects the gated route %s to /login when anonymous (allowlist is targeted, not a hole)',
+    async path => {
+      const res = await proxy(new NextRequest(`https://app.test${path}`));
+      const location = res.headers.get('location');
+      expect(location).toContain('/login');
+      // The intended destination is preserved so login can bounce back.
+      expect(location).toContain(`next=${encodeURIComponent(path)}`);
+    }
+  );
+
+  it('does NOT open a lookalike prefix like /search-abuse (exact match only)', async () => {
+    // Guards against `startsWith('/search')` creep — a prefix match would open
+    // arbitrary `/search…` routes. The exact check keeps the hole to /search.
+    const res = await proxy(new NextRequest('https://app.test/search-abuse'));
+    expect(res.headers.get('location')).toContain('/login');
+  });
+
+  // ---- Shareable listing URLs (#467 §11.2 fast-follow) --------------------
+  // The widened allowlist admits UUID-SHAPED `/search/<id>` paths only. These
+  // pin the shape gate shut: a valid-looking listing URL opens, every
+  // adversarial variant still bounces to /login.
+
+  const LISTING_ID = '123e4567-e89b-42d3-a456-426614174000';
+
+  it('serves /search/<uuid> (a shared listing link) to anonymous visitors', async () => {
+    const res = await proxy(
+      new NextRequest(`https://app.test/search/${LISTING_ID}`)
+    );
+    expect(res.headers.get('location')).toBeNull();
+    // ...and still ships the enforced CSP like every other route.
+    expect(res.headers.get(ENFORCED_HEADER)).toBeTruthy();
+  });
+
+  it('serves an UPPERCASE-uuid detail path too (ids are case-insensitively UUID-shaped)', async () => {
+    const res = await proxy(
+      new NextRequest(`https://app.test/search/${LISTING_ID.toUpperCase()}`)
+    );
+    expect(res.headers.get('location')).toBeNull();
+  });
+
+  it.each([
+    ['a junk segment', '/search/junk'],
+    ['uppercase junk', '/search/NOT-A-UUID-ATALL'],
+    ['a uuid with an extra segment', `/search/${LISTING_ID}/extra`],
+    ['an empty segment', '/search//'],
+    ['a trailing slash on a uuid', `/search/${LISTING_ID}/`],
+    ['a uuid one hex short', '/search/123e4567-e89b-42d3-a456-42661417400'],
+    [
+      'a uuid with a non-hex char',
+      '/search/123e4567-e89b-42d3-a456-42661417400g',
+    ],
+    ['a lookalike prefix carrying a uuid', `/searchx/${LISTING_ID}`],
+  ])(
+    'still redirects %s (%s) to /login — the hole is exactly UUID-shaped',
+    async (_label, path) => {
+      const res = await proxy(new NextRequest(`https://app.test${path}`));
+      expect(res.headers.get('location')).toContain('/login');
+    }
+  );
+});

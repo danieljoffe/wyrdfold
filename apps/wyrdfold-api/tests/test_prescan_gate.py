@@ -22,8 +22,7 @@ from typing import Any
 import pytest
 
 from app.models.targets import JobTarget, ScoringProfile
-from app.services.embeddings import prescan_gate
-from app.services.embeddings.prescan_gate import cosine_gate_decision, parse_vector
+from app.services.embeddings.prescan_gate import parse_vector
 
 
 def _target(target_id: str = "tgt-1") -> JobTarget:
@@ -33,7 +32,7 @@ def _target(target_id: str = "tgt-1") -> JobTarget:
         label="Staff Frontend Engineer",
         scoring_profile=ScoringProfile(),
         search_keywords=["React", "TypeScript"],
-        is_active=True,
+        app_active=True,
         created_at=now,
         updated_at=now,
     )
@@ -118,99 +117,6 @@ def test_parse_vector_none_and_garbage() -> None:
     assert parse_vector(["x", "y"]) is None  # non-numeric list
 
 
-# --------------------------------------------------------------------------- #
-# cosine_gate_decision — admit / drop across the threshold
-# --------------------------------------------------------------------------- #
-async def test_admits_when_cosine_at_or_above_threshold() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": _VEC_NEAR, "prescan_cosine_threshold": 0.5}],
-    )
-    cosine, admit = await cosine_gate_decision(sb, job_id="job-1", target=_target())
-    assert cosine is not None and cosine > 0.99
-    assert admit is True
-
-
-async def test_drops_when_cosine_below_threshold() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": _VEC_FAR, "prescan_cosine_threshold": 0.5}],
-    )
-    cosine, admit = await cosine_gate_decision(sb, job_id="job-1", target=_target())
-    assert cosine == pytest.approx(0.0)
-    assert admit is False
-
-
-async def test_admit_is_inclusive_at_exact_threshold() -> None:
-    # cosine(_VEC_A, _VEC_A) == 1.0; threshold 1.0 ⇒ admit (>= is inclusive).
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": _VEC_A, "prescan_cosine_threshold": 1.0}],
-    )
-    cosine, admit = await cosine_gate_decision(sb, job_id="job-1", target=_target())
-    assert cosine == pytest.approx(1.0)
-    assert admit is True
-
-
-# --------------------------------------------------------------------------- #
-# fail-soft on each missing input ⇒ (None, None)
-# --------------------------------------------------------------------------- #
-async def test_failsoft_no_job_vector() -> None:
-    sb = _FakeSupabase(
-        job_rows=[],  # no row for this (job, model)
-        target_rows=[{"embedding": _VEC_NEAR, "prescan_cosine_threshold": 0.5}],
-    )
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-    # Short-circuits before touching targets.
-    assert sb.tables_hit == ["job_embeddings"]
-
-
-async def test_failsoft_no_target_embedding() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": None, "prescan_cosine_threshold": 0.5}],
-    )
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-
-
-async def test_failsoft_null_threshold() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": _VEC_NEAR, "prescan_cosine_threshold": None}],
-    )
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-
-
-async def test_failsoft_no_target_row() -> None:
-    sb = _FakeSupabase(job_rows=[{"embedding": _VEC_A}], target_rows=[])
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-
-
-async def test_failsoft_dim_mismatch() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": [1.0, 0.0]}],  # 2-dim
-        target_rows=[{"embedding": _VEC_NEAR, "prescan_cosine_threshold": 0.5}],  # 3-dim
-    )
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-
-
-async def test_failsoft_client_raises() -> None:
-    sb = _FakeSupabase(raise_on="job_embeddings")
-    # Any unexpected error is swallowed — never propagates to the (best-effort) caller.
-    assert await cosine_gate_decision(sb, job_id="job-1", target=_target()) == (None, None)
-
-
-async def test_uses_default_model_in_query() -> None:
-    sb = _FakeSupabase(
-        job_rows=[{"embedding": _VEC_A}],
-        target_rows=[{"embedding": _VEC_A, "prescan_cosine_threshold": 0.5}],
-    )
-    await cosine_gate_decision(sb, job_id="job-xyz", target=_target("tgt-9"))
-    # The job lookup is keyed by (job_posting_id, model) and the target by id.
-    assert "eq:job_posting_id=job-xyz" in sb.calls
-    assert f"eq:model={prescan_gate.DEFAULT_MODEL}" in sb.calls
-    assert "eq:id=tgt-9" in sb.calls
-
 
 @pytest.mark.asyncio
 async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
@@ -236,7 +142,7 @@ async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
         def eq(self, *_a, **_k):
             return self
 
-        def execute(self):
+        async def execute(self):
             return MagicMock(data=[])
 
     sb = MagicMock()
@@ -249,3 +155,84 @@ async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
     assert len(seen_chunks) == 3  # 400 at chunk 150 → 150+150+100
     assert all(n <= pg._VECTOR_READ_CHUNK_SIZE for n in seen_chunks)
     assert sum(seen_chunks) == 400
+
+
+# ---------------------------------------------------------------------------
+# cosine_scores_batch — the surviving (ordering) read path. Load-bearing since
+# R2: it feeds the Phase-2 grade-queue priority unconditionally, so it gets
+# direct coverage now that the gate tests it used to hide behind are gone.
+
+
+def _vec_supabase(target_vec: object, job_rows: list[dict]) -> object:
+    from unittest.mock import MagicMock
+
+    sb = MagicMock()
+
+    class _Targets:
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return MagicMock(
+                data=[{"embedding": target_vec}] if target_vec is not None else []
+            )
+
+    class _Vectors:
+        def select(self, *_a, **_k):
+            return self
+
+        def in_(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return MagicMock(data=job_rows)
+
+    def _table(name: str):
+        return _Targets() if name == "targets" else _Vectors()
+
+    sb.table.side_effect = _table
+    return sb
+
+
+@pytest.mark.asyncio
+async def test_cosine_scores_batch_returns_similarity_per_job() -> None:
+    from app.services.embeddings.prescan_gate import cosine_scores_batch
+
+    sb = _vec_supabase(
+        [1.0, 0.0],
+        [
+            {"job_posting_id": "j-same", "embedding": [1.0, 0.0]},
+            {"job_posting_id": "j-orth", "embedding": [0.0, 1.0]},
+        ],
+    )
+    out = await cosine_scores_batch(sb, _target(), ["j-same", "j-orth"])
+
+    assert out["j-same"] == pytest.approx(1.0)
+    assert out["j-orth"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_cosine_scores_batch_fails_open_without_target_vector() -> None:
+    """No target embedding → {} — the runner's sort falls back to its
+    tie-breakers; ordering degradation must never drop candidates."""
+    from app.services.embeddings.prescan_gate import cosine_scores_batch
+
+    sb = _vec_supabase(None, [])
+    assert await cosine_scores_batch(sb, _target(), ["j-1"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_cosine_scores_batch_omits_dim_mismatch() -> None:
+    from app.services.embeddings.prescan_gate import cosine_scores_batch
+
+    sb = _vec_supabase([1.0, 0.0], [{"job_posting_id": "j-bad", "embedding": [1.0, 0.0, 0.0]}])
+    assert await cosine_scores_batch(sb, _target(), ["j-bad"]) == {}

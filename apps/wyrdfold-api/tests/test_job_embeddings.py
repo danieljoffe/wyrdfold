@@ -14,9 +14,11 @@ from typing import Any
 from app.constants import SYSTEM_USER_ID
 from app.services.embeddings.job_embeddings import (
     DEFAULT_MODEL,
+    EMBED_DIMENSIONS,
     JOB_EMBED_PURPOSE,
     content_hash,
     embed_text_for_job,
+    ensure_job_vectors,
     upsert_job_embedding,
 )
 from app.services.embeddings.mock import MockEmbeddingsClient
@@ -160,7 +162,7 @@ async def test_new_job_is_embedded_and_written() -> None:
     # One embed call, document side.
     assert len(client.calls) == 1
     assert client.calls[0]["input_type"] == "document"
-    # One vector row written, with the right key + hash + a 1024-d vector.
+    # One vector row written, with the right key + hash + an EMBED_DIMENSIONS-d vector.
     assert len(sb.job_embeddings.upserts) == 1
     row = sb.job_embeddings.upserts[0]
     assert row["job_posting_id"] == "job-1"
@@ -170,7 +172,7 @@ async def test_new_job_is_embedded_and_written() -> None:
     assert row["content_hash"] == content_hash(
         embed_text_for_job("Frontend Engineer", "<p>React, TypeScript</p>")
     )
-    assert len(row["embedding"]) == 1024
+    assert len(row["embedding"]) == EMBED_DIMENSIONS  # 512-d Matryoshka space
     # Cost row logged under the pre-scan purpose, instance key.
     assert len(sb.llm_costs.upserts) == 1
     cost_row = sb.llm_costs.upserts[0]
@@ -289,3 +291,110 @@ async def test_embed_failure_is_swallowed_and_returns_error() -> None:
 
     assert status == "error"  # no raise
     assert sb.job_embeddings.upserts == []  # nothing written
+
+
+# ---------------------------------------------------------------------------
+# ensure_job_vectors (lazy grade-time materialization — Disk IO slim-down)
+# ---------------------------------------------------------------------------
+
+
+class _VectorStoreQuery:
+    def __init__(self, store: _VectorStoreSupabase, table: str) -> None:
+        self._store = store
+        self._table = table
+        self._write: Any = None
+
+    def select(self, *_a: Any, **_k: Any) -> _VectorStoreQuery:
+        return self
+
+    def eq(self, *_a: Any, **_k: Any) -> _VectorStoreQuery:
+        return self
+
+    def in_(self, *_a: Any, **_k: Any) -> _VectorStoreQuery:
+        return self
+
+    def limit(self, *_a: Any, **_k: Any) -> _VectorStoreQuery:
+        return self
+
+    def upsert(self, payload: Any, **_k: Any) -> _VectorStoreQuery:
+        self._write = payload
+        return self
+
+    def insert(self, payload: Any, **_k: Any) -> _VectorStoreQuery:
+        self._write = payload
+        return self
+
+    def execute(self) -> _FakeResp:
+        if self._write is not None:
+            rows = self._write if isinstance(self._write, list) else [self._write]
+            if self._table == "job_embeddings":
+                self._store.vectors.extend(dict(r) for r in rows)
+            returned = [
+                {**dict(r), "id": "row-0", "created_at": "2026-06-24T00:00:00+00:00"}
+                for r in rows
+            ]
+            return _FakeResp(returned)
+        if self._table == "job_embeddings":
+            return _FakeResp(list(self._store.vectors))
+        return _FakeResp([])
+
+
+class _VectorStoreSupabase:
+    """A fake whose SELECTs see earlier upserts — the re-fetch after the lazy
+    embed must find exactly what ``embed_jobs_batch`` just wrote."""
+
+    def __init__(self) -> None:
+        self.vectors: list[dict[str, Any]] = []
+
+    def table(self, name: str) -> _VectorStoreQuery:
+        return _VectorStoreQuery(self, name)
+
+
+async def test_ensure_returns_existing_vector_without_embedding() -> None:
+    sb = _VectorStoreSupabase()
+    sb.vectors.append(
+        {"job_posting_id": "j-hit", "model": DEFAULT_MODEL, "embedding": "[0.5, 0.25]"}
+    )
+    client = MockEmbeddingsClient()
+
+    out = await ensure_job_vectors(
+        sb,  # type: ignore[arg-type]
+        client,
+        [{"id": "j-hit", "title": "T", "description_html": "<p>b</p>"}],
+    )
+
+    assert out == {"j-hit": [0.5, 0.25]}
+    assert client.calls == []  # cache hit — no embed spend
+
+
+async def test_ensure_materializes_missing_vectors_on_demand() -> None:
+    sb = _VectorStoreSupabase()
+    client = MockEmbeddingsClient()
+
+    out = await ensure_job_vectors(
+        sb,  # type: ignore[arg-type]
+        client,
+        [{"id": "j-miss", "title": "Engineer", "description_html": "<p>React</p>"}],
+    )
+
+    assert set(out) == {"j-miss"}
+    assert len(out["j-miss"]) == EMBED_DIMENSIONS
+    # The lazy embed is the batched path at the pinned Matryoshka size.
+    assert len(client.calls) == 1
+    assert client.calls[0]["output_dimension"] == EMBED_DIMENSIONS
+    # The vector landed in the store (subsequent ensures are cache hits).
+    assert any(v["job_posting_id"] == "j-miss" for v in sb.vectors)
+
+
+async def test_ensure_is_fail_soft_when_embedding_errors() -> None:
+    class _Boom:
+        async def embed(self, **_k: Any) -> Any:
+            raise RuntimeError("provider down")
+
+    sb = _VectorStoreSupabase()
+    out = await ensure_job_vectors(
+        sb,  # type: ignore[arg-type]
+        _Boom(),  # type: ignore[arg-type]
+        [{"id": "j-1", "title": "T", "description_html": "<p>b</p>"}],
+    )
+    assert out == {}  # absent → callers fail open; never raises

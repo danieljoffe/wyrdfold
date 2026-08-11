@@ -1,16 +1,17 @@
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
-from supabase import Client
+from supabase import AsyncClient
 
 from app.cache import job_list_cache, jobs_cache_prefix
 from app.dependencies import (
+    get_async_user_supabase,
     get_current_user_id,
-    get_user_supabase,
     verify_supabase_jwt,
 )
 from app.models.schemas import StatusUpdate
-from app.services.tailor import persistence
+from app.services.db_read import fetch_one
 
 # `verify_supabase_jwt` (not `_or_jwt`): status mutations are user actions,
 # never invoked by cron. Keeping the api-key fallback would let a leaked
@@ -22,7 +23,9 @@ router = APIRouter(
 )
 
 
-def _assert_user_owns_posting(supabase: Client, posting_id: str, user_id: str) -> dict[str, Any]:
+async def _assert_user_owns_posting(
+    supabase: AsyncClient, posting_id: str, user_id: str
+) -> dict[str, Any]:
     """Return ``{status, target_id}`` for the posting only if the caller is
     linked (via ``user_targets``) to at least one target that has scored
     this posting. 404 on either missing or unowned — don't leak existence
@@ -37,15 +40,18 @@ def _assert_user_owns_posting(supabase: Client, posting_id: str, user_id: str) -
     # 1. Confirm the posting exists. ``jobs.status`` was dropped in #75 C4
     # (per-user status now lives in ``user_jobs``); select ``id`` purely as
     # an existence probe.
-    posting_resp = supabase.table("jobs").select("id").eq("id", posting_id).single().execute()
-    if not posting_resp.data:
+    #
+    # ``fetch_one``, not ``.single()``: the latter RAISES on zero rows, so the
+    # 404 below was unreachable and an unknown posting id 500'd (see
+    # app/services/db_read.py).
+    posting = await fetch_one(supabase.table("jobs").select("id").eq("id", posting_id))
+    if posting is None:
         raise HTTPException(status_code=404, detail="Posting not found")
-    posting = cast(dict[str, Any], posting_resp.data)
 
     # 2. Get the caller's active+inactive target ids (auth boundary, not a
     # filter — the user can act on jobs even from a deactivated target).
     user_targets_resp = (
-        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     )
     user_target_ids = {cast(dict[str, Any], r)["target_id"] for r in user_targets_resp.data or []}
     if not user_target_ids:
@@ -54,7 +60,7 @@ def _assert_user_owns_posting(supabase: Client, posting_id: str, user_id: str) -
     # 3. Confirm at least one of the user's targets has a score row for
     # this posting. If so, the user is allowed to mutate its status.
     score_resp = (
-        supabase.table("scores")
+        await supabase.table("scores")
         .select("target_id")
         .eq("job_posting_id", posting_id)
         .in_("target_id", list(user_target_ids))
@@ -71,23 +77,40 @@ def _assert_user_owns_posting(supabase: Client, posting_id: str, user_id: str) -
     return posting
 
 
-# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
-# this in its threadpool, keeping the blocking `.execute()` round-trips off
-# the event loop. See #107.
-@router.get("/{posting_id}/status-history")
-def get_status_history(
-    posting_id: str,
-    user_id: str = Depends(get_current_user_id),
-    # #88 Phase 2: RLS client — status_log has a per-user SELECT policy, and
-    # the ownership probe only reads shared-catalog tables (SELECT true).
-    supabase: Client = Depends(get_user_supabase),
-) -> dict[str, Any]:
-    _assert_user_owns_posting(supabase, posting_id, user_id)
-    # Scope to the caller's own transitions (#113): a posting is shared catalog,
-    # so two users targeting the same job both "own" it — without the user_id
-    # filter each would see the other's pipeline actions in the history.
+async def _upsert_user_job(
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str, status: str
+) -> None:
+    """Async inline of ``persistence.upsert_user_job`` — the per-user pipeline
+    status write (``user_jobs``). ``persistence.upsert_user_job`` stays sync for
+    the not-yet-converted routers (``jobs`` legacy path / ``targets.from_input``),
+    so this async handler inlines the same upsert rather than fork a twin (#57
+    slice 4 — mirrors ``jobs._upsert_user_job_async`` / ``persistence.
+    mark_job_resume_draft``)."""
+    await supabase.table("user_jobs").upsert(
+        {
+            "user_id": user_id,
+            "job_posting_id": job_posting_id,
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+        on_conflict="user_id,job_posting_id",
+    ).execute()
+
+
+async def _status_history_rows(
+    supabase: AsyncClient, posting_id: str, user_id: str
+) -> list[dict[str, Any]]:
+    """The caller's own status transitions for a posting (most recent first).
+
+    Scope to the caller's own transitions (#113): a posting is shared catalog,
+    so two users targeting the same job both "own" it — without the user_id
+    filter each would see the other's pipeline actions in the history.
+
+    A module-level async helper so the handler holds no inline ``.execute()`` on
+    the loop (#107 static guard bans a literal ``.execute()`` in an ``async def``
+    handler body — it can't tell the async client apart statically)."""
     result = (
-        supabase.table("status_log")
+        await supabase.table("status_log")
         .select("id, old_status, new_status, note, created_at")
         .eq("posting_id", posting_id)
         .eq("user_id", user_id)
@@ -95,52 +118,97 @@ def get_status_history(
         .limit(50)
         .execute()
     )
-    return {"entries": result.data or []}
+    return cast(list[dict[str, Any]], result.data or [])
 
 
-# Sync `def` (not `async def`): supabase-py is synchronous, so FastAPI runs
-# this in its threadpool, keeping the blocking `.execute()` round-trips off
-# the event loop. See #107.
-@router.post("/{posting_id}/status")
-def update_status(
-    posting_id: str,
-    body: StatusUpdate,
-    user_id: str = Depends(get_current_user_id),
-    # #88 Phase 2: RLS client — user_jobs has a full CRUD self-policy and
-    # status_log gained a self-INSERT policy (20260702100000), so RLS pins
-    # both writes to the caller underneath the app-layer user_id values.
-    supabase: Client = Depends(get_user_supabase),
-) -> dict[str, Any]:
-    posting = _assert_user_owns_posting(supabase, posting_id, user_id)
-    target_id = posting["target_id"]
+async def _prior_user_status(supabase: AsyncClient, user_id: str, posting_id: str) -> str:
+    """The caller's current per-user status for a posting, for the audit log.
 
-    # ``jobs.status`` was dropped in #75 C4 — the prior status for the audit
-    # log is the caller's own per-user state in ``user_jobs`` (absent = 'new').
-    old_status_resp = (
-        supabase.table("user_jobs")
+    ``jobs.status`` was dropped in #75 C4 — the prior status is the caller's own
+    per-user state in ``user_jobs`` (absent → ``'new'``). Module-level async
+    helper: keeps the ``.execute()`` out of the handler body (#107 guard)."""
+    resp = (
+        await supabase.table("user_jobs")
         .select("status")
         .eq("user_id", user_id)
         .eq("job_posting_id", posting_id)
         .limit(1)
         .execute()
     )
-    old_status_rows = cast(list[dict[str, Any]], old_status_resp.data or [])
-    old_status = cast(str, old_status_rows[0]["status"]) if old_status_rows else "new"
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return cast(str, rows[0]["status"]) if rows else "new"
 
-    supabase.table("status_log").insert(
+
+async def _insert_status_log(
+    supabase: AsyncClient,
+    *,
+    posting_id: str,
+    old_status: str,
+    new_status: str,
+    note: str | None,
+    user_id: str,
+) -> None:
+    """Append one ``status_log`` audit row for the caller's transition.
+
+    Module-level async helper: keeps the ``.execute()`` out of the handler body
+    (#107 guard)."""
+    await supabase.table("status_log").insert(
         {
             "posting_id": posting_id,
             "old_status": old_status,
-            "new_status": body.status,
-            "note": body.note,
+            "new_status": new_status,
+            "note": note,
             "user_id": user_id,
         }
     ).execute()
 
+
+# Handlers are `async def` (#57 slice 4): their DB round-trips await natively on
+# the pooled RLS user client instead of tying up a threadpool worker per call.
+# Each DB access delegates to a module-level async helper (above) so the handler
+# body carries no inline ``.execute()`` — the #107 static guard bans a literal
+# ``.execute()`` in an ``async def`` handler regardless of the (async) client.
+@router.get("/{posting_id}/status-history")
+async def get_status_history(
+    posting_id: str,
+    user_id: str = Depends(get_current_user_id),
+    # #88 Phase 2: RLS client — status_log has a per-user SELECT policy, and
+    # the ownership probe only reads shared-catalog tables (SELECT true).
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    await _assert_user_owns_posting(supabase, posting_id, user_id)
+    entries = await _status_history_rows(supabase, posting_id, user_id)
+    return {"entries": entries}
+
+
+@router.post("/{posting_id}/status")
+async def update_status(
+    posting_id: str,
+    body: StatusUpdate,
+    user_id: str = Depends(get_current_user_id),
+    # #88 Phase 2: RLS client — user_jobs has a full CRUD self-policy and
+    # status_log gained a self-INSERT policy (20260702100000), so RLS pins
+    # both writes to the caller underneath the app-layer user_id values.
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    posting = await _assert_user_owns_posting(supabase, posting_id, user_id)
+    target_id = posting["target_id"]
+
+    old_status = await _prior_user_status(supabase, user_id, posting_id)
+
+    await _insert_status_log(
+        supabase,
+        posting_id=posting_id,
+        old_status=old_status,
+        new_status=body.status,
+        note=body.note,
+        user_id=user_id,
+    )
+
     # Per-user pipeline state lives in user_jobs (#75 C3): this writer no
     # longer touches the global jobs.status. The list/counts read per-user
     # status from user_jobs and gate global liveness on jobs.archived_at.
-    persistence.upsert_user_job(
+    await _upsert_user_job(
         supabase, user_id=user_id, job_posting_id=posting_id, status=body.status
     )
 

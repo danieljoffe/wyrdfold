@@ -228,7 +228,7 @@ def _health_supabase(
       none held so the leaked-lock check is a clean no-op in older tests
     """
     jobs_leaf = MagicMock()
-    jobs_rows = [{"created_at": newest_created_at}] if newest_created_at else []
+    jobs_rows = [{"cataloged_at": newest_created_at}] if newest_created_at else []
     jobs_leaf.execute.return_value = _Resp(data=jobs_rows)
     jobs_table = MagicMock()
     jobs_table.select.return_value.order.return_value.limit.return_value = jobs_leaf
@@ -562,7 +562,6 @@ async def test_health_reads_ride_async_client_when_flag_on(monkeypatch) -> None:
     _arm_health(monkeypatch, discovery_enabled=True)
     _patch_sentry(monkeypatch)
 
-    monkeypatch.setattr(db_write.settings, "poller_async_db", True)
     async_client = _AsyncHealthRecorder()
     monkeypatch.setattr(db_write, "get_async_supabase", lambda: async_client)
     sync_sb = MagicMock()

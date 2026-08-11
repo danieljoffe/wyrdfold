@@ -10,11 +10,10 @@ the target already has a similar-enough resume that can be cloned.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.constants import resolve_owner
 from app.models.batch import BatchItem, BatchJob
@@ -37,8 +36,8 @@ TABLE = "batch_runs"
 # ---------------------------------------------------------------------------
 
 
-def create_batch(
-    supabase: Client,
+async def create_batch(
+    supabase: AsyncClient,
     *,
     user_id: str | None,
     job_posting_ids: list[str],
@@ -53,12 +52,14 @@ def create_batch(
         "failed": 0,
         "items": items,
     }
-    resp = supabase.table(TABLE).insert(row).execute()
+    resp = await supabase.table(TABLE).insert(row).execute()
     data = cast(dict[str, Any], resp.data[0])
     return BatchJob.model_validate(data)
 
 
-def get_batch(supabase: Client, batch_id: str, *, user_id: str | None) -> BatchJob | None:
+async def get_batch(
+    supabase: AsyncClient, batch_id: str, *, user_id: str | None
+) -> BatchJob | None:
     """Fetch a batch by ID, scoped to the caller.
 
     Filters by both ``id`` AND ``user_id`` so a JWT caller can't poll
@@ -74,14 +75,14 @@ def get_batch(supabase: Client, batch_id: str, *, user_id: str | None) -> BatchJ
     """
     query = supabase.table(TABLE).select("*").eq("id", batch_id)
     query = query.eq("user_id", resolve_owner(user_id))
-    resp = query.execute()
+    resp = await query.execute()
     if not resp.data:
         return None
     return BatchJob.model_validate(resp.data[0])
 
 
-def _update_batch(
-    supabase: Client,
+async def _update_batch(
+    supabase: AsyncClient,
     batch_id: str,
     *,
     status: str | None = None,
@@ -99,7 +100,7 @@ def _update_batch(
         updates["failed"] = failed
     if items is not None:
         updates["items"] = items
-    supabase.table(TABLE).update(updates).eq("id", batch_id).execute()
+    await supabase.table(TABLE).update(updates).eq("id", batch_id).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +109,7 @@ def _update_batch(
 
 
 async def process_batch(
-    supabase: Client,
+    supabase: AsyncClient,
     llm: LLMClient,
     *,
     batch_id: str,
@@ -131,7 +132,7 @@ async def process_batch(
     checks for a reusable resume in the same target before running the
     full tailor pipeline (#504).
     """
-    batch = get_batch(supabase, batch_id, user_id=user_id)
+    batch = await get_batch(supabase, batch_id, user_id=user_id)
     if batch is None:
         return
 
@@ -142,17 +143,15 @@ async def process_batch(
     # Load target scoring keywords for reuse checks (#504)
     scoring_keywords: set[str] | None = None
     if target_id and not force_fresh:
-        target_resp = await asyncio.to_thread(
-            lambda: (
-                supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
-            )
+        target_resp = await (
+            supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
         )
         if target_resp.data:
             target_row = cast(dict[str, Any], target_resp.data[0])
             profile = ScoringProfile.model_validate(target_row["scoring_profile"])
             scoring_keywords = extract_profile_keywords(profile)
 
-    _update_batch(supabase, batch_id, status="processing")
+    await _update_batch(supabase, batch_id, status="processing")
 
     for i, posting in enumerate(jobs):
         job_posting_id = posting["id"]
@@ -161,7 +160,7 @@ async def process_batch(
         try:
             # Reuse check (#504)
             if scoring_keywords and target_id and not force_fresh:
-                reusable = find_reusable_resume(
+                reusable = await find_reusable_resume(
                     supabase,
                     target_id=target_id,
                     job_description=description_html,
@@ -169,7 +168,7 @@ async def process_batch(
                     user_id=user_id,
                 )
                 if reusable is not None:
-                    cloned = clone_resume_for_job(
+                    cloned = await clone_resume_for_job(
                         supabase,
                         source=reusable,
                         job_posting_id=job_posting_id,
@@ -181,9 +180,11 @@ async def process_batch(
                     items[i]["reused_from"] = reusable.id
                     completed += 1
 
-                    persistence.mark_job_resume_draft(supabase, job_posting_id, user_id=user_id)
+                    await persistence.mark_job_resume_draft(
+                        supabase, job_posting_id, user_id=user_id
+                    )
 
-                    _update_batch(
+                    await _update_batch(
                         supabase,
                         batch_id,
                         completed=completed,
@@ -206,25 +207,27 @@ async def process_batch(
                 job_posting_id=job_posting_id,
             )
 
-            if isinstance(result, PipelineSuccess):
-                items[i]["status"] = "completed"
-                items[i]["resume_record_id"] = result.record.id
-                completed += 1
+            # Both branches now yield a persisted record (#656): a resume that
+            # fails ATS lint is kept as a flagged draft rather than discarded,
+            # so the item completes either way and carries the violations for
+            # the surface to badge. Marking it "failed" would strand a
+            # document the user already paid for.
+            items[i]["status"] = "completed"
+            items[i]["resume_record_id"] = result.record.id
+            if not isinstance(result, PipelineSuccess):
+                items[i]["lint_violations"] = [v.message for v in result.lint.violations]
+            completed += 1
 
-                persistence.mark_job_resume_draft(supabase, job_posting_id, user_id=user_id)
-            else:
-                # Lint failure
-                violations = [v.message for v in result.lint.violations]
-                items[i]["status"] = "failed"
-                items[i]["error"] = f"lint: {'; '.join(violations)}"
-                failed += 1
+            await persistence.mark_job_resume_draft(
+                supabase, job_posting_id, user_id=user_id
+            )
 
         except Exception as exc:
             items[i]["status"] = "failed"
             items[i]["error"] = str(exc)[:500]
             failed += 1
 
-        _update_batch(
+        await _update_batch(
             supabase,
             batch_id,
             completed=completed,
@@ -233,4 +236,4 @@ async def process_batch(
         )
 
     final_status = "completed" if completed > 0 else "failed"
-    _update_batch(supabase, batch_id, status=final_status)
+    await _update_batch(supabase, batch_id, status=final_status)

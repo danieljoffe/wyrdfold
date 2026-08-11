@@ -1,6 +1,6 @@
 """RLS gate for Phase 1 slice-3 — the derive / optimized-POST write path.
 
-Those endpoints (now on `get_user_supabase`) write the optimized doc THEN its
+Those endpoints (now on `get_async_user_supabase`) write the optimized doc THEN its
 embedding chunks through the JWT-bound user client. `experience_chunks` has a
 *parent-scoped* policy — a chunk is writable only if its `optimized_doc_id`
 belongs to a doc the caller owns. Prove both legs succeed for own data and that
@@ -9,11 +9,11 @@ a chunk cannot be attached to another user's doc.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import pytest
 from postgrest.exceptions import APIError
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.experience import OptimizedPayload, Skill
 
@@ -91,18 +91,23 @@ def _one_chunk_payload() -> OptimizedPayload:
 async def test_upsert_writes_chunks_via_rls_and_cost_via_service_role(
     two_seeded_users: tuple[str, str],
     user_client_factory: Callable[[str], Client],
-    service_client: Client,
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
+    async_service_client: AsyncClient,
 ) -> None:
     """The Phase-1 dual-client fix, end-to-end on the real path: chunks write
     through the RLS user client (parent-scoped) while the cost row goes through
     the service-role client. Both must land. Regression for the #159 bug, where
     the cost write went through the RLS client and would 500 in prod.
+
+    Since #57 slice 3 the upsert runs on the async user client + async service
+    client; the doc seed + assert read stay on the sync client.
     """
     from app.services.embeddings.mock import MockEmbeddingsClient
     from app.services.experience import chunks, optimized
 
     uid_a, _uid_b = two_seeded_users
     client_a = user_client_factory(uid_a)
+    async_client_a = await async_user_client_factory(uid_a)
     doc = optimized.create_version(
         client_a,
         user_id=uid_a,
@@ -112,7 +117,7 @@ async def test_upsert_writes_chunks_via_rls_and_cost_via_service_role(
     )
 
     written = await chunks.upsert_for_optimized(
-        client_a, MockEmbeddingsClient(), doc, user_id=uid_a, cost_supabase=service_client
+        async_client_a, MockEmbeddingsClient(), doc, user_id=uid_a, cost_supabase=async_service_client
     )
     assert len(written) >= 1  # chunks written via the RLS client
 
@@ -130,6 +135,7 @@ async def test_upsert_writes_chunks_via_rls_and_cost_via_service_role(
 async def test_upsert_cost_through_user_client_is_denied(
     two_seeded_users: tuple[str, str],
     user_client_factory: Callable[[str], Client],
+    async_user_client_factory: Callable[[str], Awaitable[AsyncClient]],
 ) -> None:
     """Regression: routing the cost write through the RLS (user) client — what
     #159 did — is denied by llm_costs RLS. This is why cost_supabase must be a
@@ -140,6 +146,7 @@ async def test_upsert_cost_through_user_client_is_denied(
 
     uid_a, _uid_b = two_seeded_users
     client_a = user_client_factory(uid_a)
+    async_client_a = await async_user_client_factory(uid_a)
     doc = optimized.create_version(
         client_a,
         user_id=uid_a,
@@ -150,5 +157,5 @@ async def test_upsert_cost_through_user_client_is_denied(
 
     with pytest.raises(APIError):
         await chunks.upsert_for_optimized(
-            client_a, MockEmbeddingsClient(), doc, user_id=uid_a, cost_supabase=client_a
+            async_client_a, MockEmbeddingsClient(), doc, user_id=uid_a, cost_supabase=async_client_a
         )

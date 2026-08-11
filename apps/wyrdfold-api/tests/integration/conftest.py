@@ -18,12 +18,13 @@ import contextlib
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 import httpx
 import jwt
 import pytest
-from supabase import Client, create_client
+from supabase import AsyncClient, Client, acreate_client, create_client
+from supabase.lib.client_options import AsyncClientOptions
 
 from app import supabase_pool
 
@@ -84,6 +85,23 @@ def service_client(_require_stack: None) -> Client:
 
 
 @pytest.fixture
+async def async_service_client(_require_stack: None) -> AsyncIterator[AsyncClient]:
+    """Async service-role client (#57 slice 3) — the async mirror of
+    ``service_client`` for the converted write paths (e.g. the cost-ledger leg
+    of ``chunks.upsert_for_optimized``).
+
+    Yielded so the per-test httpx pool is closed afterwards — otherwise a fresh
+    ``acreate_client`` per test leaks connections/FDs across the run (Copilot,
+    #575). Sub-clients share the passed httpx, so one ``aclose`` covers all."""
+    http = httpx.AsyncClient()
+    client = await acreate_client(LOCAL_URL, SERVICE_KEY, AsyncClientOptions(httpx_client=http))
+    try:
+        yield client
+    finally:
+        await http.aclose()
+
+
+@pytest.fixture
 def anon_client(_require_stack: None) -> Client:
     """Anonymous client (anon key, `anon` role) — the public, unauthenticated
     surface. RLS + grants must deny it everything not explicitly public."""
@@ -91,20 +109,45 @@ def anon_client(_require_stack: None) -> Client:
 
 
 @pytest.fixture
-def user_client_factory(
+def user_client_factory(_require_stack: None) -> Callable[[str], Client]:
+    """Build a per-request, JWT-bound SYNC user client against the local stack —
+    the RLS-testing counterpart to the app's async per-request client.
+
+    The app retired its sync per-request client in #57 PR-F, but Postgres RLS
+    keys off the JWT bearer, not the transport, so a synchronous client exercises
+    the exact same policies with far simpler test code than the async client
+    would. Mirrors the retired ``get_user_client`` construction: anon key as the
+    base (a missing token degrades to anon, never service-role) + the caller's
+    JWT as the bearer on this client's own postgrest + storage headers, so no
+    request can bleed into another user's rows.
+    """
+
+    def _make(user_id: str) -> Client:
+        token = _mint_user_jwt(user_id)
+        client = create_client(LOCAL_URL, ANON_KEY)
+        client.options.headers["Authorization"] = f"Bearer {token}"
+        client.postgrest.auth(token)
+        return client
+
+    return _make
+
+
+@pytest.fixture
+def async_user_client_factory(
     _require_stack: None, monkeypatch: pytest.MonkeyPatch
-) -> Callable[[str], Client]:
-    """Point the app's per-request user-client factory at the local stack,
-    then hand back a builder that mints a JWT for `user_id` and returns the
-    exact client the API uses in production (`supabase_pool.get_user_client`).
+) -> Callable[[str], Awaitable[AsyncClient]]:
+    """Async mirror of ``user_client_factory`` (#57 slice 3). Points the app's
+    async per-request user-client factory at the local stack, then hands back a
+    builder that mints a JWT for ``user_id`` and awaits the exact async client
+    the API uses in production (``supabase_pool.get_async_user_client``).
     """
     monkeypatch.setattr(supabase_pool.settings, "supabase_url", LOCAL_URL)
     monkeypatch.setattr(supabase_pool.settings, "supabase_anon_key", ANON_KEY)
-    # Force a fresh real httpx pool (other tests monkeypatch this to a mock).
-    monkeypatch.setattr(supabase_pool, "_user_httpx", None)
+    # Force a fresh real async pool (other tests monkeypatch this to a mock).
+    monkeypatch.setattr(supabase_pool, "_async_user_httpx", None)
 
-    def _make(user_id: str) -> Client:
-        return supabase_pool.get_user_client(_mint_user_jwt(user_id))
+    async def _make(user_id: str) -> AsyncClient:
+        return await supabase_pool.get_async_user_client(_mint_user_jwt(user_id))
 
     return _make
 

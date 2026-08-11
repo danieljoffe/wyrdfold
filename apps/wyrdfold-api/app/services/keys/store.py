@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast, get_args
 
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.keys import Provider, UserApiKeyMeta
 from app.services.keys import crypto
@@ -31,8 +31,8 @@ def _validate_provider(provider: str) -> None:
         )
 
 
-def set_key(
-    supabase: Client,
+async def set_key(
+    supabase: AsyncClient,
     *,
     user_id: str,
     provider: Provider,
@@ -67,7 +67,7 @@ def set_key(
     if rotating:
         row["rotated_at"] = now
 
-    resp = supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
+    resp = await supabase.table(TABLE).upsert(row, on_conflict="user_id,provider").execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         # PostgREST returns the upserted representation by default; an empty
@@ -76,6 +76,12 @@ def set_key(
     return UserApiKeyMeta.model_validate(rows[0])
 
 
+# ``get_key`` / ``has_usable_key`` stay SYNC on ``Client``: their callers are the
+# synchronous LLM-client factory (``services.llm.get_client``) and the
+# synchronous budget resolver (``services.llm.budget``). ``get_key_async`` (below)
+# is the async twin for the poller's async BYOK payer resolver (#57 PR-G2e-1); the
+# write-path helpers the keys router owns (``set_key`` / ``delete_key`` /
+# ``list_key_meta``) are async on ``AsyncClient``.
 def get_key(
     supabase: Client,
     *,
@@ -89,6 +95,34 @@ def get_key(
     misconfigured master key is loud."""
     _validate_provider(provider)
     resp = (
+        supabase.table(TABLE)
+        .select("ciphertext")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return None
+    return crypto.decrypt(rows[0]["ciphertext"])
+
+
+async def get_key_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    provider: Provider,
+) -> str | None:
+    """Async mirror of :func:`get_key` (#57 PR-G2e-1) for ``async def`` callers on
+    the pooled async service client (the poller's async BYOK payer resolver).
+
+    Same decrypt-or-None contract and same ``BYOKDecryptError`` surfacing (rotated
+    / wrong master key) as the sync version, awaited on the loop instead of run in
+    a threadpool. The sync :func:`get_key` stays for the interactive LLM-client
+    factory."""
+    _validate_provider(provider)
+    resp = await (
         supabase.table(TABLE)
         .select("ciphertext")
         .eq("user_id", user_id)
@@ -120,18 +154,50 @@ def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> boo
         return False
 
 
-def list_key_meta(supabase: Client, *, user_id: str) -> list[UserApiKeyMeta]:
+async def has_usable_key_async(
+    supabase: AsyncClient, *, user_id: str, provider: Provider
+) -> bool:
+    """Async mirror of :func:`has_usable_key` (#57 PR-G2c) for ``async def``
+    callers on the pooled async service client (billing + the async quota
+    resolver).
+
+    Same "who pays" semantics as the sync version: an unconfigured master key
+    or a stored row that can't be decrypted (rotated/wrong master key) means the
+    HOST key would pay, so the user must stay metered → False. Mirrors
+    ``_user_byok_key``'s fallbacks exactly (Copilot on #205). The read of the
+    ciphertext is awaited inline (``get_key`` stays sync for its other callers)."""
+    if not crypto.is_configured():
+        return False
+    _validate_provider(provider)
+    resp = await (
+        supabase.table(TABLE)
+        .select("ciphertext")
+        .eq("user_id", user_id)
+        .eq("provider", provider)
+        .limit(1)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    if not rows:
+        return False
+    try:
+        return crypto.decrypt(rows[0]["ciphertext"]) is not None
+    except crypto.BYOKDecryptError:
+        return False
+
+
+async def list_key_meta(supabase: AsyncClient, *, user_id: str) -> list[UserApiKeyMeta]:
     """Non-secret metadata for every provider the user has a key for —
     the settings UI's read path. Never touches ciphertext."""
-    resp = (
+    resp = await (
         supabase.table(TABLE).select(_META_COLS).eq("user_id", user_id).order("provider").execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [UserApiKeyMeta.model_validate(r) for r in rows]
 
 
-def delete_key(
-    supabase: Client,
+async def delete_key(
+    supabase: AsyncClient,
     *,
     user_id: str,
     provider: Provider,
@@ -139,5 +205,7 @@ def delete_key(
     """Delete a user's key for ``provider``. Returns True if a row was
     removed, False if there was nothing to delete."""
     _validate_provider(provider)
-    resp = supabase.table(TABLE).delete().eq("user_id", user_id).eq("provider", provider).execute()
+    resp = await (
+        supabase.table(TABLE).delete().eq("user_id", user_id).eq("provider", provider).execute()
+    )
     return bool(resp.data)

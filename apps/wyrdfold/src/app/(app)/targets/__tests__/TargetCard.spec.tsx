@@ -20,7 +20,7 @@ function makeTarget(
     normalized_label: null,
     activation_status: 'ready',
     profile_version: 1,
-    is_active: true,
+    app_active: true,
     seniority_hint: null,
     // 1 category, 2 keywords — the API derives these from scoring_profile.
     keyword_count: 2,
@@ -125,10 +125,10 @@ describe('TargetCard', () => {
     expect(mockPush).toHaveBeenCalledWith('/targets/t-1');
   });
 
-  it('shows an "Active" status when target.is_active is true', () => {
+  it('shows an "Active" status when isActive is true', () => {
     render(
       <TargetCard
-        target={makeTarget({ is_active: true })}
+        target={makeTarget()}
         fitScore={null}
         fitScoreReasoning={null}
         isActive
@@ -144,7 +144,7 @@ describe('TargetCard', () => {
   it('shows an "Inactive" status when isActive is false', () => {
     render(
       <TargetCard
-        target={makeTarget({ is_active: false })}
+        target={makeTarget()}
         fitScore={null}
         fitScoreReasoning={null}
         isActive={false}
@@ -181,7 +181,7 @@ describe('TargetCard', () => {
     const onActivate = jest.fn();
     const { container } = render(
       <TargetCard
-        target={makeTarget({ activation_status: 'deriving', is_active: false })}
+        target={makeTarget({ activation_status: 'deriving' })}
         fitScore={null}
         fitScoreReasoning={null}
         isActive={false}
@@ -206,7 +206,7 @@ describe('TargetCard', () => {
     const onViewJobs = jest.fn();
     const { container } = render(
       <TargetCard
-        target={makeTarget({ is_active: false })}
+        target={makeTarget()}
         fitScore={null}
         fitScoreReasoning={null}
         isActive={false}

@@ -28,7 +28,7 @@ from app.services.llm.mock import MockLLMClient, dev_default_responses
 from app.services.llm.openrouter_client import OpenRouterLLMClient
 
 if TYPE_CHECKING:
-    from supabase import Client
+    from supabase import AsyncClient, Client
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ __all__ = [
     "MockLLMClient",
     "OpenRouterLLMClient",
     "get_client",
+    "get_client_async",
     "get_default_client",
     "reset_llm_client_cache",
 ]
@@ -192,6 +193,79 @@ def _user_byok_key(supabase: "Client", user_id: str) -> str | None:
         return None
     try:
         return keys.get_key(supabase, user_id=user_id, provider="openrouter")
+    except keys.BYOKDecryptError:
+        logger.warning("byok_decrypt_failed user=%s provider=openrouter", user_id)
+        return None
+
+
+async def get_client_async(supabase: "AsyncClient | None", user_id: str | None) -> LLMClient:
+    """Async mirror of :func:`get_client` (#57 PR-G2e-1) for the poller's async
+    per-payer BYOK resolver.
+
+    Identical resolution order and sponsored-payer semantics to the sync version
+    — mock short-circuit, then stored-user-key → require-error → instance-key
+    ladder — with the BYOK key read and the plan lookup awaited on the pooled
+    async service client instead of issued synchronously. The sync
+    :func:`get_client` stays for the interactive request path (it drives the sync
+    per-request client)."""
+    from app.config import settings
+
+    if settings.llm_provider == "mock":
+        return MockLLMClient(scripted=dev_default_responses())
+
+    if user_id and supabase is not None:
+        user_key = await _user_byok_key_async(supabase, user_id)
+        if user_key:
+            return _cached_openrouter(
+                user_key,
+                settings.openrouter_timeout_seconds,
+                settings.openrouter_max_retries,
+            )
+        if settings.byok_require_user_keys or await _plan_requires_byok_async(supabase, user_id):
+            raise MissingUserKeyError("openrouter")
+
+    return get_default_client()
+
+
+async def _plan_requires_byok_async(supabase: "AsyncClient", user_id: str) -> bool:
+    """Async mirror of :func:`_plan_requires_byok` (#57 PR-G2e-1). Same saas-only
+    'free tier ⇒ own key required' rule and safe-for-cost default (a missing or
+    unreadable profile resolves to 'free'), awaited on the async client."""
+    from typing import Any, cast
+
+    from app.config import settings
+
+    if settings.deployment_mode != "saas":
+        return False
+
+    from app.services.entitlements import entitlements_for
+
+    plan: str | None = None
+    try:
+        resp = (
+            await supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
+        )
+        rows = cast("list[dict[str, Any]]", resp.data or [])
+        plan = cast("str | None", rows[0].get("plan")) if rows else None
+    except Exception:
+        logger.warning(
+            "plan lookup failed for user=%s — treating as free (BYOK required)",
+            user_id,
+            exc_info=True,
+        )
+    return entitlements_for(plan).llm_key_source == "byok"
+
+
+async def _user_byok_key_async(supabase: "AsyncClient", user_id: str) -> str | None:
+    """Async mirror of :func:`_user_byok_key` (#57 PR-G2e-1). Same None-not-raise
+    fallback semantics (unconfigured master key / undecryptable ciphertext degrade
+    to the require/fallback ladder), awaited on the async client."""
+    from app.services import keys
+
+    if not keys.is_configured():
+        return None
+    try:
+        return await keys.get_key_async(supabase, user_id=user_id, provider="openrouter")
     except keys.BYOKDecryptError:
         logger.warning("byok_decrypt_failed user=%s provider=openrouter", user_id)
         return None

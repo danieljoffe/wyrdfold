@@ -79,7 +79,7 @@ class ScoresQuery:
             self._exempt_pending = True
         return self
 
-    def execute(self) -> FakeResponse:
+    async def execute(self) -> FakeResponse:
         rows = self._rows
         if self._floor is not None:
             if self._exempt_pending:
@@ -125,7 +125,7 @@ class JobsQuery:
     def or_(self, *_a: Any, **_kw: Any) -> JobsQuery:
         return self
 
-    def execute(self) -> FakeResponse:
+    async def execute(self) -> FakeResponse:
         return FakeResponse([self._postings[i] for i in self._ids if i in self._postings])
 
 

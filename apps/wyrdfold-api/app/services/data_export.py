@@ -37,7 +37,7 @@ import zipfile
 from datetime import UTC, datetime
 from typing import IO, Any, cast
 
-from supabase import Client
+from supabase import AsyncClient
 
 from app.services.ingest import storage as resume_storage
 from app.services.tailor import persistence as tailored_storage
@@ -64,6 +64,7 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "user_jobs",
     "status_log",
     "user_targets",
+    "source_registrations",  # deleted on erasure (the user's from-url board registrations)
     "user_api_keys",
     "contribution_votes",  # deleted on erasure
     "reference_jds",  # anonymized on erasure (the user's shared contributions)
@@ -104,15 +105,15 @@ _STORAGE_BUCKETS: tuple[str, ...] = (
 )
 
 
-def _select_all(
-    supabase: Client, table: str, column: str, value: str, columns: str = "*"
+async def _select_all(
+    supabase: AsyncClient, table: str, column: str, value: str, columns: str = "*"
 ) -> list[dict[str, Any]]:
-    resp = supabase.table(table).select(columns).eq(column, value).execute()
+    resp = await supabase.table(table).select(columns).eq(column, value).execute()
     return cast(list[dict[str, Any]], resp.data or [])
 
 
-def collect_user_data(
-    supabase: Client, *, user_id: str, service_supabase: Client
+async def collect_user_data(
+    supabase: AsyncClient, *, user_id: str, service_supabase: AsyncClient
 ) -> dict[str, list[dict[str, Any]]]:
     """Gather every per-user DB row for ``user_id`` into a JSON-able map.
 
@@ -126,16 +127,16 @@ def collect_user_data(
     for table in _EXPORT_TABLES:
         projection = _API_KEYS_PROJECTION if table == "user_api_keys" else "*"
         client = service_supabase if table in _SERVICE_ROLE_TABLES else supabase
-        data[table] = _select_all(client, table, "user_id", user_id, projection)
+        data[table] = await _select_all(client, table, "user_id", user_id, projection)
 
-    profile_rows = _select_all(supabase, "user_profiles", "user_id", user_id)
+    profile_rows = await _select_all(supabase, "user_profiles", "user_id", user_id)
     data["user_profiles"] = profile_rows
 
     # notifications_sent is keyed by user_profiles.id, not the auth uid —
     # and has no SELECT policy, so it reads via the service client.
     profile_id = str(profile_rows[0]["id"]) if profile_rows else None
     if profile_id is not None:
-        data["notifications_sent"] = _select_all(
+        data["notifications_sent"] = await _select_all(
             service_supabase, "notifications_sent", "user_profile_id", profile_id
         )
 
@@ -143,18 +144,18 @@ def collect_user_data(
     # collected above) so the export carries the Phase-2 grader fields
     # derived from this user's resume — in lockstep with the erasure scrub.
     target_ids = [t["target_id"] for t in data["user_targets"] if t.get("target_id")]
-    data["scores"] = _scores_for_targets(supabase, target_ids)
+    data["scores"] = await _scores_for_targets(supabase, target_ids)
     return data
 
 
-def _scores_for_targets(supabase: Client, target_ids: list[str]) -> list[dict[str, Any]]:
+async def _scores_for_targets(supabase: AsyncClient, target_ids: list[str]) -> list[dict[str, Any]]:
     """Shared ``scores`` rows for the user's targets, projected to the
     Phase-2 grader fields (+ identifying keys). Empty when the user has no
     targets — never issues ``.in_([])``."""
     if not target_ids:
         return []
     resp = (
-        supabase.table("scores")
+        await supabase.table("scores")
         .select(_SCORE_EXPORT_COLUMNS)
         .in_("target_id", target_ids)
         .execute()
@@ -169,7 +170,7 @@ def _scores_for_targets(supabase: Client, target_ids: list[str]) -> list[dict[st
 _STORAGE_PAGE_SIZE = 100
 
 
-def _add_storage_files(zf: zipfile.ZipFile, supabase: Client, user_id: str) -> int:
+async def _add_storage_files(zf: zipfile.ZipFile, supabase: AsyncClient, user_id: str) -> int:
     """Add every object under ``{user_id}/`` in both buckets to the zip.
 
     Pages through the listing (``bucket.list`` returns at most
@@ -187,13 +188,14 @@ def _add_storage_files(zf: zipfile.ZipFile, supabase: Client, user_id: str) -> i
             offset = 0
             for _ in range(1000):  # safety bound: 1000 pages
                 listing = (
-                    bucket.list(user_id, {"limit": _STORAGE_PAGE_SIZE, "offset": offset}) or []
+                    await bucket.list(user_id, {"limit": _STORAGE_PAGE_SIZE, "offset": offset})
+                    or []
                 )
                 if not listing:
                     break
                 for obj in listing:
                     name = obj["name"]
-                    blob = bucket.download(f"{user_id}/{name}")
+                    blob = await bucket.download(f"{user_id}/{name}")
                     zf.writestr(f"files/{bucket_name}/{name}", blob)
                     count += 1
                 if len(listing) < _STORAGE_PAGE_SIZE:
@@ -227,22 +229,25 @@ def _readme(
     return "\n".join(lines)
 
 
-def write_export_zip(
-    supabase: Client, fileobj: IO[bytes], *, user_id: str, service_supabase: Client
+async def write_export_zip(
+    supabase: AsyncClient, fileobj: IO[bytes], *, user_id: str, service_supabase: AsyncClient
 ) -> None:
     """Write the personal-data export ZIP for ``user_id`` into ``fileobj``.
 
     Takes any writable binary file object so the router can hand in a
     ``SpooledTemporaryFile`` and stream the result instead of holding the
     whole archive in memory (#29 H-r2-4). Peak memory is the JSON row data
-    plus the largest single Storage blob — not the full ZIP.
+    plus the largest single Storage blob — not the full ZIP. Async on the
+    pooled client (#57 slice 3): the DB reads + Storage downloads await on the
+    event loop; the zip compression is modest and runs inline (exports are a
+    rare, per-user endpoint).
     """
     generated_at = datetime.now(UTC)
-    data = collect_user_data(supabase, user_id=user_id, service_supabase=service_supabase)
+    data = await collect_user_data(supabase, user_id=user_id, service_supabase=service_supabase)
 
     with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("data.json", json.dumps(data, indent=2, default=str))
-        file_count = _add_storage_files(zf, supabase, user_id)
+        file_count = await _add_storage_files(zf, supabase, user_id)
         zf.writestr("README.txt", _readme(user_id, generated_at, data, file_count))
 
     logger.info(
@@ -253,8 +258,10 @@ def write_export_zip(
     )
 
 
-def build_export_zip(supabase: Client, *, user_id: str, service_supabase: Client) -> bytes:
+async def build_export_zip(
+    supabase: AsyncClient, *, user_id: str, service_supabase: AsyncClient
+) -> bytes:
     """In-memory convenience wrapper over ``write_export_zip`` (tests)."""
     buf = io.BytesIO()
-    write_export_zip(supabase, buf, user_id=user_id, service_supabase=service_supabase)
+    await write_export_zip(supabase, buf, user_id=user_id, service_supabase=service_supabase)
     return buf.getvalue()

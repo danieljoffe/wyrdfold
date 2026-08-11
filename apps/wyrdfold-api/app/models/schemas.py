@@ -33,14 +33,13 @@ class JobPosting(BaseModel):
     title: str
     company_name: str
     location: str | None
-    department: str | None
     absolute_url: str | None
     score: int
     score_breakdown: ScoreBreakdown | None
     status: str
     target_id: str | None = None
-    first_seen_at: datetime
-    created_at: datetime
+    source_posted_at: datetime | None = None
+    cataloged_at: datetime
 
 
 class JobSource(BaseModel):
@@ -115,6 +114,23 @@ class ManualJobResponse(BaseModel):
     extraction_tier: str
     warnings: list[str]
     needs_manual_fields: bool
+
+
+class AddToTargetRequest(BaseModel):
+    """Body for ``POST /jobs/{job_id}/add-to-target`` (#467 power-action).
+
+    The job is an EXISTING posting (a search result's ``jobs.id``), so unlike
+    ``ManualJobRequest`` there is no URL to fetch/materialize — only the target
+    to score it against."""
+
+    target_id: str = Field(max_length=64)
+
+
+class AddToTargetResponse(BaseModel):
+    success: bool
+    job_posting_id: str
+    target_id: str
+    score: int
 
 
 ScoringStatus = Literal["stage1", "stage2", "complete"]

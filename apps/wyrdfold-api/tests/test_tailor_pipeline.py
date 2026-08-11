@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from docx import Document
@@ -29,7 +29,7 @@ from app.models.tailor import (
     TailoredRole,
 )
 from app.services.llm import cost_log as cost_log_mod
-from app.services.llm.mock import MockLLMClient
+from app.services.llm.mock import MockLLMClient, ats_hostile_resume_json
 from app.services.tailor.faithfulness import (
     FAITHFULNESS_REVIEW_PURPOSE,
     FaithfulnessFlag,
@@ -131,9 +131,14 @@ def _inserted_record_row(record_id: str = "rec-1") -> dict[str, Any]:
 
 def _make_supabase_mock(*, insert_data: list[dict[str, Any]]) -> MagicMock:
     supabase = MagicMock()
-    supabase.table.return_value.insert.return_value.execute.return_value.data = insert_data
-    supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = []
-    supabase.storage.from_.return_value.upload.return_value = None
+    tbl = supabase.table.return_value
+    tbl.insert.return_value.execute = AsyncMock(return_value=MagicMock(data=insert_data))
+    tbl.update.return_value.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+    # versions.record()'s _prune reads existing versions (empty → no delete).
+    tbl.select.return_value.eq.return_value.order.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+    supabase.storage.from_.return_value.upload = AsyncMock(return_value=None)
     return supabase
 
 
@@ -144,7 +149,7 @@ async def test_success_returns_record_and_persists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -167,8 +172,8 @@ async def test_success_cost_logs_under_tailor_purpose(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    cost_record = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", cost_record)
+    cost_record = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", cost_record)
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     await run_tailor_pipeline(
@@ -187,7 +192,7 @@ async def test_preferences_are_passed_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     seen: dict[str, str] = {}
 
@@ -215,29 +220,46 @@ async def test_preferences_are_passed_through(
     assert "em dashes" in seen["latest"]
 
 
-# ---- Lint failure path ---------------------------------------------------
+# ---- Lint failure path (#656: flagged, not discarded) ---------------------
 
 
-async def test_lint_failure_does_not_persist(
+def _lint_error(code: str = "no_tables") -> LintResult:
+    return LintResult(
+        ok=False,
+        violations=[
+            LintViolation(code=code, message="simulated lint failure", severity="error")
+        ],
+    )
+
+
+def _documents_row(supabase: MagicMock) -> dict[str, Any]:
+    """The row handed to ``documents.insert(...)``.
+
+    Selected by shape, not by call index: ``insert_row`` also writes a
+    ``resume_versions`` snapshot through the same MagicMock, so
+    ``call_args`` (the LAST call) is the version row, not the document.
+    """
+    rows = [
+        c.args[0]
+        for c in supabase.table.return_value.insert.call_args_list
+        if isinstance(c.args[0], dict) and "jd_snapshot" in c.args[0]
+    ]
+    assert len(rows) == 1, f"expected exactly one documents insert, got {len(rows)}"
+    return rows[0]
+
+
+async def test_docx_lint_failure_persists_flagged_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    supabase = _make_supabase_mock(insert_data=[])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
-
-    # Force the linter to report an error.
-    def fake_lint(_b: bytes) -> LintResult:
-        return LintResult(
-            ok=False,
-            violations=[
-                LintViolation(
-                    code="no_tables",
-                    message="simulated lint failure",
-                    severity="error",
-                )
-            ],
-        )
-
-    monkeypatch.setattr("app.services.tailor.pipeline.lint_docx", fake_lint)
+    """#656: a resume that fails the .docx lint is PERSISTED with its
+    violations rather than thrown away. The run costs an LLM call and a slot
+    in the daily cap, and now that generation is backgrounded nobody may be
+    watching to retry — so the draft has to survive for the user to fix."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.tailor.pipeline.lint_docx", lambda _b, **_kw: _lint_error()
+    )
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -251,8 +273,110 @@ async def test_lint_failure_does_not_persist(
 
     assert isinstance(result, PipelineLintFailure)
     assert any(v.code == "no_tables" for v in result.lint.errors)
-    # No insert call for documents.
-    supabase.table.return_value.insert.assert_not_called()
+    # The row was written, and it carries the violations that flag it.
+    row = _documents_row(supabase)
+    assert [v["code"] for v in row["lint_violations"]] == ["no_tables"]
+    assert row["payload_md"], "the flagged draft keeps its markdown to edit"
+    assert result.record.id == "rec-1"
+    assert result.payload_md == row["payload_md"]
+    # No .docx is uploaded for a flagged draft — the download route re-renders
+    # lazily from payload_md, so rendering now would only be thrown away the
+    # moment the user edits.
+    supabase.storage.from_.return_value.upload.assert_not_called()
+
+
+async def test_markdown_lint_failure_persists_flagged_draft_without_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The earlier of the two lint gates behaves identically — and short-circuits
+    before pandoc runs at all."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.tailor.pipeline.lint_markdown",
+        lambda _md, **_kw: _lint_error("md_boom"),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        "app.services.tailor.pipeline.md_to_docx",
+        lambda md, *a, **k: rendered.append(md) or b"x",
+    )
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
+    result = await run_tailor_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        contact=_contact(),
+    )
+
+    assert isinstance(result, PipelineLintFailure)
+    assert rendered == [], "md-lint failure must not pay for a pandoc render"
+    row = _documents_row(supabase)
+    assert [v["code"] for v in row["lint_violations"]] == ["md_boom"]
+
+
+async def test_clean_generation_persists_empty_violations_not_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative case that gives the flag meaning: a resume that PASSES
+    lint stores ``[]`` — 'linted, clean' — never NULL. NULL is reserved for
+    rows that predate the column, so conflating them would make every clean
+    draft indistinguishable from an unlinted one."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
+    result = await run_tailor_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        contact=_contact(),
+    )
+
+    assert isinstance(result, PipelineSuccess)
+    row = _documents_row(supabase)
+    assert row["lint_violations"] == []
+
+
+async def test_clean_generation_persists_warnings_so_they_survive_the_202(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warnings are stored too, not just blocking errors. Pre-#656 they only
+    ever rode back on the POST response; now the POST returns 202 and the
+    client polls for the record, so a warnings-only advisory would vanish
+    entirely if the column held errors alone."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.tailor.pipeline.lint_docx",
+        lambda _b, **_kw: LintResult(
+            ok=True,
+            violations=[
+                LintViolation(code="long_line", message="a bit long", severity="warning")
+            ],
+        ),
+    )
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
+    result = await run_tailor_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        contact=_contact(),
+    )
+
+    assert isinstance(result, PipelineSuccess)
+    row = _documents_row(supabase)
+    assert [v["code"] for v in row["lint_violations"]] == ["long_line"]
+    # ...and a warnings-only list is NOT a flagged draft.
+    assert all(v["severity"] == "warning" for v in row["lint_violations"])
 
 
 # ---- Storage failure path (row already persisted, storage_path stays None)
@@ -263,7 +387,7 @@ async def test_storage_upload_failure_does_not_raise(
 ) -> None:
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
     supabase.storage.from_.return_value.upload.side_effect = RuntimeError("s3 down")
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -295,7 +419,7 @@ async def test_rendered_output_opens_as_valid_docx(
         return real_lint(data)
 
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    monkeypatch.setattr(cost_log_mod, "record", MagicMock())
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
     monkeypatch.setattr("app.services.tailor.pipeline.lint_docx", capturing_lint)
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
@@ -362,8 +486,8 @@ def _scripted_llm(review: FaithfulnessReview) -> MockLLMClient:
 async def test_review_disabled_skips_review(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", False)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     result = await run_tailor_pipeline(
         supabase,
@@ -380,8 +504,8 @@ async def test_review_disabled_skips_review(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_review_clean_does_not_regenerate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     # Only a low-severity flag → not actionable → no corrective regen.
     review = FaithfulnessReview(
@@ -404,8 +528,8 @@ async def test_review_flags_trigger_one_regeneration(
 ) -> None:
     monkeypatch.setattr(settings, "faithfulness_review_enabled", True)
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
-    rec = MagicMock()
-    monkeypatch.setattr(cost_log_mod, "record", rec)
+    rec = AsyncMock()
+    monkeypatch.setattr(cost_log_mod, "record_async", rec)
 
     review = FaithfulnessReview(
         flags=[
@@ -424,3 +548,39 @@ async def test_review_flags_trigger_one_regeneration(
     )
     assert isinstance(result, PipelineSuccess)
     assert rec.call_count == 3  # generate + review + ONE corrective regen
+
+
+async def test_flagged_draft_path_end_to_end_with_the_real_linter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flagged-draft path (#656) driven from LLM output all the way through
+    the production linter — no ``lint_markdown``/``lint_docx`` stub anywhere.
+
+    The other lint-failure tests monkeypatch the linter to force the branch,
+    which proves the branch works but not that anything real reaches it. This
+    one scripts the mock's ATS-hostile resume (bug corpus) and lets the actual
+    rules decide, so a linter change that stops catching tables — or a renderer
+    change that stops emitting them — fails here instead of silently turning
+    every "flagged" test into a success-path test.
+    """
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: ats_hostile_resume_json()})
+    result = await run_tailor_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        contact=_contact(),
+    )
+
+    assert isinstance(result, PipelineLintFailure)
+    assert any(v.code == "no_tables" for v in result.lint.errors)
+
+    # The draft SURVIVED: a real row, flagged, with the markdown to edit.
+    row = _documents_row(supabase)
+    assert "no_tables" in {v["code"] for v in row["lint_violations"]}
+    assert "| Metric | Before | After |" in row["payload_md"]
+    assert result.record.id == "rec-1"
