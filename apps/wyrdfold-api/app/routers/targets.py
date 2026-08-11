@@ -84,6 +84,7 @@ from app.services.source_discovery import (
 )
 from app.services.target_scoring import bulk_title_score_for_target
 from app.services.targets import crud, fit_refresh, from_input, votes
+from app.services.targets.activation import ActivationError
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -547,33 +548,8 @@ async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> 
 async def _update_target_async(
     supabase: AsyncClient, target_id: str, payload: TargetUpdate
 ) -> JobTarget | None:
-    """Async inline of ``crud.update`` — same partial field mapping."""
-    updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
-    if payload.label is not None:
-        updates["label"] = payload.label
-        updates["normalized_label"] = crud.normalize_label(payload.label)
-    if payload.description is not None:
-        updates["description"] = payload.description
-    if payload.scoring_profile is not None:
-        updates["scoring_profile"] = payload.scoring_profile.model_dump()
-    if payload.search_keywords is not None:
-        updates["search_keywords"] = payload.search_keywords
-    if payload.activation_status is not None:
-        updates["activation_status"] = payload.activation_status
-    if payload.app_active is not None:
-        updates["app_active"] = payload.app_active
-    if payload.profile_version is not None:
-        updates["profile_version"] = payload.profile_version
-    if payload.example_promising_titles is not None:
-        updates["example_promising_titles"] = payload.example_promising_titles
-    if payload.example_unpromising_titles is not None:
-        updates["example_unpromising_titles"] = payload.example_unpromising_titles
-    if payload.seniority_hint is not None:
-        updates["seniority_hint"] = payload.seniority_hint
-    if payload.domain_hints is not None:
-        updates["domain_hints"] = payload.domain_hints
-    if payload.role_family is not None:
-        updates["role_family"] = payload.role_family
+    """Async inline of ``crud.update`` — shares its field mapping verbatim."""
+    updates = crud.build_update_fields(payload)
     resp = await supabase.table(crud.TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return crud._parse_target(rows[0]) if rows else None
@@ -894,7 +870,12 @@ async def _activate_pipeline(
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
                 await _update_target_async(
-                    supabase, target_id, TargetUpdate(activation_status="error")
+                    supabase,
+                    target_id,
+                    TargetUpdate(
+                        activation_status="error",
+                        activation_error=ActivationError.NO_EXPERIENCE_PROFILE,
+                    ),
                 )
                 return
 
@@ -960,7 +941,12 @@ async def _activate_pipeline(
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
         await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="error")
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error",
+                activation_error=ActivationError.PIPELINE_FAILED,
+            ),
         )
 
 

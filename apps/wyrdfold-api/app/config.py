@@ -233,6 +233,22 @@ class Settings(BaseSettings):
     # See app/services/retention.py.
     retention_purge_enabled: bool = False
     retention_purge_tick_hours: int = Field(default=24, ge=1, le=720)
+
+    # Activation staleness sweep (#557 §3 / #649). `deriving` and `polling` are
+    # IN-FLIGHT states — a detached task is supposed to be advancing them. When
+    # that task dies nothing notices, and the target is stranded (prod had one
+    # sitting in `polling` for 27 days). This sweep converges such rows back to
+    # `idle`, the re-activatable state, so they heal on the user's next visit.
+    # Opt-in, like every other sweep here (retention/url_health/discovery): a
+    # self-hosted deployment should not get unrequested background writes. The
+    # one-shot heal in 20260811020000 fixes rows already stranded; this flag is
+    # the ONGOING guard, so prod wants ACTIVATION_SWEEP_ENABLED=true.
+    activation_sweep_enabled: bool = False
+    activation_sweep_tick_hours: int = Field(default=6, ge=1, le=168)
+    # Deliberately generous: the cutoff keys on `updated_at`, which a running
+    # pipeline does not touch BETWEEN status transitions, so a tight window
+    # could reclaim a live activation. Hours, not minutes.
+    activation_stale_after_hours: int = Field(default=6, ge=1, le=720)
     # llm_costs.created_at feeds the rolling budget windows (≤30d) and the
     # cost/insights history, so the floor is a year; 0 = keep forever.
     llm_costs_retention_days: int = Field(default=365, ge=0)
