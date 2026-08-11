@@ -118,7 +118,7 @@ def _seeded() -> _FakeSupabase:
                 "rotated_at": None,
             }
         ],
-        "notifications_sent": [{"user_profile_id": _PROFILE_ID, "channel": "email"}],
+        "notifications_sent": [{"user_id": _UID, "channel": "email"}],
     }
     buckets = {
         "resume-uploads": {_UID: {"original.pdf": b"PDF-BYTES"}},
@@ -145,8 +145,17 @@ def _data_json(blob: bytes) -> dict[str, Any]:
 
 def test_export_inventory_in_lockstep_with_deletion() -> None:
     """Export and erasure must cover the same per-user tables — those deleted
-    on erasure plus those anonymized (the user's shared contributions)."""
-    assert set(_EXPORT_TABLES) == (
+    on erasure plus those anonymized (the user's shared contributions).
+
+    ``_EXPORT_HANDLED_SEPARATELY`` covers tables the export reaches by a route
+    other than the plain loop (notifications_sent needs the service client plus
+    a profile-visibility gate). Counting them keeps this a TOTAL-coverage
+    assertion: a per-user table that is deleted on erasure but exported by
+    neither route still fails here.
+    """
+    from app.services.data_export import _EXPORT_HANDLED_SEPARATELY
+
+    assert set(_EXPORT_TABLES) | _EXPORT_HANDLED_SEPARATELY == (
         set(account_deletion._USER_ID_TABLES) | set(account_deletion._ANONYMIZED_TABLES)
     )
 
@@ -205,7 +214,10 @@ async def test_api_keys_exported_without_ciphertext() -> None:
     assert _SECRET.encode() not in blob
 
 
-async def test_notifications_keyed_by_resolved_profile_id() -> None:
+async def test_notifications_exported_by_auth_uid() -> None:
+    """R3 §2 (#557): the alert ledger is keyed by the auth uid, so it exports
+    through the ordinary ``_EXPORT_TABLES`` loop rather than a bespoke
+    profile-surrogate lookup."""
     data = _data_json(await _export(_seeded()))
     assert data["notifications_sent"][0]["channel"] == "email"
 
@@ -219,11 +231,34 @@ async def test_storage_files_bundled_from_both_buckets() -> None:
     assert "README.txt" in names
 
 
-async def test_no_profile_skips_notifications_without_crashing() -> None:
-    sb = _FakeSupabase({"experience_prose_docs": [{"user_id": _UID, "prose": "x"}]})
-    data = _data_json(await _export(sb))
-    assert "notifications_sent" not in data
+async def test_notifications_export_is_gated_on_profile_visibility() -> None:
+    """The alert ledger is keyed by the auth uid (R3 §2, #557) but still read
+    with the service client, which bypasses RLS — so the read stays gated on
+    the caller's own client having seen that user's profile row.
+
+    No visible profile → empty list, never someone else's alert history. That
+    gate is what ``test_rls_backstop_blocks_cross_user_export`` pins live.
+    """
+    invisible = _FakeSupabase(
+        {
+            "experience_prose_docs": [{"user_id": _UID, "prose": "x"}],
+            "notifications_sent": [{"user_id": _UID, "channel": "sms"}],
+        }
+    )
+    data = _data_json(await _export(invisible))
     assert data["user_profiles"] == []
+    # The rows EXIST and are keyed to this uid — the gate is what withholds
+    # them, so this asserts the gate rather than an empty table.
+    assert data["notifications_sent"] == []
+
+    visible = _FakeSupabase(
+        {
+            "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+            "notifications_sent": [{"user_id": _UID, "channel": "sms"}],
+        }
+    )
+    populated = _data_json(await _export(visible))
+    assert populated["notifications_sent"][0]["channel"] == "sms"
 
 
 async def test_storage_export_pages_past_one_page() -> None:
@@ -303,7 +338,7 @@ async def test_rls_gap_tables_read_via_service_client_only() -> None:
             "job_feedback": [{"user_id": _UID, "src": "service"}],
             "user_api_keys": [{"user_id": _UID, "provider": "openrouter", "last4": "ab12"}],
             "reference_jds": [{"user_id": _UID, "jd_text": "my contribution"}],
-            "notifications_sent": [{"user_profile_id": _PROFILE_ID, "channel": "email"}],
+            "notifications_sent": [{"user_id": _UID, "channel": "email"}],
         },
         {"resume-uploads": {_UID: {"leak.pdf": b"SERVICE-CLIENT-BYTES"}}},
     )
