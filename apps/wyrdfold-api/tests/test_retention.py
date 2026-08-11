@@ -3,10 +3,8 @@
 Pins the contract:
 
 * rows older than the window are deleted from ``llm_costs`` (by
-  ``created_at``), ``notifications_sent`` (by ``sent_at``),
-  ``prescan_shadow`` (by ``observed_at`` — the 2026-07-02 lifecycle audit:
-  the shadow log is temporary analysis data that otherwise grows forever)
-  and ``search_events`` (by ``occurred_at`` — #467 §10 PR6, the funnel
+  ``created_at``), ``notifications_sent`` (by ``sent_at``) and
+  ``search_events`` (by ``occurred_at`` — #467 §10 PR6, the funnel
   ledger whose ``query`` column makes bounded retention a privacy matter);
 * recent rows survive;
 * a window of 0 days retains that table indefinitely (no delete issued);
@@ -77,12 +75,6 @@ def _seeded() -> _FakeSupabase:
                 {"sent_at": _OLD},
                 {"sent_at": _FUTURE},
             ],
-            "prescan_shadow": [
-                {"observed_at": _OLD},
-                {"observed_at": _OLD},
-                {"observed_at": _OLD},
-                {"observed_at": _FUTURE},
-            ],
             "search_events": [
                 {"occurred_at": _OLD},
                 {"occurred_at": _FUTURE},
@@ -98,19 +90,16 @@ async def test_purges_old_rows_and_keeps_recent() -> None:
         sb,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
     )
     assert report == {
         "llm_costs": 2,
         "notifications_sent": 1,
-        "prescan_shadow": 3,
         "search_events": 1,
     }
     # Only the future-dated rows survive.
     assert sb.tables["llm_costs"] == [{"created_at": _FUTURE}]
     assert sb.tables["notifications_sent"] == [{"sent_at": _FUTURE}]
-    assert sb.tables["prescan_shadow"] == [{"observed_at": _FUTURE}]
     assert sb.tables["search_events"] == [{"occurred_at": _FUTURE}]
 
 
@@ -138,13 +127,11 @@ async def test_filters_on_the_right_timestamp_column() -> None:
         sb,
         llm_costs_days=30,
         notifications_sent_days=30,
-        prescan_shadow_days=30,
         search_events_days=30,
     )
     assert cols == {
         "llm_costs": "created_at",
         "notifications_sent": "sent_at",
-        "prescan_shadow": "observed_at",
         "search_events": "occurred_at",
     }
 
@@ -156,7 +143,6 @@ async def test_zero_window_retains_table_indefinitely() -> None:
         sb,
         llm_costs_days=0,
         notifications_sent_days=180,
-        prescan_shadow_days=0,
         search_events_days=0,
     )
     # llm_costs untouched (no delete issued), notifications purged.
@@ -165,9 +151,6 @@ async def test_zero_window_retains_table_indefinitely() -> None:
     deleted_tables = [name for op, name, *_ in sb.log if op == "delete"]
     assert "llm_costs" not in deleted_tables
     assert "notifications_sent" in deleted_tables
-    # prescan_shadow window 0 in this call: also retained (no delete issued).
-    assert report["prescan_shadow"] == 0
-    assert "prescan_shadow" not in deleted_tables
     # search_events window 0 in this call: also retained (no delete issued).
     assert report["search_events"] == 0
     assert "search_events" not in deleted_tables
@@ -180,7 +163,6 @@ async def test_uses_minimal_return_to_avoid_large_payloads() -> None:
         sb,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
     )
     deletes = [(count, returning) for op, _, count, returning in sb.log if op == "delete"]
@@ -197,20 +179,17 @@ async def test_idempotent_second_run_purges_nothing() -> None:
         sb,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
     )
     second = await purge_expired_records(
         sb,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
     )
     assert second == {
         "llm_costs": 0,
         "notifications_sent": 0,
-        "prescan_shadow": 0,
         "search_events": 0,
     }
 
@@ -237,7 +216,6 @@ def test_purge_endpoint_is_api_key_gated_and_returns_counts() -> None:
     assert resp.json() == {
         "llm_costs": 2,
         "notifications_sent": 1,
-        "prescan_shadow": 3,
         "search_events": 1,
     }
 

@@ -10,8 +10,11 @@ Covers ``app/services/embeddings/prescan_gate.py``:
 - ``parse_vector`` coerces the two pgvector wire shapes (list / text) and
   rejects garbage.
 
-The gate is OBSERVATION ONLY in this phase — these tests pin the computation;
-the poller-side inertness lives in ``test_poller_prescan_shadow.py``.
+The gate was RETIRED in R2 on its own shadow data (docs/decisions.md
+2026-07-30) and has no app-code callers; these tests pin the computation only.
+The companion poller-inertness suite and the ``prescan_shadow`` table it
+observed are both gone (R3 §1, #557) — this module is the last of the gate
+still standing.
 """
 
 from __future__ import annotations

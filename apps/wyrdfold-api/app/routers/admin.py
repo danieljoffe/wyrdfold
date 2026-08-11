@@ -167,7 +167,6 @@ class RetentionPurgeResult(BaseModel):
 
     llm_costs: int = Field(description="Rows deleted from llm_costs.")
     notifications_sent: int = Field(description="Rows deleted from notifications_sent.")
-    prescan_shadow: int = Field(description="Rows deleted from prescan_shadow.")
     search_events: int = Field(description="Rows deleted from search_events.")
 
 
@@ -189,7 +188,6 @@ async def purge_retention() -> RetentionPurgeResult:
         aclient,
         llm_costs_days=settings.llm_costs_retention_days,
         notifications_sent_days=settings.notifications_sent_retention_days,
-        prescan_shadow_days=settings.prescan_shadow_retention_days,
         search_events_days=settings.search_events_retention_days,
     )
     return RetentionPurgeResult(**report)
