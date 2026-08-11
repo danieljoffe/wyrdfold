@@ -809,64 +809,6 @@ export type Database = {
           },
         ];
       };
-      prescan_shadow: {
-        Row: {
-          cosine: number | null;
-          cosine_admit: boolean | null;
-          id: string;
-          job_posting_id: string;
-          keyword_admit: boolean | null;
-          keyword_score: number | null;
-          observed_at: string;
-          target_id: string;
-          threshold: number | null;
-        };
-        Insert: {
-          cosine?: number | null;
-          cosine_admit?: boolean | null;
-          id?: string;
-          job_posting_id: string;
-          keyword_admit?: boolean | null;
-          keyword_score?: number | null;
-          observed_at?: string;
-          target_id: string;
-          threshold?: number | null;
-        };
-        Update: {
-          cosine?: number | null;
-          cosine_admit?: boolean | null;
-          id?: string;
-          job_posting_id?: string;
-          keyword_admit?: boolean | null;
-          keyword_score?: number | null;
-          observed_at?: string;
-          target_id?: string;
-          threshold?: number | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'prescan_shadow_job_posting_id_fkey';
-            columns: ['job_posting_id'];
-            isOneToOne: false;
-            referencedRelation: 'jobs';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'prescan_shadow_target_id_fkey';
-            columns: ['target_id'];
-            isOneToOne: false;
-            referencedRelation: 'target_funnel';
-            referencedColumns: ['target_id'];
-          },
-          {
-            foreignKeyName: 'prescan_shadow_target_id_fkey';
-            columns: ['target_id'];
-            isOneToOne: false;
-            referencedRelation: 'targets';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
       reference_jds: {
         Row: {
           created_at: string | null;
