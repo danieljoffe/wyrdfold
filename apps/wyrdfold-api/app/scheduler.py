@@ -624,8 +624,35 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             replace_existing=True,
             misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
+        # Same catch-up the other ledger-stamped jobs carry, and for the same
+        # reason: `IntervalTrigger` counts from PROCESS START, and this app
+        # deploys near-daily — every deploy restarts the countdown, so a tick
+        # longer than the deploy cadence can go indefinitely without firing.
+        # That already happened once (discovery ran ONCE in its first 6 enabled
+        # days, #244). Shipping this sweep without the anchor reproduced the
+        # bug: two redeploys on release day each reset its 6h timer.
+        #
+        # The anchor also makes the sweep verifiable — on the first boot after
+        # this lands, `activation_sweep` has never been stamped, so it reads as
+        # overdue and runs immediately, writing the ledger row that proves it.
+        scheduler.add_job(
+            _anchor_job_from_ledger,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            kwargs={
+                "job_id": "activation_sweep",
+                "tick_hours": settings.activation_sweep_tick_hours,
+                "runner": _run_scheduled_activation_sweep,
+            },
+            args=[scheduler],
+            id="activation_sweep_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
         logger.info(
-            "activation sweep scheduler registered (tick every %d h, stale after %d h)",
+            "activation sweep scheduler registered (tick every %d h, stale after %d h, "
+            "catch-up in 3m)",
             settings.activation_sweep_tick_hours,
             settings.activation_stale_after_hours,
         )
