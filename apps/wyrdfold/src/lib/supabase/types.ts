@@ -772,7 +772,7 @@ export type Database = {
           job_posting_id: string;
           score_at_send: number;
           sent_at: string;
-          user_profile_id: string;
+          user_id: string;
         };
         Insert: {
           channel?: string;
@@ -781,7 +781,7 @@ export type Database = {
           job_posting_id: string;
           score_at_send: number;
           sent_at?: string;
-          user_profile_id: string;
+          user_id: string;
         };
         Update: {
           channel?: string;
@@ -790,7 +790,7 @@ export type Database = {
           job_posting_id?: string;
           score_at_send?: number;
           sent_at?: string;
-          user_profile_id?: string;
+          user_id?: string;
         };
         Relationships: [
           {
@@ -798,71 +798,6 @@ export type Database = {
             columns: ['job_posting_id'];
             isOneToOne: false;
             referencedRelation: 'jobs';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'job_notification_sent_user_profile_id_fkey';
-            columns: ['user_profile_id'];
-            isOneToOne: false;
-            referencedRelation: 'user_profiles';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
-      prescan_shadow: {
-        Row: {
-          cosine: number | null;
-          cosine_admit: boolean | null;
-          id: string;
-          job_posting_id: string;
-          keyword_admit: boolean | null;
-          keyword_score: number | null;
-          observed_at: string;
-          target_id: string;
-          threshold: number | null;
-        };
-        Insert: {
-          cosine?: number | null;
-          cosine_admit?: boolean | null;
-          id?: string;
-          job_posting_id: string;
-          keyword_admit?: boolean | null;
-          keyword_score?: number | null;
-          observed_at?: string;
-          target_id: string;
-          threshold?: number | null;
-        };
-        Update: {
-          cosine?: number | null;
-          cosine_admit?: boolean | null;
-          id?: string;
-          job_posting_id?: string;
-          keyword_admit?: boolean | null;
-          keyword_score?: number | null;
-          observed_at?: string;
-          target_id?: string;
-          threshold?: number | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'prescan_shadow_job_posting_id_fkey';
-            columns: ['job_posting_id'];
-            isOneToOne: false;
-            referencedRelation: 'jobs';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'prescan_shadow_target_id_fkey';
-            columns: ['target_id'];
-            isOneToOne: false;
-            referencedRelation: 'target_funnel';
-            referencedColumns: ['target_id'];
-          },
-          {
-            foreignKeyName: 'prescan_shadow_target_id_fkey';
-            columns: ['target_id'];
-            isOneToOne: false;
-            referencedRelation: 'targets';
             referencedColumns: ['id'];
           },
         ];
@@ -1342,6 +1277,8 @@ export type Database = {
       };
       targets: {
         Row: {
+          activation_error: string | null;
+          activation_failed_at: string | null;
           activation_status: string;
           app_active: boolean;
           created_at: string | null;
@@ -1362,6 +1299,8 @@ export type Database = {
           updated_at: string | null;
         };
         Insert: {
+          activation_error?: string | null;
+          activation_failed_at?: string | null;
           activation_status?: string;
           app_active?: boolean;
           created_at?: string | null;
@@ -1382,6 +1321,8 @@ export type Database = {
           updated_at?: string | null;
         };
         Update: {
+          activation_error?: string | null;
+          activation_failed_at?: string | null;
           activation_status?: string;
           app_active?: boolean;
           created_at?: string | null;

@@ -12,6 +12,25 @@ concurrency:
 permissions:
   contents: read
 
+# ⚠️ RENAMING A JOB BELOW IS A BREAKING CHANGE. Each of these six `name:`
+# values is a required status check *context* in BOTH branch rulesets —
+# protect:develop (id 17940940) and protect:main (id 17940939):
+#
+#   JS — lint, typecheck, test, build
+#   Python — wyrdfold-api
+#   E2E — public + authed specs (Playwright)
+#   Lighthouse — public CWV / a11y
+#   Image scan — Trivy
+#   RLS — integration (live Supabase)
+#
+# GitHub matches contexts by display name, so a rename here must land together
+# with the matching `context` edit in BOTH rulesets — otherwise every PR blocks
+# forever on a check that never reports, and any PR opened before the rename
+# stays blocked until its branch is updated. Read the live contexts with:
+#
+#   env -u GITHUB_TOKEN gh api repos/danieljoffe/wyrdfold/rulesets/17940940 \
+#     -q '.rules[]? | select(.type=="required_status_checks")
+#         | .parameters.required_status_checks[].context'
 jobs:
   # Detect whether the PR touches anything other than docs (*.md / docs/ /
   # .claude/). The heavy jobs below gate on this, so a docs-only PR skips the
@@ -101,7 +120,13 @@ jobs:
       # are fixed via overrides in pnpm-workspace.yaml.
       - name: Audit dependencies (OSV)
         run: |
-          curl -sSL -o /tmp/osv-scanner \
+          set -euo pipefail
+          # -f so an HTTP error page is never written to the file and then
+          # chmod +x'd; --retry-all-errors because plain --retry only covers
+          # timeouts and 408/429/5xx, not the connection resets GitHub's
+          # release CDN actually throws (see the Supabase CLI step).
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
+            -o /tmp/osv-scanner \
             https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64
           chmod +x /tmp/osv-scanner
           # --config: osv-scanner.toml carries the (rare) suppressions for
@@ -115,10 +140,11 @@ jobs:
         run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
 
   e2e:
-    # NOTE: the job name is a required check in the protect:develop ruleset —
-    # renaming it needs a ruleset edit first. It now runs the FULL tier
-    # (public + authed) despite the name.
-    name: E2E — public specs (Playwright)
+    # Runs the FULL Playwright tier: 17 public-chromium tests plus `setup` +
+    # 17 authed-chromium tests, against the throwaway local Supabase stack
+    # booted below. The old name ("E2E — public specs") predated the authed
+    # tier and misled a release review into thinking authed specs were ungated.
+    name: E2E — public + authed specs (Playwright)
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
@@ -165,13 +191,22 @@ jobs:
       # Same hardened fetch as the rls-integration job: step timeout +
       # curl retries/timeouts so a slow mirror can't hang the job, and a
       # pinned sha256 so a tampered download fails loudly.
+      #
+      # --retry-all-errors is load-bearing, not belt-and-braces: curl's plain
+      # --retry only treats "a timeout, an FTP 4xx response code or an HTTP
+      # 408, 429, 500, 502, 503 or 504" as retryable. This download really
+      # fails with `curl: (35) Recv failure: Connection reset by peer`, which
+      # is NOT in that set — so --retry 3 alone retried zero times and the job
+      # went red on a pure network blip (run 31460681334). Safe with -o: curl
+      # discards a failed partial transfer written to an output file before
+      # retrying, and the sha256 check below would catch any corruption anyway.
       - name: Install Supabase CLI
         timeout-minutes: 5
         run: |
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
           SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
-          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
           echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -
@@ -372,7 +407,7 @@ jobs:
           set -euo pipefail
           PANDOC_VERSION=3.1.3
           PANDOC_SHA256=caa7e0410f9e2cb1da2eb8db13cc97b5548fe455985e2c944e3929d22f99bcdc
-          if curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+          if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
                -o /tmp/pandoc.deb \
                "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"; then
             echo "${PANDOC_SHA256}  /tmp/pandoc.deb" | sha256sum -c -
@@ -439,7 +474,7 @@ jobs:
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
           SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
-          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
           echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -

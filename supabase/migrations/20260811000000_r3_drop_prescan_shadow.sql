@@ -1,0 +1,38 @@
+-- R3 §1 (issue #557, schema-debt audit 2026-07-30): drop the pre-scan
+-- disagreement shadow log now that it has finished self-draining.
+--
+-- `prescan_shadow` was the #60/#68 Phase-3 SHADOW table: an append-only
+-- matrix logging the would-be cosine gate verdict alongside the live keyword
+-- admit decision, written by the poller behind PRESCAN_SHADOW_ENABLED without
+-- ever changing grading. The gate it existed to evaluate was retired in R2 on
+-- this table's own outcome data ("retired by its own shadow data",
+-- docs/decisions.md 2026-07-30), and the recorder module
+-- (app/services/embeddings/prescan_shadow.py) plus the gate flags were deleted
+-- in that same tranche. Its own creation migration (20260624140000) names this
+-- exact off-ramp: "DROP TABLE IF EXISTS public.prescan_shadow;".
+--
+-- This tranche was deliberately calendar-gated to on/after 2026-08-09 — the
+-- date the 30-day retention sweep (prescan_shadow_retention_days) was
+-- predicted to finish draining the table. Verified on prod 2026-08-11 before
+-- writing this migration:
+--
+--   SELECT count(*) FROM prescan_shadow;              -> 0
+--   SELECT min(observed_at), max(observed_at) ...;    -> NULL, NULL
+--
+-- (The 2026-07-31 measurement was 406,762 rows spanning 07-04 → 07-10; newest
+-- row + 30d retention = empty by 08-09, which is what the prod check confirms.)
+--
+-- guarded-destructive: the table is EMPTY on prod (0 rows, verified above
+-- immediately before this migration was written), so there is no row data to
+-- lose and nothing to snapshot. The analysis this table existed for is
+-- complete and its conclusion is recorded in docs/decisions.md; the retired
+-- gate's threshold trade-off curve is preserved in the audit doc. RLS denied
+-- anon/authenticated throughout, so no user-facing surface depended on it.
+-- DROP TABLE cascades the table's own indexes
+-- (idx_prescan_shadow_target_observed from 20260624140000,
+-- idx_prescan_shadow_job_posting from 20260629120000) and its FK constraints
+-- to public.jobs / public.targets. Nothing else references it: no view, no
+-- function, and the last code reader (the retention sweep arm) is removed in
+-- the same PR as this migration.
+
+DROP TABLE IF EXISTS public.prescan_shadow;

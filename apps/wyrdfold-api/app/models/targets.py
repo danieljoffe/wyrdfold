@@ -89,10 +89,26 @@ class JobTarget(BaseModel):
     activation_status: str = Field(
         default="idle",
         description=(
-            "Background pipeline state: idle | deriving | polling | ready "
-            "| error. Distinct from app_active (the instance-sponsorship "
-            "floor) and from user_targets.is_active (the per-user toggle)."
+            "Background pipeline state, a LINEAR lifecycle: deriving -> idle "
+            "-> polling -> ready, with error as the failure sink. `idle` is "
+            "NOT a synonym for `ready` — it means 'derived, awaiting "
+            "activation' and is what the frontend fires POST /activate on. "
+            "Distinct from app_active (the instance-sponsorship floor) and "
+            "from user_targets.is_active (the per-user toggle)."
         ),
+    )
+    activation_error: str | None = Field(
+        default=None,
+        description=(
+            "Why the last activation failed, as a stable reason code "
+            "(services/targets/activation.ActivationError). Non-NULL only "
+            "while activation_status == 'error' — any other transition clears "
+            "it, which is what makes re-activation a retry path (#649)."
+        ),
+    )
+    activation_failed_at: datetime | None = Field(
+        default=None,
+        description="When the last activation attempt failed; cleared with activation_error.",
     )
     profile_version: int = 1
     # Standing instance-sponsorship floor (app-owned catalog / operator).
@@ -408,6 +424,11 @@ class JobTargetSummary(BaseModel):
     description: str | None = None
     normalized_label: str | None = None
     activation_status: str = "idle"
+    #: Carried on the LIST projection too, not just the full target: /targets
+    #: is where a failed card renders, so the reason has to reach the surface
+    #: that shows it (#649) without a second round-trip.
+    activation_error: str | None = None
+    activation_failed_at: datetime | None = None
     profile_version: int = 1
     app_active: bool
     seniority_hint: SeniorityHint | None = None
@@ -465,6 +486,10 @@ class TargetUpdate(BaseModel):
     scoring_profile: ScoringProfile | None = None
     search_keywords: list[str] | None = None
     activation_status: str | None = None
+    #: Reason code to stamp alongside ``activation_status="error"``. Ignored
+    #: for any other status — see ``crud.build_update_fields``, which clears
+    #: the failure context on every non-error transition.
+    activation_error: str | None = None
     app_active: bool | None = None
     profile_version: int | None = None
     example_promising_titles: list[str] | None = None

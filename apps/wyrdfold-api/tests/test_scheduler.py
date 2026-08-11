@@ -74,6 +74,7 @@ def test_start_scheduler_returns_none_when_all_disabled() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -89,6 +90,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -111,6 +113,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -134,6 +137,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -150,6 +154,29 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_scheduler_registers_only_activation_sweep_when_only_it_enabled() -> None:
+    """The sweep is opt-in (#557 §3): off by default, and when it IS on it must
+    actually land as a job — otherwise the flag is decoration."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = True
+        mock_settings.activation_sweep_tick_hours = 6
+        mock_settings.activation_stale_after_hours = 6
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        assert {j.id for j in scheduler.get_jobs()} == {"activation_sweep"}
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
 async def test_start_scheduler_registers_only_retention_when_only_retention_enabled() -> None:
     """Retention-only operation — verify only the retention_purge job lands."""
     with patch("app.scheduler.settings") as mock_settings:
@@ -159,6 +186,7 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -183,6 +211,7 @@ async def test_start_scheduler_registers_three_when_poll_health_retention_enable
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -211,6 +240,7 @@ async def test_start_scheduler_registers_only_discovery_when_only_discovery_enab
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -236,6 +266,7 @@ async def test_discovery_scheduler_off_by_default_does_not_register() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
     # No flags on → no scheduler at all, so no discovery_run job.
     assert scheduler is None
@@ -254,6 +285,7 @@ async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = True
+        mock_settings.activation_sweep_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
@@ -285,6 +317,7 @@ async def test_start_scheduler_registers_only_recency_when_only_recency_enabled(
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = True
+        mock_settings.activation_sweep_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
@@ -311,12 +344,10 @@ async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> N
     ):
         mock_settings.llm_costs_retention_days = 365
         mock_settings.notifications_sent_retention_days = 180
-        mock_settings.prescan_shadow_retention_days = 30
         mock_settings.search_events_retention_days = 90
         mock_purge.return_value = {
             "llm_costs": 0,
             "notifications_sent": 0,
-            "prescan_shadow": 0,
             "search_events": 0,
         }
         await _run_scheduled_retention_purge()
@@ -325,7 +356,6 @@ async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> N
         fake_client,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
     )
 

@@ -27,8 +27,7 @@ close: FK ``ON DELETE CASCADE`` covers hard deletes, but nothing cleans the
 children of tombstoned/archived rows): delete their ``job_embeddings``
 (regenerable caches) and their UNGRADED ``scores`` rows (no ``fit_reasoning``
 — evaluation shells with no history value). Graded scores stay (eval/bake-off
-datasets read them). ``prescan_shadow`` rows stay unless ``--include-shadow``
-(the #90 keyword-vs-cosine disagreement analysis hasn't run yet).
+datasets read them).
 
 Dry-run by default; ``--execute`` writes. Idempotent and resumable: every
 phase selects by current state, so a re-run picks up where the data says.
@@ -245,10 +244,9 @@ async def _phase_c_cascade(
     supabase: Client,
     *,
     pending_tombstone: list[str],
-    include_shadow: bool,
     execute: bool,
 ) -> dict[str, int]:
-    """Delete embeddings + ungraded scores (+ shadow, opt-in) of ALL
+    """Delete embeddings + ungraded scores of ALL
     tombstoned jobs — this run's and any earlier ones. On dry-run,
     ``pending_tombstone`` (Phase B's would-do set) stands in for the rows
     Phase B hasn't actually stamped, so counts reflect the real plan."""
@@ -263,7 +261,7 @@ async def _phase_c_cascade(
         ),
     )
     tomb_ids = list(dict.fromkeys([cast(str, r["id"]) for r in rows] + pending_tombstone))
-    counts = {"embeddings_deleted": 0, "scores_deleted": 0, "shadow_deleted": 0}
+    counts = {"embeddings_deleted": 0, "scores_deleted": 0}
     logger.info("Phase C — tombstoned jobs to cascade: %d", len(tomb_ids))
     if not tomb_ids:
         return counts
@@ -310,13 +308,7 @@ async def _phase_c_cascade(
     else:
         counts["scores_deleted"] = len(ungraded_score_ids)
 
-    for table, key, enabled in (
-        ("job_embeddings", "embeddings_deleted", True),
-        ("prescan_shadow", "shadow_deleted", include_shadow),
-    ):
-        if not enabled:
-            logger.info("  %s: skipped (opt-in via --include-shadow)", table)
-            continue
+    for table, key in (("job_embeddings", "embeddings_deleted"),):
         done = 0
         for i in range(0, len(tomb_ids), EMB_CHUNK):
             chunk = tomb_ids[i : i + EMB_CHUNK]
@@ -380,11 +372,6 @@ async def main() -> None:
         action="store_true",
         help="Phase A: leave engaged jobs live past the cutoff (scheduled-sweep behavior).",
     )
-    parser.add_argument(
-        "--include-shadow",
-        action="store_true",
-        help="Phase C: also delete prescan_shadow rows of tombstoned jobs (#90 dataset!).",
-    )
     args = parser.parse_args()
 
     supabase = create_service_client()
@@ -396,12 +383,11 @@ async def main() -> None:
 
     cutoff = _cutoff_iso(args.days)
     logger.info(
-        "retention sweep: days=%d cutoff=%s execute=%s keep_engaged=%s include_shadow=%s",
+        "retention sweep: days=%d cutoff=%s execute=%s keep_engaged=%s",
         args.days,
         cutoff[:19],
         args.execute,
         args.keep_engaged,
-        args.include_shadow,
     )
     logger.info("---")
     archived = await _phase_a_archive(
@@ -418,7 +404,6 @@ async def main() -> None:
     cascade = await _phase_c_cascade(
         supabase,
         pending_tombstone=[] if args.execute else tombstoned,
-        include_shadow=args.include_shadow,
         execute=args.execute,
     )
     logger.info("---")

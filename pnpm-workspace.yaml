@@ -37,7 +37,7 @@ overrides:
   undici: ^7.29.0 # GHSA-4cwx-7wf7-3272 + GHSA-8xcm-r25x-g524 + GHSA-jr45-8vmc-qm54 + GHSA-m8rv-5g2x-5cg5 + GHSA-v3r7-h72x-cjcm (7.28.0 flagged; fix 7.29.0). Live-DB OSV moving target.
   fast-uri: ^3.1.5 # GHSA-7p8r-x3mc-p8w7 ReDoS (3.1.4 flagged; fix 3.1.5). Pinned to the 3.x patched line — a bare >=3.1.5 pulls the 4.x major (breaking for the ajv consumers). Live-DB OSV moving target.
   ip-address: ^10.2.1 # GHSA-22jq-vg5j-6vgg (10.2.0 flagged; fix 10.2.1). ^ to stay on the 10.x line. Live-DB OSV moving target.
-  dompurify: ^3.4.11
+  dompurify: ^3.4.11 # GHSA ALLOWED_ATTR pollution (<3.4.11; 0504c8ce). Reached transitively via isomorphic-dompurify, AND declared directly in devDependencies because the sanitize specs import it (they bind DOMPurify to jsdom's window rather than pull isomorphic-dompurify's Node-only ESM). This override is the version's single source of truth — keep the devDependency range identical so the two don't read as disagreeing.
   piscina: 4.9.3
   webpack-dev-server: 5.2.5
   linkify-it: '^5.0.2' # GHSA-v245-v573-v5vm ReDoS (transitive via markdown-it, which wants ^5; stay on 5.x — bare >=5.0.2 pulled an untested 6.0.0 major)

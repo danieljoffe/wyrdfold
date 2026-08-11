@@ -41,6 +41,7 @@ from app.services.poller import poll_all_sources, poll_due_sources
 from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
+from app.services.targets.activation import sweep_stalled_activations
 from app.services.url_health import run_url_health_check
 from app.supabase_pool import get_async_supabase
 
@@ -277,12 +278,34 @@ async def _run_scheduled_retention_purge() -> None:
             client,
             llm_costs_days=settings.llm_costs_retention_days,
             notifications_sent_days=settings.notifications_sent_retention_days,
-            prescan_shadow_days=settings.prescan_shadow_retention_days,
             search_events_days=settings.search_events_retention_days,
         )
         logger.info("scheduled retention purge: %s", report)
     except Exception:
         logger.exception("scheduled retention purge raised")
+
+
+async def _run_scheduled_activation_sweep() -> None:
+    """Tick body — reclaim targets stranded in an in-flight activation state.
+
+    Same defensive shape as the other ticks: pull the singleton client, skip if
+    uninitialized, never raise (APScheduler would swallow the trace).
+    """
+    try:
+        client = get_async_supabase()
+        if client is None:
+            logger.warning(
+                "scheduled activation sweep skipped — async supabase client not initialized"
+            )
+            return
+        await _record_scheduler_run("activation_sweep")
+        reclaimed = await sweep_stalled_activations(
+            client, stale_after_hours=settings.activation_stale_after_hours
+        )
+        if any(reclaimed.values()):
+            logger.info("scheduled activation sweep: %s", reclaimed)
+    except Exception:
+        logger.exception("scheduled activation sweep raised")
 
 
 async def _run_scheduled_recency_refresh() -> None:
@@ -485,12 +508,13 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
     Called from the FastAPI lifespan; the returned handle is what the
     lifespan must shut down on exit.
 
-    Five independent recurring jobs may run on the same scheduler:
+    Six independent recurring jobs may run on the same scheduler:
       - ``poll_due_sources`` — gated on ``POLL_SCHEDULER_ENABLED``
       - ``url_health_check`` — gated on ``URL_HEALTH_CHECK_ENABLED``
       - ``retention_purge`` — gated on ``RETENTION_PURGE_ENABLED``
       - ``discovery_run`` — gated on ``DISCOVERY_SCHEDULER_ENABLED``
       - ``recency_refresh`` — gated on ``RECENCY_REFRESH_ENABLED``
+      - ``activation_sweep`` — gated on ``ACTIVATION_SWEEP_ENABLED``
 
     If all flags are off, no scheduler is started. If only some are on,
     only those jobs are registered. Sharing one scheduler avoids multiple
@@ -502,11 +526,13 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         or settings.retention_purge_enabled
         or settings.discovery_scheduler_enabled
         or settings.recency_refresh_enabled
+        or settings.activation_sweep_enabled
     ):
         logger.info(
             "schedulers disabled (set POLL_SCHEDULER_ENABLED=true, "
             "URL_HEALTH_CHECK_ENABLED=true, RETENTION_PURGE_ENABLED=true, "
-            "DISCOVERY_SCHEDULER_ENABLED=true, or RECENCY_REFRESH_ENABLED=true "
+            "DISCOVERY_SCHEDULER_ENABLED=true, RECENCY_REFRESH_ENABLED=true, "
+            "or ACTIVATION_SWEEP_ENABLED=true "
             "to enable)"
         )
         return None
@@ -586,6 +612,22 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "retention purge scheduler registered (tick every %d h)",
             settings.retention_purge_tick_hours,
+        )
+
+    if settings.activation_sweep_enabled:
+        scheduler.add_job(
+            _run_scheduled_activation_sweep,
+            IntervalTrigger(hours=settings.activation_sweep_tick_hours),
+            id="activation_sweep",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
+        )
+        logger.info(
+            "activation sweep scheduler registered (tick every %d h, stale after %d h)",
+            settings.activation_sweep_tick_hours,
+            settings.activation_stale_after_hours,
         )
 
     if settings.discovery_scheduler_enabled:

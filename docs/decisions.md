@@ -34,7 +34,9 @@ grading ≈ $1/mo). A first read of the raw admit-rate matrix was mistaken for a
 "signal is worthless" verdict — the ~5% admit rate was the _designed_
 asymmetry; only the outcome-join could judge it. **Decision:** retire the gate
 (drop `prescan_cosine_threshold`, gate/holdout/allowlist code + flags;
-`prescan_shadow` + recorder dropped after its retention drain ~2026-08-09) but
+`prescan_shadow` + recorder dropped after its retention drain — the recorder in
+R2, the table itself in R3 §1 on 2026-08-11 once prod confirmed it had drained
+to 0 rows, `20260811000000_r3_drop_prescan_shadow.sql`) but
 KEEP the full embedding stack — live grades show cosine is the strongest cheap
 fit predictor (avg fit ~7→67 monotone), so it orders the Phase-2 daily-cap
 queue; the threshold trade-off curve is preserved in the audit doc for any

@@ -257,18 +257,19 @@ async def _try_send_one(
     score: int,
 ) -> bool:
     profile_id = profile["id"]
+    user_id = profile["user_id"]
     job_id = job["id"]
 
     claim = await (
         supabase.table("notifications_sent")
         .upsert(
             {
-                "user_profile_id": profile_id,
+                "user_id": user_id,
                 "job_posting_id": job_id,
                 "score_at_send": score,
                 "channel": "email",
             },
-            on_conflict="user_profile_id,job_posting_id,channel",
+            on_conflict="user_id,job_posting_id,channel",
             ignore_duplicates=True,
         )
         .execute()
@@ -451,14 +452,14 @@ async def send_sms_alerts_for_new_jobs(
     return sent
 
 
-async def _sms_count_today(supabase: AsyncClient, profile_id: str) -> int:
-    """Count SMS notifications sent today for a profile."""
+async def _sms_count_today(supabase: AsyncClient, user_id: str) -> int:
+    """Count SMS notifications sent today for a user."""
     today = datetime.now(UTC).strftime("%Y-%m-%dT00:00:00+00:00")
     resp = await (
         supabase.table("notifications_sent")
         # head=True → count only, no rows shipped (HEAD request).
         .select("id", count="exact", head=True)  # type: ignore[arg-type]
-        .eq("user_profile_id", profile_id)
+        .eq("user_id", user_id)
         .eq("channel", "sms")
         .gte("sent_at", today)
         .execute()
@@ -473,11 +474,12 @@ async def _try_send_sms(
     score: int,
 ) -> bool:
     profile_id = profile["id"]
+    user_id = profile["user_id"]
     job_id = job["id"]
     daily_limit = int(profile.get("sms_daily_limit", 5))
 
     # Rate limit check
-    today_count = await _sms_count_today(supabase, profile_id)
+    today_count = await _sms_count_today(supabase, user_id)
     if today_count >= daily_limit:
         logger.debug(
             "SMS rate limited for profile=%s (sent=%d, limit=%d)",
@@ -492,12 +494,12 @@ async def _try_send_sms(
         supabase.table("notifications_sent")
         .upsert(
             {
-                "user_profile_id": profile_id,
+                "user_id": user_id,
                 "job_posting_id": job_id,
                 "score_at_send": score,
                 "channel": "sms",
             },
-            on_conflict="user_profile_id,job_posting_id,channel",
+            on_conflict="user_id,job_posting_id,channel",
             ignore_duplicates=True,
         )
         .execute()
