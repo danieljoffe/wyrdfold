@@ -130,15 +130,9 @@ def seeded_export_user(
     service_client.table("scores").insert(
         {"job_posting_id": job_id, "target_id": followed, "score": 80}
     ).execute()
-    profile_id = (
-        service_client.table("user_profiles")
-        .select("id")
-        .eq("user_id", uid_a)
-        .execute()
-        .data[0]["id"]
-    )
+    # Keyed by the auth uid since R3 §2 (#557) — no profile-surrogate lookup.
     service_client.table("notifications_sent").insert(
-        {"user_profile_id": profile_id, "job_posting_id": job_id, "score_at_send": 80}
+        {"user_id": uid_a, "job_posting_id": job_id, "score_at_send": 80}
     ).execute()
     path = f"{uid_a}/export-int-test.pdf"
     service_client.storage.from_(_BUCKET).upload(
@@ -285,7 +279,12 @@ async def test_rls_backstop_blocks_cross_user_export(
         "llm_costs",
     ):
         assert stolen[table] == [], f"{table}: leaked to another user's client"
-    # No profile row visible -> the notifications_sent service read never runs.
-    assert "notifications_sent" not in stolen
+    # notifications_sent can only be read with the service client (no
+    # authenticated grant), so RLS cannot be its backstop. The profile-
+    # visibility gate is: B's client sees no profile row for A, so the service
+    # read is skipped and B gets an empty list rather than A's alert history.
+    # Asserting the VALUE, not just the key's absence — after R3 §2 (#557) the
+    # key is always present, and "not in" would pass even if it were populated.
+    assert stolen["notifications_sent"] == [], "notifications_sent leaked cross-user"
     # And B's client cannot list A's Storage prefix.
     assert (await client_b.storage.from_(_BUCKET).list(uid_a) or []) == []

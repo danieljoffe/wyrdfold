@@ -772,7 +772,7 @@ export type Database = {
           job_posting_id: string;
           score_at_send: number;
           sent_at: string;
-          user_profile_id: string;
+          user_id: string;
         };
         Insert: {
           channel?: string;
@@ -781,7 +781,7 @@ export type Database = {
           job_posting_id: string;
           score_at_send: number;
           sent_at?: string;
-          user_profile_id: string;
+          user_id: string;
         };
         Update: {
           channel?: string;
@@ -790,7 +790,7 @@ export type Database = {
           job_posting_id?: string;
           score_at_send?: number;
           sent_at?: string;
-          user_profile_id?: string;
+          user_id?: string;
         };
         Relationships: [
           {
@@ -798,13 +798,6 @@ export type Database = {
             columns: ['job_posting_id'];
             isOneToOne: false;
             referencedRelation: 'jobs';
-            referencedColumns: ['id'];
-          },
-          {
-            foreignKeyName: 'job_notification_sent_user_profile_id_fkey';
-            columns: ['user_profile_id'];
-            isOneToOne: false;
-            referencedRelation: 'user_profiles';
             referencedColumns: ['id'];
           },
         ];
