@@ -171,7 +171,76 @@ async def test_start_scheduler_registers_only_activation_sweep_when_only_it_enab
     assert scheduler is not None
     try:
         assert scheduler.running is True
-        assert {j.id for j in scheduler.get_jobs()} == {"activation_sweep"}
+        # The catch-up anchor is NOT optional: IntervalTrigger counts from
+        # process start, so without it a near-daily deploy cadence can starve a
+        # 6h tick indefinitely (#244 — discovery ran once in six days).
+        assert {j.id for j in scheduler.get_jobs()} == {
+            "activation_sweep",
+            "activation_sweep_catchup",
+        }
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_every_ledger_stamped_interval_job_has_a_catch_up_anchor() -> None:
+    """Generalizes the bug this file keeps re-learning.
+
+    A job whose tick is measured in HOURS and whose cadence is persisted in
+    ``scheduler_runs`` must also register a ``<id>_catchup`` one-shot, or a
+    deploy that lands inside the interval silently resets the countdown. This
+    shipped wrong for ``activation_sweep`` (2026-08-11) exactly as it had for
+    ``discovery_run`` before it — so assert the property, not each instance.
+
+    ``poll_due_sources`` is deliberately exempt: it ticks in MINUTES, so a
+    deploy cannot starve it.
+    """
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = True
+        mock_settings.poll_tick_minutes = 30
+        mock_settings.url_health_check_enabled = True
+        mock_settings.url_health_tick_hours = 12
+        mock_settings.retention_purge_enabled = True
+        mock_settings.retention_purge_tick_hours = 24
+        mock_settings.discovery_scheduler_enabled = True
+        mock_settings.discovery_tick_hours = 24
+        mock_settings.recency_refresh_enabled = True
+        mock_settings.recency_refresh_tick_hours = 24
+        mock_settings.activation_sweep_enabled = True
+        mock_settings.activation_sweep_tick_hours = 6
+        mock_settings.activation_stale_after_hours = 6
+        scheduler = start_scheduler_if_enabled()
+
+    # Anchor id per hour-scale job. NOT an exemption list — a job absent from
+    # here fails below, so adding one forces a deliberate answer to "what
+    # re-anchors this after a deploy?". (`discovery_run` predates the shared
+    # `_anchor_job_from_ledger` and keeps its own bespoke anchor, hence the
+    # non-uniform name.)
+    expected_anchor = {
+        "url_health_check": "url_health_check_catchup",
+        "retention_purge": "retention_purge_catchup",
+        "recency_refresh": "recency_refresh_catchup",
+        "discovery_run": "discovery_catchup",
+        "activation_sweep": "activation_sweep_catchup",
+    }
+
+    assert scheduler is not None
+    try:
+        ids = {j.id for j in scheduler.get_jobs()}
+        # `poll_due_sources` ticks in MINUTES — a deploy cannot starve it.
+        hourly = {i for i in ids if i != "poll_due_sources" and not i.endswith("_catchup")}
+        # Sanity: if this found nothing the assertions below would pass vacuously.
+        assert len(hourly) >= 5, hourly
+
+        undeclared = sorted(hourly - expected_anchor.keys())
+        assert not undeclared, (
+            "hour-scale scheduled job(s) with no declared catch-up anchor. "
+            "IntervalTrigger counts from PROCESS START and this app deploys "
+            "near-daily, so an un-anchored tick can go indefinitely without "
+            f"firing (#244): {undeclared}"
+        )
+        unregistered = sorted(job_id for job_id in hourly if expected_anchor[job_id] not in ids)
+        assert not unregistered, f"declared catch-up anchor(s) never registered: {unregistered}"
     finally:
         scheduler.shutdown(wait=False)
 
