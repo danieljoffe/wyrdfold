@@ -1277,6 +1277,8 @@ export type Database = {
       };
       targets: {
         Row: {
+          activation_error: string | null;
+          activation_failed_at: string | null;
           activation_status: string;
           app_active: boolean;
           created_at: string | null;
@@ -1297,6 +1299,8 @@ export type Database = {
           updated_at: string | null;
         };
         Insert: {
+          activation_error?: string | null;
+          activation_failed_at?: string | null;
           activation_status?: string;
           app_active?: boolean;
           created_at?: string | null;
@@ -1317,6 +1321,8 @@ export type Database = {
           updated_at?: string | null;
         };
         Update: {
+          activation_error?: string | null;
+          activation_failed_at?: string | null;
           activation_status?: string;
           app_active?: boolean;
           created_at?: string | null;

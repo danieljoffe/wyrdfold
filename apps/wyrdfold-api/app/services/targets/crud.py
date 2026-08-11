@@ -56,6 +56,8 @@ def _parse_target(row: dict[str, Any]) -> JobTarget:
         scoring_profile=ScoringProfile.model_validate(row.get("scoring_profile") or {}),
         search_keywords=row.get("search_keywords") or [],
         activation_status=row.get("activation_status") or "idle",
+        activation_error=row.get("activation_error"),
+        activation_failed_at=row.get("activation_failed_at"),
         profile_version=row.get("profile_version", 1),
         app_active=row["app_active"],
         example_promising_titles=row.get("example_promising_titles") or [],
@@ -84,6 +86,8 @@ def _summarize_target(row: dict[str, Any]) -> JobTargetSummary:
         description=row.get("description"),
         normalized_label=row.get("normalized_label"),
         activation_status=row.get("activation_status") or "idle",
+        activation_error=row.get("activation_error"),
+        activation_failed_at=row.get("activation_failed_at"),
         profile_version=row.get("profile_version", 1),
         app_active=row["app_active"],
         seniority_hint=row.get("seniority_hint"),
@@ -336,7 +340,16 @@ def get_all(supabase: Client) -> list[JobTarget]:
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
+def build_update_fields(payload: TargetUpdate) -> dict[str, Any]:
+    """Map a ``TargetUpdate`` partial onto the column dict to write.
+
+    THE one field mapping. ``crud.update`` (sync, for seed/operator callers),
+    ``routers.targets._update_target_async`` and ``from_input._update`` were
+    three byte-identical copies of this; the activation-failure invariant below
+    has to hold on every write path, so it lives here rather than in triplicate.
+
+    ``None`` on the partial means "don't touch the column".
+    """
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
         updates["label"] = payload.label
@@ -349,6 +362,17 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["search_keywords"] = payload.search_keywords
     if payload.activation_status is not None:
         updates["activation_status"] = payload.activation_status
+        # INVARIANT (#649): the failure context is meaningful only while the row
+        # is in `error`. Writing `error` stamps the reason + time; ANY other
+        # transition clears both. That is what makes re-activation a real retry
+        # path — the pipeline reaching `deriving`/`polling`/`ready` wipes the
+        # previous failure without every call site having to remember to.
+        if payload.activation_status == "error":
+            updates["activation_error"] = payload.activation_error
+            updates["activation_failed_at"] = datetime.now(UTC).isoformat()
+        else:
+            updates["activation_error"] = None
+            updates["activation_failed_at"] = None
     if payload.app_active is not None:
         updates["app_active"] = payload.app_active
     if payload.profile_version is not None:
@@ -366,6 +390,11 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["domain_hints"] = payload.domain_hints
     if payload.role_family is not None:
         updates["role_family"] = payload.role_family
+    return updates
+
+
+def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
+    updates = build_update_fields(payload)
 
     resp = supabase.table(TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
