@@ -12,6 +12,25 @@ concurrency:
 permissions:
   contents: read
 
+# ⚠️ RENAMING A JOB BELOW IS A BREAKING CHANGE. Each of these six `name:`
+# values is a required status check *context* in BOTH branch rulesets —
+# protect:develop (id 17940940) and protect:main (id 17940939):
+#
+#   JS — lint, typecheck, test, build
+#   Python — wyrdfold-api
+#   E2E — public + authed specs (Playwright)
+#   Lighthouse — public CWV / a11y
+#   Image scan — Trivy
+#   RLS — integration (live Supabase)
+#
+# GitHub matches contexts by display name, so a rename here must land together
+# with the matching `context` edit in BOTH rulesets — otherwise every PR blocks
+# forever on a check that never reports, and any PR opened before the rename
+# stays blocked until its branch is updated. Read the live contexts with:
+#
+#   env -u GITHUB_TOKEN gh api repos/danieljoffe/wyrdfold/rulesets/17940940 \
+#     -q '.rules[]? | select(.type=="required_status_checks")
+#         | .parameters.required_status_checks[].context'
 jobs:
   # Detect whether the PR touches anything other than docs (*.md / docs/ /
   # .claude/). The heavy jobs below gate on this, so a docs-only PR skips the
@@ -115,10 +134,11 @@ jobs:
         run: pnpm nx run-many -t lint typecheck test build --exclude=wyrdfold-api --nxBail
 
   e2e:
-    # NOTE: the job name is a required check in the protect:develop ruleset —
-    # renaming it needs a ruleset edit first. It now runs the FULL tier
-    # (public + authed) despite the name.
-    name: E2E — public specs (Playwright)
+    # Runs the FULL Playwright tier: 17 public-chromium tests plus `setup` +
+    # 17 authed-chromium tests, against the throwaway local Supabase stack
+    # booted below. The old name ("E2E — public specs") predated the authed
+    # tier and misled a release review into thinking authed specs were ungated.
+    name: E2E — public + authed specs (Playwright)
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
