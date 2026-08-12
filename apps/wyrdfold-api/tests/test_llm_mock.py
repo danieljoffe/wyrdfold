@@ -297,6 +297,41 @@ def test_ats_hostile_resume_is_schema_valid_but_fails_the_real_linter() -> None:
     assert any(v.code == "no_tables" and v.severity == "error" for v in result.errors)
 
 
+@pytest.mark.asyncio
+async def test_country_name_job_fit_survives_the_real_parse_path() -> None:
+    """Bug-corpus entry for #693: a grader response that is right everywhere
+    except one field's FORMAT must not cost the whole grade.
+
+    Driven through the real ``complete_json`` + ``JobFitResult`` path, not a
+    direct model construction — the bug lived in the one-shot validation of
+    the whole payload, so validating the model alone would miss the thing that
+    actually broke (a surface would think it was covered while the real parse
+    still died).
+    """
+    from app.services.fit.job_fit import JobFitResult
+    from app.services.llm.client import complete_json
+    from app.services.llm.mock import country_name_job_fit_json
+
+    client = MockLLMClient(scripted={"fit.job": country_name_job_fit_json()})
+    parsed, _result = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="grade this",
+        messages=[Message(role="user", content="jd")],
+        schema=JobFitResult,
+        purpose="fit.job",
+    )
+
+    # The grade survives — and the malformed field is normalized, not dropped.
+    assert parsed.fit_score == 82
+    assert parsed.axes.title_fit == 95
+    assert parsed.logistics is not None
+    assert parsed.logistics.location_country == "IN"
+    # The rest of the payload is untouched by normalization.
+    assert parsed.logistics.location_city == "Bengaluru"
+    assert parsed.logistics.remote_status == "hybrid"
+
+
 def _dev_optimized():
     from app.models.experience import OptimizedPayload, Outcome, Role, Skill
 
