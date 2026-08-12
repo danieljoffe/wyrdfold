@@ -27,6 +27,7 @@ import {
   formatStatus,
   JOB_STATUSES,
   STATUS_DOT_CLASS,
+  postedAt,
   type AnalysisStatus,
   type JobAnalysis,
   type JobPosting,
@@ -123,51 +124,133 @@ function FitAxisList({ axes }: { axes: Record<string, number> }) {
 
 function ScoreBreakdownList({
   breakdown,
+  rawScore,
+  displayedScore,
+  postedAtIso,
 }: {
   breakdown: Record<string, number>;
+  /** Undecayed fit. Absent on responses predating #665's projection. */
+  rawScore: number | null | undefined;
+  /** What the card actually shows — fit × freshness. */
+  displayedScore: number;
+  postedAtIso: string;
 }) {
-  const entries = Object.entries(breakdown).filter(([, v]) => v !== 0);
+  // #650: the old list rendered RAW keyword points and hid zeros, so "+80"
+  // and "+4" sat under a headline of 60 with no stated relationship. Two
+  // different unit changes separate those numbers:
+  //   components (raw points) → fit% (÷ this target's max) → × freshness
+  // Show the whole chain so the panel reconciles to the number on the card.
+  const entries = Object.entries(breakdown);
   if (entries.length === 0) {
     return <Text variant='meta'>No factors contributed to this score</Text>;
   }
-  const max = Math.max(...entries.map(([, v]) => Math.abs(v)));
+
+  const rawTotal = entries.reduce((sum, [, v]) => sum + v, 0);
+  // Apportion the fit score across components by their share of the raw
+  // total. Derived from the two numbers we already have rather than
+  // re-deriving the normalizer client-side — the server owns that formula.
+  const canApportion =
+    typeof rawScore === 'number' && rawScore > 0 && rawTotal > 0;
+  const shareOf = (value: number) =>
+    canApportion ? (value / rawTotal) * rawScore : value;
+
+  // The freshness multiplier is OBSERVABLE (displayed ÷ fit), so the decay
+  // formula is never duplicated here — if the server changes it, this follows.
+  const freshness =
+    typeof rawScore === 'number' && rawScore > 0
+      ? displayedScore / rawScore
+      : 1;
+  const ageDays = Math.max(
+    0,
+    Math.round((Date.now() - new Date(postedAtIso).getTime()) / 86_400_000)
+  );
+
+  // Bars are a share of the FIT total, not of the largest entry — the old
+  // max-of-present scale made the biggest component full-width by definition,
+  // implying a denominator that did not exist.
+  const barBase = canApportion
+    ? rawScore
+    : Math.max(...entries.map(([, v]) => Math.abs(v)));
+
   return (
-    <ul className='flex flex-col gap-2'>
-      {entries.map(([key, value]) => {
-        const pct = max === 0 ? 0 : (Math.abs(value) / max) * 100;
-        const positive = value > 0;
-        const display = Number.isInteger(value)
-          ? value
-          : Number(value.toFixed(1));
-        return (
-          <li key={key} className='flex flex-col gap-1'>
-            <div className='flex items-baseline justify-between gap-3'>
-              <span className='text-sm text-text-primary'>
-                {formatFactor(key)}
-              </span>
-              <span
-                className={cn(
-                  'text-xs font-medium tabular-nums shrink-0',
-                  positive ? 'text-success' : 'text-error'
-                )}
-              >
-                {positive ? '+' : ''}
-                {display}
-              </span>
-            </div>
-            <div className='h-1.5 w-full overflow-hidden rounded-full bg-surface-elevated'>
-              <div
-                className={cn(
-                  'h-full rounded-full',
-                  positive ? 'bg-success' : 'bg-error/70'
-                )}
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+    <div className='flex flex-col gap-2'>
+      <ul className='flex flex-col gap-2'>
+        {entries.map(([key, value]) => {
+          const shown = shareOf(value);
+          const pct =
+            barBase === 0
+              ? 0
+              : Math.min(100, (Math.abs(shown) / barBase) * 100);
+          const positive = shown > 0;
+          const display = Number.isInteger(shown)
+            ? shown
+            : Number(shown.toFixed(1));
+          return (
+            <li key={key} className='flex flex-col gap-1'>
+              <div className='flex items-baseline justify-between gap-3'>
+                <span
+                  className={cn(
+                    'text-sm',
+                    // A zero component is the most actionable signal on the
+                    // card ("domain skills scored nothing") — it is shown, but
+                    // muted so it does not compete with what did contribute.
+                    shown === 0 ? 'text-text-tertiary' : 'text-text-primary'
+                  )}
+                >
+                  {formatFactor(key)}
+                </span>
+                <span
+                  className={cn(
+                    'shrink-0 text-xs font-medium tabular-nums',
+                    shown === 0
+                      ? 'text-text-tertiary'
+                      : positive
+                        ? 'text-text-secondary'
+                        : 'text-error'
+                  )}
+                >
+                  {display}
+                </span>
+              </div>
+              <div className='h-1.5 w-full rounded bg-surface-tertiary'>
+                <div
+                  className={cn(
+                    'h-1.5 rounded',
+                    positive ? 'bg-brand-500' : 'bg-error'
+                  )}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+
+      {canApportion && (
+        <dl className='flex flex-col gap-1 border-t border-border pt-2 text-xs'>
+          <div className='flex items-baseline justify-between gap-3'>
+            <dt className='text-text-secondary'>Fit against this target</dt>
+            <dd className='tabular-nums font-medium text-text-primary'>
+              {rawScore}
+            </dd>
+          </div>
+          <div className='flex items-baseline justify-between gap-3'>
+            <dt className='text-text-tertiary'>
+              Freshness{ageDays > 0 ? ` (posted ${ageDays}d ago)` : ''}
+            </dt>
+            <dd className='tabular-nums text-text-tertiary'>
+              ×{freshness.toFixed(2)}
+            </dd>
+          </div>
+          <div className='flex items-baseline justify-between gap-3 border-t border-border pt-1'>
+            <dt className='text-text-secondary'>Score shown</dt>
+            <dd className='tabular-nums font-medium text-text-primary'>
+              {displayedScore}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </div>
   );
 }
 
@@ -643,7 +726,12 @@ export default function JobDetailPanel({
           ) : axesPending ? (
             <Skeleton variant='text' lines={3} />
           ) : breakdown ? (
-            <ScoreBreakdownList breakdown={breakdown} />
+            <ScoreBreakdownList
+              breakdown={breakdown}
+              rawScore={posting.raw_score}
+              displayedScore={posting.score}
+              postedAtIso={postedAt(posting)}
+            />
           ) : (
             <Skeleton variant='text' lines={3} />
           )}
