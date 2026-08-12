@@ -208,37 +208,129 @@ async def _held_advisory_locks(supabase: AsyncClient) -> dict[int, dict[str, Any
     return held
 
 
-async def _openrouter_remaining_usd(
-    client: httpx.AsyncClient | None = None,
-) -> float | None:
-    """Remaining spendable USD on the operator's OpenRouter key.
+@dataclass(frozen=True)
+class OpenRouterBudget:
+    """What OpenRouter itself says about the operator's spend.
 
-    Prefers the key's own budget (``/v1/key`` → ``limit_remaining``); a key
-    with no per-key limit falls back to the account balance (``/v1/credits``
-    → total_credits - total_usage). Returns None when neither is available.
-    ``client`` is an injection seam for tests (httpx.MockTransport); prod
-    callers let it default.
+    Every number here comes FROM OpenRouter — none is derived from our own
+    ``llm_costs`` ledger. That distinction is the point of this type: the
+    ledger records only calls that completed successfully, so a generation
+    that is billed and then fails downstream (a model answering in prose
+    instead of calling the tool, say) is spent money we never recorded.
+    Using it to answer "how much is left" therefore reads optimistic exactly
+    when things are going wrong. Two independent limits can bind:
+
+    * the KEY's own cap (``limit`` / ``limit_remaining``), which may reset on
+      a schedule — a daily cap self-heals at the boundary; and
+    * the ACCOUNT balance (credits purchased minus used), which does not.
+
+    They fail identically (403) but have opposite remedies, so an alarm that
+    cannot tell them apart sends the operator to the wrong place. Observed
+    2026-08-12: a $10/day key cap exhausted while the account still had
+    $6.69, and the alarm said "top up credits".
+    """
+
+    key_remaining: float | None = None
+    key_limit: float | None = None
+    key_limit_reset: str | None = None
+    account_remaining: float | None = None
+    usage_daily: float | None = None
+    usage_weekly: float | None = None
+
+    @property
+    def remaining(self) -> float | None:
+        """The BINDING constraint — whichever limit runs out first."""
+        candidates = [v for v in (self.key_remaining, self.account_remaining) if v is not None]
+        return min(candidates) if candidates else None
+
+    @property
+    def binding_limit(self) -> Literal["key", "account"] | None:
+        """Which limit is the binding one, so the alert can name its remedy."""
+        if self.key_remaining is None and self.account_remaining is None:
+            return None
+        if self.account_remaining is None:
+            return "key"
+        if self.key_remaining is None:
+            return "account"
+        return "key" if self.key_remaining <= self.account_remaining else "account"
+
+    @property
+    def daily_rate(self) -> float | None:
+        """Trailing spend/day, from OpenRouter's own weekly total."""
+        return self.usage_weekly / 7.0 if self.usage_weekly is not None else None
+
+    def remedy(self) -> str:
+        """The action that actually clears THIS limit."""
+        if self.binding_limit == "key":
+            reset = f", resets {self.key_limit_reset}" if self.key_limit_reset else ""
+            cap = f"${self.key_limit:.2f}" if self.key_limit is not None else "the key cap"
+            return (
+                f"the KEY's own {cap} cap is exhausted{reset} — raise it at "
+                f"https://openrouter.ai/settings/keys (topping up credits will NOT clear this)"
+            )
+        return "the ACCOUNT balance is low — top up at https://openrouter.ai/settings/credits"
+
+
+async def _openrouter_budget(client: httpx.AsyncClient | None = None) -> OpenRouterBudget:
+    """Read the operator's spend picture straight from OpenRouter.
+
+    ``/v1/key`` already carries ``usage_daily`` / ``usage_weekly`` alongside
+    ``limit_remaining``; this reads all of them from the ONE request the
+    health check was already making. ``/v1/credits`` adds the account balance,
+    which the key endpoint never reports.
+
+    Fail-soft per source: whichever call succeeds contributes its fields, and
+    a total failure yields an empty budget (the caller then skips the check
+    rather than alarming on missing data).
     """
     headers = {"Authorization": f"Bearer {settings.openrouter_api_key}"}
     owned = client is None
     http = client or httpx.AsyncClient(timeout=10.0)
+    key_data: dict[str, Any] = {}
+    credit_data: dict[str, Any] = {}
+    failures: list[Exception] = []
     try:
-        resp = await http.get(_OPENROUTER_KEY_URL, headers=headers)
-        resp.raise_for_status()
-        key_data = (resp.json() or {}).get("data") or {}
-        remaining = key_data.get("limit_remaining")
-        if remaining is not None:
-            return float(remaining)
-        resp = await http.get(_OPENROUTER_CREDITS_URL, headers=headers)
-        resp.raise_for_status()
-        credit_data = (resp.json() or {}).get("data") or {}
-        credits, usage = credit_data.get("total_credits"), credit_data.get("total_usage")
-        if credits is None or usage is None:
-            return None
-        return float(credits) - float(usage)
+        for url, sink in ((_OPENROUTER_KEY_URL, "key"), (_OPENROUTER_CREDITS_URL, "credits")):
+            try:
+                resp = await http.get(url, headers=headers)
+                resp.raise_for_status()
+                data = (resp.json() or {}).get("data") or {}
+                if sink == "key":
+                    key_data = data
+                else:
+                    credit_data = data
+            except Exception as exc:
+                logger.warning("ingestion health: OpenRouter /%s unreadable: %s", sink, exc)
+                failures.append(exc)
+        # One source down still yields a usable picture, so degrade rather than
+        # go blind. But if BOTH are down we know NOTHING — and returning an
+        # empty budget would read as "no limit breached", i.e. healthy. Raise so
+        # the caller's handler logs it; a swallowed probe failure is how a drain
+        # goes unnoticed, which is the whole reason this alarm exists.
+        if len(failures) == 2:
+            raise failures[0]
     finally:
         if owned:
             await http.aclose()
+
+    def _f(source: dict[str, Any], field: str) -> float | None:
+        value = source.get(field)
+        return float(value) if value is not None else None
+
+    account_remaining: float | None = None
+    credits, usage = _f(credit_data, "total_credits"), _f(credit_data, "total_usage")
+    if credits is not None and usage is not None:
+        account_remaining = credits - usage
+
+    reset = key_data.get("limit_reset")
+    return OpenRouterBudget(
+        key_remaining=_f(key_data, "limit_remaining"),
+        key_limit=_f(key_data, "limit"),
+        key_limit_reset=str(reset) if reset is not None else None,
+        account_remaining=account_remaining,
+        usage_daily=_f(key_data, "usage_daily"),
+        usage_weekly=_f(key_data, "usage_weekly"),
+    )
 
 
 async def check_ingestion_health(
@@ -356,13 +448,22 @@ async def check_ingestion_health(
         and (settings.llm_credit_min_runway_days > 0 or settings.llm_credit_min_remaining_usd > 0)
     ):
         try:
-            remaining = await _openrouter_remaining_usd()
+            budget = await _openrouter_budget()
+            remaining = budget.remaining
             report.credit_remaining_usd = remaining
             if remaining is not None:
-                week_spend = await cost_log.total_spend_all_async(
-                    supabase, moment - timedelta(days=7)
-                )
-                daily_rate = week_spend / 7.0
+                # Trailing rate from OpenRouter's OWN weekly total. It used to
+                # come from `llm_costs`, which mixed two sources that disagree:
+                # on 2026-08-12 the ledger said $3.01 spent for the day while
+                # OpenRouter said $10.00, so every runway estimate read long.
+                # Fall back to the ledger only when OpenRouter withholds the
+                # figure — a stale estimate beats no alarm.
+                daily_rate = budget.daily_rate
+                if daily_rate is None:
+                    week_spend = await cost_log.total_spend_all_async(
+                        supabase, moment - timedelta(days=7)
+                    )
+                    daily_rate = week_spend / 7.0
                 runway_days = remaining / daily_rate if daily_rate > 0 else None
                 report.credit_runway_days = runway_days
                 below_floor = (
@@ -377,12 +478,25 @@ async def check_ingestion_health(
                 if below_floor or below_runway:
                     report.low_credit = True
                     runway_txt = f"~{runway_days:.1f} day(s)" if runway_days is not None else "n/a"
+                    # Name the limit that actually bound AND its own remedy —
+                    # a key cap and an empty account both surface as 403 but
+                    # are cleared by different actions.
+                    other = (
+                        f" (account ${budget.account_remaining:.2f})"
+                        if budget.binding_limit == "key" and budget.account_remaining is not None
+                        else (
+                            f" (key ${budget.key_remaining:.2f})"
+                            if budget.binding_limit == "account"
+                            and budget.key_remaining is not None
+                            else ""
+                        )
+                    )
                     msg = (
                         f"ingestion health: LLM credit runway low — "
-                        f"${remaining:.2f} remaining on the OpenRouter key "
-                        f"({runway_txt} at the trailing ${daily_rate:.2f}/day). "
-                        f"Top up before the pipeline 402s: "
-                        f"https://openrouter.ai/settings/credits"
+                        f"${remaining:.2f} remaining on the "
+                        f"{budget.binding_limit or 'openrouter'} limit{other} "
+                        f"({runway_txt} at the trailing ${daily_rate:.2f}/day, "
+                        f"per OpenRouter). Before the pipeline 403s: {budget.remedy()}"
                     )
                     report.alerts.append(msg)
                     logger.error(msg)
