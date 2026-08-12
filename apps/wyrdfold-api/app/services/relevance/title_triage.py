@@ -59,6 +59,7 @@ from app.config import settings
 from app.models.llm import LLMResult, Message, ModelId
 from app.models.targets import JobTarget
 from app.services.llm.client import LLMClient, complete_json
+from app.services.llm.errors import LLMServiceError
 from app.services.llm.untrusted import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -366,7 +367,28 @@ async def triage_titles(
             max_tokens=10240,
             cache_system=True,
         )
+    except LLMServiceError as exc:
+        # A CLASSIFIED upstream condition — dead key, spent cap, rate limit —
+        # is expected and self-describing, so log one line and skip the stack.
+        # The trace is ~25 lines of our own call frames that say nothing the
+        # message doesn't, and it is emitted per target per batch per cycle:
+        # during the 2026-08-12 credit exhaustion that flood hit Railway's
+        # 500 logs/sec replica cap and DROPPED 101 messages, costing visibility
+        # exactly when it was most needed. Deferral semantics are unchanged.
+        logger.error(
+            "Phase 1 title triage unavailable for target %s (%s): %s: %s; "
+            "returning no verdicts — the poller DEFERS these un-attempted "
+            "titles (not admit)",
+            target.id,
+            target.label,
+            type(exc).__name__,
+            exc,
+        )
+        return {}, None
     except Exception:
+        # UNCLASSIFIED — something we have not seen before. Keep the full
+        # traceback: the volume argument above does not apply to a surprise.
+        #
         # Return ({}, None). The caller (poller) marks titles "attempted" only on
         # a real LLM result, so a failed call leaves them un-attempted → they
         # DEFER (re-triaged next cycle), NOT fail-open admit. A dead key / spent
