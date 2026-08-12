@@ -33,6 +33,9 @@ export interface JobTarget {
   scoring_profile: ScoringProfile;
   search_keywords: string[];
   activation_status: string;
+  /** See {@link JobTargetSummary.activation_error} (#649). */
+  activation_error?: string | null;
+  activation_failed_at?: string | null;
   profile_version: number;
   /** Instance-sponsorship floor (app-owned catalog / operator). Never
    * user-written; pipeline-active = app_active OR an active membership. */
@@ -113,6 +116,14 @@ export interface JobTargetSummary {
   description: string | null;
   normalized_label: string | null;
   activation_status: string;
+  /**
+   * Why the last activation failed, as a stable reason code (#649). Non-null
+   * only while `activation_status === 'error'` — the API clears it on every
+   * other transition, which is what makes re-activating a genuine retry.
+   * Legacy responses predating the column send `undefined`.
+   */
+  activation_error?: string | null;
+  activation_failed_at?: string | null;
   profile_version: number;
   app_active: boolean;
   seniority_hint: string | null;
@@ -154,6 +165,10 @@ export function toSummary(target: JobTarget): JobTargetSummary {
     description: target.description,
     normalized_label: target.normalized_label,
     activation_status: target.activation_status,
+    // Carried through so a reconcile after activate/deactivate doesn't drop
+    // the failure reason off a still-failed card (#649).
+    activation_error: target.activation_error ?? null,
+    activation_failed_at: target.activation_failed_at ?? null,
     profile_version: target.profile_version,
     app_active: target.app_active,
     seniority_hint: null,
@@ -278,4 +293,31 @@ export interface LearningRunResult {
   log: TargetLearningLogRow;
   applied: boolean;
   profile_version_after: number | null;
+}
+
+/**
+ * Human copy for an `activation_error` reason code (#649).
+ *
+ * The API persists a stable CODE rather than prose precisely so the wording
+ * lives here — the same failure can be phrased differently per surface without
+ * a migration. Codes come from `app/services/targets/activation.ActivationError`.
+ *
+ * Unknown / absent codes fall back to the generic line: an older row, or a code
+ * added server-side before this map caught up, must still render something
+ * useful rather than an empty card.
+ */
+const ACTIVATION_ERROR_COPY: Record<string, string> = {
+  no_experience_profile:
+    'We need your experience profile to build this target’s scoring profile.',
+  derive_timeout: 'Building the scoring profile took too long.',
+  pipeline_failed: 'Something went wrong on our end.',
+};
+
+export function activationErrorMessage(
+  code: string | null | undefined
+): string {
+  return (
+    (code ? ACTIVATION_ERROR_COPY[code] : undefined) ??
+    'Something went wrong on our end.'
+  );
 }
