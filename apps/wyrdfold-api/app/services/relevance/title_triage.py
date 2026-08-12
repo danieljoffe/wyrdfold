@@ -223,6 +223,14 @@ def admitted(verdict: TitleVerdict | None, *, min_confidence: int) -> bool:
     return verdict.confidence >= min_confidence
 
 
+# How many mismatched (title, prefix) pairs to log per call, and how much of
+# each string. The drops repeat every poll cycle, so a handful of examples is
+# enough to spot the pattern — logging all of them on every cycle would be
+# noise that gets filtered out, which is how this went undiagnosed (#652).
+_DROP_SAMPLE_LIMIT = 5
+_DROP_SAMPLE_CHARS = 80
+
+
 def _prefix_matches_title(title: str, prefix: str) -> bool:
     """Whether the model's echoed ``prefix`` is a leading fragment of ``title``.
 
@@ -379,22 +387,53 @@ async def triage_titles(
     # admitting an off-topic role and dropping a relevant one — so drop those
     # and let the caller fail-open (admit) instead.
     verdicts_by_id: dict[int, TitleVerdict] = {}
-    dropped = 0
+    # The two drop causes are counted SEPARATELY (#652). They were one counter,
+    # which made the failure undiagnosable: an out-of-range id means the model
+    # invented an index, while a prefix mismatch means it echoed text that is
+    # not a leading fragment of the title it was numbered against. Those have
+    # nothing to do with each other, and prod showed EXACTLY 7 drops per batch
+    # across six independent targets — a deterministic pattern the old log
+    # could not distinguish from sporadic model error.
+    out_of_range = 0
+    prefix_mismatch: list[tuple[int, str, str]] = []
     for v in parsed.verdicts:
-        if not (1 <= v.id <= len(titles)) or not _prefix_matches_title(
-            titles[v.id - 1], v.title_prefix
-        ):
-            dropped += 1
+        if not (1 <= v.id <= len(titles)):
+            out_of_range += 1
+            continue
+        title = titles[v.id - 1]
+        if not _prefix_matches_title(title, v.title_prefix):
+            prefix_mismatch.append((v.id, title, v.title_prefix))
             continue
         verdicts_by_id[v.id] = v
+
+    dropped = out_of_range + len(prefix_mismatch)
     if dropped:
         logger.warning(
-            "Phase 1 dropped %d/%d verdict(s) for target %s (%s) — id "
-            "out-of-range or echoed title_prefix didn't match the input title "
-            "(possible transposition); those titles fail-open (admit)",
+            "Phase 1 dropped %d/%d verdict(s) for target %s (%s) — "
+            "%d id out-of-range, %d title_prefix mismatch; those titles "
+            "fail-open (admit)",
             dropped,
             len(parsed.verdicts),
             target.id,
             target.label,
+            out_of_range,
+            len(prefix_mismatch),
+        )
+    if prefix_mismatch:
+        # The actual (title, prefix) pairs — the payload #652 needed and the
+        # only way to tell WHY a prefix failed (abbreviation? punctuation?
+        # unicode? a genuinely transposed id?). Bounded to a sample: the drops
+        # repeat every cycle, so a few examples reveal the pattern without
+        # flooding the log.
+        logger.warning(
+            "Phase 1 title_prefix mismatches for target %s (%s) — sample %d/%d: %s",
+            target.id,
+            target.label,
+            min(len(prefix_mismatch), _DROP_SAMPLE_LIMIT),
+            len(prefix_mismatch),
+            "; ".join(
+                f"id={i} title={t[:_DROP_SAMPLE_CHARS]!r} prefix={pfx[:_DROP_SAMPLE_CHARS]!r}"
+                for i, t, pfx in prefix_mismatch[:_DROP_SAMPLE_LIMIT]
+            ),
         )
     return verdicts_by_id, result
