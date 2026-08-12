@@ -15,6 +15,7 @@ Mocks the LLM client and asserts:
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +29,7 @@ from app.models.targets import (
     SeniorityProfile,
 )
 from app.services.relevance.title_triage import (
+    _DROP_SAMPLE_LIMIT,
     PHASE1_BATCH_SIZE,
     TitleTriageResponse,
     TitleVerdict,
@@ -465,3 +467,108 @@ async def test_triage_defaults_to_configured_phase1_model(monkeypatch) -> None:
     monkeypatch.setattr("app.services.relevance.title_triage.complete_json", _fake_complete_json)
     await triage_titles(MagicMock(), target=_target(), titles=["Senior Frontend Engineer"])
     assert captured["model"] == "deepseek-v3-2"
+
+
+class TestDropDiagnostics:
+    """#652: the drop log named a COUNT and nothing else.
+
+    Prod showed exactly 7 drops per batch across six independent targets — a
+    deterministic pattern — but the log could not say which titles, what the
+    model echoed, or even which of the two causes fired. That is what made the
+    issue's own title ("undiagnosable from logs") literally true.
+    """
+
+    @pytest.mark.asyncio
+    async def test_logs_the_title_and_prefix_of_each_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        llm = MagicMock()
+
+        async def fake_complete_json(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        # Faithful echo — kept.
+                        TitleVerdict(id=1, promising=True, title_prefix="Senior Front"),
+                        # The abbreviation-vs-expansion shape that would explain a
+                        # deterministic drop count: the model normalizes the title
+                        # instead of copying its leading characters.
+                        TitleVerdict(id=2, promising=True, title_prefix="Senior Software"),
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake_complete_json)
+
+        with caplog.at_level(logging.WARNING):
+            verdicts, _ = await triage_titles(
+                llm,
+                target=_target(),
+                titles=["Senior Frontend Engineer", "Sr. Software Engineer"],
+            )
+
+        assert set(verdicts.keys()) == {1}  # the mismatch is dropped, as before
+        text = caplog.text
+        # The payload the issue needed: BOTH sides of the failed comparison, so
+        # the cause is readable straight off the log line.
+        assert "Sr. Software Engineer" in text
+        assert "Senior Software" in text
+
+    @pytest.mark.asyncio
+    async def test_separates_out_of_range_from_prefix_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The two causes were one counter. An invented index and a badly
+        echoed prefix are unrelated failures with unrelated fixes — collapsing
+        them is what hid the pattern."""
+        llm = MagicMock()
+
+        async def fake_complete_json(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        TitleVerdict(id=99, promising=True),  # out of range
+                        TitleVerdict(id=1, promising=True, title_prefix="Nope"),
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake_complete_json)
+
+        with caplog.at_level(logging.WARNING):
+            await triage_titles(llm, target=_target(), titles=["Senior Frontend"])
+
+        assert "1 id out-of-range" in caplog.text
+        assert "1 title_prefix mismatch" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sample_is_bounded_so_a_bad_batch_cannot_flood_the_log(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The drops repeat every poll cycle; logging all of them each time is
+        the kind of noise that gets filtered out and re-hides the problem."""
+        llm = MagicMock()
+        titles = [f"Engineer {i}" for i in range(20)]
+
+        async def fake_complete_json(*args: object, **kwargs: object) -> object:
+            return (
+                TitleTriageResponse(
+                    verdicts=[
+                        TitleVerdict(id=i + 1, promising=True, title_prefix="XXX")
+                        for i in range(20)
+                    ]
+                ),
+                MagicMock(),
+            )
+
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", fake_complete_json)
+
+        with caplog.at_level(logging.WARNING):
+            await triage_titles(llm, target=_target(), titles=titles)
+
+        # All 20 are counted; only the sample limit is spelled out.
+        assert "20 title_prefix mismatch" in caplog.text
+        assert f"sample {_DROP_SAMPLE_LIMIT}/20" in caplog.text
+        assert caplog.text.count("prefix='XXX'") == _DROP_SAMPLE_LIMIT
