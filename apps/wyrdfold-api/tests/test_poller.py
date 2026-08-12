@@ -16,6 +16,7 @@ from app.services.poller import (
     _title_matches_target,
 )
 from app.services.standard_job import StandardJob
+from tests.support.fake_phase1_store import FakePhase1RejectionsTable
 
 
 def _make_target(core_keywords: dict[str, int]) -> JobTarget:
@@ -435,7 +436,8 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
 
     Returns ``(supabase, jobs_table, sources_table)`` so tests can assert
     on the archive UPDATE (jobs table) separately from the
-    ``last_polled_at`` stamp (sources table).
+    ``last_polled_at`` stamp (sources table). The stateful Phase-1
+    rejection store fake rides along as ``supabase._phase1_rejections``.
     """
     jobs_table = MagicMock()
     # Admit path (e.g. the budget re-check tests): a triaged-in job upserts,
@@ -463,13 +465,16 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
     (
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
+    phase1_rejections_table = FakePhase1RejectionsTable()
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
         "user_targets": user_targets_table,
         "scores": scores_table,
+        "phase1_rejections": phase1_rejections_table,
     }[name]
+    supabase._phase1_rejections = phase1_rejections_table
 
     # #93: both the existing-rows read and the stale-archive write are
     # server-side RPCs now, so route ``supabase.rpc(name, ...)`` by name:
@@ -1033,13 +1038,16 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
     (
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
+    phase1_rejections_table = FakePhase1RejectionsTable()
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
         "sources": sources_table,
         "user_targets": user_targets_table,
         "scores": scores_table,
+        "phase1_rejections": phase1_rejections_table,
     }[name]
+    supabase._phase1_rejections = phase1_rejections_table
     # #93: the legacy Stage 3 score pre-fetch (``_batch_fetch_job_scores``)
     # is the ``get_job_scores_by_ids`` RPC now, not ``jobs.select().in_()``.
     # Default it to an empty score set; tests override as needed.
@@ -2044,56 +2052,84 @@ def _wire_rejection_cache_poll(monkeypatch, *, ttl_hours: float):
 
 
 @pytest.mark.asyncio
-async def test_phase1_rejection_cache_skips_llm_on_next_cycle(monkeypatch):
+async def test_phase1_rejection_store_skips_llm_on_next_cycle(monkeypatch):
     """A title the LLM rejected must NOT be re-sent on the next cycle while
-    the TTL holds: the cache re-injects a synthetic reject, so the job is
+    the TTL holds: the store re-injects a synthetic reject, so the job is
     still dropped from the upsert (rejected, not budget-deferred) but the
-    verdict is free the second time."""
-    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+    verdict is free the second time.
+
+    The memory lives in the ``phase1_rejections`` table (the stateful fake),
+    not in any module state — each ``run()`` rebuilds every in-process
+    object, so the second cycle here is equivalent to a post-deploy cycle.
+    The in-process dict this store replaced passed the two-cycles-one-process
+    version of this test while silently re-billing the fleet on every
+    restart."""
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
 
     first = await run()
     assert first["error"] is None
     assert fake_triage.await_count == 1
     assert fake_triage.await_args.kwargs["titles"] == ["Brand New Role"]
     assert first["new"] == 0  # rejected → never ingested
+    assert first["phase1_store_misses"] == 1
+    # Precondition for the second-cycle assert: the rejection was PERSISTED
+    # (normalized key, this target, this profile version). Without this row
+    # the skip below would pass vacuously on a store that never writes.
+    store = supabase._phase1_rejections
+    assert (target.id, target.profile_version, "brand new role") in store.rows
 
     second = await run()
     assert second["error"] is None
-    assert fake_triage.await_count == 1  # cache hit — LLM not consulted again
+    assert fake_triage.await_count == 1  # store hit — LLM not consulted again
     assert second["new"] == 0  # still rejected, still not ingested
+    assert second["phase1_store_hits"] == 1
+    assert second["phase1_store_misses"] == 0
 
 
 @pytest.mark.asyncio
-async def test_phase1_rejection_cache_disabled_at_zero_ttl(monkeypatch):
-    """``phase1_rejection_ttl_hours=0`` restores the legacy behavior: every
-    cycle re-pays the verdict."""
-    _supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
+async def test_phase1_rejection_store_disabled_at_zero_ttl(monkeypatch):
+    """``phase1_rejection_ttl_hours=0`` disables the store: every cycle
+    re-pays the verdict and nothing is read from or written to the table."""
+    supabase, fake_triage, _target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
 
     await run()
     await run()
     assert fake_triage.await_count == 2
+    store = supabase._phase1_rejections
+    assert store.rows == {}
+    assert store.select_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_phase1_rejection_cache_keyed_on_profile_version(monkeypatch):
-    """A profile edit bumps ``profile_version``; cached rejections under the
-    old profile must not gag the new one — the title is re-judged."""
+async def test_phase1_rejection_store_keyed_on_profile_version(monkeypatch, caplog):
+    """A profile edit bumps ``profile_version``; persisted rejections under
+    the old profile must not gag the new one — the title is re-judged.
+
+    The store fail-opens (all-misses) on read errors, so "LLM called again"
+    alone can't distinguish a key mismatch from a broken read path — hence
+    the no-warning assert: the miss must be a CLEAN one."""
     from app.services import poller as poller_mod
 
-    _supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
 
     await run()
     assert fake_triage.await_count == 1
+    # Sabotage guard: the old-profile rejection IS in the store — the
+    # re-judge below must come from key mismatch, not from an empty table.
+    store = supabase._phase1_rejections
+    assert (target.id, target.profile_version, "brand new role") in store.rows
 
     edited = target.model_copy(update={"profile_version": target.profile_version + 1})
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[edited]))
-    await run()
+    with caplog.at_level("WARNING"):
+        await run()
     assert fake_triage.await_count == 2  # new profile → fresh verdict
+    assert not [r for r in caplog.records if "rejection store" in r.message]
 
 
 @pytest.mark.asyncio
-async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
-    """Same cache on the activation path (``_poll_one_source_for_target``):
+async def test_targeted_phase1_rejection_store_skips_llm(monkeypatch):
+    """Same store on the activation path (``_poll_one_source_for_target``):
     the second pass over an unchanged board sends nothing to the LLM."""
     from app.config import settings as live_settings
     from app.services import poller as poller_mod
@@ -2118,74 +2154,18 @@ async def test_targeted_phase1_rejection_cache_skips_llm(monkeypatch):
     )
     assert first["error"] is None
     assert fake_triage.await_count == 1
+    # Precondition: the rejection persisted under this target's key — the
+    # second-pass skip must come from a store hit, not an accidental
+    # empty-candidate set.
+    store = supabase._phase1_rejections
+    assert (target.id, target.profile_version, "staff frontend engineer") in store.rows
 
     second = await poller_mod._poll_one_source_for_target(
         dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
     )
     assert second["error"] is None
-    assert fake_triage.await_count == 1  # cached rejection — no second call
-
-
-def test_phase1_rejection_helpers_roundtrip(monkeypatch):
-    """Unit contract of the cache helpers: keyed per (target, profile_version,
-    normalized title); an expired entry stops matching; TTL=0 records nothing."""
-    import time as time_mod
-
-    from app.config import settings as live_settings
-    from app.services import poller as poller_mod
-
-    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
-    target = _target_with_keywords({"brand": 3}, ["brand new role"])
-
-    poller_mod._phase1_record_rejection(target, "Brand  New Role")
-    # Whitespace/case-normalized title matches; other titles don't.
-    assert poller_mod._phase1_cached_rejection(target, "brand new role") is True
-    assert poller_mod._phase1_cached_rejection(target, "Other Role") is False
-    # Same title under a bumped profile_version is a different key.
-    edited = target.model_copy(update={"profile_version": target.profile_version + 1})
-    assert poller_mod._phase1_cached_rejection(edited, "brand new role") is False
-
-    # Force-expire the stored entry: it must stop matching.
-    key = poller_mod._phase1_rejection_key(target, "brand new role")
-    poller_mod._PHASE1_REJECTIONS[key] = time_mod.monotonic() - 1.0
-    assert poller_mod._phase1_cached_rejection(target, "brand new role") is False
-
-    # TTL=0: nothing is recorded, nothing matches.
-    poller_mod._PHASE1_REJECTIONS.clear()
-    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 0.0)
-    poller_mod._phase1_record_rejection(target, "brand new role")
-    assert poller_mod._PHASE1_REJECTIONS == {}
-
-
-def test_phase1_rejection_cache_size_bound(monkeypatch):
-    """At the hard cap the cache prunes expired entries first, and clears
-    outright when still full — it can grow stale-heavy but never unbounded."""
-    import time as time_mod
-
-    from app.config import settings as live_settings
-    from app.services import poller as poller_mod
-
-    monkeypatch.setattr(live_settings, "phase1_rejection_ttl_hours", 24.0)
-    monkeypatch.setattr(poller_mod, "_PHASE1_REJECTIONS_CAP", 2)
-    target = _target_with_keywords({"brand": 3}, ["brand new role"])
-
-    # Full of EXPIRED entries → pruned, then the new entry lands.
-    poller_mod._PHASE1_REJECTIONS.update(
-        {("t", 1, "a"): time_mod.monotonic() - 1, ("t", 1, "b"): time_mod.monotonic() - 1}
-    )
-    poller_mod._phase1_record_rejection(target, "fresh title")
-    assert list(poller_mod._PHASE1_REJECTIONS) == [
-        poller_mod._phase1_rejection_key(target, "fresh title")
-    ]
-
-    # Full of LIVE entries → blunt clear, then the new entry lands alone.
-    poller_mod._PHASE1_REJECTIONS.update(
-        {("t", 1, "a"): time_mod.monotonic() + 999, ("t", 1, "b"): time_mod.monotonic() + 999}
-    )
-    poller_mod._phase1_record_rejection(target, "another title")
-    assert list(poller_mod._PHASE1_REJECTIONS) == [
-        poller_mod._phase1_rejection_key(target, "another title")
-    ]
+    assert fake_triage.await_count == 1  # persisted rejection — no second call
+    assert second["phase1_store_hits"] == 1
 
 
 def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(

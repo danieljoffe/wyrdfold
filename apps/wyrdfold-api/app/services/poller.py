@@ -56,6 +56,11 @@ from app.services.qualification import (
 )
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import refresh_recency_scores_poll
+from app.services.relevance.rejection_store import (
+    fetch_rejected_titles,
+    normalize_title,
+    record_rejections,
+)
 from app.services.relevance.title_triage import (
     PHASE1_PURPOSE,
     TitleVerdict,
@@ -410,52 +415,17 @@ def _phase1_promising(
     return None
 
 
-# Phase-1 negative-verdict cache (#514 residual). A REJECTED candidate never
-# ingests, so its title re-enters triage every cycle and re-pays the LLM for
-# the same "no" at the source's poll cadence until the posting closes —
-# measured as the dominant LLM line item (17,843 title_triage calls / $8.34
-# per 7d, 2026-07-29). Remember rejections per (target, profile_version,
-# normalized title) for ``settings.phase1_rejection_ttl_hours``; a cache hit
+# Phase-1 negative-verdict memory (#514) lives in Postgres now
+# (``relevance.rejection_store`` / the ``phase1_rejections`` table). The
+# in-process TTL dict it replaces re-billed the entire standing rejected
+# corpus roughly daily — its 24h TTL guaranteed that by design, and Railway's
+# near-daily deploys wiped it anyway (measured 2026-08-12 as ~75-90% of
+# Phase-1 volume; see docs/plan-phase1-rejection-persistence.md). A store hit
 # re-injects a synthetic ``promising=False`` verdict, so every downstream
 # mechanism (attempted-set defer semantics, ``_any_target_admits``, Stage-2
 # floor writes) behaves exactly as if the LLM had re-said no. Admits are
 # never cached: an admitted job INGESTS, so known-ness already stops its
-# re-triage. Keyed on profile_version so a profile edit re-judges everything
-# under the new profile immediately. In-process only — the poller runs under
-# a fleet-wide advisory lock, so one process sees all cycles; a restart just
-# costs one extra verdict per title.
-_PHASE1_REJECTIONS: dict[tuple[str, int, str], float] = {}
-# Hard size bound. ~60k rejections is far beyond a day of fleet-wide triage
-# (~2.5k verdicts/day measured); hitting it means something is looping.
-_PHASE1_REJECTIONS_CAP = 60_000
-
-
-def _phase1_rejection_key(target: JobTarget, title: str) -> tuple[str, int, str]:
-    return (target.id, target.profile_version, " ".join(title.lower().split()))
-
-
-def _phase1_cached_rejection(target: JobTarget, title: str) -> bool:
-    """True iff this (target, title) was LLM-rejected within the TTL."""
-    if settings.phase1_rejection_ttl_hours <= 0:
-        return False
-    expiry = _PHASE1_REJECTIONS.get(_phase1_rejection_key(target, title))
-    return expiry is not None and expiry > time.monotonic()
-
-
-def _phase1_record_rejection(target: JobTarget, title: str) -> None:
-    if settings.phase1_rejection_ttl_hours <= 0:
-        return
-    if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
-        now = time.monotonic()
-        for key in [k for k, exp in _PHASE1_REJECTIONS.items() if exp <= now]:
-            del _PHASE1_REJECTIONS[key]
-        if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
-            # Still full of LIVE entries — blunt reset. Losing the cache
-            # costs extra verdicts, never correctness.
-            _PHASE1_REJECTIONS.clear()
-    _PHASE1_REJECTIONS[_phase1_rejection_key(target, title)] = (
-        time.monotonic() + settings.phase1_rejection_ttl_hours * 3600.0
-    )
+# re-triage.
 
 
 def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, str]:
@@ -1494,6 +1464,10 @@ async def _poll_one_source(
         "updated": 0,
         "archived": 0,
         "error": None,
+        # Negative-store consult counters (summed across targets); folded
+        # into one INFO line per cycle by ``poll_due_sources``.
+        "phase1_store_hits": 0,
+        "phase1_store_misses": 0,
     }
     company_name: str = source.get("company_name", "?")
 
@@ -1670,21 +1644,30 @@ async def _poll_one_source(
                 batch_cap = phase1_batch_size()
                 target_verdicts: dict[int, TitleVerdict] = {}
                 attempted_here: set[int] = set()
-                # Negative-verdict cache (#514): titles this target's LLM
-                # rejected within the TTL skip the model and re-enter as a
-                # synthetic promising=False verdict, marked attempted — the
-                # downstream gates treat them exactly like a fresh "no"
-                # (rejected, not budget-deferred). Only the remainder is
-                # actually sent.
+                # Negative-verdict store (#514, persistent): titles this
+                # target's LLM already rejected within the TTL skip the model
+                # and re-enter as a synthetic promising=False verdict, marked
+                # attempted — the downstream gates treat them exactly like a
+                # fresh "no" (rejected, not budget-deferred). Only the
+                # remainder is actually sent. One chunked read per
+                # (source, target); fail-open to the LLM on store errors.
+                cached_rejections = await fetch_rejected_titles(
+                    supabase, active_target, [j.title for _, j in triage_candidates]
+                )
                 send_candidates: list[tuple[int, StandardJob]] = []
                 for cand_idx, cand_job in triage_candidates:
-                    if _phase1_cached_rejection(active_target, cand_job.title):
+                    if normalize_title(cand_job.title) in cached_rejections:
                         global_idx = cand_idx + 1
                         target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
                         attempted_here.add(global_idx)
                     else:
                         send_candidates.append((cand_idx, cand_job))
+                summary["phase1_store_hits"] += len(triage_candidates) - len(send_candidates)
+                summary["phase1_store_misses"] += len(send_candidates)
                 titles = [job.title for _, job in send_candidates]
+                # Raw promising=False verdicts collected here persist in ONE
+                # write after the batch loop (budget breaks keep what stands).
+                rejected_now: list[tuple[str, int | None]] = []
                 for start in range(0, len(titles), batch_cap):
                     # Re-check the global daily cap before each batch (#60
                     # overspend fix). The per-cycle gate above trips the
@@ -1733,7 +1716,7 @@ async def _poll_one_source(
                     # Shift batch-local ids (1-based within the SENT subset)
                     # to global 1-based job indices via the send-candidate
                     # mapping. A raw promising=False lands in the negative
-                    # cache so the next cycle skips the model for this title.
+                    # store so future cycles skip the model for this title.
                     # Only outright rejections are cached — a low-confidence
                     # promising verdict may be gated out by ``admitted()``
                     # today, but the confidence threshold is a live setting
@@ -1745,9 +1728,11 @@ async def _poll_one_source(
                             global_idx = send_candidates[subset_pos][0] + 1
                             target_verdicts[global_idx] = verdict
                             if not verdict.promising:
-                                _phase1_record_rejection(
-                                    active_target, send_candidates[subset_pos][1].title
+                                rejected_now.append(
+                                    (send_candidates[subset_pos][1].title, verdict.confidence)
                                 )
+                if rejected_now:
+                    await record_rejections(supabase, active_target, rejected_now)
                 phase1_verdicts[active_target.id] = target_verdicts
                 phase1_attempted[active_target.id] = attempted_here
 
@@ -2956,6 +2941,13 @@ async def poll_due_sources(
         )
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
+    # Negative-store effectiveness, cycle-wide. One INFO line per cycle (not
+    # per source — the #702 log-storm lesson) makes the store's effect
+    # observable in prod: hits should dwarf misses once the corpus warms, and
+    # the count must PERSIST across a deploy — the in-process dict this
+    # replaced silently reset to all-misses on every release.
+    phase1_store_stats = {"hits": 0, "misses": 0}
+
     async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
             summary = await _poll_one_source_budgeted(
@@ -2968,8 +2960,17 @@ async def poll_due_sources(
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
+        phase1_store_stats["hits"] += summary.get("phase1_store_hits", 0)
+        phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
     await asyncio.gather(*(_worker(s) for s in due))
+    if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
+        logger.info(
+            "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the "
+            "model this cycle",
+            phase1_store_stats["hits"],
+            phase1_store_stats["misses"],
+        )
     return result
 
 
@@ -2990,7 +2991,14 @@ async def _poll_one_source_for_target(
     still ingesting fail-open — both resolved once by
     ``poll_sources_for_target``.
     """
-    summary: dict[str, Any] = {"polled": False, "new": 0, "updated": 0, "error": None}
+    summary: dict[str, Any] = {
+        "polled": False,
+        "new": 0,
+        "updated": 0,
+        "error": None,
+        "phase1_store_hits": 0,
+        "phase1_store_misses": 0,
+    }
     company_name: str = source.get("company_name", "?")
     # BYOK (#5 P3): grade on the payer's own key. Single payer here, but
     # memoized so Phase 1 and Phase 2/3 reuse one resolved client.
@@ -3071,19 +3079,25 @@ async def _poll_one_source_for_target(
             else None
         )
         if llm is not None:
-            # Negative-verdict cache (#514): titles this target's LLM already
-            # rejected within the TTL skip the model — synthetic
+            # Negative-verdict store (#514, persistent): titles this target's
+            # LLM already rejected within the TTL skip the model — synthetic
             # promising=False verdict, marked attempted (rejected, not
             # deferred). Same semantics as the scheduled path.
+            cached_rejections = await fetch_rejected_titles(
+                supabase, target, [j.title for _, j in triage_candidates]
+            )
             send_candidates: list[tuple[int, StandardJob]] = []
             for cand_idx, cand_job in triage_candidates:
-                if _phase1_cached_rejection(target, cand_job.title):
+                if normalize_title(cand_job.title) in cached_rejections:
                     global_idx = cand_idx + 1
                     target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
                     phase1_attempted.add(global_idx)
                 else:
                     send_candidates.append((cand_idx, cand_job))
+            summary["phase1_store_hits"] += len(triage_candidates) - len(send_candidates)
+            summary["phase1_store_misses"] += len(send_candidates)
             titles = [job.title for _, job in send_candidates]
+            rejected_now: list[tuple[str, int | None]] = []
             batch_cap = phase1_batch_size()
             for start in range(0, len(titles), batch_cap):
                 # Re-check the global daily cap before each batch (#60
@@ -3128,14 +3142,18 @@ async def _poll_one_source_for_target(
                         )
                 # Shift batch-local ids (1-based within the SENT subset)
                 # back to global 1-based job indices via the send-candidate
-                # mapping; raw rejections feed the negative cache (#514).
+                # mapping; raw rejections feed the negative store (#514).
                 for batch_idx, verdict in verdicts.items():
                     subset_pos = start + batch_idx - 1  # 0-based
                     if 0 <= subset_pos < len(send_candidates):
                         global_idx = send_candidates[subset_pos][0] + 1
                         target_verdicts[global_idx] = verdict
                         if not verdict.promising:
-                            _phase1_record_rejection(target, send_candidates[subset_pos][1].title)
+                            rejected_now.append(
+                                (send_candidates[subset_pos][1].title, verdict.confidence)
+                            )
+            if rejected_now:
+                await record_rejections(supabase, target, rejected_now)
 
         rows_to_upsert: list[dict[str, Any]] = []
         phase1_idx_by_external_id: dict[str, int] = {}
