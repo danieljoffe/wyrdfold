@@ -66,6 +66,14 @@ export interface JobPosting {
   location_remote?: boolean | null;
   absolute_url: string | null;
   score: number;
+  /**
+   * The UNDECAYED fit score. `score` is what the list shows and floors on —
+   * fit × freshness since #665 — so for anything past the 7-day grace the two
+   * differ. The detail panel needs both to show an honest chain from the
+   * keyword components down to the number on the card (#650).
+   * Optional: responses predating #665's projection omit it.
+   */
+  raw_score?: number | null;
   score_breakdown: Record<string, number> | null;
   /**
    * The fit grade's four axes (title/skills/seniority/domain, 0–100) for
