@@ -83,7 +83,7 @@ describe('JobDetailPanel', () => {
     expect(screen.getByText(/score breakdown/i)).toBeInTheDocument();
   });
 
-  it('renders one row per non-zero factor in the score breakdown (pending rows — graded rows show fit axes, #609)', () => {
+  it('renders one row per factor in the score breakdown, INCLUDING zeros (pending rows — graded rows show fit axes, #609/#650)', () => {
     render(
       <JobDetailPanel
         posting={makeJob({
@@ -109,7 +109,11 @@ describe('JobDetailPanel', () => {
     expect(screen.getByText(/technologies/i)).toBeInTheDocument();
     expect(screen.getByText(/penalties/i)).toBeInTheDocument();
     // Zero-valued factor must be hidden.
-    expect(screen.queryByText(/domain skills/i)).not.toBeInTheDocument();
+    // #650 CHANGED THIS CONTRACT. This previously asserted a zero component
+    // was HIDDEN. "Domain skills scored 0" is arguably the most actionable
+    // signal on the card — the user cannot act on a gap they cannot see — so
+    // zeros now render (muted, so they do not compete with contributors).
+    expect(screen.getByText(/domain skills/i)).toBeInTheDocument();
   });
 
   it('renders the "Open full view" link when viewFullHref is provided', () => {
