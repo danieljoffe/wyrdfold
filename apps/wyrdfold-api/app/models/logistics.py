@@ -20,10 +20,55 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 RemoteStatus = Literal["remote", "hybrid", "onsite", "unspecified"]
 SalaryUnit = Literal["year", "hour"]
+
+# Country NAME → ISO 3166-1 alpha-2, for the occasional grader response that
+# writes the name instead of the code.
+#
+# The column's vocabulary is alpha-2 and the grader nearly always honours it —
+# all 2,027 populated prod rows are codes (AE, AL, …, ZA). But "nearly" is not
+# a guarantee: on 2026-08-11 one response returned "India", and because
+# ``complete_json`` validates the WHOLE payload in one shot, a single 5-char
+# string took out the entire fit-score call (#693). Normalizing here keeps the
+# tight column contract while making that class of slip survivable.
+#
+# Keys are the country forms that actually occur in ``jobs.country`` (the
+# deterministic location parser's display vocabulary), so the two conventions
+# meet here rather than drifting further apart. Anything NOT in this map still
+# fails ``max_length`` — a genuinely unrecognized string is a real problem and
+# should stay loud.
+_COUNTRY_NAME_TO_ALPHA2: dict[str, str] = {
+    "australia": "AU",
+    "brazil": "BR",
+    "canada": "CA",
+    "colombia": "CO",
+    "costa rica": "CR",
+    "france": "FR",
+    "germany": "DE",
+    "hungary": "HU",
+    "india": "IN",
+    "ireland": "IE",
+    "italy": "IT",
+    "japan": "JP",
+    "malaysia": "MY",
+    "mexico": "MX",
+    "netherlands": "NL",
+    "new zealand": "NZ",
+    "philippines": "PH",
+    "poland": "PL",
+    "portugal": "PT",
+    "singapore": "SG",
+    "spain": "ES",
+    "ukraine": "UA",
+    # Long forms of the two the parser abbreviates by display convention.
+    "united states": "US",
+    "united states of america": "US",
+    "united kingdom": "GB",
+    "great britain": "GB",
+}
 
 
 class LogisticsFilters(BaseModel):
@@ -54,6 +99,22 @@ class LogisticsFilters(BaseModel):
 
     location_city: str | None = Field(default=None, max_length=120)
     location_country: str | None = Field(default=None, max_length=4)
+
+    @field_validator("location_country", mode="before")
+    @classmethod
+    def _normalize_country(cls, value: object) -> object:
+        """Map a recognized country NAME onto its alpha-2 code (#693).
+
+        Runs BEFORE ``max_length``, so "India" becomes "IN" and validates
+        instead of failing the whole grader response. Values already in the
+        column's vocabulary pass through untouched; anything unrecognized is
+        left alone and still trips ``max_length`` — normalizing is for known
+        countries, not a licence to accept free text.
+        """
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        return _COUNTRY_NAME_TO_ALPHA2.get(stripped.casefold(), stripped)
 
     def has_any_signal(self) -> bool:
         """Whether this row carries any non-default information.
