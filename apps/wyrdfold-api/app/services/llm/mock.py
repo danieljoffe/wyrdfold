@@ -355,6 +355,48 @@ def ats_hostile_resume_json(contact_name: str = "Daniel Joffe") -> str:
     )
 
 
+def country_name_job_fit_json(country: str = "India") -> str:
+    """A ``JobFitResult`` whose ``logistics.location_country`` is a country
+    NAME instead of the ISO alpha-2 code the column takes.
+
+    Bug-corpus entry for #693, observed live in prod on 2026-08-11. The grader
+    is asked for an anchor location and normally emits codes — all 2,027
+    populated rows were alpha-2 — but one response returned ``"India"``.
+    Because ``complete_json`` validates the WHOLE payload in one shot, that
+    5-character string failed ``max_length=4`` and took out the entire
+    fit-score call: score, axes and reasoning all lost over one optional
+    field.
+
+    The subtlety worth preserving: everything else in this payload is
+    perfectly valid. A mock that returned obviously-broken JSON would exercise
+    the malformed-payload path instead of this one, which is a DIFFERENT
+    failure — the model honouring its contract everywhere except one field's
+    format. Scripting it lets a surface prove the normalization actually runs
+    rather than trusting that the grader always behaves.
+    """
+    return json.dumps(
+        {
+            "fit_score": 82,
+            "axes": {
+                "title_fit": 95,
+                "skills_fit": 80,
+                "seniority_fit": 85,
+                "domain_fit": 70,
+            },
+            "reasoning": (
+                'Title: the JD asks for "5+ years of React" and the profile '
+                "shows a decade of frontend delivery. Gap: no fintech domain."
+            ),
+            "logistics": {
+                "remote_status": "hybrid",
+                "location_city": "Bengaluru",
+                # The payload under test — a NAME where a code belongs.
+                "location_country": country,
+            },
+        }
+    )
+
+
 def dev_default_responses() -> dict[str, ResponseSource]:
     """Scripted responses seeded into the mock for LOCAL DEV / integration only
     (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data
