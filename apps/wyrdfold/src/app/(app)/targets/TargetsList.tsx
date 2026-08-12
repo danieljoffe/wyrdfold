@@ -161,6 +161,56 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     [toggleActive]
   );
 
+  // Ids with a retry request in flight — drives the button's spinner so a
+  // second click can't stack another activation on the same target.
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(() => new Set());
+
+  // #649: re-running the pipeline IS the retry — any non-error transition
+  // clears `activation_error` server-side, so there is no separate "clear"
+  // call. The optimistic flip to `deriving` matters as much as the POST: it
+  // seeds the poller below, so the card recovers on screen instead of sitting
+  // on a stale error until the user reloads.
+  const handleRetry = useCallback(
+    async (id: string) => {
+      setRetryingIds(prev => new Set(prev).add(id));
+      try {
+        const res = await fetch(`/api/targets/${id}/activate`, {
+          method: 'POST',
+        });
+        if (!res.ok)
+          throw new Error(await extractApiError(res, 'Retry failed'));
+        toast({ variant: 'success', title: 'Retrying activation' });
+        setTargets(prev =>
+          prev.map(t =>
+            t.target.id === id
+              ? {
+                  ...t,
+                  target: {
+                    ...t.target,
+                    activation_status: 'deriving',
+                    activation_error: null,
+                  },
+                }
+              : t
+          )
+        );
+        setDerivingIds(prev => new Set(prev).add(id));
+      } catch (err) {
+        toast({
+          variant: 'error',
+          title: err instanceof Error ? err.message : 'Retry failed',
+        });
+      } finally {
+        setRetryingIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [toast]
+  );
+
   // The card's Delete action stashes the target id and opens the confirm
   // modal; the actual DELETE runs once the user confirms below.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
@@ -574,6 +624,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 fitScore={user_target.fit_score}
                 fitScoreReasoning={user_target.fit_score_reasoning}
                 onActivate={handleActivate}
+                onRetry={id => void handleRetry(id)}
+                retrying={retryingIds.has(target.id)}
                 onDeactivate={handleDeactivate}
                 onDelete={handleDelete}
                 onViewJobs={handleViewJobs}
