@@ -6,10 +6,12 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import { Button } from '@danieljoffe/shared-ui/Button';
 import ScoreBadge from '@/components/ScoreBadge';
 import { LocalDate } from '@/components/LocalFormat';
 import { cn } from '@/lib/cn';
 import type { JobTargetSummary } from './types';
+import { activationErrorMessage } from './types';
 
 interface TargetCardProps {
   target: JobTargetSummary;
@@ -30,6 +32,10 @@ interface TargetCardProps {
   fitScore: number | null;
   fitScoreReasoning: string | null;
   onActivate: (id: string) => void;
+  /** Re-run the activation pipeline for a failed target (#649). */
+  onRetry: (id: string) => void;
+  /** True while this card's retry request is in flight. */
+  retrying: boolean;
   onDeactivate: (id: string) => void;
   onDelete: (id: string) => void;
   onViewJobs: (id: string) => void;
@@ -41,6 +47,8 @@ export default function TargetCard({
   fitScore,
   fitScoreReasoning,
   onActivate,
+  onRetry,
+  retrying,
   onDeactivate,
   onDelete,
   onViewJobs,
@@ -159,13 +167,35 @@ export default function TargetCard({
               Building…
             </span>
           ) : failed ? (
-            <span className='inline-flex items-center gap-1.5 text-xs text-error'>
-              <span
-                className='inline-block size-2 rounded-full bg-error'
-                aria-hidden
-              />
-              Derivation failed
-            </span>
+            // #649: the card used to say only "Derivation failed" — the same
+            // red dot whether the user needs to add their experience or a
+            // backend call blipped. The API now persists WHY, so say it, and
+            // offer the retry that re-activation already performs (any
+            // non-error transition clears the failure server-side).
+            <div className='flex w-full flex-col items-start gap-1.5'>
+              <span className='inline-flex items-start gap-1.5 text-xs text-error'>
+                <span
+                  className='mt-1 inline-block size-2 shrink-0 rounded-full bg-error'
+                  aria-hidden
+                />
+                <span>
+                  Activation failed —{' '}
+                  {activationErrorMessage(target.activation_error)}
+                </span>
+              </span>
+              <Button
+                variant='bare'
+                size='sm'
+                loading={retrying}
+                onClick={event => {
+                  // The whole card navigates on click; the retry must not.
+                  event.stopPropagation();
+                  onRetry(target.id);
+                }}
+              >
+                Retry
+              </Button>
+            </div>
           ) : (
             <span className='inline-flex items-center gap-1.5 text-xs text-text-secondary'>
               <span
