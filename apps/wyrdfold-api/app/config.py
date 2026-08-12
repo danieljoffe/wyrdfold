@@ -259,6 +259,12 @@ class Settings(BaseSettings):
     # §10 PR6). `query` is user input, so bounded retention is part of the
     # privacy posture; 90d covers funnel iteration. 0 = keep forever.
     search_events_retention_days: int = Field(default=90, ge=0)
+    # phase1_rejections.judged_at — the persistent Phase-1 negative-verdict
+    # store. Rows older than the read TTL (phase1_rejection_ttl_hours,
+    # default 60d) are dead weight the read path already ignores; sweep at
+    # TTL + slack so a TTL raise never races the sweep. Also collects rows
+    # stranded under stale profile_versions. 0 = keep forever.
+    phase1_rejections_retention_days: int = Field(default=90, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
@@ -599,19 +605,19 @@ class Settings(BaseSettings):
     # over-budget boards surface via the WARNING log = catalog-hygiene
     # candidates. Keep it well under poll_cycle_timeout_seconds. 0 disables.
     poll_source_budget_seconds: int = Field(default=300, ge=0)
-    # In-process TTL cache for Phase-1 REJECTED titles (#514 residual). A
-    # rejected candidate never ingests, so the same title re-enters triage
-    # every poll cycle and re-pays the LLM verdict at the source's cadence
-    # (~4h) until the posting closes. Measured 2026-07-29:
-    # relevance.title_triage = 17,843 calls / $8.34 over 7 days — the
-    # dominant LLM line item, mostly repeat verdicts on unchanged titles.
-    # A rejection is remembered per (target, profile_version, title) for
-    # this many hours; profile edits bump profile_version, which re-judges
-    # everything under the new profile immediately. In-memory only: a
-    # restart clears it (worst case = one extra verdict per title), and the
-    # poller holds a fleet-wide advisory lock so exactly one process polls.
-    # 0 disables.
-    phase1_rejection_ttl_hours: float = Field(default=24.0, ge=0.0)
+    # TTL for the persistent Phase-1 rejection store (#514; the
+    # ``phase1_rejections`` table — see
+    # docs/plan-phase1-rejection-persistence.md). A rejected candidate never
+    # ingests, so the same title re-enters triage every poll of its source
+    # until the posting closes; the store remembers the "no" per
+    # (target, profile_version, normalized title) so it isn't re-bought.
+    # Profile edits bump profile_version, which re-judges everything under
+    # the new profile immediately — the TTL exists only to bound staleness
+    # against prompt/model drift, NOT as the primary lifecycle. Its
+    # in-process predecessor defaulted to 24h and re-billed the entire
+    # standing rejected corpus daily (~75-90% of Phase-1 volume, measured
+    # 2026-08-12); 1440h = 60 days. 0 disables the store entirely.
+    phase1_rejection_ttl_hours: float = Field(default=1440.0, ge=0.0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,

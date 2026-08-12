@@ -65,7 +65,6 @@ _scrub_settings_env()
 def _clear_caches():
     """Prevent cross-test cache pollution from in-memory state."""
     from app.services.analysis import run_registry
-    from app.services.poller import _PHASE1_REJECTIONS
     from app.services.tailor import run_registry as tailor_run_registry
 
     job_list_cache.invalidate()
@@ -74,15 +73,13 @@ def _clear_caches():
     # kick dedup to 202 without spawning (LLM never called).
     run_registry.clear_all()
     tailor_run_registry.clear_all()
-    # Phase-1 negative-verdict cache (#514) is a module-level TTL dict; a
-    # rejection leaked from one poller test would silently skip the LLM in
-    # the next one.
-    _PHASE1_REJECTIONS.clear()
+    # The Phase-1 negative-verdict memory needs no clearing here anymore: it
+    # lives in Postgres (``phase1_rejections``), so tests see it only through
+    # the per-test supabase fake they build themselves.
     yield
     job_list_cache.invalidate()
     run_registry.clear_all()
     tailor_run_registry.clear_all()
-    _PHASE1_REJECTIONS.clear()
 
 
 @pytest.fixture(autouse=True)
