@@ -154,8 +154,8 @@ export default function ApiKeysCard() {
           </div>
         ) : !available ? (
           <Text variant='meta' className='text-text-tertiary'>
-            Bring-your-own-key isn’t enabled on this instance — it runs on the
-            operator’s keys.
+            Bring-your-own-key isn’t available on this server — AI features run
+            on WyrdFold’s hosted keys.
           </Text>
         ) : (
           <>

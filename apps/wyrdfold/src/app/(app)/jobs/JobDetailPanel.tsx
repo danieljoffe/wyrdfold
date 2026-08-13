@@ -816,14 +816,14 @@ export default function JobDetailPanel({
         {targetId && (
           <div>
             <div className='mb-1 flex items-center gap-2'>
-              <Text variant='caption'>LLM Analysis</Text>
+              <Text variant='caption'>Fit analysis</Text>
               {analyzing && (
                 <span
                   className='inline-flex items-center gap-1.5'
                   role='status'
                   aria-live='polite'
                 >
-                  <Spinner size='sm' aria-label='Running LLM analysis' />
+                  <Spinner size='sm' aria-label='Running fit analysis' />
                   <Text variant='meta'>Running… {analyzingElapsedS}s</Text>
                 </span>
               )}

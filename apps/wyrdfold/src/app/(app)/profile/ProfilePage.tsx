@@ -790,7 +790,8 @@ export default function ProfilePage() {
                     </Text>
                     {evidenceCount > 0 ? (
                       <Badge variant='default' size='sm'>
-                        {evidenceCount} evidence
+                        {evidenceCount} evidence{' '}
+                        {evidenceCount === 1 ? 'item' : 'items'}
                       </Badge>
                     ) : (
                       <Badge variant='error' size='sm'>

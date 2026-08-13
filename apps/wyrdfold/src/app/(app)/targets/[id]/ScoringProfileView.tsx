@@ -22,6 +22,13 @@ function weightBadgeVariant(w: number): 'default' | 'info' | 'brand' {
   return 'brand';
 }
 
+/** Category keys arrive as scoring-profile identifiers ("CORE_SKILLS");
+ *  render them as prose ("Core skills") — the key stays the wire value. */
+export function formatCategoryName(name: string): string {
+  const words = name.replace(/_/g, ' ').trim().toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 /**
  * Read-only presentation of a target's SHARED scoring profile.
  *
@@ -98,7 +105,7 @@ export default function ScoringProfileView({
               >
                 <div className='flex items-center justify-between gap-2'>
                   <Text variant='label' as='span'>
-                    {catName}
+                    {formatCategoryName(catName)}
                   </Text>
                   <Text variant='meta' className='text-text-secondary'>
                     Weight {cat.weight}

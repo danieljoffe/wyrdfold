@@ -54,7 +54,7 @@ describe('LlmUsageCard monthly allowance meter', () => {
     mockUsage({ spent_usd: 5, limit_usd: 10 });
     render(<LlmUsageCard />);
     const bar = await screen.findByRole('progressbar', {
-      name: /monthly allowance used/i,
+      name: /30-day allowance used/i,
     });
     expect(bar).toHaveAttribute('aria-valuenow', '50');
   });
@@ -66,7 +66,7 @@ describe('LlmUsageCard monthly allowance meter', () => {
     mockUsage({ spent_usd: 5, limit_usd: 0 });
     render(<LlmUsageCard />);
     const bar = await screen.findByRole('progressbar', {
-      name: /monthly allowance used/i,
+      name: /30-day allowance used/i,
     });
     expect(bar).toHaveAttribute('aria-valuenow', '0');
   });

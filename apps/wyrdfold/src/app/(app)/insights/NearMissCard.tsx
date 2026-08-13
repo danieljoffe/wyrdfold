@@ -77,9 +77,10 @@ export default function NearMissCard() {
         <div className='flex items-baseline gap-x-4 gap-y-1 flex-wrap'>
           <CardTitle as='h2'>Almost Matched</CardTitle>
           <Text variant='meta'>
-            Titles filtered out for you with low confidence over the last{' '}
-            {data?.window_days} days — if some look right, your target may be
-            reading narrower than you intend
+            Titles filtered out in the last {data?.window_days} days where the
+            match gate wasn&rsquo;t sure (% = how confident the rejection was).
+            If some look right, this target&rsquo;s scope may be narrower than
+            you intended.
           </Text>
         </div>
       </CardHeader>

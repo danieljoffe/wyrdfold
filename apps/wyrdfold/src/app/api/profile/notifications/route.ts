@@ -27,7 +27,7 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json(
       {
         detail:
-          'Email notifications are unavailable: the operator has not configured email provider credentials.',
+          "Email notifications aren't available on this server yet — check back soon.",
       },
       { status: 400 }
     );

@@ -82,7 +82,7 @@ export default function LlmUsageCard() {
           <>
             <div className='flex items-baseline justify-between'>
               <Text variant='caption' className='text-text-secondary'>
-                Monthly allowance
+                30-day allowance
               </Text>
               <Text variant='caption'>
                 ${usage.monthly.spent_usd.toFixed(2)} of $
@@ -100,7 +100,7 @@ export default function LlmUsageCard() {
                 usage.monthly.limit_usd
               )}
               size='md'
-              aria-label='Monthly allowance used'
+              aria-label='30-day allowance used'
             />
             <div className='flex items-baseline justify-between'>
               <Text variant='caption' className='text-text-secondary'>
@@ -112,9 +112,8 @@ export default function LlmUsageCard() {
             </div>
             {usage.monthly_resets_at && (
               <Text variant='caption' className='text-text-tertiary'>
-                Allowance frees up around{' '}
-                <LocalDate value={usage.monthly_resets_at} /> as usage rolls out
-                of the 30-day window.
+                Counts your last 30 days of AI usage — your oldest spend rolls
+                off around <LocalDate value={usage.monthly_resets_at} />.
               </Text>
             )}
           </>

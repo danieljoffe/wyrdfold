@@ -310,8 +310,8 @@ export default function LearningLogPanel({
           <div className='flex flex-col gap-0.5'>
             <CardTitle>Learning log</CardTitle>
             <Text variant='meta' as='span' className='text-text-secondary'>
-              Scoring-profile updates wyrdfold proposes from your relevant /
-              irrelevant feedback.
+              Scoring-profile updates WyrdFold proposes from your &ldquo;Great
+              match&rdquo; / &ldquo;Not for me&rdquo; feedback.
             </Text>
           </div>
           <Button
@@ -338,8 +338,9 @@ export default function LearningLogPanel({
           </Text>
         ) : rows.length === 0 ? (
           <Text variant='body' as='p' className='text-text-secondary'>
-            No learning activity yet. As you mark jobs relevant or irrelevant,
-            wyrdfold proposes scoring-profile updates here for your review.
+            No learning activity yet. As you rate jobs &ldquo;Great match&rdquo;
+            or &ldquo;Not for me&rdquo;, WyrdFold proposes scoring-profile
+            updates here for your review.
           </Text>
         ) : (
           <div className='flex flex-col gap-5'>
