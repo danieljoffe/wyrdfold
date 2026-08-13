@@ -10,6 +10,7 @@ import {
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
+import { smartTitleCase } from './smartTitleCase';
 import type { NearMissInsights } from './types';
 
 /**
@@ -95,7 +96,9 @@ export default function NearMissCard() {
                 {target.titles.map(t => (
                   <li key={t.title}>
                     <Badge variant='default' size='sm'>
-                      <span className='capitalize'>{t.title}</span>
+                      {/* The store only has title_norm (lowercased) — CSS
+                          `capitalize` mangled acronyms ("It", "Ai", "Iii"). */}
+                      <span>{smartTitleCase(t.title)}</span>
                       <span
                         className='ml-1.5 text-text-secondary tabular-nums'
                         aria-label={`rejected at ${t.confidence}% confidence`}
