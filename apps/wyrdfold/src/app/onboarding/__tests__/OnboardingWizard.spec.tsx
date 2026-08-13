@@ -333,10 +333,12 @@ describe('OnboardingWizard — Path A (resume + role)', () => {
       })
     );
 
-    // Path A has 6 steps; identity is index 1. ProgressBar: Math.round((2/6)*100) = 33.
+    // The counter excludes path-chooser (§A4): Path A counts 5 steps and
+    // identity is step 1 of 5. ProgressBar: Math.round((1/5)*100) = 20.
     const progressBar = screen.getByRole('progressbar');
     expect(progressBar).toHaveAttribute('aria-valuemax', '100');
-    expect(progressBar).toHaveAttribute('aria-valuenow', '33');
+    expect(progressBar).toHaveAttribute('aria-valuenow', '20');
+    expect(screen.getByText('Step 1 of 5')).toBeInTheDocument();
   });
 
   it('advances through identity -> upload-resume -> add-job -> pick-targets -> completion', async () => {
@@ -396,10 +398,12 @@ describe('OnboardingWizard — Path B (resume only)', () => {
     );
 
     expect(screen.getByTestId('identity-step-stub')).toBeInTheDocument();
-    // Path B has 5 steps; identity is index 1. ProgressBar: Math.round((2/5)*100) = 40.
+    // The counter excludes path-chooser (§A4): Path B counts 4 steps and
+    // identity is step 1 of 4. ProgressBar: Math.round((1/4)*100) = 25.
     const progressBar = screen.getByRole('progressbar');
     expect(progressBar).toHaveAttribute('aria-valuemax', '100');
-    expect(progressBar).toHaveAttribute('aria-valuenow', '40');
+    expect(progressBar).toHaveAttribute('aria-valuenow', '25');
+    expect(screen.getByText('Step 1 of 4')).toBeInTheDocument();
   });
 
   it('skips the add-job step and goes directly to pick-targets', async () => {

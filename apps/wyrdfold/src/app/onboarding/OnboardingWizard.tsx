@@ -95,7 +95,11 @@ export default function OnboardingWizard({
 
   const steps = selectedPath ? STEPS_BY_PATH[selectedPath] : ['path-chooser'];
   const stepIndex = steps.indexOf(currentStep);
-  const totalSteps = steps.length;
+  // The counter excludes 'path-chooser': it shows no counter itself, so
+  // counting it meant users entered at "Step 2 of 5" and never saw step 1
+  // (ux-sweep 2026-08-12 §A4). ``stepIndex`` is already 1-based over the
+  // remaining steps because 'path-chooser' occupies index 0.
+  const countedSteps = steps.length - 1;
 
   // Move focus to the new step content on transition
   useEffect(() => {
@@ -175,7 +179,7 @@ export default function OnboardingWizard({
           <Text variant='body' className='mt-2 text-text-secondary'>
             {currentStep === 'path-chooser'
               ? 'How would you like to get started?'
-              : `Step ${stepIndex + 1} of ${totalSteps}`}
+              : `Step ${stepIndex} of ${countedSteps}`}
           </Text>
           {currentStep === 'path-chooser' && (
             <Text
@@ -192,10 +196,10 @@ export default function OnboardingWizard({
         {selectedPath && currentStep !== 'completion' && (
           <div className='mb-8'>
             <ProgressBar
-              value={stepIndex + 1}
-              max={totalSteps}
+              value={stepIndex}
+              max={countedSteps}
               size='sm'
-              aria-label={`Step ${stepIndex + 1} of ${totalSteps}`}
+              aria-label={`Step ${stepIndex} of ${countedSteps}`}
             />
           </div>
         )}
