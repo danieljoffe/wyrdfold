@@ -44,13 +44,19 @@ jest.mock('../JobUrlInput', () => ({
     onComplete,
     onSkip,
   }: {
-    onComplete: (data?: { postingId: string; title: string | null }) => void;
+    onComplete: (data?: {
+      postingId: string;
+      title: string | null;
+      descriptionHtml: string | null;
+    }) => void;
     onSkip: () => void;
   }) => (
     <div data-testid='job-url-input-stub'>
       <button
         type='button'
-        onClick={() => onComplete({ postingId: 'p1', title: 'Eng' })}
+        onClick={() =>
+          onComplete({ postingId: 'p1', title: 'Eng', descriptionHtml: null })
+        }
       >
         job-complete
       </button>

@@ -123,6 +123,10 @@ class TestManualJobEndpoint:
         assert result.extraction_tier == "jsonld"
         assert result.extracted["title"] == "Senior Engineer"
         assert result.needs_manual_fields is False
+        # The JD body rides the response so the onboarding path-A tailor
+        # kick doesn't need GET /jobs/{id} (which 404s pre-scoring).
+        assert result.description_html is not None
+        assert "Build things" in result.description_html
 
         # Verify upsert was called with correct source_id (last upsert = jobs row)
         upsert_call = mock_supabase.table.return_value.upsert.call_args
@@ -285,6 +289,9 @@ class TestManualJobEndpoint:
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-3"
+        # No JD was extractable from the opaque page — the field must be
+        # None (not ""), so FE callers can gate the tailor kick on it.
+        assert result.description_html is None
 
     @pytest.mark.asyncio
     async def test_dedup_same_url(self, monkeypatch):

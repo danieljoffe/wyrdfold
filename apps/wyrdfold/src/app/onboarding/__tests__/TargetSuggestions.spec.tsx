@@ -72,7 +72,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
     expect(
@@ -89,7 +89,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
@@ -115,12 +115,6 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       if (u.includes('/activate')) {
         return Promise.resolve({ ok: true, json: async () => ({}) });
       }
-      if (u === '/api/jobs/p1') {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ description_html: '<p>Great job</p>' }),
-        });
-      }
       if (u.includes('/tailor/resume') && init?.method === 'POST') {
         return Promise.resolve({
           ok: true,
@@ -128,6 +122,66 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
         });
       }
       if (u.includes('/onboarding/complete')) {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      // Everything else — including GET /api/jobs/p1 — 404s, exactly like
+      // prod: the posting has no score row yet, so the detail endpoint
+      // can't serve it. The payoff must not depend on it.
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      });
+    });
+    const onComplete = jest.fn();
+
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        jobData={{
+          postingId: 'p1',
+          title: 'Eng',
+          descriptionHtml: '<p>Great job</p>',
+        }}
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockPush).toHaveBeenCalledWith('/jobs/p1/resume');
+    });
+    // The wizard's own completion flow is bypassed — the review page IS
+    // the completion.
+    expect(onComplete).not.toHaveBeenCalled();
+    const urls = (fetchMock.mock.calls as unknown[][]).map(([u]) => String(u));
+    // The onboarding-complete flag was confirmed before navigating (the
+    // redirect-loop guard).
+    expect(urls.some(u => u.includes('/onboarding/complete'))).toBe(true);
+    // The JD travels via jobData — no detail fetch (it would 404 until
+    // the background activation scores the posting).
+    expect(urls).not.toContain('/api/jobs/p1');
+    // The tailor kick used the threaded JD.
+    const tailorCall = (fetchMock.mock.calls as unknown[][]).find(([u]) =>
+      String(u).includes('/tailor/resume')
+    );
+    expect(
+      JSON.parse((tailorCall?.[1] as { body: string }).body)
+    ).toMatchObject({
+      job_description: '<p>Great job</p>',
+      job_posting_id: 'p1',
+    });
+  });
+
+  it('skips the resume draft entirely when no JD was extracted', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes('/from-posting/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 't1', label: 'Senior Engineer' }),
+        });
+      }
+      if (u.includes('/activate')) {
         return Promise.resolve({ ok: true, json: async () => ({}) });
       }
       return Promise.resolve({
@@ -142,20 +196,21 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={onComplete}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
-    await waitFor(() => {
-      expect(mockPush).toHaveBeenCalledWith('/jobs/p1/resume');
-    });
-    // The wizard's own completion flow is bypassed — the review page IS
-    // the completion.
-    expect(onComplete).not.toHaveBeenCalled();
-    // The onboarding-complete flag was confirmed before navigating (the
-    // redirect-loop guard).
+    await waitFor(
+      () => {
+        expect(onComplete).toHaveBeenCalled();
+      },
+      { timeout: 4000 }
+    );
+    // No JD → no tailor kick and no navigation; the normal completion
+    // flow takes over.
     const urls = (fetchMock.mock.calls as unknown[][]).map(([u]) => String(u));
-    expect(urls.some(u => u.includes('/onboarding/complete'))).toBe(true);
+    expect(urls.some(u => u.includes('/tailor/resume'))).toBe(false);
+    expect(mockPush).not.toHaveBeenCalled();
   });
 
   it('falls back to the completion flow when the resume draft fails', async () => {
@@ -167,7 +222,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
           json: async () => ({ id: 't1', label: 'Senior Engineer' }),
         });
       }
-      // Everything downstream (detail fetch, tailor) fails — e.g. LLM
+      // Everything downstream (the tailor kick) fails — e.g. LLM
       // budget or gap gate.
       return Promise.resolve({
         ok: false,
@@ -181,7 +236,11 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={onComplete}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{
+          postingId: 'p1',
+          title: 'Eng',
+          descriptionHtml: '<p>Great job</p>',
+        }}
       />
     );
 
@@ -208,7 +267,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
