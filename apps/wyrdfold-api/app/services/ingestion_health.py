@@ -84,6 +84,7 @@ class IngestionHealthReport:
     stale_discovery: bool = False
     credit_remaining_usd: float | None = None
     credit_runway_days: float | None = None
+    key_cap_fraction_used: float | None = None
     low_credit: bool = False
     held_advisory_locks: list[int] = field(default_factory=list)
     stale_poll_lock: bool = False
@@ -258,6 +259,31 @@ class OpenRouterBudget:
     def daily_rate(self) -> float | None:
         """Trailing spend/day, from OpenRouter's own weekly total."""
         return self.usage_weekly / 7.0 if self.usage_weekly is not None else None
+
+    @property
+    def key_resets(self) -> bool:
+        """Whether the key's cap self-heals on a schedule (daily/weekly/…).
+
+        A resetting cap must NOT feed the runway rule: "days of runway"
+        against a window that refills every day is structurally < the
+        threshold whenever cap ÷ trailing rate is (a $15/day cap at a
+        $5/day rate can never show 3 days), so the alarm would fire on
+        every tick forever — observed 2026-08-13, when the tick after the
+        cap was RAISED still alarmed. Permanent alarms train the operator
+        to ignore the one real one.
+        """
+        return self.key_limit_reset is not None
+
+    @property
+    def key_cap_fraction_used(self) -> float | None:
+        """Fraction of the key's current cap window already consumed.
+
+        Derived from ``limit_remaining``/``limit`` (not ``usage_daily``)
+        so it is correct for any reset schedule, not just daily.
+        """
+        if self.key_remaining is None or self.key_limit is None or self.key_limit <= 0:
+            return None
+        return 1.0 - (self.key_remaining / self.key_limit)
 
     def remedy(self) -> str:
         """The action that actually clears THIS limit."""
@@ -449,8 +475,77 @@ async def check_ingestion_health(
     ):
         try:
             budget = await _openrouter_budget()
-            remaining = budget.remaining
-            report.credit_remaining_usd = remaining
+            report.credit_remaining_usd = budget.remaining
+            report.key_cap_fraction_used = budget.key_cap_fraction_used
+
+            # --- 4a. Self-resetting key cap: fraction-consumed rule -------
+            # Runway-days is meaningless for a cap that refills on a
+            # schedule (see OpenRouterBudget.key_resets), so a resetting
+            # cap gets its own rule and stays OUT of 4b: warn once most of
+            # the window's budget is gone (still time to act), page at
+            # exhaustion. 2026-08-13: the old runway rule alarmed only at
+            # $0.00 — after grading was already dead — and again right
+            # after the cap was raised.
+            fraction = budget.key_cap_fraction_used
+            fraction_threshold = settings.llm_credit_key_cap_alert_fraction
+            if (
+                budget.key_resets
+                and fraction is not None
+                and fraction_threshold > 0
+                and fraction >= fraction_threshold
+            ):
+                report.low_credit = True
+                exhausted = budget.key_remaining is not None and budget.key_remaining <= 0
+                account_txt = (
+                    f" (account ${budget.account_remaining:.2f})"
+                    if budget.account_remaining is not None
+                    else ""
+                )
+                if exhausted:
+                    msg = (
+                        f"ingestion health: LLM key cap exhausted — "
+                        f"$0.00 of the key's cap remains{account_txt}. "
+                        f"{budget.remedy()}"
+                    )
+                    level: Literal["error", "warning"] = "error"
+                else:
+                    cap_txt = (
+                        f"${budget.key_limit:.2f}" if budget.key_limit is not None else "the"
+                    )
+                    left_txt = (
+                        f"${budget.key_remaining:.2f}"
+                        if budget.key_remaining is not None
+                        else "little"
+                    )
+                    msg = (
+                        f"ingestion health: LLM key cap nearly consumed — "
+                        f"{fraction:.0%} of the key's {cap_txt} cap used "
+                        f"(resets {budget.key_limit_reset}), {left_txt} left this "
+                        f"window{account_txt}. Raise the cap at "
+                        f"https://openrouter.ai/settings/keys before grading "
+                        f"stalls for the rest of the window."
+                    )
+                    level = "warning"
+                report.alerts.append(msg)
+                if level == "error":
+                    logger.error(msg)
+                else:
+                    logger.warning(msg)
+                _capture_alert(msg, level=level)
+
+            # --- 4b. Non-recovering balances: floor + runway rules --------
+            # The account balance never refills on its own; a NON-resetting
+            # key cap behaves the same. A resetting cap is excluded — its
+            # exhaustion self-heals at the window boundary and is 4a's job.
+            balance_candidates = [
+                v
+                for v in (
+                    budget.account_remaining,
+                    budget.key_remaining if not budget.key_resets else None,
+                )
+                if v is not None
+            ]
+            remaining = min(balance_candidates) if balance_candidates else None
             if remaining is not None:
                 # Trailing rate from OpenRouter's OWN weekly total. It used to
                 # come from `llm_costs`, which mixed two sources that disagree:
@@ -481,22 +576,34 @@ async def check_ingestion_health(
                     # Name the limit that actually bound AND its own remedy —
                     # a key cap and an empty account both surface as 403 but
                     # are cleared by different actions.
+                    binding = (
+                        "account"
+                        if budget.key_resets or budget.key_remaining is None
+                        else budget.binding_limit
+                    )
                     other = (
                         f" (account ${budget.account_remaining:.2f})"
-                        if budget.binding_limit == "key" and budget.account_remaining is not None
+                        if binding == "key" and budget.account_remaining is not None
                         else (
                             f" (key ${budget.key_remaining:.2f})"
-                            if budget.binding_limit == "account"
-                            and budget.key_remaining is not None
+                            if binding == "account" and budget.key_remaining is not None
                             else ""
+                        )
+                    )
+                    remedy = (
+                        budget.remedy()
+                        if binding == budget.binding_limit
+                        else (
+                            "the ACCOUNT balance is low — top up at "
+                            "https://openrouter.ai/settings/credits"
                         )
                     )
                     msg = (
                         f"ingestion health: LLM credit runway low — "
                         f"${remaining:.2f} remaining on the "
-                        f"{budget.binding_limit or 'openrouter'} limit{other} "
+                        f"{binding or 'openrouter'} limit{other} "
                         f"({runway_txt} at the trailing ${daily_rate:.2f}/day, "
-                        f"per OpenRouter). Before the pipeline 403s: {budget.remedy()}"
+                        f"per OpenRouter). Before the pipeline 403s: {remedy}"
                     )
                     report.alerts.append(msg)
                     logger.error(msg)
