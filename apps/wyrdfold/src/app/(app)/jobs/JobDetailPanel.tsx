@@ -269,6 +269,10 @@ export default function JobDetailPanel({
   const { deleteJob, deleting } = useJobDelete();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
+  // Whether the spend-free open probe (#634) has resolved. Gates the
+  // "Analyze fit" button so it doesn't flash on jobs whose cached
+  // scorecard is about to render.
+  const [cacheChecked, setCacheChecked] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzingStartedAt, setAnalyzingStartedAt] = useState<number | null>(
     null
@@ -360,150 +364,218 @@ export default function JobDetailPanel({
     return () => window.clearInterval(id);
   }, [analyzing, analyzingStartedAt]);
 
-  const runAnalysis = useCallback(async () => {
-    if (!targetId) return;
-    // Supersede any prior loop and mark this one active.
-    const token = {};
-    activeRunRef.current = token;
-    const alive = () => activeRunRef.current === token;
+  const runAnalysis = useCallback(
+    async (kick = true) => {
+      if (!targetId) return;
+      // Supersede any prior loop and mark this one active.
+      const token = {};
+      activeRunRef.current = token;
+      const alive = () => activeRunRef.current === token;
 
-    const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
+      const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
 
-    // A finished analysis record → render it + tell the parent to refetch.
-    // The backend blended the LLM score into the per-target ``scores`` row and
-    // flipped ``scoring_status`` to ``complete``, so the stale ``posting`` prop
-    // (keyword-only score) needs a re-GET to refresh the badge + breakdown.
-    const applyRecord = (record: JobAnalysis) => {
-      setAnalysis(record);
-      onAnalysisComplete?.();
-    };
+      // A finished analysis record → render it + tell the parent to refetch.
+      // The backend blended the LLM score into the per-target ``scores`` row and
+      // flipped ``scoring_status`` to ``complete``, so the stale ``posting`` prop
+      // (keyword-only score) needs a re-GET to refresh the badge + breakdown.
+      const applyRecord = (record: JobAnalysis) => {
+        setAnalysis(record);
+        onAnalysisComplete?.();
+      };
 
-    setAnalyzing(true);
-    setAnalyzingStartedAt(Date.now());
-    setAnalysisError(null);
-    setNeedsProfile(false);
-    try {
-      // Kick off (or fetch a cached) analysis. Non-blocking (#459): a cache
-      // miss returns 202 ``{status:"running"}`` and the LLM runs server-side in
-      // a detached task, so this POST returns in well under a second.
-      const res = await fetch(url, { method: 'POST' });
-      if (!alive()) return;
-      if (!res.ok) {
-        // ``no description`` (422) is a data gap, not a transient failure;
-        // everything else routes through extractApiError (which understands
-        // the structured ``llm_budget_exceeded`` 429).
-        const message = await extractApiError(res, 'Analysis failed');
-        if (alive()) {
-          setAnalysisError(
-            res.status === 422 && /no description/i.test(message)
-              ? 'Analysis skipped — this job posting has no description text.'
-              : message
-          );
-        }
-        return;
-      }
-
-      const kicked = (await res.json()) as
-        JobAnalysis | AnalysisStatus | { code?: string };
-      if (!alive()) return;
-
-      // ``no_profile`` is a setup state, not a failure — render the CTA (below)
-      // rather than a red error + doomed retry. (#105)
-      if ((kicked as { code?: string }).code === 'no_profile') {
-        setNeedsProfile(true);
-        return;
-      }
-      // Cache hit: the record came straight back — no polling needed.
-      if ('id' in kicked) {
-        applyRecord(kicked as JobAnalysis);
-        return;
-      }
-      // A run was already failed server-side (rare on a kick) — surface it.
-      if ((kicked as AnalysisStatus).status === 'error') {
-        setAnalysisError(
-          (kicked as AnalysisStatus).message ?? 'Analysis failed. Please retry.'
+      setAnalyzing(true);
+      setAnalyzingStartedAt(Date.now());
+      setAnalysisError(null);
+      setNeedsProfile(false);
+      try {
+        // ``kick`` (the default) is explicit user intent: POST kicks off (or
+        // fetches a cached) analysis. Non-blocking (#459): a cache miss returns
+        // 202 ``{status:"running"}`` and the LLM runs server-side in a detached
+        // task, so this POST returns in well under a second. ``kick=false`` is
+        // the spend-free open probe (#634) attaching to a run that is ALREADY
+        // in flight — a GET, so opening a panel can never buy an LLM call.
+        const res = await fetch(
+          url,
+          kick ? { method: 'POST' } : { method: 'GET' }
         );
-        return;
-      }
-
-      // Otherwise it's ``running``: poll GET until the analysis lands. The work
-      // continues + persists on the server regardless of this loop, so if the
-      // user navigates away (``alive()`` → false) nothing is lost — reopening
-      // the job hits the cache.
-      let reKicked = false;
-      for (let attempt = 0; attempt < ANALYSIS_MAX_POLLS; attempt += 1) {
-        await delay(ANALYSIS_POLL_INTERVAL_MS);
         if (!alive()) return;
-
-        const poll = await fetch(url, { method: 'GET' });
-        if (!alive()) return;
-        if (!poll.ok) {
-          setAnalysisError(await extractApiError(poll, 'Analysis failed'));
+        if (!res.ok) {
+          // ``no description`` (422) is a data gap, not a transient failure;
+          // everything else routes through extractApiError (which understands
+          // the structured ``llm_budget_exceeded`` 429).
+          const message = await extractApiError(res, 'Analysis failed');
+          if (alive()) {
+            setAnalysisError(
+              res.status === 422 && /no description/i.test(message)
+                ? 'Analysis skipped — this job posting has no description text.'
+                : message
+            );
+          }
           return;
         }
-        const data = (await poll.json()) as
+
+        const kicked = (await res.json()) as
           JobAnalysis | AnalysisStatus | { code?: string };
         if (!alive()) return;
 
+        // ``no_profile`` is a setup state, not a failure — render the CTA (below)
+        // rather than a red error + doomed retry. (#105)
+        if ((kicked as { code?: string }).code === 'no_profile') {
+          setNeedsProfile(true);
+          return;
+        }
+        // Cache hit: the record came straight back — no polling needed.
+        if ('id' in kicked) {
+          applyRecord(kicked as JobAnalysis);
+          return;
+        }
+        // A run was already failed server-side (rare on a kick) — surface it.
+        if ((kicked as AnalysisStatus).status === 'error') {
+          setAnalysisError(
+            (kicked as AnalysisStatus).message ??
+              'Analysis failed. Please retry.'
+          );
+          return;
+        }
+
+        // Otherwise it's ``running``: poll GET until the analysis lands. The work
+        // continues + persists on the server regardless of this loop, so if the
+        // user navigates away (``alive()`` → false) nothing is lost — reopening
+        // the job hits the cache.
+        //
+        // Attach mode (kick=false) starts with its re-kick already spent: if the
+        // watched run dies server-side, the panel hands back to the explicit
+        // retry button rather than paying for a run the user never asked for.
+        let reKicked = !kick;
+        for (let attempt = 0; attempt < ANALYSIS_MAX_POLLS; attempt += 1) {
+          await delay(ANALYSIS_POLL_INTERVAL_MS);
+          if (!alive()) return;
+
+          const poll = await fetch(url, { method: 'GET' });
+          if (!alive()) return;
+          if (!poll.ok) {
+            setAnalysisError(await extractApiError(poll, 'Analysis failed'));
+            return;
+          }
+          const data = (await poll.json()) as
+            JobAnalysis | AnalysisStatus | { code?: string };
+          if (!alive()) return;
+
+          if ((data as { code?: string }).code === 'no_profile') {
+            setNeedsProfile(true);
+            return;
+          }
+          if ('id' in data) {
+            applyRecord(data as JobAnalysis);
+            return;
+          }
+          const status = (data as AnalysisStatus).status;
+          if (status === 'error') {
+            setAnalysisError(
+              (data as AnalysisStatus).message ??
+                'Analysis failed. Please retry.'
+            );
+            return;
+          }
+          if (status === 'idle') {
+            // The server dropped the run (e.g. a deploy restarted the API
+            // mid-analysis). Re-kick once; if it happens again, hand back to a
+            // manual retry rather than looping forever.
+            if (reKicked) {
+              setAnalysisError('Analysis was interrupted. Please retry.');
+              return;
+            }
+            reKicked = true;
+            await fetch(url, { method: 'POST' });
+            continue;
+          }
+          // ``running`` → keep polling.
+        }
+        // Ran out of poll attempts without a result.
+        if (alive()) {
+          setAnalysisError(
+            'Analysis is taking longer than expected. Please retry.'
+          );
+        }
+      } catch {
+        if (alive()) setAnalysisError('Network error running analysis.');
+      } finally {
+        if (alive()) {
+          setAnalyzing(false);
+          setAnalyzingStartedAt(null);
+        }
+      }
+    },
+    [posting.id, targetId, onAnalysisComplete]
+  );
+
+  // Keep the latest runAnalysis reachable from the probe effect below without
+  // widening that effect's deps: runAnalysis's identity churns with the
+  // parent's ``onAnalysisComplete`` callback, and a probe keyed on it would
+  // reset + re-GET on every parent render instead of once per (job, target).
+  const runAnalysisRef = useRef(runAnalysis);
+  useEffect(() => {
+    runAnalysisRef.current = runAnalysis;
+  });
+
+  // Spend-free open (#634): opening the panel only READS. A cached record
+  // renders instantly; a run already in flight (kicked earlier, possibly from
+  // another surface) is attached to; a cache miss leaves the explicit
+  // "Analyze fit" button. The auto-kick this replaces bought a ~$0.04 LLM run
+  // plus a ~30s wait on every first open of a (job, target, version) with no
+  // user intent — browsing must cost nothing until the user asks.
+  useEffect(() => {
+    if (!targetId) return;
+    // New (job, target) identity — clear the previous one's states.
+    setAnalysis(null);
+    setAnalysisError(null);
+    setNeedsProfile(false);
+    setCacheChecked(false);
+    const token = {};
+    activeRunRef.current = token;
+    const alive = () => activeRunRef.current === token;
+    const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
+    void (async () => {
+      try {
+        const res = await fetch(url, { method: 'GET' });
+        // A failed read-only probe just leaves the button — opening the
+        // panel must never surface an error the user didn't cause.
+        if (!alive() || !res.ok) return;
+        const data = (await res.json()) as
+          JobAnalysis | AnalysisStatus | { code?: string };
+        if (!alive()) return;
         if ((data as { code?: string }).code === 'no_profile') {
           setNeedsProfile(true);
           return;
         }
         if ('id' in data) {
-          applyRecord(data as JobAnalysis);
+          // Cached record: render WITHOUT onAnalysisComplete — the score
+          // blend happened on the run that produced it, so refetching the
+          // posting on every open would be a wasted round-trip.
+          setAnalysis(data as JobAnalysis);
           return;
         }
         const status = (data as AnalysisStatus).status;
+        if (status === 'running') {
+          // Already paid for and in flight — attach; never POST from here.
+          setCacheChecked(true);
+          void runAnalysisRef.current(false);
+          return;
+        }
         if (status === 'error') {
+          // A prior run failed server-side: surface it with the retry button.
           setAnalysisError(
             (data as AnalysisStatus).message ?? 'Analysis failed. Please retry.'
           );
-          return;
         }
-        if (status === 'idle') {
-          // The server dropped the run (e.g. a deploy restarted the API
-          // mid-analysis). Re-kick once; if it happens again, hand back to a
-          // manual retry rather than looping forever.
-          if (reKicked) {
-            setAnalysisError('Analysis was interrupted. Please retry.');
-            return;
-          }
-          reKicked = true;
-          await fetch(url, { method: 'POST' });
-          continue;
-        }
-        // ``running`` → keep polling.
+        // ``idle`` → nothing cached, nothing running: the Analyze button.
+      } catch {
+        // Network error on the read-only probe → the button.
+      } finally {
+        if (alive()) setCacheChecked(true);
       }
-      // Ran out of poll attempts without a result.
-      if (alive()) {
-        setAnalysisError(
-          'Analysis is taking longer than expected. Please retry.'
-        );
-      }
-    } catch {
-      if (alive()) setAnalysisError('Network error running analysis.');
-    } finally {
-      if (alive()) {
-        setAnalyzing(false);
-        setAnalyzingStartedAt(null);
-      }
-    }
-  }, [posting.id, targetId, onAnalysisComplete]);
-
-  // Auto-trigger analysis on first open when a target is selected.
-  // Cache hit returns instantly; cache miss runs the LLM exactly once
-  // per (job, target, optimized version).
-  useEffect(() => {
-    if (
-      targetId &&
-      !analysis &&
-      !analyzing &&
-      !analysisError &&
-      !needsProfile
-    ) {
-      runAnalysis();
-    }
-  }, [targetId, analysis, analyzing, analysisError, needsProfile, runAnalysis]);
+    })();
+  }, [posting.id, targetId]);
 
   async function handleDelete() {
     if (await deleteJob(posting.id)) {
@@ -828,20 +900,30 @@ export default function JobDetailPanel({
                   Set up your profile →
                 </Link>
               </div>
+            ) : !cacheChecked ? (
+              // The sub-second cache probe is still in flight — don't flash
+              // the Analyze button at a job whose cached scorecard is about
+              // to render.
+              <div className='h-4 w-3/4 rounded-xs bg-surface-elevated animate-pulse motion-reduce:animate-none' />
             ) : (
-              <div>
-                {analysisError && (
-                  <Text variant='error' className='mb-2'>
-                    {analysisError}
+              // Spend-free open (#634): nothing cached — analysis runs only
+              // on this explicit click, never as a side effect of browsing.
+              <div className='space-y-2'>
+                {analysisError ? (
+                  <Text variant='error'>{analysisError}</Text>
+                ) : (
+                  <Text variant='body' className='text-text-secondary'>
+                    See how you match this job — skills, seniority, and domain
+                    fit, graded against your experience profile.
                   </Text>
                 )}
                 <Button
                   name='analyze-job'
                   variant='secondary'
                   size='sm'
-                  onClick={runAnalysis}
+                  onClick={() => void runAnalysis()}
                 >
-                  Retry analysis
+                  {analysisError ? 'Retry analysis' : 'Analyze fit'}
                 </Button>
               </div>
             )}

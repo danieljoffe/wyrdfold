@@ -95,7 +95,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         const first = targets.find(t => t.user_target.is_active);
         if (!cancelled && first) setFallbackTargetId(first.target.id);
       } catch {
-        // Non-critical — analysis section just won't auto-trigger
+        // Non-critical — without a target the analysis section stays hidden
       }
     }
     loadTargets();
