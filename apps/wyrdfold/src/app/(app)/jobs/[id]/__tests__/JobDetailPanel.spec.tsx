@@ -1,6 +1,12 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import JobDetailPanel from '../../JobDetailPanel';
 import type { JobPosting } from '../../types';
 
@@ -167,10 +173,9 @@ describe('JobDetailPanel', () => {
         });
       }
       if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
-        // ``targetId`` triggers an auto-fire LLM analysis useEffect.
-        // Short-circuit with a non-200 so it sets analysisError once
-        // and stops re-trying — the panel still renders the resume
-        // section under it, which is what we're asserting.
+        // ``targetId`` triggers the spend-free open probe (#634). A failed
+        // probe just leaves the Analyze button — the panel still renders
+        // the resume section under it, which is what we're asserting.
         return Promise.resolve({
           ok: false,
           status: 503,
@@ -199,12 +204,13 @@ describe('JobDetailPanel', () => {
   });
 
   it('renders a "set up your profile" CTA (not a raw error / retry) when analysis returns a no_profile marker (#105)', async () => {
-    // The panel auto-fires the LLM analysis on open. For a user without an
-    // experience profile the backend returns a 200 empty-state marker
-    // (``{code:'no_profile'}``) — a 200, not a 404, so the auto-fire doesn't
-    // log a console error. The panel must render a setup CTA — never leak the
-    // old "…POST /experience/derive first." dev message, and never offer a
-    // "Retry analysis" that can't succeed.
+    // The panel probes the analysis cache on open (spend-free GET, #634).
+    // For a user without an experience profile the backend returns a 200
+    // empty-state marker (``{code:'no_profile'}``) — a 200, not a 404, so the
+    // probe doesn't log a console error. The panel must render a setup CTA —
+    // never leak the old "…POST /experience/derive first." dev message, never
+    // offer a "Retry analysis" that can't succeed, and never an Analyze
+    // button that would 200 back to this same marker.
     const noProfile = {
       code: 'no_profile',
       message: 'Set up your experience profile to generate a job-fit analysis.',
@@ -267,24 +273,28 @@ describe('JobDetailPanel', () => {
     };
   }
 
-  it('renders the scorecard immediately when the kick-off returns a cached record', async () => {
+  it('renders a cached scorecard from the spend-free open probe — no POST (#634)', async () => {
     const record = analysisRecord();
-    global.fetch = jest.fn().mockImplementation((url: string) => {
-      if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
-        // Cache hit → the record comes straight back from the kick-off POST,
-        // no polling.
+    const posts: string[] = [];
+    global.fetch = jest
+      .fn()
+      .mockImplementation((url: string, opts?: RequestInit) => {
+        if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
+          if ((opts?.method ?? 'GET') === 'POST') posts.push(url);
+          // Cache hit → the record comes straight back from the open probe's
+          // GET; no kick, no polling.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => record,
+          });
+        }
         return Promise.resolve({
           ok: true,
           status: 200,
-          json: async () => record,
+          json: async () => ({ entries: [] }),
         });
-      }
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({ entries: [] }),
-      });
-    }) as unknown as typeof fetch;
+      }) as unknown as typeof fetch;
 
     render(
       <JobDetailPanel
@@ -301,23 +311,127 @@ describe('JobDetailPanel', () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Seniority: strong/i)).toBeInTheDocument();
     expect(screen.getByText('GraphQL')).toBeInTheDocument();
+    // The cached render cost nothing: opening the panel never POSTs.
+    expect(posts).toHaveLength(0);
   });
 
-  it('shows the background message on a 202, then renders the scorecard once a poll returns the record (#459)', async () => {
+  it('opening the panel on a cache miss is spend-free: "Analyze fit" renders and nothing POSTs (#634)', async () => {
+    const posts: string[] = [];
+    global.fetch = jest
+      .fn()
+      .mockImplementation((url: string, opts?: RequestInit) => {
+        if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
+          if ((opts?.method ?? 'GET') === 'POST') posts.push(url);
+          // Nothing cached, nothing in flight.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ status: 'idle' }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ entries: [] }),
+        });
+      }) as unknown as typeof fetch;
+
+    render(
+      <JobDetailPanel
+        posting={makeJob()}
+        targetId='t-1'
+        viewFullHref={undefined}
+        onDelete={undefined}
+        onStatusChange={undefined}
+      />
+    );
+
+    // The explicit intent affordance — analysis spend now requires a click.
+    expect(
+      await screen.findByRole('button', { name: /analyze fit/i })
+    ).toBeInTheDocument();
+    expect(posts).toHaveLength(0);
+  });
+
+  it('attaches to an analysis already in flight on open — progress + result, still no POST (#634)', async () => {
     jest.useFakeTimers();
     try {
       const record = analysisRecord();
+      const posts: string[] = [];
+      let gets = 0;
+      global.fetch = jest
+        .fn()
+        .mockImplementation((url: string, opts?: RequestInit) => {
+          if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
+            if ((opts?.method ?? 'GET') === 'POST') posts.push(url);
+            // A run kicked earlier (another surface/session) is in flight:
+            // probe + attach GETs see ``running``, then the record lands.
+            gets += 1;
+            return Promise.resolve({
+              ok: true,
+              status: 200,
+              json: async () => (gets <= 2 ? { status: 'running' } : record),
+            });
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ entries: [] }),
+          });
+        }) as unknown as typeof fetch;
+
+      render(
+        <JobDetailPanel
+          posting={makeJob()}
+          targetId='t-1'
+          viewFullHref={undefined}
+          onDelete={undefined}
+          onStatusChange={undefined}
+        />
+      );
+
+      // Attached: the background reassurance shows without any kick.
+      expect(
+        await screen.findByText(/runs in the background/i)
+      ).toBeInTheDocument();
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(6000);
+      });
+      expect(
+        await screen.findByText(/Apply — strong React match/i)
+      ).toBeInTheDocument();
+      // Watching someone else's run must never buy a new one.
+      expect(posts).toHaveLength(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('kicks only on the explicit click: 202 + background message, then the scorecard lands via polling (#459/#634)', async () => {
+    jest.useFakeTimers();
+    try {
+      const record = analysisRecord();
+      let posted = false;
       let getPolls = 0;
       global.fetch = jest
         .fn()
         .mockImplementation((url: string, opts?: RequestInit) => {
           if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
             if ((opts?.method ?? 'GET') === 'POST') {
-              // Kick-off: cache miss → running (backgrounded).
+              // Kick-off (explicit click): cache miss → running (backgrounded).
+              posted = true;
               return Promise.resolve({
                 ok: true,
                 status: 202,
                 json: async () => ({ status: 'running' }),
+              });
+            }
+            if (!posted) {
+              // The spend-free open probe: nothing cached yet.
+              return Promise.resolve({
+                ok: true,
+                status: 200,
+                json: async () => ({ status: 'idle' }),
               });
             }
             // Poll: still running once, then the finished record.
@@ -346,10 +460,18 @@ describe('JobDetailPanel', () => {
         />
       );
 
+      // The probe resolves to the button — and no spend has happened yet.
+      const analyzeButton = await screen.findByRole('button', {
+        name: /analyze fit/i,
+      });
+      expect(posted).toBe(false);
+      fireEvent.click(analyzeButton);
+
       // While backgrounded, the panel reassures the user they can leave.
       expect(
         await screen.findByText(/runs in the background/i)
       ).toBeInTheDocument();
+      expect(posted).toBe(true);
 
       // Walk the poll loop (2.5s cadence): first poll → running, second → record.
       await act(async () => {
@@ -369,11 +491,13 @@ describe('JobDetailPanel', () => {
   it('surfaces a retry when a poll reports the background run failed (#459)', async () => {
     jest.useFakeTimers();
     try {
+      let posted = false;
       global.fetch = jest
         .fn()
         .mockImplementation((url: string, opts?: RequestInit) => {
           if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
             if ((opts?.method ?? 'GET') === 'POST') {
+              posted = true;
               return Promise.resolve({
                 ok: true,
                 status: 202,
@@ -383,10 +507,13 @@ describe('JobDetailPanel', () => {
             return Promise.resolve({
               ok: true,
               status: 200,
-              json: async () => ({
-                status: 'error',
-                message: 'Analysis failed. Please retry.',
-              }),
+              json: async () =>
+                posted
+                  ? {
+                      status: 'error',
+                      message: 'Analysis failed. Please retry.',
+                    }
+                  : { status: 'idle' },
             });
           }
           return Promise.resolve({
@@ -406,6 +533,9 @@ describe('JobDetailPanel', () => {
         />
       );
 
+      fireEvent.click(
+        await screen.findByRole('button', { name: /analyze fit/i })
+      );
       await act(async () => {
         await jest.advanceTimersByTimeAsync(6000);
       });
@@ -419,6 +549,49 @@ describe('JobDetailPanel', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('surfaces a prior server-side failure from the open probe — retry button, still no POST (#634)', async () => {
+    const posts: string[] = [];
+    global.fetch = jest
+      .fn()
+      .mockImplementation((url: string, opts?: RequestInit) => {
+        if (typeof url === 'string' && url.includes('/api/jobs/analysis/')) {
+          if ((opts?.method ?? 'GET') === 'POST') posts.push(url);
+          // A run failed server-side some time ago; the probe reads it.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              status: 'error',
+              message: 'Analysis failed. Please retry.',
+            }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ entries: [] }),
+        });
+      }) as unknown as typeof fetch;
+
+    render(
+      <JobDetailPanel
+        posting={makeJob()}
+        targetId='t-1'
+        viewFullHref={undefined}
+        onDelete={undefined}
+        onStatusChange={undefined}
+      />
+    );
+
+    expect(
+      await screen.findByText(/Analysis failed\. Please retry\./i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /retry analysis/i })
+    ).toBeInTheDocument();
+    expect(posts).toHaveLength(0);
   });
 
   it('does NOT render resume / cover-letter sections when no target is selected', () => {
