@@ -1,22 +1,24 @@
-// TZ must be pinned BEFORE the module (or any Date) is touched — CI runs in
-// UTC, where the old `toISOString().slice(0, 10)` bug is invisible.
-process.env.TZ = 'America/Los_Angeles';
-
 import { localDateStamp } from '../localDateStamp';
 
+// Deliberately TZ-agnostic: runtime `process.env.TZ` pinning is unreliable
+// (honored on macOS, ignored on CI's Linux workers once the zone is cached —
+// observed on PR #710's first CI run). Dates are constructed from LOCAL
+// components, so these assertions hold in any zone; on any non-UTC machine
+// (e.g. dev laptops) the evening case also catches a regression to
+// `toISOString().slice(0, 10)`, which was the §A2 bug.
+
 describe('localDateStamp', () => {
-  // The exact prod repro (ux-sweep 2026-08-12 §A2): a résumé generated on
-  // the evening of Aug 12 PT was filenamed …-2026-08-13. 02:00 UTC on the
-  // 13th IS the 12th in Los Angeles — the UTC slice returned '2026-08-13'.
-  it("uses the user's local date, not the UTC date", () => {
-    expect(localDateStamp(new Date('2026-08-13T02:00:00Z'))).toBe('2026-08-12');
+  it('stamps the local calendar date', () => {
+    expect(localDateStamp(new Date(2026, 7, 12, 9, 30))).toBe('2026-08-12');
   });
 
-  it('matches UTC when local and UTC agree', () => {
-    expect(localDateStamp(new Date('2026-08-12T18:00:00Z'))).toBe('2026-08-12');
+  it('stays on the local date late in the evening (the §A2 repro shape)', () => {
+    // 23:30 local on Aug 12 is already Aug 13 UTC anywhere west of UTC-0:30 —
+    // the old UTC slice stamped tomorrow's date for these sessions.
+    expect(localDateStamp(new Date(2026, 7, 12, 23, 30))).toBe('2026-08-12');
   });
 
   it('zero-pads month and day', () => {
-    expect(localDateStamp(new Date('2026-01-05T20:00:00Z'))).toBe('2026-01-05');
+    expect(localDateStamp(new Date(2026, 0, 5, 12, 0))).toBe('2026-01-05');
   });
 });

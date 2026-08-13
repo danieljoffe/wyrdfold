@@ -1,9 +1,9 @@
-// TZ pinned before imports: CI runs in UTC, where the old
-// `new Date('YYYY-MM')` implementation happened to render correctly — the
-// month-early shift (ux-sweep 2026-08-12 §A1) only shows west of UTC.
-process.env.TZ = 'America/Los_Angeles';
-
 import { formatDateRange, formatMonthYear } from '../ProfilePage';
+
+// No TZ pinning here (runtime process.env.TZ is unreliable across
+// platforms — see localDateStamp.spec.ts): these hold in EVERY zone
+// precisely because the implementation never constructs a Date. The old
+// Date-based implementation fails them on any machine west of UTC.
 
 describe('formatMonthYear', () => {
   // The exact prod repro: every Experience card rendered one month before
