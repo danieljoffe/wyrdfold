@@ -18,35 +18,52 @@ export interface SalaryFields {
   period: string | null | undefined;
 }
 
-function symbol(currency: string | null | undefined): string {
-  return !currency || currency === 'USD' ? '$' : `${currency} `;
+// Unambiguous symbols only. CAD/AUD/etc. share "$", so they keep their code
+// (rendered once, before the range) rather than a misleading bare dollar.
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: '$',
+  EUR: '€',
+  GBP: '£',
+};
+
+/** How to prefix an amount: a symbol repeats on both bounds ("$54k–$75k");
+ *  a code renders ONCE before the range ("PLN 54k–75k") — the sweep found
+ *  "EUR 54k–EUR 75k" on prod (§D4), which doubles the code noise. */
+function currencyStyle(currency: string | null | undefined): {
+  prefix: string;
+  repeats: boolean;
+} {
+  if (!currency) return { prefix: '$', repeats: true };
+  const sym = Object.prototype.hasOwnProperty.call(CURRENCY_SYMBOLS, currency)
+    ? CURRENCY_SYMBOLS[currency]
+    : null;
+  if (sym) return { prefix: sym, repeats: true };
+  return { prefix: `${currency} `, repeats: false };
 }
 
-function amount(
-  n: number,
-  currency: string | null | undefined,
-  period: string | null | undefined
-): string {
-  if (period === 'hourly') return `${symbol(currency)}${n}`;
+function bare(n: number, period: string | null | undefined): string {
+  if (period === 'hourly') return String(n);
   // Yearly (and unknown-period) figures compact to k with one decimal,
-  // dropping ".0" — $118.6k, $195k.
+  // dropping ".0" — 118.6k, 195k.
   const k = n / 1000;
   const rounded = Math.round(k * 10) / 10;
   const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-  return `${symbol(currency)}${text}k`;
+  return `${text}k`;
 }
 
 export function formatSalaryRange(fields: SalaryFields): string | null {
   const { min, max, currency, period } = fields;
   if (min == null && max == null) return null;
   const suffix = period === 'hourly' ? '/hr' : '';
+  const { prefix, repeats } = currencyStyle(currency);
   if (min != null && max != null) {
-    return min === max
-      ? `${amount(min, currency, period)}${suffix}`
-      : `${amount(min, currency, period)}–${amount(max, currency, period)}${suffix}`;
+    if (min === max) return `${prefix}${bare(min, period)}${suffix}`;
+    return repeats
+      ? `${prefix}${bare(min, period)}–${prefix}${bare(max, period)}${suffix}`
+      : `${prefix}${bare(min, period)}–${bare(max, period)}${suffix}`;
   }
-  if (min != null) return `${amount(min, currency, period)}+${suffix}`;
-  return `Up to ${amount(max as number, currency, period)}${suffix}`;
+  if (min != null) return `${prefix}${bare(min, period)}+${suffix}`;
+  return `Up to ${prefix}${bare(max as number, period)}${suffix}`;
 }
 
 /**

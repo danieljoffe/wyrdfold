@@ -34,7 +34,7 @@ export default function DarkModeToggle() {
   return (
     <button
       onClick={cycleTheme}
-      title={`Theme: ${theme}`}
+      title={`Theme: ${theme} — click or press D to cycle`}
       aria-label={`Switch to ${nextLabel} mode`}
       className='flex items-center gap-1.5 p-1.5 rounded-lg text-text-tertiary hover:text-text-primary hover:bg-surface-tertiary transition-colors cursor-pointer'
     >

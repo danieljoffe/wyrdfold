@@ -17,7 +17,7 @@ jest.mock('next/navigation', () => ({
 
 function makeSource(): TargetsSource {
   return {
-    targets: [{ id: 't-1', label: 'My target' }],
+    targets: [{ id: 't-1', label: 'My target', isActive: true }],
     loading: false,
     error: null,
     ensureLoaded: jest.fn(),
@@ -68,5 +68,30 @@ describe('AddToTargetMenu Escape nesting (#485)', () => {
     } finally {
       window.removeEventListener('keydown', windowSawEscape);
     }
+  });
+});
+
+/** §B2 (ux-sweep 2026-08-12): the picker listed every target with no
+ * active/inactive distinction while Jobs shows only active tabs. */
+describe('AddToTargetMenu inactive labeling (§B2)', () => {
+  it('marks inactive targets and leaves active ones bare', async () => {
+    const source = {
+      targets: [
+        { id: 't-1', label: 'Active target', isActive: true },
+        { id: 't-2', label: 'Paused target', isActive: false },
+      ],
+      loading: false,
+      error: null,
+      ensureLoaded: jest.fn(),
+    } as unknown as TargetsSource;
+
+    render(<AddToTargetMenu jobId='job-1' source={source} />);
+    fireEvent.click(screen.getByRole('button', { name: /add to target/i }));
+    await waitFor(() => expect(screen.getByRole('menu')).toBeInTheDocument());
+
+    expect(screen.getByText('Paused target')).toBeInTheDocument();
+    expect(screen.getByText('inactive')).toBeInTheDocument();
+    // Exactly one hint — the active target carries none.
+    expect(screen.getAllByText('inactive')).toHaveLength(1);
   });
 });

@@ -6,6 +6,10 @@ import { extractApiError } from '@/lib/extractApiError';
 export interface TargetOption {
   id: string;
   label: string;
+  /** The per-user toggle (`user_targets.is_active`). The picker offers every
+   *  target but must SAY which are inactive — the sweep (§B2) found it
+   *  listing 7 undifferentiated targets while Jobs shows 2 active tabs. */
+  isActive: boolean;
 }
 
 /**
@@ -48,10 +52,24 @@ export function useTargetsSource(): TargetsSource {
           throw new Error(await extractApiError(res, 'Failed to load targets'));
         }
         const data = (await res.json()) as {
-          targets: { target: { id: string; label: string } }[];
+          targets: {
+            target: { id: string; label: string };
+            user_target?: { is_active?: boolean };
+          }[];
         };
+        // Active targets first (the likely picks), each group alphabetical.
         setTargets(
-          data.targets.map(t => ({ id: t.target.id, label: t.target.label }))
+          data.targets
+            .map(t => ({
+              id: t.target.id,
+              label: t.target.label,
+              isActive: t.user_target?.is_active ?? true,
+            }))
+            .sort(
+              (a, b) =>
+                Number(b.isActive) - Number(a.isActive) ||
+                a.label.localeCompare(b.label)
+            )
         );
       } catch (e) {
         requested.current = false; // allow a retry on the next open
