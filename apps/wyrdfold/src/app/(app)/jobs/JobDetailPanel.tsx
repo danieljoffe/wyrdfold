@@ -803,7 +803,7 @@ export default function JobDetailPanel({
             keyword components can never explain an axis-blend number. */}
         <div>
           <Text variant='caption' className='mb-2'>
-            Score Breakdown
+            Score breakdown
           </Text>
           {axes && Object.keys(axes).length > 0 ? (
             <FitAxisList axes={axes} />

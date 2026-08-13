@@ -219,22 +219,29 @@ export function AddToTargetMenu({
             // The pick is async: keep the menu open while pending; success
             // closes it explicitly via the controlled state above.
             closeOnClick: false,
-            // Inactive targets stay pickable (adding still scores the job),
-            // but say so — the bare list read as 7 equal targets while Jobs
-            // shows 2 active tabs (§B2).
-            ...(t.isActive || pendingId === t.id
+            // Every item carries its full label as a native tooltip — long
+            // labels truncate in the fixed-width menu with no way to read
+            // them (re-sweep R6). Inactive targets stay pickable (adding
+            // still scores the job) but say so — the bare list read as 7
+            // equal targets while Jobs shows 2 active tabs (§B2).
+            ...(pendingId === t.id
               ? {}
               : {
                   content: (
-                    <span className='flex items-baseline gap-1.5'>
-                      <span>{t.label}</span>
-                      <Text
-                        variant='meta'
-                        as='span'
-                        className='text-text-tertiary'
-                      >
-                        inactive
-                      </Text>
+                    <span
+                      className='flex items-baseline gap-1.5'
+                      title={t.label}
+                    >
+                      <span className='min-w-0 truncate'>{t.label}</span>
+                      {!t.isActive && (
+                        <Text
+                          variant='meta'
+                          as='span'
+                          className='shrink-0 text-text-tertiary'
+                        >
+                          inactive
+                        </Text>
+                      )}
                     </span>
                   ),
                 }),

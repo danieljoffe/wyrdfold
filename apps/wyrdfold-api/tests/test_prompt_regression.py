@@ -52,6 +52,11 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("resume_tailor.system", "app.services.tailor.prompts:TAILOR_SYSTEM"),
     ("qualification_tagger.system", "app.services.qualification.tagger:_SYSTEM_PROMPT"),
     ("feedback_learner.system", "app.services.llm_learner:SYSTEM_PROMPT"),
+    # Deep-analysis prompt — was MISSING from this contract even though
+    # CONTRIBUTING lists services/analysis/ as guarded (found while fixing
+    # the re-sweep R2 vocabulary leak). Note: no eval script exercises this
+    # surface yet — the pin at least makes edits visible and reviewable.
+    ("analysis.system", "app.services.analysis.prompts:ANALYSIS_SYSTEM"),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
@@ -70,6 +75,7 @@ _SCALARS: tuple[tuple[str, str], ...] = (
     ("model.target_fit_score", "app.services.targets.fit_score:DEFAULT_MODEL"),
     ("model.qualification_tagger", "app.services.qualification.tagger:QUALIFICATION_MODEL"),
     ("model.feedback_learner", "app.services.llm_learner:DEFAULT_MODEL"),
+    ("model.analysis", "app.services.analysis.analyze:DEFAULT_MODEL"),
     ("prompt_version.derive_target_from_jd", "app.services.targets.derive_profile:PROMPT_VERSION"),
 )
 
