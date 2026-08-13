@@ -10,6 +10,7 @@ import {
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Text } from '@danieljoffe/shared-ui/Text';
+import { smartTitleCase } from './smartTitleCase';
 import type { NearMissInsights } from './types';
 
 /**
@@ -77,9 +78,10 @@ export default function NearMissCard() {
         <div className='flex items-baseline gap-x-4 gap-y-1 flex-wrap'>
           <CardTitle as='h2'>Almost Matched</CardTitle>
           <Text variant='meta'>
-            Titles filtered out for you with low confidence over the last{' '}
-            {data?.window_days} days — if some look right, your target may be
-            reading narrower than you intend
+            Titles filtered out in the last {data?.window_days} days where the
+            match gate wasn&rsquo;t sure (% = how confident the rejection was).
+            If some look right, this target&rsquo;s scope may be narrower than
+            you intended.
           </Text>
         </div>
       </CardHeader>
@@ -94,7 +96,9 @@ export default function NearMissCard() {
                 {target.titles.map(t => (
                   <li key={t.title}>
                     <Badge variant='default' size='sm'>
-                      <span className='capitalize'>{t.title}</span>
+                      {/* The store only has title_norm (lowercased) — CSS
+                          `capitalize` mangled acronyms ("It", "Ai", "Iii"). */}
+                      <span>{smartTitleCase(t.title)}</span>
                       <span
                         className='ml-1.5 text-text-secondary tabular-nums'
                         aria-label={`rejected at ${t.confidence}% confidence`}

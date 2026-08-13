@@ -595,7 +595,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 onClick={() => setModalOpen(true)}
               >
                 <Plus className='size-4' aria-hidden />
-                <span>Create Target</span>
+                <span>Create target</span>
               </Button>
               <Button
                 name='target-suggest-empty'
@@ -605,7 +605,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 disabled={suggesting}
               >
                 <Sparkles className='size-4' aria-hidden />
-                <span>Suggest from Experience</span>
+                <span>Suggest from experience</span>
               </Button>
             </div>
           </CardContent>
@@ -641,7 +641,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               onClick={() => setModalOpen(true)}
             >
               <Plus className='size-4' aria-hidden />
-              <span>Add Target</span>
+              <span>Add target</span>
             </Button>
             <Button
               name='target-suggest'
@@ -658,7 +658,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               ) : (
                 <>
                   <Sparkles className='size-4' aria-hidden />
-                  <span>Suggest from Experience</span>
+                  <span>Suggest from experience</span>
                 </>
               )}
             </Button>
@@ -724,7 +724,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                   >
                     {addingSuggestion === match.suggestion.label
                       ? 'Adding...'
-                      : 'Add Target'}
+                      : 'Add target'}
                   </Button>
                 </CardContent>
               </Card>
@@ -769,7 +769,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                   >
                     {addingLateral === suggestion.label
                       ? 'Adding...'
-                      : 'Add Target'}
+                      : 'Add target'}
                   </Button>
                 </CardContent>
               </Card>

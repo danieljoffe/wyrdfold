@@ -565,8 +565,8 @@ export default function SettingsPage() {
               </Text>
               {!emailAvailable && (
                 <Text variant='meta' className='text-text-tertiary'>
-                  Email notifications are unavailable until the operator
-                  configures the email provider credentials.
+                  Email notifications aren&rsquo;t available on this server yet
+                  — check back soon.
                 </Text>
               )}
               {emailAvailable && prefs?.email && (
@@ -619,8 +619,8 @@ export default function SettingsPage() {
               </Text>
               {!smsAvailable && (
                 <Text variant='meta' className='text-text-tertiary'>
-                  SMS notifications are unavailable until the operator
-                  configures Twilio credentials.
+                  SMS notifications aren&rsquo;t available on this server yet —
+                  check back soon.
                 </Text>
               )}
               <Text variant='meta' className='text-text-tertiary'>

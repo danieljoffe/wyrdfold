@@ -294,3 +294,36 @@ def test_can_generate_counts_outcome_role_refs() -> None:
     )
     result = can_generate(payload)
     assert result.ok
+
+
+# --- _snippet: user-facing gap context excerpts (ux-sweep 2026-08-12) ---
+
+
+def test_missing_metric_context_short_description_verbatim() -> None:
+    payload = OptimizedPayload(
+        roles=[_role("a", outcome_refs=["x"])],
+        outcomes=[_outcome("Cut mobile load times", role_ref="a")],
+    )
+    gap = next(g for g in detect_gaps(payload) if g.kind == "outcome.missing_metric")
+    assert gap.context == "Outcome lacks a quantified metric: 'Cut mobile load times'"
+
+
+def test_missing_metric_context_truncates_at_word_boundary() -> None:
+    # The prod repro: an 80-char raw slice ended mid-word with a dangling
+    # quote ("…ran quarterly experiments o'"). The context must cut at a
+    # word boundary and mark the cut; the ref keeps the raw slice (it is
+    # the gap's stable identifier).
+    description = (
+        "Built A/B testing infrastructure on Google Optimize; ran quarterly "
+        "experiments on pricing pages"
+    )
+    payload = OptimizedPayload(
+        roles=[_role("a", outcome_refs=["x"])],
+        outcomes=[_outcome(description, role_ref="a")],
+    )
+    gap = next(g for g in detect_gaps(payload) if g.kind == "outcome.missing_metric")
+    excerpt = gap.context.split(": '", 1)[1].rstrip("'")
+    assert excerpt.endswith("…")
+    # No mid-word cut: every excerpt word is a full word of the source.
+    assert all(word in description.split() for word in excerpt.rstrip("…").split())
+    assert gap.ref == description[:80]

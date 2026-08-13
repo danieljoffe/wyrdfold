@@ -92,7 +92,7 @@ describe('LogisticsChips', () => {
         })}
       />
     );
-    expect(screen.getByText('EUR 90k')).toBeInTheDocument();
+    expect(screen.getByText('€90k')).toBeInTheDocument();
   });
 
   it('formats city + country location', () => {

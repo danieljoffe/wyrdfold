@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
   ShieldCheck,
@@ -90,7 +91,7 @@ export default function CoverLetterReviewPage({
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'cover-letter';
-    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${new Date().toISOString().slice(0, 10)}`;
+    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${localDateStamp()}`;
   }, [record, posting]);
 
   const load = useCallback(async () => {
@@ -638,21 +639,17 @@ export default function CoverLetterReviewPage({
         </div>
       )}
 
+      {/* Cost only — tokens/model/latency are developer telemetry (ux-sweep
+          2026-08-12 §C12); they stay reachable in the native tooltip. */}
       <div className='flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-surface-secondary px-3 py-2'>
-        <Text variant='meta' as='span'>
-          Cost: ${record.cost_usd.toFixed(4)}
-        </Text>
-        <Text variant='meta' as='span'>
-          Tokens:{' '}
-          <LocalNumber value={record.input_tokens + record.output_tokens} />
-        </Text>
-        {record.model && (
-          <Text variant='meta' as='span'>
-            Model: {record.model}
-          </Text>
-        )}
-        <Text variant='meta' as='span'>
-          Latency: {(record.latency_ms / 1000).toFixed(1)}s
+        <Text
+          variant='meta'
+          as='span'
+          title={`${record.input_tokens + record.output_tokens} tokens · ${
+            record.model ?? 'unknown model'
+          } · ${(record.latency_ms / 1000).toFixed(1)}s`}
+        >
+          Generated for ${record.cost_usd.toFixed(4)}
         </Text>
       </div>
 

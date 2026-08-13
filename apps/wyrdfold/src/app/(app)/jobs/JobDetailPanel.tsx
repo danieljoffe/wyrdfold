@@ -706,7 +706,19 @@ export default function JobDetailPanel({
             keep all their generate/review/view state internally. */}
         {targetId && (
           <>
-            <ResumeSection jobPostingId={posting.id} />
+            <ResumeSection
+              jobPostingId={posting.id}
+              onDrafted={() => {
+                // Mirror the server's mark_job_resume_draft so the pill
+                // doesn't show "New" until a reload (§B7). Forward-only:
+                // never demote a job the user already advanced.
+                if (status === 'new' || status === 'saved') {
+                  setStatus('resume_draft');
+                  onStatusChange?.('resume_draft');
+                  fetchHistory();
+                }
+              }}
+            />
             <CoverLetterSection
               jobPostingId={posting.id}
               companyName={posting.company_name}
@@ -816,14 +828,14 @@ export default function JobDetailPanel({
         {targetId && (
           <div>
             <div className='mb-1 flex items-center gap-2'>
-              <Text variant='caption'>LLM Analysis</Text>
+              <Text variant='caption'>Fit analysis</Text>
               {analyzing && (
                 <span
                   className='inline-flex items-center gap-1.5'
                   role='status'
                   aria-live='polite'
                 >
-                  <Spinner size='sm' aria-label='Running LLM analysis' />
+                  <Spinner size='sm' aria-label='Running fit analysis' />
                   <Text variant='meta'>Running… {analyzingElapsedS}s</Text>
                 </span>
               )}

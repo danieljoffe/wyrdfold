@@ -24,7 +24,7 @@ describe('HomeViewToggle', () => {
     const user = userEvent.setup();
     render(<HomeViewToggle value='today' />);
 
-    expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: 'Overview' })).toHaveAttribute(
       'aria-pressed',
       'true'
     );
@@ -37,7 +37,7 @@ describe('HomeViewToggle', () => {
       'aria-pressed',
       'true'
     );
-    expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: 'Overview' })).toHaveAttribute(
       'aria-pressed',
       'false'
     );
@@ -46,13 +46,13 @@ describe('HomeViewToggle', () => {
     });
   });
 
-  it('clears the view param when returning to Today', async () => {
+  it('clears the view param when returning to Overview', async () => {
     const user = userEvent.setup();
     render(<HomeViewToggle value='trends' />);
 
-    await user.click(screen.getByRole('button', { name: 'Today' }));
+    await user.click(screen.getByRole('button', { name: 'Overview' }));
 
-    expect(screen.getByRole('button', { name: 'Today' })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: 'Overview' })).toHaveAttribute(
       'aria-pressed',
       'true'
     );

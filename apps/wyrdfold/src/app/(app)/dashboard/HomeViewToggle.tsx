@@ -7,8 +7,12 @@ import { cn } from '@/lib/cn';
 
 import type { HomeView } from './view';
 
+// Label is "Overview", id stays 'today' (URL-stable). The section shows
+// lifetime pipeline counts (status=new, saved, drafts…) — labeling it
+// "Today" read those as daily figures ("New matches 7340" under a Today
+// tab; ux-sweep 2026-08-12 §B5).
 const VIEWS: { id: HomeView; label: string }[] = [
-  { id: 'today', label: 'Today' },
+  { id: 'today', label: 'Overview' },
   { id: 'trends', label: 'Trends' },
 ];
 

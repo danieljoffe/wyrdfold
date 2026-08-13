@@ -235,7 +235,7 @@ export default function ListingDetailBody({
       ) : (
         <div className='flex flex-col gap-3 border-t border-border pt-4'>
           <Text variant='meta' as='p' className='text-text-tertiary'>
-            Add to a target to unlock LLM pipelines.
+            Add to a target to unlock fit analysis and resume tailoring.
           </Text>
           <div className='flex flex-wrap items-center gap-2'>
             <AddToTargetMenu

@@ -33,6 +33,18 @@ def _pct_to_tier(pct: float) -> GapTier:
     return "green"
 
 
+def _snippet(text: str, limit: int = 80) -> str:
+    """User-facing excerpt: cut at a word boundary and mark the cut with an
+    ellipsis. The raw ``[:80]`` slice ended gap context mid-word with a
+    dangling quote ("…ran quarterly experiments o'" — ux-sweep 2026-08-12,
+    Gaps-to-Fill card)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    head, _, _ = cut.rpartition(" ")
+    return f"{head or cut}…"
+
+
 def _role_priority_boost(index: int, total: int) -> int:
     """Earlier roles (by declared order) get higher priority boost since
     `roles[0]` is usually the most recent. Translates index to an additive
@@ -102,9 +114,15 @@ def detect_gaps(payload: OptimizedPayload) -> list[Gap]:
             gaps.append(
                 Gap(
                     kind="outcome.missing_metric",
+                    # ``ref`` keeps the raw slice — it's the gap's identifier
+                    # and must stay stable for existing matching; only the
+                    # user-facing ``context`` gets the readable snippet.
                     ref=outcome.description[:80],
                     priority=20,
-                    context=(f"Outcome lacks a quantified metric: '{outcome.description[:80]}'"),
+                    context=(
+                        "Outcome lacks a quantified metric: "
+                        f"'{_snippet(outcome.description)}'"
+                    ),
                 )
             )
 

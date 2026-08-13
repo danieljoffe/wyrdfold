@@ -179,8 +179,14 @@ export default function TargetCard({
                   aria-hidden
                 />
                 <span>
-                  Activation failed —{' '}
-                  {activationErrorMessage(target.activation_error)}
+                  Activation failed
+                  {target.activation_failed_at && (
+                    <>
+                      {' '}
+                      (<LocalDate value={target.activation_failed_at} />)
+                    </>
+                  )}{' '}
+                  — {activationErrorMessage(target.activation_error)}
                 </span>
               </span>
               <Button

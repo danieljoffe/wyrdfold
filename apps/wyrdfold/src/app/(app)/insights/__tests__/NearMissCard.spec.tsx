@@ -57,6 +57,9 @@ describe('NearMissCard', () => {
     expect(
       await screen.findByText(/staff platform engineer/i)
     ).toBeInTheDocument();
+    // Exact casing: the card smart-title-cases title_norm (which arrives
+    // lowercased) — an /i regex alone would not catch this regressing.
+    expect(screen.getByText('Staff Platform Engineer')).toBeInTheDocument();
     expect(screen.getByText(/almost matched/i)).toBeInTheDocument();
     expect(screen.getByText(/staff frontend engineer/i)).toBeInTheDocument();
     expect(screen.getByText('60%')).toBeInTheDocument();
