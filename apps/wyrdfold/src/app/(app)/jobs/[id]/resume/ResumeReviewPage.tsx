@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
   Download,
@@ -107,7 +108,7 @@ export default function ResumeReviewPage({
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'resume';
-    return `${slugify(name)}-${slugify(posting.company_name)}-${new Date().toISOString().slice(0, 10)}`;
+    return `${slugify(name)}-${slugify(posting.company_name)}-${localDateStamp()}`;
   }, [record, posting]);
 
   // The posting is fetched independently of the document — the hook owns the
