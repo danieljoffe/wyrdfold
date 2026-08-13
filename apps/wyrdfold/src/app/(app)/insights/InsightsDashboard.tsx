@@ -18,6 +18,7 @@ import { useInsights, type InsightsInitial } from '@/hooks/useInsights';
 import { cn } from '@/lib/cn';
 import { downloadInsightsCsv } from './exportCsv';
 import { foldMissingSkills, foldSkillFrequencies } from './foldSkills';
+import NearMissCard from './NearMissCard';
 import type { Period } from './types';
 
 // Pass ``ChartSkeleton`` (declared below) as the dynamic-import
@@ -449,6 +450,10 @@ export default function InsightsDashboard({
           )}
         </CardContent>
       </Card>
+
+      {/* Almost Matched — near-miss titles per target (#703 f/u). Self-
+          contained fetch (no period dimension), hides itself when empty. */}
+      <NearMissCard />
 
       {/* Download — bottom of page */}
       <div className='flex justify-center pt-2'>
