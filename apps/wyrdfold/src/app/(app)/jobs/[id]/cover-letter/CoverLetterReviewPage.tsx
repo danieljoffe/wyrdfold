@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
   ShieldCheck,
@@ -90,7 +91,7 @@ export default function CoverLetterReviewPage({
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'cover-letter';
-    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${new Date().toISOString().slice(0, 10)}`;
+    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${localDateStamp()}`;
   }, [record, posting]);
 
   const load = useCallback(async () => {
