@@ -44,13 +44,19 @@ jest.mock('../JobUrlInput', () => ({
     onComplete,
     onSkip,
   }: {
-    onComplete: (data?: { postingId: string; title: string | null }) => void;
+    onComplete: (data?: {
+      postingId: string;
+      title: string | null;
+      descriptionHtml: string | null;
+    }) => void;
     onSkip: () => void;
   }) => (
     <div data-testid='job-url-input-stub'>
       <button
         type='button'
-        onClick={() => onComplete({ postingId: 'p1', title: 'Eng' })}
+        onClick={() =>
+          onComplete({ postingId: 'p1', title: 'Eng', descriptionHtml: null })
+        }
       >
         job-complete
       </button>
@@ -213,11 +219,13 @@ describe('OnboardingWizard — initial state', () => {
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
   });
 
-  it('navigates to /targets when the user clicks Skip for now', async () => {
+  it('navigates to /targets when the user clicks Skip setup for now', async () => {
     const user = userEvent.setup();
     render(<OnboardingWizard />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     expect(mockPush).toHaveBeenCalledWith('/targets');
   });
@@ -226,7 +234,9 @@ describe('OnboardingWizard — initial state', () => {
     const user = userEvent.setup();
     render(<OnboardingWizard />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
       method: 'POST',
@@ -259,7 +269,9 @@ describe('OnboardingWizard — initial state', () => {
 
     render(<OnboardingWizard />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     // POST is in flight but unresolved → we must still be on the wizard.
     expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
@@ -282,7 +294,9 @@ describe('OnboardingWizard — initial state', () => {
 
     render(<OnboardingWizard />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     await waitFor(() =>
       expect(
@@ -303,9 +317,101 @@ describe('OnboardingWizard — initial state', () => {
 
     render(<OnboardingWizard />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+  });
+});
+
+describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
+  // The old wiring sent EVERY step's skip through the global exit, so
+  // "skip the upload" silently completed the whole wizard — with the AI
+  // down, the natural recovery click threw away the remaining steps.
+
+  it('a step-level skip ADVANCES to the next step, not out of the wizard', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+
+    // Advanced to upload-resume; nothing completed, nowhere navigated.
+    expect(screen.getByTestId('resume-uploader-stub')).toBeInTheDocument();
+    expect(mockPush).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      '/api/profile/onboarding/complete',
+      expect.anything()
+    );
+  });
+
+  it('skipping every step still walks the full path to completion', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+    await user.click(screen.getByRole('button', { name: 'resume-skip' }));
+    await user.click(screen.getByRole('button', { name: 'job-skip' }));
+    await user.click(screen.getByRole('button', { name: 'targets-skip' }));
+
+    expect(screen.getByTestId('completion-screen-stub')).toBeInTheDocument();
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it('"Finish setup later" mid-path exits via the persisted-complete contract', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+
+    await user.click(
+      screen.getByRole('button', { name: /finish setup later/i })
+    );
+
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
+      method: 'POST',
+    });
+  });
+
+  it('offers no "Finish setup later" on the chooser or the completion step', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    // Chooser: the global exit is its own "Skip setup for now" button.
+    expect(
+      screen.queryByRole('button', { name: /finish setup later/i })
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+    await user.click(screen.getByRole('button', { name: 'resume-skip' }));
+    await user.click(screen.getByRole('button', { name: 'job-skip' }));
+    await user.click(screen.getByRole('button', { name: 'targets-skip' }));
+
+    // Completion: nothing left to skip.
+    expect(
+      screen.queryByRole('button', { name: /finish setup later/i })
+    ).not.toBeInTheDocument();
   });
 });
 

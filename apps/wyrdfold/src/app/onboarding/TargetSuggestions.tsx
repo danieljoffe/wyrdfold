@@ -23,6 +23,7 @@ import type {
 } from '@/app/(app)/targets/types';
 import { completeOnboarding } from './completeOnboarding';
 import type { JobData } from './JobUrlInput';
+import { useStagedMessage } from './useStagedMessage';
 
 /**
  * Path A's promised payoff: after the from-posting target lands, draft
@@ -34,17 +35,20 @@ import type { JobData } from './JobUrlInput';
  * Any failure — no JD, gap gate, LLM budget, network — returns false and
  * the caller falls back to the normal completion flow: the target is
  * already created, so the user lost nothing but the shortcut.
+ *
+ * The JD is threaded through from the add-job step's manual-add response
+ * rather than re-fetched: ``GET /api/jobs/{id}`` gates on a ``scores``
+ * row existing for one of the caller's targets, and the from-posting
+ * target only gets scores once its background activation runs — so the
+ * fetch 404'd on every fresh onboarding and the payoff never fired.
  */
-async function draftPathAResume(postingId: string): Promise<boolean> {
+async function draftPathAResume(
+  postingId: string,
+  descriptionHtml: string | null
+): Promise<boolean> {
+  const jd = (descriptionHtml ?? '').trim();
+  if (!jd) return false;
   try {
-    const detailRes = await fetch(`/api/jobs/${postingId}`);
-    if (!detailRes.ok) return false;
-    const detail = (await detailRes.json()) as {
-      description_html: string | null;
-    };
-    const jd = (detail.description_html ?? '').trim();
-    if (!jd) return false;
-
     const res = await fetch('/api/jobs/tailor/resume', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -61,6 +65,11 @@ async function draftPathAResume(postingId: string): Promise<boolean> {
   }
 }
 
+const ANALYZE_STAGES = [
+  'Analyzing your experience...',
+  'Matching roles to your background — a few more seconds...',
+] as const;
+
 interface TargetSuggestionsProps {
   onComplete: () => void;
   onSkip: () => void;
@@ -74,6 +83,9 @@ export default function TargetSuggestions({
 }: TargetSuggestionsProps) {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
+  // The suggest call runs a full LLM pass over the master doc (~20s
+  // observed); stage the copy so the wait doesn't read as a hang.
+  const analyzeStage = useStagedMessage(ANALYZE_STAGES, loading);
   const [error, setError] = useState<string | null>(null);
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
   const [draftingResume, setDraftingResume] = useState(false);
@@ -93,6 +105,7 @@ export default function TargetSuggestions({
   useEffect(() => {
     if (!jobData) return;
     const postingId = jobData.postingId;
+    const descriptionHtml = jobData.descriptionHtml;
     let cancelled = false;
 
     async function createFromPosting() {
@@ -124,7 +137,7 @@ export default function TargetSuggestions({
           // this posting and finish on its review page. Fallback on any
           // failure is the pre-existing flow (completion screen).
           setDraftingResume(true);
-          const drafted = await draftPathAResume(postingId);
+          const drafted = await draftPathAResume(postingId, descriptionHtml);
           if (cancelled) return;
           if (drafted) {
             router.push(`/jobs/${postingId}/resume`);
@@ -308,7 +321,7 @@ export default function TargetSuggestions({
       <div className='flex flex-col items-center gap-4 py-12'>
         <Spinner size='lg' aria-label='Loading suggestions' />
         <Text variant='body' className='text-text-secondary'>
-          Analyzing your experience...
+          {analyzeStage}
         </Text>
       </div>
     );
@@ -450,7 +463,7 @@ export default function TargetSuggestions({
             size='sm'
             onClick={onSkip}
           >
-            Skip for now
+            Skip this step
           </Button>
           <Button
             name='onboarding-create-targets'
@@ -529,7 +542,7 @@ export default function TargetSuggestions({
           size='sm'
           onClick={onSkip}
         >
-          Skip for now
+          Skip this step
         </Button>
       </div>
     </div>

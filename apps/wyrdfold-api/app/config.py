@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     # rate-can't-be-computed cases — a fresh stats window, or a pipeline
     # already starved to ~$0/day). 0 disables the floor rule.
     llm_credit_min_remaining_usd: float = Field(default=2.0, ge=0.0)
+    # Early warning for a SELF-RESETTING key cap (a $N/day key limit):
+    # alarm once this fraction of the current window's cap is consumed.
+    # Runway-days is the wrong lens for a resetting cap — it reads
+    # permanently low (cap ÷ trailing rate), so the 2026-08-13 daily-cap
+    # exhaustion alarmed only at $0.00, after the pipeline was already
+    # dead, and kept alarming after the cap was raised. The fraction rule
+    # fires while there is still budget to act on (warning at the
+    # threshold, error at exhaustion). 0 disables it.
+    llm_credit_key_cap_alert_fraction: float = Field(default=0.8, ge=0.0, le=1.0)
 
     # BYOK (#5). Master key for AES-256-GCM envelope encryption of
     # per-user provider API keys at rest in `user_api_keys`. Base64 of

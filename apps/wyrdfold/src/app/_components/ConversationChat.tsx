@@ -14,6 +14,12 @@ import { extractApiError } from '@/lib/extractApiError';
 interface ConversationChatProps {
   onComplete: () => void;
   onSkip: () => void;
+  /**
+   * Label for the skip affordance. The onboarding wizard wires ``onSkip``
+   * to "advance a step", so it passes "Skip this step"; the profile page
+   * keeps the default, where skipping dismisses the chat entirely.
+   */
+  skipLabel?: string;
 }
 
 interface Message {
@@ -32,6 +38,7 @@ const extractErrorDetail = extractApiError;
 export default function ConversationChat({
   onComplete,
   onSkip,
+  skipLabel = 'Skip for now',
 }: ConversationChatProps) {
   const idPrefix = useId();
   const msgCountRef = useRef(0);
@@ -405,7 +412,7 @@ export default function ConversationChat({
             onClick={onSkip}
             disabled={sending || deriving}
           >
-            Skip for now
+            {skipLabel}
           </Button>
         </div>
       </div>

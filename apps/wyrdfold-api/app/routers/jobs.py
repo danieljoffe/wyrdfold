@@ -2649,6 +2649,7 @@ async def add_manual_job(
         extraction_tier=extraction.tier,
         warnings=warnings,
         needs_manual_fields=False,
+        description_html=description_html or None,
     )
 
 
