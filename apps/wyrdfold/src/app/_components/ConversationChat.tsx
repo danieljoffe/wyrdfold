@@ -40,6 +40,12 @@ export default function ConversationChat({
   }
 
   const [messages, setMessages] = useState<Message[]>([]);
+  // The gap the opening question came from (`gap.context`, e.g. "Outcome
+  // lacks a quantified metric: '…'"). Without it the first question can
+  // reference content it never quotes — the sweep (§A4) opened cold with
+  // "…what was the average lift from those tests?" and nothing saying
+  // which tests. Shown until the user answers.
+  const [probeContext, setProbeContext] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -64,11 +70,15 @@ export default function ConversationChat({
           '/api/career/experience/conversation/next-probe'
         );
         if (!res.ok) throw new Error('Failed to load question');
-        const data = (await res.json()) as { question: string };
+        const data = (await res.json()) as {
+          question: string;
+          gap?: { context?: string | null } | null;
+        };
         if (!cancelled) {
           setMessages([
             { id: nextMsgId(), role: 'assistant', content: data.question },
           ]);
+          setProbeContext(data.gap?.context ?? null);
         }
       } catch {
         if (!cancelled)
@@ -260,6 +270,16 @@ export default function ConversationChat({
           Answer a few questions about your experience. Skip any you&apos;d
           rather not answer.
         </Text>
+        {probeContext && messages.length <= 1 && (
+          <Text
+            variant='caption'
+            as='p'
+            role='note'
+            className='mt-2 text-text-tertiary'
+          >
+            Why this question — from your saved experience: {probeContext}
+          </Text>
+        )}
       </div>
 
       {/* Messages area */}
