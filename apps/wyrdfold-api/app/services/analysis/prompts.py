@@ -56,6 +56,15 @@ HONESTY:
 - Do not penalize for nice-to-haves that are missing.
 - Weight required skills more heavily than preferred ones.
 
+LANGUAGE:
+- Every free-text field (evidence, rationales, recommendation, \
+skills_missing entries) is shown to the candidate verbatim. Write plain \
+language.
+- Never use internal or technical input labels in output text: do not \
+write "OptimizedPayload", "payload", "JSON", or "JD". Say "the \
+candidate's profile" (or "their background") and "the job description" \
+instead.
+
 OUTPUT:
 - Return ONLY the JobAnalysis JSON object. No prose around it. No code fences.
 """

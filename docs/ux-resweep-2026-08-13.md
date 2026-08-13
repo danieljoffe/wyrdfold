@@ -40,6 +40,26 @@ skipped (state preserved). No other mutations.
 | R7  | Title junk persists as documented ("(1508) Senior Fullstack Engineer (Python, Node, C# & React)") — the deferred D4 ingest-design item, still visible in search                                                                                                                                                                                                                           | known-deferred                  |
 | R8  | Perceived performance: several authed pages (Profile, Settings, target tabs) hydrate through multi-second skeletons on this pass's navigation. Observed right after a deploy (cold caches) and through the browser extension (whose timings are unreliable per standing note) — **flagging as an observation to measure properly, not a verdict**                                         | needs real measurement          |
 
+## Addressed (2026-08-13, follow-up PR)
+
+- **R1** — "Score breakdown" sentence-cased (e2e dom-probe updated).
+- **R3** — target-card badge tooltip now leads with "Fit score N — how well this
+  target matches your experience" before the reasoning prose.
+- **R5** — the roll-off line renders only when the date is >24h out
+  (`rollOffIsInformative`, unit-tested); for an active account it was perpetually
+  "today".
+- **R6** — every picker item carries its full label as a native tooltip; labels
+  truncate with CSS instead of overflowing.
+- **R8 measured** (page performance API, not the extension): Profile TTFB 41ms but
+  content-ready ≈3.1s — `gap-health` is the long pole (**1.65s** server time; the
+  page gates ALL content on the slowest of its 3-fetch batch) and the identity card
+  only mounts after that gate, so its 650ms fetch **waterfalls** at t≈2.4s. Settings
+  is fine (2 parallel ~740ms calls). Two concrete follow-ups: speed up / defer
+  `gap-health` server-side, and mount the identity card outside the parent's loading
+  gate. Not rushed into the nits PR — both need layout/API design attention.
+- **R2 / R7 / R4** — remain as dispositioned (prompt vocabulary = owner call on
+  spend-bearing evals; title junk = ingest design; failed-card date self-heals).
+
 ## Verdict
 
 The release holds up under a fresh-eyes walk: every shipped fix reads correctly in

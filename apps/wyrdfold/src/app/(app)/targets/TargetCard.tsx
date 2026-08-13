@@ -121,7 +121,12 @@ export default function TargetCard({
               <ScoreBadge
                 score={fitScore}
                 size='sm'
-                title={fitScoreReasoning ?? 'Fit score'}
+                // The bare number badge was the sweep's "score of what?"
+                // moment (re-sweep R3) — the tooltip now NAMES it before
+                // the reasoning prose.
+                title={`Fit score ${fitScore} — how well this target matches your experience${
+                  fitScoreReasoning ? `. ${fitScoreReasoning}` : ''
+                }`}
               />
             )}
             <span className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary'>

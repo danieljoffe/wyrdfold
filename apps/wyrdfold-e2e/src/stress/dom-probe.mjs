@@ -48,7 +48,7 @@ console.log(
     .evaluateAll(els => els.map(e => e.className.slice(0, 60)))
 );
 const snap2 = await page.locator('body').ariaSnapshot();
-const i2 = snap2.indexOf('Score Breakdown');
+const i2 = snap2.indexOf('Score breakdown');
 console.log('=== aria snapshot around panel ===');
 console.log(snap2.slice(Math.max(0, i2 - 1200), i2 + 400));
 
