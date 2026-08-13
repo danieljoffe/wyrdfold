@@ -7,6 +7,7 @@ import { useToast } from '@/state/Toast/ToastProvider';
 import JobsFilter from './JobsFilter';
 import { filtersToApiParams } from './jobsFilterFields';
 import JobsListMobile from './JobsListMobile';
+import JobsPendingOnlyNote from './JobsPendingOnlyNote';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import type { JobPosting, JobsFilterState, JobsSortColumn } from './types';
 
@@ -155,6 +156,11 @@ export default function JobsListView({
         sort={sort}
         order={order}
         handleSort={handleSort}
+      />
+      <JobsPendingOnlyNote
+        postings={postings}
+        loading={loading}
+        minScore={filters.minScore}
       />
       {/* Reserve a minimum height so the list doesn't collapse between
           result sets during a filter/search/sort refetch — that shrink-then-
