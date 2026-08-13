@@ -116,7 +116,7 @@ describe('/search/[id] hard-load page (#467 §11.2 fast-follow)', () => {
       '/login'
     );
     // Never the authed bind/LLM actions.
-    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
 
   it('signed in → threads isAuthenticated: bind actions, no signup allusion', async () => {
@@ -124,7 +124,9 @@ describe('/search/[id] hard-load page (#467 §11.2 fast-follow)', () => {
     render(await ListingPage(pageProps()));
 
     expect(
-      screen.getByText(/add to a target to unlock llm pipelines/i)
+      screen.getByText(
+        /add to a target to unlock fit analysis and resume tailoring/i
+      )
     ).toBeInTheDocument();
     expect(
       screen.queryByRole('link', { name: /sign up free/i })

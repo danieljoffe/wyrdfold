@@ -107,7 +107,7 @@ export default function CreateTargetModal({
           />
           <Textarea
             label='Description (optional)'
-            helperText='A short note about this role. The LLM will use it (alongside your experience) to canonicalize the target and derive a scoring profile.'
+            helperText='A short note about this role — used alongside your experience to name the target and build its scoring profile.'
             placeholder='Roles I want to optimize for...'
             value={description}
             onChange={e => setDescription(e.target.value)}

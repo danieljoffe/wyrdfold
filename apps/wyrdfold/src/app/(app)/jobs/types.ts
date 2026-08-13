@@ -25,7 +25,9 @@ export const STATUS_DOT_CLASS: Record<JobStatus, string> = {
 };
 
 export function formatStatus(status: string): string {
-  return status.replace(/_/g, ' ');
+  // Title-cased so dropdown options match the status pill, which was the only
+  // surface capitalizing (via CSS) — "resume_draft" → "Resume Draft".
+  return status.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 export type ScoringStatus = 'stage1' | 'stage2' | 'complete';

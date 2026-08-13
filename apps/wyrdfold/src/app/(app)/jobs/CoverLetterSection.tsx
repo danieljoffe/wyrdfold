@@ -105,7 +105,7 @@ export default function CoverLetterSection({
         size='sm'
         onClick={handleGenerate}
       >
-        Generate Cover Letter
+        Generate cover letter
       </Button>
     );
   }

@@ -36,7 +36,7 @@ export default function CostChart({ data }: CostChartProps) {
 
   return (
     <ChartFigure
-      ariaLabel='LLM cost: weekly spend and resume count'
+      ariaLabel='AI cost: weekly spend and resume count'
       rows={data}
       columns={COLUMNS}
       rowKey={row => row.week_start}

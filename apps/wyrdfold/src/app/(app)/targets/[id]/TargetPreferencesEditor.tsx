@@ -354,7 +354,8 @@ export default function TargetPreferencesEditor({
         />
 
         <Text variant='meta' className='text-text-tertiary'>
-          Seniority and employment-type filters apply once job tagging is live.
+          Heads-up: job tagging is still rolling out — the seniority and
+          employment-type filters take effect as jobs get tagged.
         </Text>
 
         <div className='flex flex-wrap items-center justify-end gap-2'>

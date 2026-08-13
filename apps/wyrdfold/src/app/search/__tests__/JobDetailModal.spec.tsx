@@ -118,7 +118,9 @@ describe('JobDetailModal', () => {
     renderModal({ inTargets: [] });
 
     expect(
-      screen.getByText(/add to a target to unlock llm pipelines/i)
+      screen.getByText(
+        /add to a target to unlock fit analysis and resume tailoring/i
+      )
     ).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /add to target/i })
@@ -290,7 +292,7 @@ describe('JobDetailModal', () => {
     expect(
       screen.queryByRole('button', { name: /create a target from this role/i })
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
 
   it('closes via the dialog ✕ (shared-ui Modal), calling onClose', () => {
@@ -354,6 +356,6 @@ describe('JobDetailModal', () => {
     expect(
       screen.queryByRole('link', { name: /tailor a r/i })
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
 });

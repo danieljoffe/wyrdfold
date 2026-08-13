@@ -7,12 +7,12 @@ import { JOB_STATUSES, formatStatus } from '../types';
 describe('StatusIndicator', () => {
   it('renders a known status with its formatted label', () => {
     render(<StatusIndicator status='resume_draft' />);
-    expect(screen.getByText('resume draft')).toBeInTheDocument();
+    expect(screen.getByText('Resume Draft')).toBeInTheDocument();
   });
 
-  it('renders the bare status text for unknown statuses', () => {
+  it('title-cases unknown statuses like known ones', () => {
     render(<StatusIndicator status='mystery' />);
-    expect(screen.getByText('mystery')).toBeInTheDocument();
+    expect(screen.getByText('Mystery')).toBeInTheDocument();
   });
 
   it('renders one indicator per known JOB_STATUS', () => {
