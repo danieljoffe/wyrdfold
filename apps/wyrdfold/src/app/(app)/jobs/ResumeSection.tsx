@@ -11,6 +11,11 @@ import { useTailorDocument } from './useTailorDocument';
 
 interface ResumeSectionProps {
   jobPostingId: string;
+  /** Fired when a generation this panel started lands a draft. The server
+   *  marks the job ``resume_draft`` as part of the run (tailor.py,
+   *  ``mark_job_resume_draft``); without this the host's status pill kept
+   *  showing "New" until a full reload (ux-sweep 2026-08-12 §B7). */
+  onDrafted?: () => void;
 }
 
 /**
@@ -28,7 +33,10 @@ interface ResumeSectionProps {
  * that run was started before this panel mounted (or in another tab), and
  * navigating away mid-generation loses nothing.
  */
-export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
+export default function ResumeSection({
+  jobPostingId,
+  onDrafted,
+}: ResumeSectionProps) {
   const { toast } = useToast();
   const { record, loading, generating, error, generate } = useTailorDocument({
     jobPostingId,
@@ -69,6 +77,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
     });
     if (ok) {
       toast({ variant: 'success', title: 'Tailored resume drafted with AI' });
+      onDrafted?.();
     }
   }
 

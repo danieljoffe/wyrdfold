@@ -219,6 +219,25 @@ export function AddToTargetMenu({
             // The pick is async: keep the menu open while pending; success
             // closes it explicitly via the controlled state above.
             closeOnClick: false,
+            // Inactive targets stay pickable (adding still scores the job),
+            // but say so — the bare list read as 7 equal targets while Jobs
+            // shows 2 active tabs (§B2).
+            ...(t.isActive || pendingId === t.id
+              ? {}
+              : {
+                  content: (
+                    <span className='flex items-baseline gap-1.5'>
+                      <span>{t.label}</span>
+                      <Text
+                        variant='meta'
+                        as='span'
+                        className='text-text-tertiary'
+                      >
+                        inactive
+                      </Text>
+                    </span>
+                  ),
+                }),
           }));
 
   // Escape guard: shared-ui Modal listens for Escape on window, and the

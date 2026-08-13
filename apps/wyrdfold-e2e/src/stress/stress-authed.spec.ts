@@ -175,7 +175,7 @@ test('dashboard journey', async ({ page }) => {
     'dash.toggle.back-to-today',
     'dashboard',
     async () => {
-      await page.getByRole('button', { name: /^today$/i }).click();
+      await page.getByRole('button', { name: /^overview$/i }).click();
     },
     async () => {
       await expect(page.getByText(/top matches/i)).toBeVisible({

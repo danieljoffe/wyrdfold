@@ -57,8 +57,8 @@ function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
 
 /** Targets already loaded — the picker renders its menu without a fetch. */
 function loadedTargets(
-  targets: { id: string; label: string }[] = [
-    { id: 't1', label: 'Frontend Engineer' },
+  targets: { id: string; label: string; isActive: boolean }[] = [
+    { id: 't1', label: 'Frontend Engineer', isActive: true },
   ]
 ): TargetsSource {
   return { targets, loading: false, error: null, ensureLoaded: jest.fn() };
@@ -141,7 +141,7 @@ describe('JobDetailModal', () => {
   it('unbound → creates a target from the listing via the from-url flow', async () => {
     const created = {
       user_target: { id: 'ut1' },
-      target: { id: 't1', label: 'Frontend Engineer' },
+      target: { id: 't1', label: 'Frontend Engineer', isActive: true },
       was_matched: false,
     };
     (global.fetch as jest.Mock).mockResolvedValue({

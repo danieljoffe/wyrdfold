@@ -98,7 +98,9 @@ describe('DarkModeToggle', () => {
 
   test('has a title showing current theme', () => {
     render(<DarkModeToggle />);
-    expect(screen.getByTitle('Theme: system')).toBeInTheDocument();
+    expect(
+      screen.getByTitle('Theme: system — click or press D to cycle')
+    ).toBeInTheDocument();
   });
 
   test('contains an SVG icon', () => {
