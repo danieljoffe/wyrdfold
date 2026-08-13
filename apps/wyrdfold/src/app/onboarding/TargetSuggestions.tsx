@@ -23,6 +23,7 @@ import type {
 } from '@/app/(app)/targets/types';
 import { completeOnboarding } from './completeOnboarding';
 import type { JobData } from './JobUrlInput';
+import { useStagedMessage } from './useStagedMessage';
 
 /**
  * Path A's promised payoff: after the from-posting target lands, draft
@@ -64,6 +65,11 @@ async function draftPathAResume(
   }
 }
 
+const ANALYZE_STAGES = [
+  'Analyzing your experience...',
+  'Matching roles to your background — a few more seconds...',
+] as const;
+
 interface TargetSuggestionsProps {
   onComplete: () => void;
   onSkip: () => void;
@@ -77,6 +83,9 @@ export default function TargetSuggestions({
 }: TargetSuggestionsProps) {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
+  // The suggest call runs a full LLM pass over the master doc (~20s
+  // observed); stage the copy so the wait doesn't read as a hang.
+  const analyzeStage = useStagedMessage(ANALYZE_STAGES, loading);
   const [error, setError] = useState<string | null>(null);
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
   const [draftingResume, setDraftingResume] = useState(false);
@@ -312,7 +321,7 @@ export default function TargetSuggestions({
       <div className='flex flex-col items-center gap-4 py-12'>
         <Spinner size='lg' aria-label='Loading suggestions' />
         <Text variant='body' className='text-text-secondary'>
-          Analyzing your experience...
+          {analyzeStage}
         </Text>
       </div>
     );
@@ -454,7 +463,7 @@ export default function TargetSuggestions({
             size='sm'
             onClick={onSkip}
           >
-            Skip for now
+            Skip this step
           </Button>
           <Button
             name='onboarding-create-targets'
@@ -533,7 +542,7 @@ export default function TargetSuggestions({
           size='sm'
           onClick={onSkip}
         >
-          Skip for now
+          Skip this step
         </Button>
       </div>
     </div>

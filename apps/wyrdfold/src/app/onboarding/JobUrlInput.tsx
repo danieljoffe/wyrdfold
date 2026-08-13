@@ -184,7 +184,7 @@ export default function JobUrlInput({ onComplete, onSkip }: JobUrlInputProps) {
           onClick={onSkip}
           disabled={submitting}
         >
-          Skip for now
+          Skip this step
         </Button>
       </div>
     </div>

@@ -65,12 +65,14 @@ describe('PathChooser', () => {
     expect(onSelect).toHaveBeenCalledWith('C');
   });
 
-  it('calls onSkip when the "Skip for now" button is clicked', async () => {
+  it('calls onSkip when the "Skip setup for now" button is clicked', async () => {
     const user = userEvent.setup();
     const onSkip = jest.fn();
     render(<PathChooser onSelect={jest.fn()} onSkip={onSkip} />);
 
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(
+      screen.getByRole('button', { name: /skip setup for now/i })
+    );
 
     expect(onSkip).toHaveBeenCalledTimes(1);
   });

@@ -7,6 +7,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
+import Button from '@/components/kit/Button';
 import { completeOnboarding } from './completeOnboarding';
 import ConversationChat from '../_components/ConversationChat';
 import PathChooser from './PathChooser';
@@ -233,11 +234,18 @@ export default function OnboardingWizard({
           {currentStep === 'path-chooser' && (
             <PathChooser onSelect={handlePathSelect} onSkip={handleSkip} />
           )}
+          {/* Step-level skip ADVANCES (2026-08-13 walkthrough): every
+              step's "Skip this step" is wired to ``goNext``, never the
+              global exit. The old wiring sent every skip through
+              ``handleSkip``, so "skip the upload" silently completed the
+              whole wizard — with the AI down, the natural recovery click
+              threw away the remaining steps. The single global exit is
+              the "Finish setup later" link below. */}
           {currentStep === 'identity' && (
-            <IdentityStep onComplete={goNext} onSkip={handleSkip} />
+            <IdentityStep onComplete={goNext} onSkip={goNext} />
           )}
           {currentStep === 'upload-resume' && (
-            <ResumeUploader onComplete={goNext} onSkip={handleSkip} />
+            <ResumeUploader onComplete={goNext} onSkip={goNext} />
           )}
           {currentStep === 'add-job' && (
             <JobUrlInput
@@ -245,21 +253,44 @@ export default function OnboardingWizard({
                 if (data) setJobData(data);
                 goNext();
               }}
-              onSkip={handleSkip}
+              onSkip={goNext}
             />
           )}
           {currentStep === 'pick-targets' && (
             <TargetSuggestions
               onComplete={goNext}
-              onSkip={handleSkip}
+              onSkip={goNext}
               jobData={jobData}
             />
           )}
           {currentStep === 'conversation' && (
-            <ConversationChat onComplete={goNext} onSkip={handleSkip} />
+            <ConversationChat
+              onComplete={goNext}
+              onSkip={goNext}
+              skipLabel='Skip this step'
+            />
           )}
           {currentStep === 'completion' && <CompletionScreen />}
         </div>
+
+        {/* The one global exit. Same contract as the chooser's skip:
+            the completed flag must be confirmed persisted before
+            navigating (see handleSkip), or the dashboard guard bounces
+            the user straight back into the wizard. */}
+        {selectedPath && currentStep !== 'completion' && (
+          <div className='mt-6 text-center'>
+            <Button
+              name='onboarding-finish-later'
+              variant='bare'
+              size='sm'
+              className='text-text-tertiary hover:bg-surface-elevated hover:text-text-primary'
+              onClick={handleSkip}
+              disabled={skipping}
+            >
+              Finish setup later
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );
