@@ -275,6 +275,47 @@ def test_dev_default_job_analysis_is_schema_valid() -> None:
     assert analysis.scorecard.skills_matched
 
 
+def test_analysis_internal_vocab_echo_passes_through_unsanitized() -> None:
+    """Bug-corpus entry for the 2026-08-13 re-sweep R2: live analyses echoed
+    internal input labels into user-facing text ("no evidence in payload",
+    "JD-specific") because the prompt named its own sections. The fix is the
+    ANALYSIS_SYSTEM Language rule — nothing downstream sanitizes free text,
+    and this pins that: an internal-vocab verdict validates and passes
+    through verbatim. If a sanitizer is ever added, this fixture is its
+    first regression case (flip the assertions).
+    """
+    from app.models.analysis import JobAnalysis
+
+    analysis = JobAnalysis.model_validate(
+        {
+            "scorecard": {
+                "skills_matched": [
+                    {
+                        "name": "Remix",
+                        "matched": False,
+                        "confidence": "low",
+                        "evidence": None,
+                    }
+                ],
+                "skills_missing": [
+                    "Remix (preferred stack item; no evidence in payload)",
+                    "TS/SCI clearance (not assessable from payload)",
+                ],
+                "nice_to_haves": [],
+                "seniority_fit": "weak",
+                "seniority_rationale": "JD-specific requirement the OptimizedPayload lacks.",
+                "domain_fit": "weak",
+                "domain_rationale": "No overlap with the candidate's payload.",
+            },
+            "recommendation": "Skip: no evidence in payload for the JD's core stack.",
+        }
+    )
+    # Verbatim pass-through — the vocabulary reaches the user unless the
+    # PROMPT prevents it (ANALYSIS_SYSTEM -> LANGUAGE).
+    assert "payload" in analysis.recommendation
+    assert any("payload" in s for s in analysis.scorecard.skills_missing)
+
+
 def test_ats_hostile_resume_is_schema_valid_but_fails_the_real_linter() -> None:
     """Bug-corpus entry for #656: a resume the model got *right* by its own
     contract and wrong by the ATS linter's.

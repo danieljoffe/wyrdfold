@@ -1,6 +1,9 @@
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
-import LlmUsageCard, { usageVariant } from '../LlmUsageCard';
+import LlmUsageCard, {
+  rollOffIsInformative,
+  usageVariant,
+} from '../LlmUsageCard';
 
 // The monthly-allowance meter moved from a hand-rolled bar to the shared-ui
 // ProgressBar. These lock the two things that migration could silently break:
@@ -25,6 +28,23 @@ describe('usageVariant — the meter colour tiers', () => {
 
   it('treats a zero/absent limit as 0% → accent (no divide-by-zero)', () => {
     expect(usageVariant(5, 0)).toBe('accent');
+  });
+});
+
+describe('rollOffIsInformative — the roll-off line gate (re-sweep R5)', () => {
+  const now = new Date('2026-08-13T12:00:00Z');
+
+  it('hides a date within the next day — perpetually "today" for an active account', () => {
+    expect(rollOffIsInformative('2026-08-13T13:00:00Z', now)).toBe(false);
+    expect(rollOffIsInformative('2026-08-14T11:00:00Z', now)).toBe(false);
+  });
+
+  it('shows a date more than a day out (usage paused → real information)', () => {
+    expect(rollOffIsInformative('2026-08-20T12:00:00Z', now)).toBe(true);
+  });
+
+  it('hides on malformed input', () => {
+    expect(rollOffIsInformative('not a date', now)).toBe(false);
   });
 });
 

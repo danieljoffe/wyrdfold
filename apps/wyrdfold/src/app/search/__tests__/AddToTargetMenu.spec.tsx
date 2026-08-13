@@ -93,5 +93,9 @@ describe('AddToTargetMenu inactive labeling (§B2)', () => {
     expect(screen.getByText('inactive')).toBeInTheDocument();
     // Exactly one hint — the active target carries none.
     expect(screen.getAllByText('inactive')).toHaveLength(1);
+    // Every item carries its full label as a native tooltip — truncated
+    // labels were unreadable in the fixed-width menu (re-sweep R6).
+    expect(screen.getByTitle('Active target')).toBeInTheDocument();
+    expect(screen.getByTitle('Paused target')).toBeInTheDocument();
   });
 });
