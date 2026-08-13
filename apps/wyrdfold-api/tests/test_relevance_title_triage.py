@@ -572,3 +572,62 @@ class TestDropDiagnostics:
         assert "20 title_prefix mismatch" in caplog.text
         assert f"sample {_DROP_SAMPLE_LIMIT}/20" in caplog.text
         assert caplog.text.count("prefix='XXX'") == _DROP_SAMPLE_LIMIT
+
+
+class TestFailureLoggingVolume:
+    """2026-08-12: OpenRouter credits ran out and every triage call 403'd.
+
+    Each failure emitted a full `logger.exception` traceback — per target, per
+    batch, per cycle — which hit Railway's 500 logs/sec replica cap and DROPPED
+    101 messages. The flood cost visibility exactly when it was most needed,
+    and the trace itself said nothing the error message didn't.
+    """
+
+    @pytest.mark.asyncio
+    async def test_classified_llm_error_logs_one_line_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from app.services.llm.errors import LLMAuthError
+
+        llm = MagicMock()
+
+        async def boom(*args: object, **kwargs: object) -> object:
+            raise LLMAuthError("Our AI service is temporarily unavailable.")
+
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", boom)
+
+        with caplog.at_level(logging.ERROR):
+            verdicts, result = await triage_titles(
+                llm, target=_target(), titles=["Senior Frontend Engineer"]
+            )
+
+        # Deferral semantics are UNCHANGED — this is a logging fix, and a
+        # regression here would silently flip the pipeline to fail-open admit.
+        assert verdicts == {}
+        assert result is None
+
+        records = [r for r in caplog.records if "title triage" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].exc_info is None, "classified error must not carry a traceback"
+        assert "LLMAuthError" in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_error_keeps_its_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The volume argument does not apply to a surprise — an unclassified
+        failure is exactly when the stack is worth having."""
+        llm = MagicMock()
+
+        async def boom(*args: object, **kwargs: object) -> object:
+            raise RuntimeError("something nobody predicted")
+
+        monkeypatch.setattr("app.services.relevance.title_triage.complete_json", boom)
+
+        with caplog.at_level(logging.ERROR):
+            verdicts, _ = await triage_titles(llm, target=_target(), titles=["A"])
+
+        assert verdicts == {}
+        records = [r for r in caplog.records if "title triage" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].exc_info is not None, "unclassified error must keep its traceback"

@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _LLM_COSTS = ("llm_costs", "created_at")
 _NOTIFICATIONS = ("notifications_sent", "sent_at")
 _SEARCH_EVENTS = ("search_events", "occurred_at")
+_PHASE1_REJECTIONS = ("phase1_rejections", "judged_at")
 
 
 async def _purge_table(supabase: AsyncClient, table: str, ts_col: str, days: int) -> int:
@@ -76,6 +77,7 @@ async def purge_expired_records(
     llm_costs_days: int,
     notifications_sent_days: int,
     search_events_days: int,
+    phase1_rejections_days: int,
 ) -> dict[str, int]:
     """Purge expired rows from the logs; return a per-table deleted count.
 
@@ -85,4 +87,7 @@ async def purge_expired_records(
         _LLM_COSTS[0]: await _purge_table(supabase, *_LLM_COSTS, llm_costs_days),
         _NOTIFICATIONS[0]: await _purge_table(supabase, *_NOTIFICATIONS, notifications_sent_days),
         _SEARCH_EVENTS[0]: await _purge_table(supabase, *_SEARCH_EVENTS, search_events_days),
+        _PHASE1_REJECTIONS[0]: await _purge_table(
+            supabase, *_PHASE1_REJECTIONS, phase1_rejections_days
+        ),
     }
