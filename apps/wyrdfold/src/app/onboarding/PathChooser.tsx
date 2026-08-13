@@ -77,7 +77,7 @@ export default function PathChooser({ onSelect, onSkip }: PathChooserProps) {
           size='sm'
           onClick={onSkip}
         >
-          Skip for now
+          Skip setup for now
         </Button>
       </div>
     </div>

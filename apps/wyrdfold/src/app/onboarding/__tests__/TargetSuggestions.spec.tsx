@@ -404,7 +404,7 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     });
   });
 
-  it('invokes onSkip when "Skip for now" is clicked from the manual fallback', async () => {
+  it('invokes onSkip when "Skip this step" is clicked from the manual fallback', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ matches: [] }),
@@ -413,7 +413,7 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     const user = userEvent.setup();
     render(<TargetSuggestions onComplete={jest.fn()} onSkip={onSkip} />);
 
-    const skip = await screen.findByRole('button', { name: /skip for now/i });
+    const skip = await screen.findByRole('button', { name: /skip this step/i });
     await user.click(skip);
     expect(onSkip).toHaveBeenCalledTimes(1);
   });

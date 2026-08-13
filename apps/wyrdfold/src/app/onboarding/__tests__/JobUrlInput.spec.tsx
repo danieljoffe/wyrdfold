@@ -152,11 +152,11 @@ describe('JobUrlInput', () => {
     });
   });
 
-  it('invokes onSkip when "Skip for now" is clicked', async () => {
+  it('invokes onSkip when "Skip this step" is clicked', async () => {
     const onSkip = jest.fn();
     const user = userEvent.setup();
     render(<JobUrlInput onComplete={jest.fn()} onSkip={onSkip} />);
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(screen.getByRole('button', { name: /skip this step/i }));
     expect(onSkip).toHaveBeenCalledTimes(1);
   });
 });

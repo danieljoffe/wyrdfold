@@ -10,12 +10,19 @@ import { Alert } from '@danieljoffe/shared-ui/Alert';
 import Button from '@/components/kit/Button';
 import { cn } from '@/lib/cn';
 import { extractApiError } from '@/lib/extractApiError';
+import { useStagedMessage } from './useStagedMessage';
 
 const ACCEPTED_TYPES = [
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+
+const PARSE_STAGES = [
+  'Uploading and parsing your resume...',
+  'Reading your work history...',
+  'Building your experience document — this can take up to a minute...',
+] as const;
 
 interface ResumeUploaderProps {
   onComplete: () => void;
@@ -28,6 +35,9 @@ export default function ResumeUploader({
 }: ResumeUploaderProps) {
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
+  // Parsing a long resume takes ~45s (prod, 2026-08-13); a static line
+  // reads as a hang well before that.
+  const parseStage = useStagedMessage(PARSE_STAGES, uploading);
   const [error, setError] = useState<string | null>(null);
   const [uploaded, setUploaded] = useState(false);
   // Re-collection dedup (UX/IA §F): a redo-onboarding user already has a
@@ -168,7 +178,7 @@ export default function ResumeUploader({
             size='sm'
             onClick={onSkip}
           >
-            Skip for now
+            Skip this step
           </Button>
         </div>
       </div>
@@ -218,7 +228,7 @@ export default function ResumeUploader({
             <>
               <Spinner size='lg' aria-label='Uploading resume' />
               <Text variant='body' className='text-text-secondary'>
-                Uploading and parsing your resume...
+                {parseStage}
               </Text>
             </>
           ) : uploaded ? (
@@ -271,7 +281,7 @@ export default function ResumeUploader({
           onClick={onSkip}
           disabled={uploading}
         >
-          Skip for now
+          Skip this step
         </Button>
       </div>
     </div>
