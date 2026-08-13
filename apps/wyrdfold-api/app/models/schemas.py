@@ -114,6 +114,12 @@ class ManualJobResponse(BaseModel):
     extraction_tier: str
     warnings: list[str]
     needs_manual_fields: bool
+    # The extracted JD body, returned so callers that need it next (the
+    # onboarding path-A tailor kick) don't have to re-fetch the posting.
+    # ``GET /jobs/{id}`` can't serve them: its ownership probe requires a
+    # ``scores`` row, and a brand-new user has no active targets at add
+    # time, so nothing has scored the posting yet.
+    description_html: str | None = None
 
 
 class AddToTargetRequest(BaseModel):

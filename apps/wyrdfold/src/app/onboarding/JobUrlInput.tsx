@@ -14,6 +14,15 @@ import { extractApiError } from '@/lib/extractApiError';
 export interface JobData {
   postingId: string;
   title: string | null;
+  /**
+   * The extracted JD body, threaded through from the manual-add response
+   * so the pick-targets step can kick the path-A tailor draft without
+   * re-fetching the posting. ``GET /api/jobs/{id}`` 404s here: its
+   * ownership check needs a ``scores`` row, and a new user's posting has
+   * nothing scored against it yet (the from-posting target activates in
+   * the background).
+   */
+  descriptionHtml: string | null;
 }
 
 interface JobUrlInputProps {
@@ -65,6 +74,7 @@ export default function JobUrlInput({ onComplete, onSkip }: JobUrlInputProps) {
           success: boolean;
           posting_id: string | null;
           extracted: { title: string | null; company_name: string | null };
+          description_html: string | null;
         };
 
         setExtracted({
@@ -74,7 +84,11 @@ export default function JobUrlInput({ onComplete, onSkip }: JobUrlInputProps) {
         });
 
         const jobData = data.posting_id
-          ? { postingId: data.posting_id, title: data.extracted?.title ?? null }
+          ? {
+              postingId: data.posting_id,
+              title: data.extracted?.title ?? null,
+              descriptionHtml: data.description_html ?? null,
+            }
           : undefined;
         timerRef.current = setTimeout(() => onComplete(jobData), 1500);
       } catch (err) {

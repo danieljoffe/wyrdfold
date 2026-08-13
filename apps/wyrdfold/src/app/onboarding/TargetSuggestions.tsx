@@ -34,17 +34,20 @@ import type { JobData } from './JobUrlInput';
  * Any failure — no JD, gap gate, LLM budget, network — returns false and
  * the caller falls back to the normal completion flow: the target is
  * already created, so the user lost nothing but the shortcut.
+ *
+ * The JD is threaded through from the add-job step's manual-add response
+ * rather than re-fetched: ``GET /api/jobs/{id}`` gates on a ``scores``
+ * row existing for one of the caller's targets, and the from-posting
+ * target only gets scores once its background activation runs — so the
+ * fetch 404'd on every fresh onboarding and the payoff never fired.
  */
-async function draftPathAResume(postingId: string): Promise<boolean> {
+async function draftPathAResume(
+  postingId: string,
+  descriptionHtml: string | null
+): Promise<boolean> {
+  const jd = (descriptionHtml ?? '').trim();
+  if (!jd) return false;
   try {
-    const detailRes = await fetch(`/api/jobs/${postingId}`);
-    if (!detailRes.ok) return false;
-    const detail = (await detailRes.json()) as {
-      description_html: string | null;
-    };
-    const jd = (detail.description_html ?? '').trim();
-    if (!jd) return false;
-
     const res = await fetch('/api/jobs/tailor/resume', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -93,6 +96,7 @@ export default function TargetSuggestions({
   useEffect(() => {
     if (!jobData) return;
     const postingId = jobData.postingId;
+    const descriptionHtml = jobData.descriptionHtml;
     let cancelled = false;
 
     async function createFromPosting() {
@@ -124,7 +128,7 @@ export default function TargetSuggestions({
           // this posting and finish on its review page. Fallback on any
           // failure is the pre-existing flow (completion screen).
           setDraftingResume(true);
-          const drafted = await draftPathAResume(postingId);
+          const drafted = await draftPathAResume(postingId, descriptionHtml);
           if (cancelled) return;
           if (drafted) {
             router.push(`/jobs/${postingId}/resume`);
