@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -192,6 +193,27 @@ class TestComputePipeline:
         assert len(result.velocity) >= 1
         total_resumes = sum(v.resumes_generated for v in result.velocity)
         assert total_resumes == 3
+
+    async def test_velocity_pads_quiet_weeks_through_today(self):
+        # ux-sweep 2026-08-12 §B7: plotting only weeks WITH data dropped
+        # trailing quiet weeks — the chart's axis ended at the last burst
+        # of activity, so a 30d view stopped 10 days before today. Weeks
+        # must be contiguous from first activity through today's week,
+        # with quiet weeks present as zeros.
+        resumes = [
+            {"job_posting_id": "1", "created_at": _ts(_NOW - timedelta(days=28))},
+        ]
+        sb = _mock_supabase({"documents": resumes})
+        result = await compute_pipeline(sb, since=None)
+
+        assert len(result.velocity) == 5  # activity week + 4 through today
+        assert result.velocity[0].resumes_generated == 1
+        assert all(v.resumes_generated == 0 for v in result.velocity[1:])
+        # Contiguous Mondays, no gaps.
+        starts = [v.week_start for v in result.velocity]
+        assert all((b - a).days == 7 for a, b in itertools.pairwise(starts))
+        # The final bucket is the CURRENT week.
+        assert starts[-1] == _NOW.date() - timedelta(days=_NOW.date().weekday())
 
     async def test_previous_is_none_without_prior_window(self):
         sb = _mock_supabase({})

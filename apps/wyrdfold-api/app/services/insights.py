@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 from supabase import AsyncClient
@@ -530,15 +530,25 @@ async def compute_pipeline(
         if log["new_status"] in APPLIED_STATUSES and log["old_status"] not in APPLIED_STATUSES:
             week_apps[_iso_week_start(_parse_dt(log["created_at"]))] += 1
 
-    all_weeks = sorted(set(week_resumes.keys()) | set(week_apps.keys()))
-    velocity = [
-        WeeklyCount(
-            week_start=w,
-            resumes_generated=week_resumes.get(w, 0),
-            applications_submitted=week_apps.get(w, 0),
-        )
-        for w in all_weeks
-    ]
+    # Contiguous weeks from the first activity through TODAY's week — not
+    # just weeks that have data. Plotting only active weeks silently dropped
+    # trailing quiet weeks, so the chart's x-axis ended at the last burst of
+    # activity and recent silence was invisible (ux-sweep 2026-08-12 §B7:
+    # a 30d view whose axis stopped 10 days before today).
+    data_weeks = set(week_resumes.keys()) | set(week_apps.keys())
+    velocity: list[WeeklyCount] = []
+    if data_weeks:
+        week = min(data_weeks)
+        last = max(_iso_week_start(datetime.now(UTC).date()), max(data_weeks))
+        while week <= last:
+            velocity.append(
+                WeeklyCount(
+                    week_start=week,
+                    resumes_generated=week_resumes.get(week, 0),
+                    applications_submitted=week_apps.get(week, 0),
+                )
+            )
+            week += timedelta(days=7)
 
     return PipelineInsights(
         total_applications=current.total_applications,
