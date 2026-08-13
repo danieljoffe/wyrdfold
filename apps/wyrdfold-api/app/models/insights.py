@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel
 
@@ -121,3 +121,32 @@ class SkillsCostInsights(BaseModel):
     cost_by_purpose: list[PurposeCost]
     total_cost: float
     avg_cost_per_resume: float | None
+
+
+class NearMissTitle(BaseModel):
+    """One low-confidence Phase-1 rejection for a target (#634 f/u).
+
+    Mined from ``phase1_rejections`` — data the triage gate already paid
+    for. A rejection the model itself marked shaky (confidence below the
+    ceiling) is a role ADJACENT to the target: either a posting family the
+    user may want the target widened to include, or a sign the target
+    label reads narrower than intended.
+    """
+
+    title: str
+    confidence: int
+    last_judged_at: datetime
+
+
+class TargetNearMisses(BaseModel):
+    target_id: str
+    label: str
+    titles: list[NearMissTitle]
+
+
+class NearMissInsights(BaseModel):
+    """Per-target near-miss rejections, shakiest verdicts first."""
+
+    targets: list[TargetNearMisses]
+    confidence_ceiling: int
+    window_days: int
