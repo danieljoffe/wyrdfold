@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
@@ -114,3 +114,44 @@ async def test_target_delete_cascades_rejections(service_client: Client) -> None
 
     service_client.table("targets").delete().eq("id", target_id).execute()
     assert _rows(service_client, target_id) == []
+
+
+@pytest.mark.asyncio
+async def test_near_miss_compute_roundtrips_against_real_postgrest(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    store_target: SimpleNamespace,
+) -> None:
+    """The near-miss read uses chain pieces the store's own reads don't
+    (``.lt`` on confidence, ``.gte`` on judged_at, chained ``.order``,
+    ``.limit``) — prove them against real PostgREST, not just the fake.
+
+    The compute runs on the ASYNC client, the same shape prod's endpoint
+    passes (``get_async_service_supabase``): its ``.execute()`` is awaited
+    directly, which the sync test client cannot satisfy — exactly the kind
+    of client-shape drift a dual-mode fake papers over."""
+    from app.services.relevance.near_miss import compute_near_misses
+
+    await record_rejections(
+        service_client,
+        store_target,
+        [("Shakiest Role", 40), ("Shaky Role", 60), ("Settled No", 95)],
+    )
+    # Poison one sub-ceiling row out of the window: it must not surface.
+    await record_rejections(service_client, store_target, [("Stale Near Miss", 50)])
+    stale = (datetime.now(UTC) - timedelta(days=45)).isoformat()
+    service_client.table("phase1_rejections").update({"judged_at": stale}).eq(
+        "target_id", store_target.id
+    ).eq("title_norm", "stale near miss").execute()
+
+    result = await compute_near_misses(
+        async_service_client, [(store_target.id, "IT Target", 1)]
+    )
+
+    got = result.targets[0]
+    assert got.label == "IT Target"
+    # Shakiest first; the settled 95 and the stale 50 both excluded.
+    assert [(t.title, t.confidence) for t in got.titles] == [
+        ("shakiest role", 40),
+        ("shaky role", 60),
+    ]

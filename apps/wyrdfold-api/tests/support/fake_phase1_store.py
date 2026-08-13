@@ -26,18 +26,50 @@ change.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 
+class AwaitableResponse:
+    """A response usable from BOTH supabase client shapes.
+
+    The rejection store reaches this fake through the ``poll_db_read``
+    sync fallback (calls ``execute()`` and reads ``.data``); the
+    near-miss insight path awaits ``execute()`` directly on the async
+    client. Awaiting resolves to the same object, so one fake serves
+    both without duplicating row semantics.
+    """
+
+    def __init__(self, data: list[dict[str, Any]]) -> None:
+        self.data = data
+
+    def __await__(self):
+        return self
+        yield  # pragma: no cover — makes this method a generator
+
+
 class FakePhase1RejectionsQuery:
-    """One built SELECT against :class:`FakePhase1RejectionsTable`."""
+    """One built SELECT against :class:`FakePhase1RejectionsTable`.
+
+    Covers the two real query shapes against the table:
+
+    - the rejection store's membership read —
+      ``.eq(target_id).eq(profile_version).gt(judged_at).in_(title_norm)``
+    - the near-miss insight read —
+      ``.eq(target_id).eq(profile_version).lt(confidence).gte(judged_at)
+      .order(confidence).order(judged_at, desc=True).limit(n)``
+    """
 
     def __init__(self, rows: dict[tuple[str, int, str], dict]) -> None:
         self._rows = rows
         self._target_id: str | None = None
         self._profile_version: int | None = None
-        self._cutoff: str | None = None
-        self._titles: set[str] = set()
+        self._judged_after: str | None = None
+        self._judged_after_inclusive = False
+        self._confidence_below: int | None = None
+        self._titles: set[str] | None = None
+        self._orders: list[tuple[str, bool]] = []
+        self._limit: int | None = None
 
     def eq(self, column: str, value: object) -> FakePhase1RejectionsQuery:
         if column == "target_id":
@@ -47,24 +79,66 @@ class FakePhase1RejectionsQuery:
         return self
 
     def gt(self, _column: str, value: str) -> FakePhase1RejectionsQuery:
-        self._cutoff = value
+        self._judged_after = value
+        self._judged_after_inclusive = False
+        return self
+
+    def gte(self, _column: str, value: str) -> FakePhase1RejectionsQuery:
+        self._judged_after = value
+        self._judged_after_inclusive = True
+        return self
+
+    def lt(self, _column: str, value: int) -> FakePhase1RejectionsQuery:
+        self._confidence_below = value
         return self
 
     def in_(self, _column: str, values: list[str]) -> FakePhase1RejectionsQuery:
         self._titles = set(values)
         return self
 
-    def execute(self) -> MagicMock:
-        resp = MagicMock()
-        resp.data = [
-            {"title_norm": key[2]}
+    def order(self, column: str, *, desc: bool = False) -> FakePhase1RejectionsQuery:
+        self._orders.append((column, desc))
+        return self
+
+    def limit(self, count: int) -> FakePhase1RejectionsQuery:
+        self._limit = count
+        return self
+
+    def _matches(self, key: tuple[str, int, str], row: dict) -> bool:
+        if key[0] != self._target_id or key[1] != self._profile_version:
+            return False
+        if self._titles is not None and key[2] not in self._titles:
+            return False
+        if self._judged_after is not None:
+            # ISO-8601 UTC strings on both sides — lexicographic compare
+            # matches Postgres' timestamptz ordering.
+            ok = (
+                row["judged_at"] >= self._judged_after
+                if self._judged_after_inclusive
+                else row["judged_at"] > self._judged_after
+            )
+            if not ok:
+                return False
+        if self._confidence_below is not None:
+            conf = row.get("confidence")
+            # SQL semantics: NULL never satisfies a < comparison.
+            if conf is None or conf >= self._confidence_below:
+                return False
+        return True
+
+    def execute(self) -> AwaitableResponse:
+        matched = [
+            dict(row)
             for key, row in self._rows.items()
-            if key[0] == self._target_id
-            and key[1] == self._profile_version
-            and key[2] in self._titles
-            and (self._cutoff is None or row["judged_at"] > self._cutoff)
+            if self._matches(key, row)
         ]
-        return resp
+        # Apply order specs primary-first: stable-sort from the last spec
+        # to the first, mirroring SQL's ORDER BY a, b.
+        for column, desc in reversed(self._orders):
+            matched.sort(key=lambda r: r[column], reverse=desc)
+        if self._limit is not None:
+            matched = matched[: self._limit]
+        return AwaitableResponse(matched)
 
 
 class FakePhase1RejectionsTable:
