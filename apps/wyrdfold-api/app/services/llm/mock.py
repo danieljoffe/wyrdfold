@@ -397,6 +397,36 @@ def country_name_job_fit_json(country: str = "India") -> str:
     )
 
 
+def conversation_recap_echo_json(recap: str) -> str:
+    """A schema-VALID ``LLMTurnResponse`` whose ``prose_append`` restates a
+    block that is already in the prose doc verbatim.
+
+    Bug-corpus entry for the 2026-08-13 Path-C prompt work. The grounding
+    instructions tell the interviewer to restate the user's earlier claims
+    when asking follow-ups ("You said X — what was Y?"), which invites
+    restating them into ``prose_append`` too. The contract bans it
+    ("restating is NOT new content"), but a model that does it anyway is
+    honouring the schema perfectly — same shape of failure as
+    ``country_name_job_fit_json``: valid payload, wrong semantics. Unguarded,
+    the duplicate lands in the source-of-truth prose the tailor later
+    reproduces verbatim. Scripting it lets the orchestrator test prove the
+    recap-echo guard actually drops the append instead of trusting the
+    prompt to always be obeyed.
+    """
+    return json.dumps(
+        {
+            "assistant_message": (
+                "You said the poller was the bottleneck — what did its "
+                "throughput go from and to?"
+            ),
+            # The payload under test — old content presented as new.
+            "prose_append": recap,
+            "done": False,
+            "annotation": None,
+        }
+    )
+
+
 def dev_default_responses() -> dict[str, ResponseSource]:
     """Scripted responses seeded into the mock for LOCAL DEV / integration only
     (the ``LLM_PROVIDER=mock`` factory), so LLM-backed flows return usable data
