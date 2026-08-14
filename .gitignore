@@ -121,3 +121,4 @@ apps/root/src/data/generated/
 # Written by apps/wyrdfold-e2e/src/auth.setup.ts on first run; this
 # file contains a live Supabase JWT and must not be committed.
 apps/wyrdfold-e2e/src/.auth/
+daniel-joffe-resume.pdf

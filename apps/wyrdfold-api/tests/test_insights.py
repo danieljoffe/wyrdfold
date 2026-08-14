@@ -1478,6 +1478,8 @@ def _chunk_tracking_supabase(
 
         for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq"):
             getattr(tbl, method).return_value = tbl
+        # ``.not_.is_(col, "null")`` — the harvest union's not-null filter.
+        tbl.not_.is_.return_value = tbl
 
         def in_recorder(col: str, ids: list, _name: str = name) -> MagicMock:
             in_batches.setdefault(_name, []).append(list(ids))
@@ -1548,11 +1550,12 @@ class TestComputeChunksLargeIdLists:
             assert big and all(s <= 200 for s in big), f"{table} not chunked at 200: {sizes}"
 
     async def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
-        """#60-perf: skills-cost no longer resolves posting membership via
-        ``scores`` (tens of thousands of rows) + fetches every target posting.
-        It scopes analyses by ``target_id`` directly; since R2 the priority
-        weight comes from each analysis's own scorecard, so there is NO jobs
-        fetch at all."""
+        """#60-perf, amended for the skills harvest: skills-cost never
+        resolves posting membership via per-posting id pulls. Analyses scope
+        by ``target_id`` directly; the harvest union reads ``scores`` in the
+        SAME cheap shape (one target-scoped ``in_``, not posting-id batches);
+        and there is still NO ``jobs`` fetch at all — the harvest's job-level
+        list is denormalized onto ``scores`` precisely to keep it that way."""
         analyses = [
             {
                 "job_posting_id": "p1",
@@ -1570,22 +1573,39 @@ class TestComputeChunksLargeIdLists:
                 "scorecard": {"skills_missing": ["Go"]},
             },
         ]
+        harvest_scores = [
+            {
+                "skills_matched": ["kubernetes"],
+                "skills_missing": ["terraform"],
+                "score": 80,
+                "updated_at": _ts(_NOW),
+            },
+        ]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
-            {"analyses": analyses, "documents": [], "llm_costs": []},
+            {
+                "analyses": analyses,
+                "scores": harvest_scores,
+                "documents": [],
+                "llm_costs": [],
+            },
             in_batches,
         )
 
         result = await compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
-        # No membership pull: skills-cost must not touch the ``scores`` table.
-        assert "scores" not in in_batches
-        # And since R2, no ``jobs`` read either — the weight is in-hand from
-        # the analyses' scorecards.
+        # The ONLY scores read is the target-scoped harvest union — never a
+        # posting-membership pull (which would batch posting ids, not the
+        # handful of target ids).
+        assert in_batches.get("scores") == [["t1"]]
+        # And still no ``jobs`` read — the harvest denorm keeps it that way.
         assert "jobs" not in in_batches
-        # Skills flow through from the scorecards.
+        # Skills flow through from BOTH sources: analyses scorecards + the
+        # harvested scores columns.
         skills = {s.skill for s in result.top_skills}
-        assert {"React", "Rust", "Go"} <= skills
+        assert {"React", "Rust", "Go", "kubernetes"} <= skills
+        missing = {m.skill for m in result.top_missing}
+        assert "terraform" in missing
 
 
 # ===========================================================================
