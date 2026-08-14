@@ -159,6 +159,9 @@ async def test_suggest_and_match_from_query_excludes_existing(
         return owned if label == "Senior Frontend Engineer" else None
 
     monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value={"t-owned"}))
+    # Labels empty: the ID-exclusion path is the SUT here; containment has
+    # its own coverage in test_targets_match.py.
+    monkeypatch.setattr(match_module, "_user_target_labels", AsyncMock(return_value=set()))
     monkeypatch.setattr(match_module, "find_matching_target", _fake_match)
 
     llm = MockLLMClient(
