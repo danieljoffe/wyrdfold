@@ -37,6 +37,7 @@ from app.services.jd_parser import parse_jd
 from app.services.location_parse import parse_location
 from app.services.sanitize import sanitize_html
 from app.services.target_scoring import score_and_upsert_async
+from app.services.titles import clean_title_display
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ async def materialize_and_score_job(
         "external_id": job_external_id(final_url),
         "source_id": MANUAL_SOURCE_ID,
         "title": title,
+        "title_display": clean_title_display(title),
         "company_name": company_name,
         "location": location,
         "city": loc.city,

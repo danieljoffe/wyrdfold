@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
@@ -218,15 +219,15 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
               target='_blank'
               rel='noopener noreferrer'
               className='group inline-flex items-center gap-2 min-w-0 max-w-full text-text-primary hover:text-brand-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 rounded-md'
-              aria-label={`Open original posting for ${posting.title} in a new tab`}
+              aria-label={`Open original posting for ${displayTitle(posting)} in a new tab`}
             >
               <Heading
                 variant='component'
                 as='h1'
                 className='min-w-0 truncate underline decoration-dotted decoration-text-tertiary underline-offset-4 group-hover:decoration-brand-500'
-                title={posting.title}
+                title={displayTitle(posting)}
               >
-                {posting.title}
+                {displayTitle(posting)}
               </Heading>
               <ExternalLink
                 className='size-5 shrink-0 text-brand-500'
@@ -238,9 +239,9 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
               variant='component'
               as='h1'
               className='min-w-0 truncate'
-              title={posting.title}
+              title={displayTitle(posting)}
             >
-              {posting.title}
+              {displayTitle(posting)}
             </Heading>
           )}
           <div className='mt-1 flex flex-col gap-0.5 text-text-secondary'>
@@ -307,7 +308,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
         title='Delete posting?'
-        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
+        message={`Delete "${displayTitle(posting)}" from ${posting.company_name}? This can't be undone.`}
         confirmLabel='Delete'
         destructive
         loading={deleting}

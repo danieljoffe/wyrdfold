@@ -18,6 +18,9 @@ class JobSearchResult(BaseModel):
 
     id: str
     title: str
+    # Cleaned display form (services/titles.py), None when raw ``title`` is
+    # already presentable — clients render ``title_display ?? title``.
+    title_display: str | None = None
     company_name: str
     location: str | None = None
     # Structured parts parsed from ``location`` at ingest (#518). Nullable —

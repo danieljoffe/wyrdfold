@@ -10,6 +10,7 @@ import {
 } from 'react';
 import Link from 'next/link';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { Check, ChevronDown, Plus } from 'lucide-react';
@@ -326,7 +327,7 @@ function JobSearchCard({
     <Link
       href={`/search/${job.id}`}
       scroll={false}
-      aria-label={`Open ${job.title} at ${job.company_name}`}
+      aria-label={`Open ${displayTitle(job)} at ${job.company_name}`}
       onClick={() => {
         // Funnel tick (§10 PR6) — fire-and-forget (keepalive), never blocks
         // or delays the navigation into the detail.
@@ -343,7 +344,7 @@ function JobSearchCard({
         <CompanyAvatar name={formatCompanyName(job.company_name)} />
         <div className='min-w-0 flex-1'>
           <span className='font-semibold transition-colors group-hover:text-text-brand'>
-            {job.title}
+            {displayTitle(job)}
           </span>
           {meta && (
             <Text

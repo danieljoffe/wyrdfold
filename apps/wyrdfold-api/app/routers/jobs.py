@@ -110,7 +110,10 @@ router = APIRouter(
 )
 
 _JP_SELECT_COLS = (
-    "id, external_id, source_id, title, company_name, location, "
+    # ``title_display``: cleaned display form (services/titles.py), NULL when
+    # the raw title is fine. The RPC list paths don't return it yet (stage 2 —
+    # function recreations); the FE falls back to ``title`` there.
+    "id, external_id, source_id, title, title_display, company_name, location, "
     "city, state, country, location_remote, "
     "absolute_url, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "

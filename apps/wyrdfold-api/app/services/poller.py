@@ -80,6 +80,7 @@ from app.services.target_scoring import (
 )
 from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
+from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import fetch_workday_jobs
 from app.supabase_pool import get_async_supabase
@@ -1810,6 +1811,7 @@ async def _poll_one_source(
                     "external_id": job.external_id,
                     "source_id": source_id,
                     "title": job.title,
+                    "title_display": clean_title_display(job.title),
                     "company_name": company_name,
                     "location": job.location_name,
                     "city": loc.city,
@@ -3196,6 +3198,7 @@ async def _poll_one_source_for_target(
                     "external_id": job.external_id,
                     "source_id": source_id,
                     "title": job.title,
+                    "title_display": clean_title_display(job.title),
                     "company_name": company_name,
                     "location": job.location_name,
                     "city": loc.city,
