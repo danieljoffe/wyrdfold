@@ -31,6 +31,13 @@ const nextConfig = {
   transpilePackages: ['@danieljoffe/shared-ui'],
   pageExtensions: ['js', 'jsx', 'ts', 'tsx'],
   devIndicators: false,
+  // Next 16's `next dev` auto-generates AGENTS.md/CLAUDE.md in this app dir.
+  // Their substance (read node_modules/next/dist/docs/ before writing Next
+  // code — this version differs from model training data) is folded into the
+  // repo-root CLAUDE.md, where every session loads it; the generated files
+  // were untracked churn on top of that. Generator:
+  // node_modules/next/dist/server/lib/generate-agent-files.js
+  agentRules: false,
   // Next 16 blocks cross-origin requests to internal dev endpoints
   // (HMR WebSocket, /__nextjs_font/*, etc.) by default — and the
   // built-in allow list is only `localhost` / `*.localhost`. Loading
