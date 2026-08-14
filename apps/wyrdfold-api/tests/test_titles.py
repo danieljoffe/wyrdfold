@@ -47,6 +47,8 @@ class TestRepairs:
             clean_title_display("Staff Engineer (REQ-20441)") == "Staff Engineer"
         )
         assert clean_title_display("Staff Engineer [R 123456]") == "Staff Engineer"
+        # Bare digits need 5+ — a 5-digit id is a code, a 4-digit year is not.
+        assert clean_title_display("Staff Engineer (20441)") == "Staff Engineer"
 
     def test_trailing_req_code_dash(self) -> None:
         assert clean_title_display("Staff Engineer — JR2044123") == "Staff Engineer"
@@ -72,6 +74,11 @@ class TestConservatism:
             "Software Engineer 2026",
             # A short parenthetical is NOT a req code.
             "Engineer (AHT)",
+            # A parenthesized TERM is content — the first prod dry-run
+            # flagged this one before the uppercase-prefix rule.
+            "Enterprise Technology Intern - Technical Delivery (Fall 2026)",
+            # A bare parenthesized year is a year, not a code.
+            "Software Engineer (2026)",
         ],
     )
     def test_clean_titles_return_none(self, raw: str) -> None:

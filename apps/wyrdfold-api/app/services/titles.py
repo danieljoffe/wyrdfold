@@ -59,11 +59,15 @@ _ROMAN = re.compile(r"^(?:i{2,3}|iv|vi{1,3}|ix)$")
 # split runs so "cd&ai" and "c/c++" case per part.
 _WORD_RUN = re.compile(r"[a-z0-9][a-z0-9+#'’]*", re.IGNORECASE)
 
-# Trailing requisition/job codes. Conservative on purpose: only a trailing
-# parenthesized/bracketed token that is digits-heavy (>=4 digits, optional
-# short letter prefix), or a dash-separated REQ/JR/R-prefixed number. Plain
-# trailing years ("... 2026") survive — stripping those would eat real titles.
-_REQ_CODE_PAREN = re.compile(r"\s*[\(\[][A-Za-z]{0,4}[-#\s]?\d{4,}[\)\]]\s*$")
+# Trailing requisition/job codes. Conservative on purpose: a trailing
+# parenthesized/bracketed token that is an UPPERCASE-prefixed number
+# ("(REQ 20441)", "[R-12345]") or bare digits of 5+ ("(20441)"), or a
+# dash-separated REQ/JR/R-prefixed number. Plain trailing years survive —
+# and so do parenthesized TERMS: the first prod dry-run flagged
+# "(Fall 2026)" because a mixed-case prefix + a 4-digit year fit the old
+# pattern; seasons/months are content, req codes are not. Uppercase-only
+# prefixes and the 5-digit floor for bare numbers encode that split.
+_REQ_CODE_PAREN = re.compile(r"\s*[\(\[](?:[A-Z]{1,4}[-#\s]?\d{4,}|\d{5,})[\)\]]\s*$")
 _REQ_CODE_DASH = re.compile(r"\s*[-–—]\s*(?:REQ|JR|R)[-#\s]?\d{4,}\s*$", re.IGNORECASE)
 
 # Leading/trailing separator junk left behind by feeds and the strips above.
