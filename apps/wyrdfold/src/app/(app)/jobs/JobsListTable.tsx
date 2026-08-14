@@ -2,6 +2,7 @@
 
 import { Fragment, useEffect, useState } from 'react';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
@@ -229,7 +230,7 @@ export default function JobsListTable({
                   role='row'
                   aria-expanded={expandedId === job.id}
                   aria-controls={`job-detail-${job.id}`}
-                  aria-label={`${job.title} at ${job.company_name}, press Enter to ${expandedId === job.id ? 'collapse' : 'expand'} details`}
+                  aria-label={`${displayTitle(job)} at ${job.company_name}, press Enter to ${expandedId === job.id ? 'collapse' : 'expand'} details`}
                 >
                   <td className='px-3 py-2'>
                     {/* stopPropagation on the wrapper, not the control: the
@@ -239,7 +240,7 @@ export default function JobsListTable({
                       <Checkbox
                         checked={selectedIds.has(job.id)}
                         onChange={() => toggleSelect(job.id)}
-                        aria-label={`Select ${job.title}`}
+                        aria-label={`Select ${displayTitle(job)}`}
                       />
                     </span>
                   </td>
@@ -264,7 +265,7 @@ export default function JobsListTable({
                             className='text-brand-500 hover:text-brand-600'
                             onClick={e => e.stopPropagation()}
                           >
-                            {job.title}
+                            {displayTitle(job)}
                           </a>
                         ) : (
                           job.title

@@ -15,6 +15,7 @@ import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { LocalDate } from '@/components/LocalFormat';
 import { cn } from '@/lib/cn';
+import { displayTitle } from '@/lib/displayTitle';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
@@ -722,7 +723,7 @@ export default function JobDetailPanel({
             <CoverLetterSection
               jobPostingId={posting.id}
               companyName={posting.company_name}
-              roleTitle={posting.title}
+              roleTitle={displayTitle(posting)}
             />
           </>
         )}
@@ -784,7 +785,7 @@ export default function JobDetailPanel({
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
         title='Delete posting?'
-        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
+        message={`Delete "${displayTitle(posting)}" from ${posting.company_name}? This can't be undone.`}
         confirmLabel='Delete'
         destructive
         loading={deleting}

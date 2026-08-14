@@ -56,6 +56,12 @@ export interface JobPosting {
   external_id: string;
   source_id: string;
   title: string;
+  /**
+   * Cleaned display form of `title` (server-side, deterministic), null when
+   * the raw title is already presentable. Render via `displayTitle()` — the
+   * RPC-backed list paths don't serve it yet (stage 2), so it is optional.
+   */
+  title_display?: string | null;
   company_name: string;
   location: string | null;
   /**

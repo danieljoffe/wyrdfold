@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # a preview that links to the source) nor the legacy ``score``/``score_breakdown``
 # columns (search must carry no match score).
 _SEARCH_COLS = (
-    "id, title, company_name, location, city, state, country, location_remote, "
+    "id, title, title_display, company_name, location, city, state, country, location_remote, "
     "salary_text, salary_min, salary_max, salary_currency, "
     "salary_period, absolute_url, source_posted_at, cataloged_at"
 )

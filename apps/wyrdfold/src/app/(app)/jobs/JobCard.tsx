@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { useRouter } from 'next/navigation';
 import { ExternalLink, Maximize2, MoreVertical, Trash2 } from 'lucide-react';
@@ -85,7 +86,7 @@ export default function JobCard({
       }}
       tabIndex={0}
       role='button'
-      aria-label={`${job.title} at ${job.company_name}`}
+      aria-label={`${displayTitle(job)} at ${job.company_name}`}
     >
       <header className='flex items-start justify-between gap-2'>
         <div className='flex min-w-0 items-center gap-2'>
@@ -96,7 +97,7 @@ export default function JobCard({
             <Checkbox
               checked={selected}
               onChange={onSelectToggle}
-              aria-label={`Select ${job.title}`}
+              aria-label={`Select ${displayTitle(job)}`}
             />
           </span>
           <ScoreBadge
@@ -105,7 +106,7 @@ export default function JobCard({
             pending={job.pending}
           />
           <span className='truncate text-sm font-medium leading-tight text-text-primary'>
-            {job.title}
+            {displayTitle(job)}
           </span>
         </div>
         <div onClick={e => e.stopPropagation()}>
@@ -168,7 +169,7 @@ export default function JobCard({
             onDelete();
           }}
           title='Delete posting?'
-          message={`Delete "${job.title}" from ${job.company_name}? This can't be undone.`}
+          message={`Delete "${displayTitle(job)}" from ${job.company_name}? This can't be undone.`}
           confirmLabel='Delete'
           destructive
         />
