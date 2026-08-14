@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { ArrowLeft } from 'lucide-react';
 import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
@@ -176,6 +177,26 @@ export default function OnboardingWizard({
     router.push('/dashboard');
   }, [router]);
 
+  const handleChangePath = useCallback(() => {
+    // Back to the chooser (sweep 2026-08-14 B1) — before this, a
+    // mis-clicked path card was a commitment: only forward skips or the
+    // global exit. Nothing is destroyed by returning: work already done
+    // (uploaded resume, created targets) persists server-side and the
+    // steps detect it ("You already have a source file").
+    //
+    // Persist the reset fire-and-forget, mirroring the step-transition
+    // effect: ``resolveResume`` treats a stored 'path-chooser' as a clean
+    // start, so a refresh after changing course lands on the chooser
+    // instead of resuming into the abandoned path.
+    void fetch('/api/profile/onboarding/step', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_step: 'path-chooser' }),
+    });
+    setSelectedPath(null);
+    setCurrentStep('path-chooser');
+  }, []);
+
   return (
     <div className='flex min-h-screen items-center justify-center bg-bg px-4 py-12'>
       <div className='w-full max-w-2xl'>
@@ -200,6 +221,18 @@ export default function OnboardingWizard({
               Match scores start rough and get more accurate as you add resume
               content, target roles, and preferences.
             </Text>
+          )}
+          {selectedPath && currentStep !== 'completion' && (
+            <Button
+              name='onboarding-change-path'
+              variant='bare'
+              size='sm'
+              className='mt-2 text-text-tertiary hover:bg-surface-elevated hover:text-text-primary'
+              onClick={handleChangePath}
+            >
+              <ArrowLeft className='size-3.5' aria-hidden />
+              <span>Change path</span>
+            </Button>
           )}
         </div>
 

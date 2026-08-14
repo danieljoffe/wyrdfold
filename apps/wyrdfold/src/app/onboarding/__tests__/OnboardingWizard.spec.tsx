@@ -429,6 +429,66 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
   });
 });
 
+describe('OnboardingWizard — change path (sweep 2026-08-14 B1)', () => {
+  it('offers no change-path link on the chooser itself', () => {
+    render(<OnboardingWizard />);
+    expect(
+      screen.queryByRole('button', { name: /change path/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('returns to the chooser and persists the reset so refresh does not resume the abandoned path', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    expect(screen.getByTestId('identity-step-stub')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /change path/i }));
+
+    // Back at the chooser…
+    expect(
+      screen.getByText(/how would you like to get started\?/i)
+    ).toBeInTheDocument();
+    // …and the persisted step is reset to 'path-chooser', which
+    // resolveResume treats as a clean start — without this write a
+    // mid-change refresh resumes INTO the abandoned path.
+    await waitFor(() =>
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/profile/onboarding/step',
+        expect.objectContaining({
+          method: 'PATCH',
+          body: JSON.stringify({ current_step: 'path-chooser' }),
+        })
+      )
+    );
+  });
+
+  it('a different path can be picked after changing course', async () => {
+    const user = userEvent.setup();
+    render(<OnboardingWizard />);
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /i have a resume and a role in mind/i,
+      })
+    );
+    await user.click(screen.getByRole('button', { name: /change path/i }));
+    await user.click(
+      screen.getByRole('button', { name: /not sure where to start/i })
+    );
+
+    // Path C's first real step is identity, then conversation.
+    expect(screen.getByTestId('identity-step-stub')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    expect(screen.getByTestId('conversation-chat-stub')).toBeInTheDocument();
+  });
+});
+
 describe('OnboardingWizard — Path A (resume + role)', () => {
   it('dispatches to IdentityStep after selecting Path A', async () => {
     const user = userEvent.setup();
