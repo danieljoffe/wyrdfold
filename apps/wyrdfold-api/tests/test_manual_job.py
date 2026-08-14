@@ -133,6 +133,11 @@ class TestManualJobEndpoint:
         row = upsert_call[0][0]
         assert row["source_id"] == MANUAL_SOURCE_ID
         assert row["title"] == "Senior Engineer"
+        # The display column is WRITTEN at ingest (None here — this raw title
+        # needs no repair; the key is that the column is in the payload, so a
+        # junk title would get its cleaned form persisted).
+        assert "title_display" in row
+        assert row["title_display"] is None
         assert row["company_name"] == "Acme Corp"
         # R2 dropped the vestigial global jobs.score/score_breakdown; writing
         # them PGRST204s the whole upsert (prod, 2026-08-06). This test used

@@ -6,6 +6,8 @@
 export interface JobSearchResult {
   id: string;
   title: string;
+  /** Cleaned display form; null when raw `title` is fine. See `displayTitle()`. */
+  title_display?: string | null;
   company_name: string;
   location: string | null;
   // Structured parts parsed from `location` at ingest (#518) — compose with

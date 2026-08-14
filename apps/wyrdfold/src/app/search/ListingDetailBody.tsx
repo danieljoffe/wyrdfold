@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { formatCompanyName } from '@/lib/formatCompanyName';
+import { displayTitle } from '@/lib/displayTitle';
 import Link from 'next/link';
 import { ArrowRight, ArrowUpRight, Check } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
@@ -127,7 +128,7 @@ export default function ListingDetailBody({
         <CompanyAvatar name={formatCompanyName(job.company_name)} size='lg' />
         <div className='min-w-0 flex-1'>
           <Heading variant='component' as='h2' className='text-balance'>
-            {job.title}
+            {displayTitle(job)}
           </Heading>
           {meta && (
             <Text variant='meta' as='p' className='mt-0.5 text-text-secondary'>

@@ -42,7 +42,11 @@ better than recording an unverified specific.
 - If the user's latest turn did not carry new career content, prose_append is null.
 - If the user skipped a question (skipped=true in the turn metadata), \
 acknowledge gracefully and ask the next question.
-- Keep assistant_message short and direct — one concrete question at a time.
+- Keep assistant_message short and direct — ask exactly ONE question per \
+turn. Never stack questions ("...? And also ...?"): pick the single most \
+valuable one; the rest can wait for their own turn.
+- Restating or summarizing content that is already in the prose doc is NOT \
+new content — prose_append must be null then.
 - annotation and prose_append can coexist in one response.
 """
 
@@ -57,6 +61,11 @@ Strategy:
 quantified outcomes (metric + value), and one hard decision or trade-off.
 - Prefer specifics over generalities: "what did LCP drop from and to?" \
 not "did you improve performance?"
+- Ground every follow-up in the user's own words: name the role, project, \
+or claim it builds on ("You said the poller was the bottleneck — what did \
+its throughput go from and to?"). Never ask about "those tests" or "that \
+project" without naming it — the user cannot see your notes, and a \
+context-free question reads as a non sequitur (observed live 2026-08-13).
 - Avoid yes/no questions. Prefer "what" and "how" phrasings.
 - Move on when the user skips or says "I don't remember."
 - Set done=true when you have roles + outcomes for the last 3 positions.
@@ -84,8 +93,14 @@ PROBE_SYSTEM = """You phrase deterministic gap-tracker findings as a single \
 probing question the user can answer in one sentence.
 
 Input: a JSON object describing one gap in the career record.
-Output: ONE sentence ending with a question mark. No preamble. No closing. \
-No quoting the gap back verbatim.
+Output: ONE sentence ending with a question mark. No preamble. No closing.
+
+The question must be self-contained: name the role, company, or claim it is \
+about in plain words, because the user sees ONLY your question — never the \
+gap record, and not your notes. A question like "what was the average lift \
+from those tests?" with no referent reads as a non sequitur (observed live \
+2026-08-13). Don't paste the JSON or its field names back; translate the \
+context into the user's own terms.
 
 Examples:
 Input: {"kind": "role.missing_outcomes", "ref": "fightcamp-senior-fe", \
@@ -95,4 +110,9 @@ Output: What's the single number you'd lead with from your time at FightCamp?
 Input: {"kind": "outcome.missing_metric", "ref": "Cut mobile load times", \
 "context": "Outcome lacks a quantified metric: 'Cut mobile load times'"}
 Output: What did the mobile load time drop from and to, and in what units?
+
+Input: {"kind": "outcome.missing_metric", "ref": "ab-tests", \
+"context": "A/B testing program at FightCamp lacks a lift figure."}
+Output: For the A/B testing program you ran at FightCamp, what was the \
+average lift?
 """

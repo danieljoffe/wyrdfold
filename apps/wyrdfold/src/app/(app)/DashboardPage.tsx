@@ -2,6 +2,7 @@
 // Renders as a server component to keep the dashboard shell streaming.
 import Link from 'next/link';
 import { formatCompanyName } from '@/lib/formatCompanyName';
+import { displayTitle } from '@/lib/displayTitle';
 import {
   ArrowRight,
   Award,
@@ -230,7 +231,7 @@ export default function DashboardPage({ initial }: DashboardPageProps) {
                     variant='body'
                     className='truncate text-sm font-semibold leading-tight group-hover:text-brand-500'
                   >
-                    {posting.title}
+                    {displayTitle(posting)}
                   </Text>
                   <Text
                     variant='caption'
