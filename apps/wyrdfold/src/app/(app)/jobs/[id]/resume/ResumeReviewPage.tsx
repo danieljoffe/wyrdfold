@@ -84,7 +84,13 @@ export default function ResumeReviewPage({
   } = useTailorDocument({ jobPostingId, kind: 'resume' });
 
   const [postingLoading, setPostingLoading] = useState(true);
-  const [notFound, setNotFound] = useState(false);
+  // ``GET /jobs/{id}`` gates on a ``scores`` row (privacy boundary), so a
+  // just-added manual posting 404s until background scoring lands — exactly
+  // the window the onboarding path-A payoff arrives in (#720 follow-up,
+  // release smoke 2026-08-13). A missing posting therefore degrades the
+  // chrome (subtitle, filename slug) but must never gate the document:
+  // the draft is the user's own, fetched per-user via by-job.
+  const [postingMissing, setPostingMissing] = useState(false);
   const [approving, setApproving] = useState(false);
   const [unapproving, setUnapproving] = useState(false);
   const [rechecking, setRechecking] = useState(false);
@@ -104,11 +110,15 @@ export default function ResumeReviewPage({
   // is absent — the production API populates it, but unit-test fixtures
   // often elide payload internals.
   const defaultFilename = useMemo(() => {
-    if (!record || !posting) return '';
+    if (!record) return '';
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'resume';
-    return `${slugify(name)}-${slugify(posting.company_name)}-${localDateStamp()}`;
+    // Without the posting (still scoring — see ``postingMissing``) there is
+    // no company to slug; a name-date filename beats blocking the download.
+    return posting
+      ? `${slugify(name)}-${slugify(posting.company_name)}-${localDateStamp()}`
+      : `${slugify(name)}-${localDateStamp()}`;
   }, [record, posting]);
 
   // The posting is fetched independently of the document — the hook owns the
@@ -118,7 +128,7 @@ export default function ResumeReviewPage({
     try {
       const jobRes = await fetch(`/api/jobs/${jobPostingId}`);
       if (jobRes.status === 404) {
-        setNotFound(true);
+        setPostingMissing(true);
         return;
       }
       if (!jobRes.ok) {
@@ -375,7 +385,7 @@ export default function ResumeReviewPage({
   }
 
   async function handleDownload() {
-    if (!record || !posting) return;
+    if (!record) return;
     const ok = await flushPendingSave();
     if (!ok) return;
     try {
@@ -511,7 +521,12 @@ export default function ResumeReviewPage({
   const documentMissing =
     !recordLoading && !generating && !record && !generationError;
 
-  if (notFound || documentMissing) {
+  // ``postingMissing`` deliberately does NOT reach this gate: the posting
+  // 404s until scoring lands (see its declaration), and the payoff flow
+  // arrives before that. Only the DOCUMENT's absence means "not found" —
+  // a foreign/garbage posting id has no document either, so it still ends
+  // here.
+  if (documentMissing) {
     return (
       <div className='mx-auto max-w-4xl p-6'>
         <Heading variant='hero' as='h1'>
@@ -567,7 +582,12 @@ export default function ResumeReviewPage({
     );
   }
 
-  if (postingLoading || recordLoading || !record || !posting) {
+  if (
+    postingLoading ||
+    recordLoading ||
+    !record ||
+    (!posting && !postingMissing)
+  ) {
     return (
       <div
         className='mx-auto max-w-4xl space-y-4 p-6'
@@ -623,7 +643,10 @@ export default function ResumeReviewPage({
         <Breadcrumbs
           items={[
             { label: 'Jobs', href: '/jobs' },
-            { label: crumbLabel(posting.title), href: `/jobs/${jobPostingId}` },
+            {
+              label: crumbLabel(posting?.title ?? 'Job'),
+              href: `/jobs/${jobPostingId}`,
+            },
             { label: 'Resume' },
           ]}
         />
@@ -646,7 +669,15 @@ export default function ResumeReviewPage({
           Review tailored resume
         </Heading>
         <Text variant='body' className='text-text-secondary'>
-          {posting.title} &mdash; {posting.company_name}
+          {posting ? (
+            <>
+              {posting.title} &mdash; {posting.company_name}
+            </>
+          ) : (
+            // Scoring hasn't linked the posting to a target yet, so the
+            // job detail is temporarily unavailable — the draft isn't.
+            'Job details are still processing — they\u2019ll appear here shortly.'
+          )}
         </Text>
       </div>
 
