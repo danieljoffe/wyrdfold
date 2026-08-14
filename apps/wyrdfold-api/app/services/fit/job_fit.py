@@ -76,6 +76,72 @@ class AxisScores(BaseModel):
 _REASONING_MAX_CHARS = 1500
 
 
+def normalize_skill(raw: str) -> str:
+    """Canonical short form of an LLM-emitted skill name.
+
+    Write-time normalization (plan-phase2-structured-harvest.md): strip a
+    trailing em-dash evidence clause ("Automated testing — listed in…"),
+    lowercase, collapse whitespace. The insights fold layer
+    (``foldSkills.ts``) keeps doing this display-side for legacy
+    analyses-sourced rows; harvest rows arrive pre-normalized so
+    aggregation buckets stop splitting on case variants (#605 debt).
+    """
+    em_dash = raw.find(" — ")
+    base = raw if em_dash == -1 else raw[:em_dash]
+    return " ".join(base.lower().split())
+
+
+def _clean_skill_list(value: object, cap: int) -> list[str]:
+    """Normalize, dedupe (order-preserving), and cap a raw skills list.
+
+    Tolerant by design — non-list input or non-string entries yield ``[]``
+    / are skipped rather than raising: a malformed harvest field must
+    never cost the grade it rode in on (#693 blast-radius lesson).
+    """
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        norm = normalize_skill(item)
+        # Bound each entry: a "skill" longer than a few words is the model
+        # leaking a sentence; drop it rather than pollute aggregation keys.
+        if not norm or len(norm) > 60 or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+        if len(out) >= cap:
+            break
+    return out
+
+
+class JobSkills(BaseModel):
+    """Structured skill facts harvested from a grading read (#harvest).
+
+    ``skills_required`` is a fact about the JOB (target-independent, ≤8);
+    ``skills_matched`` / ``skills_missing`` are facts about the
+    (job, target, profile) pair (≤5 each). All lists arrive normalized
+    via ``normalize_skill`` — the model's raw casing never reaches
+    persistence. Purely informational: never an input to the fit score.
+    """
+
+    skills_required: list[str] = Field(default_factory=list)
+    skills_matched: list[str] = Field(default_factory=list)
+    skills_missing: list[str] = Field(default_factory=list)
+
+    @field_validator("skills_required", mode="before")
+    @classmethod
+    def _clean_required(cls, value: object) -> list[str]:
+        return _clean_skill_list(value, cap=8)
+
+    @field_validator("skills_matched", "skills_missing", mode="before")
+    @classmethod
+    def _clean_pair_lists(cls, value: object) -> list[str]:
+        return _clean_skill_list(value, cap=5)
+
+
 class JobFitResult(BaseModel):
     """LLM output: overall fit + axis breakdown + reasoning.
 
@@ -95,6 +161,21 @@ class JobFitResult(BaseModel):
     axes: AxisScores
     reasoning: str = Field(max_length=_REASONING_MAX_CHARS)
     logistics: LogisticsFilters | None = None
+    skills: JobSkills | None = None
+    """Harvested skill facts — populated only when the skills addendum was
+    in the prompt (``settings.skills_harvest_enabled``). ``None`` on older
+    grades and when the flag is off."""
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _tolerate_malformed_skills(cls, value: object) -> object:
+        """A malformed ``skills`` object degrades to None, never fails the
+        grade. ``complete_json`` validates the WHOLE payload, so without
+        this a bad optional field would cost the score + axes it rode in
+        with — the exact #693 blast-radius failure. Dict-shaped input
+        passes through to ``JobSkills`` (whose per-field validators are
+        themselves tolerant); anything else is dropped."""
+        return value if isinstance(value, dict | JobSkills) or value is None else None
 
     @field_validator("reasoning", mode="before")
     @classmethod
@@ -239,6 +320,46 @@ Return JSON matching this extended schema:
 }"""
 
 
+# Optional addendum appended when ``settings.skills_harvest_enabled`` is
+# True (plan-phase2-structured-harvest.md). Same contract as the logistics
+# addendum: a separate string so the base prompt stays byte-identical in
+# the off case (prompt-cache + golden-diff hygiene), purely informational,
+# never an input to the score. Applied AFTER the logistics addendum when
+# both are on — the order is part of the pinned prompt contract.
+_SKILLS_PROMPT_ADDENDUM = """\
+
+Additionally, extract a ``skills`` object harvesting the concrete skill \
+facts you already identified while grading. This is purely informational \
+— it does NOT affect the fit_score or axis scores.
+
+- ``skills_required``: up to 8 skills the JD actually requires — concrete, \
+canonical short names ("react", "kubernetes", "sql"), not sentences, not \
+soft traits ("communication"), not seniority words. Prefer the JD's own \
+technology/skill nouns. Fewer, higher-confidence entries beat padding.
+- ``skills_matched``: up to 5 of those required skills the user's profile \
+demonstrates concretely.
+- ``skills_missing``: up to 5 of those required skills absent from the \
+user's profile. A skill goes in matched OR missing, never both.
+
+Use lowercase canonical names. Do not append evidence or commentary to a \
+skill name — names only.
+
+Return JSON matching this extended schema (``skills`` added alongside the \
+fields above):
+
+{
+  "fit_score": 82,
+  "axes": { "title_fit": 95, "skills_fit": 80, "seniority_fit": 85, \
+"domain_fit": 70 },
+  "reasoning": "...",
+  "skills": {
+    "skills_required": ["react", "typescript", "graphql", "accessibility"],
+    "skills_matched": ["react", "typescript", "accessibility"],
+    "skills_missing": ["graphql"]
+  }
+}"""
+
+
 def _split_user_message(
     *,
     payload: OptimizedPayload,
@@ -335,6 +456,7 @@ async def derive_job_fit(
     model: ModelId | None = None,
     purpose: str = JOB_FIT_PURPOSE,
     extract_logistics: bool = False,
+    extract_skills: bool = False,
 ) -> tuple[JobFitResult, LLMResult]:
     """Grade a single (user, target, job) tuple.
 
@@ -357,6 +479,10 @@ async def derive_job_fit(
     version (matters for Anthropic prompt cache hits + shadow parity).
     Callers should pass ``settings.logistics_extraction_enabled`` so
     the global flag controls the behaviour.
+
+    ``extract_skills`` toggles the skills-harvest addendum the same way
+    (``settings.skills_harvest_enabled``); addenda compose in the fixed
+    order logistics → skills, which is part of the pinned prompt contract.
     """
     if model is None:
         model = settings.phase2_fit_model
@@ -365,9 +491,11 @@ async def derive_job_fit(
     )
     user_message = static_prefix + dynamic_suffix
 
-    system_prompt = (
-        _SYSTEM_PROMPT + _LOGISTICS_PROMPT_ADDENDUM if extract_logistics else _SYSTEM_PROMPT
-    )
+    system_prompt = _SYSTEM_PROMPT
+    if extract_logistics:
+        system_prompt += _LOGISTICS_PROMPT_ADDENDUM
+    if extract_skills:
+        system_prompt += _SKILLS_PROMPT_ADDENDUM
 
     return await complete_json(
         llm,

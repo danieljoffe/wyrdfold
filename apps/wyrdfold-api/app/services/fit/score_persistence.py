@@ -60,6 +60,28 @@ async def _apply_scores_update(
     )
 
 
+async def _apply_jobs_skills_update(
+    supabase: AsyncClient,
+    *,
+    job_posting_id: str,
+    skills_required: list[str],
+) -> None:
+    """Persist the harvested ``jobs.skills_required`` (canonical, job-level).
+
+    Same poll-write seam as the scores update. Separate helper (not folded
+    into ``_apply_scores_update``) because it targets a different table with
+    different failure semantics — see the best-effort call site."""
+    await poll_db_write(
+        supabase,
+        lambda c: (
+            c.table("jobs")
+            .update({"skills_required": skills_required})
+            .eq("id", job_posting_id)
+        ),
+        label="phase2 jobs skills update",
+    )
+
+
 async def score_with_phase2_and_persist(
     supabase: AsyncClient,
     llm: LLMClient,
@@ -122,6 +144,7 @@ async def score_with_phase2_and_persist(
             job_title=title,
             jd_text=jd_text,
             extract_logistics=settings.logistics_extraction_enabled,
+            extract_skills=settings.skills_harvest_enabled,
         )
     except Exception:
         logger.exception(
@@ -188,6 +211,14 @@ async def score_with_phase2_and_persist(
         # rather than blowing away historical logistics data.
         if fit.logistics is not None:
             update_payload["logistics_filters"] = fit.logistics.model_dump()
+        # Skills harvest (same omit-when-None contract as logistics). The
+        # pair-level lists ride the scores row — including skills_required,
+        # denormalized here so the insights aggregation reads ONE table
+        # instead of fanning out to jobs (#60-perf lesson).
+        if fit.skills is not None:
+            update_payload["skills_required"] = fit.skills.skills_required
+            update_payload["skills_matched"] = fit.skills.skills_matched
+            update_payload["skills_missing"] = fit.skills.skills_missing
         # Persist via the async client (#57) or the sync thread (#107) —
         # see ``_apply_scores_update``. Either way the write never stalls the
         # event loop the Phase-2 fan-out runs on.
@@ -204,5 +235,23 @@ async def score_with_phase2_and_persist(
             target.id,
         )
         return None
+
+    # Canonical job-level skills fact (target-independent). Last-writer-wins
+    # across targets is fine — any grader's read of the same JD is
+    # equivalent. Best-effort: a failed write costs the enrichment, never
+    # the grade already persisted above.
+    if fit.skills is not None and fit.skills.skills_required:
+        try:
+            await _apply_jobs_skills_update(
+                supabase,
+                job_posting_id=job_posting_id,
+                skills_required=fit.skills.skills_required,
+            )
+        except Exception:
+            logger.warning(
+                "Phase 2 skills_required write failed for job %s (grade persisted)",
+                job_posting_id,
+                exc_info=True,
+            )
 
     return fit

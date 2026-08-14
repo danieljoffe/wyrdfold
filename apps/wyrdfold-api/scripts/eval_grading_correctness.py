@@ -89,7 +89,12 @@ def _deserialize_target(entry: dict[str, Any]) -> tuple[Any, Any]:
 async def _grade_cases(fixture: dict[str, Any], cases: list[dict[str, Any]]) -> list[int | None]:
     """Grade each case with the REAL Phase-2 grader, returning fit_scores
     aligned to ``cases`` (``None`` on failure)."""
-    from app.services.fit.job_fit import _SYSTEM_PROMPT
+    from app.config import settings
+    from app.services.fit.job_fit import (
+        _LOGISTICS_PROMPT_ADDENDUM,
+        _SKILLS_PROMPT_ADDENDUM,
+        _SYSTEM_PROMPT,
+    )
     from app.services.llm import get_default_client as get_llm
     from scripts.eval_grading_prompts import _grade_one
 
@@ -99,13 +104,23 @@ async def _grade_cases(fixture: dict[str, Any], cases: list[dict[str, Any]]) -> 
     banks = {k: _deserialize_target(v) for k, v in fixture["targets"].items()}
     llm = get_llm()
 
+    # Compose the prompt the way PROD does (score_persistence): base + the
+    # flag-enabled addenda in pinned order. Grading the bare base prompt —
+    # what this eval did until the skills harvest — ratifies bands for a
+    # prompt production never sends once any addendum flag is on.
+    system_prompt = _SYSTEM_PROMPT
+    if settings.logistics_extraction_enabled:
+        system_prompt += _LOGISTICS_PROMPT_ADDENDUM
+    if settings.skills_harvest_enabled:
+        system_prompt += _SKILLS_PROMPT_ADDENDUM
+
     async def _one(case: dict[str, Any]) -> int | None:
         try:
             target, payload = banks[case["target_key"]]
             fit, _tin, _tout, _cost = await _grade_one(
                 llm,
                 model="claude-sonnet-4-6",
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 payload=payload,
                 target=target,
                 title=case["title"],

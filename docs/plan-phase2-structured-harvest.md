@@ -1,8 +1,21 @@
 # Plan: Phase-2 structured harvest — get the tax's worth out of every graded read
 
-Status: **proposed** — needs the owner's go on ONE spend-bearing eval
-re-baseline before any build. The free-mining slice (near-miss insights) shipped
-separately and needed no gate.
+Status: **built & eval-ratified 2026-08-14** (owner authorized the re-baseline;
+branch `feat/phase2-structured-harvest`). Eval: 100% band accuracy (6/6) on the
+live grader with the PROD-FAITHFUL prompt (base + logistics + skills addenda) —
+highs 95/72/93, lows 2/4/2, indistinguishable from the 2026-07-07 ratified
+baseline. Found + fixed in the same PR: `eval_grading_correctness.py` had been
+grading the BARE base prompt, so bands were never ratified against what prod
+actually sends once any addendum flag is on; it now composes the prompt exactly
+as `score_persistence` does.
+
+**Slimming verdict — DROPPED, round 2 (do not revive without a new mechanism):**
+the fold-in assumed an equivalent cheaper transposition guard exists. It
+doesn't: a first-word echo collides on shared prefixes ("Senior …") across a
+batch, so a transposed id frequently passes — a WEAKENED #47 guard, not an
+equivalent one, bought for ~$0.02-0.05/day post-collapse. Checksums are
+model-unreliable. The harvest shipped WITHOUT it.
+
 Context: 2026-08-13, follow-up to `plan-phase1-rejection-persistence.md`.
 
 ## Premise

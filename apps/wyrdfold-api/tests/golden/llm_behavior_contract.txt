@@ -130,6 +130,29 @@ Return JSON matching this extended schema:
   }
 }
 
+===== PROMPT: phase2_fit.skills_addendum =====
+
+Additionally, extract a ``skills`` object harvesting the concrete skill facts you already identified while grading. This is purely informational — it does NOT affect the fit_score or axis scores.
+
+- ``skills_required``: up to 8 skills the JD actually requires — concrete, canonical short names ("react", "kubernetes", "sql"), not sentences, not soft traits ("communication"), not seniority words. Prefer the JD's own technology/skill nouns. Fewer, higher-confidence entries beat padding.
+- ``skills_matched``: up to 5 of those required skills the user's profile demonstrates concretely.
+- ``skills_missing``: up to 5 of those required skills absent from the user's profile. A skill goes in matched OR missing, never both.
+
+Use lowercase canonical names. Do not append evidence or commentary to a skill name — names only.
+
+Return JSON matching this extended schema (``skills`` added alongside the fields above):
+
+{
+  "fit_score": 82,
+  "axes": { "title_fit": 95, "skills_fit": 80, "seniority_fit": 85, "domain_fit": 70 },
+  "reasoning": "...",
+  "skills": {
+    "skills_required": ["react", "typescript", "graphql", "accessibility"],
+    "skills_matched": ["react", "typescript", "accessibility"],
+    "skills_missing": ["graphql"]
+  }
+}
+
 ===== PROMPT: derive_target_from_label.generic =====
 You are a job-search scoring-profile generator. Given a target role label, generate two things based on what this role GENERALLY requires across the industry — NOT tailored to any individual's background:
 

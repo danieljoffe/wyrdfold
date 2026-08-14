@@ -508,6 +508,17 @@ class Settings(BaseSettings):
     # newly-graded jobs going forward.
     logistics_extraction_enabled: bool = True
 
+    # Skills harvest (plan-phase2-structured-harvest.md): the Phase-2 grader
+    # additionally emits skills_required / skills_matched / skills_missing —
+    # structured, normalized, capped lists mined from the SAME read that
+    # produces the grade (marginal cost ≈ output tokens only). Purely
+    # informational, never a score input; the eval re-baseline that shipped
+    # this flag proved band stability with the addendum on. Fields persist to
+    # jobs.skills_required (canonical) + the scores row (denormalized for the
+    # insights aggregation — the analyses-only source covered ~146 rows ever).
+    # Historical grades are NOT backfilled; columns populate as jobs (re)grade.
+    skills_harvest_enabled: bool = True
+
     # Learner re-score projection / learning-rate cap (#5 P4). Before a
     # high-confidence ``ProfilePatch`` auto-applies, the learner projects the
     # patch over the target's recent scored jobs (deterministic keyword
