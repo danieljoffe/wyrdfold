@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
@@ -97,7 +98,7 @@ export default function CoverLetterReviewPage({
     // Without the posting (still scoring — see ``postingMissing``) there is
     // no company to slug; a name-date filename beats blocking the download.
     return posting
-      ? `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${localDateStamp()}`
+      ? `${slugify(name)}-${slugify(formatCompanyName(posting.company_name))}-cover-letter-${localDateStamp()}`
       : `${slugify(name)}-cover-letter-${localDateStamp()}`;
   }, [record, posting]);
 
@@ -434,7 +435,9 @@ export default function CoverLetterReviewPage({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           job_posting_id: jobPostingId,
-          company_name: posting.company_name,
+          // Display-cleaned: this string is the letter's addressee — feed
+          // junk ("003 Humana Inc.") and the LLM writes to it verbatim.
+          company_name: formatCompanyName(posting.company_name),
           role_title: posting.title,
         }),
       });
@@ -592,7 +595,7 @@ export default function CoverLetterReviewPage({
         <Text variant='body' className='text-text-secondary'>
           {posting ? (
             <>
-              {posting.title} &mdash; {posting.company_name}
+              {posting.title} &mdash; {formatCompanyName(posting.company_name)}
             </>
           ) : (
             // Scoring hasn't linked the posting to a target yet, so the

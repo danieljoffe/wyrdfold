@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
@@ -117,7 +118,7 @@ export default function ResumeReviewPage({
     // Without the posting (still scoring — see ``postingMissing``) there is
     // no company to slug; a name-date filename beats blocking the download.
     return posting
-      ? `${slugify(name)}-${slugify(posting.company_name)}-${localDateStamp()}`
+      ? `${slugify(name)}-${slugify(formatCompanyName(posting.company_name))}-${localDateStamp()}`
       : `${slugify(name)}-${localDateStamp()}`;
   }, [record, posting]);
 
@@ -671,7 +672,7 @@ export default function ResumeReviewPage({
         <Text variant='body' className='text-text-secondary'>
           {posting ? (
             <>
-              {posting.title} &mdash; {posting.company_name}
+              {posting.title} &mdash; {formatCompanyName(posting.company_name)}
             </>
           ) : (
             // Scoring hasn't linked the posting to a target yet, so the
