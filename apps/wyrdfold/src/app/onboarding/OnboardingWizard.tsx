@@ -90,6 +90,11 @@ export default function OnboardingWizard({
     () => resolveResume(initialPath, initialStep).path
   );
   const [jobData, setJobData] = useState<JobData | null>(null);
+  // Targets created (or linked) during THIS run — reported up by
+  // TargetSuggestions so CompletionScreen can tell the truth: a
+  // zero-target finish must not claim "you're all set" (sweep
+  // 2026-08-14 P2). Stays 0 when the step is skipped outright.
+  const [targetsCreated, setTargetsCreated] = useState(0);
   const [skipping, setSkipping] = useState(false);
   const [skipFailed, setSkipFailed] = useState(false);
   const stepRef = useRef<HTMLDivElement>(null);
@@ -265,6 +270,7 @@ export default function OnboardingWizard({
             <TargetSuggestions
               onComplete={goNext}
               onSkip={goNext}
+              onTargetsCreated={setTargetsCreated}
               jobData={jobData}
             />
           )}
@@ -275,7 +281,9 @@ export default function OnboardingWizard({
               skipLabel='Skip this step'
             />
           )}
-          {currentStep === 'completion' && <CompletionScreen />}
+          {currentStep === 'completion' && (
+            <CompletionScreen targetsCreated={targetsCreated} />
+          )}
         </div>
 
         {/* The one global exit. Same contract as the chooser's skip:

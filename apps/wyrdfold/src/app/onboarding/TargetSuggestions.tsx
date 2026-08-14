@@ -73,12 +73,17 @@ const ANALYZE_STAGES = [
 interface TargetSuggestionsProps {
   onComplete: () => void;
   onSkip: () => void;
+  /** Reports how many targets this step actually created/linked, so the
+   *  completion screen can branch its copy on it — a zero-target finish
+   *  must not claim "you're all set" (sweep 2026-08-14 P2). */
+  onTargetsCreated?: (count: number) => void;
   jobData?: JobData | null;
 }
 
 export default function TargetSuggestions({
   onComplete,
   onSkip,
+  onTargetsCreated,
   jobData,
 }: TargetSuggestionsProps) {
   const router = useRouter();
@@ -127,6 +132,10 @@ export default function TargetSuggestions({
         const data = (await res.json()) as { id: string; label: string };
         if (!cancelled) {
           setCreatedLabel(data.label);
+          // The from-posting target exists regardless of whether the
+          // resume shortcut below fires — if we fall back to the
+          // completion screen, it should know one target was created.
+          onTargetsCreated?.(1);
           // Kick off the derive → poll → score pipeline so the new
           // target actually has matched jobs by the time the user
           // lands on /dashboard. Path B (suggest) does this after
@@ -169,7 +178,7 @@ export default function TargetSuggestions({
     return () => {
       cancelled = true;
     };
-  }, [jobData, onComplete, router]);
+  }, [jobData, onComplete, onTargetsCreated, router]);
 
   // Paths B/C: fetch suggestions from LLM
   useEffect(() => {
@@ -267,9 +276,10 @@ export default function TargetSuggestions({
     }
 
     setCreatedCount(created);
+    onTargetsCreated?.(created);
     setCreating(false);
     timerRef.current = setTimeout(onComplete, 1500);
-  }, [selected, suggestions, onComplete]);
+  }, [selected, suggestions, onComplete, onTargetsCreated]);
 
   // Path A: auto-creation in progress or completed
   if (jobData) {

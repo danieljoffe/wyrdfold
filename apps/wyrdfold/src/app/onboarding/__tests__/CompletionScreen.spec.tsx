@@ -22,21 +22,21 @@ describe('CompletionScreen', () => {
   });
 
   it("renders the 'all set' heading", () => {
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
     expect(
       screen.getByRole('heading', { level: 2, name: /all set/i })
     ).toBeInTheDocument();
   });
 
   it('renders the supporting copy directing the user to targets', () => {
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
     expect(
       screen.getByText(/head to your targets to start tracking jobs/i)
     ).toBeInTheDocument();
   });
 
   it('renders the "Go to Targets" continue button', () => {
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
     expect(
       screen.getByRole('button', { name: /go to targets/i })
     ).toBeInTheDocument();
@@ -44,7 +44,7 @@ describe('CompletionScreen', () => {
 
   it('marks onboarding complete on click, then navigates to /targets', async () => {
     const user = userEvent.setup();
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
 
     await user.click(screen.getByRole('button', { name: /go to targets/i }));
 
@@ -62,7 +62,7 @@ describe('CompletionScreen', () => {
     // affordance and stay put instead.
     (global.fetch as jest.Mock).mockRejectedValue(new Error('boom'));
     const user = userEvent.setup();
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
 
     await user.click(screen.getByRole('button', { name: /go to targets/i }));
 
@@ -84,7 +84,7 @@ describe('CompletionScreen', () => {
       json: async () => ({}),
     });
     const user = userEvent.setup();
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
 
     await user.click(screen.getByRole('button', { name: /go to targets/i }));
 
@@ -101,7 +101,7 @@ describe('CompletionScreen', () => {
       .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
     const user = userEvent.setup();
-    render(<CompletionScreen />);
+    render(<CompletionScreen targetsCreated={2} />);
 
     await user.click(screen.getByRole('button', { name: /go to targets/i }));
 
@@ -109,7 +109,57 @@ describe('CompletionScreen', () => {
   });
 
   it('has no accessibility violations', async () => {
-    const { container } = render(<CompletionScreen />);
+    const { container } = render(<CompletionScreen targetsCreated={2} />);
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe('CompletionScreen — zero targets created (sweep 2026-08-14 P2)', () => {
+  beforeEach(() => {
+    mockPush.mockClear();
+    global.fetch = jest.fn(() =>
+      Promise.resolve({ ok: true, json: async () => ({}) })
+    ) as jest.Mock;
+  });
+
+  it('does NOT claim "all set" — says setup is saved and matching needs a target', () => {
+    render(<CompletionScreen targetsCreated={0} />);
+    expect(
+      screen.queryByRole('heading', { name: /all set/i })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: /setup saved/i })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/matching only starts once at least one target/i)
+    ).toBeInTheDocument();
+  });
+
+  it('labels the CTA "Add a target" instead of "Go to Targets"', () => {
+    render(<CompletionScreen targetsCreated={0} />);
+    expect(
+      screen.getByRole('button', { name: /add a target/i })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /go to targets/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('still completes onboarding and lands on /targets (where adding happens)', async () => {
+    const user = userEvent.setup();
+    render(<CompletionScreen targetsCreated={0} />);
+
+    await user.click(screen.getByRole('button', { name: /add a target/i }));
+
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+    expect(global.fetch).toHaveBeenCalledWith(
+      '/api/profile/onboarding/complete',
+      expect.objectContaining({ method: 'POST' })
+    );
+  });
+
+  it('has no accessibility violations', async () => {
+    const { container } = render(<CompletionScreen targetsCreated={0} />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
