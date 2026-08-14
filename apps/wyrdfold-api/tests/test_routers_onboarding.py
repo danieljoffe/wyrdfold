@@ -80,6 +80,7 @@ def test_get_returns_null_fields_for_brand_new_user(client_factory):
     assert r.status_code == 200
     assert r.json() == {
         "completed_at": None,
+        "deferred_at": None,
         "path": None,
         "current_step": None,
     }
@@ -266,6 +267,98 @@ def test_complete_is_idempotent_on_already_completed_users(client_factory):
     assert "onboarding_completed_at" not in payload  # not overwritten
 
 
+# ---- POST /profile/onboarding/defer ----------------------------------
+
+
+def test_defer_sets_timestamp_and_leaves_completion_alone(client_factory):
+    """The wizard's global exit records deferred_at WITHOUT completing:
+    completed_at must stay NULL so /onboarding remains enterable and
+    resumes mid-flow — that's the whole point of the third state
+    (docs/onboarding-sweep-2026-08-14.md P1)."""
+    sb = MagicMock()
+    _select_returns(
+        sb,
+        {
+            "onboarding_completed_at": None,
+            "onboarding_deferred_at": None,
+            "onboarding_path": "B",
+            "onboarding_current_step": "upload-resume",
+        },
+    )
+    client = client_factory(sb)
+    r = client.post("/profile/onboarding/defer")
+
+    assert r.status_code == 200
+    payload = sb.table.return_value.update.call_args.args[0]
+    assert "onboarding_deferred_at" in payload
+    assert payload["onboarding_deferred_at"] is not None
+    assert "onboarding_completed_at" not in payload  # never completes
+    # Step/path untouched — they're exactly what resume needs.
+    assert "onboarding_current_step" not in payload
+    assert "onboarding_path" not in payload
+
+
+def test_defer_is_idempotent_on_already_deferred_users(client_factory):
+    """Re-deferring keeps the original timestamp — no update issued."""
+    sb = MagicMock()
+    _select_returns(
+        sb,
+        {
+            "onboarding_completed_at": None,
+            "onboarding_deferred_at": datetime(2026, 8, 1, tzinfo=UTC).isoformat(),
+            "onboarding_path": "B",
+            "onboarding_current_step": "upload-resume",
+        },
+    )
+    client = client_factory(sb)
+    r = client.post("/profile/onboarding/defer")
+
+    assert r.status_code == 200
+    assert sb.table.return_value.update.call_args is None  # no write
+    assert r.json()["deferred_at"] is not None
+
+
+def test_get_returns_deferred_at(client_factory):
+    sb = MagicMock()
+    _select_returns(
+        sb,
+        {
+            "onboarding_completed_at": None,
+            "onboarding_deferred_at": datetime(2026, 8, 1, tzinfo=UTC).isoformat(),
+            "onboarding_path": "B",
+            "onboarding_current_step": "upload-resume",
+        },
+    )
+    client = client_factory(sb)
+    r = client.get("/profile/onboarding")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deferred_at"] is not None
+    assert body["completed_at"] is None
+
+
+def test_complete_clears_deferred(client_factory):
+    """Completing supersedes a deferral — the dashboard nudge keys off
+    deferred_at alone, so a completed profile must not keep it."""
+    sb = MagicMock()
+    _select_returns(
+        sb,
+        {
+            "onboarding_completed_at": None,
+            "onboarding_deferred_at": datetime(2026, 8, 1, tzinfo=UTC).isoformat(),
+            "onboarding_path": "B",
+            "onboarding_current_step": "completion",
+        },
+    )
+    client = client_factory(sb)
+    r = client.post("/profile/onboarding/complete")
+
+    assert r.status_code == 200
+    payload = sb.table.return_value.update.call_args.args[0]
+    assert payload["onboarding_deferred_at"] is None
+
+
 # ---- POST /profile/onboarding/reset ----------------------------------
 
 
@@ -289,6 +382,7 @@ def test_reset_clears_completion_and_step(client_factory):
     assert r.status_code == 200
     payload = sb.table.return_value.update.call_args.args[0]
     assert payload["onboarding_completed_at"] is None
+    assert payload["onboarding_deferred_at"] is None
     assert payload["onboarding_current_step"] is None
     # Path is NOT in the update payload — we deliberately leave it.
     assert "onboarding_path" not in payload
