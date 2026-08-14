@@ -8,7 +8,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
 import Button from '@/components/kit/Button';
-import { completeOnboarding } from './completeOnboarding';
+import { deferOnboarding } from './completeOnboarding';
 import ConversationChat from '../_components/ConversationChat';
 import PathChooser from './PathChooser';
 import ResumeUploader from './ResumeUploader';
@@ -142,28 +142,33 @@ export default function OnboardingWizard({
   }, []);
 
   const handleSkip = useCallback(async () => {
-    // Mark onboarding complete on skip so the user isn't bounced back to
-    // /onboarding by the dashboard's completed_at gate. CompletionScreen
-    // hits the same endpoint on the "happy path" finish; the API is
-    // idempotent (complete_onboarding short-circuits if completed_at is
-    // already set) so re-completing after a finish is a no-op.
+    // DEFER, don't complete (onboarding-sweep-2026-08-14 P1): the exits
+    // used to POST /complete because the dashboard gate bounced any
+    // completed_at=NULL profile back into the wizard — which made "Finish
+    // setup later" permanent (no way back except the Settings reset).
+    // ``deferOnboarding`` records the exit while leaving completed_at
+    // NULL, so the gate stays quiet AND /onboarding still resumes at the
+    // persisted step; the dashboard shows a finish-your-setup nudge.
     //
     // We MUST confirm the write landed (HTTP 2xx) before navigating.
-    // ``completeOnboarding`` checks ``res.ok`` — a non-2xx (expired
+    // ``deferOnboarding`` checks ``res.ok`` — a non-2xx (expired
     // session → 401, API down → 503) used to be swallowed, navigating
-    // away while ``onboarding_completed_at`` stayed NULL so the next
-    // dashboard visit re-fired the wizard (the "skip doesn't stick" bug).
-    // On a confirmed failure we keep the user here with a retry
-    // affordance instead of dropping them into that redirect loop.
+    // away while the flag stayed NULL so the next dashboard visit
+    // re-fired the wizard (the "skip doesn't stick" bug). On a confirmed
+    // failure we keep the user here with a retry affordance instead of
+    // dropping them into that redirect loop.
     setSkipping(true);
     setSkipFailed(false);
-    const ok = await completeOnboarding();
+    const ok = await deferOnboarding();
     if (!ok) {
       setSkipping(false);
       setSkipFailed(true);
       return;
     }
-    router.push('/targets');
+    // Dashboard, not /targets: it's the surface that carries the
+    // finish-your-setup nudge, and "later" should land somewhere that
+    // explains what's next rather than an unexplained targets list.
+    router.push('/dashboard');
   }, [router]);
 
   return (
