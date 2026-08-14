@@ -373,6 +373,70 @@ async def test_country_name_job_fit_survives_the_real_parse_path() -> None:
     assert parsed.logistics.remote_status == "hybrid"
 
 
+async def test_messy_skills_harvest_normalizes_through_the_real_parse_path() -> None:
+    """Harvest-corpus entry: a grader response whose ``skills`` object needs
+    every write-time cleanup at once. The grade must survive untouched and
+    the lists must arrive normalized/deduped/capped — proven through the
+    real ``complete_json`` + ``JobFitResult`` path (#693 generalized: every
+    optional schema field is blast radius under whole-payload validation).
+    """
+    from app.services.fit.job_fit import JobFitResult
+    from app.services.llm.client import complete_json
+    from app.services.llm.mock import messy_skills_job_fit_json
+
+    client = MockLLMClient(scripted={"fit.job": messy_skills_job_fit_json()})
+    parsed, _result = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="grade this",
+        messages=[Message(role="user", content="jd")],
+        schema=JobFitResult,
+        purpose="fit.job",
+    )
+
+    # The grade is untouched.
+    assert parsed.fit_score == 74
+    assert parsed.axes.title_fit == 80
+    assert parsed.skills is not None
+    req = parsed.skills.skills_required
+    # Normalized + deduped: "React"/"react" collapse; evidence clause stripped.
+    assert req.count("react") == 1
+    assert "kubernetes" in req  # " — mentioned in..." clause stripped
+    assert "typescript" in req  # trailing whitespace collapsed
+    # Non-strings and sentence-length entries are dropped, list capped at 8.
+    assert len(req) <= 8
+    assert all(isinstance(s, str) and len(s) <= 60 for s in req)
+    # Injection-looking text is inert DATA — normalized like any other string,
+    # never executed, and bounded by the same caps.
+    assert parsed.skills.skills_matched == ["react", "typescript"]
+    assert len(parsed.skills.skills_missing) == 5  # capped from 6
+
+
+async def test_skills_as_string_degrades_to_none_not_a_dead_grade() -> None:
+    """Harvest-corpus entry: ``skills`` arrives as a comma-joined STRING.
+    The field must degrade to None — the grade (score, axes, reasoning)
+    survives, exactly the omit-when-None persistence contract."""
+    from app.services.fit.job_fit import JobFitResult
+    from app.services.llm.client import complete_json
+    from app.services.llm.mock import messy_skills_job_fit_json
+
+    client = MockLLMClient(
+        scripted={"fit.job": messy_skills_job_fit_json("string_not_object")}
+    )
+    parsed, _result = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="grade this",
+        messages=[Message(role="user", content="jd")],
+        schema=JobFitResult,
+        purpose="fit.job",
+    )
+
+    assert parsed.fit_score == 74
+    assert parsed.axes.seniority_fit == 70
+    assert parsed.skills is None
+
+
 async def test_conversation_recap_echo_survives_the_real_parse_path() -> None:
     """Bug-corpus entry for the Path-C grounding work (2026-08-13): a turn
     response that restates already-recorded prose as ``prose_append`` is
