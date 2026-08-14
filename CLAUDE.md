@@ -18,6 +18,12 @@ résumé tailoring. Live at wyrdfold.com (Vercel FE + Railway API + hosted Supab
   `@danieljoffe/shared-ui` — **read
   `node_modules/@danieljoffe/shared-ui/README.md` before building any form
   control/menu**; don't hand-roll what it ships.
+  - **Next 16 is NOT the Next.js in model training data** — APIs, conventions, and
+    file structure changed. Before writing Next-specific code (routing, caching,
+    config, middleware), read the relevant shipped guide in
+    `apps/wyrdfold/node_modules/next/dist/docs/` and heed deprecation notices.
+    (This folds in Next's auto-generated agent rules; generation is disabled via
+    `agentRules: false` in `next.config.mjs`.)
 - `apps/wyrdfold-api` — FastAPI (Python 3.11, uv workspace). Poller, scoring, LLM
   pipeline (`app/services/`), routers.
 - `apps/wyrdfold-e2e` — Playwright. `supabase/migrations/` — Postgres schema (manual
