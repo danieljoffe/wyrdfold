@@ -251,8 +251,8 @@ importers:
   apps/wyrdfold:
     dependencies:
       '@danieljoffe/shared-ui':
-        specifier: ^0.11.0
-        version: 0.11.0(lucide-react@1.29.0(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(tailwindcss@4.3.3)
+        specifier: ^0.12.1
+        version: 0.12.1(lucide-react@1.29.0(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(tailwindcss@4.3.3)
       '@supabase/ssr':
         specifier: ^0.12.4
         version: 0.12.4(@supabase/supabase-js@2.112.2(@opentelemetry/api@1.9.1))
@@ -1100,8 +1100,8 @@ packages:
     resolution: {integrity: sha512-QxULHAm7cNu72w97JUNCBFODFaXpbDg+dP8b/oWFAZ2MTRppA3U00Y2L1HqaS4J6yBqxwa/Y3nMBaxVKbB/NsA==}
     engines: {node: '>=20.19.0'}
 
-  '@danieljoffe/shared-ui@0.11.0':
-    resolution: {integrity: sha512-ORzi/w7C7Jtmog96sykrDf98ZIAS+Lhl5hP8e+D0pyeYAjviCuIFb+P0INLlyIadZNbhpPrC6hgkhYUnW63rsQ==}
+  '@danieljoffe/shared-ui@0.12.1':
+    resolution: {integrity: sha512-rDarAa22ZbFXjz80igFNSdhx3is+QgQX+mSEGAcjhmjtgGKKxCjpukWrK805m9QH0TZjq8M06Vg+KRLMWA84UQ==}
     peerDependencies:
       lucide-react: '>=0.400.0'
       react: ^19.0.0
@@ -10807,7 +10807,7 @@ snapshots:
 
   '@csstools/css-tokenizer@4.0.0': {}
 
-  '@danieljoffe/shared-ui@0.11.0(lucide-react@1.29.0(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(tailwindcss@4.3.3)':
+  '@danieljoffe/shared-ui@0.12.1(lucide-react@1.29.0(react@19.2.8))(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(tailwindcss@4.3.3)':
     dependencies:
       clsx: 2.1.1
       lucide-react: 1.29.0(react@19.2.8)

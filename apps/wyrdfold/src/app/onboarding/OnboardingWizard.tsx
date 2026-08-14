@@ -2,13 +2,14 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { ArrowLeft } from 'lucide-react';
 import { ProgressBar } from '@danieljoffe/shared-ui/ProgressBar';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Alert } from '@danieljoffe/shared-ui/Alert';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
 import Button from '@/components/kit/Button';
-import { completeOnboarding } from './completeOnboarding';
+import { deferOnboarding } from './completeOnboarding';
 import ConversationChat from '../_components/ConversationChat';
 import PathChooser from './PathChooser';
 import ResumeUploader from './ResumeUploader';
@@ -90,6 +91,11 @@ export default function OnboardingWizard({
     () => resolveResume(initialPath, initialStep).path
   );
   const [jobData, setJobData] = useState<JobData | null>(null);
+  // Targets created (or linked) during THIS run — reported up by
+  // TargetSuggestions so CompletionScreen can tell the truth: a
+  // zero-target finish must not claim "you're all set" (sweep
+  // 2026-08-14 P2). Stays 0 when the step is skipped outright.
+  const [targetsCreated, setTargetsCreated] = useState(0);
   const [skipping, setSkipping] = useState(false);
   const [skipFailed, setSkipFailed] = useState(false);
   const stepRef = useRef<HTMLDivElement>(null);
@@ -142,29 +148,54 @@ export default function OnboardingWizard({
   }, []);
 
   const handleSkip = useCallback(async () => {
-    // Mark onboarding complete on skip so the user isn't bounced back to
-    // /onboarding by the dashboard's completed_at gate. CompletionScreen
-    // hits the same endpoint on the "happy path" finish; the API is
-    // idempotent (complete_onboarding short-circuits if completed_at is
-    // already set) so re-completing after a finish is a no-op.
+    // DEFER, don't complete (onboarding-sweep-2026-08-14 P1): the exits
+    // used to POST /complete because the dashboard gate bounced any
+    // completed_at=NULL profile back into the wizard — which made "Finish
+    // setup later" permanent (no way back except the Settings reset).
+    // ``deferOnboarding`` records the exit while leaving completed_at
+    // NULL, so the gate stays quiet AND /onboarding still resumes at the
+    // persisted step; the dashboard shows a finish-your-setup nudge.
     //
     // We MUST confirm the write landed (HTTP 2xx) before navigating.
-    // ``completeOnboarding`` checks ``res.ok`` — a non-2xx (expired
+    // ``deferOnboarding`` checks ``res.ok`` — a non-2xx (expired
     // session → 401, API down → 503) used to be swallowed, navigating
-    // away while ``onboarding_completed_at`` stayed NULL so the next
-    // dashboard visit re-fired the wizard (the "skip doesn't stick" bug).
-    // On a confirmed failure we keep the user here with a retry
-    // affordance instead of dropping them into that redirect loop.
+    // away while the flag stayed NULL so the next dashboard visit
+    // re-fired the wizard (the "skip doesn't stick" bug). On a confirmed
+    // failure we keep the user here with a retry affordance instead of
+    // dropping them into that redirect loop.
     setSkipping(true);
     setSkipFailed(false);
-    const ok = await completeOnboarding();
+    const ok = await deferOnboarding();
     if (!ok) {
       setSkipping(false);
       setSkipFailed(true);
       return;
     }
-    router.push('/targets');
+    // Dashboard, not /targets: it's the surface that carries the
+    // finish-your-setup nudge, and "later" should land somewhere that
+    // explains what's next rather than an unexplained targets list.
+    router.push('/dashboard');
   }, [router]);
+
+  const handleChangePath = useCallback(() => {
+    // Back to the chooser (sweep 2026-08-14 B1) — before this, a
+    // mis-clicked path card was a commitment: only forward skips or the
+    // global exit. Nothing is destroyed by returning: work already done
+    // (uploaded resume, created targets) persists server-side and the
+    // steps detect it ("You already have a source file").
+    //
+    // Persist the reset fire-and-forget, mirroring the step-transition
+    // effect: ``resolveResume`` treats a stored 'path-chooser' as a clean
+    // start, so a refresh after changing course lands on the chooser
+    // instead of resuming into the abandoned path.
+    void fetch('/api/profile/onboarding/step', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current_step: 'path-chooser' }),
+    });
+    setSelectedPath(null);
+    setCurrentStep('path-chooser');
+  }, []);
 
   return (
     <div className='flex min-h-screen items-center justify-center bg-bg px-4 py-12'>
@@ -190,6 +221,18 @@ export default function OnboardingWizard({
               Match scores start rough and get more accurate as you add resume
               content, target roles, and preferences.
             </Text>
+          )}
+          {selectedPath && currentStep !== 'completion' && (
+            <Button
+              name='onboarding-change-path'
+              variant='bare'
+              size='sm'
+              className='mt-2 text-text-tertiary hover:bg-surface-elevated hover:text-text-primary'
+              onClick={handleChangePath}
+            >
+              <ArrowLeft className='size-3.5' aria-hidden />
+              <span>Change path</span>
+            </Button>
           )}
         </div>
 
@@ -260,6 +303,7 @@ export default function OnboardingWizard({
             <TargetSuggestions
               onComplete={goNext}
               onSkip={goNext}
+              onTargetsCreated={setTargetsCreated}
               jobData={jobData}
             />
           )}
@@ -270,7 +314,9 @@ export default function OnboardingWizard({
               skipLabel='Skip this step'
             />
           )}
-          {currentStep === 'completion' && <CompletionScreen />}
+          {currentStep === 'completion' && (
+            <CompletionScreen targetsCreated={targetsCreated} />
+          )}
         </div>
 
         {/* The one global exit. Same contract as the chooser's skip:

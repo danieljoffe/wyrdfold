@@ -1,6 +1,8 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import * as Sentry from '@sentry/nextjs';
+import { Alert } from '@danieljoffe/shared-ui/Alert';
 import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import { fetchJsonFromWyrdfoldAPI } from '@/lib/api/proxy';
@@ -21,6 +23,10 @@ import { parseHomeView } from './view';
 
 interface OnboardingStatus {
   completed_at: string | null;
+  // Set when the user deliberately exited the wizard ("Finish setup
+  // later") — suppresses the auto-redirect below while /onboarding stays
+  // enterable + resumable; the dashboard shows a resume nudge instead.
+  deferred_at: string | null;
   path: 'A' | 'B' | 'C' | null;
   current_step: string | null;
 }
@@ -197,15 +203,39 @@ export default async function WyrdfoldHome({
   const trendsPromise = view === 'trends' ? fetchTrendsInitial() : null;
 
   const onboardingStatus = await onboardingPromise;
-  if (onboardingStatus !== null && onboardingStatus.completed_at == null) {
+  // Auto-redirect only profiles that neither finished NOR deliberately
+  // exited the wizard: a deferred_at profile chose "Finish setup later",
+  // so bouncing them back in would override that choice — they get the
+  // resume-setup nudge below instead (onboarding-sweep-2026-08-14 P1).
+  if (
+    onboardingStatus !== null &&
+    onboardingStatus.completed_at == null &&
+    onboardingStatus.deferred_at == null
+  ) {
     redirect('/onboarding');
   }
+  const showFinishSetupNudge =
+    onboardingStatus !== null &&
+    onboardingStatus.completed_at == null &&
+    onboardingStatus.deferred_at != null;
 
   const todayInitial = todayPromise ? await todayPromise : null;
   const trendsInitial = trendsPromise ? await trendsPromise : null;
 
   return (
     <div className='flex flex-col gap-6'>
+      {showFinishSetupNudge && (
+        <Alert variant='info'>
+          Your setup isn&apos;t finished — matching gets sharper once your
+          resume and targets are in.{' '}
+          <Link
+            href='/onboarding'
+            className='font-medium underline underline-offset-2'
+          >
+            Resume setup
+          </Link>
+        </Alert>
+      )}
       <div className='flex flex-wrap items-end justify-between gap-4'>
         <div>
           <Heading variant='hero' as='h1'>

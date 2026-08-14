@@ -14,6 +14,7 @@ import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { LocalDate } from '@/components/LocalFormat';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { cn } from '@/lib/cn';
 import { displayTitle } from '@/lib/displayTitle';
 import { extractApiError } from '@/lib/extractApiError';
@@ -722,7 +723,7 @@ export default function JobDetailPanel({
             />
             <CoverLetterSection
               jobPostingId={posting.id}
-              companyName={posting.company_name}
+              companyName={formatCompanyName(posting.company_name)}
               roleTitle={displayTitle(posting)}
             />
           </>

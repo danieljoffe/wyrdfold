@@ -29,6 +29,20 @@ jest.mock('@sentry/nextjs', () => ({
 // Re-import after mocks are set up.
 import WyrdfoldDashboard from '../dashboard/page';
 
+/** Walk a React element tree (children only — props can be circular) and
+ *  report whether any text node contains the given string. Server
+ *  components can't be DOM-rendered in jest, so gate tests assert on the
+ *  returned element tree instead. */
+function treeContainsText(node: unknown, text: string): boolean {
+  if (typeof node === 'string') return node.includes(text);
+  if (Array.isArray(node)) return node.some(n => treeContainsText(n, text));
+  if (node && typeof node === 'object' && 'props' in node) {
+    const props = (node as { props: { children?: unknown } }).props;
+    return treeContainsText(props?.children, text);
+  }
+  return false;
+}
+
 describe('WyrdfoldDashboard route', () => {
   beforeEach(() => {
     mockRedirect.mockClear();
@@ -56,6 +70,57 @@ describe('WyrdfoldDashboard route', () => {
     // path buys a round-trip off every load of the app's default page.
     expect(mockFetch).toHaveBeenCalledTimes(5);
     expect(mockSentryCapture).not.toHaveBeenCalled();
+  });
+
+  it('does NOT redirect a deferred user — renders the resume-setup nudge instead', async () => {
+    // "Finish setup later" sets deferred_at while completed_at stays
+    // NULL (onboarding-sweep-2026-08-14 P1). Bouncing this user back
+    // into the wizard would override their explicit exit; they get a
+    // nudge banner and /onboarding remains enterable + resumable.
+    mockFetch
+      .mockResolvedValueOnce({
+        completed_at: null,
+        deferred_at: '2026-08-14T00:00:00Z',
+        path: 'B',
+        current_step: 'upload-resume',
+      })
+      .mockResolvedValueOnce({ postings: [], total: 0, page: 1, page_size: 5 })
+      .mockResolvedValueOnce({ prose: null })
+      .mockResolvedValue({ targets: [], postings: [], total: 0 });
+
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({}),
+    });
+
+    expect(mockRedirect).not.toHaveBeenCalled();
+    expect(treeContainsText(result, 'Resume setup')).toBe(true);
+  });
+
+  it('does NOT show the nudge once onboarding is completed', async () => {
+    // complete clears deferred_at server-side, but guard the render
+    // condition anyway: a completed profile never sees the nudge even
+    // if a stale deferred_at slips through.
+    mockFetch
+      .mockResolvedValueOnce({
+        completed_at: '2026-06-01T00:00:00Z',
+        deferred_at: '2026-08-14T00:00:00Z',
+        path: 'B',
+        current_step: 'completion',
+      })
+      .mockResolvedValueOnce({ postings: [], total: 0, page: 1, page_size: 5 })
+      .mockResolvedValueOnce({
+        id: 'p-1',
+        content: 'My experience...',
+        version: 1,
+      })
+      .mockResolvedValue({ targets: [], postings: [], total: 0 });
+
+    const result = await WyrdfoldDashboard({
+      searchParams: Promise.resolve({}),
+    });
+
+    expect(mockRedirect).not.toHaveBeenCalled();
+    expect(treeContainsText(result, 'Resume setup')).toBe(false);
   });
 
   it('does NOT redirect when the onboarding read fails (null) — fails open', async () => {
