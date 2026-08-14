@@ -188,13 +188,16 @@ class OnboardingStatus(BaseModel):
     """Read model for the user's onboarding progress.
 
     A user is considered "onboarded" when ``completed_at`` is non-null.
-    Until then, the dashboard redirects them to the wizard. The wizard
-    consumes ``current_step`` + ``path`` to resume mid-flow (Stage 2
-    of plan-wyrdfold-onboarding-completion-tracking.md; for now the
-    fields are populated but not yet read by the wizard).
+    Until then, the dashboard redirects them to the wizard — unless
+    ``deferred_at`` is set, which records "deliberately exited the wizard
+    without finishing" (the global 'Finish setup later' exit): the
+    redirect is suppressed but /onboarding stays enterable and resumes
+    mid-flow. The wizard consumes ``current_step`` + ``path`` to resume
+    (Stage 2 of plan-wyrdfold-onboarding-completion-tracking.md).
     """
 
     completed_at: datetime | None = None
+    deferred_at: datetime | None = None
     path: OnboardingPath | None = None
     current_step: OnboardingStep | None = None
 

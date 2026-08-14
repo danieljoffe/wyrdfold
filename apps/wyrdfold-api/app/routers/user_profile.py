@@ -84,7 +84,9 @@ _IDENTITY_COLUMNS = "name, email, phone_number, location, linkedin_url, website_
 
 _RESUME_STYLE_COLUMNS = "resume_style_settings"
 
-_ONBOARDING_COLUMNS = "onboarding_completed_at, onboarding_path, onboarding_current_step"
+_ONBOARDING_COLUMNS = (
+    "onboarding_completed_at, onboarding_deferred_at, onboarding_path, onboarding_current_step"
+)
 
 
 async def _get_or_create_profile(
@@ -318,6 +320,7 @@ def _read_onboarding(row: dict[str, Any]) -> OnboardingStatus:
     return OnboardingStatus.model_validate(
         {
             "completed_at": row.get("onboarding_completed_at"),
+            "deferred_at": row.get("onboarding_deferred_at"),
             "path": path if path in _KNOWN_PATHS else None,
             "current_step": step if step in _KNOWN_STEPS else None,
         }
@@ -393,7 +396,13 @@ async def complete_onboarding(
         supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
     )
 
-    updates: dict[str, Any] = {"onboarding_current_step": "completion"}
+    updates: dict[str, Any] = {
+        "onboarding_current_step": "completion",
+        # A completed profile is no longer "deferred" — clear the flag so
+        # the dashboard's finish-your-setup nudge can key off deferred_at
+        # alone without also checking completion.
+        "onboarding_deferred_at": None,
+    }
     if row.get("onboarding_completed_at") is None:
         # Client-side timestamp is fine here — clock skew between the
         # API container and the DB is sub-second and we don't render
@@ -402,6 +411,41 @@ async def complete_onboarding(
         updates["onboarding_completed_at"] = datetime.now(UTC).isoformat()
 
     await _update_profile(supabase, user_id, updates)
+
+    fresh = await _get_or_create_profile(
+        supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
+    )
+    return _read_onboarding(fresh)
+
+
+@router.post("/onboarding/defer")
+async def defer_onboarding(
+    user_id: str = Depends(get_current_user_id),
+    user_email: str | None = Depends(get_current_user_email),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> OnboardingStatus:
+    """Record that the user deliberately exited the wizard without finishing.
+
+    Called by the wizard's global exits ("Skip setup for now" / "Finish
+    setup later"). Unlike /complete this leaves ``completed_at`` NULL, so
+    /onboarding stays enterable and resumes mid-flow — the dashboard just
+    stops auto-redirecting into the wizard and shows a finish-your-setup
+    nudge instead (docs/onboarding-sweep-2026-08-14.md P1).
+
+    Idempotent like /complete: re-deferring keeps the original timestamp
+    ("when did this user first bail" is the analytically useful value).
+    Current step/path are left alone — they're exactly what resume needs.
+    """
+    row = await _get_or_create_profile(
+        supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
+    )
+
+    if row.get("onboarding_deferred_at") is None:
+        await _update_profile(
+            supabase,
+            user_id,
+            {"onboarding_deferred_at": datetime.now(UTC).isoformat()},
+        )
 
     fresh = await _get_or_create_profile(
         supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
@@ -436,7 +480,11 @@ async def reset_onboarding(
     await _update_profile(
         supabase,
         user_id,
-        {"onboarding_completed_at": None, "onboarding_current_step": None},
+        {
+            "onboarding_completed_at": None,
+            "onboarding_deferred_at": None,
+            "onboarding_current_step": None,
+        },
     )
 
     fresh = await _get_or_create_profile(

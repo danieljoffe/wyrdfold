@@ -219,7 +219,7 @@ describe('OnboardingWizard — initial state', () => {
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
   });
 
-  it('navigates to /targets when the user clicks Skip setup for now', async () => {
+  it('navigates to /dashboard when the user clicks Skip setup for now', async () => {
     const user = userEvent.setup();
     render(<OnboardingWizard />);
 
@@ -227,10 +227,13 @@ describe('OnboardingWizard — initial state', () => {
       screen.getByRole('button', { name: /skip setup for now/i })
     );
 
-    expect(mockPush).toHaveBeenCalledWith('/targets');
+    expect(mockPush).toHaveBeenCalledWith('/dashboard');
   });
 
-  it('marks onboarding complete on Skip so the dashboard guard does not bounce back', async () => {
+  it('DEFERS (not completes) on Skip — the exit is recorded but resumable', async () => {
+    // onboarding-sweep-2026-08-14 P1: completing on skip made "later"
+    // permanent. The exit now posts /defer, which quiets the dashboard
+    // gate while completed_at stays NULL so /onboarding still resumes.
     const user = userEvent.setup();
     render(<OnboardingWizard />);
 
@@ -238,18 +241,22 @@ describe('OnboardingWizard — initial state', () => {
       screen.getByRole('button', { name: /skip setup for now/i })
     );
 
-    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
+    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/defer', {
       method: 'POST',
     });
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      '/api/profile/onboarding/complete',
+      expect.anything()
+    );
   });
 
   // Regression for the "skip doesn't stick" bug: handleSkip used to fire
-  // the complete POST un-awaited and navigate immediately, so the page
+  // the flag POST un-awaited and navigate immediately, so the page
   // tore down before the request settled and the flag was never written
   // — the dashboard then re-fired onboarding on the next visit. The skip
   // MUST persist (await the POST) before navigation. Pre-fix, mockPush
   // was already called before the deferred fetch resolved → this fails.
-  it('awaits the complete POST BEFORE navigating away (skip persists)', async () => {
+  it('awaits the defer POST BEFORE navigating away (skip persists)', async () => {
     const user = userEvent.setup();
 
     // Deferred fetch we resolve by hand, to observe ordering: navigation
@@ -274,17 +281,17 @@ describe('OnboardingWizard — initial state', () => {
     );
 
     // POST is in flight but unresolved → we must still be on the wizard.
-    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
+    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/defer', {
       method: 'POST',
     });
     expect(mockPush).not.toHaveBeenCalled();
 
-    // Once the completion write settles, navigation proceeds.
+    // Once the defer write settles, navigation proceeds.
     deferred.resolve({ ok: true, status: 200 });
-    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/dashboard'));
   });
 
-  it('does NOT navigate and shows a retry when the complete POST fails on every attempt', async () => {
+  it('does NOT navigate and shows a retry when the defer POST fails on every attempt', async () => {
     // Persistent failure (network down on both the initial call and the
     // retry) → the flag never landed. Navigating would drop the user into
     // the dashboard's redirect loop, so we stay on the wizard and surface
@@ -309,7 +316,7 @@ describe('OnboardingWizard — initial state', () => {
     ).toBeInTheDocument();
   });
 
-  it('navigates to /targets when a transient 5xx recovers on retry', async () => {
+  it('navigates to /dashboard when a transient 5xx recovers on retry', async () => {
     const user = userEvent.setup();
     mockFetch
       .mockResolvedValueOnce({ ok: false, status: 503 })
@@ -321,7 +328,7 @@ describe('OnboardingWizard — initial state', () => {
       screen.getByRole('button', { name: /skip setup for now/i })
     );
 
-    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/dashboard'));
   });
 });
 
@@ -368,7 +375,10 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
     expect(mockPush).not.toHaveBeenCalled();
   });
 
-  it('"Finish setup later" mid-path exits via the persisted-complete contract', async () => {
+  it('"Finish setup later" mid-path exits via the persisted-DEFER contract', async () => {
+    // The exit records deferred_at (dashboard gate quiets down) but must
+    // NEVER complete — completed_at=NULL is what keeps /onboarding
+    // enterable so "later" actually exists (sweep 2026-08-14 P1).
     const user = userEvent.setup();
     render(<OnboardingWizard />);
 
@@ -383,10 +393,14 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
       screen.getByRole('button', { name: /finish setup later/i })
     );
 
-    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/targets'));
-    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/complete', {
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith('/dashboard'));
+    expect(mockFetch).toHaveBeenCalledWith('/api/profile/onboarding/defer', {
       method: 'POST',
     });
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      '/api/profile/onboarding/complete',
+      expect.anything()
+    );
   });
 
   it('offers no "Finish setup later" on the chooser or the completion step', async () => {
