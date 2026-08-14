@@ -153,8 +153,11 @@ async def test_suggest_and_match_excludes_users_existing_targets(
     )
     supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
 
-    # Bypass the supabase chain for the membership read — not the SUT here.
+    # Bypass the supabase chain for the membership + label reads — not the
+    # SUT here. Labels empty so the ID-exclusion path is tested in
+    # isolation from the containment check (covered separately below).
     monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value={"t1"}))
+    monkeypatch.setattr(match_module, "_user_target_labels", AsyncMock(return_value=set()))
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
 
@@ -189,3 +192,76 @@ async def test_suggest_and_match_marks_unmatched_suggestions_as_new(
     assert len(matched.matches) == 2
     assert all(m.is_new for m in matched.matches)
     assert all(m.matched_target is None for m in matched.matches)
+
+
+# ---- _near_duplicate_of_existing (sweep 2026-08-14 A4) ----------------------
+
+
+def test_near_duplicate_catches_word_extension_labels() -> None:
+    """The prod repro: 'Founding Engineer / Head of Engineering' offered while
+    the user already follows 'Founding Engineer' — trigram similarity dips
+    below 0.7 (extra words dilute), containment must catch it."""
+    assert match_module._near_duplicate_of_existing(
+        "founding engineer / head of engineering", {"founding engineer"}
+    )
+    # Symmetric: existing label is the longer one.
+    assert match_module._near_duplicate_of_existing(
+        "founding engineer", {"founding engineer / head of engineering"}
+    )
+
+
+def test_near_duplicate_requires_word_boundaries() -> None:
+    # "end engineer" appears inside "backend engineer" only mid-word — the
+    # guard must NOT fire (this would be a specialization collision).
+    assert not match_module._near_duplicate_of_existing(
+        "backend engineer", {"end engineer"}
+    )
+
+
+def test_near_duplicate_ignores_single_word_labels() -> None:
+    # A one-word label ("engineer") sits inside almost anything — dropping
+    # on it would erase whole categories of suggestions.
+    assert not match_module._near_duplicate_of_existing(
+        "platform engineer", {"engineer"}
+    )
+
+
+def test_near_duplicate_unrelated_labels_pass() -> None:
+    assert not match_module._near_duplicate_of_existing(
+        "senior data scientist", {"founding engineer", "staff frontend engineer"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_suggest_and_match_drops_near_duplicates_of_own_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through suggest_and_match: a word-extension near-dup of a
+    label the user follows is dropped before any catalog lookup; the other
+    suggestion flows through normally."""
+    supabase = MagicMock()
+    # Only ONE catalog lookup should happen (for the non-dup suggestion) —
+    # a single-response mock would fail loudly if the dropped suggestion
+    # were looked up too.
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(side_effect=[MagicMock(data=[])])
+    )
+    supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+
+    monkeypatch.setattr(match_module, "_user_target_ids", AsyncMock(return_value={"t9"}))
+    monkeypatch.setattr(
+        match_module,
+        "_user_target_labels",
+        AsyncMock(return_value={"senior frontend engineer"}),
+    )
+
+    llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _scripted_suggestions()})
+
+    matched, _ = await suggest_and_match(
+        supabase, llm, payload=OptimizedPayload(), user_id="user-1"
+    )
+
+    # "Senior Frontend Engineer" is a (here: exact) containment hit against
+    # the user's own label set → dropped; "Staff DevOps Engineer" survives.
+    assert [m.suggestion.label for m in matched.matches] == ["Staff DevOps Engineer"]
+    assert matched.matches[0].is_new is True

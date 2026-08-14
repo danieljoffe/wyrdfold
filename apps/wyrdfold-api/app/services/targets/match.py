@@ -19,6 +19,7 @@ because they share "senior" + "engineer" + suffix).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, cast
 
 from supabase import AsyncClient
@@ -73,6 +74,51 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
     return {r["target_id"] for r in rows}
 
 
+async def _user_target_labels(supabase: AsyncClient, target_ids: set[str]) -> set[str]:
+    """Normalized labels of the caller's own targets, for the containment
+    check below. Single ``in_`` read — user memberships are tens at most,
+    far under the ~150-id URL-length ceiling on ``in_()`` chunks (#57)."""
+    if not target_ids:
+        return set()
+    resp = (
+        await supabase.table(TARGETS_TABLE)
+        .select("normalized_label")
+        .in_("id", sorted(target_ids))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return {r["normalized_label"] for r in rows if r.get("normalized_label")}
+
+
+# A containment match requires the shorter label to carry at least this many
+# words — single-word labels ("engineer") are generic enough to sit inside
+# almost any suggestion, and dropping on those would erase whole categories.
+_MIN_CONTAINMENT_WORDS = 2
+
+
+def _near_duplicate_of_existing(normalized: str, existing_labels: set[str]) -> bool:
+    """True when the suggestion contains — or is contained by, at word
+    boundaries — a label the user already follows.
+
+    Closes the word-extension gap in the trigram gate (sweep 2026-08-14
+    A4): "founding engineer / head of engineering" vs an existing
+    "founding engineer" scores below the 0.7 similarity threshold (the
+    extra words dilute the trigram overlap) yet is the same target for
+    offer purposes. Scoped to the USER'S OWN labels only — catalog-wide
+    matching keeps the documented 0.7 rationale untouched.
+    """
+    for existing in existing_labels:
+        shorter, longer = sorted((normalized, existing), key=len)
+        if len(shorter.split()) < _MIN_CONTAINMENT_WORDS:
+            continue
+        # Word-boundary containment: "founding engineer" matches inside
+        # "founding engineer / head of engineering" (delimited by space /
+        # punctuation) but "end engineer" never matches "backend engineer".
+        if re.search(rf"(?<!\w){re.escape(shorter)}(?!\w)", longer):
+            return True
+    return False
+
+
 async def find_matching_target(supabase: AsyncClient, label: str) -> JobTarget | None:
     """Find an existing target matching a label, or None.
 
@@ -112,16 +158,24 @@ async def _match_suggestions(
     supabase: AsyncClient,
     suggestions: list[TargetSuggestion],
     existing_ids: set[str],
+    existing_labels: set[str],
 ) -> list[MatchedSuggestion]:
     """Match each suggestion against the shared catalog, dropping any the user
     already follows.
 
     A suggestion matched to a target the caller already has is skipped (no
-    point re-offering it); everything else is returned paired with its matched
-    target (``is_new=False``) or flagged as new (``is_new=True``).
+    point re-offering it), as is a word-boundary near-duplicate of one of
+    their labels (``_near_duplicate_of_existing``); everything else is
+    returned paired with its matched target (``is_new=False``) or flagged as
+    new (``is_new=True``).
     """
     matches: list[MatchedSuggestion] = []
     for suggestion in suggestions:
+        # Containment first: it's an in-memory check, so a near-dup of an
+        # already-followed target never costs the catalog lookups below.
+        if _near_duplicate_of_existing(_normalize_label(suggestion.label), existing_labels):
+            continue
+
         matched = await find_matching_target(supabase, suggestion.label)
 
         if matched and matched.id in existing_ids:
@@ -151,8 +205,11 @@ async def suggest_and_match(
     Returns (matched_suggestions, llm_result) so callers can log cost.
     """
     existing_ids = await _user_target_ids(supabase, user_id)
+    existing_labels = await _user_target_labels(supabase, existing_ids)
     suggestions, result = await suggest_targets(llm, payload=payload)
-    matches = await _match_suggestions(supabase, suggestions.suggestions, existing_ids)
+    matches = await _match_suggestions(
+        supabase, suggestions.suggestions, existing_ids, existing_labels
+    )
     return MatchedSuggestions(matches=matches), result
 
 
@@ -175,6 +232,9 @@ async def suggest_and_match_from_query(
     Returns (matched_suggestions, llm_result) so callers can log cost.
     """
     existing_ids = await _user_target_ids(supabase, user_id)
+    existing_labels = await _user_target_labels(supabase, existing_ids)
     suggestions, result = await suggest_targets_from_query(llm, query=query, payload=payload)
-    matches = await _match_suggestions(supabase, suggestions.suggestions, existing_ids)
+    matches = await _match_suggestions(
+        supabase, suggestions.suggestions, existing_ids, existing_labels
+    )
     return MatchedSuggestions(matches=matches), result

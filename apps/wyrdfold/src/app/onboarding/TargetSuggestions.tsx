@@ -70,6 +70,54 @@ const ANALYZE_STAGES = [
   'Matching roles to your background — a few more seconds...',
 ] as const;
 
+// Per-tab cache of the last suggestion set (sweep 2026-08-14 A3). The
+// suggest call is a fresh LLM pass — non-deterministic and billed — so a
+// mid-step refresh used to reroll the options: sets shrank or changed
+// entirely, and the user paid another ~20 s wait for the privilege.
+// sessionStorage survives exactly the reload case and dies with the tab;
+// the TTL bounds staleness across a same-tab redo-onboarding run.
+const SUGGESTIONS_CACHE_KEY = 'wyrdfold.onboarding.suggestions';
+const SUGGESTIONS_CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface CachedSuggestions {
+  cachedAt: number;
+  matches: MatchedSuggestion[];
+}
+
+function readSuggestionsCache(): MatchedSuggestion[] | null {
+  try {
+    const raw = sessionStorage.getItem(SUGGESTIONS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CachedSuggestions;
+    if (!Array.isArray(parsed.matches) || parsed.matches.length === 0) {
+      return null;
+    }
+    if (Date.now() - parsed.cachedAt > SUGGESTIONS_CACHE_TTL_MS) return null;
+    return parsed.matches;
+  } catch {
+    return null; // corrupt / unavailable storage — treat as no cache
+  }
+}
+
+function writeSuggestionsCache(matches: MatchedSuggestion[]): void {
+  try {
+    sessionStorage.setItem(
+      SUGGESTIONS_CACHE_KEY,
+      JSON.stringify({ cachedAt: Date.now(), matches })
+    );
+  } catch {
+    // Quota / unavailable storage — the cache is best-effort.
+  }
+}
+
+function clearSuggestionsCache(): void {
+  try {
+    sessionStorage.removeItem(SUGGESTIONS_CACHE_KEY);
+  } catch {
+    // Nothing to do — absence is the goal.
+  }
+}
+
 interface TargetSuggestionsProps {
   onComplete: () => void;
   onSkip: () => void;
@@ -98,6 +146,9 @@ export default function TargetSuggestions({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
   const [createdCount, setCreatedCount] = useState(0);
+  // Bumped by "Refresh suggestions" — a deliberate reroll that bypasses
+  // (and replaces) the per-tab cache.
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -180,10 +231,23 @@ export default function TargetSuggestions({
     };
   }, [jobData, onComplete, onTargetsCreated, router]);
 
-  // Paths B/C: fetch suggestions from LLM
+  // Paths B/C: fetch suggestions from LLM (or serve the per-tab cache)
   useEffect(() => {
     if (jobData) return;
     let cancelled = false;
+
+    // A plain (re)mount — most importantly a page refresh mid-step —
+    // reuses the cached set instead of rerolling it. ``refreshNonce > 0``
+    // is a deliberate reroll via "Refresh suggestions" and bypasses.
+    if (refreshNonce === 0) {
+      const cached = readSuggestionsCache();
+      if (cached) {
+        setSuggestions(cached);
+        setSelected(new Set(cached.map(m => m.suggestion.label)));
+        setLoading(false);
+        return;
+      }
+    }
 
     async function fetchSuggestions() {
       try {
@@ -197,6 +261,7 @@ export default function TargetSuggestions({
           setSuggestions(data.matches);
           // Pre-select all suggestions
           setSelected(new Set(data.matches.map(m => m.suggestion.label)));
+          writeSuggestionsCache(data.matches);
         }
       } catch (err) {
         if (!cancelled) {
@@ -221,7 +286,7 @@ export default function TargetSuggestions({
     return () => {
       cancelled = true;
     };
-  }, [jobData]);
+  }, [jobData, refreshNonce]);
 
   const toggleSelection = useCallback((label: string) => {
     setSelected(prev => {
@@ -235,7 +300,21 @@ export default function TargetSuggestions({
     });
   }, []);
 
+  const handleRefreshSuggestions = useCallback(() => {
+    // Deliberate reroll: drop the cached set and re-run the (billed)
+    // suggest pass. The nonce bump re-fires the fetch effect above.
+    clearSuggestionsCache();
+    setError(null);
+    setSuggestions([]);
+    setSelected(new Set());
+    setLoading(true);
+    setRefreshNonce(n => n + 1);
+  }, []);
+
   const handleCreateSelected = useCallback(async () => {
+    // Either exit consumes the offer — a later wizard run should get a
+    // fresh set, not this tab's leftovers.
+    clearSuggestionsCache();
     if (selected.size === 0) {
       onComplete();
       return;
@@ -466,15 +545,27 @@ export default function TargetSuggestions({
         {error && <Alert variant='error'>{error}</Alert>}
 
         <div className='flex items-center justify-between'>
-          <Button
-            name='onboarding-skip-targets'
-            variant='bare'
-            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
-            size='sm'
-            onClick={onSkip}
-          >
-            Skip this step
-          </Button>
+          <div className='flex items-center gap-2'>
+            <Button
+              name='onboarding-skip-targets'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
+              size='sm'
+              onClick={onSkip}
+            >
+              Skip this step
+            </Button>
+            <Button
+              name='onboarding-refresh-suggestions'
+              variant='bare'
+              className='text-text-tertiary hover:bg-surface-elevated hover:text-text-primary'
+              size='sm'
+              onClick={handleRefreshSuggestions}
+              disabled={creating}
+            >
+              Refresh suggestions
+            </Button>
+          </div>
           <Button
             name='onboarding-create-targets'
             variant='primary'
