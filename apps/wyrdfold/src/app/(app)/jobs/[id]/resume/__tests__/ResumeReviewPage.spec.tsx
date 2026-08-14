@@ -285,4 +285,61 @@ describe('ResumeReviewPage — flagged drafts (#656)', () => {
       await screen.findByText(/Tailored resume not found/i)
     ).toBeInTheDocument();
   });
+
+  describe('posting 404 — pre-scoring window (release smoke 2026-08-13)', () => {
+    // ``GET /jobs/{id}`` gates on a ``scores`` row, so a just-added manual
+    // posting 404s until background scoring lands — and the onboarding
+    // path-A payoff navigates here inside exactly that window. The posting
+    // fetch must degrade the chrome, never gate the user's own document.
+    const posting404 = (url: string) =>
+      url === '/api/jobs/j-1'
+        ? { ok: false, status: 404, json: async () => ({}) }
+        : undefined;
+
+    it('renders the draft even while the posting is still unscored', async () => {
+      mockPage({ record: RECORD, status: 'idle' }, posting404);
+
+      render(<ResumeReviewPage jobPostingId='j-1' />);
+
+      const surface = await screen.findByLabelText('Resume markdown');
+      expect(surface.textContent).toContain('Resume markdown');
+      expect(screen.queryByText(/Tailored resume not found/i)).toBeNull();
+      // The subtitle says why the job header is missing instead of
+      // pretending nothing exists.
+      expect(
+        screen.getByText(/Job details are still processing/i)
+      ).toBeInTheDocument();
+      // Filename degrades to name-date — there is no company to slug.
+      const filenameInput = screen.getByLabelText(
+        'Download filename'
+      ) as HTMLInputElement;
+      expect(filenameInput.placeholder).toMatch(/^resume-/);
+      expect(filenameInput.placeholder).not.toMatch(/acme/i);
+    });
+
+    it('shows the wait state, not "not found", when landing mid-generation', async () => {
+      // The payoff's actual arrival shape: tailor 202 accepted, run in
+      // flight, posting unscored. The old gate slammed this to "not found".
+      mockPage({ record: null, status: 'running' }, posting404);
+
+      render(<ResumeReviewPage jobPostingId='j-1' />);
+
+      expect(
+        await screen.findByText(/Tailoring your resume/i)
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Tailored resume not found/i)).toBeNull();
+    });
+
+    it('still reports not-found when there is no document either', async () => {
+      // A garbage/foreign posting id has no document and nothing running —
+      // the honest dead end survives the gate change.
+      mockPage({ record: null, status: 'idle' }, posting404);
+
+      render(<ResumeReviewPage jobPostingId='j-1' />);
+
+      expect(
+        await screen.findByText(/Tailored resume not found/i)
+      ).toBeInTheDocument();
+    });
+  });
 });
