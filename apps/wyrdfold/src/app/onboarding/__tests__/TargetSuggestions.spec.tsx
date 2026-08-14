@@ -463,6 +463,103 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     });
   });
 
+  it('reports the created count via onTargetsCreated (completion-copy input)', async () => {
+    // CompletionScreen branches its copy on this number (sweep
+    // 2026-08-14 P2): a zero-target finish must not claim "all set".
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [
+              makeSuggestion('Frontend Engineer', true, null),
+              makeSuggestion('Backend Engineer', true, null),
+            ],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            makeTarget({ id: `t-${Math.random().toString(36).slice(2, 6)}` }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const onTargetsCreated = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <TargetSuggestions
+        onComplete={jest.fn()}
+        onSkip={jest.fn()}
+        onTargetsCreated={onTargetsCreated}
+      />
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+
+    // Deselect one of the two pre-selected suggestions, then create —
+    // the reported count must reflect what was actually created (1),
+    // not what was offered (2).
+    await user.click(screen.getByText('Backend Engineer'));
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => expect(onTargetsCreated).toHaveBeenCalledWith(1));
+  });
+
+  it('reports zero when the user continues without targets', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const onTargetsCreated = jest.fn();
+    const onComplete = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        onTargetsCreated={onTargetsCreated}
+      />
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('Frontend Engineer')); // deselect
+    await user.click(
+      screen.getByRole('button', { name: /continue without targets/i })
+    );
+
+    // Zero-selection short-circuits straight to onComplete — no target
+    // writes, no creation report (the wizard's count stays at its 0
+    // default, which is exactly what CompletionScreen should see).
+    await waitFor(() => expect(onComplete).toHaveBeenCalled());
+    expect(onTargetsCreated).not.toHaveBeenCalled();
+    const targetPosts = fetchMock.mock.calls.filter(
+      ([url, init]: [string, RequestInit | undefined]) =>
+        url === '/api/targets' && init?.method === 'POST'
+    );
+    expect(targetPosts.length).toBe(0);
+  });
+
   it('invokes onSkip when "Skip this step" is clicked from the manual fallback', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
