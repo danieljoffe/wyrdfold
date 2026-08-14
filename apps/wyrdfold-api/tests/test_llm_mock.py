@@ -373,6 +373,37 @@ async def test_country_name_job_fit_survives_the_real_parse_path() -> None:
     assert parsed.logistics.remote_status == "hybrid"
 
 
+async def test_conversation_recap_echo_survives_the_real_parse_path() -> None:
+    """Bug-corpus entry for the Path-C grounding work (2026-08-13): a turn
+    response that restates already-recorded prose as ``prose_append`` is
+    schema-valid — the failure is semantic, not structural. The payload must
+    parse cleanly through the real ``complete_json`` + ``LLMTurnResponse``
+    path so the orchestrator-level recap-echo guard (not the parser) is the
+    thing that drops it — proven in
+    ``test_handle_turn_drops_a_recap_echo_append``.
+    """
+    from app.models.conversation import LLMTurnResponse
+    from app.services.llm.client import complete_json
+    from app.services.llm.mock import conversation_recap_echo_json
+
+    recap = "Worked at FightCamp 2021-11 to 2024-04."
+    client = MockLLMClient(
+        scripted={"conversation.turn": conversation_recap_echo_json(recap)}
+    )
+    parsed, _result = await complete_json(
+        client,
+        model="claude-sonnet-4-6",
+        system="interview",
+        messages=[Message(role="user", content="what else?")],
+        schema=LLMTurnResponse,
+        purpose="conversation.turn",
+    )
+
+    assert parsed.prose_append == recap
+    assert parsed.done is False
+    assert parsed.assistant_message.count("?") == 1
+
+
 def _dev_optimized():
     from app.models.experience import OptimizedPayload, Outcome, Role, Skill
 

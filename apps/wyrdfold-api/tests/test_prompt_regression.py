@@ -57,6 +57,15 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     # the re-sweep R2 vocabulary leak). Note: no eval script exercises this
     # surface yet — the pin at least makes edits visible and reviewable.
     ("analysis.system", "app.services.analysis.prompts:ANALYSIS_SYSTEM"),
+    # Conversation interviewer prompts (Path-C onboarding + career-log +
+    # probe phrasing) — pinned 2026-08-13 with the grounding/one-question
+    # rework. No eval script exercises this surface either; like analysis,
+    # the pin turns silent prompt drift into a reviewable diff. The prose
+    # these prompts elicit becomes the tailor's source-of-truth, so they are
+    # quality-bearing inputs even without a scored eval.
+    ("conversation.onboarding.system", "app.services.conversation.prompts:ONBOARDING_SYSTEM"),
+    ("conversation.update.system", "app.services.conversation.prompts:UPDATE_SYSTEM"),
+    ("conversation.probe.system", "app.services.conversation.prompts:PROBE_SYSTEM"),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
