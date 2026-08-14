@@ -1,6 +1,6 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import CoverLetterReviewPage from '../CoverLetterReviewPage';
 
 const mockToast = jest.fn();
@@ -215,5 +215,60 @@ describe('CoverLetterReviewPage — #656 envelope + flagged drafts', () => {
     render(<CoverLetterReviewPage jobPostingId='j-1' />);
     await screen.findByLabelText('Cover letter markdown');
     expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  describe('posting 404 — pre-scoring window (#724 sibling)', () => {
+    // ``GET /jobs/{id}`` gates on a ``scores`` row, so a just-added manual
+    // posting 404s until background scoring lands. The letter is the
+    // caller's own document — the posting fetch degrades the chrome, never
+    // gates the page.
+    const posting404 = (url: string) =>
+      url === '/api/jobs/j-1'
+        ? { ok: false, status: 404, json: async () => ({}) }
+        : undefined;
+
+    it('renders the letter even while the posting is still unscored', async () => {
+      mockPage({ record: RECORD, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+
+      const surface = await screen.findByLabelText('Cover letter markdown');
+      expect(surface.textContent).toContain('Cover letter draft');
+      expect(screen.queryByText(/Cover letter not found/i)).toBeNull();
+      expect(
+        screen.getByText(/Job details are still processing/i)
+      ).toBeInTheDocument();
+      // Filename degrades to name-date — there is no company to slug.
+      const filenameInput = screen.getByLabelText(
+        'Download filename'
+      ) as HTMLInputElement;
+      expect(filenameInput.placeholder).toMatch(/-cover-letter-/);
+      expect(filenameInput.placeholder).not.toMatch(/acme/i);
+    });
+
+    it('disables regenerate while the posting is unavailable', async () => {
+      // Regeneration POSTs the posting's company + title — without them the
+      // confirm would silently no-op, so the control must read as disabled.
+      mockPage({ record: RECORD, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+      await screen.findByLabelText('Cover letter markdown');
+
+      fireEvent.click(screen.getByLabelText('More actions'));
+      const regen = await screen.findByRole('menuitem', {
+        name: /re-generate with ai/i,
+      });
+      expect(regen).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('still reports not-found when there is no letter either', async () => {
+      mockPage({ record: null, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+
+      expect(
+        await screen.findByText(/Cover letter not found/i)
+      ).toBeInTheDocument();
+    });
   });
 });

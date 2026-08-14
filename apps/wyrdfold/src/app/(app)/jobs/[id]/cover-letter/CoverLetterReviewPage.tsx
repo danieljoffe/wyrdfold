@@ -72,6 +72,9 @@ export default function CoverLetterReviewPage({
 
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
+  // Posting 404'd (pre-scoring window) — degrade the chrome, never gate the
+  // document. See the load() comment and #724 for the diagnosed race.
+  const [postingMissing, setPostingMissing] = useState(false);
   const [approving, setApproving] = useState(false);
   const [unapproving, setUnapproving] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
@@ -87,11 +90,15 @@ export default function CoverLetterReviewPage({
   const [versionsOpen, setVersionsOpen] = useState(false);
 
   const defaultFilename = useMemo(() => {
-    if (!record || !posting) return '';
+    if (!record) return '';
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'cover-letter';
-    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${localDateStamp()}`;
+    // Without the posting (still scoring — see ``postingMissing``) there is
+    // no company to slug; a name-date filename beats blocking the download.
+    return posting
+      ? `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${localDateStamp()}`
+      : `${slugify(name)}-cover-letter-${localDateStamp()}`;
   }, [record, posting]);
 
   const load = useCallback(async () => {
@@ -101,20 +108,28 @@ export default function CoverLetterReviewPage({
         fetch(`/api/jobs/${jobPostingId}`),
         fetch(`/api/jobs/tailor/by-job/${jobPostingId}/cover-letter`),
       ]);
-      if (jobRes.status === 404 || letterRes.status === 404) {
+      // ``GET /jobs/{id}`` gates on a ``scores`` row, so a just-added manual
+      // posting 404s until background scoring lands (#724's race, fixed here
+      // for the sibling page). A missing posting degrades the chrome —
+      // subtitle, filename slug, regenerate — but never gates the letter:
+      // the document is the caller's own, fetched per-user.
+      if (letterRes.status === 404) {
         setNotFound(true);
         return;
       }
-      if (!jobRes.ok || !letterRes.ok) {
+      if (!letterRes.ok || (!jobRes.ok && jobRes.status !== 404)) {
         toast({ variant: 'error', title: 'Failed to load cover letter' });
         return;
       }
-      const job = (await jobRes.json()) as JobPosting;
+      if (jobRes.status === 404) {
+        setPostingMissing(true);
+      } else {
+        setPosting((await jobRes.json()) as JobPosting);
+      }
       // #656 envelope: this route returns {record, status, message}, not a
       // bare record. Reading it as a record silently yielded an undefined id
       // and empty markdown — the page rendered but was inert.
       const state = (await letterRes.json()) as TailoredDocumentState;
-      setPosting(job);
       if (!state.record) {
         setNotFound(true);
         return;
@@ -375,7 +390,7 @@ export default function CoverLetterReviewPage({
   }
 
   async function handleDownload() {
-    if (!record || !posting) return;
+    if (!record) return;
     const ok = await flushPendingSave();
     if (!ok) return;
     try {
@@ -500,7 +515,7 @@ export default function CoverLetterReviewPage({
     );
   }
 
-  if (loading || !record || !posting) {
+  if (loading || !record || (!posting && !postingMissing)) {
     return (
       <div
         className='mx-auto max-w-4xl space-y-4 p-6'
@@ -556,7 +571,10 @@ export default function CoverLetterReviewPage({
         <Breadcrumbs
           items={[
             { label: 'Jobs', href: '/jobs' },
-            { label: crumbLabel(posting.title), href: `/jobs/${jobPostingId}` },
+            {
+              label: crumbLabel(posting?.title ?? 'Job'),
+              href: `/jobs/${jobPostingId}`,
+            },
             { label: 'Cover letter' },
           ]}
         />
@@ -572,7 +590,15 @@ export default function CoverLetterReviewPage({
           Review Cover Letter
         </Heading>
         <Text variant='body' className='text-text-secondary'>
-          {posting.title} &mdash; {posting.company_name}
+          {posting ? (
+            <>
+              {posting.title} &mdash; {posting.company_name}
+            </>
+          ) : (
+            // Scoring hasn't linked the posting to a target yet, so the
+            // job detail is temporarily unavailable — the letter isn't.
+            'Job details are still processing — they’ll appear here shortly.'
+          )}
         </Text>
       </div>
 
@@ -791,11 +817,15 @@ export default function CoverLetterReviewPage({
                   label: 'Re-generate with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
                   onClick: () => setConfirmRegenerateOpen(true),
+                  // ``!posting``: regeneration POSTs the posting's company +
+                  // title, which aren't available in the pre-scoring window —
+                  // disabled beats a silently no-op confirm.
                   disabled:
                     regenerating ||
                     approving ||
                     saveStatus === 'saving' ||
-                    isApproved,
+                    isApproved ||
+                    !posting,
                 },
                 ...(isApproved
                   ? [
