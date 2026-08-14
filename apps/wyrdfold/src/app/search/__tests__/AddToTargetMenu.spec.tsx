@@ -25,16 +25,22 @@ function makeSource(): TargetsSource {
 }
 
 /**
- * #485 nested-dismiss guard: shared-ui Modal listens for Escape on window,
- * and the Dropdown's Escape handler doesn't stop propagation. The menu's
- * wrapper must swallow exactly the Escapes the menu CONSUMED
- * (``defaultPrevented`` — the primitive preventDefault()s before closing),
- * so one keystroke closes the menu, and only the NEXT one reaches a
- * hosting modal. Gating on component open-state instead is a real race we
- * shipped and reverted: keydown is a discrete event, so the close's
- * setState flushes synchronously mid-dispatch.
+ * #485 nested-dismiss guard, revised for the shared-ui 0.12 portal:
+ * shared-ui Modal listens for Escape on window (no ``defaultPrevented``
+ * check), and the Dropdown's Escape handler doesn't stop propagation.
+ * Since 0.12 the menu renders in a document.body portal, so a keydown
+ * from inside it never bubbles through this component's DOM — the old
+ * wrapper-listener guard was silently bypassed whenever focus sat in the
+ * menu. The guard now lives on ``document`` (still before window in the
+ * bubble path, and in EVERY path) while the menu is open, and swallows
+ * exactly the Escapes the menu CONSUMED (``defaultPrevented`` — the
+ * primitive preventDefault()s before closing): one keystroke closes the
+ * menu, and only the NEXT one reaches a hosting modal. Gating on
+ * component open-state instead is a real race we shipped and reverted:
+ * keydown is a discrete event, so the close's setState flushes
+ * synchronously mid-dispatch.
  */
-describe('AddToTargetMenu Escape nesting (#485)', () => {
+describe('AddToTargetMenu Escape nesting (#485 / shared-ui 0.12 portal)', () => {
   it('swallows the Escape that closed the menu; passes the next one through', async () => {
     const windowSawEscape = jest.fn();
     window.addEventListener('keydown', windowSawEscape);
@@ -65,6 +71,43 @@ describe('AddToTargetMenu Escape nesting (#485)', () => {
         cancelable: true,
       });
       expect(windowSawEscape).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener('keydown', windowSawEscape);
+    }
+  });
+
+  it('guards the PORTAL path: Escape from inside the portaled menu never reaches window', async () => {
+    // The 0.12 regression shape: focus in the menu (arrow-key navigation),
+    // Escape. The panel lives in a document.body portal, so the event
+    // path is panel → body → document → window — the component's own DOM
+    // is never traversed. The old wrapper guard misses this entirely; the
+    // document-level guard must swallow it.
+    const windowSawEscape = jest.fn();
+    window.addEventListener('keydown', windowSawEscape);
+    try {
+      render(<AddToTargetMenu jobId='job-1' source={makeSource()} />);
+      fireEvent.click(screen.getByRole('button', { name: /add to target/i }));
+      const menu = await screen.findByRole('menu');
+
+      // The portaled panel is NOT a descendant of the trigger's wrapper —
+      // this is the precondition that bypassed the old guard. Anchor the
+      // test to it so a future de-portaling flips this loudly.
+      const wrapper = screen
+        .getByRole('button', { name: /add to target/i })
+        .closest('div');
+      expect(wrapper?.contains(menu)).toBe(false);
+
+      const item = screen.getByText('My target');
+      fireEvent.keyDown(item, {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      });
+
+      await waitFor(() =>
+        expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+      );
+      expect(windowSawEscape).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener('keydown', windowSawEscape);
     }
