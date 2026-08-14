@@ -5,7 +5,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
-  useRef,
   useState,
 } from 'react';
 import Link from 'next/link';
@@ -98,8 +97,11 @@ export function CompanyAvatar({
   // Shared-ui Avatar (square) carrying the deterministic per-company hue. Avatar
   // exposes no per-instance colour prop — only a static `tileClassName` — so the
   // computed hsl() rides a CSS variable set on the root and consumed by the inner
-  // tile via `bg-[var(...)]` (a literal class Tailwind emits). Solid colour +
-  // white text stays self-contained and reads in light and dark themes.
+  // tile via an arbitrary-value background class (see tileClassName below).
+  // Solid colour + white text stays self-contained and reads in light and dark
+  // themes. (Don't quote the class shape with a "..." placeholder here — the
+  // Tailwind scanner token-matches comments too, and the placeholder compiles
+  // to an invalid `var(...)` utility that 500s `next dev`.)
   return (
     <Avatar
       aria-hidden
@@ -248,29 +250,38 @@ export function AddToTargetMenu({
                 }),
           }));
 
-  // Escape guard: shared-ui Modal listens for Escape on window, and the
-  // Dropdown's own Escape handler (on its wrapper) doesn't stop
-  // propagation — without a guard, one keystroke closes BOTH the menu and a
-  // hosting detail modal. A NATIVE bubble-phase listener on this wrapper
-  // sits in the true DOM path (menu → dropdown wrapper → HERE → … → window)
-  // and swallows exactly the Escapes the menu CONSUMED: the primitive calls
-  // preventDefault() before closing, so ``defaultPrevented`` marks them.
-  // (Gating on our own open state instead is a race — keydown is a discrete
-  // event, so the close's setState flushes synchronously mid-dispatch and
-  // the state already reads closed by the time the event bubbles here.)
-  const escapeGuardRef = useRef<HTMLDivElement>(null);
+  // Escape guard (revised for shared-ui 0.12): the menu now renders in a
+  // document.body PORTAL, so a keydown with focus inside it bubbles
+  // panel → body → document → window without ever passing through this
+  // component's DOM — the 0.11 wrapper-listener guard is no longer in the
+  // path. shared-ui Modal still listens for Escape on window (and doesn't
+  // check ``defaultPrevented``), so the keystroke that closes the menu
+  // would close a hosting detail modal too. A document-level bubble
+  // listener sits between the portal and window in every path (trigger-
+  // focused Escapes bubble through document as well) and swallows exactly
+  // the Escapes the menu CONSUMED: the primitive calls preventDefault()
+  // before closing, so ``defaultPrevented`` marks them.
+  //
+  // LIFETIME attachment ([] deps), deliberately NOT gated on ``open``:
+  // keydown is a DISCRETE event, so when the primitive's panel listener
+  // closes the menu, React flushes the state update AND passive-effect
+  // cleanup synchronously mid-dispatch — an ``open``-gated guard is
+  // removed from document before the very Escape it exists to swallow
+  // arrives there (verified with the real browser via
+  // authed-search-target-picker.spec.ts; jsdom does not reproduce the
+  // mid-dispatch flush). Same race the pre-0.12 comment warned about,
+  // one node higher. The ``defaultPrevented`` predicate keeps the
+  // always-on listener scoped to consumed Escapes.
   useEffect(() => {
-    const el = escapeGuardRef.current;
-    if (!el) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && e.defaultPrevented) e.stopPropagation();
     };
-    el.addEventListener('keydown', onKeyDown);
-    return () => el.removeEventListener('keydown', onKeyDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
   }, []);
 
   return (
-    <div ref={escapeGuardRef}>
+    <div>
       <Dropdown
         open={open}
         onOpenChange={handleOpenChange}
