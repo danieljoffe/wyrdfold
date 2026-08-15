@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { ReactElement } from 'react';
 import { render } from '@testing-library/react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import {
   LocalDate,
   LocalDateTime,
@@ -10,31 +10,93 @@ import {
 } from '../LocalFormat';
 
 /**
- * Regression cover for the 2026-08-08 prod defect: `/targets` threw React #418
- * ("text content does not match server-rendered HTML") on every load because
- * `TargetCard` rendered `new Date(updated_at).toLocaleDateString()`, which
- * resolves against the *host's* locale and timezone — UTC on the server, the
- * user's own settings in the browser. Measured on the live row:
- * server `"8/8/2026"` vs a US-West browser `"8/7/2026"`.
+ * Regression cover for two prod defects in the same components.
  *
- * NOTE ON HOW THIS IS ASSERTED: React consumes `suppressHydrationWarning`
- * internally and does NOT emit it as a DOM attribute, so it is invisible to
- * `container.querySelector(...).getAttribute(...)` — a DOM-level assertion here
- * would pass whether or not the prop was set, and certify nothing. These
- * components are pure and hook-free, so calling them directly and inspecting
- * the returned element's props is the assertion that can actually fail.
+ * 2026-08-08 — `/targets` threw React #418 ("text content does not match
+ * server-rendered HTML") on every load because `TargetCard` rendered
+ * `new Date(updated_at).toLocaleDateString()`, which resolves against the
+ * *host's* locale and timezone — UTC on the server, the user's own settings in
+ * the browser. Measured on the live row: server `"8/8/2026"` vs a US-West
+ * browser `"8/7/2026"`.
+ *
+ * 2026-08-14 — the `suppressHydrationWarning` fix for the above stopped React
+ * *correcting* the mismatch as well as warning about it, so every date froze at
+ * the server's UTC rendering. Measured live at 23:37 local (06:37Z the next
+ * day), a card read **"8/15/2026"** — tomorrow.
+ *
+ * HOW THE SECOND ONE IS ASSERTED: `suppressHydrationWarning` is consumed by
+ * React and never reaches the DOM, so it cannot be observed from either
+ * `container` or the server markup — an assertion on it would certify nothing.
+ * What matters is observable: WHICH locale and timezone each render pass asks
+ * for. Spying on the `toLocale*` call and reading its arguments distinguishes
+ * the pre-hydration pass (pinned, deterministic) from the post-mount one (the
+ * viewer's own), and fails if either disappears.
+ *
+ * These assertions are deliberately timezone-agnostic — `process.env.TZ`
+ * pinning in jest is honoured on macOS and ignored on Linux CI, so a test that
+ * depends on the ambient zone passes locally and rots in CI.
  */
 
-describe('LocalFormat components', () => {
-  it.each([
-    ['LocalDate', () => LocalDate({ value: '2026-08-08T06:50:44Z' })],
-    ['LocalDateTime', () => LocalDateTime({ value: '2026-08-08T06:50:44Z' })],
-    ['LocalNumber', () => LocalNumber({ value: 1234567 })],
-  ])('%s marks its output hydration-exempt', (_name, make) => {
-    const el = make() as ReactElement<{ suppressHydrationWarning?: boolean }>;
-    expect(el.props.suppressHydrationWarning).toBe(true);
+const VALUE = '2026-08-08T06:50:44Z';
+
+describe('locale-dependent text survives hydration', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
+  it('LocalDate pins locale and timezone on the server render', () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleDateString');
+    renderToStaticMarkup(<LocalDate value={VALUE} />);
+    expect(spy).toHaveBeenCalledWith(
+      'en-US',
+      expect.objectContaining({ timeZone: 'UTC' })
+    );
+  });
+
+  it('LocalDate server markup is the deterministic UTC rendering', () => {
+    // The exact string the browser used to be stuck with. No ambient-timezone
+    // dependency: locale and zone are both pinned for this pass.
+    expect(
+      renderToStaticMarkup(<LocalDate value='2026-08-15T06:37:10Z' />)
+    ).toContain('8/15/2026');
+  });
+
+  it("LocalDate re-formats in the viewer's own locale after mount", () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleDateString');
+    render(<LocalDate value={VALUE} />);
+    // First pass pinned so hydration matches...
+    expect(spy.mock.calls[0]).toEqual(['en-US', { timeZone: 'UTC' }]);
+    // ...then a real re-render that hands formatting back to the browser.
+    expect(spy.mock.calls.length).toBeGreaterThan(1);
+    expect(spy.mock.calls.at(-1)).toEqual([undefined, undefined]);
+  });
+
+  it("LocalDateTime re-formats in the viewer's own locale after mount", () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleString');
+    render(<LocalDateTime value={VALUE} />);
+    expect(spy.mock.calls[0]).toEqual(['en-US', { timeZone: 'UTC' }]);
+    expect(spy.mock.calls.at(-1)).toEqual([undefined, undefined]);
+  });
+
+  it("LocalNumber re-formats in the viewer's own locale after mount", () => {
+    const spy = jest.spyOn(Number.prototype, 'toLocaleString');
+    render(<LocalNumber value={1234567} />);
+    expect(spy.mock.calls[0]).toEqual(['en-US', undefined]);
+    expect(spy.mock.calls.at(-1)).toEqual([undefined, undefined]);
+  });
+
+  it('a caller-pinned timezone is respected, not overridden, before mount', () => {
+    const spy = jest.spyOn(Date.prototype, 'toLocaleDateString');
+    renderToStaticMarkup(
+      <LocalDate value={VALUE} options={{ timeZone: 'America/New_York' }} />
+    );
+    expect(spy).toHaveBeenCalledWith('en-US', {
+      timeZone: 'America/New_York',
+    });
+  });
+});
+
+describe('LocalFormat components', () => {
   it('renders the date text', () => {
     const { container } = render(<LocalDate value='2026-08-08T06:50:44Z' />);
     expect(container.textContent).toMatch(/2026/);
