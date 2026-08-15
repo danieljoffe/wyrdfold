@@ -99,6 +99,53 @@ def test_merge_category_weights_averaged():
     assert result.categories["core_skills"].weight == 1.5
 
 
+# --- case-insensitive keyword dedup -----------------------------------------
+#
+# Observed on prod 2026-08-14: adding one reference JD to "Senior Full Stack
+# Engineer" left `Microservices: 3` and `microservices: 2` side by side in
+# core_skills, so the concept scored at 1.67x its intended weight. Seniority,
+# domain and negative already deduped on `.lower()`; categories did not.
+
+
+def test_merge_collapses_case_variant_keywords_across_profiles():
+    a = _profile(core={"Microservices": 3})
+    b = _profile(core={"microservices": 1})
+    kw = merge_profiles([a, b]).categories["core_skills"].keywords
+    # One entry, not two — and averaged as a genuine overlap: avg(3,1) = 2.
+    assert kw == {"Microservices": 2}
+
+
+def test_merge_keeps_the_first_seen_spelling():
+    """Dedup must not lowercase everyone's keywords — the display casing of
+    the earliest-contributed profile wins."""
+    a = _profile(core={"PostgreSQL": 3})
+    b = _profile(core={"postgresql": 3})
+    assert list(merge_profiles([a, b]).categories["core_skills"].keywords) == ["PostgreSQL"]
+
+
+def test_merge_single_profile_collapses_case_variants():
+    """The single-profile path is the common one (a target with one reference
+    JD reaches it), so it must dedup too rather than pass through verbatim."""
+    p = _profile(core={"GraphQL": 3, "graphql": 1})
+    kw = merge_profiles([p]).categories["core_skills"].keywords
+    assert kw == {"GraphQL": 2}
+
+
+def test_merge_single_profile_dedup_does_not_mutate_the_input():
+    p = _profile(core={"Kafka": 3, "kafka": 1})
+    merge_profiles([p])
+    assert p.categories["core_skills"].keywords == {"Kafka": 3, "kafka": 1}
+
+
+def test_merge_case_variants_do_not_cross_categories():
+    """Dedup is scoped per category — the same word in two categories is a
+    separate (prompt-quality) concern, not something the merge collapses."""
+    p = _profile(core={"Docker": 3}, secondary={"docker": 2})
+    result = merge_profiles([p])
+    assert result.categories["core_skills"].keywords == {"Docker": 3}
+    assert result.categories["secondary_skills"].keywords == {"docker": 2}
+
+
 def test_merge_disjoint_categories():
     a = _profile(core={"React": 3})
     b = _profile(secondary={"Node.js": 2})
@@ -245,3 +292,18 @@ def test_merge_reference_jds_all_suppressed_yields_empty():
     a = _ref_jd("user-1", _profile(core={"React": 3}))
     a.suppressed = True
     assert merge_reference_jds([a]) == ScoringProfile()
+
+
+def test_merge_reference_jds_collapses_case_variants_across_contributors():
+    """End-to-end reproduction of the 2026-08-14 prod defect.
+
+    A seeded JD with no contributor plus one user-contributed JD that spells
+    the same skill in lower case. Before the fix this returned BOTH spellings
+    in core_skills.
+    """
+    seeded = _ref_jd(None, _profile(core={"Microservices": 3}))
+    contributed = _ref_jd("user-1", _profile(core={"microservices": 1, "Rust": 3}))
+
+    kw = merge_reference_jds([seeded, contributed]).categories["core_skills"].keywords
+    assert sorted(kw) == ["Microservices", "Rust"]
+    assert kw["Microservices"] == 2  # avg(3, 1)

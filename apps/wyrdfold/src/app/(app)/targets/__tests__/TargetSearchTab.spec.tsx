@@ -63,6 +63,9 @@ const searchBox = () =>
   screen.getByRole('textbox', { name: /search existing targets/i });
 
 const noop = () => Promise.resolve(true);
+/** `onCreateManually` is exercised in CreateTargetModal.spec.tsx, where the
+ *  handoff to the Manual tab is observable. */
+const noop2 = jest.fn();
 
 afterEach(() => {
   global.fetch = ORIGINAL_FETCH;
@@ -73,7 +76,13 @@ describe('TargetSearchTab', () => {
   it('prompts for a longer query and does not search on a single character', async () => {
     mockRoutes({ search: [] });
     const user = userEvent.setup();
-    render(<TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />);
+    render(
+      <TargetSearchTab
+        onFollow={jest.fn()}
+        onCreateSuggestion={noop}
+        onCreateManually={noop2}
+      />
+    );
 
     expect(screen.getByText(/type at least 2 characters/i)).toBeInTheDocument();
 
@@ -103,6 +112,7 @@ describe('TargetSearchTab', () => {
       <TargetSearchTab
         onFollow={jest.fn().mockResolvedValue(true)}
         onCreateSuggestion={noop}
+        onCreateManually={noop2}
       />
     );
 
@@ -134,7 +144,13 @@ describe('TargetSearchTab', () => {
     });
     const onFollow = jest.fn().mockResolvedValue(true);
     const user = userEvent.setup();
-    render(<TargetSearchTab onFollow={onFollow} onCreateSuggestion={noop} />);
+    render(
+      <TargetSearchTab
+        onFollow={onFollow}
+        onCreateSuggestion={noop}
+        onCreateManually={noop2}
+      />
+    );
 
     await user.type(searchBox(), 'frontend');
     await user.click(await screen.findByRole('button', { name: /^follow$/i }));
@@ -166,7 +182,13 @@ describe('TargetSearchTab', () => {
     });
     const onFollow = jest.fn().mockResolvedValue(false); // e.g. active-target limit
     const user = userEvent.setup();
-    render(<TargetSearchTab onFollow={onFollow} onCreateSuggestion={noop} />);
+    render(
+      <TargetSearchTab
+        onFollow={onFollow}
+        onCreateSuggestion={noop}
+        onCreateManually={noop2}
+      />
+    );
 
     await user.type(searchBox(), 'frontend');
     await user.click(await screen.findByRole('button', { name: /^follow$/i }));
@@ -181,7 +203,13 @@ describe('TargetSearchTab', () => {
   it('shows an empty-state when nothing matches', async () => {
     mockRoutes({ search: [] });
     const user = userEvent.setup();
-    render(<TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />);
+    render(
+      <TargetSearchTab
+        onFollow={jest.fn()}
+        onCreateSuggestion={noop}
+        onCreateManually={noop2}
+      />
+    );
 
     await user.type(searchBox(), 'zznomatch');
 
@@ -203,7 +231,11 @@ describe('TargetSearchTab', () => {
       });
       const user = userEvent.setup();
       render(
-        <TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />
+        <TargetSearchTab
+          onFollow={jest.fn()}
+          onCreateSuggestion={noop}
+          onCreateManually={noop2}
+        />
       );
 
       await user.type(searchBox(), 'senior frontend engineer');
@@ -240,6 +272,7 @@ describe('TargetSearchTab', () => {
         <TargetSearchTab
           onFollow={jest.fn()}
           onCreateSuggestion={onCreateSuggestion}
+          onCreateManually={noop2}
         />
       );
 
@@ -280,6 +313,7 @@ describe('TargetSearchTab', () => {
         <TargetSearchTab
           onFollow={jest.fn()}
           onCreateSuggestion={onCreateSuggestion}
+          onCreateManually={noop2}
         />
       );
 
@@ -302,7 +336,11 @@ describe('TargetSearchTab', () => {
       mockRoutes({ search: [], suggest: { matches: [] } });
       const user = userEvent.setup();
       render(
-        <TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />
+        <TargetSearchTab
+          onFollow={jest.fn()}
+          onCreateSuggestion={noop}
+          onCreateManually={noop2}
+        />
       );
 
       await user.type(searchBox(), 'zznorole');
@@ -319,7 +357,11 @@ describe('TargetSearchTab', () => {
       mockRoutes({ search: [], suggestFails: true });
       const user = userEvent.setup();
       render(
-        <TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />
+        <TargetSearchTab
+          onFollow={jest.fn()}
+          onCreateSuggestion={noop}
+          onCreateManually={noop2}
+        />
       );
 
       await user.type(searchBox(), 'senior frontend engineer');
@@ -346,7 +388,11 @@ describe('TargetSearchTab', () => {
       });
       const user = userEvent.setup();
       render(
-        <TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />
+        <TargetSearchTab
+          onFollow={jest.fn()}
+          onCreateSuggestion={noop}
+          onCreateManually={noop2}
+        />
       );
 
       await user.type(searchBox(), 'frontend');
@@ -370,7 +416,11 @@ describe('TargetSearchTab', () => {
       });
       const user = userEvent.setup();
       render(
-        <TargetSearchTab onFollow={jest.fn()} onCreateSuggestion={noop} />
+        <TargetSearchTab
+          onFollow={jest.fn()}
+          onCreateSuggestion={noop}
+          onCreateManually={noop2}
+        />
       );
 
       await user.type(searchBox(), 'senior frontend engineer');
