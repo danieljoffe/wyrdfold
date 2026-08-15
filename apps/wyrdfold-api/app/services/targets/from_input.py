@@ -95,6 +95,9 @@ from app.services.targets.normalize_manual import (
 from app.services.targets.normalize_manual import (
     normalize_manual_input,
 )
+from app.services.targets.normalize_posting_title import (
+    normalize_posting_title,
+)
 from app.services.targets.profile_writes import apply_profile_merge_rpc_async
 
 logger = logging.getLogger(__name__)
@@ -250,9 +253,7 @@ async def _list_reference_jds(supabase: AsyncClient, target_id: str) -> list[Tar
     return [crud._parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-async def _count_user_reference_jds(
-    supabase: AsyncClient, *, target_id: str, user_id: str
-) -> int:
+async def _count_user_reference_jds(supabase: AsyncClient, *, target_id: str, user_id: str) -> int:
     """Async inline of ``crud.count_user_reference_jds`` (the #47 per-user cap)."""
     resp = (
         await supabase.table(crud.REF_JDS_TABLE)
@@ -275,15 +276,19 @@ async def _upsert_user_job_async(
     the not-yet-converted callers, so the deferred URL derive inlines the same
     upsert rather than fork a twin (#57 PR-G2e-4 — mirrors
     ``jobs._upsert_user_job_async``)."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 async def _apply_fit_score(
@@ -444,9 +449,7 @@ async def _contribute_reference_jd(
     # #47 per-user cap — bounds a single follower's footprint on the shared
     # profile. Over cap: skip the contribution entirely (do NOT touch the shared
     # profile).
-    contributed = await _count_user_reference_jds(
-        supabase, target_id=target_id, user_id=user_id
-    )
+    contributed = await _count_user_reference_jds(supabase, target_id=target_id, user_id=user_id)
     if contributed >= settings.reference_jd_max_per_user_per_target:
         logger.info(
             "URL corpus contribution skipped: user %s at reference-JD cap (%d) for target %s",
@@ -674,9 +677,7 @@ async def _create_or_link_from_suggestion(
         link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
         if payload is not None:
             spawn_detached(
-                _apply_fit_score(
-                    supabase, llm, user_id=user_id, target=matched, payload=payload
-                ),
+                _apply_fit_score(supabase, llm, user_id=user_id, target=matched, payload=payload),
                 name=f"fit-score-{matched.id}",
             )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
@@ -829,6 +830,38 @@ def _schedule_url_bg_tasks(
     )
 
 
+def _raw_url_label(extracted_title: str | None) -> str:
+    """The pre-canonicalization label: strip, fall back, truncate."""
+    return ((extracted_title or "").strip() or "Untitled Target")[:200]
+
+
+async def _canonical_url_label(llm: LLMClient, extracted_title: str | None, jd_text: str) -> str:
+    """Canonical role label for a posting, falling back to the raw title.
+
+    Deliberately non-fatal. This step improves the NAME; it is not what makes
+    the target work. A normalizer outage (provider 5xx, malformed JSON, schema
+    violation, budget breaker) must not turn a working create-from-URL into a
+    502 — the user would lose the whole flow to cosmetics. On any failure we
+    keep today's behavior exactly: the raw posting title.
+    """
+    raw = _raw_url_label(extracted_title)
+    try:
+        normalized, _ = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
+    except Exception:
+        logger.warning(
+            "normalize_posting_title failed; falling back to the raw posting title",
+            exc_info=True,
+            extra={"raw_label": raw},
+        )
+        return raw
+
+    canonical = normalized.label.strip()
+    # An empty/whitespace label would produce a blank card and a useless dedup
+    # key; the schema's min_length should prevent it, but the fallback is one
+    # line and the failure mode is user-visible.
+    return canonical[:200] if canonical else raw
+
+
 async def from_url(
     supabase: AsyncClient,
     llm: LLMClient,
@@ -846,11 +879,18 @@ async def from_url(
 
     The label is ALWAYS derived from the posting's own title — there is no
     user-supplied title override (an inaccurate one poisons matching + the
-    shared catalog). Matching keys off that derived title, so duplicate
-    detection runs inline without any LLM call. The profile derivation + merge
-    + fit score + job materialization are all deferred to a detached task.
+    shared catalog). The profile derivation + merge + fit score + job
+    materialization are all deferred to a detached task.
+
+    The raw posting title is CANONICALIZED first (one inline LLM call). A
+    posting title sells one requisition at one company, so verbatim it yields
+    targets like "Senior Product Builder (Product Manager), Enterprise
+    Readiness & Admin Platform" — not a role profile, and unable to dedup,
+    because ``crud.normalize_label`` keeps punctuation and comma-suffixes in
+    the UNIQUE key. Canonicalizing has to precede ``find_matching_target``:
+    the canonical form is what matches and what becomes the dedup key.
     """
-    label = ((extracted_title or "").strip() or "Untitled Target")[:200]
+    label = await _canonical_url_label(llm, extracted_title, jd_text)
 
     matched = await find_matching_target(supabase, label)
     if matched is not None:
