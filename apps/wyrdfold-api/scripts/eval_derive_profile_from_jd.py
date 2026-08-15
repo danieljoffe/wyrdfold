@@ -37,6 +37,10 @@ Per JD, against the LIVE ``SYSTEM_PROMPT`` imported from the service module
 - ``bare_signals``      — seniority signals carrying no seniority evidence.
 - ``case_dupes``        — case-variant duplicates within one category.
 - ``schema_ok``         — the payload round-trips through ``DerivedTarget``.
+  READ WITH CARE: this harness uses OpenRouter's JSON mode, whereas production
+  uses ``complete_json``'s FORCED TOOL USE, where the API validates against
+  the schema before the call returns. A failure here means the PROMPT ALONE
+  did not pin the shape — informative, but not something prod would emit.
 - ``skills`` / ``domain`` / ``signals`` counts — so a "fix" that simply
   empties a section is visible as a regression rather than a win.
 
@@ -47,6 +51,17 @@ at all would score perfectly on the defect metrics and be strictly worse.
 Fixtures are SYNTHETIC and committed. The prod snapshot
 (``tests/fixtures/eval_set.json``) is real JD text — PII, gitignored, and
 therefore unusable as a shared baseline anyone can re-run.
+
+TEMPERATURE — runs at 0.0, matching production. ``complete_json`` defaults
+``temperature`` to 0.0 and forwards it, so every real extraction is at 0. The
+first version of this script left it unset, sampling at the provider default
+(~1.0) and measuring a distribution the app never produces: two runs of the
+SAME prompt gave 2 leaks then 0, and that noise was mistaken for a property of
+the extractor. At 0 the output is near-deterministic, so ``--repeats`` now
+confirms stability rather than sampling a spread — kept because 0 is not a
+hard guarantee of identical output, and because a defect that reproduces on
+every trial (as the v4 shape regression does) is worth distinguishing from one
+that appears once.
 
 Cost: ~8 JDs x 1 call ~= $0.10 per run at Sonnet 4.6 rates.
 
@@ -328,6 +343,10 @@ async def _run_one(case: dict[str, Any], api_key: str, trial: int = 0) -> dict[s
         user=user,
         api_key=api_key,
         max_tokens=2048,
+        # Mirror production: `complete_json` defaults temperature to 0.0 and
+        # forwards it, so every real extraction runs at 0. Leaving it unset
+        # here measured a distribution the app never actually produces.
+        temperature=0.0,
     )
     if res.error or res.parsed is None:
         return {

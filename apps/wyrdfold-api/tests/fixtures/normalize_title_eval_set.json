@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "Synthetic postings for scripts/eval_normalize_posting_title.py. AUTHORED, not",
+    "scraped — the prod snapshot is PII and gitignored, so it can never be a shared",
+    "baseline anyone can re-run.",
+    "",
+    "Cases are grouped. Every posting in a group is the SAME ROLE dressed in",
+    "different company/team/product noise, so they must all normalize to ONE label.",
+    "That convergence IS the feature: the label becomes `normalized_label`, the",
+    "dedup key behind the targets UNIQUE constraint, so a group that fails to",
+    "converge mints one catalog row per posting — the exact defect #745 shipped to",
+    "fix.",
+    "",
+    "`expect_no_seniority` marks the #749 regression guard: the title carries NO",
+    "seniority word while the body shouts about years and staff-level scope. The",
+    "prompt's central rule is that the TITLE is the only source of seniority, so",
+    "any level word in these outputs is a real defect, not a style quibble."
+  ],
+  "groups": [
+    {
+      "id": "senior-product-manager",
+      "note": "The original prod offender: a jargon title plus a trailing platform name.",
+      "expect_no_seniority": false,
+      "noise_tokens": [
+        "Enterprise Readiness",
+        "Admin Platform",
+        "Wayfarer",
+        "Helios",
+        "R2938"
+      ],
+      "postings": [
+        {
+          "title": "Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform",
+          "jd_text": "You will own the Enterprise Readiness roadmap at Wayfarer, partnering with design and engineering to ship admin tooling for our largest customers. You will define requirements, run discovery, and prioritise a backlog across two squads."
+        },
+        {
+          "title": "Senior Product Manager, Helios Growth Team - R2938",
+          "jd_text": "Own the growth surface end to end. Partner with data science on experimentation, write specs, and drive the roadmap for activation and retention."
+        },
+        {
+          "title": "Sr. Product Manager (Remote, US) — Platform",
+          "jd_text": "Define and deliver the platform product roadmap. Work with engineering leads on API strategy and developer experience."
+        }
+      ]
+    },
+    {
+      "id": "software-engineer-no-seniority",
+      "note": "#749 GUARD. No seniority in any title; every body screams senior/staff.",
+      "expect_no_seniority": true,
+      "noise_tokens": ["Northwind", "Payments Core", "REQ-11824", "Berlin"],
+      "postings": [
+        {
+          "title": "Software Engineer",
+          "jd_text": "Requirements: 10+ years of professional software engineering. This is a staff-level role with company-wide scope; you will set technical direction across three teams and mentor senior engineers. Compensation band reflects a principal-level hire."
+        },
+        {
+          "title": "Software Engineer, Payments Core - REQ-11824",
+          "jd_text": "We are hiring at Northwind for our Payments Core group. You will need 12+ years of experience and will operate at a staff level, reporting to the Director of Engineering."
+        },
+        {
+          "title": "Software Engineer (Berlin, Hybrid)",
+          "jd_text": "8+ years required. Seniority: this role sits at the senior/staff boundary and carries architectural authority over the whole platform."
+        }
+      ]
+    },
+    {
+      "id": "staff-frontend-engineer",
+      "note": "Genuine seniority in the title, buried in req IDs, locations and employment type.",
+      "expect_no_seniority": false,
+      "noise_tokens": [
+        "Contract",
+        "Remote",
+        "Toronto",
+        "JR-4417",
+        "Lumen",
+        "Atlas"
+      ],
+      "postings": [
+        {
+          "title": "Staff Frontend Engineer (Remote, Toronto) - Contract",
+          "jd_text": "Build and own the component library. Deep React and TypeScript, strong CSS, and measurable Core Web Vitals work."
+        },
+        {
+          "title": "Staff Frontend Engineer — Lumen Design Systems, JR-4417",
+          "jd_text": "Lead the Atlas design-system rebuild. Partner with product design on tokens, accessibility and performance."
+        }
+      ]
+    },
+    {
+      "id": "marketing-noise",
+      "note": "Adjectives, emoji and punctuation the prompt is told to strip.",
+      "expect_no_seniority": true,
+      "noise_tokens": ["Rockstar", "Ninja", "Superstar", "🚀", "!!!"],
+      "postings": [
+        {
+          "title": "Rockstar Backend Developer 🚀!!!",
+          "jd_text": "Join a fast-moving team building APIs in Go and Postgres. You will ship features end to end."
+        },
+        {
+          "title": "Backend Developer — Ninja Superstar Wanted!",
+          "jd_text": "We need someone to build and operate backend services in Go, backed by Postgres, on Kubernetes."
+        }
+      ]
+    },
+    {
+      "id": "jargon-needs-jd",
+      "note": "CONTROL for the other direction: the body legitimately disambiguates FUNCTION (not level). A prompt that ignored the body entirely would fail this.",
+      "expect_no_seniority": true,
+      "noise_tokens": ["Foundry", "Beacon"],
+      "postings": [
+        {
+          "title": "Data Wrangler, Beacon Foundry",
+          "jd_text": "You will build and maintain ELT pipelines in dbt and Airflow, model warehouse tables in Snowflake, and own data quality checks. This is a data engineering role, not analysis."
+        }
+      ]
+    }
+  ]
+}

@@ -124,6 +124,7 @@ regression audit). If your change touches anything in:
 - `apps/wyrdfold-api/app/services/fit/`
 - `apps/wyrdfold-api/app/services/analysis/`
 - `apps/wyrdfold-api/app/services/targets/derive_profile*.py`
+- `apps/wyrdfold-api/app/services/targets/normalize_*.py`
 - `apps/wyrdfold-api/app/services/tailor/prompts*.py`
 
 …the **prompt-regression guard** (`apps/wyrdfold-api/tests/test_prompt_regression.py`)
@@ -134,7 +135,14 @@ version bump can't merge silently. When it fails:
 
 1. **Re-run the relevant eval** in `apps/wyrdfold-api/scripts/` (pick the one
    closest to the prompt you touched — they need an `OPENROUTER_API_KEY` and
-   cost real spend) and attach a before/after summary to the PR.
+   cost real spend) and attach a before/after summary to the PR. The mapping
+   is not always obvious, so: `derive_profile.py` (JD → profile) is
+   `eval_derive_profile_from_jd.py`; `derive_profile_from_label.py` (label →
+   profile) is `eval_derive_target.py` — a different prompt on a different
+   input; `normalize_posting_title.py` is
+   `eval_normalize_posting_title.py`. **If no eval covers the prompt you are
+   editing, that gap is the first thing to fix** — two prompt defects reached
+   prod through call sites that had none.
 2. **Regenerate the golden** so the change lands as an explicit, reviewable diff:
    ```bash
    cd apps/wyrdfold-api && UPDATE_PROMPT_GOLDENS=1 uv run pytest tests/test_prompt_regression.py

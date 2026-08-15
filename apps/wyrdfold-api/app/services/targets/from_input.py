@@ -300,7 +300,7 @@ async def _apply_fit_score(
     *,
     user_id: str,
     target: JobTarget,
-    payload: OptimizedPayload,
+    payload: OptimizedPayload | None,
 ) -> None:
     """Derive a per-user fit score and upsert it onto the user's link.
 
@@ -322,6 +322,21 @@ async def _apply_fit_score(
         supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     payload = fresh if fresh is not None else payload
+    if payload is None:
+        # No experience to score against, from either source. Callers used to
+        # guard this with `if payload is not None` on the INLINE capture and
+        # skip silently — but the inline value is only a fallback here, so that
+        # guard also skipped users who had a resolvable profile, and left no
+        # trace when it did. A link with a null fit_score is now healed on the
+        # next /targets/mine view (fit_refresh.stale_target_ids), so deferring
+        # is fine; being undiagnosable was not.
+        logger.warning(
+            "No payload to fit-score target %s for user %s — leaving the link "
+            "unscored for the lazy refresh to pick up",
+            target.id,
+            user_id,
+        )
+        return
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
     await cost_log.record_async(
         supabase,
@@ -396,10 +411,7 @@ async def derive_manual_target_bg(
             if updated is None:
                 logger.error("Failed to update target %s after deferred derive", target_id)
                 return
-            if payload is not None:
-                await _apply_fit_score(
-                    supabase, llm, user_id=user_id, target=updated, payload=payload
-                )
+            await _apply_fit_score(supabase, llm, user_id=user_id, target=updated, payload=payload)
     except TimeoutError:
         logger.error(
             "Deferred manual-target derivation timed out after %ss for target %s",
@@ -678,11 +690,10 @@ async def _create_or_link_from_suggestion(
     matched = await find_matching_target(supabase, suggestion.label)
     if matched is not None:
         link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
-        if payload is not None:
-            spawn_detached(
-                _apply_fit_score(supabase, llm, user_id=user_id, target=matched, payload=payload),
-                name=f"fit-score-{matched.id}",
-            )
+        spawn_detached(
+            _apply_fit_score(supabase, llm, user_id=user_id, target=matched, payload=payload),
+            name=f"fit-score-{matched.id}",
+        )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
     # New target: create immediately in "deriving" so it appears in the
