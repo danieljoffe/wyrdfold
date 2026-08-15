@@ -41,6 +41,52 @@ interface PendingTarget {
   label: string;
 }
 
+/**
+ * Durable "we ran it and found nothing" panel for the two suggest actions.
+ *
+ * Both calls are LLM-backed and routinely take 20-50s, while the toast that
+ * reports a zero-result run auto-dismisses after 4s — so the user who looks
+ * away for the duration (i.e. most of them) comes back to a page identical to
+ * the one they left and cannot tell whether anything ran. The toast stays for
+ * whoever is watching; this is the trace for whoever is not.
+ *
+ * Mirrors LearningLogPanel's two-layer treatment of the same situation.
+ */
+function SuggestEmptyPanel({
+  title,
+  children,
+  onRetry,
+  retrying,
+  retryName,
+}: {
+  title: string;
+  children: React.ReactNode;
+  onRetry: () => void;
+  retrying: boolean;
+  retryName: string;
+}) {
+  return (
+    <Card padding='none'>
+      <CardContent className='flex flex-col items-start gap-2 p-4'>
+        <Heading variant='cardTitle'>{title}</Heading>
+        <Text variant='body' as='p' className='text-text-secondary'>
+          {children}
+        </Text>
+        <Button
+          name={retryName}
+          variant='outline'
+          size='sm'
+          onClick={onRetry}
+          disabled={retrying}
+          className='mt-1'
+        >
+          {retrying ? 'Checking again…' : 'Check again'}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 interface TargetsListProps {
   initialTargets: UserTargetWithSummary[];
 }
@@ -452,11 +498,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
+  const [suggestEmpty, setSuggestEmpty] = useState(false);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
   const handleSuggest = useCallback(async () => {
     setSuggesting(true);
     setSuggestions([]);
+    setSuggestEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest', { method: 'POST' });
       if (!res.ok)
@@ -464,6 +512,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as MatchedSuggestions;
       setSuggestions(data.matches);
       if (data.matches.length === 0) {
+        setSuggestEmpty(true);
         toast({
           variant: 'info',
           title: 'No new suggestions',
@@ -514,11 +563,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     LateralSuggestion[]
   >([]);
   const [suggestingLateral, setSuggestingLateral] = useState(false);
+  const [lateralEmpty, setLateralEmpty] = useState(false);
   const [addingLateral, setAddingLateral] = useState<string | null>(null);
 
   const handleSuggestLateral = useCallback(async () => {
     setSuggestingLateral(true);
     setLateralSuggestions([]);
+    setLateralEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest-lateral', {
         method: 'POST',
@@ -528,6 +579,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as LateralSuggestions;
       setLateralSuggestions(data.suggestions);
       if (data.suggestions.length === 0) {
+        setLateralEmpty(true);
         toast({
           variant: 'info',
           title: 'No lateral roles found',
@@ -603,9 +655,19 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 size='sm'
                 onClick={handleSuggest}
                 disabled={suggesting}
+                aria-busy={suggesting}
               >
-                <Sparkles className='size-4' aria-hidden />
-                <span>Suggest from experience</span>
+                {suggesting ? (
+                  <>
+                    <Spinner size='sm' aria-label='Suggesting' />
+                    <span>Suggesting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className='size-4' aria-hidden />
+                    <span>Suggest from experience</span>
+                  </>
+                )}
               </Button>
             </div>
           </CardContent>
@@ -649,6 +711,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggest}
               disabled={suggesting}
+              aria-busy={suggesting}
             >
               {suggesting ? (
                 <>
@@ -668,6 +731,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggestLateral}
               disabled={suggestingLateral}
+              aria-busy={suggestingLateral}
             >
               {suggestingLateral ? (
                 <>
@@ -683,6 +747,19 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
             </Button>
           </div>
         </>
+      )}
+
+      {suggestEmpty && suggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No new suggestions'
+          onRetry={handleSuggest}
+          retrying={suggesting}
+          retryName='target-suggest-retry'
+        >
+          Your existing targets already cover the roles that fit your
+          experience. Update your profile with new skills or experience, then
+          check again.
+        </SuggestEmptyPanel>
       )}
 
       {suggestions.length > 0 && (
@@ -731,6 +808,18 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
             ))}
           </div>
         </div>
+      )}
+
+      {lateralEmpty && lateralSuggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No lateral roles found'
+          onRetry={handleSuggestLateral}
+          retrying={suggestingLateral}
+          retryName='target-suggest-lateral-retry'
+        >
+          We could not find adjacent roles to branch into from your current
+          targets. Add a target or two first, then check again.
+        </SuggestEmptyPanel>
       )}
 
       {lateralSuggestions.length > 0 && (
