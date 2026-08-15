@@ -29,6 +29,14 @@ This is deliberately a *separate, narrower* prompt from
 ``normalize_manual.SYSTEM_PROMPT``. That one's job is to stay as close to the
 user's typed words as possible (they typed what they meant). This one's job is
 the opposite — to strip everything the employer added around the role.
+
+**Seniority comes from the title alone**, and the prompt says so at length
+because the first version did not and the model got it wrong. Given a title of
+plain "Software Engineer" with a body asking for "8+ years ... at a senior
+level", it returned "Senior Software Engineer" — reasonable-sounding, and
+wrong for this use: the label IS the dedup key, so inferring level from prose
+makes the key depend on how a JD happens to read. Two postings with identical
+titles would fork into two catalog rows. The whole point is that they converge.
 """
 
 from pydantic import BaseModel, Field
@@ -72,6 +80,15 @@ Return JSON matching this exact schema:
 The label names a ROLE, not a requisition. Multiple postings at different \
 companies must normalize to the SAME label.
 
+THE TITLE IS THE ONLY SOURCE OF SENIORITY.
+Copy the seniority word from the title or use none at all. The description \
+excerpt exists ONLY to disambiguate what FUNCTION a jargon title refers to \
+(e.g. "Product Builder" -> Product Manager). It is NEVER evidence of level. \
+Ignore years of experience, scope, "senior level", compensation band, and \
+reporting lines entirely — a title of "Software Engineer" returns \
+"Software Engineer" even when the body asks for 10+ years and staff-level \
+scope.
+
 REMOVE:
 - Company, team, org, product, and platform names, and any trailing \
 qualifier after a comma or dash that names one \
@@ -86,7 +103,7 @@ codes).
 "!!!").
 
 KEEP:
-- The genuine seniority word if the posting has one: Junior, Mid, Senior, \
+- The genuine seniority word IF THE TITLE HAS ONE: Junior, Mid, Senior, \
 Staff, Principal, Lead, Director, VP, Head of, Chief.
 - The genuine function and, where it is a real discipline rather than a \
 team name, one specialization: "Frontend", "Backend", "Full-Stack", \
@@ -95,9 +112,8 @@ team name, one specialization: "Frontend", "Backend", "Full-Stack", \
 III").
 
 NEVER:
-- Invent a seniority the posting does not state. An untitled "Software \
-Engineer" stays "Software Engineer".
-- Invent a specialization the posting does not support.
+- Add a seniority word that does not appear in the title.
+- Invent a specialization the title does not support.
 - Return a company name, a person's name, or a sentence.
 - Exceed 80 characters. Prefer 2-5 words.
 
