@@ -187,6 +187,83 @@ describe('TargetsList — recourse after a failed create', () => {
     expect(screen.queryByTestId('create-modal')).not.toBeInTheDocument();
   });
 
+  it('clears a stale "no suggestions" panel once a target is created', async () => {
+    // Cross-PR interaction. `runCreate` already cleared the suggestion RESULT
+    // arrays, but the empty-panel flags were added by a different PR and were
+    // not in that reset. The panel's copy is a claim about the target list
+    // ("your existing targets already cover the roles that fit your
+    // experience"), so it goes stale the moment the list changes — leaving it
+    // up has the page argue with the card the user just created.
+    global.fetch = jest
+      .fn()
+      // 1. the suggest run: empty → panel appears
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ matches: [] }) })
+      // 2. the create: succeeds
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          was_matched: false,
+          user_target: {
+            id: 'ut-new',
+            user_id: 'u',
+            target_id: 't-new',
+            is_active: false,
+            fit_score: 55,
+            fit_score_reasoning: null,
+            axis_weights: null,
+            axis_weights_previous: null,
+            job_score_threshold: null,
+            sms_score_threshold: null,
+            created_at: '2026-01-01',
+            updated_at: '2026-01-01',
+          },
+          target: {
+            id: 't-new',
+            label: 'Staff SRE',
+            description: null,
+            normalized_label: 'staff sre',
+            scoring_profile: {
+              categories: {},
+              seniority: { level: null, signals: [] },
+              domain: { signals: [], weight: 0.5 },
+              negative: { keywords: [], weight: -10 },
+            },
+            search_keywords: [],
+            activation_status: 'ready',
+            profile_version: 1,
+            app_active: true,
+            created_at: '2026-01-01',
+            updated_at: '2026-01-01',
+          },
+        }),
+      }) as unknown as typeof fetch;
+
+    const user = userEvent.setup();
+    render(<TargetsList initialTargets={NO_TARGETS} />);
+
+    // Zero-result suggest → the durable panel.
+    await user.click(
+      document.querySelector(
+        'button[name="target-suggest-empty"]'
+      ) as HTMLButtonElement
+    );
+    expect(await screen.findByText(/no new suggestions/i)).toBeInTheDocument();
+
+    // Now create a target through the real runCreate path.
+    await openModal(user);
+    await user.click(screen.getByText('submit-manual'));
+
+    await waitFor(() => {
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'success' })
+      );
+    });
+    // The stale claim must be gone.
+    await waitFor(() => {
+      expect(screen.queryByText(/no new suggestions/i)).not.toBeInTheDocument();
+    });
+  });
+
   it('clears a stale draft when the modal is re-opened from the CTA', async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
