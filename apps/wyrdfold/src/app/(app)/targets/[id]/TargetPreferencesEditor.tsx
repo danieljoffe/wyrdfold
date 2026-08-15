@@ -67,7 +67,12 @@ export const DEFAULT_PREFERENCES: TargetPreferences = {
 };
 
 export const SCORE_MIN = 0;
-export const SCORE_MAX = 200;
+// Job scores are hard-clamped to 0-100 at the write site
+// (api services/scoring.py: `max(0, min(100, ...))`), so a cutoff above
+// 100 could only ever hide every job — and nothing told the user that.
+// The sibling NotificationThresholdsEditor and the /jobs minScore parse
+// both already used 100; this was the outlier.
+export const SCORE_MAX = 100;
 
 /** Comma/newline-separated text → trimmed string[] (empty → null). */
 export function parseList(raw: string): string[] | null {
@@ -292,7 +297,7 @@ export default function TargetPreferencesEditor({
             max={SCORE_MAX}
             aria-label='Minimum fit score'
             disabled={saving}
-            error={!cutoff.valid ? 'Enter a whole number 0–200' : undefined}
+            error={!cutoff.valid ? 'Enter a whole number 0–100' : undefined}
             helperText='Hide jobs scoring below this (default 40).'
           />
         </div>

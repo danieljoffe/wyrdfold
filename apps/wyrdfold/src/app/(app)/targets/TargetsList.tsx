@@ -261,6 +261,17 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   // modal; the actual DELETE runs once the user confirms below.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
+  // Resolved from the list rather than stashed alongside the id, so the prompt
+  // can never name a target the row no longer describes.
+  const pendingDeleteLabel = useMemo(
+    () =>
+      pendingDeleteId === null
+        ? null
+        : (targets.find(t => t.target.id === pendingDeleteId)?.target.label ??
+          null),
+    [pendingDeleteId, targets]
+  );
+
   const handleDelete = useCallback((id: string) => {
     setPendingDeleteId(id);
   }, []);
@@ -876,11 +887,22 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onCreateSuggestion={handleCreateSearchSuggestion}
       />
 
+      {/* The dialog names the target. It used to say only "Delete target?",
+          which is unverifiable on an account holding several near-identical
+          labels ("Senior Full Stack Engineer" / "Senior Full-Stack Engineer" /
+          "Staff Full-Stack Engineer" / "Senior Frontend Engineer" / "Senior
+          Frontend Engineer – Web Performance"). Opening the wrong card's kebab
+          was unrecoverable and undetectable, and the action is irreversible by
+          design — which is exactly why the name has to be in the prompt. */}
       <ConfirmModal
         isOpen={pendingDeleteId !== null}
         onClose={() => setPendingDeleteId(null)}
         onConfirm={confirmDelete}
-        title='Delete target?'
+        title={
+          pendingDeleteLabel
+            ? `Delete “${pendingDeleteLabel}”?`
+            : 'Delete target?'
+        }
         message='Saved jobs scored against this target lose their target context. This cannot be undone.'
         confirmLabel='Delete'
         destructive
