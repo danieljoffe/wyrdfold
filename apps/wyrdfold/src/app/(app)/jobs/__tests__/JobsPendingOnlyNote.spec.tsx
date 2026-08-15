@@ -28,7 +28,7 @@ function posting(overrides: Partial<JobPosting>): JobPosting {
   };
 }
 
-const NOTE = /still waiting for its full fit grade/i;
+const NOTE = /still waiting for its full match grade/i;
 
 describe('JobsPendingOnlyNote', () => {
   it('explains a pending-only result set under an explicit score filter', () => {

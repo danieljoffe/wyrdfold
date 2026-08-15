@@ -5,8 +5,32 @@ import CircleBadge, {
 } from '@/components/CircleBadge';
 import { fitScoreVariant } from '@/lib/fitScore';
 
+/**
+ * WHICH number this chip is showing. The app has two, on different scales,
+ * and they are visible within two clicks of each other:
+ *
+ *   'fit'   — how well a TARGET suits YOUR EXPERIENCE (`user_targets.fit_score`)
+ *   'match' — how well a JOB scores against a TARGET  (`scores.score`)
+ *
+ * They are not comparable, so they do not share a name. This chip used to
+ * hardcode "Match score" into its accessible name while accepting a
+ * caller-supplied tooltip, so on a target card a sighted user read "Fit score
+ * 82" and a screen-reader user heard "Match score 82" off the same element.
+ */
+export type ScoreKind = 'fit' | 'match';
+
+const SCORE_NOUN: Record<ScoreKind, string> = {
+  fit: 'Fit score',
+  match: 'Match score',
+};
+
 interface ScoreBadgeBaseProps {
   score: number;
+  /**
+   * Defaults to 'match': four of the five call sites are job chips, so the
+   * common case is right without opting in, and the one target chip says so.
+   */
+  kind?: ScoreKind;
   /** Override the default score→colour mapping (e.g. the dashboard's). */
   variant?: CircleBadgeVariant;
   size?: CircleBadgeSize;
@@ -44,6 +68,7 @@ type ScoreBadgeProps = ScoreBadgeBaseProps &
  */
 export default function ScoreBadge({
   score,
+  kind = 'match',
   variant,
   size = 'md',
   scoringStatus,
@@ -65,8 +90,14 @@ export default function ScoreBadge({
       <CircleBadge
         variant={isPending ? 'default' : (variant ?? fitScoreVariant(score))}
         size={size}
-        title={isPending ? 'Not yet scored — pending a full fit grade' : title}
-        ariaLabel={isPending ? 'Fit score pending' : `Match score ${score}`}
+        title={
+          isPending ? `Not yet scored — pending a full ${kind} grade` : title
+        }
+        ariaLabel={
+          isPending
+            ? `${SCORE_NOUN[kind]} pending`
+            : `${SCORE_NOUN[kind]} ${score}`
+        }
         className={className}
       >
         {isPending ? '·' : score}

@@ -28,7 +28,7 @@ export default function JobsPendingOnlyNote({
 
   return (
     <Text variant='caption' as='p' className='text-text-secondary' role='note'>
-      Every job matching this filter is still waiting for its full fit grade
+      Every job matching this filter is still waiting for its full match grade
       (the &middot; badge). The score filter applies only to graded jobs —
       ungraded ones stay visible so new matches aren&rsquo;t hidden while
       grading catches up.

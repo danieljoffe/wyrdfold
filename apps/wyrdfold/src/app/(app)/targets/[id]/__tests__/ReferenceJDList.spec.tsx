@@ -266,3 +266,109 @@ describe('ReferenceJDList', () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Affordance gaps found in the second /targets sweep (resweep B5/B6). The
+ * rows carried three unlabelled-looking icon buttons with no explanation of
+ * what a vote does, a delete dialog that never said WHICH JD, and text
+ * clamped to two lines with no way to read the rest — which for a JD pasted
+ * without a source URL meant it could not be read back at all.
+ */
+describe('ReferenceJDList — affordances', () => {
+  it('explains what voting does before asking the user to vote', () => {
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={() => undefined}
+      />
+    );
+    expect(
+      screen.getByText(/stops contributing to the shared model/i)
+    ).toBeInTheDocument();
+  });
+
+  it('names the JD in the delete dialog using its source URL', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[
+          {
+            ...SAMPLE_JD,
+            jd_url: 'https://boards.example.com/jobs/senior-platform-engineer',
+          },
+        ]}
+        onChanged={() => undefined}
+      />
+    );
+    await user.click(screen.getByLabelText('Delete reference JD'));
+    expect(screen.getByText(/senior platform engineer/i)).toBeInTheDocument();
+  });
+
+  it('names a URL-less pasted JD by its opening words', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[
+          {
+            ...SAMPLE_JD,
+            jd_url: null,
+            jd_text:
+              'Staff Backend Engineer, Clinical Data. Join a healthtech company.',
+          },
+        ]}
+        onChanged={() => undefined}
+      />
+    );
+    await user.click(screen.getByLabelText('Delete reference JD'));
+    // Scope to the dialog heading — the same words also sit in the row behind it.
+    expect(
+      screen.getByRole('heading', { name: /Delete “Staff Backend Engineer/i })
+    ).toBeInTheDocument();
+  });
+
+  it('distinguishes the two rows when there is more than one JD', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[
+          {
+            ...SAMPLE_JD,
+            id: 'jd-1',
+            jd_url: 'https://x.test/jobs/alpha-role',
+          },
+          { ...SAMPLE_JD, id: 'jd-2', jd_url: 'https://x.test/jobs/beta-role' },
+        ]}
+        onChanged={() => undefined}
+      />
+    );
+    // Deleting the SECOND row must name the second role, not the first.
+    const [, secondDelete] = screen.getAllByLabelText('Delete reference JD');
+    expect(secondDelete).toBeDefined();
+    await user.click(secondDelete as HTMLElement);
+    expect(screen.getByText(/beta role/i)).toBeInTheDocument();
+    expect(screen.queryByText(/alpha role/i)).not.toBeInTheDocument();
+  });
+
+  it('expands a clamped JD and collapses it again', async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <ReferenceJDList
+        targetId='t-1'
+        referenceJDs={[SAMPLE_JD]}
+        onChanged={() => undefined}
+      />
+    );
+    const clamped = () => container.querySelector('.line-clamp-2');
+    expect(clamped()).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: /show full jd/i }));
+    expect(clamped()).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: /show less/i }));
+    expect(clamped()).not.toBeNull();
+  });
+});

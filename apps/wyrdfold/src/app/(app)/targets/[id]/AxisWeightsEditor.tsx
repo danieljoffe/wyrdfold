@@ -167,8 +167,8 @@ export default function AxisWeightsEditor({
         </div>
         <Text variant='meta' className='text-text-secondary'>
           Tune how much each of the four scoring axes contributes to a
-          job&rsquo;s overall fit score. Weights renormalize on save — relative
-          values are what matter.
+          job&rsquo;s overall match score. Weights renormalize on save —
+          relative values are what matter.
         </Text>
       </CardHeader>
 

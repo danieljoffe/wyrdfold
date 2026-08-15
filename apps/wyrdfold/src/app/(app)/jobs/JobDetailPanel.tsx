@@ -80,12 +80,12 @@ function formatFactor(key: string): string {
   return SCORE_FACTOR_LABEL[key] ?? key.replace(/_/g, ' ');
 }
 
-/** Fixed render order — the four fit axes whose average IS the score (#609). */
+/** Fixed render order — the four axes whose average IS the match score (#609). */
 const FIT_AXES: ReadonlyArray<[key: string, label: string]> = [
-  ['title_fit', 'Title fit'],
-  ['skills_fit', 'Skills fit'],
-  ['seniority_fit', 'Seniority fit'],
-  ['domain_fit', 'Domain fit'],
+  ['title_fit', 'Title match'],
+  ['skills_fit', 'Skills match'],
+  ['seniority_fit', 'Seniority match'],
+  ['domain_fit', 'Domain match'],
 ];
 
 /**
@@ -97,7 +97,7 @@ const FIT_AXES: ReadonlyArray<[key: string, label: string]> = [
 function FitAxisList({ axes }: { axes: Record<string, number> }) {
   const known = FIT_AXES.filter(([key]) => typeof axes[key] === 'number');
   if (known.length === 0) {
-    return <Text variant='meta'>No fit axes recorded for this grade</Text>;
+    return <Text variant='meta'>No match axes recorded for this grade</Text>;
   }
   return (
     <ul className='flex flex-col gap-2'>
@@ -231,7 +231,7 @@ function ScoreBreakdownList({
       {canApportion && (
         <dl className='flex flex-col gap-1 border-t border-border pt-2 text-xs'>
           <div className='flex items-baseline justify-between gap-3'>
-            <dt className='text-text-secondary'>Fit against this target</dt>
+            <dt className='text-text-secondary'>Match against this target</dt>
             <dd className='tabular-nums font-medium text-text-primary'>
               {rawScore}
             </dd>
@@ -830,14 +830,14 @@ export default function JobDetailPanel({
         {targetId && (
           <div>
             <div className='mb-1 flex items-center gap-2'>
-              <Text variant='caption'>Fit analysis</Text>
+              <Text variant='caption'>Match analysis</Text>
               {analyzing && (
                 <span
                   className='inline-flex items-center gap-1.5'
                   role='status'
                   aria-live='polite'
                 >
-                  <Spinner size='sm' aria-label='Running fit analysis' />
+                  <Spinner size='sm' aria-label='Running match analysis' />
                   <Text variant='meta'>Running… {analyzingElapsedS}s</Text>
                 </span>
               )}
@@ -927,8 +927,8 @@ export default function JobDetailPanel({
                   <Text variant='error'>{analysisError}</Text>
                 ) : (
                   <Text variant='body' className='text-text-secondary'>
-                    See how you match this job — skills, seniority, and domain
-                    fit, graded against your experience profile.
+                    See how you match this job on skills, seniority and domain,
+                    graded against your experience profile.
                   </Text>
                 )}
                 <Button
@@ -937,7 +937,7 @@ export default function JobDetailPanel({
                   size='sm'
                   onClick={() => void runAnalysis()}
                 >
-                  {analysisError ? 'Retry analysis' : 'Analyze fit'}
+                  {analysisError ? 'Retry analysis' : 'Analyze match'}
                 </Button>
               </div>
             )}

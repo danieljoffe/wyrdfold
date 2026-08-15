@@ -107,10 +107,10 @@ test('graded row with axes from the list payload renders fit axes, not keyword c
 
   renderPanel(makeJob({ axis_scores: AXES }));
 
-  expect(screen.getByText('Title fit')).toBeInTheDocument();
-  expect(screen.getByText('Skills fit')).toBeInTheDocument();
-  expect(screen.getByText('Seniority fit')).toBeInTheDocument();
-  expect(screen.getByText('Domain fit')).toBeInTheDocument();
+  expect(screen.getByText('Title match')).toBeInTheDocument();
+  expect(screen.getByText('Skills match')).toBeInTheDocument();
+  expect(screen.getByText('Seniority match')).toBeInTheDocument();
+  expect(screen.getByText('Domain match')).toBeInTheDocument();
   expect(screen.queryByText('Role titles')).not.toBeInTheDocument();
   expect(screen.queryByText('Technologies')).not.toBeInTheDocument();
   // Axes were on the payload — no detail-GET fallback fired.
@@ -131,7 +131,7 @@ test('pending row keeps the keyword components and never fetches the detail', ()
   );
 
   expect(screen.getByText('Role titles')).toBeInTheDocument();
-  expect(screen.queryByText('Title fit')).not.toBeInTheDocument();
+  expect(screen.queryByText('Title match')).not.toBeInTheDocument();
   expect(fetchSpy).not.toHaveBeenCalledWith('/api/jobs/j-1');
 });
 
@@ -146,7 +146,7 @@ test('graded row WITHOUT the axis_scores key lazily fetches the detail GET and s
   renderPanel(job);
 
   await waitFor(() =>
-    expect(screen.getByText('Title fit')).toBeInTheDocument()
+    expect(screen.getByText('Title match')).toBeInTheDocument()
   );
   expect(fetchSpy).toHaveBeenCalledWith('/api/jobs/j-1');
   expect(screen.queryByText('Role titles')).not.toBeInTheDocument();
@@ -162,7 +162,7 @@ test('graded row falls back to keyword components when the detail fetch fails', 
   await waitFor(() =>
     expect(screen.getByText('Role titles')).toBeInTheDocument()
   );
-  expect(screen.queryByText('Title fit')).not.toBeInTheDocument();
+  expect(screen.queryByText('Title match')).not.toBeInTheDocument();
 });
 
 /**
@@ -204,7 +204,7 @@ test('pending row reconciles components → fit → freshness → the score show
   expect(screen.getByText('57.1')).toBeInTheDocument();
   expect(screen.getByText('2.9')).toBeInTheDocument();
   expect(screen.queryByText('80')).toBeNull(); // the raw point value is gone
-  expect(screen.getByText('Fit against this target')).toBeInTheDocument();
+  expect(screen.getByText('Match against this target')).toBeInTheDocument();
 
   // Freshness is shown as its own step. Derived from displayed ÷ fit, so the
   // decay formula is never duplicated client-side.
@@ -260,6 +260,6 @@ test('pending row without raw_score degrades to raw points, no invented chain', 
   );
 
   expect(screen.getByText('Role titles')).toBeInTheDocument();
-  expect(screen.queryByText('Fit against this target')).toBeNull();
+  expect(screen.queryByText('Match against this target')).toBeNull();
   expect(screen.queryByText(/Freshness/)).toBeNull();
 });

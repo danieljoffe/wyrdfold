@@ -266,3 +266,141 @@ describe('TargetsList — suggestion panels are dismissible', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+/**
+ * The active-target cap (1 free / 2 starter / 5 pro) made activation a dead
+ * end: a toast saying "deactivate one first" and no way to do it from there.
+ * The 409 now names what's holding the cap, and the user picks one to swap out.
+ */
+describe('TargetsList — swapping at the active-target cap', () => {
+  function capResponse(active: { id: string; label: string }[], limit: number) {
+    return {
+      ok: false,
+      status: 409,
+      clone: () => ({
+        json: async () => ({
+          detail: {
+            error: 'ACTIVE_LIMIT',
+            limit,
+            active_count: active.length,
+            active_targets: active,
+            message: `You already have ${active.length} active target(s) (limit ${limit}) — deactivate one first.`,
+          },
+        }),
+      }),
+      json: async () => ({}),
+    };
+  }
+
+  it('offers a picker naming every active target, not just the first', async () => {
+    // Pro tier: five active, so a fixed "swap with the active one" would be
+    // meaningless — the choice has to be a list.
+    const active = [
+      { id: 'a1', label: 'Alpha Engineer' },
+      { id: 'a2', label: 'Beta Engineer' },
+      { id: 'a3', label: 'Gamma Engineer' },
+      { id: 'a4', label: 'Delta Engineer' },
+      { id: 'a5', label: 'Epsilon Engineer' },
+    ];
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(capResponse(active, 5)) as unknown as typeof fetch;
+
+    const user = userEvent.setup();
+    render(
+      <TargetsList
+        initialTargets={[makeEntry('t-new', 'Senior Frontend Engineer', false)]}
+      />
+    );
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /actions for senior frontend engineer/i,
+      })
+    );
+    await user.click(screen.getByRole('menuitem', { name: /^activate$/i }));
+
+    expect(
+      await screen.findByText(/at your limit of 5 active targets/i)
+    ).toBeInTheDocument();
+    for (const a of active) {
+      expect(screen.getByText(a.label)).toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('radio')).toHaveLength(5);
+  });
+
+  it('retries the activation with the chosen target as the swap-out', async () => {
+    const fetchMock = jest
+      .fn()
+      // 1) plain activate -> refused by the cap
+      .mockResolvedValueOnce(
+        capResponse(
+          [
+            { id: 'a1', label: 'Alpha Engineer' },
+            { id: 'a2', label: 'Beta Engineer' },
+          ],
+          2
+        )
+      )
+      // 2) the swap -> accepted
+      .mockResolvedValue({ ok: true, json: async () => ({}) });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const user = userEvent.setup();
+    render(
+      <TargetsList
+        initialTargets={[makeEntry('t-new', 'Senior Frontend Engineer', false)]}
+      />
+    );
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /actions for senior frontend engineer/i,
+      })
+    );
+    await user.click(screen.getByRole('menuitem', { name: /^activate$/i }));
+
+    // Pick the SECOND one — picking the first could pass on a preselect bug.
+    await user.click(
+      await screen.findByRole('radio', { name: /Beta Engineer/i })
+    );
+    await user.click(screen.getByRole('button', { name: /^swap$/i }));
+
+    const swapCall = fetchMock.mock.calls.find(
+      ([, init]) => typeof init?.body === 'string'
+    );
+    expect(swapCall).toBeDefined();
+    expect(swapCall?.[0]).toBe('/api/targets/t-new/activate');
+    expect(JSON.parse(swapCall?.[1].body as string)).toEqual({
+      deactivate_target_id: 'a2',
+    });
+  });
+
+  it('leaves the target inactive when the user cancels the swap', async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(
+        capResponse([{ id: 'a1', label: 'Alpha Engineer' }], 1)
+      ) as unknown as typeof fetch;
+
+    const user = userEvent.setup();
+    render(
+      <TargetsList
+        initialTargets={[makeEntry('t-new', 'Senior Frontend Engineer', false)]}
+      />
+    );
+
+    await user.click(
+      screen.getByRole('button', {
+        name: /actions for senior frontend engineer/i,
+      })
+    );
+    await user.click(screen.getByRole('menuitem', { name: /^activate$/i }));
+    await user.click(await screen.findByRole('button', { name: /^cancel$/i }));
+
+    // The optimistic flip must be undone — the card cannot claim Active after
+    // a refused activation.
+    expect(screen.queryByText(/at your limit/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/^Inactive$/i)).toBeInTheDocument();
+  });
+});

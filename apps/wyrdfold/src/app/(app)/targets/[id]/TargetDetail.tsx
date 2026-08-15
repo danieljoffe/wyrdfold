@@ -40,10 +40,26 @@ interface TargetDetailProps {
 const TAB_IDS = ['scoring', 'preferences', 'jds', 'learning'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
-function parseTab(raw: string | null): TabId {
-  return (TAB_IDS as readonly string[]).includes(raw ?? '')
-    ? (raw as TabId)
-    : 'scoring';
+/**
+ * Slugs people reasonably guess for a tab whose URL name is shorter than its
+ * label. The Reference JDs tab is `?tab=jds`, so a link typed or remembered as
+ * `reference-jds` used to land silently on Scoring — the fallback gives no clue
+ * that the requested tab was not the one shown.
+ */
+const TAB_ALIASES: Record<string, TabId> = {
+  'reference-jds': 'jds',
+  reference_jds: 'jds',
+  referencejds: 'jds',
+  jd: 'jds',
+  prefs: 'preferences',
+};
+
+/** Exported for direct unit cover — the component's `useSearchParams` is
+ *  module-mocked to a fixed value, so the aliasing is not reachable through it. */
+export function parseTab(raw: string | null): TabId {
+  const key = (raw ?? '').trim().toLowerCase();
+  if ((TAB_IDS as readonly string[]).includes(key)) return key as TabId;
+  return TAB_ALIASES[key] ?? 'scoring';
 }
 
 export default function TargetDetail({ id }: TargetDetailProps) {
