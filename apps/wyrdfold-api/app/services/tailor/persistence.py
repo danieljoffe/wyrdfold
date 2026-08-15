@@ -444,15 +444,19 @@ async def mark_job_resume_draft(
     ``upsert_user_job`` twin kept for the not-yet-converted routers (#57 slice 3).
     """
     if user_id is not None:
-        await supabase.table("user_jobs").upsert(
-            {
-                "user_id": user_id,
-                "job_posting_id": job_posting_id,
-                "status": "resume_draft",
-                "updated_at": datetime.now(UTC).isoformat(),
-            },
-            on_conflict="user_id,job_posting_id",
-        ).execute()
+        await (
+            supabase.table("user_jobs")
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "job_posting_id": job_posting_id,
+                    "status": "resume_draft",
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+                on_conflict="user_id,job_posting_id",
+            )
+            .execute()
+        )
 
 
 async def approve(

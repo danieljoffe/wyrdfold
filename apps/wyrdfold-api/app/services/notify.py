@@ -105,9 +105,7 @@ async def _families_by_target(
     (unlabeled target) is kept — the gate treats it as match-anything."""
     if not target_ids:
         return {}
-    resp = await (
-        supabase.table("targets").select("id, role_family").in_("id", target_ids).execute()
-    )
+    resp = await supabase.table("targets").select("id, role_family").in_("id", target_ids).execute()
     out: dict[str, str | None] = {}
     for row in cast(list[dict[str, Any]], resp.data or []):
         tid = row.get("id")

@@ -329,7 +329,9 @@ class TestSingleResumeStatusBump:
             patch(
                 "app.routers.tailor._optimized_latest",
                 new_callable=AsyncMock,
-                return_value=MagicMock(payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])),
+                return_value=MagicMock(
+                    payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
+                ),
             ),
             patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
             patch(
@@ -349,7 +351,9 @@ class TestSingleResumeStatusBump:
                 new_callable=AsyncMock,
                 return_value=True,
             ),
-            patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock) as mock_mark,
+            patch(
+                "app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock
+            ) as mock_mark,
         ):
             # Bypass the structural gap gate — we're testing the post-success path.
             with patch(
@@ -410,7 +414,9 @@ class TestSingleResumeStatusBump:
             patch(
                 "app.routers.tailor._optimized_latest",
                 new_callable=AsyncMock,
-                return_value=MagicMock(payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])),
+                return_value=MagicMock(
+                    payload=MagicMock(roles=[MagicMock()], outcomes=[MagicMock()])
+                ),
             ),
             patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
             patch(
@@ -423,7 +429,9 @@ class TestSingleResumeStatusBump:
                 new_callable=AsyncMock,
                 return_value=success,
             ),
-            patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock) as mock_mark,
+            patch(
+                "app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock
+            ) as mock_mark,
         ):
             with patch(
                 "app.routers.tailor.gap_tracker.can_generate",
@@ -508,7 +516,9 @@ class TestEditResume:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.edit_tailored_resume(
@@ -537,7 +547,9 @@ class TestEditResume:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.update_payload_md",
                 new_callable=AsyncMock,
@@ -565,7 +577,9 @@ class TestEditResume:
         bad_md = "# Daniel Joffe\n\n## Skills\n\nPython\n"
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.edit_tailored_resume(
@@ -594,7 +608,9 @@ class TestApproveResume:
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.approve",
                 new_callable=AsyncMock,
@@ -659,7 +675,9 @@ class TestApproveResume:
         approved_record = _make_record(document_type="cover_letter", approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.approve",
                 new_callable=AsyncMock,
@@ -690,7 +708,9 @@ class TestApproveResume:
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.approve",
                 new_callable=AsyncMock,
@@ -724,7 +744,9 @@ class TestApproveResume:
         approved_record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.approve",
                 new_callable=AsyncMock,
@@ -755,7 +777,9 @@ class TestApproveResume:
         reopened = _make_record(approved_at=None)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=approved),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=approved
+            ),
             patch(
                 "app.services.tailor.persistence.unapprove",
                 new_callable=AsyncMock,
@@ -793,7 +817,9 @@ class TestExportZip:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.download_docx",
                 new_callable=AsyncMock,
@@ -826,7 +852,11 @@ class TestExportZip:
         unapproved = _make_record(approved_at=None)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=unapproved),
+            patch(
+                "app.services.tailor.persistence.get",
+                new_callable=AsyncMock,
+                return_value=unapproved,
+            ),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.export_resumes_zip(
@@ -969,13 +999,17 @@ class TestCheckpointEndpoint:
         record = _make_record(payload_md=_GOOD_MD)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.versions.checkpoint",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_checkpoint,
-            patch("app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock) as mock_update,
+            patch(
+                "app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock
+            ) as mock_update,
         ):
             result = await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
@@ -997,8 +1031,12 @@ class TestCheckpointEndpoint:
         new_md = "# New\n\n## Experience\n\n### Eng — Acme\n\n- Did things\n"
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
-            patch("app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock) as mock_update,
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
+            patch(
+                "app.services.tailor.persistence.update_payload_md", new_callable=AsyncMock
+            ) as mock_update,
             patch(
                 "app.services.tailor.versions.checkpoint",
                 new_callable=AsyncMock,
@@ -1034,8 +1072,12 @@ class TestCheckpointEndpoint:
         bad_md = "# Daniel\n\n## Skills\n\nPython\n"
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
-            patch("app.services.tailor.versions.checkpoint", new_callable=AsyncMock) as mock_checkpoint,
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
+            patch(
+                "app.services.tailor.versions.checkpoint", new_callable=AsyncMock
+            ) as mock_checkpoint,
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.checkpoint_tailored_resume(
@@ -1056,8 +1098,12 @@ class TestCheckpointEndpoint:
         record = _make_record(approved_at=_NOW)
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
-            patch("app.services.tailor.versions.checkpoint", new_callable=AsyncMock) as mock_checkpoint,
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
+            patch(
+                "app.services.tailor.versions.checkpoint", new_callable=AsyncMock
+            ) as mock_checkpoint,
         ):
             result = await tailor_router.checkpoint_tailored_resume(
                 resume_id="rec-1",
@@ -1151,14 +1197,18 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.download_docx",
                 new_callable=AsyncMock,
                 return_value=b"PKcached-bytes",
             ) as mock_download,
             patch("app.routers.tailor.md_to_docx") as mock_render,
-            patch("app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock) as mock_mark,
+            patch(
+                "app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock
+            ) as mock_mark,
         ):
             user_supabase = MagicMock()
             response = await tailor_router.download_tailored_resume(
@@ -1187,7 +1237,9 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.routers.tailor.md_to_docx",
                 return_value=b"PKfresh-bytes",
@@ -1197,7 +1249,9 @@ class TestDownloadCache:
                 new_callable=AsyncMock,
                 return_value="anon/rec-1.docx",
             ),
-            patch("app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock) as mock_mark,
+            patch(
+                "app.services.tailor.persistence.mark_docx_rendered", new_callable=AsyncMock
+            ) as mock_mark,
         ):
             response = await tailor_router.download_tailored_resume(
                 resume_id="rec-1",
@@ -1233,7 +1287,9 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.routers.tailor.md_to_docx",
                 return_value=b"PKfresh-bytes",
@@ -1263,7 +1319,9 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.services.tailor.persistence.download_docx",
                 new_callable=AsyncMock,
@@ -1297,7 +1355,9 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             pytest.raises(HTTPException) as exc_info,
         ):
             await tailor_router.download_tailored_resume(
@@ -1321,7 +1381,9 @@ class TestDownloadCache:
         )
 
         with (
-            patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record),
+            patch(
+                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
+            ),
             patch(
                 "app.routers.tailor.md_to_docx",
                 side_effect=PandocNotInstalledError("pandoc missing"),

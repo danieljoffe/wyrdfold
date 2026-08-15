@@ -194,8 +194,8 @@ async def test_checkpoint_records_when_no_prior_versions() -> None:
 
 async def test_checkpoint_returns_false_when_resume_missing() -> None:
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=[])
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
 
     wrote = await versions.checkpoint(supabase, "missing")

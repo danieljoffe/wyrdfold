@@ -265,9 +265,7 @@ async def test_rls_backstop_blocks_cross_user_export(
     service-role client would have returned everything."""
     uid_a, uid_b = seeded_export_user
     client_b = await async_user_client_factory(uid_b)
-    stolen = await collect_user_data(
-        client_b, user_id=uid_a, service_supabase=async_service_client
-    )
+    stolen = await collect_user_data(client_b, user_id=uid_a, service_supabase=async_service_client)
     for table in (
         "user_targets",
         "job_feedback",

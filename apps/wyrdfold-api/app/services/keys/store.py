@@ -154,9 +154,7 @@ def has_usable_key(supabase: Client, *, user_id: str, provider: Provider) -> boo
         return False
 
 
-async def has_usable_key_async(
-    supabase: AsyncClient, *, user_id: str, provider: Provider
-) -> bool:
+async def has_usable_key_async(supabase: AsyncClient, *, user_id: str, provider: Provider) -> bool:
     """Async mirror of :func:`has_usable_key` (#57 PR-G2c) for ``async def``
     callers on the pooled async service client (billing + the async quota
     resolver).

@@ -232,11 +232,13 @@ async def _get_cached(supabase: Client | AsyncClient, key: str) -> DerivedTarget
             )
         else:
             resp = await asyncio.to_thread(
-                lambda: supabase.table(_CACHE_TABLE)
-                .select("derived_payload")
-                .eq("jd_hash", key)
-                .limit(1)
-                .execute()
+                lambda: (
+                    supabase.table(_CACHE_TABLE)
+                    .select("derived_payload")
+                    .eq("jd_hash", key)
+                    .limit(1)
+                    .execute()
+                )
             )
     except Exception:
         # Cache layer is best-effort — a Supabase outage must not break
@@ -263,9 +265,10 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
             # fetch_one, not .single(): the outer try/except made the raise
             # harmless, but it still turned every cache-row miss into a thrown
             # (and swallowed) exception rather than a plain empty read.
-            row = await fetch_one(
-                supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
-            ) or {}
+            row = (
+                await fetch_one(supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key))
+                or {}
+            )
             next_count = int(row.get("hit_count", 0)) + 1
             await (
                 supabase.table(_CACHE_TABLE)
@@ -279,10 +282,14 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
                 .execute()
             )
         else:
+
             def _bump() -> None:
-                row = fetch_one_sync(
-                    supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
-                ) or {}
+                row = (
+                    fetch_one_sync(
+                        supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+                    )
+                    or {}
+                )
                 next_count = int(row.get("hit_count", 0)) + 1
                 supabase.table(_CACHE_TABLE).update(
                     {
@@ -319,9 +326,9 @@ async def _persist_cache(
             await supabase.table(_CACHE_TABLE).upsert(payload, on_conflict="jd_hash").execute()
         else:
             await asyncio.to_thread(
-                lambda: supabase.table(_CACHE_TABLE)
-                .upsert(payload, on_conflict="jd_hash")
-                .execute()
+                lambda: (
+                    supabase.table(_CACHE_TABLE).upsert(payload, on_conflict="jd_hash").execute()
+                )
             )
     except Exception:
         logger.warning("derive-jd cache write failed", exc_info=True)

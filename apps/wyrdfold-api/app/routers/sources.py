@@ -126,9 +126,7 @@ async def manage_source(
         current = await _source_enabled(supabase, board_token=body.board_token)
         if current:
             new_enabled = not current["enabled"]
-            await _set_source_enabled(
-                supabase, board_token=body.board_token, enabled=new_enabled
-            )
+            await _set_source_enabled(supabase, board_token=body.board_token, enabled=new_enabled)
             return {"success": True, "enabled": new_enabled}
         return {"error": "Source not found"}
 

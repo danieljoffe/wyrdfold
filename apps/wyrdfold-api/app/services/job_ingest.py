@@ -106,12 +106,12 @@ async def materialize_and_score_job(
 
     # Idempotently ensure the ``manual`` pseudo-source (NOT-NULL FK target) then
     # upsert the posting — both awaited on the async service client.
-    await supabase.table("sources").upsert(
-        MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True
-    ).execute()
-    resp = await (
-        supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
+    await (
+        supabase.table("sources")
+        .upsert(MANUAL_SOURCE_ROW, on_conflict="id", ignore_duplicates=True)
+        .execute()
     )
+    resp = await supabase.table("jobs").upsert(row, on_conflict="source_id,external_id").execute()
     posting_id: str | None = None
     if resp.data:
         posting_id = cast(dict[str, Any], resp.data[0]).get("id")

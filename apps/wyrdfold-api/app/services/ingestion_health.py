@@ -509,9 +509,7 @@ async def check_ingestion_health(
                     )
                     level: Literal["error", "warning"] = "error"
                 else:
-                    cap_txt = (
-                        f"${budget.key_limit:.2f}" if budget.key_limit is not None else "the"
-                    )
+                    cap_txt = f"${budget.key_limit:.2f}" if budget.key_limit is not None else "the"
                     left_txt = (
                         f"${budget.key_remaining:.2f}"
                         if budget.key_remaining is not None

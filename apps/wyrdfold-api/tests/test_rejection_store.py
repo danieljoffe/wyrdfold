@@ -133,9 +133,7 @@ async def test_record_dedupes_within_one_batch():
     this is load-bearing, not cosmetic."""
     supabase = phase1_store_supabase()
 
-    await record_rejections(
-        supabase, _target(), [("Brand  New Role", 70), ("brand new role", 90)]
-    )
+    await record_rejections(supabase, _target(), [("Brand  New Role", 70), ("brand new role", 90)])
     assert list(supabase._phase1_rejections.rows) == [("tgt-1", 1, "brand new role")]
 
 

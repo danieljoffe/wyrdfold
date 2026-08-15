@@ -243,9 +243,7 @@ async def test_gate_null_last_seen_not_blocked(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"}))
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
         return_value=MagicMock(
@@ -264,9 +262,7 @@ async def test_gate_idle_defer_zero_disables(monkeypatch):
     import app.services.targets.payers as payers_mod
     from app.services.targets.payers import build_budget_gate
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"}))
     ancient = (datetime.now(UTC) - timedelta(days=365)).isoformat()
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(

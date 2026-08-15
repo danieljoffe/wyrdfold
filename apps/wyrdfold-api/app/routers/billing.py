@@ -100,9 +100,12 @@ async def _get_stripe_customer_id(supabase: AsyncClient, user_id: str) -> str | 
 
 
 async def _save_stripe_customer_id(supabase: AsyncClient, user_id: str, customer_id: str) -> None:
-    await supabase.table("user_profiles").update({"stripe_customer_id": customer_id}).eq(
-        "user_id", user_id
-    ).execute()
+    await (
+        supabase.table("user_profiles")
+        .update({"stripe_customer_id": customer_id})
+        .eq("user_id", user_id)
+        .execute()
+    )
 
 
 async def _ensure_customer(supabase: AsyncClient, user_id: str) -> str:

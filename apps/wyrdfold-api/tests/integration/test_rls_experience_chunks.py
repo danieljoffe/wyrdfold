@@ -117,7 +117,11 @@ async def test_upsert_writes_chunks_via_rls_and_cost_via_service_role(
     )
 
     written = await chunks.upsert_for_optimized(
-        async_client_a, MockEmbeddingsClient(), doc, user_id=uid_a, cost_supabase=async_service_client
+        async_client_a,
+        MockEmbeddingsClient(),
+        doc,
+        user_id=uid_a,
+        cost_supabase=async_service_client,
     )
     assert len(written) >= 1  # chunks written via the RLS client
 

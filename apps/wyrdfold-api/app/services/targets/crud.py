@@ -279,14 +279,10 @@ def get_active(supabase: Client) -> list[JobTarget]:
     # scale (tens of rows); at 1000+ active memberships the derived set would
     # silently truncate — page the membership read before that ever happens.
     member_ids_resp = (
-        supabase.table(USER_TARGETS_TABLE)
-        .select("target_id")
-        .eq("is_active", True)
-        .execute()
+        supabase.table(USER_TARGETS_TABLE).select("target_id").eq("is_active", True).execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -305,11 +301,7 @@ def is_pipeline_active(supabase: Client, target_id: str) -> bool:
     the instance floor OR any active membership.
     """
     t_resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("app_active")
-        .eq("id", target_id)
-        .limit(1)
-        .execute()
+        supabase.table(TARGETS_TABLE).select("app_active").eq("id", target_id).limit(1).execute()
     )
     t_rows = cast(list[dict[str, Any]], t_resp.data or [])
     if not t_rows:
@@ -716,9 +708,7 @@ def link_user_to_target(
     return _parse_user_target(rows[0])
 
 
-def get_fit_score_prose_doc_id(
-    supabase: Client, *, user_id: str, target_id: str
-) -> str | None:
+def get_fit_score_prose_doc_id(supabase: Client, *, user_id: str, target_id: str) -> str | None:
     """The prose-doc version marker on the user's link (E2), or None if the link
     is gone or was never scored. Read right before a lazy refresh recomputes, so
     a concurrent refresh (two quick views) doesn't double-spend the LLM."""

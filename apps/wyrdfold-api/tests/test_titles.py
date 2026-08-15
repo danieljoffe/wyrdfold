@@ -27,25 +27,17 @@ class TestRepairs:
         )
 
     def test_all_upper_title_recases(self) -> None:
-        assert (
-            clean_title_display("SENIOR SOFTWARE ENGINEER")
-            == "Senior Software Engineer"
-        )
+        assert clean_title_display("SENIOR SOFTWARE ENGINEER") == "Senior Software Engineer"
 
     def test_special_brand_spellings(self) -> None:
-        assert (
-            clean_title_display("javascript devops engineer")
-            == "JavaScript DevOps Engineer"
-        )
+        assert clean_title_display("javascript devops engineer") == "JavaScript DevOps Engineer"
 
     def test_ampersand_splits_runs(self) -> None:
         # "cd&ai" cases per part — the B1 chip mangle "Cd&Ai".
         assert clean_title_display("director, cd&ai") == "Director, CD&AI"
 
     def test_trailing_req_code_parenthesized(self) -> None:
-        assert (
-            clean_title_display("Staff Engineer (REQ-20441)") == "Staff Engineer"
-        )
+        assert clean_title_display("Staff Engineer (REQ-20441)") == "Staff Engineer"
         assert clean_title_display("Staff Engineer [R 123456]") == "Staff Engineer"
         # Bare digits need 5+ — a 5-digit id is a code, a 4-digit year is not.
         assert clean_title_display("Staff Engineer (20441)") == "Staff Engineer"

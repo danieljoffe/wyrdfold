@@ -629,8 +629,6 @@ def _prom_jobs(ids: list[str]) -> list[dict[str, Any]]:
     return [{"id": j, "title": "x", "description_html": ""} for j in ids]
 
 
-
-
 @pytest.mark.asyncio
 async def test_us_gate_skips_confirmed_non_us_jobs(
     monkeypatch: pytest.MonkeyPatch,

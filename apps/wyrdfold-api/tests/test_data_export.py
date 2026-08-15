@@ -68,7 +68,9 @@ class _FakeBucket:
     def __init__(self, objects: dict[str, dict[str, bytes]]) -> None:
         self._objects = objects
 
-    async def list(self, prefix: str, options: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    async def list(
+        self, prefix: str, options: dict[str, Any] | None = None
+    ) -> list[dict[str, str]]:
         names = sorted(self._objects.get(prefix, {}))
         opts = options or {}
         limit = opts.get("limit", self.DEFAULT_LIMIT)

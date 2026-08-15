@@ -257,9 +257,7 @@ async def test_handle_turn_drops_a_recap_echo_append(
 
     recap = "Worked at FightCamp 2021-11 to 2024-04."
     llm = MockLLMClient(
-        scripted={
-            orchestrator.PURPOSE_TURN_ONBOARDING: conversation_recap_echo_json(recap)
-        }
+        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: conversation_recap_echo_json(recap)}
     )
     mock_service_layer["prose_get_latest"].return_value = _prose(
         f"{recap}\n\nShipped the poller rewrite."
@@ -289,8 +287,7 @@ async def test_handle_turn_appends_a_superset_of_old_content(
         scripted={
             orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
                 prose_append=(
-                    "Worked at FightCamp 2021-11 to 2024-04, leading a team of "
-                    "four engineers."
+                    "Worked at FightCamp 2021-11 to 2024-04, leading a team of four engineers."
                 )
             )
         }
@@ -410,9 +407,7 @@ def _reset_supabase_mock() -> MagicMock:
     and yields an empty result set (#57 slice 4 — reset_content is now async)."""
     supabase = MagicMock()
     delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.eq.return_value.execute = AsyncMock(
-        return_value=SimpleNamespace(data=[])
-    )
+    delete_chain.eq.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=[]))
     return supabase
 
 

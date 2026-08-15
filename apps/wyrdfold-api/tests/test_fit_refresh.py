@@ -63,9 +63,7 @@ def _rows_supabase(rows: list[dict], target_rows: list[dict] | None = None) -> M
                 captured["in_"] = list(ids)
                 m = MagicMock()
                 m.execute = AsyncMock(
-                    return_value=MagicMock(
-                        data=[r for r in (target_rows or []) if r["id"] in ids]
-                    )
+                    return_value=MagicMock(data=[r for r in (target_rows or []) if r["id"] in ids])
                 )
                 return m
 
@@ -229,7 +227,9 @@ def refresh_patches(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(fit_refresh, "derive_fit_score", fake_derive)
 
-    async def fake_update(_s, *, user_id, target_id, fit_score, fit_score_reasoning, fit_score_prose_doc_id):  # type: ignore[no-untyped-def]
+    async def fake_update(
+        _s, *, user_id, target_id, fit_score, fit_score_reasoning, fit_score_prose_doc_id
+    ):  # type: ignore[no-untyped-def]
         rec["updates"].append(
             {"target_id": target_id, "fit_score": fit_score, "marker": fit_score_prose_doc_id}
         )

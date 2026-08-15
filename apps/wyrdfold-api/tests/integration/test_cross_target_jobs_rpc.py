@@ -408,14 +408,15 @@ async def test_weighted_blend_actually_moves_the_score(
     weights = {tid: AxisWeights(**_SKEWED) for tid in target_ids}
 
     weighted = await _rpc_page(
-        async_service_client, user_id, target_ids, sort="score", ascending=False,
+        async_service_client,
+        user_id,
+        target_ids,
+        sort="score",
+        ascending=False,
         weights_by_target=weights,
     )
     # raw_score rides along on every RPC row now (#457) — the undecayed Sonnet fit.
-    moved = [
-        p for p in weighted["postings"]
-        if not p["pending"] and p["score"] != p["raw_score"]
-    ]
+    moved = [p for p in weighted["postings"] if not p["pending"] and p["score"] != p["raw_score"]]
     assert moved, (
         "skewed weights moved no displayed score off raw_score — the DB-side "
         f"blend was not applied: {[(p['title'], p['score'], p['raw_score']) for p in weighted['postings']]}"
@@ -460,8 +461,12 @@ async def test_rpc_company_and_search_filters_match_python(
         {"search": "Graded"},  # "Alpha Graded High" + "Bravo Graded Low"
         {"company": "Bristol", "search": "Bravo"},  # both filters together
     ):
-        rpc = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False, **kw)
-        py = await _py_page(async_service_client, user_id, target_ids, sort="score", ascending=False, **kw)
+        rpc = await _rpc_page(
+            async_service_client, user_id, target_ids, sort="score", ascending=False, **kw
+        )
+        py = await _py_page(
+            async_service_client, user_id, target_ids, sort="score", ascending=False, **kw
+        )
         assert _ids(rpc) == _ids(py), f"filter {kw}: rpc={_ids(rpc)} py={_ids(py)}"
 
 
@@ -478,7 +483,9 @@ async def test_jobs_archival_trigger_syncs_and_drops(
     before = {
         p["title"]
         for p in (
-            await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
+            await _rpc_page(
+                async_service_client, user_id, target_ids, sort="score", ascending=False
+            )
         )["postings"]
     }
     assert "Alpha Graded High" in before
@@ -607,7 +614,9 @@ async def test_rpc_offset_pagination_and_has_more(
 ) -> None:
     """page_size=2 yields a next cursor; walking it covers the full set once."""
     user_id, target_ids = seeded_cross_target
-    full = _ids(await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False))
+    full = _ids(
+        await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
+    )
     assert len(full) >= 4  # enough to page
 
     seen: list[str] = []
@@ -650,9 +659,7 @@ async def test_rpcs_serve_title_display(
     # Cross-target RPC: repaired row carries the cleaned form; untouched rows
     # carry an explicit NULL (a MISSING key would mean the projection silently
     # dropped the column again).
-    page = await _rpc_page(
-        async_service_client, user_id, target_ids, sort="score", ascending=False
-    )
+    page = await _rpc_page(async_service_client, user_id, target_ids, sort="score", ascending=False)
     by_title = {p["title"]: p for p in page["postings"]}
     assert by_title["Alpha Graded High"]["title_display"] == "Alpha Graded High (Clean)"
     assert "title_display" in by_title["Bravo Graded Low"]

@@ -178,9 +178,7 @@ class TestManualJobEndpoint:
             captured["score_client"] = client
             return None
 
-        monkeypatch.setattr(
-            job_ingest, "score_and_upsert_async", AsyncMock(side_effect=fake_score)
-        )
+        monkeypatch.setattr(job_ingest, "score_and_upsert_async", AsyncMock(side_effect=fake_score))
 
         mock_service = _async_service_client(posting_id="posting-uuid-r2")
 
@@ -235,9 +233,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="not-a-url")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
-            )
+            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
         assert exc_info.value.status_code == 400
         assert "Malformed" in exc_info.value.detail
 
@@ -250,9 +246,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://www.ziprecruiter.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
-            )
+            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
         assert exc_info.value.status_code == 400
         assert "Banned" in exc_info.value.detail
 
@@ -314,9 +308,7 @@ class TestManualJobEndpoint:
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url=url)
-        await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
 
         upsert_call = mock_supabase.table.return_value.upsert.call_args
         row = upsert_call[0][0]

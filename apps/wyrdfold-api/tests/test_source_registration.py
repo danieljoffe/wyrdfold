@@ -112,9 +112,7 @@ async def test_dead_board_not_registered(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["registered", "linked", "already_owned", "cap_reached"])
-async def test_live_board_delegates_to_rpc(
-    monkeypatch: pytest.MonkeyPatch, status: str
-) -> None:
+async def test_live_board_delegates_to_rpc(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
     """A live board delegates to the RPC with the detected board + settings cap,
     and passes the server's status straight back."""
     _patch_detect(monkeypatch, LIVE)

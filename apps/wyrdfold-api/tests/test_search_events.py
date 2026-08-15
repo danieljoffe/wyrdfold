@@ -206,9 +206,7 @@ def test_beacon_rejects_unknown_event_type_and_junk_uuid(
         },
     )
     assert r2.status_code == 422
-    r3 = client.post(
-        "/search-events", json={"event_type": "card_open", "surface": "operator"}
-    )
+    r3 = client.post("/search-events", json={"event_type": "card_open", "surface": "operator"})
     assert r3.status_code == 422
     assert captured_rows == []  # junk never becomes a row
 
@@ -221,9 +219,7 @@ def test_beacon_is_bff_gated() -> None:
     from app.dependencies import get_settings
 
     app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret="s3cret")
-    r = _client().post(
-        "/search-events", json={"event_type": "card_open", "surface": "public"}
-    )
+    r = _client().post("/search-events", json={"event_type": "card_open", "surface": "public"})
     assert r.status_code == 403
 
 

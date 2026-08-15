@@ -193,9 +193,7 @@ async def test_async_statement_timeout_not_retried_by_default() -> None:
 @pytest.mark.asyncio
 async def test_async_statement_timeout_retried_when_opted_in() -> None:
     counter = _AsyncCounter(fail_times=1, exc=_statement_timeout())
-    result = await execute_with_retry(
-        counter, label="t", retry_statement_timeout=True
-    )
+    result = await execute_with_retry(counter, label="t", retry_statement_timeout=True)
     assert result == "ok"
     assert counter.calls == 2
 
@@ -206,9 +204,7 @@ async def test_async_statement_timeout_exhaust_reraises() -> None:
 
     counter = _AsyncCounter(fail_times=99, exc=_statement_timeout())
     with pytest.raises(APIError):
-        await execute_with_retry(
-            counter, label="t", retries=2, retry_statement_timeout=True
-        )
+        await execute_with_retry(counter, label="t", retries=2, retry_statement_timeout=True)
     assert counter.calls == 3
 
 

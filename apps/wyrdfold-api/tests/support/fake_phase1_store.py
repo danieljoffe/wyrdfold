@@ -127,11 +127,7 @@ class FakePhase1RejectionsQuery:
         return True
 
     def execute(self) -> AwaitableResponse:
-        matched = [
-            dict(row)
-            for key, row in self._rows.items()
-            if self._matches(key, row)
-        ]
+        matched = [dict(row) for key, row in self._rows.items() if self._matches(key, row)]
         # Apply order specs primary-first: stable-sort from the last spec
         # to the first, mirroring SQL's ORDER BY a, b.
         for column, desc in reversed(self._orders):
@@ -154,9 +150,7 @@ class FakePhase1RejectionsTable:
         self.select_calls = 0
         self.upsert_calls = 0
 
-    def upsert(
-        self, rows: list[dict], on_conflict: str = "", **_kwargs: object
-    ) -> MagicMock:
+    def upsert(self, rows: list[dict], on_conflict: str = "", **_kwargs: object) -> MagicMock:
         assert on_conflict == "target_id,profile_version,title_norm"
         self.upsert_calls += 1
         for row in rows:

@@ -30,19 +30,27 @@ async def set_user_vote(
     Awaited on the pooled async user client so the write never blocks the loop.
     """
     if value == 0:
-        await user_client.table(VOTES_TABLE).delete().eq("reference_jd_id", reference_jd_id).eq(
-            "user_id", user_id
-        ).execute()
+        await (
+            user_client.table(VOTES_TABLE)
+            .delete()
+            .eq("reference_jd_id", reference_jd_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
         return
-    await user_client.table(VOTES_TABLE).upsert(
-        {
-            "reference_jd_id": reference_jd_id,
-            "user_id": user_id,
-            "value": value,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="reference_jd_id,user_id",
-    ).execute()
+    await (
+        user_client.table(VOTES_TABLE)
+        .upsert(
+            {
+                "reference_jd_id": reference_jd_id,
+                "user_id": user_id,
+                "value": value,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="reference_jd_id,user_id",
+        )
+        .execute()
+    )
 
 
 def get_user_vote(user_client: Client, *, reference_jd_id: str, user_id: str) -> int:

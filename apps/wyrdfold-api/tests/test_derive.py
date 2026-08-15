@@ -244,8 +244,12 @@ class TestDeriveEndpoint:
         )
 
         monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
-        monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=previous_user_edit))
-        monkeypatch.setattr(exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc))
+        monkeypatch.setattr(
+            exp_router, "_optimized_latest", AsyncMock(return_value=previous_user_edit)
+        )
+        monkeypatch.setattr(
+            exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc)
+        )
 
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None
@@ -401,7 +405,9 @@ class TestDeriveStreamEndpoint:
 
         monkeypatch.setattr(exp_router, "_prose_latest", AsyncMock(return_value=prose_doc))
         monkeypatch.setattr(exp_router, "_optimized_latest", AsyncMock(return_value=None))
-        monkeypatch.setattr(exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc))
+        monkeypatch.setattr(
+            exp_router, "_optimized_create_version", AsyncMock(return_value=new_doc)
+        )
 
         async def fake_upsert(*a: object, **kw: object) -> None:
             return None

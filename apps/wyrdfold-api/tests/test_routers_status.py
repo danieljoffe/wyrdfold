@@ -83,9 +83,13 @@ def _build_supabase(
                 return_value=_Resp([{"target_id": _TEST_TARGET_ID}] if owns_posting else [])
             )
             # Legacy delete-path chain (kept for jobs.py compatibility).
-            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-                return_value=_Resp(
-                    [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = (
+                AsyncMock(
+                    return_value=_Resp(
+                        [{"target_id": _TEST_TARGET_ID}]
+                        if owns_posting and posting_with_target
+                        else []
+                    )
                 )
             )
         elif name == "scores":
@@ -93,16 +97,20 @@ def _build_supabase(
             score_rows = (
                 [{"target_id": _TEST_TARGET_ID}] if owns_posting and posting_with_target else []
             )
-            t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute = AsyncMock(
-                return_value=_Resp(score_rows)
+            t.select.return_value.eq.return_value.in_.return_value.limit.return_value.execute = (
+                AsyncMock(return_value=_Resp(score_rows))
             )
         elif name == "status_log":
             t.insert.return_value.execute = AsyncMock(return_value=_Resp(None))
         elif name == "user_jobs":
             # Prior per-user status read (#75 C4):
             # ``.select("status").eq(...).eq(...).limit(1).execute()``.
-            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-                return_value=_Resp([{"status": prior_status}] if posting_data is not None else [])
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = (
+                AsyncMock(
+                    return_value=_Resp(
+                        [{"status": prior_status}] if posting_data is not None else []
+                    )
+                )
             )
             # Dual-write target (#75 C1): upsert(...).execute().
             t.upsert.return_value.execute = AsyncMock(return_value=_Resp(None))
@@ -191,8 +199,8 @@ def test_status_update_dual_writes_user_jobs_and_status_log_user(client_factory)
                 t.insert.side_effect = _insert
             elif name == "user_jobs":
                 # Prior per-user status read (#75 C4).
-                t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-                    return_value=_Resp([{"status": "saved"}])
+                t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = (
+                    AsyncMock(return_value=_Resp([{"status": "saved"}]))
                 )
 
                 def _upsert(payload: Any, **kwargs: Any):
@@ -330,7 +338,11 @@ def _async_delete_supabase(*, posting_exists: bool, owns: bool = True) -> MagicM
             )
         elif name == "scores":
             t.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute = AsyncMock(
-                return_value=_Resp([{"target_id": _TEST_TARGET_ID, "score": 90, "score_breakdown": {}}] if owns else [])
+                return_value=_Resp(
+                    [{"target_id": _TEST_TARGET_ID, "score": 90, "score_breakdown": {}}]
+                    if owns
+                    else []
+                )
             )
         elif name == "user_jobs":
             t.upsert.return_value.execute = AsyncMock(return_value=_Resp(None))

@@ -169,9 +169,7 @@ def _build_async_http2_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         # Wrapped so a GOAWAY at the connection's stream ceiling can't take a
         # request down with it — see _GoawayRetryTransport.
-        transport=_GoawayRetryTransport(
-            httpx.AsyncHTTPTransport(http2=True, limits=limits)
-        ),
+        transport=_GoawayRetryTransport(httpx.AsyncHTTPTransport(http2=True, limits=limits)),
         follow_redirects=True,
         timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT,
         limits=limits,

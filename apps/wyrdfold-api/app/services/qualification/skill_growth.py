@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 # page small enough that one batch is a modest payload.
 _PAGE = 200
 
+# PostgREST clamps any response to 1,000 rows, so the coverage scan pages at
+# that size. The cap bounds an admin request on an ever-growing catalog.
+_COVERAGE_PAGE = 1000
+_COVERAGE_MAX_ROWS = 50_000
+
 # A term needs this many postings before it is worth proposing. Below it the
 # candidate list becomes noise — one-off phrasings a model invented once.
 MIN_CANDIDATE_MENTIONS = 5
@@ -185,22 +190,47 @@ async def vocabulary_candidates(supabase: AsyncClient, *, limit: int = 40) -> di
         logger.warning("vocabulary candidates: search scan failed", exc_info=True)
 
     # 3. Per-family coverage — the blind-spot metric.
+    #
+    # PAGINATED, because `.limit(20000)` does NOT return 20,000 rows: PostgREST
+    # clamps a response to 1,000 regardless of the requested limit (the same
+    # clamp this repo already hit in the poller). Unpaginated, this metric
+    # silently described the first 1,000 jobs of a 16k catalog — and since the
+    # backfill walks `cataloged_at DESC` while this scan has no order at all,
+    # the two barely overlapped. It reported 0% coverage immediately after a
+    # run that had demonstrably written 1,566 rows, which is worse than no
+    # metric: a blind-spot monitor that always reads zero can never alarm.
     try:
-        resp = await (
-            supabase.table("jobs")
-            .select("role_family, skills_required")
-            .is_("archived_at", "null")
-            .is_("purged_at", "null")
-            .limit(20000)
-            .execute()
-        )
         total: Counter[str] = Counter()
         with_skills: Counter[str] = Counter()
-        for row in cast(list[dict[str, Any]], resp.data or []):
-            fam = row.get("role_family") or "untagged"
-            total[fam] += 1
-            if row.get("skills_required"):
-                with_skills[fam] += 1
+        offset = 0
+        while offset < _COVERAGE_MAX_ROWS:
+            resp = await (
+                supabase.table("jobs")
+                .select("role_family, skills_required")
+                .is_("archived_at", "null")
+                .is_("purged_at", "null")
+                .order("id")
+                .range(offset, offset + _COVERAGE_PAGE - 1)
+                .execute()
+            )
+            rows = cast(list[dict[str, Any]], resp.data or [])
+            for row in rows:
+                fam = row.get("role_family") or "untagged"
+                total[fam] += 1
+                if row.get("skills_required"):
+                    with_skills[fam] += 1
+            if len(rows) < _COVERAGE_PAGE:
+                break
+            offset += len(rows)
+        else:
+            # Hit the cap with rows still unread. Say so — a cap that truncates
+            # quietly is the same failure this function was just fixed for,
+            # only at a higher threshold.
+            logger.warning(
+                "vocabulary candidates: coverage scan stopped at the %d-row cap; "
+                "the percentages describe a prefix of the catalog, not all of it",
+                _COVERAGE_MAX_ROWS,
+            )
         out["family_coverage"] = sorted(
             (
                 {
