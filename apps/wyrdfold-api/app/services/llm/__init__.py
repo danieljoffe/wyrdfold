@@ -242,9 +242,7 @@ async def _plan_requires_byok_async(supabase: "AsyncClient", user_id: str) -> bo
 
     plan: str | None = None
     try:
-        resp = (
-            await supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
-        )
+        resp = await supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
         rows = cast("list[dict[str, Any]]", resp.data or [])
         plan = cast("str | None", rows[0].get("plan")) if rows else None
     except Exception:

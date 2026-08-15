@@ -216,3 +216,63 @@ needs a backend endpoint), **C2** (prompt quality — needs a spend-bearing eval
 **B5/B6** (reference-JD affordances), **B7** (rename — `label` feeds
 `normalized_label`, the catalog dedup key, so renaming is a data-model
 question, not a UI one).
+
+---
+
+## F. What actually shipped
+
+The plan in §E was four PRs. It grew to fourteen, across three releases, because
+the release gate's interaction pass and a concurrent session's work both turned
+up defects no single PR could have surfaced.
+
+| Finding                                     | Disposition                                                                                                                                                                 | PR         |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| A1 dates render tomorrow                    | Fixed — `LocalFormat` two-pass, SSR pinned to `en-US`/UTC                                                                                                                   | #760       |
+| A2 case-variant duplicate keywords          | Fixed — `_dedupe_keywords`, applied to the single-profile short-circuit too (the common path)                                                                               | #760       |
+| A3 create failure only toasted              | Fixed — durable inline error + draft restore                                                                                                                                | #762       |
+| A4 activation never mentioned               | Fixed — no-active-targets banner with an inline activate path                                                                                                               | #762       |
+| B1/B2/B3/B4                                 | Fixed alongside A3/A4                                                                                                                                                       | #762       |
+| C1 target with no fit score, unrecomputable | Fixed — `stale_target_ids` returns unscored links first, guarded by `_not_deriving()`. **Verified on prod: "Senior Full Stack Engineer" went from permanently null to 52.** | #761       |
+| Score nomenclature split                    | Fixed — `/jobs` says "Match score", `/targets` says "Fit". Deliberately two words for two numbers.                                                                          | #763, #764 |
+| Active-cap dead end                         | Fixed — `SwapActiveTargetModal`, driven by the server's `active_targets` list so it works at every tier                                                                     | #765       |
+| …same dead end from the detail header       | Fixed — the picker was wired only into the cards grid                                                                                                                       | #773       |
+| C2 prompt quality                           | **Owner call, still open.** A prompt edit trips `test_prompt_regression` → spend-bearing eval + golden re-baseline.                                                         | —          |
+| B5/B6 reference-JD affordances              | Not done                                                                                                                                                                    | —          |
+| B7 rename a target                          | **Not done, deliberately.** `label` feeds `normalized_label`, the catalog dedup key. Blocked on a `title_display` split.                                                    | —          |
+
+### Defects found only by assembling the release
+
+None of these were visible in the PR that introduced them.
+
+1. **#749** — #745's prompt had never run against a real model (every test stubs
+   the LLM). A live probe returned `Senior Software Engineer` for a JD titled
+   `Software Engineer` whose body said "8+ years". The label IS the dedup key,
+   so inferring level from prose forks identical titles into two rows.
+2. **#751** — `runCreate` reset the suggestion arrays but not #742's new
+   empty-panel flags, leaving a stale "your existing targets already cover…".
+3. **#752** — #745 discarded its `LLMResult`, so the new inline call never
+   reached the cost ledger that `enforce_llm_budget` reads.
+
+### Defects in #766 (concurrent session), found by driving the deployed system
+
+The skill-harvest work shipped in release #769 with three defects, none of which
+its own tests could catch, because its fakes returned canned pages.
+
+1. **Livelock** (#770) — the backfill's offset didn't advance past rows matching
+   no dictionary term. Under `only_missing` those stay `IS NULL`, pile up at the
+   head, and every later page re-reads them. Prod showed `scanned 500,
+written 0`. After the fix, draining the catalog wrote **8,603 rows** across
+   nine chunks, declining monotonically 1387→628 — the correct shape.
+2. **PostgREST's 1,000-row clamp** (#772) — the per-family coverage metric's
+   `.limit(20000)` returns 1,000 rows. The "blind-spot monitor" therefore
+   described 6% of a 16,625-job catalog and read **0.0% forever**, worse than no
+   metric at all. The tell: family totals summing to _exactly_ 1000. Compounded
+   because the scan has no `order` while the backfill walks `cataloged_at DESC`,
+   so the two sets barely overlapped.
+3. The 50k cap added in that same fix was itself a silent truncation — caught in
+   self-review and changed to log when the cap is what stopped the scan.
+
+**The durable lesson** is the one already in `feedback_mocks_that_cant_fail`:
+each fix here ships a fake that models the _real_ dependency behaviour —
+re-evaluating `IS NULL` on every read, truncating any read to 1,000 rows — and
+each was falsified against the unfixed code before being trusted.

@@ -132,8 +132,18 @@ def test_output_is_capped_and_sorted() -> None:
 
 @pytest.mark.parametrize(
     "category",
-    ["ai", "cloud", "engineering", "software development", "automation",
-     "infrastructure", "analytics", "technology", "devops", "data"],
+    [
+        "ai",
+        "cloud",
+        "engineering",
+        "software development",
+        "automation",
+        "infrastructure",
+        "analytics",
+        "technology",
+        "devops",
+        "data",
+    ],
 )
 def test_field_wide_categories_stay_out_of_the_vocabulary(category: str) -> None:
     """These matched nearly every posting in the LLM's output ("ai" appeared
@@ -155,7 +165,11 @@ def test_search_filter_normalization_agrees_with_the_vocabulary() -> None:
     silently returns nothing."""
     from app.services.job_search import normalize_skill_filter
 
-    for typed, canon in (("React", "react"), ("  KUBERNETES ", "kubernetes"), ("Node.js", "node.js")):
+    for typed, canon in (
+        ("React", "react"),
+        ("  KUBERNETES ", "kubernetes"),
+        ("Node.js", "node.js"),
+    ):
         assert normalize_skill_filter([typed]) == [canon]
         assert canon in VOCABULARY
 

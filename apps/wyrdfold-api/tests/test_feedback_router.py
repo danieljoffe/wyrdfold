@@ -166,9 +166,7 @@ def test_learning_log_reads_via_user_client(
     # The endpoint reads via ``_learning_log_rows`` on the user client; make the
     # async chain return no rows so the response validates, and assert which
     # client was used.
-    chain = (
-        user_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
-    )
+    chain = user_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
     chain.execute = AsyncMock(return_value=SimpleNamespace(data=[]))
     monkeypatch.setattr("app.routers.feedback._target_exists_for_user", _atrue)
     app.dependency_overrides[get_async_user_supabase] = lambda: user_sb

@@ -56,9 +56,7 @@ async def _target_get(supabase: AsyncClient, target_id: str) -> JobTarget | None
     return crud._parse_target(rows[0]) if rows else None
 
 
-async def _fit_score_marker(
-    supabase: AsyncClient, *, user_id: str, target_id: str
-) -> str | None:
+async def _fit_score_marker(supabase: AsyncClient, *, user_id: str, target_id: str) -> str | None:
     """Async inline of ``crud.get_fit_score_prose_doc_id`` — the version marker on
     the user's link, re-read right before a lazy refresh recomputes so a concurrent
     refresh (two quick views) doesn't double-spend the LLM."""

@@ -2193,11 +2193,20 @@ def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(
     monkeypatch.setattr(poller_mod, "_is_pipeline_active", _active)
     monkeypatch.setattr(poller_mod, "_ACTIVE_RECHECK_S", 0.02)
     monkeypatch.setattr(
-        poller_mod, "_read_enabled_sources", AsyncMock(return_value=[{"id": f"s-{i}"} for i in range(40)])
+        poller_mod,
+        "_read_enabled_sources",
+        AsyncMock(return_value=[{"id": f"s-{i}"} for i in range(40)]),
     )
-    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=MagicMock(
-        payer_for=lambda _tid: None, target_blocked=lambda _tid: False,
-    )))
+    monkeypatch.setattr(
+        poller_mod,
+        "build_budget_gate",
+        AsyncMock(
+            return_value=MagicMock(
+                payer_for=lambda _tid: None,
+                target_blocked=lambda _tid: False,
+            )
+        ),
+    )
 
     polled: list[str] = []
 

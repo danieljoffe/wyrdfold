@@ -124,7 +124,11 @@ async def test_off_family_rows_never_badge() -> None:
         labels={"t-eng": "Senior Frontend Engineer"},
         families={"t-eng": "engineering"},
         score_rows=[
-            {"job_posting_id": "cx", "target_id": "t-eng", "job_role_family": "customer_experience"},
+            {
+                "job_posting_id": "cx",
+                "target_id": "t-eng",
+                "job_role_family": "customer_experience",
+            },
             {"job_posting_id": "eng", "target_id": "t-eng", "job_role_family": "engineering"},
             {"job_posting_id": "untagged", "target_id": "t-eng", "job_role_family": None},
         ],
@@ -141,7 +145,9 @@ async def test_unclassified_target_is_ungated() -> None:
         user_target_ids=["t"],
         labels={"t": "Anything Goes"},
         families={"t": None},
-        score_rows=[{"job_posting_id": "cx", "target_id": "t", "job_role_family": "customer_experience"}],
+        score_rows=[
+            {"job_posting_id": "cx", "target_id": "t", "job_role_family": "customer_experience"}
+        ],
     )
     assert "cx" in await _membership(sb, _USER, ["cx"])
 
@@ -180,9 +186,7 @@ def test_endpoint_requires_auth_and_returns_memberships() -> None:
     app.dependency_overrides[get_current_user_id] = lambda: _USER
     app.dependency_overrides[get_async_user_supabase] = lambda: sb
 
-    r = TestClient(app).post(
-        "/jobs/target-membership", json={"job_posting_ids": ["a", "b"]}
-    )
+    r = TestClient(app).post("/jobs/target-membership", json={"job_posting_ids": ["a", "b"]})
     assert r.status_code == 200
     body = r.json()
     assert body["memberships"]["a"][0]["label"] == "Frontend Roles"

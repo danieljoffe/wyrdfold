@@ -103,7 +103,9 @@ def test_get_job_malformed_uuid_returns_404_not_500() -> None:
     # _assert_user_owns_posting does:
     #   table("jobs").select(...).eq("id", posting_id).limit(1).execute()
     supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
-        AsyncMock(side_effect=_api_error("22P02", 'invalid input syntax for type uuid: "not-a-uuid"'))
+        AsyncMock(
+            side_effect=_api_error("22P02", 'invalid input syntax for type uuid: "not-a-uuid"')
+        )
     )
 
     # The jobs router gates every route with ``verify_api_key_or_jwt``; override

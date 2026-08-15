@@ -104,7 +104,7 @@ async def _ids(client: AsyncClient, target_id: str, f: _LogisticsFilter) -> set[
 async def test_remote_only_drops_onsite(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     target_id, _ = seeded_logistics
     got = await _ids(async_service_client, target_id, _LogisticsFilter(remote_only=True))
@@ -114,7 +114,7 @@ async def test_remote_only_drops_onsite(
 async def test_min_salary_drops_below(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     target_id, _ = seeded_logistics
     got = await _ids(async_service_client, target_id, _LogisticsFilter(min_salary=150000))
@@ -124,17 +124,19 @@ async def test_min_salary_drops_below(
 async def test_country_drops_mismatch_lenient_on_null(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     target_id, _ = seeded_logistics
-    got = await _ids(async_service_client, target_id, _LogisticsFilter(country="us"))  # case-insensitive
+    got = await _ids(
+        async_service_client, target_id, _LogisticsFilter(country="us")
+    )  # case-insensitive
     assert got == {"remote_hi", "onsite_hi", "remote_lo"}  # CA dropped
 
 
 async def test_filters_compose(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     target_id, _ = seeded_logistics
     got = await _ids(
@@ -148,7 +150,7 @@ async def test_filters_compose(
 async def test_no_filter_returns_all_with_logistics_overlaid(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     """Sanity: with no filter every row returns AND carries its logistics_filters
     (proving the SELECT + overlay wiring, not just the drop logic)."""
@@ -177,7 +179,7 @@ async def test_no_filter_returns_all_with_logistics_overlaid(
 async def test_rpc_fast_path_also_returns_logistics(
     service_client: Client,
     async_service_client: AsyncClient,
-    seeded_logistics: tuple[str, dict[str, str]]
+    seeded_logistics: tuple[str, dict[str, str]],
 ) -> None:
     """The keyset RPC fast path (non-score sort, no floor) now carries
     logistics_filters too (#86), so chips render on created_at/title/company

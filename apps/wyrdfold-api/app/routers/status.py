@@ -86,15 +86,19 @@ async def _upsert_user_job(
     so this async handler inlines the same upsert rather than fork a twin (#57
     slice 4 — mirrors ``jobs._upsert_user_job_async`` / ``persistence.
     mark_job_resume_draft``)."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 async def _status_history_rows(
@@ -152,15 +156,19 @@ async def _insert_status_log(
 
     Module-level async helper: keeps the ``.execute()`` out of the handler body
     (#107 guard)."""
-    await supabase.table("status_log").insert(
-        {
-            "posting_id": posting_id,
-            "old_status": old_status,
-            "new_status": new_status,
-            "note": note,
-            "user_id": user_id,
-        }
-    ).execute()
+    await (
+        supabase.table("status_log")
+        .insert(
+            {
+                "posting_id": posting_id,
+                "old_status": old_status,
+                "new_status": new_status,
+                "note": note,
+                "user_id": user_id,
+            }
+        )
+        .execute()
+    )
 
 
 # Handlers are `async def` (#57 slice 4): their DB round-trips await natively on
@@ -208,9 +216,7 @@ async def update_status(
     # Per-user pipeline state lives in user_jobs (#75 C3): this writer no
     # longer touches the global jobs.status. The list/counts read per-user
     # status from user_jobs and gate global liveness on jobs.archived_at.
-    await _upsert_user_job(
-        supabase, user_id=user_id, job_posting_id=posting_id, status=body.status
-    )
+    await _upsert_user_job(supabase, user_id=user_id, job_posting_id=posting_id, status=body.status)
 
     # Scoped invalidation: a single posting status change only affects the
     # owning target's cached pages and the global view. Sibling targets'

@@ -74,6 +74,7 @@ async def _record_embedding_cost(
             )
         )
 
+
 # Cost-log grouping label — sliceable alongside "qualification.tagger",
 # "experience.chunks", etc. on the spend dashboard.
 JOB_EMBED_PURPOSE = "prescan.job_embed"

@@ -330,8 +330,7 @@ class _VectorStoreQuery:
             if self._table == "job_embeddings":
                 self._store.vectors.extend(dict(r) for r in rows)
             returned = [
-                {**dict(r), "id": "row-0", "created_at": "2026-06-24T00:00:00+00:00"}
-                for r in rows
+                {**dict(r), "id": "row-0", "created_at": "2026-06-24T00:00:00+00:00"} for r in rows
             ]
             return _FakeResp(returned)
         if self._table == "job_embeddings":

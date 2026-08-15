@@ -76,9 +76,7 @@ async def test_output_dimension_shortens_the_vector() -> None:
     default AND really is the vector length — so dimension-mismatch bugs
     reproduce in tests instead of hiding behind a fixed-size mock."""
     client = MockEmbeddingsClient()
-    result = await client.embed(
-        model="voyage-3.5", inputs=["x"], purpose="t", output_dimension=512
-    )
+    result = await client.embed(model="voyage-3.5", inputs=["x"], purpose="t", output_dimension=512)
     assert len(result.embeddings[0]) == 512
     assert client.calls[0]["output_dimension"] == 512
 

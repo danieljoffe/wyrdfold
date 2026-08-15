@@ -255,9 +255,6 @@ async def _scrub_shared_scores(supabase: AsyncClient, target_ids: list[str]) -> 
     update_payload: dict[str, Any] = dict.fromkeys(_SCORE_PII_COLUMNS, None)
     update_payload["scoring_status"] = "stage2"
     resp = (
-        await supabase.table("scores")
-        .update(update_payload)
-        .in_("target_id", target_ids)
-        .execute()
+        await supabase.table("scores").update(update_payload).in_("target_id", target_ids).execute()
     )
     return len(resp.data or [])

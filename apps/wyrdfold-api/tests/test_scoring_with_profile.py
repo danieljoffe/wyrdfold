@@ -63,7 +63,6 @@ def test_high_score_for_ideal_match():
     assert body_only.score < ideal.score
 
 
-
 def test_low_score_for_poor_match():
     profile = _profile(
         core={"React": 3, "TypeScript": 3},
@@ -479,8 +478,7 @@ def test_breakdown_components_sum_to_score():
     )
     result = score_job_with_profile(
         "Lead React Engineer",
-        "<h3>Requirements</h3><p>React, GraphQL, fintech background, "
-        "lead experience.</p>",
+        "<h3>Requirements</h3><p>React, GraphQL, fintech background, lead experience.</p>",
         profile,
     )
     axes_sum = (

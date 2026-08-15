@@ -91,12 +91,10 @@ def test_is_pipeline_active_falls_through_to_membership_count() -> None:
         targets_table.select.return_value.eq.return_value.limit.return_value.execute.return_value.data
     ) = [{"app_active": False}]
     ut_table = MagicMock()
-    (
-        ut_table.select.return_value.eq.return_value.eq.return_value.execute.return_value.count
-    ) = 2
+    (ut_table.select.return_value.eq.return_value.eq.return_value.execute.return_value.count) = 2
 
-    supabase.table.side_effect = (
-        lambda name: targets_table if name == crud.TARGETS_TABLE else ut_table
+    supabase.table.side_effect = lambda name: (
+        targets_table if name == crud.TARGETS_TABLE else ut_table
     )
 
     assert crud.is_pipeline_active(supabase, "t-1") is True

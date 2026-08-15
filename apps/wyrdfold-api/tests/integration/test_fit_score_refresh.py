@@ -99,9 +99,9 @@ def test_get_marker_reads_current_version(service_client: Client) -> None:
             fit_score_reasoning="x",
             fit_score_prose_doc_id=new_marker,
         )
-        assert crud.get_fit_score_prose_doc_id(service_client, user_id=uid, target_id=target_id) == (
-            new_marker
-        )
+        assert crud.get_fit_score_prose_doc_id(
+            service_client, user_id=uid, target_id=target_id
+        ) == (new_marker)
     finally:
         _cleanup(service_client, target_id)
         delete_auth_user(service_client, uid)

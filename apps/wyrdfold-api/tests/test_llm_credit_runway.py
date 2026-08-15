@@ -405,7 +405,6 @@ class TestResettingKeyCapRule:
         assert len(report.alerts) == 1
 
 
-
 class TestBudgetTruthSource:
     """2026-08-12 incident. The alarm mixed two sources: `remaining` from
     OpenRouter, `daily_rate` from our own `llm_costs`. The ledger records only

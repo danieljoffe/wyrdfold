@@ -153,9 +153,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fit: JobFitResult) -> None:
         return MagicMock()
 
     monkeypatch.setattr("app.services.fit.score_persistence.derive_job_fit", fake_derive)
-    monkeypatch.setattr(
-        "app.services.fit.score_persistence.record_llm_cost_async", fake_cost
-    )
+    monkeypatch.setattr("app.services.fit.score_persistence.record_llm_cost_async", fake_cost)
 
 
 @pytest.mark.asyncio

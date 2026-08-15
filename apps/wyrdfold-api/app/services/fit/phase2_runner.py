@@ -296,11 +296,7 @@ async def run_phase2_for_jobs(
         cos = cosines.get(jid, -1.0)
         conf = state[jid][3]  # phase1_confidence
         c = int(conf) if conf is not None else -1
-        seen = (
-            job_by_id[jid].get("source_posted_at")
-            or job_by_id[jid].get("cataloged_at")
-            or ""
-        )
+        seen = job_by_id[jid].get("source_posted_at") or job_by_id[jid].get("cataloged_at") or ""
         return (cos, c, seen)
 
     candidates.sort(key=_priority, reverse=True)

@@ -168,7 +168,9 @@ class TestComputePipeline:
         assert [r["posting_id"] for r in mine] == ["p1"]
         assert len(mine) == 1
 
-        everyone = await _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, None)
+        everyone = await _fetch_status_logs_window(
+            _faithful_supabase(seed), None, None, {"p1"}, None
+        )
         assert len(everyone) == 2
 
     async def test_empty_data(self):
@@ -492,7 +494,9 @@ class TestPipelineGroupByRpcByteIdentical:
         }
         jobs_by_id = {j["id"]: j for j in seed["jobs"]}
         win_pids = {pid for pid in member if jobs_by_id[pid]["cataloged_at"] >= since.isoformat()}
-        ref_logs = await _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
+        ref_logs = await _fetch_status_logs_window(
+            _faithful_supabase(seed), since, None, win_pids, _USER
+        )
         ref_current = _kpis_from(ref_counts, ref_logs)
 
         # Funnel is byte-identical to the Python recompute.
@@ -1836,9 +1840,7 @@ class TestTargetsHappyPathSkipsMembershipWalk:
             tables_read.append(name)
             tbl = MagicMock()
             result = MagicMock()
-            result.data = (
-                [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
-            )
+            result.data = [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
             for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq", "in_"):
                 getattr(tbl, method).return_value = tbl
             tbl.execute = AsyncMock(return_value=result)
@@ -1901,7 +1903,15 @@ class TestTargetsHappyPathSkipsMembershipWalk:
         assert result.score_trend == []
         assert result.unscored_count == 0
         assert [b.bucket for b in result.score_distribution] == [
-            "0-10", "10-20", "20-30", "30-40", "40-50",
-            "50-60", "60-70", "70-80", "80-90", "90-100",
+            "0-10",
+            "10-20",
+            "20-30",
+            "30-40",
+            "40-50",
+            "50-60",
+            "60-70",
+            "70-80",
+            "80-90",
+            "90-100",
         ]
         assert all(b.count == 0 for b in result.score_distribution)

@@ -932,6 +932,7 @@ async def _assemble_jobs_page(
     # pre-filter total and render short. The score cutoff is NOT here — it's
     # already folded into min_score at the query layer.
     has_pref_filter = _preferences_have_post_fetch_filter(preferences)
+
     def _include_unknown_salary_for_row(row: dict[str, Any]) -> bool:
         """``_include_unknown_salary`` for a scores row (no hydrated posting
         exists yet at pre-filter time). Same precedence: explicit per-target
@@ -982,9 +983,7 @@ async def _assemble_jobs_page(
         }
         logistics_prefiltered = True
 
-    has_logistics_filter = (
-        logistics is not None and logistics.active and not logistics_prefiltered
-    )
+    has_logistics_filter = logistics is not None and logistics.active and not logistics_prefiltered
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
@@ -1832,11 +1831,7 @@ def _apply_logistics_filter(
     if not f.active:
         return postings
     resolve = include_unknown_salary_for or (lambda _p: False)
-    return [
-        p
-        for p in postings
-        if _logistics_passes(p, f, include_unknown_salary=resolve(p))
-    ]
+    return [p for p in postings if _logistics_passes(p, f, include_unknown_salary=resolve(p))]
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -2669,9 +2664,7 @@ async def _get_target_async(supabase: AsyncClient, target_id: str) -> JobTarget 
     return _parse_target(rows[0]) if rows else None
 
 
-async def _active_targets_for_user_async(
-    supabase: AsyncClient, user_id: str
-) -> list[JobTarget]:
+async def _active_targets_for_user_async(supabase: AsyncClient, user_id: str) -> list[JobTarget]:
     """Async inline of ``crud.get_active_for_user`` — the caller's active
     memberships as full target rows (``crud`` stays sync for its poller callers,
     #57 PR-G2e-4). Mirrors ``targets._active_targets_for_user``."""
@@ -2694,23 +2687,18 @@ async def _all_active_targets_async(supabase: AsyncClient) -> list[JobTarget]:
     EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
     Python (the operator/api-key manual-add fan-out, #57 PR-G2e-4). Mirrors
     ``targets._active_targets``."""
-    floor_resp = await (
-        supabase.table("targets").select("*").eq("app_active", True).execute()
-    )
+    floor_resp = await supabase.table("targets").select("*").eq("app_active", True).execute()
     member_ids_resp = await (
         supabase.table("user_targets").select("target_id").eq("is_active", True).execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
     missing = sorted(member_ids - seen)
     if missing:
-        member_resp = await (
-            supabase.table("targets").select("*").in_("id", missing).execute()
-        )
+        member_resp = await supabase.table("targets").select("*").in_("id", missing).execute()
         rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
     return [_parse_target(r) for r in rows]
 
@@ -3031,15 +3019,19 @@ async def _upsert_user_job_async(
     the not-yet-converted routers, so the async handler inlines the same upsert
     rather than fork a twin (#57 slice 3/4 — mirrors ``persistence.
     mark_job_resume_draft``)."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 @router.get("/{posting_id}")

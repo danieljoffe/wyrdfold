@@ -61,9 +61,7 @@ def jd_similarity(
     return len(hits_a & hits_b) / len(union)
 
 
-async def _current_master_created_at(
-    supabase: AsyncClient, user_id: str | None
-) -> datetime | None:
+async def _current_master_created_at(supabase: AsyncClient, user_id: str | None) -> datetime | None:
     """``created_at`` of the user's CURRENT master optimized doc, or None.
 
     Async inline of ``optimized.get_latest``'s timestamp read — the sync helper

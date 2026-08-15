@@ -110,9 +110,7 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
     ``crud.get_user_target_ids`` (which stays sync for its sync callers) — an
     async handler holds the async user client and can't hand it to that sync
     helper (#57 slice 3)."""
-    resp = (
-        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
-    )
+    resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 
@@ -136,8 +134,7 @@ async def _member_target_rows(
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return [
-        (str(r["id"]), str(r.get("label") or ""), int(r.get("profile_version") or 1))
-        for r in rows
+        (str(r["id"]), str(r.get("label") or ""), int(r.get("profile_version") or 1)) for r in rows
     ]
 
 
@@ -189,9 +186,7 @@ async def target_insights(
     target_ids = await _user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_targets()
-    result = await compute_targets(
-        supabase, _since(period), target_ids=target_ids, user_id=user_id
-    )
+    result = await compute_targets(supabase, _since(period), target_ids=target_ids, user_id=user_id)
     insights_cache.set(cache_key, result)
     return result
 

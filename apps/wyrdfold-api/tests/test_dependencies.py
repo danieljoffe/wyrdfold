@@ -502,7 +502,9 @@ async def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
         return budget_mod.ResolvedQuota(25.0, True, ("fit.job", "poll_scoring"))
 
     monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
-    await enforce_llm_budget(user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0))
+    await enforce_llm_budget(
+        user_id=USER_SUB, supabase=MagicMock(), s=_budget_settings(monthly=5.0)
+    )
     assert captured["monthly_limit_usd"] == 25.0
     assert captured["monthly_excluded_purposes"] == ("fit.job", "poll_scoring")
     # The hourly/daily rails must meter interactive spend only — the

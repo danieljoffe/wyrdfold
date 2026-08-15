@@ -120,8 +120,7 @@ def detect_gaps(payload: OptimizedPayload) -> list[Gap]:
                     ref=outcome.description[:80],
                     priority=20,
                     context=(
-                        "Outcome lacks a quantified metric: "
-                        f"'{_snippet(outcome.description)}'"
+                        f"Outcome lacks a quantified metric: '{_snippet(outcome.description)}'"
                     ),
                 )
             )

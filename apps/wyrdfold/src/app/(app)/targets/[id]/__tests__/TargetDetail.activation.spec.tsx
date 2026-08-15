@@ -256,3 +256,104 @@ describe('TargetDetail — membership state in the header', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+/**
+ * The cap is not a plain failure — it has a way out, and the header is the
+ * OTHER place activation can be attempted. The swap picker was wired only
+ * into the cards grid, so activating from a target's own page (the natural
+ * spot, and where a deep link lands you) still dead-ended on a sentence
+ * telling the user to "deactivate one first" with no way to do it.
+ */
+describe('active-target cap from the detail header', () => {
+  /** A 409 shaped exactly like the API's ACTIVE_LIMIT body. */
+  function cappedResponse() {
+    const body = {
+      detail: {
+        error: 'ACTIVE_LIMIT',
+        limit: 2,
+        active_count: 2,
+        message: 'You already have 2 active targets. Deactivate one first.',
+        active_targets: [
+          { id: 't-9', label: 'Staff Full-Stack Engineer' },
+          { id: 't-8', label: 'Founding Engineer' },
+        ],
+      },
+    };
+    return {
+      ok: false,
+      status: 409,
+      clone: () => ({ json: async () => body }),
+      json: async () => body,
+    };
+  }
+
+  it('offers the picker instead of a dead-end toast, and swaps the chosen one', async () => {
+    const fetchMock = mockFetch(false, { post: cappedResponse() });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<TargetDetail id='t-1' />);
+    await screen.findByRole('button', { name: 'Activate' });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Activate' }));
+
+    // Every active target is offered by name — not a fixed "swap the other
+    // one", which only works at cap 1.
+    await screen.findByText('Staff Full-Stack Engineer');
+    expect(screen.getByText('Founding Engineer')).toBeInTheDocument();
+
+    // Nothing was toasted as a failure; the cap is a choice, not an error.
+    expect(mockToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ variant: 'error' })
+    );
+
+    // Choosing one retries the activation naming it as the target to free.
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: true, json: async () => TARGET });
+      }
+      if (input.endsWith('/user-target')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ user_target: userTarget(true), target: TARGET }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => TARGET });
+    });
+
+    await userEvent.click(screen.getByText('Founding Engineer'));
+    await userEvent.click(screen.getByRole('button', { name: 'Swap' }));
+
+    await waitFor(() => {
+      const swap = fetchMock.mock.calls.find(
+        ([, init]) => (init as RequestInit | undefined)?.body
+      );
+      expect(swap).toBeDefined();
+      const init = swap?.[1] as RequestInit;
+      expect(JSON.parse(init.body as string)).toEqual({
+        deactivate_target_id: 't-8',
+      });
+    });
+  });
+
+  it('still surfaces a non-cap failure as an error toast', async () => {
+    global.fetch = mockFetch(false, {
+      post: {
+        ok: false,
+        status: 500,
+        clone: () => ({ json: async () => ({}) }),
+        json: async () => ({ detail: 'boom' }),
+      },
+    }) as unknown as typeof fetch;
+
+    render(<TargetDetail id='t-1' />);
+    await screen.findByRole('button', { name: 'Activate' });
+    await userEvent.click(screen.getByRole('button', { name: 'Activate' }));
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: 'error' })
+      )
+    );
+    expect(screen.queryByText('Founding Engineer')).not.toBeInTheDocument();
+  });
+});

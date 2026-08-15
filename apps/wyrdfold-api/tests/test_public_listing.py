@@ -196,9 +196,7 @@ def test_bff_forwarded_call_is_allowed(monkeypatch) -> None:
     rid = str(uuid4())
     _stub_get_listing(monkeypatch, result=_result(rid))
     app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret="s3cret")
-    r = TestClient(app).get(
-        f"/public/listings/{rid}", headers={"x-wyrdfold-bff": "s3cret"}
-    )
+    r = TestClient(app).get(f"/public/listings/{rid}", headers={"x-wyrdfold-bff": "s3cret"})
     assert r.status_code == 200
 
 

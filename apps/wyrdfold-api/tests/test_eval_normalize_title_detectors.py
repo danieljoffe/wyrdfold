@@ -40,7 +40,7 @@ def test_accepts_a_level_word_the_title_did_have() -> None:
 
 
 def test_expanding_an_abbreviation_is_not_a_leak() -> None:
-    """"Sr." -> "Senior" is the canonicalization working, not an invention."""
+    """ "Sr." -> "Senior" is the canonicalization working, not an invention."""
     got = _one("Senior Product Manager", "Sr. Product Manager (Remote, US) — Platform")
     assert got["seniority_leak"] == []
 
@@ -90,7 +90,9 @@ def test_flags_a_label_stripped_down_to_nothing() -> None:
 
 
 def test_flags_an_over_length_label() -> None:
-    long_label = "Senior Product Builder Product Manager Enterprise Readiness and Admin Platform Team"
+    long_label = (
+        "Senior Product Builder Product Manager Enterprise Readiness and Admin Platform Team"
+    )
     assert _one(long_label, long_label)["over_length"] is True
 
 

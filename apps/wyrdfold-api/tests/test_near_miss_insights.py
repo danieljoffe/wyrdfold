@@ -160,9 +160,7 @@ async def test_route_returns_empty_shape_for_user_with_no_targets():
     )
     service = MagicMock()
 
-    result = await near_miss_insights(
-        user_id="u-near-miss-none", supabase=caller, service=service
-    )
+    result = await near_miss_insights(user_id="u-near-miss-none", supabase=caller, service=service)
     assert result.targets == []
     service.table.assert_not_called()
 

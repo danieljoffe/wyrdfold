@@ -144,9 +144,7 @@ async def test_near_miss_compute_roundtrips_against_real_postgrest(
         "target_id", store_target.id
     ).eq("title_norm", "stale near miss").execute()
 
-    result = await compute_near_misses(
-        async_service_client, [(store_target.id, "IT Target", 1)]
-    )
+    result = await compute_near_misses(async_service_client, [(store_target.id, "IT Target", 1)])
 
     got = result.targets[0]
     assert got.label == "IT Target"
