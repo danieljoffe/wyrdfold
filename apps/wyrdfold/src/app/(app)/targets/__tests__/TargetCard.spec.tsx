@@ -379,4 +379,44 @@ describe('TargetCard', () => {
     );
     expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
   });
+
+  /**
+   * The card navigated via `router.push` on a `role="button"` div, so there
+   * was no cmd/middle-click to open a target in a new tab and no link to copy
+   * — everything an anchor gives for free (first sweep C4).
+   */
+  function renderPlainCard() {
+    render(
+      <TargetCard
+        target={makeTarget()}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+  }
+
+  it('exposes the target as a real link, so it can be opened in a new tab', () => {
+    renderPlainCard();
+    const link = screen.getByRole('link', {
+      name: /senior frontend engineer/i,
+    });
+    expect(link).toHaveAttribute('href', '/targets/t-1');
+  });
+
+  it('does not also fire the card push when the link itself is clicked', async () => {
+    const user = userEvent.setup();
+    renderPlainCard();
+    await user.click(
+      screen.getByRole('link', { name: /senior frontend engineer/i })
+    );
+    // The anchor handles navigation; the card's router.push must not also fire.
+    expect(mockPush).not.toHaveBeenCalled();
+  });
 });

@@ -673,15 +673,22 @@ async def test_from_suggestion_matched_dedups_to_existing_row(
 
 
 @pytest.mark.asyncio
-async def test_from_suggestion_no_profile_skips_fit_score(
+async def test_from_suggestion_still_fit_scores_when_the_inline_payload_is_none(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
     sched: Any,
 ) -> None:
-    """payload=None (user has no experience profile): a matched suggestion links
-    but schedules NO fit-score task (fit needs the profile). Profile-independent
-    is the whole point of the search fallback."""
+    """A None INLINE payload must not skip fit scoring.
+
+    `_apply_fit_score` resolves a FRESH payload itself and uses the passed one
+    only as a fallback, so the old `if payload is not None` guard tested the
+    wrong thing: it skipped users who had a perfectly resolvable profile, and
+    left no trace when it did. That silent skip is how a target reached prod
+    with a permanently null fit_score (resweep C1).
+
+    Scheduling the task is correct here; whether it produces a score is
+    `_apply_fit_score`'s call, covered below."""
     supabase = MagicMock()
     matched = _target(id="existing")
     monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
@@ -696,20 +703,20 @@ async def test_from_suggestion_no_profile_skips_fit_score(
     )
 
     assert result.was_matched is True
-    # Linked, but NO fit-score task — nothing to score against.
     assert stub_crud.by_name("link")[0]["is_active"] is False
-    assert sched.calls == {}
-    assert sched.names == []
+    # The fit-score task IS scheduled — the fresh resolve is what decides.
+    assert any("fit-score" in n for n in sched.names), sched.names
 
 
 @pytest.mark.asyncio
-async def test_derive_manual_target_bg_skips_fit_when_no_payload(
+async def test_derive_manual_target_bg_fit_scores_from_the_fresh_payload(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
 ) -> None:
-    """Background derive with payload=None still derives the label profile
-    (status→idle) but skips the fit score."""
+    """Background derive with a None inline payload still derives the label
+    profile (status→idle) AND fit-scores, because `_apply_fit_score` resolves a
+    fresh payload of its own. The old guard skipped the score outright."""
     supabase = MagicMock()
 
     await from_input.derive_manual_target_bg(
@@ -723,10 +730,12 @@ async def test_derive_manual_target_bg_skips_fit_when_no_payload(
 
     names = stub_llm_helpers.names()
     assert "derive_from_label" in names  # profile still derived from the label
-    assert "fit_score" not in names  # but no per-user fit score
+    assert "fit_score" in names  # ...and scored against the freshly-resolved payload
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
-    assert stub_crud.by_name("link") == []  # fit-score link upsert skipped
+    # ...and the score is written onto the link.
+    link = stub_crud.by_name("link")[0]
+    assert link["fit_score"] == 82
 
 
 # ---- from_url: inline path --------------------------------------------------
@@ -1502,3 +1511,38 @@ async def test_from_url_survives_a_cost_ledger_failure(
         payload=OptimizedPayload(),
     )
     assert result.was_matched is False
+
+
+@pytest.mark.asyncio
+async def test_apply_fit_score_logs_when_there_is_no_payload_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Neither a fresh nor an inline payload: skip, but SAY SO.
+
+    This is the state that produced a target stuck with a null fit_score for a
+    full day. Skipping is fine — `fit_refresh` heals the link on a later view
+    once the user has a profile — but skipping in silence left nothing to
+    diagnose it by. The warning is the whole fix for this half.
+    """
+
+    async def no_payload(supabase, llm, *, cost_supabase, user_id):  # type: ignore[no-untyped-def]
+        return None, None
+
+    monkeypatch.setattr(from_input, "resolve_current_payload", no_payload)
+
+    with caplog.at_level("WARNING"):
+        await from_input._apply_fit_score(
+            MagicMock(),
+            MagicMock(),
+            user_id="user-1",
+            target=_target(id="t-unscored"),
+            payload=None,
+        )
+
+    assert "fit_score" not in stub_llm_helpers.names()  # no LLM spend
+    assert stub_crud.by_name("link") == []  # nothing written
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("t-unscored" in m for m in messages), messages

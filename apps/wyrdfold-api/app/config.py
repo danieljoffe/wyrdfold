@@ -399,14 +399,6 @@ class Settings(BaseSettings):
     # description" (title/company/location only).
     qualification_jd_snippet_chars: int = Field(default=600, ge=0)
 
-    # Catalog-wide skill extraction (backs /search?skill=react). A SEPARATE
-    # cheap call per job alongside the tagger — deliberately not folded into
-    # the tagger prompt, which measured a ~4-point role_family regression
-    # (see services/qualification/skills.py for the A/B and the model
-    # bake-off). Forward-only: newly-tagged jobs get skills, history is not
-    # backfilled, so coverage grows as the catalog turns over.
-    # ~$12/mo at current intake; 0/False disables and the column stays NULL.
-    skills_extraction_enabled: bool = True
     # deepseek-v3-2 won the bake-off on quality-per-dollar (100% valid JSON,
     # ~6x the recall of the sub-cent tier, ~1/14th of Sonnet's cost). Pinned
     # into the prompt-regression golden so a swap can't merge silently.
@@ -527,8 +519,10 @@ class Settings(BaseSettings):
     # produces the grade (marginal cost ≈ output tokens only). Purely
     # informational, never a score input; the eval re-baseline that shipped
     # this flag proved band stability with the addendum on. Fields persist to
-    # jobs.skills_required (canonical) + the scores row (denormalized for the
-    # insights aggregation — the analyses-only source covered ~146 rows ever).
+    # the scores row (pair-level, denormalized for the insights aggregation —
+    # the analyses-only source covered ~146 rows ever). It does NOT write
+    # jobs.skills_required: that column is the search facet, owned solely by
+    # the skill dictionary so the vocabulary stays canonical.
     # Historical grades are NOT backfilled; columns populate as jobs (re)grade.
     skills_harvest_enabled: bool = True
 

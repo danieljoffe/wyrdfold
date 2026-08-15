@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Briefcase, MoreVertical, Power, Trash2 } from 'lucide-react';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
@@ -121,6 +122,10 @@ export default function TargetCard({
               <ScoreBadge
                 score={fitScore}
                 size='sm'
+                // This is the ONE 'fit' chip in the app — how well the target
+                // suits the user's experience. Every other ScoreBadge is a
+                // job's 'match' against a target, on a different scale.
+                kind='fit'
                 // The bare number badge was the sweep's "score of what?"
                 // moment (re-sweep R3) — the tooltip now NAMES it before
                 // the reasoning prose.
@@ -129,9 +134,24 @@ export default function TargetCard({
                 }`}
               />
             )}
-            <span className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary'>
+            {/* A real <a href> — the card's own click is a `router.push` on a
+                `role="button"` div, which gives no cmd/middle-click to open in
+                a new tab, no "copy link address", and no status-bar preview.
+                The title is where people aim, so it carries the link; the
+                surrounding card keeps its convenience click.
+
+                Deliberately NOT a stretched overlay across the whole card:
+                that would put the ⋮ menu's <button> inside an <a> (invalid,
+                and the anchor eats the click) and would kill text selection
+                on the card. `stopPropagation` so a plain click is handled by
+                the link alone rather than also firing the card's push. */}
+            <Link
+              href={detailHref}
+              onClick={e => e.stopPropagation()}
+              className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
+            >
               {target.label}
-            </span>
+            </Link>
           </div>
           <div className='shrink-0' onClick={e => e.stopPropagation()}>
             <Dropdown

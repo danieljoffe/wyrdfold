@@ -315,7 +315,7 @@ describe('JobDetailPanel', () => {
     expect(posts).toHaveLength(0);
   });
 
-  it('opening the panel on a cache miss is spend-free: "Analyze fit" renders and nothing POSTs (#634)', async () => {
+  it('opening the panel on a cache miss is spend-free: "Analyze match" renders and nothing POSTs (#634)', async () => {
     const posts: string[] = [];
     global.fetch = jest
       .fn()
@@ -348,7 +348,7 @@ describe('JobDetailPanel', () => {
 
     // The explicit intent affordance — analysis spend now requires a click.
     expect(
-      await screen.findByRole('button', { name: /analyze fit/i })
+      await screen.findByRole('button', { name: /analyze match/i })
     ).toBeInTheDocument();
     expect(posts).toHaveLength(0);
   });
@@ -462,7 +462,7 @@ describe('JobDetailPanel', () => {
 
       // The probe resolves to the button — and no spend has happened yet.
       const analyzeButton = await screen.findByRole('button', {
-        name: /analyze fit/i,
+        name: /analyze match/i,
       });
       expect(posted).toBe(false);
       fireEvent.click(analyzeButton);
@@ -534,7 +534,7 @@ describe('JobDetailPanel', () => {
       );
 
       fireEvent.click(
-        await screen.findByRole('button', { name: /analyze fit/i })
+        await screen.findByRole('button', { name: /analyze match/i })
       );
       await act(async () => {
         await jest.advanceTimersByTimeAsync(6000);

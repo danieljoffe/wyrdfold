@@ -128,12 +128,22 @@ async def call_model(
     max_tokens: int = 1024,
     request_timeout_seconds: float = 120.0,
     response_format_json: bool = True,
+    temperature: float | None = None,
 ) -> CallResult:
     """Single OpenRouter /chat/completions call.
 
     ``response_format_json=True`` asks for JSON mode. Anthropic ignores
     it gracefully; OpenAI/Gemini honor it; some open-source models
     don't. Either way we attempt to parse JSON from the returned text.
+
+    ``temperature`` defaults to None, which leaves it unset and lets the
+    provider pick (~1.0 for Anthropic). That is NOT what production does:
+    ``app/services/llm/client.py:complete_json`` defaults it to **0.0** and
+    forwards it, so every scoring/extraction call in the app runs at 0. An
+    eval that leaves it unset therefore measures a noisier distribution than
+    the thing it is meant to be measuring — pass ``temperature=0.0`` to match
+    prod. Left as None rather than defaulting to 0 here so the existing
+    bake-off scripts, which deliberately sample, are unaffected.
     """
     key = api_key or get_api_key()
     body: dict[str, Any] = {
@@ -145,6 +155,8 @@ async def call_model(
         "max_tokens": max_tokens,
         "usage": {"include": True},  # ask OpenRouter to report cost
     }
+    if temperature is not None:
+        body["temperature"] = temperature
     if response_format_json:
         body["response_format"] = {"type": "json_object"}
 

@@ -224,4 +224,51 @@ describe('TargetDetail', () => {
       expect(screen.getByTestId('learning-log-stub')).toBeInTheDocument()
     );
   });
+
+  /**
+   * One `/user-target` per visit.
+   *
+   * The first sweep reported the detail page firing 6-8 identical
+   * `GET /api/targets/{id}/user-target` requests per visit. I could not
+   * reproduce it: there is exactly ONE call site here, and the mount effect's
+   * dependencies (`fetchTarget`, `fetchUserTarget`) are stable — `toast`
+   * resolves to a `useCallback([], ...)` in ToastProvider, so it does not
+   * re-arm the effect.
+   *
+   * The likely original cause is the /targets LIST page's derive-poller,
+   * which hits the IDENTICAL url every 2.5s by design — 6-8 requests over
+   * ~20s of the same session. That is a different page and correct behaviour.
+   *
+   * Either way the contract worth holding is this one, so it gets a test
+   * rather than a comment: if a future edit destabilises a dependency and
+   * turns the mount effect into a loop, this fails.
+   */
+  it('fetches the user-target row exactly once per visit', async () => {
+    const calls: string[] = [];
+    global.fetch = jest.fn().mockImplementation((input: string) => {
+      calls.push(String(input));
+      if (String(input).endsWith('/reference-jds')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ reference_jds: [] }),
+        });
+      }
+      if (String(input).endsWith('/user-target')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ user_target: USER_TARGET, target: TARGET }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => TARGET });
+    }) as unknown as typeof fetch;
+
+    render(<TargetDetail id='t-1' />);
+    await screen.findByRole('heading', {
+      level: 1,
+      name: /senior frontend engineer/i,
+    });
+
+    const userTargetCalls = calls.filter(c => c.endsWith('/user-target'));
+    expect(userTargetCalls).toEqual(['/api/targets/t-1/user-target']);
+  });
 });

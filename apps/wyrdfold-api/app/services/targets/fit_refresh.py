@@ -117,17 +117,57 @@ async def current_prose_doc_id(supabase: AsyncClient, user_id: str) -> str | Non
     return rows[0].get("id") if rows else None
 
 
+async def _not_deriving(supabase: AsyncClient, target_ids: list[str]) -> list[str]:
+    """Of ``target_ids``, those whose derive is NOT currently in flight.
+
+    Guards the unscored branch below against double-spend: a target created
+    seconds ago is legitimately unscored because its inline derive is still
+    running, and re-deriving it from a page view would pay twice and race the
+    write. Callers pass an already-capped list, so the ``in_`` stays small.
+    """
+    if not target_ids:
+        return []
+    resp = await (
+        supabase.table(crud.TARGETS_TABLE)
+        .select("id, activation_status")
+        .in_("id", target_ids)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return [tid for r in rows if r.get("activation_status") != "deriving" and (tid := r.get("id"))]
+
+
 async def stale_target_ids(
     supabase: AsyncClient, *, user_id: str, current_prose_doc_id: str, limit: int
 ) -> list[str]:
-    """Up to ``limit`` target ids whose cached fit_score is stale vs the current
-    profile version.
+    """Up to ``limit`` target ids whose cached fit_score needs recomputing.
 
-    Stale = the link HAS a score (``fit_score`` not null) but its version marker
-    differs from ``current_prose_doc_id`` — including a NULL marker (scored before
-    version tracking). Unscored links (null ``fit_score``) are skipped: there is
-    nothing to refresh yet (their initial derive is still pending or was never
-    possible). ``limit <= 0`` disables the sweep.
+    Two kinds qualify, UNSCORED FIRST:
+
+    - **Unscored** (``fit_score`` is null) and not currently deriving. These
+      show no badge at all, so they are the worse user-visible state and get
+      priority over a merely-stale number.
+    - **Stale**: the link has a score but its version marker differs from
+      ``current_prose_doc_id`` — including a NULL marker (scored before version
+      tracking).
+
+    ``limit <= 0`` disables the sweep.
+
+    WHY UNSCORED IS INCLUDED (changed 2026-08-15). This function used to skip
+    null scores on the reasoning that "their initial derive is still pending or
+    was never possible". The first half is handled by the ``_not_deriving``
+    guard; the second half was the bug. Nothing ever completes a derive that
+    was never possible, so "pending" became permanent: a target whose creation
+    ran with no resolvable payload (``from_input._apply_fit_score`` is called
+    only ``if payload is not None``, and skipping it records no error either)
+    kept a null score forever. This was the ONLY self-heal path in the system
+    and it was written to skip exactly the state that needs healing — found on
+    prod with a target unscored for a full day
+    (``docs/ux-resweep-targets-2026-08-14.md`` C1).
+
+    Spend stays bounded by the same per-view cap as before; unscored targets
+    just consume it first. A target skipped because the cap filled, or because
+    it was mid-derive, is retried on the next view.
     """
     if limit <= 0:
         return []
@@ -138,6 +178,14 @@ async def stale_target_ids(
         .execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
+
+    unscored_candidates = [
+        tid for r in rows if r.get("fit_score") is None and (tid := r.get("target_id"))
+    ]
+    # Cap BEFORE the status lookup so the `in_` can't grow with the user's
+    # target count (a large `in_` is also a 414 risk on this client).
+    unscored = await _not_deriving(supabase, unscored_candidates[:limit])
+
     stale = [
         tid
         for r in rows
@@ -145,7 +193,7 @@ async def stale_target_ids(
         and r.get("fit_score_prose_doc_id") != current_prose_doc_id
         and (tid := r.get("target_id"))
     ]
-    return stale[:limit]
+    return (unscored + stale)[:limit]
 
 
 async def refresh_stale_fit_scores(

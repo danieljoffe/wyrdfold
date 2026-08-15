@@ -11,6 +11,7 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
+import { parseActiveLimit, type ActiveLimitDetail } from '@/lib/activeLimit';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
 import CreateTargetModal, {
@@ -19,6 +20,7 @@ import CreateTargetModal, {
   type UrlSubmission,
 } from './CreateTargetModal';
 import PendingTargetCard from './PendingTargetCard';
+import SwapActiveTargetModal from './SwapActiveTargetModal';
 import {
   addSearchSuggestionTarget,
   addSuggestionTarget,
@@ -167,6 +169,21 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     setTargets(initialTargets);
   }, [initialTargets]);
 
+  // Set when an activation is refused by the active-target cap: the target
+  // the user wanted, plus the server's list of what is currently holding the
+  // cap. Drives the swap picker.
+  const [swapFor, setSwapFor] = useState<{
+    id: string;
+    label: string;
+    detail: ActiveLimitDetail;
+  } | null>(null);
+
+  const labelFor = useCallback(
+    (id: string) =>
+      targets.find(t => t.target.id === id)?.target.label ?? 'this target',
+    [targets]
+  );
+
   // Flip THIS user's `user_target.is_active` for one target in local state.
   // `isActive` on the card reads this per-user flag (see TargetCard ~14-27),
   // distinct from the shared catalog's `target.app_active` instance floor.
@@ -186,7 +203,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   // nav route (7 requests for one toggle); a targeted GET of just this
   // target's user-target row settles the single card instead.
   const toggleActive = useCallback(
-    async (id: string, active: boolean) => {
+    async (id: string, active: boolean, swapOut?: string) => {
       const endpoint = active ? 'activate' : 'deactivate';
       const failTitle = active
         ? 'Failed to activate target'
@@ -196,14 +213,35 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       try {
         const res = await fetch(`/api/targets/${id}/${endpoint}`, {
           method: 'POST',
+          ...(swapOut
+            ? {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ deactivate_target_id: swapOut }),
+              }
+            : {}),
         });
-        if (!res.ok)
+        if (!res.ok) {
+          // The cap is not a plain failure — it has a way out. Offer the
+          // picker instead of a toast the user can only read and obey.
+          const capped = active ? await parseActiveLimit(res) : null;
+          if (capped) {
+            setActive(id, false); // undo the optimistic flip; nothing changed
+            setSwapFor({ id, label: labelFor(id), detail: capped });
+            return;
+          }
           throw new Error(
             await extractApiError(
               res,
               active ? 'Activate failed' : 'Deactivate failed'
             )
           );
+        }
+        if (swapOut) {
+          // The server deactivated it as part of the swap; mirror that
+          // locally so the other card doesn't keep claiming to be active.
+          setActive(swapOut, false);
+          setSwapFor(null);
+        }
         toast({
           variant: 'success',
           title: active ? 'Target activated' : 'Target deactivated',
@@ -236,7 +274,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         });
       }
     },
-    [toast, setActive]
+    [toast, setActive, labelFor]
   );
 
   const handleActivate = useCallback(
@@ -379,7 +417,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const pollKey = useMemo(() => {
     const ids = new Set(derivingIds);
     for (const t of targets) {
-      if (t.target.activation_status === 'deriving') ids.add(t.target.id);
+      // Seed from the SAME predicate that decides when to stop (`isDeriving`).
+      // These used to disagree: the seed only looked at `activation_status ===
+      // 'deriving'` while the settle condition also treated a null fit_score as
+      // deriving. A target that finished its profile but never got a score was
+      // therefore never picked up on load — no spinner, no poll, no score, and
+      // the backend's lazy refresh skipped it too. Both halves are fixed; this
+      // is the client half.
+      if (isDeriving(t)) ids.add(t.target.id);
     }
     return [...ids].sort().join(',');
   }, [derivingIds, targets]);
@@ -990,6 +1035,15 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
           </div>
         </div>
       )}
+
+      <SwapActiveTargetModal
+        detail={swapFor?.detail ?? null}
+        incomingLabel={swapFor?.label ?? ''}
+        onClose={() => setSwapFor(null)}
+        onSwap={async deactivateId => {
+          if (swapFor) await toggleActive(swapFor.id, true, deactivateId);
+        }}
+      />
 
       <CreateTargetModal
         isOpen={modalOpen}
