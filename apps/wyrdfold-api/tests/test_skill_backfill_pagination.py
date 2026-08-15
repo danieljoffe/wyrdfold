@@ -160,3 +160,81 @@ async def test_full_rescan_advances_by_the_whole_page() -> None:
 
     assert result["scanned"] == 3
     assert result["written"] == 2
+
+
+# --- coverage metric: the 1,000-row clamp ------------------------------------
+
+
+class _FakeCoverageTable:
+    """Models the PostgREST behaviour that broke the metric: a response is
+    CLAMPED to 1,000 rows however many were requested."""
+
+    CLAMP = 1000
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self._range: tuple[int, int] | None = None
+        self.pages_read = 0
+
+    def select(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
+        return self
+
+    def is_(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
+        return self
+
+    def not_(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
+        return self
+
+    def order(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
+        return self
+
+    def limit(self, n: int) -> _FakeCoverageTable:
+        self._range = (0, min(n, self.CLAMP) - 1)
+        return self
+
+    def range(self, lo: int, hi: int) -> _FakeCoverageTable:
+        self._range = (lo, min(hi, lo + self.CLAMP - 1))
+        return self
+
+    async def execute(self) -> Any:
+        lo, hi = self._range or (0, self.CLAMP - 1)
+        page = self.rows[lo : hi + 1]
+        self.pages_read += 1
+        self._range = None
+        return type("R", (), {"data": page})()
+
+
+class _CoverageClient:
+    def __init__(self, jobs: _FakeCoverageTable) -> None:
+        self._jobs = jobs
+
+    def table(self, name: str) -> Any:
+        if name == "jobs":
+            return self._jobs
+        # `scores` / `search_events` feed the other two candidate generators;
+        # empty is fine, this test is about coverage.
+        return _FakeCoverageTable([])
+
+
+@pytest.mark.asyncio
+async def test_coverage_counts_the_whole_catalog_not_the_first_clamped_page() -> None:
+    """THE REGRESSION. `.limit(20000)` returns 1,000 rows, not 20,000.
+
+    Unpaginated, the metric described the first 1,000 jobs of a much larger
+    catalog. Here every job PAST that first page has skills and every job
+    inside it does not — so a clamped scan reports 0% while the true figure is
+    substantial. A blind-spot monitor that always reads zero can never alarm.
+    """
+    from app.services.qualification.skill_growth import vocabulary_candidates
+
+    rows = [
+        {"role_family": "engineering", "skills_required": None} for _ in range(1000)
+    ] + [{"role_family": "engineering", "skills_required": ["react"]} for _ in range(1000)]
+    jobs = _FakeCoverageTable(rows)
+
+    out = await vocabulary_candidates(_CoverageClient(jobs), limit=5)
+
+    cov = {c["role_family"]: c for c in out["family_coverage"]}
+    assert cov["engineering"]["jobs"] == 2000, cov
+    assert cov["engineering"]["with_skills_pct"] == 50.0, cov
+    assert jobs.pages_read > 1, "never paged past the clamp"
