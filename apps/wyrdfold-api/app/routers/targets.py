@@ -292,8 +292,7 @@ async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
         .execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -682,9 +681,7 @@ async def _set_notification_thresholds_async(
     if current is None:
         return None
     updates: dict[str, Any] = {
-        col: thresholds[col]
-        for col in crud._NOTIFICATION_THRESHOLD_COLUMNS
-        if col in thresholds
+        col: thresholds[col] for col in crud._NOTIFICATION_THRESHOLD_COLUMNS if col in thresholds
     }
     if not updates:
         return current
@@ -772,6 +769,29 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
         plan = cast("str | None", rows[0].get("plan")) if rows else None
         return entitlements_for(plan).max_active_targets
     return crud.MAX_ACTIVE_TARGETS_PER_USER
+
+
+def _active_limit_error(e: crud.ActiveTargetLimitError) -> HTTPException:
+    """The one 409 shape for the active-target cap.
+
+    Raised from three places (activate, link/follow, add-from-posting) that
+    each carried a byte-identical copy of this dict. ``message`` is the string
+    the user actually reads — the frontend surfaces it verbatim rather than
+    composing its own — so it is worth having exactly one of.
+    """
+    noun = "target" if e.current_count == 1 else "targets"
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "ACTIVE_LIMIT",
+            "limit": e.limit,
+            "active_count": e.current_count,
+            "message": (
+                f"You already have {e.current_count} active {noun} "
+                f"(limit {e.limit}) — deactivate one first."
+            ),
+        },
+    )
 
 
 async def _link_user_to_target_async(
@@ -909,9 +929,7 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="polling")
-        )
+        await _update_target_async(supabase, target_id, TargetUpdate(activation_status="polling"))
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: %d sources, %d new jobs",
@@ -935,9 +953,7 @@ async def _activate_pipeline(
             retro_scored,
         )
 
-        await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="ready")
-        )
+        await _update_target_async(supabase, target_id, TargetUpdate(activation_status="ready"))
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
         await _update_target_async(
@@ -1088,7 +1104,18 @@ async def create_target_from_url(
         )
     final_url = vr.final_url
 
-    extraction = await _fetch_jd_from_url(final_url)
+    extraction = await _fetch_jd_from_url(
+        final_url,
+        # The generic hint ("paste the JD directly") is true for reference JDs
+        # but NOT here: there is no JD-text field in the create flow, and the
+        # Reference JDs tab it lives on belongs to a target that does not exist
+        # yet. Advising an impossible action is worse than no advice.
+        recovery_hint=(
+            "The page may need a login or render its text with JavaScript. "
+            "Check the link opens publicly, or create the target manually and "
+            "add this posting from its Reference JDs tab."
+        ),
+    )
 
     return await from_input.from_url(
         supabase,
@@ -1427,20 +1454,9 @@ async def activate_target(
     except crud.ActiveTargetLimitError as e:
         # 409 Conflict — the request was well-formed but conflicts with
         # current state (the user is already at the active-target cap).
-        # Frontend reads ``error`` to switch on this case specifically and
-        # offers a deactivate picker rather than a generic toast.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+        # ``error`` lets the frontend switch on this case specifically;
+        # ``message`` is what it shows when it doesn't.
+        raise _active_limit_error(e) from e
     refreshed = await _target_get(supabase, target_id) or target
 
     spawn_detached(
@@ -1770,18 +1786,7 @@ async def link_target(
             fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+        raise _active_limit_error(e) from e
 
 
 @router.post(
@@ -1993,18 +1998,7 @@ async def create_target_from_posting(
                 is_active=True,
             )
         except crud.ActiveTargetLimitError as e:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "ACTIVE_LIMIT",
-                    "limit": e.limit,
-                    "active_count": e.current_count,
-                    "message": (
-                        f"You already have {e.current_count} active targets "
-                        f"(limit {e.limit}) — deactivate one first."
-                    ),
-                },
-            ) from e
+            raise _active_limit_error(e) from e
         # Re-read the target row so the response reflects any writes the
         # linking flow made.
         refreshed = await _target_get(supabase, target.id)
@@ -2016,7 +2010,9 @@ async def create_target_from_posting(
 # ---- Reference JDs ---------------------------------------------------------
 
 
-async def _fetch_jd_from_url(url: str) -> ExtractionResult:
+async def _fetch_jd_from_url(
+    url: str, *, recovery_hint: str = "Try pasting the JD text directly."
+) -> ExtractionResult:
     """Fetch a JD page and run the extraction cascade (JSON-LD → meta → Firecrawl).
 
     Returns ``(title, jd_text)``. The title comes from the same extraction
@@ -2095,10 +2091,7 @@ async def _fetch_jd_from_url(url: str) -> ExtractionResult:
     if len(jd_text) < 50:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Could not extract a job description from that URL. "
-                "Try pasting the JD text directly."
-            ),
+            detail=("Could not extract a job description from that URL. " + recovery_hint),
         )
     # Return the whole extraction (title + company + location + description +
     # salary) so the from-url flow can materialize a full job, not just derive

@@ -5,6 +5,7 @@ import TargetPreferencesEditor, {
   DEFAULT_PREFERENCES,
   parseList,
   parseScoreCutoff,
+  SCORE_MAX,
   type TargetPreferences,
 } from '../TargetPreferencesEditor';
 
@@ -41,16 +42,29 @@ afterAll(() => {
 });
 
 describe('parseScoreCutoff', () => {
+  // The ceiling is 100, not 200. Job scores are hard-clamped to 0-100 at the
+  // write site (api services/scoring.py: `max(0, min(100, ...))`), so a cutoff
+  // above 100 could only ever hide EVERY job — silently, with nothing in the
+  // UI explaining the now-empty list. 150 saved cleanly before this change.
   it.each([
     ['', { value: 40, valid: true }],
     ['0', { value: 0, valid: true }],
-    ['200', { value: 200, valid: true }],
-    ['201', { value: 40, valid: false }],
+    ['100', { value: 100, valid: true }],
+    ['101', { value: 40, valid: false }],
+    ['150', { value: 40, valid: false }],
+    ['200', { value: 40, valid: false }],
     ['-1', { value: 40, valid: false }],
     ['40.5', { value: 40, valid: false }],
     ['abc', { value: 40, valid: false }],
   ])('parses %p', (raw, expected) => {
     expect(parseScoreCutoff(raw as string)).toEqual(expected);
+  });
+
+  it('caps at the same ceiling the score scale actually has', () => {
+    expect(SCORE_MAX).toBe(100);
+    // Guards the regression directly: any value above the real ceiling is
+    // rejected rather than accepted-then-silently-filtering-everything.
+    expect(parseScoreCutoff(String(SCORE_MAX + 1)).valid).toBe(false);
   });
 });
 

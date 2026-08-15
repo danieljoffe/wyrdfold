@@ -206,8 +206,13 @@ class NotificationThresholdsUpdate(BaseModel):
     UI can send one channel or both.
     """
 
-    job_score_threshold: int | None = Field(default=None, ge=0, le=200)
-    sms_score_threshold: int | None = Field(default=None, ge=0, le=200)
+    # Same 0-100 scale as every other score on this model — see the
+    # pref_score_cutoff note below for why 200 was dead range. The editor UI
+    # already capped these at 100; the API was simply more permissive than any
+    # value that can ever fire, so an API client could set 150 and silently
+    # never be alerted.
+    job_score_threshold: int | None = Field(default=None, ge=0, le=100)
+    sms_score_threshold: int | None = Field(default=None, ge=0, le=100)
 
 
 # Closed vocabulary for the seniority range. Mirrors ``SeniorityHint`` (the
@@ -253,13 +258,35 @@ class TargetPreferences(BaseModel):
     (lenient), so these preferences are inert until the firewall lands.
     """
 
-    pref_score_cutoff: int = Field(default=40, ge=0, le=200)
+    pref_score_cutoff: int = Field(default=40, ge=0, le=100)
     pref_locations: list[str] | None = None
     pref_remote_ok: bool = True
     pref_seniority_min: SeniorityLevel | None = None
     pref_seniority_max: SeniorityLevel | None = None
     pref_employment_types: list[str] | None = None
     pref_include_unknown_salary: bool = True
+
+    @field_validator("pref_score_cutoff", mode="before")
+    @classmethod
+    def _clamp_legacy_cutoff(cls, v: object) -> object:
+        """Fold a legacy out-of-range cutoff down to the real ceiling.
+
+        Job scores are hard-clamped to 0-100 at the write site
+        (``services/scoring.py`` — ``max(0, min(100, ...))``), and
+        ``JobFitResult.fit_score`` is ``le=100``, so a cutoff above 100 could
+        only ever hide every job. The bound used to be 200, so rows saved under
+        it can exist; tightening this READ model alone would 500 the
+        preferences page for exactly the users the fix is meant to help. Clamp
+        instead — the stored value converges on the next save, and the meaning
+        is unchanged (">=150" and ">=100" both mean "everything", except 100 is
+        honest about it).
+
+        Deliberately one-directional: it fixes the bound we moved and does not
+        become a blanket "coerce anything", which would mask real corruption.
+        """
+        if type(v) is int and v > 100:
+            return 100
+        return v
 
     @model_validator(mode="after")
     def _seniority_range_ordered(self) -> "TargetPreferences":
@@ -283,7 +310,7 @@ class TargetPreferencesUpdate(BaseModel):
     than an accreting partial. The validation mirrors ``TargetPreferences``.
     """
 
-    pref_score_cutoff: int = Field(default=40, ge=0, le=200)
+    pref_score_cutoff: int = Field(default=40, ge=0, le=100)
     pref_locations: list[str] | None = Field(default=None, max_length=50)
     pref_remote_ok: bool = True
     pref_seniority_min: SeniorityLevel | None = None

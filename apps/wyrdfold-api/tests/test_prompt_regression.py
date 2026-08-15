@@ -67,6 +67,17 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("conversation.onboarding.system", "app.services.conversation.prompts:ONBOARDING_SYSTEM"),
     ("conversation.update.system", "app.services.conversation.prompts:UPDATE_SYSTEM"),
     ("conversation.probe.system", "app.services.conversation.prompts:PROBE_SYSTEM"),
+    # Label-canonicalization prompts. Neither was pinned, because neither file
+    # matches the CONTRIBUTING globs (which name derive_profile*.py but not the
+    # normalize_* siblings). They are quality-bearing all the same: the label
+    # they produce becomes ``crud.normalize_label``'s input, i.e. the
+    # ``targets_normalized_label_key`` UNIQUE key, so a drift here decides
+    # whether two users' targets converge on one catalog row or fork into two.
+    ("normalize_manual.system", "app.services.targets.normalize_manual:SYSTEM_PROMPT"),
+    (
+        "normalize_posting_title.system",
+        "app.services.targets.normalize_posting_title:SYSTEM_PROMPT",
+    ),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
@@ -87,6 +98,11 @@ _SCALARS: tuple[tuple[str, str], ...] = (
     ("model.feedback_learner", "app.services.llm_learner:DEFAULT_MODEL"),
     ("model.analysis", "app.services.analysis.analyze:DEFAULT_MODEL"),
     ("prompt_version.derive_target_from_jd", "app.services.targets.derive_profile:PROMPT_VERSION"),
+    ("model.normalize_manual", "app.services.targets.normalize_manual:DEFAULT_MODEL"),
+    (
+        "model.normalize_posting_title",
+        "app.services.targets.normalize_posting_title:DEFAULT_MODEL",
+    ),
 )
 
 _REGEN_HINT = "UPDATE_PROMPT_GOLDENS=1 uv run pytest tests/test_prompt_regression.py"

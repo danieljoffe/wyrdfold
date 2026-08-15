@@ -306,11 +306,17 @@ def test_patch_idor_other_users_link_404(client: TestClient) -> None:
     supabase.table.return_value.update.assert_not_called()
 
 
-@pytest.mark.parametrize("value,expected", [(0, 200), (200, 200), (-1, 422), (201, 422)])
+# `expected` is the HTTP status. The ceiling is 100, not 200: match scores are
+# hard-clamped to 0-100 at the write site (services/scoring.py), so a threshold
+# above 100 could never fire and the caller would simply never be alerted.
+@pytest.mark.parametrize(
+    "value,expected",
+    [(0, 200), (70, 200), (100, 200), (-1, 422), (101, 422), (150, 422), (200, 422)],
+)
 def test_patch_boundary_validation(client: TestClient, value: int, expected: int) -> None:
     supabase = MagicMock()
     _awire_select(supabase, [_row()])
-    _awire_update(supabase, [_row(job_score_threshold=value if value in (0, 200) else None)])
+    _awire_update(supabase, [_row(job_score_threshold=value if 0 <= value <= 100 else None)])
     app.dependency_overrides[get_async_user_supabase] = lambda: supabase
 
     resp = client.patch(

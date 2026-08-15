@@ -50,6 +50,7 @@ from app.models.targets import (
 from app.services.llm import cost_log
 from app.services.targets import from_input
 from app.services.targets.fit_score import FitScoreResult
+from app.services.targets.normalize_posting_title import NormalizedTitle
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -118,6 +119,16 @@ def _ref_jd(*, target_id: str = "t-1", jd_url: str | None = None) -> TargetRefer
     )
 
 
+
+def _amock(value: Any):  # type: ignore[no-untyped-def]
+    """Async no-op returning a fixed value (find_matching_target stand-in)."""
+
+    async def _inner(*_a, **_k):  # type: ignore[no-untyped-def]
+        return value
+
+    return _inner
+
+
 class _Recorder:
     """Captures calls to monkeypatched async/sync helpers."""
 
@@ -154,6 +165,13 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
             ),
             _llm_result(),
         )
+
+    async def fake_normalize_posting_title(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        recorder.record("normalize_posting_title", title=title, jd_len=len(jd_text))
+        # Echo the raw title back by default so the label-resolution tests keep
+        # asserting strip/fallback behavior directly; canonicalization is
+        # exercised by its own tests, which override this.
+        return NormalizedTitle(label=title), _llm_result()
 
     async def fake_derive_label(llm, *, label):  # type: ignore[no-untyped-def]
         recorder.record("derive_from_label", label=label)
@@ -206,6 +224,7 @@ def stub_llm_helpers(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _R
         recorder.record("user_job", **kwargs)
 
     monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_normalize_posting_title)
     monkeypatch.setattr(from_input, "derive_profile_from_label", fake_derive_label)
     monkeypatch.setattr(from_input, "derive_profile_from_jd", fake_derive_jd)
     monkeypatch.setattr(from_input, "derive_fit_score", fake_fit_score)
@@ -1137,3 +1156,349 @@ async def test_derive_url_target_bg_marks_error_on_timeout(
     assert any(b.activation_status == "error" for b in update_bodies)
     assert all(b.activation_status != "idle" for b in update_bodies)
     assert stub_crud.by_name("link") == []
+
+
+# ---- from_url label canonicalization -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_from_url_matches_on_the_canonical_label_not_the_raw_title(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """The canonical label is what dedups.
+
+    ``crud.normalize_label`` only lowercases/trims/collapses whitespace, so
+    punctuation and comma-suffixes survive into the UNIQUE key. A verbatim
+    posting title therefore can never collide with the plain role some other
+    user already follows — every URL create minted its own catalog row. So the
+    canonicalization has to happen BEFORE ``find_matching_target``.
+    """
+    raw = "Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform"
+    canonical = "Senior Product Manager"
+
+    async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        assert title == raw
+        return NormalizedTitle(label=canonical), _llm_result()
+
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
+
+    seen_labels: list[str] = []
+
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        seen_labels.append(label)
+        return None
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    created_labels: list[str] = []
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        created_labels.append(payload.label)
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title=raw,
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    # Matched on the canonical form...
+    assert seen_labels == [canonical]
+    # ...and the catalog row was created under it, so the dedup key is canonical.
+    assert created_labels == [canonical]
+    assert raw not in created_labels
+
+
+@pytest.mark.asyncio
+async def test_from_url_links_an_existing_target_when_canonicalization_collides(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """The payoff: two differently-worded postings now converge on one target."""
+
+    async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        return NormalizedTitle(label="Senior Product Manager"), _llm_result()
+
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
+
+    existing = _target(id="t-existing", label="Senior Product Manager")
+
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        assert label == "Senior Product Manager"
+        return existing
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    async def _no_create(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise AssertionError("must link the existing target, not mint a new row")
+
+    monkeypatch.setattr(from_input, "_create_and_link", _no_create)
+
+    result = await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/y",
+        extracted_title="Sr. Product Builder (PM), Growth Platform — Remote",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    assert result.was_matched is True
+    assert result.target.id == "t-existing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boom",
+    [
+        RuntimeError("provider 5xx"),
+        ValueError("schema violation"),
+        TimeoutError("provider hung"),
+    ],
+)
+async def test_from_url_falls_back_to_the_raw_title_when_the_normalizer_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+    boom: Exception,
+) -> None:
+    """Cosmetics must never cost the user the whole flow.
+
+    The normalizer improves the NAME; it is not what makes the target work. A
+    provider outage, malformed JSON, or schema violation must degrade to
+    today's exact behavior (the raw posting title) rather than 502 the create.
+    """
+
+    async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        raise boom
+
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
+
+    seen_labels: list[str] = []
+
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        seen_labels.append(label)
+        return None
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    result = await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="  Staff Backend Engineer  ",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    # Degraded, not failed — and the raw title is still trimmed as before.
+    assert seen_labels == ["Staff Backend Engineer"]
+    assert result.was_matched is False
+
+
+@pytest.mark.asyncio
+async def test_from_url_falls_back_when_the_normalizer_returns_a_blank_label(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """A whitespace label would render a blank card and a useless dedup key."""
+
+    async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        return NormalizedTitle(label="   "), _llm_result()
+
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
+
+    seen_labels: list[str] = []
+
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        seen_labels.append(label)
+        return None
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="Data Engineer",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    assert seen_labels == ["Data Engineer"]
+
+
+@pytest.mark.asyncio
+async def test_from_url_still_falls_back_to_untitled_for_a_missing_title(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """The pre-existing no-title contract survives canonicalization."""
+    seen_titles: list[str] = []
+
+    async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
+        seen_titles.append(title)
+        raise RuntimeError("normalizer unavailable")
+
+    monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
+
+    seen_labels: list[str] = []
+
+    async def _match(_s, label):  # type: ignore[no-untyped-def]
+        seen_labels.append(label)
+        return None
+
+    monkeypatch.setattr(from_input, "find_matching_target", _match)
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title=None,
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    assert seen_titles == ["Untitled Target"]
+    assert seen_labels == ["Untitled Target"]
+
+
+@pytest.mark.asyncio
+async def test_from_url_records_the_canonicalization_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """The inline canonicalization is billed, so it must reach the ledger.
+
+    An unlogged LLM call makes the cost ledger under-report real spend, which
+    loosens ``enforce_llm_budget`` (it reads that ledger) and makes the usage
+    card lie. The sibling manual path has always recorded its normalize call.
+    """
+    monkeypatch.setattr(from_input, "find_matching_target", _amock(None))
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="Staff Backend Engineer",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    logged = [
+        kw
+        for kw in stub_llm_helpers.by_name("cost_log")
+        if kw.get("purpose") == "target.normalize_posting_title"
+    ]
+    assert logged, (
+        "the canonicalization LLM call was not recorded in the cost ledger; "
+        f"purposes seen: {[kw.get('purpose') for kw in stub_llm_helpers.by_name('cost_log')]}"
+    )
+    assert logged[0]["user_id"] == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_from_url_survives_a_cost_ledger_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """A ledger write must never cost the user the create.
+
+    By the time we record, the canonical label is already in hand — failing the
+    whole flow over bookkeeping would trade a real user outcome for an
+    accounting row.
+    """
+
+    async def boom_cost(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(from_input.cost_log, "record_async", boom_cost)
+    monkeypatch.setattr(from_input, "find_matching_target", _amock(None))
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    result = await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="Staff Backend Engineer",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+    assert result.was_matched is False

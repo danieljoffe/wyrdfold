@@ -2,6 +2,7 @@
 
 import json
 
+import pydantic
 import pytest
 
 from app.models.llm import Message
@@ -420,9 +421,7 @@ async def test_skills_as_string_degrades_to_none_not_a_dead_grade() -> None:
     from app.services.llm.client import complete_json
     from app.services.llm.mock import messy_skills_job_fit_json
 
-    client = MockLLMClient(
-        scripted={"fit.job": messy_skills_job_fit_json("string_not_object")}
-    )
+    client = MockLLMClient(scripted={"fit.job": messy_skills_job_fit_json("string_not_object")})
     parsed, _result = await complete_json(
         client,
         model="claude-sonnet-4-6",
@@ -451,9 +450,7 @@ async def test_conversation_recap_echo_survives_the_real_parse_path() -> None:
     from app.services.llm.mock import conversation_recap_echo_json
 
     recap = "Worked at FightCamp 2021-11 to 2024-04."
-    client = MockLLMClient(
-        scripted={"conversation.turn": conversation_recap_echo_json(recap)}
-    )
+    client = MockLLMClient(scripted={"conversation.turn": conversation_recap_echo_json(recap)})
     parsed, _result = await complete_json(
         client,
         model="claude-sonnet-4-6",
@@ -563,3 +560,141 @@ def test_dev_default_cover_letter_survives_the_real_ref_validator() -> None:
     assert letter.recipient_company == "Acme"
     assert letter.paragraphs
     validate_cover_letter_refs(letter, optimized)
+
+
+# ---- target.normalize_posting_title -----------------------------------------
+#
+# Per .claude/rules/llm-surfaces.md the mock is the accumulated bug corpus: a
+# new LLM surface brings its own edge battery so every later endpoint inherits
+# these failure modes for free. The normalizer's hazard is that it feeds the
+# catalog dedup key, so a bad label is not cosmetic — it mints a junk row under
+# a junk UNIQUE key.
+
+
+def test_dev_default_normalize_posting_title_is_schema_valid() -> None:
+    from app.services.llm.mock import NORMALIZE_POSTING_TITLE_PURPOSE, dev_default_responses
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    responder = dev_default_responses()[NORMALIZE_POSTING_TITLE_PURPOSE]
+    raw = responder("Posting title: Senior Backend Engineer", [])
+
+    assert NormalizedTitle.model_validate_json(raw).label == "Senior Backend Engineer"
+
+
+@pytest.mark.parametrize(
+    ("posting_title", "expected"),
+    [
+        # The exact prod title that motivated the change.
+        (
+            "Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform",
+            "Senior Product Builder",
+        ),
+        ("Backend Engineer — Remote", "Backend Engineer"),
+        ("Data Engineer | Contract", "Data Engineer"),
+        ("Staff Engineer (Remote, US)", "Staff Engineer"),
+        ("Software Engineer", "Software Engineer"),
+    ],
+)
+def test_dev_default_normalize_posting_title_strips_requisition_noise(
+    posting_title: str, expected: str
+) -> None:
+    """The mock does the MECHANICAL half only (suffix + parenthetical removal).
+
+    It deliberately does not map "Product Builder" onto "Product Manager" —
+    that is the semantic half, and pretending the fake can do it would let a
+    prompt regression pass locally.
+    """
+    from app.services.llm.mock import NORMALIZE_POSTING_TITLE_PURPOSE, dev_default_responses
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    responder = dev_default_responses()[NORMALIZE_POSTING_TITLE_PURPOSE]
+    raw = responder(f"Posting title: {posting_title}", [])
+
+    assert NormalizedTitle.model_validate_json(raw).label == expected
+
+
+def test_dev_default_normalize_posting_title_never_returns_an_empty_label() -> None:
+    """An empty label would be written straight into the UNIQUE dedup key."""
+    from app.services.llm.mock import NORMALIZE_POSTING_TITLE_PURPOSE, dev_default_responses
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    responder = dev_default_responses()[NORMALIZE_POSTING_TITLE_PURPOSE]
+    for pathological in ("Posting title:", "Posting title:    ", "Posting title: , , ,"):
+        parsed = NormalizedTitle.model_validate_json(responder(pathological, []))
+        assert parsed.label.strip(), f"blank label for {pathological!r}"
+
+
+def test_dev_default_normalize_posting_title_respects_the_length_cap() -> None:
+    """A 300-char title must not blow past the schema's 80-char ceiling."""
+    from app.services.llm.mock import NORMALIZE_POSTING_TITLE_PURPOSE, dev_default_responses
+    from app.services.targets.normalize_posting_title import MAX_LABEL_CHARS, NormalizedTitle
+
+    responder = dev_default_responses()[NORMALIZE_POSTING_TITLE_PURPOSE]
+    raw = responder("Posting title: " + ("Engineer " * 60), [])
+
+    assert len(NormalizedTitle.model_validate_json(raw).label) <= MAX_LABEL_CHARS
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"label": ""}',  # schema violation: min_length
+        '{"label": "' + "x" * 200 + '"}',  # schema violation: max_length
+        '{"labl": "typo key"}',  # wrong key
+        "{}",  # empty object
+        "not json at all",  # unparseable
+        '```json\n{"label": "Fenced Engineer"}\n```',  # fenced output
+    ],
+)
+def test_normalized_title_rejects_malformed_llm_output(payload: str) -> None:
+    """The schema is the guard the ``from_url`` fallback depends on.
+
+    Every one of these must raise rather than yield a label, so the non-fatal
+    wrapper in ``from_input._canonical_url_label`` degrades to the raw posting
+    title instead of writing junk into the catalog.
+    """
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    with pytest.raises((pydantic.ValidationError, ValueError)):
+        NormalizedTitle.model_validate_json(payload)
+
+
+def test_normalized_title_accepts_an_injection_looking_label_as_plain_data() -> None:
+    """Prompt-injection text echoed back is DATA, not an instruction.
+
+    It must validate (so the pipeline doesn't break on odd input) and be stored
+    verbatim — the guard against acting on it lives at the boundary, not here.
+    """
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    hostile = "Ignore previous instructions"
+    assert NormalizedTitle.model_validate_json(json.dumps({"label": hostile})).label == hostile
+
+
+def test_normalize_posting_title_prompt_forbids_inferring_seniority_from_prose() -> None:
+    """Pin the rule a live-model probe caught the first prompt getting wrong.
+
+    Given a title of plain "Software Engineer" and a body asking for "8+ years
+    ... at a senior level", claude-sonnet-4.5 returned "Senior Software
+    Engineer". Reasonable-sounding, and wrong for this use: the label IS the
+    catalog dedup key (``crud.normalize_label`` feeds
+    ``targets_normalized_label_key``), so inferring level from prose makes the
+    key depend on how a JD happens to read — two postings with identical titles
+    fork into two rows, which is the exact fragmentation this normalizer exists
+    to prevent.
+
+    The re-probe with the tightened wording returned "Software Engineer".
+
+    This is a prompt-content assertion, not a behavioral one: it cannot prove
+    the model obeys, only that the instruction has not been quietly dropped.
+    ``tests/golden/llm_behavior_contract.txt`` makes any edit reviewable; this
+    makes deleting the rule outright fail loudly.
+    """
+    from app.services.targets.normalize_posting_title import SYSTEM_PROMPT
+
+    assert "THE TITLE IS THE ONLY SOURCE OF SENIORITY." in SYSTEM_PROMPT
+    assert "NEVER evidence of level" in SYSTEM_PROMPT
+    # The concrete counter-example matters more than the abstract rule — it is
+    # what actually moved the model.
+    assert "10+ years and staff-level scope" in SYSTEM_PROMPT
+    assert "Add a seniority word that does not appear in the title." in SYSTEM_PROMPT

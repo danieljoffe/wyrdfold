@@ -291,3 +291,52 @@ def test_get_active_target_ids_filters_on_membership_activity() -> None:
     second_eq = chain.eq.return_value.eq.call_args_list[0].args
     assert first_eq == ("user_id", "user-1")
     assert second_eq == ("is_active", True)
+
+
+class TestActiveLimitErrorPayload:
+    """The 409 body for the active-target cap.
+
+    ``message`` is the string the user actually reads — the frontend surfaces
+    it verbatim rather than composing its own — so its wording is a contract,
+    not an implementation detail. Three routes (activate, link/follow,
+    add-from-posting) used to carry byte-identical copies of this dict; they
+    now share one builder.
+    """
+
+    def test_shape_carries_error_limit_count_and_message(self) -> None:
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=3, limit=3))
+
+        assert exc.status_code == 409
+        assert exc.detail["error"] == "ACTIVE_LIMIT"
+        assert exc.detail["limit"] == 3
+        assert exc.detail["active_count"] == 3
+        assert exc.detail["message"] == (
+            "You already have 3 active targets (limit 3) — deactivate one first."
+        )
+
+    def test_singularizes_at_a_count_of_one(self) -> None:
+        """The default cap is 1, so "1 active targets" was the common case."""
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=1, limit=1))
+
+        assert exc.detail["message"] == (
+            "You already have 1 active target (limit 1) — deactivate one first."
+        )
+        assert "1 active targets" not in exc.detail["message"]
+
+    def test_message_is_non_empty_so_the_frontend_never_falls_back(self) -> None:
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        for count, limit in ((0, 1), (1, 1), (2, 5), (10, 10)):
+            exc = _active_limit_error(
+                crud.ActiveTargetLimitError(current_count=count, limit=limit)
+            )
+            assert isinstance(exc.detail["message"], str)
+            assert exc.detail["message"].strip()
+            assert "deactivate one first" in exc.detail["message"]

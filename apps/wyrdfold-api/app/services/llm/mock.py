@@ -42,6 +42,7 @@ ResponseSource = str | Callable[[str, list[Message]], str]
 # Kept in sync with ``targets.suggest.QUERY_DEFAULT_PURPOSE``. Duplicated (not
 # imported) to keep the mock free of service-layer imports.
 QUERY_SUGGEST_PURPOSE = "target.suggest_from_query"
+NORMALIZE_POSTING_TITLE_PURPOSE = "target.normalize_posting_title"
 
 # Kept in sync with ``analysis.analyze.DEFAULT_PURPOSE``. Duplicated (not
 # imported) — same service-layer-free rule as above.
@@ -162,13 +163,9 @@ def _dev_job_analysis(_latest_user: str, _messages: list[Message]) -> str:
                 "skills_missing": ["Kubernetes"],
                 "nice_to_haves": ["GraphQL"],
                 "seniority_fit": "moderate",
-                "seniority_rationale": (
-                    "Scope reads mid-to-senior individual contributor."
-                ),
+                "seniority_rationale": ("Scope reads mid-to-senior individual contributor."),
                 "domain_fit": "moderate",
-                "domain_rationale": (
-                    "Adjacent product domain with core stack overlap."
-                ),
+                "domain_rationale": ("Adjacent product domain with core stack overlap."),
             },
             "recommendation": (
                 "Solid match on the core stack; close the missing "
@@ -201,9 +198,7 @@ def _dev_tailor_resume(latest_user: str, _messages: list[Message]) -> str:
     ]
     outcomes = [o for o in payload.get("outcomes", []) if isinstance(o, dict)]
     skills = [
-        s.get("name")
-        for s in payload.get("skills", [])
-        if isinstance(s, dict) and s.get("name")
+        s.get("name") for s in payload.get("skills", []) if isinstance(s, dict) and s.get("name")
     ]
 
     experience = []
@@ -473,8 +468,7 @@ def conversation_recap_echo_json(recap: str) -> str:
     return json.dumps(
         {
             "assistant_message": (
-                "You said the poller was the bottleneck — what did its "
-                "throughput go from and to?"
+                "You said the poller was the bottleneck — what did its throughput go from and to?"
             ),
             # The payload under test — old content presented as new.
             "prose_append": recap,
@@ -482,6 +476,35 @@ def conversation_recap_echo_json(recap: str) -> str:
             "annotation": None,
         }
     )
+
+
+def _dev_normalize_posting_title(latest_user: str, _messages: list[Message]) -> str:
+    """Deterministic canonicalization for ``target.normalize_posting_title``.
+
+    The service puts the raw title on the first line as
+    ``Posting title: <title>`` (see ``normalize_posting_title._build_user_message``).
+    This fake applies the cheap, mechanical half of what the real prompt does —
+    drop everything after the first comma / em-dash and strip a trailing
+    parenthetical — so local dev sees plausibly-canonical labels instead of the
+    bare ``{"mock": True}`` echo. It does NOT do the semantic half (mapping
+    "Product Builder" onto "Product Manager"); only the real model does that.
+    """
+    first_line = next((line.strip() for line in latest_user.splitlines() if line.strip()), "")
+    raw = first_line.removeprefix("Posting title:").strip() or "Untitled Role"
+    # Applied to fixpoint, not in one pass: "Staff Engineer (Remote, US)" needs
+    # the parenthetical gone BEFORE the comma rule, while "Senior Builder (PM),
+    # Growth Platform" needs the comma gone first. Iterating sidesteps the
+    # ordering entirely.
+    for _ in range(4):
+        before = raw
+        if raw.endswith(")") and "(" in raw:
+            raw = raw[: raw.rindex("(")].strip()
+        for sep in (",", " — ", " - ", " | "):
+            if sep in raw:
+                raw = raw.split(sep, 1)[0].strip()
+        if raw == before:
+            break
+    return json.dumps({"label": (raw or "Untitled Role")[:80]})
 
 
 def dev_default_responses() -> dict[str, ResponseSource]:
@@ -495,6 +518,7 @@ def dev_default_responses() -> dict[str, ResponseSource]:
     """
     return {
         QUERY_SUGGEST_PURPOSE: _dev_suggest_from_query,
+        NORMALIZE_POSTING_TITLE_PURPOSE: _dev_normalize_posting_title,
         JOB_ANALYSIS_PURPOSE: _dev_job_analysis,
         TAILOR_RESUME_PURPOSE: _dev_tailor_resume,
         TAILOR_COVER_LETTER_PURPOSE: _dev_cover_letter,

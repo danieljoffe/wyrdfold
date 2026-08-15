@@ -14,6 +14,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
 import CreateTargetModal, {
+  type CreateTargetDraft,
   type ManualSubmission,
   type UrlSubmission,
 } from './CreateTargetModal';
@@ -39,6 +40,52 @@ import { toSummary } from './types';
 interface PendingTarget {
   id: string;
   label: string;
+}
+
+/**
+ * Durable "we ran it and found nothing" panel for the two suggest actions.
+ *
+ * Both calls are LLM-backed and routinely take 20-50s, while the toast that
+ * reports a zero-result run auto-dismisses after 4s — so the user who looks
+ * away for the duration (i.e. most of them) comes back to a page identical to
+ * the one they left and cannot tell whether anything ran. The toast stays for
+ * whoever is watching; this is the trace for whoever is not.
+ *
+ * Mirrors LearningLogPanel's two-layer treatment of the same situation.
+ */
+function SuggestEmptyPanel({
+  title,
+  children,
+  onRetry,
+  retrying,
+  retryName,
+}: {
+  title: string;
+  children: React.ReactNode;
+  onRetry: () => void;
+  retrying: boolean;
+  retryName: string;
+}) {
+  return (
+    <Card padding='none'>
+      <CardContent className='flex flex-col items-start gap-2 p-4'>
+        <Heading variant='cardTitle'>{title}</Heading>
+        <Text variant='body' as='p' className='text-text-secondary'>
+          {children}
+        </Text>
+        <Button
+          name={retryName}
+          variant='outline'
+          size='sm'
+          onClick={onRetry}
+          disabled={retrying}
+          className='mt-1'
+        >
+          {retrying ? 'Checking again…' : 'Check again'}
+        </Button>
+      </CardContent>
+    </Card>
+  );
 }
 
 interface TargetsListProps {
@@ -68,6 +115,11 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const [targets, setTargets] =
     useState<UserTargetWithSummary[]>(initialTargets);
   const [modalOpen, setModalOpen] = useState(false);
+  // Set only when a create fails, so the modal can re-open holding what
+  // the user typed instead of an empty form.
+  const [createDraft, setCreateDraft] = useState<CreateTargetDraft | undefined>(
+    undefined
+  );
   const { toast } = useToast();
   const router = useRouter();
 
@@ -215,6 +267,17 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   // modal; the actual DELETE runs once the user confirms below.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
+  // Resolved from the list rather than stashed alongside the id, so the prompt
+  // can never name a target the row no longer describes.
+  const pendingDeleteLabel = useMemo(
+    () =>
+      pendingDeleteId === null
+        ? null
+        : (targets.find(t => t.target.id === pendingDeleteId)?.target.label ??
+          null),
+    [pendingDeleteId, targets]
+  );
+
   const handleDelete = useCallback((id: string) => {
     setPendingDeleteId(id);
   }, []);
@@ -346,7 +409,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     async (
       endpoint: '/api/targets/from-manual' | '/api/targets/from-url',
       body: object,
-      pendingLabel: string
+      pendingLabel: string,
+      draft: CreateTargetDraft
     ) => {
       const pendingId =
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -356,6 +420,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       setModalOpen(false);
       setSuggestions([]);
       setLateralSuggestions([]);
+      // Clear the "we found nothing" panels too, not just the result arrays.
+      // Their copy ("your existing targets already cover the roles that fit
+      // your experience") is a claim about the target list, so it goes stale
+      // the moment the list changes — leaving it up would have the page argue
+      // with the card the user just created.
+      setSuggestEmpty(false);
+      setLateralEmpty(false);
 
       try {
         const result = await createOrLinkTarget(endpoint, body);
@@ -378,6 +449,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
           variant: 'error',
           title: e instanceof Error ? e.message : 'Failed to add target',
         });
+        // Hand the draft back. The modal is closed optimistically above
+        // because success is the common case, but that meant a failure threw
+        // away what the user typed — and the from-url errors in particular
+        // ("we couldn't read that page") are ones you recover from by editing
+        // the URL you no longer have. A fresh object each time so a second
+        // failure re-seeds even if the field was edited in between.
+        setCreateDraft({ ...draft });
+        setModalOpen(true);
       } finally {
         setPendingTargets(p => p.filter(t => t.id !== pendingId));
       }
@@ -387,7 +466,11 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const handleSubmitManual = useCallback(
     (payload: ManualSubmission) => {
-      void runCreate('/api/targets/from-manual', payload, payload.label);
+      void runCreate('/api/targets/from-manual', payload, payload.label, {
+        mode: 'manual',
+        label: payload.label,
+        description: payload.description ?? '',
+      });
     },
     [runCreate]
   );
@@ -396,7 +479,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     (payload: UrlSubmission) => {
       // Empty pending label: the title is derived server-side from the posting,
       // so the optimistic card shows the URL-mode skeleton until it resolves.
-      void runCreate('/api/targets/from-url', payload, '');
+      void runCreate('/api/targets/from-url', payload, '', {
+        mode: 'url',
+        jdUrl: payload.jd_url,
+      });
     },
     [runCreate]
   );
@@ -452,11 +538,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
+  const [suggestEmpty, setSuggestEmpty] = useState(false);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
   const handleSuggest = useCallback(async () => {
     setSuggesting(true);
     setSuggestions([]);
+    setSuggestEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest', { method: 'POST' });
       if (!res.ok)
@@ -464,6 +552,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as MatchedSuggestions;
       setSuggestions(data.matches);
       if (data.matches.length === 0) {
+        setSuggestEmpty(true);
         toast({
           variant: 'info',
           title: 'No new suggestions',
@@ -514,11 +603,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     LateralSuggestion[]
   >([]);
   const [suggestingLateral, setSuggestingLateral] = useState(false);
+  const [lateralEmpty, setLateralEmpty] = useState(false);
   const [addingLateral, setAddingLateral] = useState<string | null>(null);
 
   const handleSuggestLateral = useCallback(async () => {
     setSuggestingLateral(true);
     setLateralSuggestions([]);
+    setLateralEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest-lateral', {
         method: 'POST',
@@ -528,6 +619,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as LateralSuggestions;
       setLateralSuggestions(data.suggestions);
       if (data.suggestions.length === 0) {
+        setLateralEmpty(true);
         toast({
           variant: 'info',
           title: 'No lateral roles found',
@@ -592,7 +684,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 name='target-create-empty'
                 variant='primary'
                 size='sm'
-                onClick={() => setModalOpen(true)}
+                onClick={() => {
+                  setCreateDraft(undefined);
+                  setModalOpen(true);
+                }}
               >
                 <Plus className='size-4' aria-hidden />
                 <span>Create target</span>
@@ -603,9 +698,19 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 size='sm'
                 onClick={handleSuggest}
                 disabled={suggesting}
+                aria-busy={suggesting}
               >
-                <Sparkles className='size-4' aria-hidden />
-                <span>Suggest from experience</span>
+                {suggesting ? (
+                  <>
+                    <Spinner size='sm' aria-label='Suggesting' />
+                    <span>Suggesting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className='size-4' aria-hidden />
+                    <span>Suggest from experience</span>
+                  </>
+                )}
               </Button>
             </div>
           </CardContent>
@@ -638,7 +743,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               name='target-create'
               variant='primary'
               size='sm'
-              onClick={() => setModalOpen(true)}
+              onClick={() => {
+                setCreateDraft(undefined);
+                setModalOpen(true);
+              }}
             >
               <Plus className='size-4' aria-hidden />
               <span>Add target</span>
@@ -649,6 +757,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggest}
               disabled={suggesting}
+              aria-busy={suggesting}
             >
               {suggesting ? (
                 <>
@@ -668,6 +777,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggestLateral}
               disabled={suggestingLateral}
+              aria-busy={suggestingLateral}
             >
               {suggestingLateral ? (
                 <>
@@ -683,6 +793,19 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
             </Button>
           </div>
         </>
+      )}
+
+      {suggestEmpty && suggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No new suggestions'
+          onRetry={handleSuggest}
+          retrying={suggesting}
+          retryName='target-suggest-retry'
+        >
+          Your existing targets already cover the roles that fit your
+          experience. Update your profile with new skills or experience, then
+          check again.
+        </SuggestEmptyPanel>
       )}
 
       {suggestions.length > 0 && (
@@ -733,6 +856,18 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         </div>
       )}
 
+      {lateralEmpty && lateralSuggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No lateral roles found'
+          onRetry={handleSuggestLateral}
+          retrying={suggestingLateral}
+          retryName='target-suggest-lateral-retry'
+        >
+          We could not find adjacent roles to branch into from your current
+          targets. Add a target or two first, then check again.
+        </SuggestEmptyPanel>
+      )}
+
       {lateralSuggestions.length > 0 && (
         <div className='flex flex-col gap-3'>
           <Text variant='caption'>
@@ -780,18 +915,33 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
       <CreateTargetModal
         isOpen={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onClose={() => {
+          setCreateDraft(undefined);
+          setModalOpen(false);
+        }}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
         onFollow={handleFollowSearchResult}
         onCreateSuggestion={handleCreateSearchSuggestion}
+        draft={createDraft}
       />
 
+      {/* The dialog names the target. It used to say only "Delete target?",
+          which is unverifiable on an account holding several near-identical
+          labels ("Senior Full Stack Engineer" / "Senior Full-Stack Engineer" /
+          "Staff Full-Stack Engineer" / "Senior Frontend Engineer" / "Senior
+          Frontend Engineer – Web Performance"). Opening the wrong card's kebab
+          was unrecoverable and undetectable, and the action is irreversible by
+          design — which is exactly why the name has to be in the prompt. */}
       <ConfirmModal
         isOpen={pendingDeleteId !== null}
         onClose={() => setPendingDeleteId(null)}
         onConfirm={confirmDelete}
-        title='Delete target?'
+        title={
+          pendingDeleteLabel
+            ? `Delete “${pendingDeleteLabel}”?`
+            : 'Delete target?'
+        }
         message='Saved jobs scored against this target lose their target context. This cannot be undone.'
         confirmLabel='Delete'
         destructive
