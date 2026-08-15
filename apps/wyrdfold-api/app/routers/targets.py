@@ -35,6 +35,7 @@ from app.models.experience import OptimizedDoc
 from app.models.learning import ProfilePatch
 from app.models.schemas import PollResult
 from app.models.targets import (
+    ActivateTargetRequest,
     AxisWeights,
     ContributionVoteResult,
     CreateOrLinkResult,
@@ -554,6 +555,26 @@ async def _update_target_async(
     return crud._parse_target(rows[0]) if rows else None
 
 
+async def _set_link_active(
+    supabase: AsyncClient, *, user_id: str, target_id: str, active: bool
+) -> None:
+    """Flip one link's ``is_active`` directly, with no cap check.
+
+    Used by the activate-with-swap path. Bypassing the cap is correct for
+    both of its uses: deactivating always lowers the count, and the rollback
+    only restores a link that was active moments earlier — re-checking the
+    cap there could refuse to undo our own change and strand the user with
+    nothing active.
+    """
+    await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update({"is_active": active, "updated_at": datetime.now(UTC).isoformat()})
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+
+
 async def _set_user_target_inactive_async(
     supabase: AsyncClient, user_id: str, target_id: str
 ) -> UserTarget | None:
@@ -771,13 +792,105 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
     return crud.MAX_ACTIVE_TARGETS_PER_USER
 
 
-def _active_limit_error(e: crud.ActiveTargetLimitError) -> HTTPException:
+async def _active_target_choices(supabase: AsyncClient, user_id: str) -> list[dict[str, str]]:
+    """``[{id, label}]`` for the user's currently-active targets.
+
+    Only read on the 409 path, so it costs nothing on the happy path. It is
+    carried in the error body rather than left for the client to work out
+    because not every caller HAS the list: ``/targets`` holds all the user's
+    targets in state, but the detail page knows only the one it is showing,
+    and would otherwise need a second round-trip to name the alternatives.
+    """
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id, targets(label)")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    out: list[dict[str, str]] = []
+    for r in rows:
+        tid = r.get("target_id")
+        if not tid:
+            continue
+        joined = r.get("targets")
+        # PostgREST returns an embedded to-one as an object, but older
+        # rows/queries can surface a single-element list — accept both rather
+        # than dropping the label and rendering an unnamed radio button.
+        if isinstance(joined, list):
+            joined = joined[0] if joined else None
+        label = (joined or {}).get("label") if isinstance(joined, dict) else None
+        out.append({"id": str(tid), "label": str(label or "Untitled target")})
+    return sorted(out, key=lambda t: t["label"].lower())
+
+
+async def _activate_link_with_optional_swap(
+    supabase: AsyncClient, *, user_id: str, target_id: str, swap_out: str | None
+) -> None:
+    """Activate ``target_id``, optionally freeing a slot first.
+
+    ``swap_out`` makes this a SWAP. Ordering is forced: the cap check counts
+    active links, so the deactivation must land before the activation. Doing
+    both here rather than as two client calls keeps the window where the user
+    has NEITHER target active server-side and short, instead of spanning a
+    network round-trip they could navigate away from.
+
+    Any failure after the deactivation rolls it back. Without that, a failed
+    swap leaves the user with fewer active targets than they started with —
+    strictly worse than the refusal they were trying to get past.
+
+    Raises ``HTTPException`` (400 for an invalid swap, 409 for the cap).
+    """
+    if swap_out:
+        if swap_out == target_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deactivate the target being activated.",
+            )
+        # Only a target the user currently has ACTIVE may be swapped out.
+        # Otherwise this endpoint doubles as "deactivate any target by id" as
+        # a side effect of activating an unrelated one.
+        active_now = await _active_target_choices(supabase, user_id)
+        if swap_out not in {t["id"] for t in active_now}:
+            raise HTTPException(
+                status_code=400,
+                detail="That target is not currently active.",
+            )
+        await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=False)
+
+    try:
+        await _link_user_to_target_async(
+            supabase, user_id=user_id, target_id=target_id, is_active=True
+        )
+    except crud.ActiveTargetLimitError as e:
+        if swap_out:
+            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
+        # 409 Conflict — well-formed, but conflicts with current state.
+        # ``error`` lets the frontend switch on this case specifically,
+        # ``message`` is what it shows when it doesn't, and
+        # ``active_targets`` is what its swap picker lists.
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
+    except Exception:
+        if swap_out:
+            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
+        raise
+
+
+def _active_limit_error(
+    e: crud.ActiveTargetLimitError,
+    active_targets: list[dict[str, str]] | None = None,
+) -> HTTPException:
     """The one 409 shape for the active-target cap.
 
     Raised from three places (activate, link/follow, add-from-posting) that
     each carried a byte-identical copy of this dict. ``message`` is the string
     the user actually reads — the frontend surfaces it verbatim rather than
     composing its own — so it is worth having exactly one of.
+
+    ``active_targets`` names what is currently holding the cap so the client
+    can offer a pick-one-to-deactivate swap instead of a dead end. Optional:
+    a caller that cannot cheaply resolve it still gets the message.
     """
     noun = "target" if e.current_count == 1 else "targets"
     return HTTPException(
@@ -786,6 +899,7 @@ def _active_limit_error(e: crud.ActiveTargetLimitError) -> HTTPException:
             "error": "ACTIVE_LIMIT",
             "limit": e.limit,
             "active_count": e.current_count,
+            "active_targets": active_targets or [],
             "message": (
                 f"You already have {e.current_count} active {noun} "
                 f"(limit {e.limit}) — deactivate one first."
@@ -1436,6 +1550,7 @@ async def update_target(
 )
 async def activate_target(
     target_id: str,
+    body: ActivateTargetRequest | None = None,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
@@ -1444,19 +1559,12 @@ async def activate_target(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    try:
-        await _link_user_to_target_async(
-            supabase,
-            user_id=user_id,
-            target_id=target_id,
-            is_active=True,
-        )
-    except crud.ActiveTargetLimitError as e:
-        # 409 Conflict — the request was well-formed but conflicts with
-        # current state (the user is already at the active-target cap).
-        # ``error`` lets the frontend switch on this case specifically;
-        # ``message`` is what it shows when it doesn't.
-        raise _active_limit_error(e) from e
+    await _activate_link_with_optional_swap(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        swap_out=(body.deactivate_target_id if body else None) or None,
+    )
     refreshed = await _target_get(supabase, target_id) or target
 
     spawn_detached(
@@ -1786,7 +1894,7 @@ async def link_target(
             fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
-        raise _active_limit_error(e) from e
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
 
 
 @router.post(
@@ -1998,7 +2106,7 @@ async def create_target_from_posting(
                 is_active=True,
             )
         except crud.ActiveTargetLimitError as e:
-            raise _active_limit_error(e) from e
+            raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
         # Re-read the target row so the response reflects any writes the
         # linking flow made.
         refreshed = await _target_get(supabase, target.id)

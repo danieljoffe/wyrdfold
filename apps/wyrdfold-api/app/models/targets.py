@@ -571,6 +571,23 @@ class ReferenceJDAdd(BaseModel):
         return self
 
 
+class ActivateTargetRequest(BaseModel):
+    """Optional body for ``POST /targets/{id}/activate``.
+
+    ``deactivate_target_id`` turns the call into a SWAP: free a slot by
+    deactivating that target, then activate this one. It exists because the
+    active-target cap (1 on free, 2 starter, 5 pro) otherwise makes activation
+    a dead end — the client can offer "pick one to deactivate" and complete it
+    in a single request, rather than issuing a deactivate and an activate and
+    owning the window in between.
+
+    Omitting it preserves the original behaviour exactly, so the whole body is
+    optional and every existing caller is unaffected.
+    """
+
+    deactivate_target_id: str | None = None
+
+
 class ReferenceJDVote(BaseModel):
     """Cast a vote on a reference-JD contribution (#5 P3).
 
