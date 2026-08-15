@@ -244,7 +244,7 @@ test('the analysis panel survives verdict completion and its refetch (#602)', as
   await gradedRow.click();
 
   // Panel opens and the (mock-LLM) analysis auto-runs.
-  await expect(page.getByText('Fit analysis')).toBeVisible();
+  await expect(page.getByText('Match analysis')).toBeVisible();
 
   // Completion: the in-flight copy leaves. The mock provider grades fast;
   // the generous timeout covers a cold API.
@@ -255,7 +255,7 @@ test('the analysis panel survives verdict completion and its refetch (#602)', as
   // The #602 contract: whatever the verdict did to the row's rank, the
   // panel the user is reading MUST still be mounted after the completion
   // refetch — either in place or pinned with the re-ranked notice.
-  await expect(page.getByText('Fit analysis')).toBeVisible();
+  await expect(page.getByText('Match analysis')).toBeVisible();
   await expect(page.getByRole('button', { name: /not for me/i })).toBeVisible();
 });
 

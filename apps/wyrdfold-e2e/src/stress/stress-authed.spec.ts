@@ -503,7 +503,7 @@ test('jobs list journey', async ({ page }) => {
       analysisJobId = href ? href.split('/jobs/')[1] : null;
     },
     async () => {
-      await expect(page.getByText('Fit analysis')).toBeVisible({
+      await expect(page.getByText('Match analysis')).toBeVisible({
         timeout: 30_000,
       });
       await expect(
