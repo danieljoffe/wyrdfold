@@ -379,7 +379,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const pollKey = useMemo(() => {
     const ids = new Set(derivingIds);
     for (const t of targets) {
-      if (t.target.activation_status === 'deriving') ids.add(t.target.id);
+      // Seed from the SAME predicate that decides when to stop (`isDeriving`).
+      // These used to disagree: the seed only looked at `activation_status ===
+      // 'deriving'` while the settle condition also treated a null fit_score as
+      // deriving. A target that finished its profile but never got a score was
+      // therefore never picked up on load — no spinner, no poll, no score, and
+      // the backend's lazy refresh skipped it too. Both halves are fixed; this
+      // is the client half.
+      if (isDeriving(t)) ids.add(t.target.id);
     }
     return [...ids].sort().join(',');
   }, [derivingIds, targets]);
