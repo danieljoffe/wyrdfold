@@ -138,6 +138,11 @@ export default function TargetCard({
               trigger={
                 <span className='inline-flex rounded p-1 text-text-secondary hover:bg-surface-tertiary hover:text-text-primary'>
                   <MoreVertical className='size-4' aria-hidden />
+                  {/* The icon is the whole trigger, so without this the a11y
+                      tree reports an unnamed button — ten of them on a full
+                      page. Naming it with the target disambiguates which card
+                      the menu belongs to. Same pattern as JobDetailPanel. */}
+                  <span className='sr-only'>Actions for {target.label}</span>
                 </span>
               }
               items={items}

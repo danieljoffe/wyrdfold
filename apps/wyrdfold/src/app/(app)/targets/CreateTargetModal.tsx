@@ -5,6 +5,7 @@ import { Modal } from '@danieljoffe/shared-ui/Modal';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
+import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import TargetSearchTab from './TargetSearchTab';
 import type { MatchedSuggestion, TargetSearchResult } from './types';
@@ -43,6 +44,12 @@ interface CreateTargetModalProps {
   onCreateSuggestion: (match: MatchedSuggestion) => Promise<boolean>;
   /** Restored on open after a failed submit; cleared by the parent. */
   draft?: CreateTargetDraft | undefined;
+  /**
+   * Why the last submit failed. Rendered inline next to the field that caused
+   * it, and shown only on that tab — see the alert below for why the toast
+   * alone was not enough.
+   */
+  error?: string | undefined;
 }
 
 export default function CreateTargetModal({
@@ -53,6 +60,7 @@ export default function CreateTargetModal({
   onFollow,
   onCreateSuggestion,
   draft,
+  error,
 }: CreateTargetModalProps) {
   // Discovery-first: default to searching the shared catalog so a user follows
   // an existing target instead of minting a duplicate; Manual / From URL are
@@ -62,28 +70,36 @@ export default function CreateTargetModal({
   const [description, setDescription] = useState('');
   const [jdUrl, setJdUrl] = useState('');
 
+  // `Tabs` is uncontrolled, so the only way to move the user to another tab is
+  // to remount it with a new `defaultTab`. Both jumps below need that: a
+  // restored draft (land back where you failed) and "create this manually"
+  // out of an empty search.
+  const [tabsKey, setTabsKey] = useState(0);
+  const [initialTab, setInitialTab] = useState<Mode>('search');
+
+  const jumpTo = useCallback((next: Mode) => {
+    setMode(next);
+    setInitialTab(next);
+    setTabsKey(k => k + 1);
+  }, []);
+
   // Re-open holding the failed draft. Keyed on `draft` identity: the parent
   // hands over a fresh object per failure, so a second failure re-seeds even
   // if the user had edited the field in between.
   useEffect(() => {
     if (!isOpen || !draft) return;
-    setMode(draft.mode);
     setLabel(draft.label ?? '');
     setDescription(draft.description ?? '');
     setJdUrl(draft.jdUrl ?? '');
-  }, [isOpen, draft]);
-
-  // Bumped per restored draft so the uncontrolled Tabs remounts (see below).
-  const [draftKey, setDraftKey] = useState(0);
-  useEffect(() => {
-    if (isOpen && draft) setDraftKey(k => k + 1);
-  }, [isOpen, draft]);
+    jumpTo(draft.mode);
+  }, [isOpen, draft, jumpTo]);
 
   const reset = useCallback(() => {
     setLabel('');
     setDescription('');
     setJdUrl('');
     setMode('search');
+    setInitialTab('search');
   }, []);
 
   const handleClose = useCallback(() => {
@@ -126,6 +142,10 @@ export default function CreateTargetModal({
         <TargetSearchTab
           onFollow={onFollow}
           onCreateSuggestion={onCreateSuggestion}
+          onCreateManually={q => {
+            setLabel(q);
+            jumpTo('manual');
+          }}
         />
       ),
     },
@@ -170,6 +190,11 @@ export default function CreateTargetModal({
     },
   ];
 
+  // The error belongs to the tab that produced it — an extraction failure has
+  // nothing to say while the user is looking at Manual.
+  const showError =
+    Boolean(error) && draft !== undefined && mode === draft.mode;
+
   return (
     <Modal
       isOpen={isOpen}
@@ -184,7 +209,10 @@ export default function CreateTargetModal({
             size='sm'
             onClick={handleClose}
           >
-            Cancel
+            {/* Search applies each Follow immediately, so there is no draft to
+                abandon and "Cancel" read as "undo what I just did" right after
+                a successful follow. */}
+            {mode === 'search' ? 'Done' : 'Cancel'}
           </Button>
           {mode !== 'search' && (
             <Button
@@ -200,14 +228,26 @@ export default function CreateTargetModal({
         </div>
       }
     >
-      {/* Tabs is uncontrolled, so restoring `mode` alone would leave the user
-          looking at the Search tab while the state said "url". Remounting on
-          the draft's identity makes `defaultTab` re-apply, landing them back
-          on the tab they failed from. */}
+      {/* A failed create was announced ONLY by a toast, which auto-dismisses --
+          while this modal stayed open holding the draft and showing nothing.
+          The from-url fetch runs 10-20s, so the user who looks away comes back
+          to a modal that looks untouched. Same defect #742 fixed for the
+          suggest actions; the create path kept it. */}
+      {showError && (
+        <div
+          role='alert'
+          className='mb-1 rounded-md border border-error/30 bg-error-light p-3'
+        >
+          <Text variant='meta' as='p' className='text-error'>
+            {error}
+          </Text>
+        </div>
+      )}
+
       <Tabs
-        key={draftKey}
+        key={tabsKey}
         tabs={tabs}
-        defaultTab={draft ? draft.mode : 'search'}
+        defaultTab={initialTab}
         variant='underline'
         onChange={id => setMode(id as Mode)}
       />

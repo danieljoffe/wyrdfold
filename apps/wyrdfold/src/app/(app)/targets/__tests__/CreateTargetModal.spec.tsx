@@ -105,10 +105,10 @@ describe('CreateTargetModal', () => {
     });
   });
 
-  it('calls onClose when Cancel is clicked', async () => {
+  it('calls onClose when the dismiss button is clicked', async () => {
     const user = userEvent.setup();
     const { onClose } = renderModal();
-    await user.click(screen.getByRole('button', { name: /cancel/i }));
+    await user.click(screen.getByRole('button', { name: /done/i }));
     expect(onClose).toHaveBeenCalled();
   });
 
@@ -117,5 +117,98 @@ describe('CreateTargetModal', () => {
     const { onClose } = renderModal();
     await user.keyboard('{Escape}');
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  /**
+   * Following a target from the Search tab applies immediately — there is no
+   * draft to abandon — so a footer reading "Cancel" told the user their
+   * just-completed follow was about to be undone.
+   */
+  describe('dismiss button wording', () => {
+    it('reads "Done" on Search, where actions are already applied', () => {
+      renderModal();
+      expect(screen.getByRole('button', { name: /done/i })).toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /cancel/i })
+      ).not.toBeInTheDocument();
+    });
+
+    it('reads "Cancel" on Manual, where there is an unsaved draft', async () => {
+      const user = userEvent.setup();
+      renderModal();
+      await user.click(screen.getByRole('tab', { name: /manual/i }));
+      expect(
+        screen.getByRole('button', { name: /cancel/i })
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /done/i })
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  /**
+   * A failed create was reported ONLY by a toast, which auto-dismisses, while
+   * this modal re-opened holding the draft and showing nothing. The from-url
+   * fetch runs 10-20s, so the user who looks away comes back to a modal that
+   * looks untouched.
+   */
+  describe('durable failure reason', () => {
+    const REASON = 'Could not extract a job description from that URL.';
+
+    it('shows the reason on the tab the failure came from', () => {
+      renderModal({
+        draft: { mode: 'url', jdUrl: 'https://example.com/not-a-job' },
+        error: REASON,
+      });
+      expect(screen.getByRole('alert')).toHaveTextContent(REASON);
+      // ...alongside the draft it failed with, so the URL can be edited.
+      expect(
+        screen.getByDisplayValue('https://example.com/not-a-job')
+      ).toBeInTheDocument();
+    });
+
+    it('hides the reason once the user moves to another tab', async () => {
+      const user = userEvent.setup();
+      renderModal({
+        draft: { mode: 'url', jdUrl: 'https://example.com/not-a-job' },
+        error: REASON,
+      });
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+      await user.click(screen.getByRole('tab', { name: /manual/i }));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('shows no alert when there is no error', () => {
+      renderModal();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+  });
+
+  /**
+   * The zero-result search used to offer only the LLM fallback, so a user who
+   * knew exactly what they wanted had to switch tabs and retype it.
+   */
+  it('carries a dead-end search query into the Manual tab', async () => {
+    const user = userEvent.setup();
+    renderModal();
+
+    await user.type(
+      screen.getByRole('textbox', { name: /search existing targets/i }),
+      'data engineer'
+    );
+    const createManually = await screen.findByRole(
+      'button',
+      { name: /create .*data engineer.* manually/i },
+      { timeout: 3000 }
+    );
+    await user.click(createManually);
+
+    // Landed on Manual with the query already in the Title field.
+    expect(screen.getByRole('textbox', { name: /^title$/i })).toHaveValue(
+      'data engineer'
+    );
+    expect(
+      screen.getByRole('button', { name: /create target/i })
+    ).toBeEnabled();
   });
 });
