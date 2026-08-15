@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Modal } from '@danieljoffe/shared-ui/Modal';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
@@ -20,6 +20,20 @@ export interface UrlSubmission {
 
 type Mode = 'search' | 'manual' | 'url';
 
+/**
+ * What the user had typed when a create failed, so the modal can come back
+ * holding it. Creation closes the modal optimistically (the happy path is the
+ * common one), which meant a failure dropped the typed URL or title on the
+ * floor — for `from-url` in particular, the error tells you to try something
+ * else, and you no longer have the thing you typed to try it with.
+ */
+export interface CreateTargetDraft {
+  mode: Exclude<Mode, 'search'>;
+  label?: string;
+  description?: string;
+  jdUrl?: string;
+}
+
 interface CreateTargetModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -27,6 +41,8 @@ interface CreateTargetModalProps {
   onSubmitUrl: (payload: UrlSubmission) => void;
   onFollow: (target: TargetSearchResult) => Promise<boolean>;
   onCreateSuggestion: (match: MatchedSuggestion) => Promise<boolean>;
+  /** Restored on open after a failed submit; cleared by the parent. */
+  draft?: CreateTargetDraft | undefined;
 }
 
 export default function CreateTargetModal({
@@ -36,6 +52,7 @@ export default function CreateTargetModal({
   onSubmitUrl,
   onFollow,
   onCreateSuggestion,
+  draft,
 }: CreateTargetModalProps) {
   // Discovery-first: default to searching the shared catalog so a user follows
   // an existing target instead of minting a duplicate; Manual / From URL are
@@ -44,6 +61,23 @@ export default function CreateTargetModal({
   const [label, setLabel] = useState('');
   const [description, setDescription] = useState('');
   const [jdUrl, setJdUrl] = useState('');
+
+  // Re-open holding the failed draft. Keyed on `draft` identity: the parent
+  // hands over a fresh object per failure, so a second failure re-seeds even
+  // if the user had edited the field in between.
+  useEffect(() => {
+    if (!isOpen || !draft) return;
+    setMode(draft.mode);
+    setLabel(draft.label ?? '');
+    setDescription(draft.description ?? '');
+    setJdUrl(draft.jdUrl ?? '');
+  }, [isOpen, draft]);
+
+  // Bumped per restored draft so the uncontrolled Tabs remounts (see below).
+  const [draftKey, setDraftKey] = useState(0);
+  useEffect(() => {
+    if (isOpen && draft) setDraftKey(k => k + 1);
+  }, [isOpen, draft]);
 
   const reset = useCallback(() => {
     setLabel('');
@@ -72,8 +106,10 @@ export default function CreateTargetModal({
       // No user-supplied title — the label is always derived from the posting.
       onSubmitUrl({ jd_url: trimmedUrl });
     }
-    reset();
-  }, [mode, label, description, jdUrl, onSubmitManual, onSubmitUrl, reset]);
+    // Deliberately NOT reset here: the parent closes the modal optimistically
+    // and, on failure, re-opens it seeded with this draft. Wiping now would
+    // race that restore and hand the user an empty form after an error.
+  }, [mode, label, description, jdUrl, onSubmitManual, onSubmitUrl]);
 
   const canSubmit =
     mode === 'manual'
@@ -164,9 +200,14 @@ export default function CreateTargetModal({
         </div>
       }
     >
+      {/* Tabs is uncontrolled, so restoring `mode` alone would leave the user
+          looking at the Search tab while the state said "url". Remounting on
+          the draft's identity makes `defaultTab` re-apply, landing them back
+          on the tab they failed from. */}
       <Tabs
+        key={draftKey}
         tabs={tabs}
-        defaultTab='search'
+        defaultTab={draft ? draft.mode : 'search'}
         variant='underline'
         onChange={id => setMode(id as Mode)}
       />
