@@ -1,37 +1,78 @@
 'use client';
 
+import { useEffect, useState } from 'react';
+
 /**
  * Locale-dependent values that are DELIBERATELY different on server and client.
  *
- * THE BUG THESE EXIST TO FIX (prod, 2026-08-08): `/targets` threw
- * **React #418 — "text content does not match server-rendered HTML"** on every
- * load. `TargetCard` rendered `new Date(target.updated_at).toLocaleDateString()`.
- * With no explicit locale or timeZone, `toLocaleDateString` resolves against the
- * *host's* settings — and the two hosts disagree:
+ * THE ORIGINAL BUG (prod, 2026-08-08): `/targets` threw **React #418 — "text
+ * content does not match server-rendered HTML"** on every load. `TargetCard`
+ * rendered `new Date(target.updated_at).toLocaleDateString()`. With no explicit
+ * locale or timeZone, `toLocaleDateString` resolves against the *host's*
+ * settings — and the two hosts disagree:
  *
  *     updated_at        2026-08-08T06:50:44Z
  *     server (UTC)      "8/8/2026"
  *     browser (LA)      "8/7/2026"     <- different day
  *     browser (de-DE)   "8.8.2026"     <- different separator/order
  *
- * React sees the text differ, discards the server HTML for that subtree, and
- * re-renders it on the client — a real cost, and it fills error tracking with a
- * minified stack that looks like a crash but is a formatting mismatch.
  * `Number.prototype.toLocaleString` has exactly the same problem
- * (`"12,345"` vs `"12.345"`).
+ * ("12,345" vs "12.345").
  *
- * WHY `suppressHydrationWarning` RATHER THAN FORMATTING IN UTC:
- * these are "when did this happen to *me*" labels, so the user's own timezone is
- * the correct thing to show. Pinning them to UTC would silence React by showing
- * US users the wrong day every evening. React documents this attribute for
- * precisely this case — intentionally-divergent content like timestamps — and it
- * applies to the text of the element it sits on, which is why each helper below
- * renders its own leaf `<span>` rather than expecting callers to remember it.
+ * THE SECOND BUG (prod, 2026-08-14) — why this file no longer relies on
+ * `suppressHydrationWarning` alone. That attribute stops React *warning* about
+ * a text mismatch, and also stops it *correcting* one: the server's HTML is
+ * kept and never replaced, because nothing re-renders the subtree afterwards.
+ * So every date froze at the server's UTC rendering. Measured live:
+ *
+ *     browser local   Fri Aug 14 2026 23:37 GMT-0700
+ *     UTC             2026-08-15T06:37Z
+ *     card rendered   "8/15/2026"    <- TOMORROW, to the user
+ *
+ * For every user west of UTC that is a date in the future, on every card, every
+ * evening. The old comment here argued against pinning to UTC because it "would
+ * silence React by showing US users the wrong day every evening";
+ * `suppressHydrationWarning` was quietly producing that exact outcome.
+ *
+ * HOW IT WORKS NOW — two renders, both correct for their moment:
+ *
+ *   1. Server + first client render: an explicitly pinned locale and timezone.
+ *      Deterministic, so both hosts produce the same string and hydration has
+ *      nothing to reconcile.
+ *   2. After mount: the viewer's own locale and timezone. This is an ordinary
+ *      React update, not hydration, so the DOM text is genuinely replaced.
+ *
+ * `suppressHydrationWarning` is kept as a backstop for any residual divergence
+ * in step 1 — with step 2 always firing, it can no longer freeze a wrong value.
  *
  * RULE: never call `toLocaleDateString` / `toLocaleTimeString` /
  * `toLocaleString` directly in a rendered component. Use these.
  * `src/components/__tests__/LocalFormat.spec.tsx` pins that.
  */
+
+/**
+ * Locale used for the pre-hydration render. Any fixed value works — it only has
+ * to be the SAME on both hosts. It is visible for one frame before the viewer's
+ * own locale takes over.
+ */
+const SSR_LOCALE = 'en-US';
+
+/** False on the server and for the hydrating render; true from mount onwards. */
+function useHydrated(): boolean {
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
+  return hydrated;
+}
+
+/**
+ * Pin the timezone for the pre-hydration pass — unless the caller already pinned
+ * one, in which case their choice is deterministic and is left alone.
+ */
+function ssrDateOptions(
+  options?: Intl.DateTimeFormatOptions
+): Intl.DateTimeFormatOptions {
+  return { ...options, timeZone: options?.timeZone ?? 'UTC' };
+}
 
 interface DateProps {
   /** ISO-8601 timestamp, or anything `new Date()` accepts. */
@@ -55,10 +96,15 @@ export function LocalDate({
   options,
   className,
 }: DateProps) {
+  const hydrated = useHydrated();
   const d = toDate(value);
   return (
     <span className={className} suppressHydrationWarning>
-      {d ? d.toLocaleDateString(undefined, options) : fallback}
+      {d
+        ? hydrated
+          ? d.toLocaleDateString(undefined, options)
+          : d.toLocaleDateString(SSR_LOCALE, ssrDateOptions(options))
+        : fallback}
     </span>
   );
 }
@@ -70,10 +116,15 @@ export function LocalDateTime({
   options,
   className,
 }: DateProps) {
+  const hydrated = useHydrated();
   const d = toDate(value);
   return (
     <span className={className} suppressHydrationWarning>
-      {d ? d.toLocaleString(undefined, options) : fallback}
+      {d
+        ? hydrated
+          ? d.toLocaleString(undefined, options)
+          : d.toLocaleString(SSR_LOCALE, ssrDateOptions(options))
+        : fallback}
     </span>
   );
 }
@@ -90,10 +141,15 @@ export function LocalNumber({
   options?: Intl.NumberFormatOptions;
   className?: string;
 }) {
+  const hydrated = useHydrated();
   const ok = typeof value === 'number' && Number.isFinite(value);
   return (
     <span className={className} suppressHydrationWarning>
-      {ok ? value.toLocaleString(undefined, options) : fallback}
+      {ok
+        ? hydrated
+          ? value.toLocaleString(undefined, options)
+          : value.toLocaleString(SSR_LOCALE, options)
+        : fallback}
     </span>
   );
 }
