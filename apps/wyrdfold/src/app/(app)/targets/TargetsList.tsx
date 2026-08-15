@@ -14,6 +14,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
 import CreateTargetModal, {
+  type CreateTargetDraft,
   type ManualSubmission,
   type UrlSubmission,
 } from './CreateTargetModal';
@@ -114,6 +115,11 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const [targets, setTargets] =
     useState<UserTargetWithSummary[]>(initialTargets);
   const [modalOpen, setModalOpen] = useState(false);
+  // Set only when a create fails, so the modal can re-open holding what
+  // the user typed instead of an empty form.
+  const [createDraft, setCreateDraft] = useState<CreateTargetDraft | undefined>(
+    undefined
+  );
   const { toast } = useToast();
   const router = useRouter();
 
@@ -392,7 +398,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     async (
       endpoint: '/api/targets/from-manual' | '/api/targets/from-url',
       body: object,
-      pendingLabel: string
+      pendingLabel: string,
+      draft: CreateTargetDraft
     ) => {
       const pendingId =
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -424,6 +431,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
           variant: 'error',
           title: e instanceof Error ? e.message : 'Failed to add target',
         });
+        // Hand the draft back. The modal is closed optimistically above
+        // because success is the common case, but that meant a failure threw
+        // away what the user typed — and the from-url errors in particular
+        // ("we couldn't read that page") are ones you recover from by editing
+        // the URL you no longer have. A fresh object each time so a second
+        // failure re-seeds even if the field was edited in between.
+        setCreateDraft({ ...draft });
+        setModalOpen(true);
       } finally {
         setPendingTargets(p => p.filter(t => t.id !== pendingId));
       }
@@ -433,7 +448,11 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const handleSubmitManual = useCallback(
     (payload: ManualSubmission) => {
-      void runCreate('/api/targets/from-manual', payload, payload.label);
+      void runCreate('/api/targets/from-manual', payload, payload.label, {
+        mode: 'manual',
+        label: payload.label,
+        description: payload.description ?? '',
+      });
     },
     [runCreate]
   );
@@ -442,7 +461,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     (payload: UrlSubmission) => {
       // Empty pending label: the title is derived server-side from the posting,
       // so the optimistic card shows the URL-mode skeleton until it resolves.
-      void runCreate('/api/targets/from-url', payload, '');
+      void runCreate('/api/targets/from-url', payload, '', {
+        mode: 'url',
+        jdUrl: payload.jd_url,
+      });
     },
     [runCreate]
   );
@@ -644,7 +666,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 name='target-create-empty'
                 variant='primary'
                 size='sm'
-                onClick={() => setModalOpen(true)}
+                onClick={() => {
+                  setCreateDraft(undefined);
+                  setModalOpen(true);
+                }}
               >
                 <Plus className='size-4' aria-hidden />
                 <span>Create target</span>
@@ -700,7 +725,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               name='target-create'
               variant='primary'
               size='sm'
-              onClick={() => setModalOpen(true)}
+              onClick={() => {
+                setCreateDraft(undefined);
+                setModalOpen(true);
+              }}
             >
               <Plus className='size-4' aria-hidden />
               <span>Add target</span>
@@ -869,11 +897,15 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
       <CreateTargetModal
         isOpen={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onClose={() => {
+          setCreateDraft(undefined);
+          setModalOpen(false);
+        }}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
         onFollow={handleFollowSearchResult}
         onCreateSuggestion={handleCreateSearchSuggestion}
+        draft={createDraft}
       />
 
       <ConfirmModal
