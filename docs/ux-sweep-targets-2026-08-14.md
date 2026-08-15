@@ -99,8 +99,14 @@ matched. The likeliest first action for a new user — **Add target → Manual**
 card that quietly does nothing, and the obvious next step ("View jobs") walks straight
 into A2.
 
+The asymmetry is two conflicting defaults on twin helpers: `from_input._link` defaults
+`is_active=False` (`from_input.py:177-193`) while `targets._link_user_to_target_async`
+defaults `is_active=True` (`targets.py:777-782`), and the `/link` route relies on that
+implicit default rather than passing one.
+
 Decision taken: **keep creation inactive and prompt**, rather than auto-activating.
-Auto-activation would silently start LLM scoring spend on every creation.
+Auto-activation would silently start LLM scoring spend on every creation — and, given A6's
+cap of 1, would fail outright for every target after the first.
 
 ### A4 — Target names are taken verbatim from the source, and can never be changed **confirmed**
 
@@ -133,6 +139,42 @@ that already exists — which the user does not have, because creation just fail
 ```
 POST /api/targets/from-url  →  422
 ```
+
+### A6 — Hitting the active-target cap shows a bare "Activate failed (409)" **found in code, not in the browser**
+
+Not observable during the sweep because the owner account has a raised cap, but it is on
+the default path for every self-host user and is the worst dead end in the set.
+
+`MAX_ACTIVE_TARGETS_PER_USER = 1` (`services/targets/crud.py:590`), overridable per user
+(`user_profiles.max_active_targets`) or by plan tier in saas mode. So on a default install
+a user may have **exactly one** active target. Activating a second returns a well-formed,
+actionable 409 (`routers/targets.py:1432-1443`):
+
+```json
+{
+  "error": "ACTIVE_LIMIT",
+  "limit": 1,
+  "active_count": 1,
+  "message": "You already have 1 active targets (limit 1) — deactivate one first."
+}
+```
+
+The backend even documents the intended UX in a comment beside it:
+
+> "Frontend reads `error` to switch on this case specifically and offers a deactivate
+> picker rather than a generic toast."
+
+**That frontend does not exist.** `ACTIVE_LIMIT` appears nowhere under `apps/wyrdfold/src`.
+`extractApiError` switches on `detail.code`, but this payload keys on `detail.error`, so
+none of its branches match and it falls through to the generic
+`` `${fallback} (${res.status})` `` — the user sees **"Activate failed (409)"**. A ready-made
+sentence explaining exactly what happened and what to do is discarded one layer from the
+screen.
+
+Three call sites raise it (`targets.py:1435`, `:1776`, `:1999`), so the same dead end is
+reachable from Activate, from Follow-in-search, and from add-from-posting. Note the middle
+one means **"Follow" can 409** — a button that reads like a bookmark silently consumes the
+single active slot.
 
 ---
 
@@ -253,9 +295,10 @@ fix. Every `LocalDate` caller shares the bug — at minimum `TargetCard.tsx:160`
 
 ## E. Retracted mid-sweep — do not resurrect
 
-| #   | Initial claim                                                               | What checking showed                                                                                                                                  |
-| --- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| R1  | "Card click areas are inconsistent — only the header navigates."            | **Wrong.** The `div[role="button"]` covers 173px of the 174px card. The failures were automation clicking before hydration completed.                 |
-| R2  | "'View jobs' never passes a target."                                        | **Wrong.** It passes `?target=<id>` correctly — but only when the target is active. Narrowed into A2.                                                 |
-| R3  | "The From URL path skips fit scoring."                                      | **Wrong.** The From-URL test target did receive a fit score (18); it just takes ~40s longer than the other paths. B5 is an individually stuck record. |
-| R4  | "The last lateral-suggestion card renders without its 'Add target' button." | **Wrong.** All 8 buttons were present in the DOM; the last was simply below the screenshot fold.                                                      |
+| #   | Initial claim                                                                                                                                            | What checking showed                                                                                                                                                                                                                                                                                                                                    |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1  | "Card click areas are inconsistent — only the header navigates."                                                                                         | **Wrong.** The `div[role="button"]` covers 173px of the 174px card. The failures were automation clicking before hydration completed.                                                                                                                                                                                                                   |
+| R2  | "'View jobs' never passes a target."                                                                                                                     | **Wrong.** It passes `?target=<id>` correctly — but only when the target is active. Narrowed into A2.                                                                                                                                                                                                                                                   |
+| R3  | "The From URL path skips fit scoring."                                                                                                                   | **Wrong.** The From-URL test target did receive a fit score (18); it just takes ~40s longer than the other paths. B5 is an individually stuck record.                                                                                                                                                                                                   |
+| R4  | "The last lateral-suggestion card renders without its 'Add target' button."                                                                              | **Wrong.** All 8 buttons were present in the DOM; the last was simply below the screenshot fold.                                                                                                                                                                                                                                                        |
+| R5  | "`activate_target` skips the ownership guard, so any authed user can activate an arbitrary target id and read back the full shared row — an authz leak." | **Not a finding.** The catalog is shared _by design_: `search_targets` (`targets.py:1315-1323`) states "any user's target is discoverable" and that "the full row is served by `GET /targets/{id}` once followed". Activating creates that membership as its documented side effect, so the row is not disclosed to a non-follower. Checked, not fixed. |

@@ -3,7 +3,8 @@ import { redirect } from 'next/navigation';
 import { fetchJsonFromWyrdfoldAPI } from '@/lib/api/proxy';
 import type { UserTargetWithSummary } from '../targets/types';
 import JobsList, { type TargetTab } from './JobsList';
-import { toActiveTargetTabs } from './targetTabs';
+import PausedTargetNotice from './PausedTargetNotice';
+import { resolveRequestedTarget, toActiveTargetTabs } from './targetTabs';
 import { JOB_STATUSES, type JobStatus } from './types';
 
 export const metadata: Metadata = {
@@ -43,19 +44,37 @@ export default async function FittedJobsPage({
     targetsRes?.targets ?? []
   );
 
-  // If the URL points to a target this user isn't linked to at all, drop
-  // the filter rather than rendering an empty list. Server-side redirect
-  // avoids a render → effect → client redirect waterfall.
-  if (targetId && !initialTargets.some(t => t.id === targetId)) {
+  // An unrenderable `?target=` used to mean one thing (silent redirect); it
+  // actually means two. See resolveRequestedTarget for the split — a paused
+  // membership now gets named and offered a resume instead of being dropped
+  // on whichever other target happens to be active.
+  const resolution = resolveRequestedTarget(
+    targetId,
+    targetsRes?.targets ?? []
+  );
+  if (resolution.kind === 'redirect') {
+    // Server-side redirect avoids a render → effect → client redirect waterfall.
     redirect('/jobs');
   }
+  const pausedTarget =
+    resolution.kind === 'paused' ? resolution.target : undefined;
 
   return (
-    <JobsList
-      targetId={targetId}
-      initialStatus={initialStatus}
-      initialMinScore={initialMinScore}
-      initialTargets={initialTargets}
-    />
+    <>
+      {pausedTarget && (
+        <div className='mb-4'>
+          <PausedTargetNotice
+            targetId={pausedTarget.id}
+            label={pausedTarget.label}
+          />
+        </div>
+      )}
+      <JobsList
+        targetId={pausedTarget ? undefined : targetId}
+        initialStatus={initialStatus}
+        initialMinScore={initialMinScore}
+        initialTargets={initialTargets}
+      />
+    </>
   );
 }
