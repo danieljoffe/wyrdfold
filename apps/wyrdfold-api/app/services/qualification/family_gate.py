@@ -1,12 +1,15 @@
 """The family-gate predicate (#277/#278) — the single Python definition.
 
-Keep-null, unknown-tolerant, adjacency-aware. A (target, job) pair passes when:
+Keep-null and unknown-tolerant. A (target, job) pair passes when:
 
 * the target is unclassified (``role_family`` NULL → ungated); or
 * the job's family is UNKNOWN — NULL (untagged) or ``"other"`` (the tagger's
   catch-all) — benefit of the doubt, same spirit as ``is_us IS NOT FALSE``; or
-* the families match exactly; or
-* the families are ADJACENT (see ``_ADJACENT``).
+* the families match exactly.
+
+That is the whole rule. It is NOT adjacency-aware — see the note below, which
+this summary used to contradict by listing adjacency as a fourth pass
+condition and pointing at an ``_ADJACENT`` table that does not exist.
 
 Every Python consumer of "is this job's family compatible with this target"
 MUST route through this function rather than re-deriving the comparison —
