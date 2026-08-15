@@ -231,7 +231,7 @@ function ScoreBreakdownList({
       {canApportion && (
         <dl className='flex flex-col gap-1 border-t border-border pt-2 text-xs'>
           <div className='flex items-baseline justify-between gap-3'>
-            <dt className='text-text-secondary'>Fit against this target</dt>
+            <dt className='text-text-secondary'>Match against this target</dt>
             <dd className='tabular-nums font-medium text-text-primary'>
               {rawScore}
             </dd>

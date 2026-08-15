@@ -321,7 +321,7 @@ describe('JobsListTable score cell (issue #603)', () => {
         onSelectionChange={() => undefined}
       />
     );
-    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.getByLabelText('Match score pending')).toBeInTheDocument();
     expect(screen.queryByLabelText('Match score 61')).not.toBeInTheDocument();
   });
 });

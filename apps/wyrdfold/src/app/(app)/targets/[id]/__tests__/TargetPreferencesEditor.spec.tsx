@@ -81,7 +81,7 @@ describe('TargetPreferencesEditor', () => {
     mockFetch({ pref_score_cutoff: 60, pref_locations: ['Remote'] });
     render(<TargetPreferencesEditor targetId='t-1' />);
     const cutoff = (await screen.findByLabelText(
-      /minimum fit score/i
+      /minimum match score/i
     )) as HTMLInputElement;
     expect(cutoff.value).toBe('60');
     expect(
@@ -92,9 +92,9 @@ describe('TargetPreferencesEditor', () => {
   it('PUTs the full preference set on save', async () => {
     const calls = mockFetch();
     render(<TargetPreferencesEditor targetId='t-1' />);
-    await screen.findByLabelText(/minimum fit score/i);
+    await screen.findByLabelText(/minimum match score/i);
 
-    fireEvent.change(screen.getByLabelText(/minimum fit score/i), {
+    fireEvent.change(screen.getByLabelText(/minimum match score/i), {
       target: { value: '70' },
     });
     fireEvent.change(screen.getByLabelText(/^locations$/i), {
@@ -121,9 +121,9 @@ describe('TargetPreferencesEditor', () => {
   it('blocks save and shows an error for an out-of-range cutoff', async () => {
     mockFetch();
     render(<TargetPreferencesEditor targetId='t-1' />);
-    await screen.findByLabelText(/minimum fit score/i);
+    await screen.findByLabelText(/minimum match score/i);
 
-    fireEvent.change(screen.getByLabelText(/minimum fit score/i), {
+    fireEvent.change(screen.getByLabelText(/minimum match score/i), {
       target: { value: '999' },
     });
     expect(screen.getByText(/whole number 0/i)).toBeInTheDocument();

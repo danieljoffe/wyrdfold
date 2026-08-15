@@ -204,7 +204,7 @@ test('pending row reconciles components → fit → freshness → the score show
   expect(screen.getByText('57.1')).toBeInTheDocument();
   expect(screen.getByText('2.9')).toBeInTheDocument();
   expect(screen.queryByText('80')).toBeNull(); // the raw point value is gone
-  expect(screen.getByText('Fit against this target')).toBeInTheDocument();
+  expect(screen.getByText('Match against this target')).toBeInTheDocument();
 
   // Freshness is shown as its own step. Derived from displayed ÷ fit, so the
   // decay formula is never duplicated client-side.
@@ -260,6 +260,6 @@ test('pending row without raw_score degrades to raw points, no invented chain', 
   );
 
   expect(screen.getByText('Role titles')).toBeInTheDocument();
-  expect(screen.queryByText('Fit against this target')).toBeNull();
+  expect(screen.queryByText('Match against this target')).toBeNull();
   expect(screen.queryByText(/Freshness/)).toBeNull();
 });

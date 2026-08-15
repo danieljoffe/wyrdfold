@@ -288,14 +288,14 @@ export default function TargetPreferencesEditor({
 
         <div className='max-w-xs'>
           <Input
-            label='Minimum fit score'
+            label='Minimum match score'
             type='number'
             inputMode='numeric'
             value={cutoffRaw}
             onChange={e => setCutoffRaw(e.target.value)}
             min={SCORE_MIN}
             max={SCORE_MAX}
-            aria-label='Minimum fit score'
+            aria-label='Minimum match score'
             disabled={saving}
             error={!cutoff.valid ? 'Enter a whole number 0–100' : undefined}
             helperText='Hide jobs scoring below this (default 40).'

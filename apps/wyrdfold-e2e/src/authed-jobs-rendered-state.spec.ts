@@ -224,7 +224,7 @@ test('graded rows render their fit score; ungraded rows render the pending badge
   const pendingRow = page
     .getByRole('row')
     .filter({ hasText: 'E2E Pending Platform Role' });
-  await expect(pendingRow.getByLabel('Fit score pending')).toBeVisible();
+  await expect(pendingRow.getByLabel('Match score pending')).toBeVisible();
   await expect(pendingRow.getByLabel('Match score 55')).toHaveCount(0);
 
   // Structured salary renders through the shared formatter (#606) — one

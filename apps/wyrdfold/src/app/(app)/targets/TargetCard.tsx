@@ -121,6 +121,10 @@ export default function TargetCard({
               <ScoreBadge
                 score={fitScore}
                 size='sm'
+                // This is the ONE 'fit' chip in the app — how well the target
+                // suits the user's experience. Every other ScoreBadge is a
+                // job's 'match' against a target, on a different scale.
+                kind='fit'
                 // The bare number badge was the sweep's "score of what?"
                 // moment (re-sweep R3) — the tooltip now NAMES it before
                 // the reasoning prose.
