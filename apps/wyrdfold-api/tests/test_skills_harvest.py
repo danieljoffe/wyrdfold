@@ -159,9 +159,17 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fit: JobFitResult) -> None:
 
 
 @pytest.mark.asyncio
-async def test_persists_skills_on_scores_and_jobs(
+async def test_persists_pair_level_skills_and_never_touches_the_facet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The harvest writes PAIR-level skills (for insights) and must NOT write
+    ``jobs.skills_required``.
+
+    That column is the search facet and has exactly one writer — the skill
+    dictionary. Two writers would mean last-write-wins between a canonical
+    vocabulary and the model's free-form one (1,757 values, 68% singletons),
+    so a posting's findability would depend on whether it was graded or
+    re-tagged more recently."""
     supabase, scores_table, jobs_table = _routed_supabase()
     _wire(monkeypatch, _fit_with_skills())
 
@@ -180,10 +188,8 @@ async def test_persists_skills_on_scores_and_jobs(
     assert scores_update["skills_required"] == ["react", "typescript", "graphql"]
     assert scores_update["skills_matched"] == ["react", "typescript"]
     assert scores_update["skills_missing"] == ["graphql"]
-    # Canonical job-level write, keyed by posting id.
-    jobs_update = jobs_table.update.call_args.args[0]
-    assert jobs_update == {"skills_required": ["react", "typescript", "graphql"]}
-    jobs_table.update.return_value.eq.assert_called_once_with("id", "job-1")
+    # The facet column is left entirely alone.
+    jobs_table.update.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -221,34 +227,33 @@ async def test_no_skills_means_no_keys_and_no_jobs_write(
 
 
 @pytest.mark.asyncio
-async def test_jobs_write_failure_never_costs_the_grade(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_grade_persists_without_any_jobs_table_access(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The canonical jobs write is best-effort enrichment: if it blows up,
-    the already-persisted grade is still returned and the failure is
-    WARNING-visible."""
+    """Regression guard for the single-writer rule: a supabase whose ``jobs``
+    table raises on touch must not affect grading at all. Before the dictionary
+    owned the facet, this path wrote there and had to be failure-tolerant; now
+    it must never reach the table in the first place."""
     scores_table = MagicMock()
     supabase = MagicMock()
 
     def _route(name: str) -> MagicMock:
         if name == "jobs":
-            raise RuntimeError("jobs table unavailable")
+            raise AssertionError("harvest must not touch jobs.skills_required")
         return scores_table
 
     supabase.table.side_effect = _route
     _wire(monkeypatch, _fit_with_skills())
 
-    with caplog.at_level("WARNING"):
-        result = await score_with_phase2_and_persist(
-            supabase,
-            MagicMock(),
-            payload=_payload(),
-            target=_target(),
-            job_posting_id="job-1",
-            title="Senior FE",
-            jd_text="JD body",
-        )
+    result = await score_with_phase2_and_persist(
+        supabase,
+        MagicMock(),
+        payload=_payload(),
+        target=_target(),
+        job_posting_id="job-1",
+        title="Senior FE",
+        jd_text="JD body",
+    )
 
-    assert result is not None  # the grade survived
-    assert scores_table.update.called  # and was persisted
-    assert any("skills_required write failed" in r.message for r in caplog.records)
+    assert result is not None
+    assert scores_table.update.called

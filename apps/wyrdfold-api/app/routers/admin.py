@@ -12,13 +12,17 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from supabase import AsyncClient
 
 from app.config import settings
 from app.dependencies import get_async_service_supabase, verify_api_key
 from app.services.llm import cost_log
+from app.services.qualification.skill_growth import (
+    backfill_dictionary_skills,
+    vocabulary_candidates,
+)
 from app.services.retention import purge_expired_records
 from app.supabase_pool import get_async_supabase
 
@@ -360,3 +364,36 @@ async def set_signup_mode(
     await _upsert_signup_mode(supabase, body.mode)
     logger.warning("signup_mode set to '%s' by operator", body.mode)
     return SignupModeResult(mode=body.mode)
+
+
+@router.post("/skills/backfill")
+async def skills_backfill(
+    limit: int = Query(2000, ge=1, le=20000),
+    only_missing: bool = Query(True),
+) -> dict[str, int]:
+    """Re-scan stored postings and write dictionary-extracted skills.
+
+    FREE — no LLM, just regex over text already in the database. That is what
+    makes it the "apply a vocabulary change retroactively" button: add a term
+    to ``skill_dictionary``, call this with ``only_missing=false``, and every
+    historical posting that mentions it becomes searchable. Idempotent.
+    """
+    aclient = get_async_supabase()
+    if aclient is None:
+        raise HTTPException(status_code=503, detail="async supabase client not initialized")
+    return await backfill_dictionary_skills(aclient, limit=limit, only_missing=only_missing)
+
+
+@router.get("/skills/candidates")
+async def skills_candidates(limit: int = Query(40, ge=1, le=200)) -> dict[str, Any]:
+    """What the skill dictionary should learn next (read-only, free).
+
+    Three feeds: Phase-2 harvest terms the dictionary does not know (the LLM
+    discovers vocabulary as a byproduct of grading we already pay for),
+    unmatched single/two-word search queries (proven demand), and per-family
+    coverage (the non-technical blind spot, as a monitored number).
+    """
+    aclient = get_async_supabase()
+    if aclient is None:
+        raise HTTPException(status_code=503, detail="async supabase client not initialized")
+    return await vocabulary_candidates(aclient, limit=limit)

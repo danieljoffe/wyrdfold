@@ -147,6 +147,47 @@ class TestQualifyOneJob:
         )
 
     @pytest.mark.asyncio
+    async def test_dictionary_skills_ride_the_tag_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Catalog skills are extracted by DICTIONARY and written in the same
+        jobs-row update as the tags — free, so no budget gate and no second
+        call. The row fixture's JD names nothing recognizable, so this drives a
+        row whose text does."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(
+            sb,
+            [_row(description_html="<p>Build with React, TypeScript and k8s.</p>")],
+        )
+
+        payload = rec["writes"][0]
+        # Canonical + alias-collapsed (k8s -> kubernetes).
+        assert payload["skills_required"] == ["kubernetes", "react", "typescript"]
+        # ONE write, ONE LLM call (the tagger) — the dictionary costs nothing.
+        assert len(rec["writes"]) == 1
+        assert rec["tag_calls"] == 1
+        assert rec["cost_calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_recognizable_skills_omits_the_column(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A posting naming nothing in the vocabulary must not write an empty
+        list: the Phase-2 harvest writes the same column from an LLM read, and
+        a blanking write would erase its richer value."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(
+            sb, [_row(description_html="<p>Make coffee. Be friendly.</p>")]
+        )
+
+        assert "skills_required" not in rec["writes"][0]
+        assert rec["writes"][0]["role_family"] == "engineering"  # tags unaffected
+
+    @pytest.mark.asyncio
     async def test_unchanged_row_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)

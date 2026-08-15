@@ -527,8 +527,10 @@ class Settings(BaseSettings):
     # produces the grade (marginal cost ≈ output tokens only). Purely
     # informational, never a score input; the eval re-baseline that shipped
     # this flag proved band stability with the addendum on. Fields persist to
-    # jobs.skills_required (canonical) + the scores row (denormalized for the
-    # insights aggregation — the analyses-only source covered ~146 rows ever).
+    # the scores row (pair-level, denormalized for the insights aggregation —
+    # the analyses-only source covered ~146 rows ever). It does NOT write
+    # jobs.skills_required: that column is the search facet, owned solely by
+    # the skill dictionary so the vocabulary stays canonical.
     # Historical grades are NOT backfilled; columns populate as jobs (re)grade.
     skills_harvest_enabled: bool = True
 

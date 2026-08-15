@@ -444,23 +444,18 @@ async def test_prose_skills_extraction_is_cleaned_not_rejected() -> None:
     because the cleanup lives in a field validator — asserting on the model
     alone would not prove the pipeline's parse step applies it.
     """
-    from app.services.llm.client import complete_json
+    from app.services.fit.job_fit import JobSkills
     from app.services.llm.mock import prose_skills_extraction_json
-    from app.services.qualification.skills import MAX_SKILLS, ExtractedSkills
 
-    client = MockLLMClient(
-        scripted={"qualification.skills": prose_skills_extraction_json()}
-    )
-    parsed, _result = await complete_json(
-        client,
-        model="deepseek-v3-2",
-        system="extract skills",
-        messages=[Message(role="user", content="jd")],
-        schema=ExtractedSkills,
-        purpose="qualification.skills",
-    )
+    # Catalog-wide extraction is a DICTIONARY now (it can only ever emit
+    # canonical vocabulary keys, so it cannot produce junk). The path that
+    # still parses model-authored skill lists is the Phase-2 harvest, so the
+    # corpus entry guards that schema.
+    raw = json.loads(prose_skills_extraction_json())["skills_required"]
+    parsed = JobSkills.model_validate({"skills_required": raw})
 
-    skills = parsed.skills
+    max_skills = 8
+    skills = parsed.skills_required
     # Case-folded and deduped: three spellings of React collapse to one entry.
     assert skills.count("react") == 1
     # A sentence is not a skill — dropped by the length bound, not stored.
@@ -470,10 +465,15 @@ async def test_prose_skills_extraction_is_cleaned_not_rejected() -> None:
     # 4-word bound also keeps it out of the facet vocabulary entirely.
     assert not any("ignore previous instructions" in s for s in skills)
     # Cap respected, everything canonical-cased.
-    assert len(skills) <= MAX_SKILLS
+    assert len(skills) <= max_skills
     assert all(s == s.lower() for s in skills)
     # The genuinely useful entries survive.
     assert {"typescript", "node.js", "postgresql"} <= set(skills)
+    # And the dictionary — which now does catalog-wide extraction — cannot
+    # emit any of this: it only ever returns keys from its own vocabulary.
+    from app.services.qualification import VOCABULARY
+
+    assert "claud" not in VOCABULARY
     # KNOWN LIMIT, asserted so it is a decision and not a surprise: a
     # MISSPELLING is indistinguishable from a real skill to a normalizer, so
     # "claud" persists as a junk facet value. Bounded by the cap; the defense

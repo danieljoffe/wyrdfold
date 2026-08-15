@@ -466,7 +466,16 @@ def prose_skills_extraction_json() -> str:
     """
     return json.dumps(
         {
-            "skills": [
+            # A VALID classification rides alongside, so a surface test can
+            # prove the messy skills field costs only itself.
+            "is_us": True,
+            "us_confidence": 90,
+            "role_family": "engineering",
+            "seniority": "senior_ic",
+            "employment_type": "full_time",
+            "is_remote": False,
+            "is_genuine_role": True,
+            "skills_required": [
                 "React",
                 "react",
                 "React 18",
