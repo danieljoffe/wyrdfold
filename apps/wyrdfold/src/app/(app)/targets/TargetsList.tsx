@@ -120,6 +120,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const [createDraft, setCreateDraft] = useState<CreateTargetDraft | undefined>(
     undefined
   );
+  // Paired with the draft: the toast that reports the failure auto-dismisses,
+  // and the from-url fetch runs 10-20s, so the reason has to survive on the
+  // re-opened modal too.
+  const [createError, setCreateError] = useState<string | undefined>(undefined);
   const { toast } = useToast();
   const router = useRouter();
 
@@ -418,6 +422,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
           : `pending-${Date.now()}-${Math.random()}`;
       setPendingTargets(p => [...p, { id: pendingId, label: pendingLabel }]);
       setModalOpen(false);
+      // This attempt is not the previous attempt's failure.
+      setCreateError(undefined);
       setSuggestions([]);
       setLateralSuggestions([]);
       // Clear the "we found nothing" panels too, not just the result arrays.
@@ -445,10 +451,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         // is slow or fails.
         insertEntry(toListEntry(result));
       } catch (e) {
-        toast({
-          variant: 'error',
-          title: e instanceof Error ? e.message : 'Failed to add target',
-        });
+        const message = e instanceof Error ? e.message : 'Failed to add target';
+        toast({ variant: 'error', title: message });
         // Hand the draft back. The modal is closed optimistically above
         // because success is the common case, but that meant a failure threw
         // away what the user typed — and the from-url errors in particular
@@ -456,6 +460,9 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         // the URL you no longer have. A fresh object each time so a second
         // failure re-seeds even if the field was edited in between.
         setCreateDraft({ ...draft });
+        // ...and the same message the toast is about to drop, so it is still
+        // there when the user looks back at the modal.
+        setCreateError(message);
         setModalOpen(true);
       } finally {
         setPendingTargets(p => p.filter(t => t.id !== pendingId));
@@ -686,6 +693,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 size='sm'
                 onClick={() => {
                   setCreateDraft(undefined);
+                  setCreateError(undefined);
                   setModalOpen(true);
                 }}
               >
@@ -745,6 +753,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={() => {
                 setCreateDraft(undefined);
+                setCreateError(undefined);
                 setModalOpen(true);
               }}
             >
@@ -917,6 +926,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         isOpen={modalOpen}
         onClose={() => {
           setCreateDraft(undefined);
+          setCreateError(undefined);
           setModalOpen(false);
         }}
         onSubmitManual={handleSubmitManual}
@@ -924,6 +934,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         onFollow={handleFollowSearchResult}
         onCreateSuggestion={handleCreateSearchSuggestion}
         draft={createDraft}
+        error={createError}
       />
 
       {/* The dialog names the target. It used to say only "Delete target?",
