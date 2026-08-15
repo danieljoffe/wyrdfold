@@ -285,7 +285,9 @@ def test_search_endpoint_forwards_filters_to_the_service(
 
     captured: dict[str, Any] = {}
 
-    async def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
+    async def fake_search(
+        supabase, *, q, limit, offset, location, posted_within_days, salary_floor, skills=None
+    ):
         captured.update(
             q=q,
             location=location,
