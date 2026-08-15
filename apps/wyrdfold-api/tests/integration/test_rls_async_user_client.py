@@ -50,7 +50,5 @@ async def test_async_user_client_no_token_bleed_under_concurrency(
     uids = [uid_a if i % 2 == 0 else uid_b for i in range(40)]
     results = await asyncio.gather(*[read_as(uid) for uid in uids])
 
-    mismatches = [
-        (uid, seen) for uid, seen in zip(uids, results, strict=True) if seen != {uid}
-    ]
+    mismatches = [(uid, seen) for uid, seen in zip(uids, results, strict=True) if seen != {uid}]
     assert mismatches == [], f"token bleed / RLS leak: {mismatches[:5]}"

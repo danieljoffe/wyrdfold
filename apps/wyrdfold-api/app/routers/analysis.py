@@ -82,9 +82,7 @@ def _no_profile_response() -> JSONResponse:
 async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
     """Any-status target ids for the user. Async inline of
     ``targets_crud.get_user_target_ids`` (sync twin kept for its sync callers)."""
-    resp = (
-        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
-    )
+    resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 
@@ -119,11 +117,7 @@ async def _fetch_job_description(supabase: AsyncClient, job_id: str) -> str | No
     """The posting's ``description_html`` (empty string when NULL), or ``None``
     when the posting doesn't exist — so the caller can 404 vs 422 distinctly."""
     resp = await (
-        supabase.table("jobs")
-        .select("id, description_html")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
+        supabase.table("jobs").select("id, description_html").eq("id", job_id).limit(1).execute()
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:

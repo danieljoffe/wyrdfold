@@ -226,9 +226,7 @@ async def test_preferences_are_passed_through(
 def _lint_error(code: str = "no_tables") -> LintResult:
     return LintResult(
         ok=False,
-        violations=[
-            LintViolation(code=code, message="simulated lint failure", severity="error")
-        ],
+        violations=[LintViolation(code=code, message="simulated lint failure", severity="error")],
     )
 
 
@@ -257,9 +255,7 @@ async def test_docx_lint_failure_persists_flagged_draft(
     watching to retry — so the draft has to survive for the user to fix."""
     supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
     monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
-    monkeypatch.setattr(
-        "app.services.tailor.pipeline.lint_docx", lambda _b, **_kw: _lint_error()
-    )
+    monkeypatch.setattr("app.services.tailor.pipeline.lint_docx", lambda _b, **_kw: _lint_error())
 
     llm = MockLLMClient(scripted={DEFAULT_PURPOSE: _valid_resume_json()})
     result = await run_tailor_pipeline(
@@ -356,9 +352,7 @@ async def test_clean_generation_persists_warnings_so_they_survive_the_202(
         "app.services.tailor.pipeline.lint_docx",
         lambda _b, **_kw: LintResult(
             ok=True,
-            violations=[
-                LintViolation(code="long_line", message="a bit long", severity="warning")
-            ],
+            violations=[LintViolation(code="long_line", message="a bit long", severity="warning")],
         ),
     )
 

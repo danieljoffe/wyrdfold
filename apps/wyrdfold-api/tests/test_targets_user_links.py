@@ -280,9 +280,7 @@ def test_get_active_target_ids_filters_on_membership_activity() -> None:
     (authz/dedup via get_user_target_ids) still sees the link."""
     supabase = MagicMock()
     chain = supabase.table.return_value.select.return_value
-    chain.eq.return_value.eq.return_value.execute.return_value.data = [
-        {"target_id": "t-active"}
-    ]
+    chain.eq.return_value.eq.return_value.execute.return_value.data = [{"target_id": "t-active"}]
 
     ids = crud.get_active_target_ids(supabase, "user-1")
 
@@ -335,9 +333,7 @@ class TestActiveLimitErrorPayload:
         from app.services.targets import crud
 
         for count, limit in ((0, 1), (1, 1), (2, 5), (10, 10)):
-            exc = _active_limit_error(
-                crud.ActiveTargetLimitError(current_count=count, limit=limit)
-            )
+            exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=count, limit=limit))
             assert isinstance(exc.detail["message"], str)
             assert exc.detail["message"].strip()
             assert "deactivate one first" in exc.detail["message"]
@@ -369,9 +365,7 @@ class TestActiveLimitPickerPayload:
             {"id": "t-1", "label": "Senior Frontend Engineer"},
             {"id": "t-2", "label": "Staff Full-Stack Engineer"},
         ]
-        exc = _active_limit_error(
-            crud.ActiveTargetLimitError(current_count=2, limit=2), choices
-        )
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=2, limit=2), choices)
         assert exc.detail["active_targets"] == choices
         # ...and the message still stands on its own for a client that
         # ignores the list entirely.
@@ -384,9 +378,7 @@ class TestActiveLimitPickerPayload:
         from app.services.targets import crud
 
         choices = [{"id": f"t-{i}", "label": f"Target {i}"} for i in range(5)]
-        exc = _active_limit_error(
-            crud.ActiveTargetLimitError(current_count=5, limit=5), choices
-        )
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=5, limit=5), choices)
         assert len(exc.detail["active_targets"]) == 5
         assert exc.detail["message"] == (
             "You already have 5 active targets (limit 5) — deactivate one first."

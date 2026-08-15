@@ -311,12 +311,17 @@ async def maybe_run_learner(
 
     run_id = str(uuid.uuid4())
     consumed_ids = [r.id for r in pending]
-    await supabase.table(TABLE).update(
-        {
-            "applied_at": datetime.now(UTC).isoformat(),
-            "applied_run_id": run_id,
-        }
-    ).in_("id", consumed_ids).execute()
+    await (
+        supabase.table(TABLE)
+        .update(
+            {
+                "applied_at": datetime.now(UTC).isoformat(),
+                "applied_run_id": run_id,
+            }
+        )
+        .in_("id", consumed_ids)
+        .execute()
+    )
 
     logger.info(
         "Feedback learner applied for (user=%s, target=%s): +%d negative "
@@ -360,9 +365,7 @@ async def run_learner_off_loop(*, user_id: str, target_id: str) -> LearnerPatchS
     )
 
 
-async def run_learner_and_rescore(
-    supabase: AsyncClient, *, user_id: str, target_id: str
-) -> None:
+async def run_learner_and_rescore(supabase: AsyncClient, *, user_id: str, target_id: str) -> None:
     """The post-feedback background learner chain (moved from the router's
     ``_safe_run_learner``, #57 PR-G2d-a; fully async since PR-G2e-3).
 

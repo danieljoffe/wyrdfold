@@ -65,7 +65,9 @@ def _owned_posting_supabase() -> tuple[MagicMock, dict[str, MagicMock]]:
             )
         elif name == "scores":
             tbl.select.return_value.eq.return_value.in_.return_value.order.return_value.limit.return_value.execute = AsyncMock(
-                return_value=MagicMock(data=[{"target_id": "tgt-a", "score": 90, "score_breakdown": {}}])
+                return_value=MagicMock(
+                    data=[{"target_id": "tgt-a", "score": 90, "score_breakdown": {}}]
+                )
             )
         elif name == "user_jobs":
             tbl.upsert.return_value.execute = AsyncMock(return_value=MagicMock(data=None))

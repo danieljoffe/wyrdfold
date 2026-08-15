@@ -255,9 +255,7 @@ def test_get_endpoint_returns_preferences(
     assert body["pref_remote_ok"] is True
 
 
-def test_get_endpoint_404_when_no_link(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_endpoint_404_when_no_link(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """A user querying a target they never linked gets 404 and no leak of the
     target's existence."""
     from app.routers import targets as router_mod

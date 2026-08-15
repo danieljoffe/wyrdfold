@@ -105,9 +105,7 @@ async def _rows(query: Any, label: str) -> list[Row]:
     # ``retry_statement_timeout``: the 2026-08-05 drive caught
     # /insights/targets 500ing on a single 57014 while the identical read
     # succeeded 23s later (#604) — one backoff retry absorbs that class.
-    resp = await execute_with_retry(
-        query.execute, label=label, retry_statement_timeout=True
-    )
+    resp = await execute_with_retry(query.execute, label=label, retry_statement_timeout=True)
     return cast(list[Row], resp.data or [])
 
 

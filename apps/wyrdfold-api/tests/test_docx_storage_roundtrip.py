@@ -63,7 +63,9 @@ async def test_upload_then_download_returns_same_bytes() -> None:
     sb = _supabase_with_fake_storage()
     payload = b"PK\x03\x04 fake docx bytes"
 
-    path = await persistence.upload_docx(sb, user_id="user-1", resume_id="resume-1", docx_bytes=payload)
+    path = await persistence.upload_docx(
+        sb, user_id="user-1", resume_id="resume-1", docx_bytes=payload
+    )
     got = await persistence.download_docx(sb, path)
 
     assert got == payload
@@ -96,8 +98,12 @@ async def test_two_users_same_resume_id_do_not_collide() -> None:
     another's artifact."""
     sb = _supabase_with_fake_storage()
 
-    p1 = await persistence.upload_docx(sb, user_id="user-1", resume_id="shared-id", docx_bytes=b"one")
-    p2 = await persistence.upload_docx(sb, user_id="user-2", resume_id="shared-id", docx_bytes=b"two")
+    p1 = await persistence.upload_docx(
+        sb, user_id="user-1", resume_id="shared-id", docx_bytes=b"one"
+    )
+    p2 = await persistence.upload_docx(
+        sb, user_id="user-2", resume_id="shared-id", docx_bytes=b"two"
+    )
 
     assert p1 != p2
     assert await persistence.download_docx(sb, p1) == b"one"

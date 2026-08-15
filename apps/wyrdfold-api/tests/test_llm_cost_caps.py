@@ -109,9 +109,7 @@ def _spend_by_window_async(hour: float, day: float, month: float):
 
 
 async def test_async_monthly_breach_raises_429(monkeypatch):
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 0.0, 5.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 0.0, 5.0))
     with pytest.raises(HTTPException) as exc:
         await budget.check_user_budget_async(
             MagicMock(),
@@ -153,9 +151,7 @@ async def test_async_under_monthly_cap_passes(monkeypatch):
 
 async def test_async_hourly_trips_before_monthly(monkeypatch):
     """Same burst-protection ordering as the sync gate: hourly first."""
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend_async", _spend_by_window_async(1.0, 1.0, 5.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend_async", _spend_by_window_async(1.0, 1.0, 5.0))
     with pytest.raises(HTTPException) as exc:
         await budget.check_user_budget_async(
             MagicMock(),
@@ -205,9 +201,7 @@ async def test_async_gate_mirrors_sync_gate(monkeypatch):
     """Parity guard against the twins drifting: identical spend + limits →
     identical verdict from both gates."""
     monkeypatch.setattr(budget.cost_log, "total_spend", _spend_by_window(0.0, 3.0, 3.0))
-    monkeypatch.setattr(
-        budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 3.0, 3.0)
-    )
+    monkeypatch.setattr(budget.cost_log, "total_spend_async", _spend_by_window_async(0.0, 3.0, 3.0))
     kwargs = {
         "user_id": "u-1",
         "daily_limit_usd": 3.0,
@@ -375,9 +369,7 @@ async def test_build_gate_classifies_over_budget_payer(monkeypatch):
 async def test_build_gate_zero_cap_disables_gating(monkeypatch):
     import app.services.targets.payers as payers_mod
 
-    monkeypatch.setattr(
-        payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"})
-    )
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"}))
     sb = MagicMock()
     sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
         return_value=MagicMock(data=[])
@@ -445,9 +437,7 @@ async def test_build_gate_override_raises_cap(monkeypatch):
         return_value=MagicMock(data=[{"user_id": "u-vip", "llm_monthly_budget_usd": 50}])
     )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
-    monkeypatch.setattr(
-        payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=20.0)
-    )
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=20.0))
 
     gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False  # 20 < 50 override

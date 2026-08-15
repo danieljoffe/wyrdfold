@@ -88,9 +88,7 @@ async def fetch_rejected_titles(
     if settings.phase1_rejection_ttl_hours <= 0 or not titles:
         return set()
     norms = sorted({normalize_title(t) for t in titles})
-    cutoff = (
-        datetime.now(UTC) - timedelta(hours=settings.phase1_rejection_ttl_hours)
-    ).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(hours=settings.phase1_rejection_ttl_hours)).isoformat()
     rejected: set[str] = set()
     try:
         for i in range(0, len(norms), _IN_CHUNK_SIZE):

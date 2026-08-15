@@ -218,9 +218,7 @@ async def process_batch(
                 items[i]["lint_violations"] = [v.message for v in result.lint.violations]
             completed += 1
 
-            await persistence.mark_job_resume_draft(
-                supabase, job_posting_id, user_id=user_id
-            )
+            await persistence.mark_job_resume_draft(supabase, job_posting_id, user_id=user_id)
 
         except Exception as exc:
             items[i]["status"] = "failed"

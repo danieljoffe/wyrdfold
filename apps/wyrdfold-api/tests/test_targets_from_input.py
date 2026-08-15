@@ -119,7 +119,6 @@ def _ref_jd(*, target_id: str = "t-1", jd_url: str | None = None) -> TargetRefer
     )
 
 
-
 def _amock(value: Any):  # type: ignore[no-untyped-def]
     """Async no-op returning a fixed value (find_matching_target stand-in)."""
 

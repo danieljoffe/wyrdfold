@@ -92,9 +92,7 @@ def test_matrix_actually_exercises_both_outcomes() -> None:
     """A predicate stuck at True (or False) would satisfy the equivalence test
     trivially. Prove the matrix produces a real mix."""
     results = [
-        _score_row_passes_logistics(
-            _pair(log=log, salary=salary)[1], f, include_unknown_salary=inc
-        )
+        _score_row_passes_logistics(_pair(log=log, salary=salary)[1], f, include_unknown_salary=inc)
         for f, log, salary, inc in itertools.product(_FILTERS, _LOGS, _SALARIES, (True, False))
     ]
     assert any(results) and not all(results)

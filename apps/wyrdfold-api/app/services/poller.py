@@ -718,8 +718,7 @@ async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
         retry_sync=True,
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -1162,8 +1161,7 @@ async def _reconcile_offfamily_promising(supabase: AsyncClient, job_ids: list[st
             )
         if to_retract:
             logger.info(
-                "Family reconcile: retracted %d off-family promising verdict(s) "
-                "across %d job(s)",
+                "Family reconcile: retracted %d off-family promising verdict(s) across %d job(s)",
                 len(to_retract),
                 len(job_ids),
             )
@@ -1542,9 +1540,9 @@ async def _poll_one_source(
         # deliberately out of bounds.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs")
-            .select("external_id, content_hash")
-            .eq("source_id", source_id),
+            lambda c: (
+                c.table("jobs").select("external_id, content_hash").eq("source_id", source_id)
+            ),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
@@ -1882,9 +1880,7 @@ async def _poll_one_source(
         # rescore via bulk_score_for_target at bump time, not here.
         unchanged_skipped = 0
         if rows_to_upsert:
-            rows_to_upsert, unchanged_skipped = _partition_unchanged(
-                rows_to_upsert, known_hashes
-            )
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(rows_to_upsert, known_hashes)
             if unchanged_skipped:
                 summary["unchanged"] = unchanged_skipped
 
@@ -2435,10 +2431,7 @@ _spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0}
 
 async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> float:
     now = time.monotonic()
-    if (
-        _spend_memo["midnight"] == midnight
-        and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S
-    ):
+    if _spend_memo["midnight"] == midnight and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S:
         return cast(float, _spend_memo["value"])
     value = await total_llm_spend_all_async(supabase, since=midnight)
     _spend_memo.update(at=now, midnight=midnight, value=value)
@@ -2772,9 +2765,7 @@ def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> Non
     # #642 visibility: unchanged-row skips ride the log, not PollResult
     # (API model stability). Grep 'poll cycle unchanged' for the cycle sum.
     if summary.get("unchanged"):
-        logger.debug(
-            "poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"]
-        )
+        logger.debug("poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"])
     result.archived_jobs += summary["archived"]
     if summary["error"]:
         result.errors.append(summary["error"])
@@ -2981,8 +2972,7 @@ async def poll_due_sources(
     await asyncio.gather(*(_worker(s) for s in due))
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
         logger.info(
-            "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the "
-            "model this cycle",
+            "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",
             phase1_store_stats["hits"],
             phase1_store_stats["misses"],
         )
@@ -3039,9 +3029,9 @@ async def _poll_one_source_for_target(
         # refresh. Same full-set admission scoping as ``_poll_one_source``.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs")
-            .select("external_id, content_hash")
-            .eq("source_id", source_id),
+            lambda c: (
+                c.table("jobs").select("external_id, content_hash").eq("source_id", source_id)
+            ),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
@@ -3250,9 +3240,7 @@ async def _poll_one_source_for_target(
         # rescore via bulk_score_for_target at bump time, not here.
         unchanged_skipped = 0
         if rows_to_upsert:
-            rows_to_upsert, unchanged_skipped = _partition_unchanged(
-                rows_to_upsert, known_hashes
-            )
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(rows_to_upsert, known_hashes)
             if unchanged_skipped:
                 summary["unchanged"] = unchanged_skipped
 

@@ -74,8 +74,6 @@ async def test_no_active_user_links_means_no_stage3_grading() -> None:
     sb = MagicMock()
     sb.table.return_value = ut_chain
 
-    primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
-        sb, [target], "(test)"
-    )
+    primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(sb, [target], "(test)")
     assert primary_by_user == {}
     assert user_optimized == {}

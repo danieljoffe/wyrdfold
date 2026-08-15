@@ -113,9 +113,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
             )
         ),
     )
-    monkeypatch.setattr(
-        "app.routers.targets._list_reference_jds_async", AsyncMock(return_value=[])
-    )
+    monkeypatch.setattr("app.routers.targets._list_reference_jds_async", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         "app.routers.targets.merge_reference_jds",
         lambda *_a: ScoringProfile(),
@@ -186,9 +184,7 @@ def test_capped_contribution_is_quarantined_not_applied(
 def test_uncapped_contribution_writes_through_merge_rpc(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", AsyncMock(return_value=None))
     rpc = AsyncMock(name="merge_rpc", return_value=("applied", 4))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 
@@ -208,9 +204,7 @@ def test_uncapped_contribution_writes_through_merge_rpc(
 def test_unresolvable_version_conflict_is_409(
     wired: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "app.routers.targets.project_profile_impact", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("app.routers.targets.project_profile_impact", AsyncMock(return_value=None))
     rpc = AsyncMock(name="merge_rpc", return_value=("version_conflict", 9))
     monkeypatch.setattr("app.routers.targets.apply_profile_merge_rpc_async", rpc)
 

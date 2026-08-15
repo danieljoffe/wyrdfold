@@ -182,7 +182,11 @@ class _FakeCoverageTable:
     def is_(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
         return self
 
-    def not_(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
+    @property
+    def not_(self) -> _FakeCoverageTable:
+        # Production writes `.not_.is_(...)` — ATTRIBUTE access, then a call.
+        # A plain method here would make that chain raise, which the caller's
+        # `except Exception` would swallow into a misleading warning.
         return self
 
     def order(self, *_a: Any, **_k: Any) -> _FakeCoverageTable:
@@ -227,9 +231,9 @@ async def test_coverage_counts_the_whole_catalog_not_the_first_clamped_page() ->
     """
     from app.services.qualification.skill_growth import vocabulary_candidates
 
-    rows = [
-        {"role_family": "engineering", "skills_required": None} for _ in range(1000)
-    ] + [{"role_family": "engineering", "skills_required": ["react"]} for _ in range(1000)]
+    rows = [{"role_family": "engineering", "skills_required": None} for _ in range(1000)] + [
+        {"role_family": "engineering", "skills_required": ["react"]} for _ in range(1000)
+    ]
     jobs = _FakeCoverageTable(rows)
 
     out = await vocabulary_candidates(_CoverageClient(jobs), limit=5)

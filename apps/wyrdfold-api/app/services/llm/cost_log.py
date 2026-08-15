@@ -66,9 +66,11 @@ async def record_async(
     service client — the row lands on the event loop instead of a threadpool
     worker. Same immediate-INSERT semantics as :func:`record` (budget guard sees
     fresh totals). The sync :func:`record` stays for the poller/batch paths."""
-    resp = await supabase.table(TABLE).insert(_row_for(
-        user_id=user_id, purpose=purpose, result=result, metadata=metadata
-    )).execute()
+    resp = (
+        await supabase.table(TABLE)
+        .insert(_row_for(user_id=user_id, purpose=purpose, result=result, metadata=metadata))
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to insert llm_costs row")
@@ -84,9 +86,13 @@ async def record_embedding_async(
 ) -> LLMCallRecord:
     """Async mirror of :func:`record_embedding` (#57 slice 3) for ``async def``
     callers on the pooled async client."""
-    resp = await supabase.table(TABLE).insert(_embedding_row_for(
-        user_id=user_id, purpose=purpose, result=result, metadata=metadata
-    )).execute()
+    resp = (
+        await supabase.table(TABLE)
+        .insert(
+            _embedding_row_for(user_id=user_id, purpose=purpose, result=result, metadata=metadata)
+        )
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         raise RuntimeError("Failed to insert llm_costs row")
@@ -397,9 +403,7 @@ async def total_billable_spend_async(
         ).execute()
     except Exception:
         _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
-        return await _total_billable_spend_python_async(
-            supabase, user_id, since, excluded_purposes
-        )
+        return await _total_billable_spend_python_async(supabase, user_id, since, excluded_purposes)
 
     raw = resp.data
     if raw is None:

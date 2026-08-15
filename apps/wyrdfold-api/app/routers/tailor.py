@@ -171,15 +171,19 @@ async def _upsert_user_job(
 ) -> None:
     """Async inline of ``persistence.upsert_user_job`` (sync twin kept for the
     jobs / status routers). Mirrors a pipeline-status write into ``user_jobs``."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 async def _get_records(
@@ -204,9 +208,7 @@ async def _target_scoring_profile_row(
 ) -> dict[str, Any] | None:
     """The ``targets`` row (scoring_profile only) for *target_id*, or None.
     A non-handler helper so the #107 guard sees the handler await the read."""
-    resp = await (
-        supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
-    )
+    resp = await supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return rows[0] if rows else None
 
@@ -226,15 +228,11 @@ async def _posting_exists(supabase: AsyncClient, job_posting_id: str) -> bool:
     (``_fetch_job_description`` → 404); this is the same contract — a 202 must
     only ever mean "accepted work that can actually run".
     """
-    resp = await (
-        supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
-    )
+    resp = await supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
     return bool(cast(list[dict[str, Any]], resp.data or []))
 
 
-async def _fetch_postings_by_ids(
-    supabase: AsyncClient, ids: list[str]
-) -> list[dict[str, Any]]:
+async def _fetch_postings_by_ids(supabase: AsyncClient, ids: list[str]) -> list[dict[str, Any]]:
     """Batch-fetch ``jobs`` rows for *ids* (id/title/description_html)."""
     resp = await (
         supabase.table("jobs").select("id, title, description_html").in_("id", ids).execute()
@@ -369,8 +367,7 @@ def _claim_run_or_202(
                 "code": "tailor_concurrent_limit",
                 "limit": max_concurrent,
                 "message": (
-                    "Too many documents generating at once. "
-                    "Wait for one to finish, then try again."
+                    "Too many documents generating at once. Wait for one to finish, then try again."
                 ),
             },
         )
@@ -430,9 +427,7 @@ async def create_tailored_resume(
     # A 202 must only ever mean "accepted work that can actually run" — see
     # _posting_exists. Checked before the reuse probe and the claim, so a bogus
     # id costs one indexed lookup and nothing else.
-    if body.job_posting_id is not None and not await _posting_exists(
-        supabase, body.job_posting_id
-    ):
+    if body.job_posting_id is not None and not await _posting_exists(supabase, body.job_posting_id):
         raise HTTPException(status_code=404, detail="job posting not found")
 
     # Reuse check (#504): skip pipeline if a similar resume exists in the target
@@ -666,9 +661,7 @@ async def create_tailored_cover_letter(
     ):
         return _running_202()
 
-    if body.job_posting_id is not None and not await _posting_exists(
-        supabase, body.job_posting_id
-    ):
+    if body.job_posting_id is not None and not await _posting_exists(supabase, body.job_posting_id):
         raise HTTPException(status_code=404, detail="job posting not found")
 
     if body.job_posting_id is None:
@@ -691,9 +684,7 @@ async def create_tailored_cover_letter(
         # A lint failure is no longer a 422 — the draft is persisted flagged,
         # so it comes back as a normal record whose ``lint_violations`` say why
         # it needs attention (mirrors ``_resume_response``).
-        if not isinstance(
-            result, CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure
-        ):
+        if not isinstance(result, CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure):
             raise HTTPException(status_code=500, detail="Unexpected pipeline result")
         return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
 
@@ -864,9 +855,7 @@ async def get_resume_by_job(
     Still 200-with-null rather than 404 for the empty state, so the browser
     doesn't log a failed request on every job-detail visit before generation.
     """
-    return await _document_state(
-        supabase, job_posting_id, user_id=user_id, document_type="resume"
-    )
+    return await _document_state(supabase, job_posting_id, user_id=user_id, document_type="resume")
 
 
 @router.get("/cover-letters/by-job/{job_posting_id}")

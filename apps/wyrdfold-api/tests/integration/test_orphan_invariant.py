@@ -42,9 +42,7 @@ def cleanup_targets(service_client: Client) -> Iterator[list[str]]:
 
 def _orphans(service_client: Client) -> list[dict]:
     """Rows violating the invariant: unsponsored and unfollowed."""
-    targets = (
-        service_client.table("targets").select("id,label,app_active").execute().data or []
-    )
+    targets = service_client.table("targets").select("id,label,app_active").execute().data or []
     links = service_client.table("user_targets").select("target_id").execute().data or []
     followed = {r["target_id"] for r in links}
     return [t for t in targets if not t["app_active"] and t["id"] not in followed]
@@ -142,11 +140,7 @@ def test_erasure_reaps_a_target_the_user_solely_followed(
     remaining = {
         r["id"]
         for r in (
-            service_client.table("targets")
-            .select("id")
-            .in_("id", [solo, shared])
-            .execute()
-            .data
+            service_client.table("targets").select("id").in_("id", [solo, shared]).execute().data
             or []
         )
     }

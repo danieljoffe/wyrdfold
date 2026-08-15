@@ -149,7 +149,6 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
         country = location.get("country", "")
         location_str = f"{city}, {country}".strip(", ") if city or country else None
 
-
         # Prefer ``postingUrl`` — that's the human-facing apply page
         # (``jobs.smartrecruiters.com/{company}/{id}-{slug}``). Fall back
         # in order: applyUrl → ref (API URL — last resort, the previous

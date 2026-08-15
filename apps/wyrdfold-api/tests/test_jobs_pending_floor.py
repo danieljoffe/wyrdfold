@@ -204,7 +204,9 @@ def test_prefer_score_row_graded_beats_pending() -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_floor_drops_low_graded_but_keeps_low_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_floor_drops_low_graded_but_keeps_low_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = [
         {
@@ -290,7 +292,9 @@ async def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.Mon
 # --------------------------------------------------------------------------
 
 
-async def test_cross_target_dedup_prefers_graded_over_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cross_target_dedup_prefers_graded_over_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     # Same job scored on two targets: a graded 60 and a Pending 90.
     scores = [
@@ -342,7 +346,9 @@ async def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> N
     # Python here cost floored users ~2s of chunked round-trips per dashboard
     # load (2026-07-16 audit).
     sb = MagicMock()
-    sb.rpc.return_value.execute = AsyncMock(return_value=FakeResponse([{"status": "new", "count": 7}]))
+    sb.rpc.return_value.execute = AsyncMock(
+        return_value=FakeResponse([{"status": "new", "count": 7}])
+    )
     monkeypatch.setattr(
         jobs_mod,
         "_pipeline_counts_python",
@@ -358,7 +364,9 @@ async def test_counts_use_rpc_when_floored(monkeypatch: pytest.MonkeyPatch) -> N
 
 async def test_counts_use_rpc_when_unfloored() -> None:
     sb = MagicMock()
-    sb.rpc.return_value.execute = AsyncMock(return_value=FakeResponse([{"status": "new", "count": 3}]))
+    sb.rpc.return_value.execute = AsyncMock(
+        return_value=FakeResponse([{"status": "new", "count": 3}])
+    )
     out = await _pipeline_counts_grouped(sb, target_ids={"t-1"}, min_score=None, user_id="u1")
     assert out == {"new": 3}
     sb.rpc.assert_called_once()  # no floor → keyset RPC fast path

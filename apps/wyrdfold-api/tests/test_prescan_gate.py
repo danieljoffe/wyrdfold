@@ -120,7 +120,6 @@ def test_parse_vector_none_and_garbage() -> None:
     assert parse_vector(["x", "y"]) is None  # non-numeric list
 
 
-
 @pytest.mark.asyncio
 async def test_vector_batch_read_chunks_stay_url_safe(monkeypatch) -> None:
     """Regression for the 2026-07-15 backfill find: the vectors read rode ONE
@@ -182,9 +181,7 @@ def _vec_supabase(target_vec: object, job_rows: list[dict]) -> object:
             return self
 
         async def execute(self):
-            return MagicMock(
-                data=[{"embedding": target_vec}] if target_vec is not None else []
-            )
+            return MagicMock(data=[{"embedding": target_vec}] if target_vec is not None else [])
 
     class _Vectors:
         def select(self, *_a, **_k):

@@ -72,9 +72,7 @@ async def test_analysis_unowned_target_is_404_before_any_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """JWT caller not linked to target_id → 404; no cache read, no LLM call."""
-    monkeypatch.setattr(
-        analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"})
-    )
+    monkeypatch.setattr(analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"}))
     from app.services.analysis import persistence as persistence_mod
 
     get_cached = AsyncMock()
@@ -107,9 +105,7 @@ async def test_analysis_owned_target_passes_gate(
 ) -> None:
     """Linked caller proceeds past the ownership gate (404s later on the
     missing optimized doc, NOT on ownership)."""
-    monkeypatch.setattr(
-        analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"})
-    )
+    monkeypatch.setattr(analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-owned"}))
     monkeypatch.setattr(analysis_router, "_optimized_latest", AsyncMock(return_value=None))
 
     from app.main import app

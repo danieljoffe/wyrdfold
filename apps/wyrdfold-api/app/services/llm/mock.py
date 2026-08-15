@@ -486,7 +486,7 @@ def prose_skills_extraction_json() -> str:
                 "TYPESCRIPT",
                 "node.js",
                 "postgresql",
-            ]
+            ],
         }
     )
 

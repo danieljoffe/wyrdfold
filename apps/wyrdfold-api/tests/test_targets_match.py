@@ -82,9 +82,7 @@ async def test_find_matching_target_exact_match() -> None:
     supabase = MagicMock()
     supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
         AsyncMock(
-            return_value=MagicMock(
-                data=[_target_row(id="t1", label="Senior Frontend Engineer")]
-            )
+            return_value=MagicMock(data=[_target_row(id="t1", label="Senior Frontend Engineer")])
         )
     )
 
@@ -213,17 +211,13 @@ def test_near_duplicate_catches_word_extension_labels() -> None:
 def test_near_duplicate_requires_word_boundaries() -> None:
     # "end engineer" appears inside "backend engineer" only mid-word — the
     # guard must NOT fire (this would be a specialization collision).
-    assert not match_module._near_duplicate_of_existing(
-        "backend engineer", {"end engineer"}
-    )
+    assert not match_module._near_duplicate_of_existing("backend engineer", {"end engineer"})
 
 
 def test_near_duplicate_ignores_single_word_labels() -> None:
     # A one-word label ("engineer") sits inside almost anything — dropping
     # on it would erase whole categories of suggestions.
-    assert not match_module._near_duplicate_of_existing(
-        "platform engineer", {"engineer"}
-    )
+    assert not match_module._near_duplicate_of_existing("platform engineer", {"engineer"})
 
 
 def test_near_duplicate_unrelated_labels_pass() -> None:

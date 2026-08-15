@@ -237,8 +237,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
                 # attempt, then fail loud as before (the caller's fallback —
                 # triage defers, grading skips — engages on the second miss).
                 logger.warning(
-                    "forced tool_call missing for %s (model answered in prose) — "
-                    "retrying once",
+                    "forced tool_call missing for %s (model answered in prose) — retrying once",
                     tool_name,
                 )
                 return await self._openai_tool_use(

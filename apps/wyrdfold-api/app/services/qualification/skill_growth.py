@@ -222,6 +222,15 @@ async def vocabulary_candidates(supabase: AsyncClient, *, limit: int = 40) -> di
             if len(rows) < _COVERAGE_PAGE:
                 break
             offset += len(rows)
+        else:
+            # Hit the cap with rows still unread. Say so — a cap that truncates
+            # quietly is the same failure this function was just fixed for,
+            # only at a higher threshold.
+            logger.warning(
+                "vocabulary candidates: coverage scan stopped at the %d-row cap; "
+                "the percentages describe a prefix of the catalog, not all of it",
+                _COVERAGE_MAX_ROWS,
+            )
         out["family_coverage"] = sorted(
             (
                 {

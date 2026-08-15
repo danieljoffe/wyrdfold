@@ -258,15 +258,20 @@ async def _email_on_waitlist(supabase: AsyncClient, email: str) -> bool:
 
 
 async def _upsert_beta_invite(supabase: AsyncClient, email: str) -> None:
-    await supabase.table("wyrdfold_beta_invites").upsert(
-        {"email": email}, on_conflict="email", ignore_duplicates=True
-    ).execute()
+    await (
+        supabase.table("wyrdfold_beta_invites")
+        .upsert({"email": email}, on_conflict="email", ignore_duplicates=True)
+        .execute()
+    )
 
 
 async def _stamp_waitlist_invited(supabase: AsyncClient, email: str) -> None:
-    await supabase.table("waitlist_signups").update(
-        {"invited_at": datetime.now(UTC).isoformat()}
-    ).eq("email", email).execute()
+    await (
+        supabase.table("waitlist_signups")
+        .update({"invited_at": datetime.now(UTC).isoformat()})
+        .eq("email", email)
+        .execute()
+    )
 
 
 # Native async handler (#57 PR-G2a): the reads/writes run on the pooled async
@@ -337,14 +342,18 @@ class SignupModeResult(BaseModel):
 # Module-level async helper so the handler holds no inline ``.execute()`` on the
 # loop (#57 slice 4) — the CI guard scans only router handlers.
 async def _upsert_signup_mode(supabase: AsyncClient, mode: str) -> None:
-    await supabase.table("app_settings").upsert(
-        {
-            "key": "signup_mode",
-            "value": mode,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="key",
-    ).execute()
+    await (
+        supabase.table("app_settings")
+        .upsert(
+            {
+                "key": "signup_mode",
+                "value": mode,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="key",
+        )
+        .execute()
+    )
 
 
 # Native async handler (#57 slice 4): the write runs on the pooled async service
