@@ -786,6 +786,9 @@ Return JSON matching this exact schema:
 
 The label names a ROLE, not a requisition. Multiple postings at different companies must normalize to the SAME label.
 
+THE TITLE IS THE ONLY SOURCE OF SENIORITY.
+Copy the seniority word from the title or use none at all. The description excerpt exists ONLY to disambiguate what FUNCTION a jargon title refers to (e.g. "Product Builder" -> Product Manager). It is NEVER evidence of level. Ignore years of experience, scope, "senior level", compensation band, and reporting lines entirely — a title of "Software Engineer" returns "Software Engineer" even when the body asks for 10+ years and staff-level scope.
+
 REMOVE:
 - Company, team, org, product, and platform names, and any trailing qualifier after a comma or dash that names one ("Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform" -> "Senior Product Manager").
 - Requisition IDs, numbers, and codes ("Software Engineer III - R2938" -> "Software Engineer III" only if the numeral is a real level; drop bare req codes).
@@ -793,13 +796,13 @@ REMOVE:
 - Marketing adjectives and punctuation noise ("Rockstar", "Ninja", emoji, "!!!").
 
 KEEP:
-- The genuine seniority word if the posting has one: Junior, Mid, Senior, Staff, Principal, Lead, Director, VP, Head of, Chief.
+- The genuine seniority word IF THE TITLE HAS ONE: Junior, Mid, Senior, Staff, Principal, Lead, Director, VP, Head of, Chief.
 - The genuine function and, where it is a real discipline rather than a team name, one specialization: "Frontend", "Backend", "Full-Stack", "Platform", "Security", "Data", "Machine Learning", "Site Reliability".
 - Numeric levels only when they are industry-legible ("Software Engineer III").
 
 NEVER:
-- Invent a seniority the posting does not state. An untitled "Software Engineer" stays "Software Engineer".
-- Invent a specialization the posting does not support.
+- Add a seniority word that does not appear in the title.
+- Invent a specialization the title does not support.
 - Return a company name, a person's name, or a sentence.
 - Exceed 80 characters. Prefer 2-5 words.
 
