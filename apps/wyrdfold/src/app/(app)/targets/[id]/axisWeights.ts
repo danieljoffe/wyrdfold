@@ -71,10 +71,10 @@ export function axisWeightsEqual(a: AxisWeights, b: AxisWeights): boolean {
 
 /** Human label for each axis — shared between slider label and preview row. */
 export const AXIS_LABELS: Record<AxisKey, string> = {
-  title_fit: 'Title fit',
-  skills_fit: 'Skills fit',
-  seniority_fit: 'Seniority fit',
-  domain_fit: 'Domain fit',
+  title_fit: 'Title match',
+  skills_fit: 'Skills match',
+  seniority_fit: 'Seniority match',
+  domain_fit: 'Domain match',
 };
 
 /**
