@@ -774,6 +774,29 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
     return crud.MAX_ACTIVE_TARGETS_PER_USER
 
 
+def _active_limit_error(e: crud.ActiveTargetLimitError) -> HTTPException:
+    """The one 409 shape for the active-target cap.
+
+    Raised from three places (activate, link/follow, add-from-posting) that
+    each carried a byte-identical copy of this dict. ``message`` is the string
+    the user actually reads — the frontend surfaces it verbatim rather than
+    composing its own — so it is worth having exactly one of.
+    """
+    noun = "target" if e.current_count == 1 else "targets"
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "ACTIVE_LIMIT",
+            "limit": e.limit,
+            "active_count": e.current_count,
+            "message": (
+                f"You already have {e.current_count} active {noun} "
+                f"(limit {e.limit}) — deactivate one first."
+            ),
+        },
+    )
+
+
 async def _link_user_to_target_async(
     supabase: AsyncClient,
     *,
@@ -1427,20 +1450,9 @@ async def activate_target(
     except crud.ActiveTargetLimitError as e:
         # 409 Conflict — the request was well-formed but conflicts with
         # current state (the user is already at the active-target cap).
-        # Frontend reads ``error`` to switch on this case specifically and
-        # offers a deactivate picker rather than a generic toast.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+        # ``error`` lets the frontend switch on this case specifically;
+        # ``message`` is what it shows when it doesn't.
+        raise _active_limit_error(e) from e
     refreshed = await _target_get(supabase, target_id) or target
 
     spawn_detached(
@@ -1770,18 +1782,7 @@ async def link_target(
             fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+        raise _active_limit_error(e) from e
 
 
 @router.post(
@@ -1993,18 +1994,7 @@ async def create_target_from_posting(
                 is_active=True,
             )
         except crud.ActiveTargetLimitError as e:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "ACTIVE_LIMIT",
-                    "limit": e.limit,
-                    "active_count": e.current_count,
-                    "message": (
-                        f"You already have {e.current_count} active targets "
-                        f"(limit {e.limit}) — deactivate one first."
-                    ),
-                },
-            ) from e
+            raise _active_limit_error(e) from e
         # Re-read the target row so the response reflects any writes the
         # linking flow made.
         refreshed = await _target_get(supabase, target.id)

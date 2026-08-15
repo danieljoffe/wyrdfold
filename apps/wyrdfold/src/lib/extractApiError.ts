@@ -134,5 +134,32 @@ export async function extractApiError(
       : 'Set up your experience profile first.';
   }
 
+  // ``ACTIVE_LIMIT`` (409) — the user is at their active-target cap
+  // (``MAX_ACTIVE_TARGETS_PER_USER``, 1 by default). Raised from three
+  // places: activate, follow/link, and add-from-posting.
+  //
+  // This branch keys on ``error``, not ``code``: the API composed this
+  // payload with an ``error`` key while every other structured detail above
+  // uses ``code``, so none of them matched and a ready-made, actionable
+  // sentence was being dropped one layer from the screen — the user saw
+  // "Activate failed (409)" and had no idea a cap even existed. The API
+  // comment beside the raise site describes a frontend that reads this and
+  // offers a deactivate picker; that picker doesn't exist yet, but surfacing
+  // the server's own message is what it was meant to say.
+  if (
+    detail &&
+    typeof detail === 'object' &&
+    'error' in detail &&
+    (detail as { error: unknown }).error === 'ACTIVE_LIMIT'
+  ) {
+    const d = detail as { message?: unknown; limit?: unknown };
+    if (typeof d.message === 'string' && d.message.trim()) return d.message;
+    // Server message missing/blank — say something true rather than falling
+    // through to a bare status code.
+    return typeof d.limit === 'number'
+      ? `You can have ${d.limit} active target${d.limit === 1 ? '' : 's'} — deactivate one first.`
+      : 'You are at your active-target limit — deactivate one first.';
+  }
+
   return statusFallback;
 }

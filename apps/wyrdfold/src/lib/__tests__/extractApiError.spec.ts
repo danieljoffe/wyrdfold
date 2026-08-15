@@ -119,3 +119,69 @@ describe('extractApiError — pydantic validation arrays gated by status', () =>
     expect(msg).not.toMatch(/POST/);
   });
 });
+
+describe('extractApiError — ACTIVE_LIMIT (409)', () => {
+  // The API composes this payload with an `error` key while every other
+  // structured detail uses `code`, so none of the branches above matched and
+  // the server's ready-made sentence was dropped one layer from the screen —
+  // the user saw a bare "Activate failed (409)" and had no idea a cap existed.
+  it('surfaces the server message verbatim', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, {
+        error: 'ACTIVE_LIMIT',
+        limit: 1,
+        active_count: 1,
+        message:
+          'You already have 1 active target (limit 1) — deactivate one first.',
+      }),
+      'Activate failed'
+    );
+    expect(msg).toBe(
+      'You already have 1 active target (limit 1) — deactivate one first.'
+    );
+    // The regression guard: never the bare status fallback.
+    expect(msg).not.toMatch(/\(409\)/);
+  });
+
+  it('composes a true sentence when the server message is missing', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, { error: 'ACTIVE_LIMIT', limit: 3, active_count: 3 }),
+      'Activate failed'
+    );
+    expect(msg).toBe('You can have 3 active targets — deactivate one first.');
+  });
+
+  it('singularizes the fallback for a cap of 1', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, { error: 'ACTIVE_LIMIT', limit: 1, active_count: 1 }),
+      'Activate failed'
+    );
+    expect(msg).toBe('You can have 1 active target — deactivate one first.');
+  });
+
+  it('falls back to generic copy when even the limit is absent', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, { error: 'ACTIVE_LIMIT' }),
+      'Activate failed'
+    );
+    expect(msg).toBe(
+      'You are at your active-target limit — deactivate one first.'
+    );
+  });
+
+  it('ignores a blank server message rather than showing an empty toast', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, { error: 'ACTIVE_LIMIT', limit: 2, message: '   ' }),
+      'Activate failed'
+    );
+    expect(msg).toBe('You can have 2 active targets — deactivate one first.');
+  });
+
+  it('does NOT hijack other structured errors that happen to carry `error`', async () => {
+    const msg = await extractApiError(
+      resWithDetail(409, { error: 'SOMETHING_ELSE', message: 'nope' }),
+      'Activate failed'
+    );
+    expect(msg).toBe('Activate failed (409)');
+  });
+});
