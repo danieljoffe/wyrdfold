@@ -40,11 +40,38 @@ JDs, Sonnet as the yardstick):
     exactly, a typo is a dead facet value nobody can ever click. DeepSeek
     returned valid JSON on 36/36 calls and tracks Sonnet's picks closely.
 
-PROMPT — the "be thorough" wording is deliberate and measured: an earlier
-"do not pad the list" instruction suppressed every model (deepseek 5.5 -> 8.5
-skills/job when switched). A skill the posting requires but we omit is a job
-nobody can find, so recall is the thing to optimize here; precision is
-protected by the normalizer's caps + the grounding of a real JD.
+PROMPT — every clause here is measured, and two attempts went wrong first:
+
+1. "Do not pad the list" suppressed every model (deepseek 5.5 -> 8.5
+   skills/job when switched to "be thorough"). A skill the posting requires
+   but we omit is a job nobody can find, so recall is what to optimize;
+   precision is protected by the normalizer's caps and the JD's grounding.
+
+2. The first anti-generic attempt (2026-08-15) drove generic terms to 0% —
+   and WIPED OUT non-technical roles: a UX Designer went from 8 real facets
+   (user research, information architecture, wireframing, prototyping) to
+   ZERO. "Skip category nouns" had taught the model that a craft without a
+   product name isn't a skill. The aggregate metric looked like a triumph;
+   reading the per-job output showed the opposite. Hence the explicit
+   "this is NOT a rule against non-software skills" clause with worked
+   examples — do not delete it.
+
+   Final A/B over 18 postings across 6 role families:
+
+                    skills/job   generic   jobs with none
+       shipped          3.8         4%          6/18
+       current          5.7         2%          2/18
+
+   It beat the shipped prompt on all three axes and closed a coverage gap
+   nobody had noticed: Product, Finance and Marketing postings had been
+   coming back EMPTY (0 -> 8 skills each) because the extractor was reading
+   "skill" as "software tool".
+
+KNOWN FLAKE: deepseek occasionally answers in prose instead of calling the
+forced tool (~5-10% through the tool_use path, though it was 36/36 valid via
+raw response_format in the bake-off). ``complete_json`` retries once, then
+this fails soft and the column stays NULL for a later cycle — the same
+MissingToolCallError already in the mock's bug corpus.
 
 Fail-soft like the tagger: any error returns ``([], None)`` and the caller
 simply omits the column, leaving it NULL for a later cycle to fill.
@@ -98,10 +125,29 @@ sentence. "react", not "react 18" or "strong react experience".
 - NEVER soft traits (communication, teamwork, fast-paced, growth mindset), \
 seniority words, or degrees.
 - Only what the posting actually asks for; do not invent a stack it never names.
-- List EVERY concrete skill the posting names, up to 8. Be thorough: a skill \
-the posting requires but you omit is a job nobody can find. Include the \
-languages, frameworks, databases, cloud services and tools it mentions.
-- Empty list if the posting names no concrete skills.
+- When the posting names a TOOL for a job, extract the tool, not the activity: \
+"monitoring with Datadog and Grafana" -> "datadog", "grafana" (not \
+"monitoring"). "infrastructure as code via Terraform" -> "terraform" (not \
+"infrastructure"). "CI/CD in GitHub Actions" -> "github actions".
+- SKIP only the handful of words so broad they describe an entire field and \
+would match nearly every posting in it: "ai", "software development", \
+"programming", "engineering", "devops", "cloud", "cloud infrastructure", \
+"infrastructure", "automation", "data", "analytics", "technology". When the \
+posting names no tool for one of these, leave it out rather than falling back \
+to the category.
+- This is NOT a rule against non-software skills. A specific professional \
+craft IS a skill and must be extracted, product name or not: "user research", \
+"information architecture", "wireframing", "design systems", "financial \
+modeling", "revenue forecasting", "clinical research", "technical writing", \
+"distributed systems", "supply chain planning", "seo". Design, product, \
+finance, marketing and operations postings should come back just as full as \
+engineering ones — a designer's craft skills are exactly what makes their \
+jobs findable.
+- List EVERY specific skill the posting names, up to 8 — a skill the posting \
+requires but you omit is a job nobody can find. Include languages, \
+frameworks, databases, cloud services, named tools, AND the domain crafts \
+above. Do not pad with field-wide categories to reach 8.
+- Empty list only when the posting truly names no specific skill of any kind.
 
 Return exactly: {"skills": ["...", "..."]}"""
 )
