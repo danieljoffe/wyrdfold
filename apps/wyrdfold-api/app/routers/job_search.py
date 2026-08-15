@@ -61,6 +61,14 @@ async def search_jobs_endpoint(
         le=job_search.MAX_SALARY_FLOOR,
         description="Only postings whose yearly USD salary range reaches this floor",
     ),
+    skill: list[str] | None = Query(
+        None,
+        description=(
+            "Narrow to postings requiring ALL named skills (repeatable). "
+            "Matched against tagger-extracted skills; normalized, so "
+            "'React' and 'react' are equivalent."
+        ),
+    ),
     supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> JobSearchResponse:
     """Keyword search over the live, US jobs corpus (one page).
@@ -79,6 +87,7 @@ async def search_jobs_endpoint(
         location=(location or "").strip().lower(),
         posted_within_days=posted_within_days or 0,
         salary_floor=salary_floor or 0,
+        skills=",".join(job_search.normalize_skill_filter(skill)),
     )
 
     def _instrument(resp: JobSearchResponse) -> None:
@@ -112,6 +121,7 @@ async def search_jobs_endpoint(
         location=location,
         posted_within_days=posted_within_days,
         salary_floor=salary_floor,
+        skills=skill,
     )
     response = JobSearchResponse(query=q, count=len(results), has_more=has_more, results=results)
     job_list_cache.set(cache_key, response)

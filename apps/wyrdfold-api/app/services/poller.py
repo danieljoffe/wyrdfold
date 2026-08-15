@@ -49,6 +49,8 @@ from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
+    SKILLS_PURPOSE,
+    extract_skills,
     is_us_location,
     positively_us_location,
     qualification_hash,
@@ -904,6 +906,39 @@ async def _qualify_one_job(
         with contextlib.suppress(Exception):
             enqueue_llm_cost(None, QUALIFICATION_PURPOSE, result)
 
+    # Catalog-wide skill facts, backing /search?skill=react. A SECOND cheap
+    # call rather than extra fields on the tagger prompt: that variant measured
+    # a ~4-point role_family regression (A/B in services/qualification/
+    # skills.py), and role_family gates which jobs reach users — never trade
+    # match quality for a search facet.
+    #
+    # Rides this pass because it's the one place that reads every job exactly
+    # once, so it inherits the content-hash skip (a re-poll costs nothing), the
+    # fan-out semaphore, the breaker, and the same instance-key billing.
+    # Best-effort and strictly subordinate: a skills failure leaves the column
+    # NULL and the tag write below proceeds untouched.
+    skills: list[str] = []
+    if settings.skills_extraction_enabled:
+        try:
+            async with _qualify_llm_semaphore():
+                if not _provider_fatal_active():
+                    skills, skills_result = await extract_skills(
+                        llm,
+                        title=row.get("title", ""),
+                        description=row.get("description_html"),
+                    )
+                    if skills_result is not None:
+                        with contextlib.suppress(Exception):
+                            enqueue_llm_cost(None, SKILLS_PURPOSE, skills_result)
+        except (LLMQuotaExhaustedError, LLMRateLimitedError) as exc:
+            # Same provider-fatal contract as the tagger call: latch the
+            # breaker so the cycle stops hammering a dead key. The tags we
+            # already have still persist below — losing them to a skills
+            # failure would be strictly worse than a NULL column.
+            _trip_provider_fatal(exc)
+        except LLMServiceError:
+            pass  # transient/config — column stays NULL, retried next cycle
+
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
         "role_family": tags.role_family,
@@ -914,6 +949,7 @@ async def _qualify_one_job(
         "is_genuine_role": tags.is_genuine_role,
         "qualified_at": datetime.now(UTC).isoformat(),
         "qualified_hash": new_hash,
+        **({"skills_required": skills} if skills else {}),
     }
     # US-only corpus (#60 workstream B): a high-confidence non-US verdict
     # archives the job in the SAME write. The poller's ingest gate already

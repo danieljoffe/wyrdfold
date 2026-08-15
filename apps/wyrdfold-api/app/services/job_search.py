@@ -22,6 +22,7 @@ easily extended; embedding re-rank is a later, logged-in-only enhancement.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,7 @@ from typing import Any, cast
 from supabase import AsyncClient
 
 from app.models.job_search import JobSearchResult
+from app.services.fit.job_fit import normalize_skill
 from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,11 @@ _SEARCH_COLS = (
 # Salary-floor ceiling — mirrors the parser's plausibility cap (no real posted
 # salary exceeds $5M/yr), so the router bound and the data agree.
 MAX_SALARY_FLOOR = 5_000_000
+
+# Upper bound on skills in one filter. A facet UI sends a handful; a longer
+# list is either abuse or a bug, and every added term shrinks the result set
+# anyway (containment is AND).
+MAX_SKILL_FILTER_TERMS = 8
 
 # How many title-matching candidates to pull for Python re-ranking. This also
 # bounds how deep pagination can go (we rank the candidate window, then page
@@ -165,6 +172,7 @@ async def search_jobs(
     location: str | None = None,
     posted_within_days: int | None = None,
     salary_floor: int | None = None,
+    skills: list[str] | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
     """Search the live, US jobs corpus by title. Service-role client (the corpus
     is shared, non-user data).
@@ -183,6 +191,20 @@ async def search_jobs(
     escaping over a free-text value, and location text is too irregular to index
     on anyway). Both are refinements over the title match, so they operate within
     the capped candidate window — the same V1 bound as pagination.
+
+    ``skills`` narrows to postings whose extracted ``skills_required`` contains
+    EVERY named skill (jsonb ``@>``, GIN-indexed) — "frontend" + react + node.js
+    means all three, not any. Values are normalized through the harvest's
+    ``normalize_skill`` so a caller's "React" matches the stored "react": the
+    filter is exact-string containment, and a casing mismatch would silently
+    return zero rather than erroring. Applied DB-side so non-matching rows never
+    consume candidate-window slots.
+
+    Coverage caveat worth knowing at the call site: ``skills_required`` is
+    populated forward-only by the qualification tagger (every newly-tagged job)
+    plus the Phase-2 harvest for graded rows — historical jobs were NOT
+    backfilled, so a skill filter reaches only the tagged-since-2026-08-15
+    corpus and grows as the catalog turns over.
 
     ``salary_floor`` (USD/year) keeps rows whose posted range REACHES the floor
     (``salary_max >= floor``, or ``salary_min >= floor`` for min-only rows) —
@@ -228,6 +250,17 @@ async def search_jobs(
             .eq("salary_period", "yearly")
             .or_(f"salary_max.gte.{floor},and(salary_max.is.null,salary_min.gte.{floor})")
         )
+    wanted_skills = normalize_skill_filter(skills)
+    if wanted_skills:
+        # jsonb containment — index-backed by idx_jobs_skills_required (GIN).
+        #
+        # The value MUST be a JSON-encoded array string, not a Python list:
+        # postgrest-py renders a list as a Postgres array literal (``cs.{react}``),
+        # which a JSONB column rejects with 22P02 — surfaced as a 404 by the
+        # app-wide PostgREST handler, i.e. a silently empty facet rather than an
+        # error. Verified against real PostgREST (a mock asserting the call
+        # arguments cannot catch this).
+        query = query.filter("skills_required", "cs", json.dumps(wanted_skills))
 
     resp = await (
         # Bias the capped candidate pull toward recent postings before re-ranking.
@@ -344,6 +377,33 @@ async def attach_snippets(
         r.snippet = _html_to_snippet(by_id.get(r.id), max_len)
 
 
+def normalize_skill_filter(skills: list[str] | None) -> list[str]:
+    """Caller-supplied skill terms → the stored vocabulary, deduped and capped.
+
+    Shares ``normalize_skill`` with the write side (tagger + Phase-2 harvest),
+    which is the whole point: the DB filter is exact-string jsonb containment,
+    so read and write MUST agree on casing/spacing or the facet silently
+    returns nothing. Empty/whitespace terms drop out; ``None`` yields ``[]``
+    (no filter).
+    """
+    if not skills:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in skills:
+        # No isinstance guard: FastAPI validates the ``list[str]`` query param
+        # at the boundary, so a non-string can't reach here (mypy agrees — the
+        # check was dead code).
+        norm = normalize_skill(raw)
+        if not norm or len(norm) > 60 or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+        if len(out) >= MAX_SKILL_FILTER_TERMS:
+            break
+    return out
+
+
 async def search_jobs_with_snippets(
     supabase: AsyncClient,
     *,
@@ -353,6 +413,7 @@ async def search_jobs_with_snippets(
     location: str | None = None,
     posted_within_days: int | None = None,
     salary_floor: int | None = None,
+    skills: list[str] | None = None,
 ) -> tuple[list[JobSearchResult], bool]:
     """``search_jobs`` + the page-only snippet fetch, both native async round-trips
     on the pooled async service client (#57 slice 4).
@@ -369,6 +430,7 @@ async def search_jobs_with_snippets(
         location=location,
         posted_within_days=posted_within_days,
         salary_floor=salary_floor,
+        skills=skills,
     )
     await attach_snippets(supabase, results)
     return results, has_more

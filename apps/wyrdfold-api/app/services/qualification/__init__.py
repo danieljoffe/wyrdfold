@@ -24,6 +24,11 @@ from app.services.qualification.heuristics import (
     positively_us_location,
     qualification_hash,
 )
+from app.services.qualification.skills import (
+    SKILLS_MODEL,
+    SKILLS_PURPOSE,
+    extract_skills,
+)
 from app.services.qualification.tagger import (
     QUALIFICATION_MODEL,
     QUALIFICATION_PURPOSE,
@@ -37,11 +42,14 @@ from app.services.qualification.tagger import (
 __all__ = [
     "QUALIFICATION_MODEL",
     "QUALIFICATION_PURPOSE",
+    "SKILLS_MODEL",
+    "SKILLS_PURPOSE",
     "EmploymentType",
     "QualificationTags",
     "RoleFamily",
     "Seniority",
     "clean_description",
+    "extract_skills",
     "is_us_location",
     "positively_us_location",
     "qualification_hash",

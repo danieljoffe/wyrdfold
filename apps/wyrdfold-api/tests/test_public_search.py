@@ -54,7 +54,9 @@ def _stub_search(
     """Patch the service so the endpoint returns controlled rows, and capture the
     (q, limit, offset, filters) it forwarded."""
 
-    async def fake(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
+    async def fake(
+        supabase, *, q, limit, offset, location, posted_within_days, salary_floor, skills=None
+    ):
         if captured is not None:
             captured.update(
                 q=q,
@@ -169,7 +171,9 @@ def test_populates_snippet_from_page_jd_html(monkeypatch) -> None:
     """The public endpoint runs the real ``attach_snippets`` after ``search_jobs``:
     a page-only ``description_html`` fetch, tag-stripped into a preview."""
 
-    async def fake_search(supabase, *, q, limit, offset, location, posted_within_days, salary_floor):
+    async def fake_search(
+        supabase, *, q, limit, offset, location, posted_within_days, salary_floor, skills=None
+    ):
         return ([_result("a"), _result("b")], False)
 
     monkeypatch.setattr(public_search.job_search, "search_jobs", fake_search)

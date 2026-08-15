@@ -436,6 +436,51 @@ async def test_skills_as_string_degrades_to_none_not_a_dead_grade() -> None:
     assert parsed.skills is None
 
 
+async def test_prose_skills_extraction_is_cleaned_not_rejected() -> None:
+    """Bug-corpus entry for catalog skill extraction: a schema-VALID list full
+    of facet-hostile shapes must survive the parse and come out clean.
+
+    Driven through the real ``complete_json`` + ``ExtractedSkills`` path,
+    because the cleanup lives in a field validator — asserting on the model
+    alone would not prove the pipeline's parse step applies it.
+    """
+    from app.services.llm.client import complete_json
+    from app.services.llm.mock import prose_skills_extraction_json
+    from app.services.qualification.skills import MAX_SKILLS, ExtractedSkills
+
+    client = MockLLMClient(
+        scripted={"qualification.skills": prose_skills_extraction_json()}
+    )
+    parsed, _result = await complete_json(
+        client,
+        model="deepseek-v3-2",
+        system="extract skills",
+        messages=[Message(role="user", content="jd")],
+        schema=ExtractedSkills,
+        purpose="qualification.skills",
+    )
+
+    skills = parsed.skills
+    # Case-folded and deduped: three spellings of React collapse to one entry.
+    assert skills.count("react") == 1
+    # A sentence is not a skill — dropped by the length bound, not stored.
+    assert not any(len(s) > 60 for s in skills)
+    assert not any("years of experience" in s for s in skills)
+    # Injection-looking text echoed out of a scraped JD is inert DATA, and the
+    # 4-word bound also keeps it out of the facet vocabulary entirely.
+    assert not any("ignore previous instructions" in s for s in skills)
+    # Cap respected, everything canonical-cased.
+    assert len(skills) <= MAX_SKILLS
+    assert all(s == s.lower() for s in skills)
+    # The genuinely useful entries survive.
+    assert {"typescript", "node.js", "postgresql"} <= set(skills)
+    # KNOWN LIMIT, asserted so it is a decision and not a surprise: a
+    # MISSPELLING is indistinguishable from a real skill to a normalizer, so
+    # "claud" persists as a junk facet value. Bounded by the cap; the defense
+    # is model choice (deepseek made no such typo in the bake-off), not code.
+    assert "claud" in skills
+
+
 async def test_conversation_recap_echo_survives_the_real_parse_path() -> None:
     """Bug-corpus entry for the Path-C grounding work (2026-08-13): a turn
     response that restates already-recorded prose as ``prose_append`` is
