@@ -11,6 +11,8 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
 import Button from '@/components/kit/Button';
 import { extractApiError } from '@/lib/extractApiError';
+import { parseActiveLimit, type ActiveLimitDetail } from '@/lib/activeLimit';
+import SwapActiveTargetModal from '../SwapActiveTargetModal';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type {
   JobTarget,
@@ -69,6 +71,9 @@ export default function TargetDetail({ id }: TargetDetailProps) {
   const [jdsLoaded, setJdsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
+  // Set when activation is refused by the active-target cap; drives the
+  // swap picker. Null the rest of the time.
+  const [swapDetail, setSwapDetail] = useState<ActiveLimitDetail | null>(null);
   const { toast } = useToast();
 
   const pathname = usePathname();
@@ -135,42 +140,63 @@ export default function TargetDetail({ id }: TargetDetailProps) {
    * reports membership state — showing "Active" for a request the server
    * refused would be worse than a beat of latency.
    */
-  const handleToggleActive = useCallback(async () => {
-    if (!userTarget) return;
-    const activating = !userTarget.is_active;
-    setToggling(true);
-    try {
-      const res = await fetch(
-        `/api/targets/${id}/${activating ? 'activate' : 'deactivate'}`,
-        { method: 'POST' }
-      );
-      if (!res.ok) {
-        throw new Error(
-          await extractApiError(
-            res,
-            activating ? 'Activate failed' : 'Deactivate failed'
-          )
+  const handleToggleActive = useCallback(
+    async (swapOut?: string) => {
+      if (!userTarget) return;
+      const activating = !userTarget.is_active;
+      setToggling(true);
+      try {
+        const res = await fetch(
+          `/api/targets/${id}/${activating ? 'activate' : 'deactivate'}`,
+          {
+            method: 'POST',
+            ...(swapOut
+              ? {
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ deactivate_target_id: swapOut }),
+                }
+              : {}),
+          }
         );
+        if (!res.ok) {
+          // The cap has a way out, so offer the picker rather than a toast the
+          // user can only read and obey. Same treatment the cards grid gives
+          // it — this header is the other place activation can be attempted,
+          // and it is the one the target's own page sends you to.
+          const capped = activating ? await parseActiveLimit(res) : null;
+          if (capped) {
+            setSwapDetail(capped);
+            return;
+          }
+          throw new Error(
+            await extractApiError(
+              res,
+              activating ? 'Activate failed' : 'Deactivate failed'
+            )
+          );
+        }
+        setSwapDetail(null);
+        toast({
+          variant: 'success',
+          title: activating ? 'Target activated' : 'Target deactivated',
+        });
+        await fetchUserTarget();
+      } catch (err) {
+        toast({
+          variant: 'error',
+          title:
+            err instanceof Error
+              ? err.message
+              : activating
+                ? 'Activate failed'
+                : 'Deactivate failed',
+        });
+      } finally {
+        setToggling(false);
       }
-      toast({
-        variant: 'success',
-        title: activating ? 'Target activated' : 'Target deactivated',
-      });
-      await fetchUserTarget();
-    } catch (err) {
-      toast({
-        variant: 'error',
-        title:
-          err instanceof Error
-            ? err.message
-            : activating
-              ? 'Activate failed'
-              : 'Deactivate failed',
-      });
-    } finally {
-      setToggling(false);
-    }
-  }, [id, userTarget, toast, fetchUserTarget]);
+    },
+    [id, userTarget, toast, fetchUserTarget]
+  );
 
   const fetchReferenceJDs = useCallback(async () => {
     try {
@@ -403,7 +429,7 @@ export default function TargetDetail({ id }: TargetDetailProps) {
             variant='outline'
             size='sm'
             className='ml-auto'
-            onClick={handleToggleActive}
+            onClick={() => void handleToggleActive()}
             disabled={toggling}
             aria-busy={toggling}
           >
@@ -423,6 +449,15 @@ export default function TargetDetail({ id }: TargetDetailProps) {
         defaultTab={initialTabRef.current}
         variant='underline'
         onChange={handleTabChange}
+      />
+
+      <SwapActiveTargetModal
+        detail={swapDetail}
+        incomingLabel={target?.label ?? ''}
+        onClose={() => setSwapDetail(null)}
+        onSwap={async deactivateId => {
+          await handleToggleActive(deactivateId);
+        }}
       />
     </div>
   );
