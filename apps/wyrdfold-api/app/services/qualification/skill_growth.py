@@ -77,6 +77,8 @@ async def backfill_dictionary_skills(
     scanned = written = 0
     offset = 0
     while scanned < limit:
+        # Rows on this page that will still match the filter next time.
+        unmatched = 0
         page = min(_PAGE, limit - scanned)
         query = (
             supabase.table("jobs")
@@ -97,13 +99,13 @@ async def backfill_dictionary_skills(
         if not rows:
             break
         scanned += len(rows)
-        # When filling gaps the written rows leave the result set, so the
-        # window must NOT advance or it skips the rows that shift into place.
-        if not only_missing:
-            offset += len(rows)
         for row in rows:
             skills = extract_skills(row.get("title"), row.get("description_html"))
             if not skills:
+                # No dictionary hit. Under `only_missing` this row keeps
+                # `skills_required IS NULL`, so it STAYS in the result set —
+                # the offset arithmetic below has to step over it.
+                unmatched += 1
                 continue
             try:
                 await (
@@ -115,14 +117,26 @@ async def backfill_dictionary_skills(
                 written += 1
             except Exception:
                 logger.warning("skill backfill: write failed for %s", row.get("id"))
+                unmatched += 1  # still matches the filter; step over it too
+        # Advance past exactly the rows that did NOT leave the result set.
+        #
+        # Under `only_missing` the filter is `skills_required IS NULL`, so a
+        # WRITTEN row drops out and the rows behind it shift forward —
+        # advancing by the full page would skip them. That was the original
+        # reasoning, and it was right about written rows and wrong about the
+        # rest: a row with no dictionary hit is `continue`d WITHOUT a write, so
+        # it stays NULL and stays at the head. With the offset pinned at 0,
+        # every subsequent page re-read those same rows, and the scan
+        # livelocked as soon as enough of them accumulated at the front.
+        # Observed on prod minutes after release: `scanned 500, written 0` with
+        # coverage at 0%, on the DEFAULT (`only_missing=true`) path.
+        offset += unmatched if only_missing else len(rows)
         if len(rows) < page:
             break
     return {"scanned": scanned, "written": written}
 
 
-async def vocabulary_candidates(
-    supabase: AsyncClient, *, limit: int = 40
-) -> dict[str, Any]:
+async def vocabulary_candidates(supabase: AsyncClient, *, limit: int = 40) -> dict[str, Any]:
     """What the dictionary should learn next. Read-only, free, no LLM."""
     out: dict[str, Any] = {
         "vocabulary_size": len(VOCABULARY),
@@ -155,12 +169,7 @@ async def vocabulary_candidates(
     #    no supply. A single-word query is the strong case ("svelte"); longer
     #    phrases are usually role searches, not skill searches.
     try:
-        resp = await (
-            supabase.table("search_events")
-            .select("query")
-            .limit(5000)
-            .execute()
-        )
+        resp = await supabase.table("search_events").select("query").limit(5000).execute()
         q_counter: Counter[str] = Counter()
         for row in cast(list[dict[str, Any]], resp.data or []):
             raw = row.get("query")
