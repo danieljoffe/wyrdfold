@@ -119,6 +119,16 @@ def _ref_jd(*, target_id: str = "t-1", jd_url: str | None = None) -> TargetRefer
     )
 
 
+
+def _amock(value: Any):  # type: ignore[no-untyped-def]
+    """Async no-op returning a fixed value (find_matching_target stand-in)."""
+
+    async def _inner(*_a, **_k):  # type: ignore[no-untyped-def]
+        return value
+
+    return _inner
+
+
 class _Recorder:
     """Captures calls to monkeypatched async/sync helpers."""
 
@@ -1405,3 +1415,90 @@ async def test_from_url_still_falls_back_to_untitled_for_a_missing_title(
 
     assert seen_titles == ["Untitled Target"]
     assert seen_labels == ["Untitled Target"]
+
+
+@pytest.mark.asyncio
+async def test_from_url_records_the_canonicalization_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """The inline canonicalization is billed, so it must reach the ledger.
+
+    An unlogged LLM call makes the cost ledger under-report real spend, which
+    loosens ``enforce_llm_budget`` (it reads that ledger) and makes the usage
+    card lie. The sibling manual path has always recorded its normalize call.
+    """
+    monkeypatch.setattr(from_input, "find_matching_target", _amock(None))
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="Staff Backend Engineer",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+
+    logged = [
+        kw
+        for kw in stub_llm_helpers.by_name("cost_log")
+        if kw.get("purpose") == "target.normalize_posting_title"
+    ]
+    assert logged, (
+        "the canonicalization LLM call was not recorded in the cost ledger; "
+        f"purposes seen: {[kw.get('purpose') for kw in stub_llm_helpers.by_name('cost_log')]}"
+    )
+    assert logged[0]["user_id"] == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_from_url_survives_a_cost_ledger_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_llm_helpers: _Recorder,
+    stub_crud: _Recorder,
+    sched: Any,
+) -> None:
+    """A ledger write must never cost the user the create.
+
+    By the time we record, the canonical label is already in hand — failing the
+    whole flow over bookkeeping would trade a real user outcome for an
+    accounting row.
+    """
+
+    async def boom_cost(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(from_input.cost_log, "record_async", boom_cost)
+    monkeypatch.setattr(from_input, "find_matching_target", _amock(None))
+
+    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        target = _target(id="new", label=payload.label)
+        return target, _user_target(target_id=target.id)
+
+    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+
+    result = await from_input.from_url(
+        MagicMock(),
+        MagicMock(),
+        user_id="user-1",
+        final_url="https://example.com/jobs/x",
+        extracted_title="Staff Backend Engineer",
+        jd_text="x" * 200,
+        company_name="Acme",
+        location=None,
+        salary_text=None,
+        payload=OptimizedPayload(),
+    )
+    assert result.was_matched is False

@@ -96,6 +96,9 @@ from app.services.targets.normalize_manual import (
     normalize_manual_input,
 )
 from app.services.targets.normalize_posting_title import (
+    DEFAULT_PURPOSE as NORMALIZE_TITLE_PURPOSE,
+)
+from app.services.targets.normalize_posting_title import (
     normalize_posting_title,
 )
 from app.services.targets.profile_writes import apply_profile_merge_rpc_async
@@ -835,7 +838,14 @@ def _raw_url_label(extracted_title: str | None) -> str:
     return ((extracted_title or "").strip() or "Untitled Target")[:200]
 
 
-async def _canonical_url_label(llm: LLMClient, extracted_title: str | None, jd_text: str) -> str:
+async def _canonical_url_label(
+    supabase: AsyncClient,
+    llm: LLMClient,
+    *,
+    user_id: str,
+    extracted_title: str | None,
+    jd_text: str,
+) -> str:
     """Canonical role label for a posting, falling back to the raw title.
 
     Deliberately non-fatal. This step improves the NAME; it is not what makes
@@ -843,10 +853,15 @@ async def _canonical_url_label(llm: LLMClient, extracted_title: str | None, jd_t
     violation, budget breaker) must not turn a working create-from-URL into a
     502 — the user would lose the whole flow to cosmetics. On any failure we
     keep today's behavior exactly: the raw posting title.
+
+    The call is billed like every other: an unlogged LLM call makes the cost
+    ledger under-report real spend, which both loosens ``enforce_llm_budget``
+    (it reads that ledger) and makes the usage card lie. The sibling manual
+    path has always recorded its normalize call; this one must too.
     """
     raw = _raw_url_label(extracted_title)
     try:
-        normalized, _ = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
+        normalized, norm_result = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
     except Exception:
         logger.warning(
             "normalize_posting_title failed; falling back to the raw posting title",
@@ -854,6 +869,19 @@ async def _canonical_url_label(llm: LLMClient, extracted_title: str | None, jd_t
             extra={"raw_label": raw},
         )
         return raw
+
+    # Record before returning, and never let a ledger write cost the user the
+    # create — the label is already in hand by this point.
+    try:
+        await cost_log.record_async(
+            supabase,
+            user_id=user_id,
+            purpose=NORMALIZE_TITLE_PURPOSE,
+            result=norm_result,
+            metadata={"user_id": user_id, "raw_label": raw},
+        )
+    except Exception:
+        logger.warning("cost_log for normalize_posting_title failed", exc_info=True)
 
     canonical = normalized.label.strip()
     # An empty/whitespace label would produce a blank card and a useless dedup
@@ -890,7 +918,13 @@ async def from_url(
     the UNIQUE key. Canonicalizing has to precede ``find_matching_target``:
     the canonical form is what matches and what becomes the dedup key.
     """
-    label = await _canonical_url_label(llm, extracted_title, jd_text)
+    label = await _canonical_url_label(
+        supabase,
+        llm,
+        user_id=user_id,
+        extracted_title=extracted_title,
+        jd_text=jd_text,
+    )
 
     matched = await find_matching_target(supabase, label)
     if matched is not None:
