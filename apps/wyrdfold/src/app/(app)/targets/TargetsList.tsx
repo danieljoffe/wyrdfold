@@ -420,6 +420,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       setModalOpen(false);
       setSuggestions([]);
       setLateralSuggestions([]);
+      // Clear the "we found nothing" panels too, not just the result arrays.
+      // Their copy ("your existing targets already cover the roles that fit
+      // your experience") is a claim about the target list, so it goes stale
+      // the moment the list changes — leaving it up would have the page argue
+      // with the card the user just created.
+      setSuggestEmpty(false);
+      setLateralEmpty(false);
 
       try {
         const result = await createOrLinkTarget(endpoint, body);
