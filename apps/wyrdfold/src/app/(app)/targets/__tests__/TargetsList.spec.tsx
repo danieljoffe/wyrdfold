@@ -174,6 +174,46 @@ describe('TargetsList', () => {
       expect(screen.getByText('4')).toBeInTheDocument(); // keyword count
     });
 
+    /**
+     * The seed and the settle condition used to disagree. `isDeriving` (which
+     * decides when to STOP) counts a null fit_score as still deriving, but the
+     * seed only looked at `activation_status === 'deriving'`. So a target whose
+     * profile finished but whose score never landed was never picked up on
+     * load: no spinner, no poll, no score — and the backend's lazy refresh
+     * skipped null scores too, so nothing healed it. Found on prod with a
+     * target unscored for a full day (resweep C1).
+     */
+    it('polls a target whose profile is ready but whose fit score never landed', async () => {
+      jest.useFakeTimers();
+      const healed = makeEntry('t-1', 'Senior Full Stack Engineer', {
+        activation_status: 'ready',
+        fit_score: 52,
+        categories: { frontend: { keywords: { react: 3 }, weight: 1 } },
+      });
+      const fetchMock = mockFetchResolving(healed);
+
+      render(
+        <TargetsList
+          initialTargets={[
+            makeSummaryEntry('t-1', 'Senior Full Stack Engineer', {
+              // NOT 'deriving' — the old seed condition ignored this row.
+              activation_status: 'ready',
+              fit_score: null,
+            }),
+          ]}
+        />
+      );
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(2500);
+      });
+
+      expect(fetchMock).toHaveBeenCalledWith('/api/targets/t-1/user-target');
+      await waitFor(() => {
+        expect(screen.getByText('52')).toBeInTheDocument();
+      });
+    });
+
     it('stops polling once the target settles', async () => {
       jest.useFakeTimers();
       const derived = makeEntry('t-1', 'Senior Frontend Engineer', {
