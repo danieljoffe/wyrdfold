@@ -1206,7 +1206,7 @@ test('deep: targets CRUD on a throwaway target', async ({ page }) => {
       async () => {
         await page.getByRole('tab', { name: /preferences/i }).click();
         await page
-          .getByRole('spinbutton', { name: /minimum fit score/i })
+          .getByRole('spinbutton', { name: /minimum match score/i })
           .fill('42');
         // Two "Save" buttons live on this tab (preferences + notification
         // thresholds) — a name-only locator is a strict-mode violation.

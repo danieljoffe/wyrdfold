@@ -45,7 +45,7 @@ describe('ScoreBadge', () => {
       <ScoreBadge score={80} scoringStatus='stage2' pending={undefined} />
     );
     expect(screen.queryByText('80')).toBeNull();
-    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.getByLabelText('Match score pending')).toBeInTheDocument();
   });
 
   it('shows the real number once graded (complete)', () => {
@@ -63,12 +63,55 @@ describe('ScoreBadge', () => {
     // since the row isn't actively scoring.
     render(<ScoreBadge score={100} scoringStatus='complete' pending={true} />);
     expect(screen.queryByText('100')).toBeNull();
-    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.getByLabelText('Match score pending')).toBeInTheDocument();
     expect(screen.queryByLabelText(/scoring in progress/i)).toBeNull();
   });
 
   it('shows the number when pending=false (a real grade)', () => {
     render(<ScoreBadge score={72} scoringStatus='complete' pending={false} />);
     expect(screen.getByText('72')).toBeInTheDocument();
+  });
+
+  /**
+   * The app shows TWO scores on different scales, within two clicks of each
+   * other: a target's fit against your experience, and a job's match against a
+   * target. This chip used to hardcode "Match score" into its accessible name
+   * while accepting a caller-supplied tooltip — so on a target card a sighted
+   * user read "Fit score 82" and a screen-reader user heard "Match score 82"
+   * off the same element.
+   */
+  describe('score kind', () => {
+    it('defaults to match — four of the five call sites are job chips', () => {
+      render(<ScoreBadge score={91} />);
+      expect(screen.getByLabelText('Match score 91')).toBeInTheDocument();
+    });
+
+    it('announces a target chip as a fit score', () => {
+      render(<ScoreBadge score={82} kind='fit' />);
+      expect(screen.getByLabelText('Fit score 82')).toBeInTheDocument();
+      expect(screen.queryByLabelText('Match score 82')).toBeNull();
+    });
+
+    it('keeps the pending label in the same vocabulary as the chip', () => {
+      const { unmount } = render(
+        <ScoreBadge score={80} kind='fit' scoringStatus='stage2' pending />
+      );
+      expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+      unmount();
+
+      render(
+        <ScoreBadge score={80} kind='match' scoringStatus='stage2' pending />
+      );
+      expect(screen.getByLabelText('Match score pending')).toBeInTheDocument();
+    });
+
+    it('does not let the tooltip and the accessible name disagree', () => {
+      // The exact defect: a "Fit score …" tooltip over a "Match score …" name.
+      render(
+        <ScoreBadge score={82} kind='fit' title='Fit score 82 — how well…' />
+      );
+      const chip = screen.getByLabelText('Fit score 82');
+      expect(chip).toHaveAttribute('title', 'Fit score 82 — how well…');
+    });
   });
 });
