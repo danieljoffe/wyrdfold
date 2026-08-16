@@ -37,6 +37,7 @@ from app.models.schemas import (
     AddToTargetResponse,
     ManualJobRequest,
     ManualJobResponse,
+    RemoveJobRequest,
     UrlValidateRequest,
     UrlValidateResponse,
 )
@@ -1126,6 +1127,42 @@ async def _assemble_jobs_page(
     return {"postings": postings, "next_cursor": next_cursor, "total": total}
 
 
+async def _removed_pairs(
+    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+) -> set[tuple[str, str]]:
+    """``(target_id, job_posting_id)`` pairs the caller removed from a target.
+
+    Removal is per-(user, target, job) on purpose — see
+    ``remove_job_from_target``. The pair granularity is load-bearing on the
+    cross-target paths: a job removed from target A must stay visible under
+    target B, so these paths cannot collapse to a flat set of job ids.
+
+    Anonymous / operator callers (``user_id is None``) have no removals.
+    """
+    if user_id is None or not target_ids:
+        return set()
+    resp = (
+        await supabase.table("user_target_job_removals")
+        .select("target_id, job_posting_id")
+        .eq("user_id", user_id)
+        .in_("target_id", target_ids)
+        .execute()
+    )
+    return {
+        (cast(dict[str, Any], r)["target_id"], cast(dict[str, Any], r)["job_posting_id"])
+        for r in resp.data or []
+    }
+
+
+async def _removed_job_ids(
+    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+) -> set[str]:
+    """Job ids removed from any of ``target_ids``. Safe to flatten only when
+    the caller is scoped to a SINGLE target — see ``_removed_pairs``."""
+    pairs = await _removed_pairs(supabase, user_id=user_id, target_ids=target_ids)
+    return {job_id for _tid, job_id in pairs}
+
+
 async def _list_jobs_for_target_two_query(
     supabase: AsyncClient,
     *,
@@ -1170,6 +1207,14 @@ async def _list_jobs_for_target_two_query(
     ts_query = _scores_live_join(ts_query, archived_view=archived_view)
     ts_query = _apply_score_floor(ts_query, min_score)
     ts_rows = cast(list[dict[str, Any]], (await ts_query.execute()).data or [])
+
+    # Drop what the caller removed from THIS target. The RPC twin does the
+    # same as a SQL anti-join; this path filters in Python because PostgREST
+    # can't express NOT EXISTS. Both must agree — a job that survives here but
+    # not there (or vice versa) reappears purely on which sort the user picked.
+    removed = await _removed_job_ids(supabase, user_id=user_id, target_ids=[target_id])
+    if removed:
+        ts_rows = [r for r in ts_rows if r["job_posting_id"] not in removed]
 
     if not ts_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -1573,6 +1618,19 @@ async def _list_jobs_across_user_targets_two_query(
         retry_statement_timeout=True,
     )
     score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+
+    # Drop removed (target, job) pairs BEFORE the best-target collapse below,
+    # mirroring the RPC's anti-join inside ``best``. Filtering after the
+    # collapse would hide a job everywhere the moment the target it was
+    # removed from happened to win the dedup — "remove from this target" has
+    # to leave it visible under the others.
+    removed = await _removed_pairs(
+        supabase, user_id=user_id, target_ids=list(user_target_ids)
+    )
+    if removed:
+        score_rows = [
+            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
+        ]
 
     if not score_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -2339,16 +2397,23 @@ async def _pipeline_counts_python(
     per-user status (``user_jobs`` row; absent → ``'new'``)."""
     score_query = (
         supabase.table("scores")
-        .select("job_posting_id")
+        .select("job_posting_id, target_id")
         .in_("target_id", list(target_ids))
         .eq("excluded", False)
     )
     # Floor exempts Pending rows so the tab counts match the list (#47).
     score_query = _apply_score_floor(score_query, min_score)
     score_resp = await score_query.execute()
-    job_ids = sorted(
-        {cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], score_resp.data or [])}
-    )
+    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+    # Removed pairs are excluded from the list, so they must be excluded from
+    # the counts too — otherwise the tab badge keeps counting jobs the user
+    # can no longer see.
+    removed = await _removed_pairs(supabase, user_id=user_id, target_ids=list(target_ids))
+    if removed:
+        score_rows = [
+            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
+        ]
+    job_ids = sorted({cast(str, r["job_posting_id"]) for r in score_rows})
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
@@ -3119,3 +3184,143 @@ async def delete_job(
 
     job_list_cache.invalidate()
     return {"success": True, "deleted_id": posting_id}
+
+
+async def _targets_holding_posting(
+    supabase: AsyncClient, *, user_id: str, posting_id: str
+) -> list[str]:
+    """The caller's own target ids that currently carry this posting.
+
+    Scoped through ``user_targets`` first so a target id is never taken from
+    request input — the same privacy boundary ``target_membership`` documents.
+    """
+    ut_resp = (
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    )
+    owned = {cast(dict[str, Any], r)["target_id"] for r in ut_resp.data or []}
+    if not owned:
+        return []
+    score_resp = (
+        await supabase.table("scores")
+        .select("target_id")
+        .eq("job_posting_id", posting_id)
+        .in_("target_id", list(owned))
+        .execute()
+    )
+    return sorted({cast(dict[str, Any], r)["target_id"] for r in score_resp.data or []})
+
+
+async def _upsert_target_removals_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    posting_id: str,
+    target_ids: list[str],
+) -> None:
+    """Record "the caller removed this posting from these targets".
+
+    Idempotent: re-removing an already-removed pair is a no-op rather than a
+    duplicate-key error, so a double-click or a retried request is harmless.
+    """
+    await (
+        supabase.table("user_target_job_removals")
+        .upsert(
+            [
+                {"user_id": user_id, "target_id": tid, "job_posting_id": posting_id}
+                for tid in target_ids
+            ],
+            on_conflict="user_id,target_id,job_posting_id",
+        )
+        .execute()
+    )
+
+
+async def _delete_target_removals_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    posting_id: str,
+    target_id: str | None,
+) -> list[str]:
+    """Undo removals; returns the target ids the posting was restored to."""
+    query = (
+        supabase.table("user_target_job_removals")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("job_posting_id", posting_id)
+    )
+    if target_id is not None:
+        query = query.eq("target_id", target_id)
+    resp = await query.execute()
+    return sorted(cast(dict[str, Any], r)["target_id"] for r in resp.data or [])
+
+
+@router.post("/{posting_id}/remove")
+async def remove_job_from_target(
+    posting_id: str,
+    body: RemoveJobRequest,
+    user_id: str = Depends(get_current_user_id),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    """Remove a posting from one of the caller's targets (or from all of them).
+
+    This is the honest version of what the UI used to call "Delete". That
+    button soft-archived the caller's ``user_jobs`` row and told the user it
+    "can't be undone", while the row stayed in the list — the archived
+    exclusion was implemented in the Python hydration path but missing from
+    both list RPCs, so a default ``sort=score`` view kept showing it.
+
+    Removal is deliberately per-(user, target, job) rather than a flag on
+    ``scores``:
+
+    * ``scores.excluded`` is recomputed by the scorer on every re-score, so a
+      removal written there comes back on the next poll.
+    * ``scores`` rows are per-target and targets are shared with co-searchers,
+      so writing removal there would remove the job from other users' lists.
+
+    A global hard delete stays off the table — it cascades into every other
+    follower's ``user_jobs`` / ``status_log`` (audit #29 round 3 / H1).
+
+    ``target_id`` omitted removes the posting from every one of the caller's
+    targets that currently holds it, which is what "Remove" has to mean on the
+    All Jobs tab where no single target is in scope.
+    """
+    await _assert_user_owns_posting_async(supabase, posting_id, user_id)
+
+    holding = await _targets_holding_posting(supabase, user_id=user_id, posting_id=posting_id)
+    if body.target_id is not None:
+        if body.target_id not in holding:
+            # Never confirm the existence of a target the caller doesn't own.
+            raise HTTPException(status_code=404, detail="Posting not found in that target")
+        target_ids = [body.target_id]
+    else:
+        target_ids = holding
+
+    if target_ids:
+        await _upsert_target_removals_async(
+            supabase, user_id=user_id, posting_id=posting_id, target_ids=target_ids
+        )
+
+    job_list_cache.invalidate()
+    return {"success": True, "removed_from": target_ids}
+
+
+@router.delete("/{posting_id}/remove")
+async def undo_remove_job_from_target(
+    posting_id: str,
+    target_id: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    """Undo a removal — the recourse the old "can't be undone" delete lacked.
+
+    Scoped to the caller's own rows by RLS *and* by an explicit ``user_id``
+    filter. Omitting ``target_id`` restores the posting to every target the
+    caller had removed it from.
+    """
+    restored = await _delete_target_removals_async(
+        supabase, user_id=user_id, posting_id=posting_id, target_id=target_id
+    )
+
+    job_list_cache.invalidate()
+    return {"success": True, "restored_to": restored}

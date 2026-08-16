@@ -9,7 +9,7 @@ import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
-import { useJobDelete } from './useJobDelete';
+import { useJobRemove } from './useJobRemove';
 import { cn } from '@/lib/cn';
 import BatchActionBar from './BatchActionBar';
 import {
@@ -237,7 +237,7 @@ export default function JobsList({
   >(undefined);
   const [exporting, setExporting] = useState(false);
   const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
-  const { deleteJobs, deleting: batchDeleting } = useJobDelete();
+  const { removeJobs, removing: batchDeleting } = useJobRemove();
   const [visiblePostings, setVisiblePostings] = useState<JobPosting[]>([]);
   const [activationStatus, setActivationStatus] = useState<string>('idle');
   // Total job count for the active target, sourced from
@@ -250,6 +250,8 @@ export default function JobsList({
   const { toast } = useToast();
 
   const targets = initialTargets;
+  /** Label of the tab in scope; undefined on All Jobs (no single target). */
+  const activeTargetLabel = targets.find(t => t.id === activeTargetId)?.label;
 
   // Check target activation status when switching tabs
   useEffect(() => {
@@ -618,11 +620,16 @@ export default function JobsList({
 
   const handleBatchDelete = useCallback(async () => {
     if (selectedIds.size === 0) return;
-    await deleteJobs([...selectedIds]);
+    // Remove from the target the user is actually looking at. On All Jobs
+    // (``activeTargetId`` undefined) the API removes from every target that
+    // holds the posting — there is no single target in scope there.
+    await removeJobs([...selectedIds], activeTargetId, () =>
+      setRefreshKey(k => k + 1)
+    );
     setSelectedIds(new Set());
     setRefreshKey(k => k + 1);
     setConfirmBatchDeleteOpen(false);
-  }, [selectedIds, deleteJobs]);
+  }, [selectedIds, removeJobs, activeTargetId]);
 
   // When the action bar is visible it overlaps the bottom of the table /
   // pagination. Mobile bar is two-row (~5.5rem) + gap, desktop is single-row
@@ -778,14 +785,20 @@ export default function JobsList({
             isOpen={confirmBatchDeleteOpen}
             onClose={() => setConfirmBatchDeleteOpen(false)}
             onConfirm={handleBatchDelete}
-            title='Delete jobs?'
-            message={`Delete ${selectedIds.size} ${
+            title='Remove jobs?'
+            // The old copy said "This can't be undone", which was false — the
+            // action archived a per-user row that any status change reversed.
+            // Say what actually happens, and name the scope: removal is per
+            // target, so the posting survives under the user's other targets.
+            message={`Remove ${selectedIds.size} ${
               selectedIds.size === 1 ? 'job' : 'jobs'
-            }? This can't be undone.`}
-            confirmLabel='Delete'
+            } from ${activeTargetLabel ?? 'your targets'}? ${
+              selectedIds.size === 1 ? 'It' : 'They'
+            } will stop appearing here. You can undo this.`}
+            confirmLabel='Remove'
             destructive
             loading={batchDeleting}
-            loadingLabel='Deleting…'
+            loadingLabel='Removing…'
           />
         </>
       )}

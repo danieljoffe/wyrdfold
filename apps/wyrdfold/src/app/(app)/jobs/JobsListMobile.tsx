@@ -4,7 +4,7 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import Button from '@/components/kit/Button';
 import { cn } from '@/lib/cn';
 import JobCard from './JobCard';
-import { useJobDelete } from './useJobDelete';
+import { useJobRemove } from './useJobRemove';
 import JobsEmptyState from './JobsEmptyState';
 import JobsLoadError from './JobsLoadError';
 import type { JobPosting } from './types';
@@ -21,6 +21,9 @@ interface JobsListMobileProps {
   /** Set when the list fetch itself failed — renders the load-error state
    *  instead of the misleading "No jobs found" empty state (#604). */
   loadError?: string | undefined;
+  /** Target tab in scope. Removal is per-target; undefined (All Jobs) removes
+   *  the posting from every target of the caller's that holds it. */
+  targetId?: string | undefined;
 }
 
 export default function JobsListMobile({
@@ -33,8 +36,9 @@ export default function JobsListMobile({
   onSelectionChange,
   onRefetch,
   loadError,
+  targetId,
 }: JobsListMobileProps) {
-  const { deleteJob } = useJobDelete();
+  const { removeJob } = useJobRemove();
 
   function toggleSelect(id: string) {
     const next = new Set(selectedIds);
@@ -47,7 +51,7 @@ export default function JobsListMobile({
   }
 
   async function handleDelete(jobId: string) {
-    if (await deleteJob(jobId)) onRefetch();
+    if (await removeJob(jobId, targetId, onRefetch)) onRefetch();
   }
 
   if (loading && postings.length === 0) {
