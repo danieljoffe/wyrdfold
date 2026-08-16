@@ -105,5 +105,18 @@ export function useJobRemove() {
     [toast, undo]
   );
 
-  return { removeJobs, undo, removing };
+  /**
+   * Single-job twin of ``removeJobs`` for the row menu / detail surfaces.
+   * Resolves true when the posting was removed.
+   */
+  const removeJob = useCallback(
+    async (
+      jobId: string,
+      targetId: string | undefined,
+      onUndone?: () => void
+    ): Promise<boolean> => (await removeJobs([jobId], targetId, onUndone)) > 0,
+    [removeJobs]
+  );
+
+  return { removeJob, removeJobs, undo, removing };
 }

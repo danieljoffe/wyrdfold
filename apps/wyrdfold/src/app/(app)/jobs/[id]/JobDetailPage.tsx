@@ -18,7 +18,7 @@ import { formatLocation } from '@/lib/formatLocation';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
-import { useJobDelete } from '../useJobDelete';
+import { useJobRemove } from '../useJobRemove';
 import type { UserTargetWithSummary } from '../../targets/types';
 import JobDetailPanel from '../JobDetailPanel';
 import { MANUAL_SOURCE_ID, type JobPosting } from '../types';
@@ -32,7 +32,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
   const [posting, setPosting] = useState<JobPosting | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
-  const { deleteJob, deleting } = useJobDelete();
+  const { removeJob, removing: deleting } = useJobRemove();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [fallbackTargetId, setFallbackTargetId] = useState<string | undefined>(
     undefined
@@ -128,11 +128,11 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
 
   const handleDelete = useCallback(async () => {
     if (!posting) return;
-    if (await deleteJob(posting.id)) {
+    if (await removeJob(posting.id, undefined)) {
       setConfirmDeleteOpen(false);
       router.push('/jobs');
     }
-  }, [posting, router, deleteJob]);
+  }, [posting, router, removeJob]);
 
   if (loading) {
     return (
@@ -299,7 +299,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
           title='Remove this posting from your list.'
         >
           <Trash2 className='size-4' aria-hidden />
-          <span>{deleting ? 'Deleting…' : 'Delete posting'}</span>
+          <span>{deleting ? 'Removing…' : 'Remove posting'}</span>
         </Button>
       </div>
 
@@ -307,12 +307,12 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         isOpen={confirmDeleteOpen}
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
-        title='Delete posting?'
-        message={`Delete "${displayTitle(posting)}" from ${posting.company_name}? This can't be undone.`}
-        confirmLabel='Delete'
+        title='Remove posting?'
+        message={`Remove "${displayTitle(posting)}" from ${posting.company_name}? It will stop appearing in your matched jobs. You can undo this.`}
+        confirmLabel='Remove'
         destructive
         loading={deleting}
-        loadingLabel='Deleting…'
+        loadingLabel='Removing…'
       />
     </div>
   );
