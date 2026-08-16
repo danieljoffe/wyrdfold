@@ -680,6 +680,10 @@ async def create_tailored_cover_letter(
             critique=body.critique,
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
+            # The JD-only path silently dropped this (#780 wired only the
+            # backgrounded branch), so a caller without a posting was accepted
+            # and then ignored. Same flag, same meaning, both branches.
+            allow_stretch=body.allow_stretch,
         )
         # A lint failure is no longer a 422 — the draft is persisted flagged,
         # so it comes back as a normal record whose ``lint_violations`` say why

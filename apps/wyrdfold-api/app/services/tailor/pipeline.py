@@ -374,6 +374,10 @@ async def run_cover_letter_pipeline(
             llm_result=llm_result,
             storage_path=None,
             lint_violations=[v.model_dump() for v in lint_result.violations],
+            # #785: the opt-in is a property of THIS letter, so it rides with
+            # the row. Re-generate on the review page reads it back rather than
+            # re-deriving a per-(job, target) verdict it has no target for.
+            allow_stretch=allow_stretch,
         )
 
     md_lint = lint_markdown(payload_md, document_type="cover_letter")

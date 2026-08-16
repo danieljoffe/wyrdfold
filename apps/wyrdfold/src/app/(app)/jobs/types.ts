@@ -271,6 +271,16 @@ export interface TailoredResumeRecord {
   approved_at: string | null;
   source_resume_id: string | null;
   /**
+   * Whether this document was generated under the user's stretch opt-in — the
+   * "Generate anyway" confirm on a Skip-verdict job (#780/#785). Re-generate
+   * on the review page reuses it, because that route has no target in scope
+   * and the Skip verdict it would need is per-(job, target).
+   *
+   * Optional on the type so a stale cached response still parses; the API
+   * always sends it and it is `false` for every resume.
+   */
+  allow_stretch?: boolean;
+  /**
    * ATS lint state (#656). `null` = never linted (rows predating the column);
    * `[]` = linted with nothing to report; a list with any
    * `severity: 'error'` entry = **flagged draft**,
