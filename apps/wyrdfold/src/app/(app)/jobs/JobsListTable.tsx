@@ -1,6 +1,7 @@
 'use client';
 
 import { Fragment, useEffect, useState } from 'react';
+import { ExternalLink } from 'lucide-react';
 import { formatJobSalary } from '@/lib/formatSalary';
 import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
@@ -256,19 +257,27 @@ export default function JobsListTable({
                   </td>
                   <td className='px-3 py-2 font-medium'>
                     <div className='flex flex-col gap-1'>
+                      {/* The title used to BE the outbound ATS link, so the
+                          most obvious click target on the row left the app —
+                          past the score breakdown, match analysis and
+                          tailoring the user came for. The title now expands
+                          the row (the <tr> handler); applying keeps its own
+                          explicit icon. */}
                       <span className='inline-flex items-center gap-2'>
-                        {job.absolute_url ? (
+                        <span className='text-text-primary'>
+                          {displayTitle(job)}
+                        </span>
+                        {job.absolute_url && (
                           <a
                             href={job.absolute_url}
                             target='_blank'
                             rel='noopener noreferrer'
                             className='text-brand-500 hover:text-brand-600'
                             onClick={e => e.stopPropagation()}
+                            aria-label={`Open ${displayTitle(job)} at ${formatCompanyName(job.company_name)} on the employer's site (opens in a new tab)`}
                           >
-                            {displayTitle(job)}
+                            <ExternalLink className='h-3.5 w-3.5' />
                           </a>
-                        ) : (
-                          job.title
                         )}
                         {job.source_id === MANUAL_SOURCE_ID && (
                           <Badge variant='info'>Discovered</Badge>

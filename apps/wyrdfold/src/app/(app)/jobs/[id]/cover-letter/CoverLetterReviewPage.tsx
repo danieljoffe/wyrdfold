@@ -528,7 +528,7 @@ export default function CoverLetterReviewPage({
         {/* Back link */}
         <Skeleton className='h-5 w-24' />
 
-        {/* Hero h1 "Review Cover Letter" + body subtitle ("Job Title — Company"). */}
+        {/* Hero h1 "Review cover letter" + body subtitle ("Job Title — Company"). */}
         <div className='space-y-2'>
           <Skeleton variant='rectangular' className='h-10 w-80' />
           <Skeleton className='h-4 w-72' />
@@ -590,7 +590,7 @@ export default function CoverLetterReviewPage({
 
       <div>
         <Heading variant='hero' as='h1'>
-          Review Cover Letter
+          Review cover letter
         </Heading>
         <Text variant='body' className='text-text-secondary'>
           {posting ? (
