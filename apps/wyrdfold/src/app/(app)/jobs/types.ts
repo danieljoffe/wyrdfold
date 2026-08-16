@@ -360,8 +360,27 @@ export interface ResumeVersion {
   id: string;
   resume_id: string;
   payload: TailoredResumePayload;
+  /**
+   * The snapshot's markdown — what a restore actually writes back. Null only
+   * for rows snapshotted before this column was populated.
+   *
+   * Declared here rather than cast at each use site: the API omitted this
+   * field entirely (its Pydantic model had no `payload_md` and
+   * `extra: "ignore"` dropped the column), so every version failed restore.
+   * Typing it means the next serialization gap fails the build instead of
+   * silently degrading to "cannot restore".
+   */
+  payload_md: string | null;
   source: ResumeVersionSource;
   created_at: string;
+}
+
+/**
+ * Can this snapshot actually be restored? Restore writes `payload_md` into the
+ * editor, so a version without it is listable but not loadable.
+ */
+export function hasRestorableMarkdown(version: ResumeVersion): boolean {
+  return Boolean(version.payload_md);
 }
 
 export interface ResumeVersionsResponse {

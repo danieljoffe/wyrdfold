@@ -26,7 +26,7 @@ import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
-import { isFlaggedDraft } from '../../types';
+import { hasRestorableMarkdown, isFlaggedDraft } from '../../types';
 import type {
   AtsRecheckResponse,
   JobPosting,
@@ -478,24 +478,15 @@ export default function ResumeReviewPage({
   }
 
   function restoreVersion(version: ResumeVersion) {
-    // Versions before the markdown pivot stored only structured payload.
-    // Newer versions include payload_md. We fall back to current markdown
-    // if the snapshot has no markdown to restore.
-    const md = (version as ResumeVersion & { payload_md?: string | null })
-      .payload_md;
-    if (!md) {
-      toast({
-        variant: 'error',
-        title: 'This version predates markdown — cannot restore',
-      });
-      return;
-    }
+    // Guarded by ``hasRestorableMarkdown`` at the call site, so this only
+    // fires for snapshots that genuinely carry markdown. Kept as a
+    // belt-and-braces check rather than a user-facing dead end.
+    if (!hasRestorableMarkdown(version)) return;
     setVersionToRestore(version);
   }
 
   async function performRestore(version: ResumeVersion) {
-    const md = (version as ResumeVersion & { payload_md?: string | null })
-      .payload_md;
+    const md = version.payload_md;
     if (!md) return;
     // Snapshot the current draft before swapping markdown so the
     // pre-restore content is recoverable from the same version
@@ -826,23 +817,36 @@ export default function ResumeReviewPage({
                         <LocalDateTime value={v.created_at} />
                       </Text>
                     </span>
-                    {!isApproved && (
-                      <Button
-                        name={`restore-version-${v.id}`}
-                        variant='bare'
-                        className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
-                        size='sm'
-                        // "Load" by itself is ambiguous to SR users
-                        // when several versions are listed — they'd
-                        // hear "Load" repeated with no way to
-                        // distinguish. Disambiguate via the version
-                        // source + timestamp.
-                        aria-label={`Load ${v.source.replace('_', ' ')} version from ${new Date(v.created_at).toLocaleString()}`}
-                        onClick={() => restoreVersion(v)}
-                      >
-                        Load
-                      </Button>
-                    )}
+                    {!isApproved &&
+                      (hasRestorableMarkdown(v) ? (
+                        <Button
+                          name={`restore-version-${v.id}`}
+                          variant='bare'
+                          className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
+                          size='sm'
+                          // "Load" by itself is ambiguous to SR users
+                          // when several versions are listed — they'd
+                          // hear "Load" repeated with no way to
+                          // distinguish. Disambiguate via the version
+                          // source + timestamp.
+                          aria-label={`Load ${v.source.replace('_', ' ')} version from ${new Date(v.created_at).toLocaleString()}`}
+                          onClick={() => restoreVersion(v)}
+                        >
+                          Load
+                        </Button>
+                      ) : (
+                        // Say so up front instead of offering a button that
+                        // only fails on click. Reachable now only for rows
+                        // written before the snapshot carried markdown.
+                        <Text
+                          variant='meta'
+                          as='span'
+                          className='text-text-tertiary'
+                          title='This snapshot stored no markdown, so there is nothing to restore.'
+                        >
+                          Not restorable
+                        </Text>
+                      ))}
                   </li>
                 ))}
               </ul>
