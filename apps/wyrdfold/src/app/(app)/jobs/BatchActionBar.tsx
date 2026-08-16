@@ -1,7 +1,13 @@
 'use client';
 
+import { ChevronDown } from 'lucide-react';
+import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
+import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
+import { cn } from '@/lib/cn';
+import type { JobStatus } from './types';
+import { JOB_STATUSES, STATUS_DOT_CLASS, formatStatus } from './types';
 
 const BATCH_WARN_THRESHOLD = 5;
 const BATCH_MAX = 20;
@@ -12,8 +18,11 @@ interface BatchActionBarProps {
   onBatchGenerate: () => void;
   onBatchDelete: () => void;
   onBatchExport: () => void;
+  /** #10: apply one status to every selected posting. */
+  onBatchStatus: (status: JobStatus) => void;
   generating: boolean;
   exporting: boolean;
+  statusUpdating: boolean;
   hasApproved: boolean;
   /** F3-B: live counter shown while a batch is processing (n of N completed). */
   batchProgress?: { completed: number; total: number } | undefined;
@@ -25,8 +34,10 @@ export default function BatchActionBar({
   onBatchGenerate,
   onBatchDelete,
   onBatchExport,
+  onBatchStatus,
   generating,
   exporting,
+  statusUpdating,
   hasApproved,
   batchProgress,
 }: BatchActionBarProps) {
@@ -80,6 +91,38 @@ export default function BatchActionBar({
         >
           {generatingLabel}
         </Button>
+        {/* Same control as the detail panel's status picker, so the two
+            surfaces read as one action rather than two vocabularies. */}
+        <Dropdown
+          trigger={
+            <span
+              className={cn(
+                'inline-flex items-center gap-2 rounded-md border border-border bg-surface-elevated px-3 py-1.5 text-sm transition-colors',
+                statusUpdating
+                  ? 'cursor-not-allowed opacity-50'
+                  : 'hover:bg-surface-tertiary'
+              )}
+              aria-disabled={statusUpdating || undefined}
+            >
+              {statusUpdating ? 'Updating…' : 'Set status'}
+              <ChevronDown className='size-4 text-text-tertiary' aria-hidden />
+            </span>
+          }
+          items={JOB_STATUSES.map<DropdownItem>(s => ({
+            label: formatStatus(s),
+            icon: (
+              <span
+                className={cn(
+                  'inline-block size-2 rounded-full',
+                  STATUS_DOT_CLASS[s]
+                )}
+                aria-hidden
+              />
+            ),
+            disabled: statusUpdating,
+            onClick: () => onBatchStatus(s),
+          }))}
+        />
         {hasApproved && (
           <Button
             name='batch-export'
