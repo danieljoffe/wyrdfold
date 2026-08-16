@@ -9,6 +9,7 @@ import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
+import { useBatchStatus } from './useBatchStatus';
 import { useJobRemove } from './useJobRemove';
 import { cn } from '@/lib/cn';
 import BatchActionBar from './BatchActionBar';
@@ -20,7 +21,12 @@ import {
 import JobsListView from './JobsListView';
 import JobsThinResultsCallout from './JobsThinResultsCallout';
 import { promptForMissingContactName } from './promptForMissingContactName';
-import type { JobPosting, JobsFilterState, JobsSortColumn } from './types';
+import type {
+  JobPosting,
+  JobsFilterState,
+  JobsSortColumn,
+  JobStatus,
+} from './types';
 import { useJobsFilterPersistence } from './useJobsFilterPersistence';
 import { useJobsUrlState } from './useJobsUrlState';
 
@@ -238,6 +244,7 @@ export default function JobsList({
   const [exporting, setExporting] = useState(false);
   const [confirmBatchDeleteOpen, setConfirmBatchDeleteOpen] = useState(false);
   const { removeJobs, removing: batchDeleting } = useJobRemove();
+  const { setStatusForJobs, updating: statusUpdating } = useBatchStatus();
   const [visiblePostings, setVisiblePostings] = useState<JobPosting[]>([]);
   const [activationStatus, setActivationStatus] = useState<string>('idle');
   // Total job count for the active target, sourced from
@@ -631,6 +638,21 @@ export default function JobsList({
     setConfirmBatchDeleteOpen(false);
   }, [selectedIds, removeJobs, activeTargetId]);
 
+  /**
+   * #10: apply one status to the whole selection. No confirm — unlike Remove,
+   * a status change is a normal pipeline move and every status is reachable
+   * again from the same menu, so a modal would be friction without recourse
+   * value. The selection is kept so a mis-click is one more click to correct.
+   */
+  const handleBatchStatus = useCallback(
+    async (status: JobStatus) => {
+      if (selectedIds.size === 0) return;
+      const changed = await setStatusForJobs([...selectedIds], status);
+      if (changed > 0) setRefreshKey(k => k + 1);
+    },
+    [selectedIds, setStatusForJobs]
+  );
+
   // When the action bar is visible it overlaps the bottom of the table /
   // pagination. Mobile bar is two-row (~5.5rem) + gap, desktop is single-row
   // (~3.25rem). Reserve enough space at each breakpoint to scroll past it.
@@ -773,8 +795,10 @@ export default function JobsList({
             onBatchGenerate={handleBatchGenerate}
             onBatchDelete={() => setConfirmBatchDeleteOpen(true)}
             onBatchExport={handleBatchExport}
+            onBatchStatus={handleBatchStatus}
             generating={generating}
             exporting={exporting}
+            statusUpdating={statusUpdating}
             hasApproved={visiblePostings.some(
               p => selectedIds.has(p.id) && p.status === 'resume_ready'
             )}

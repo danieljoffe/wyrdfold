@@ -121,6 +121,7 @@ def _record(
     lint_violations: list[LintViolation] | None = None,
     payload_md: str | None = _CLEAN_MD,
     approved_at: datetime | None = None,
+    created_at: datetime | None = None,
 ) -> TailoredResumeRecord:
     return TailoredResumeRecord(
         id=record_id,
@@ -139,7 +140,7 @@ def _record(
         output_tokens=50,
         cost_usd=0.001,
         latency_ms=50,
-        created_at=_NOW,
+        created_at=created_at if created_at is not None else _NOW,
         approved_at=approved_at,
         lint_violations=lint_violations,
     )
@@ -651,16 +652,76 @@ async def test_poll_reports_running_then_the_record() -> None:
     # The row landed. Even with the registry entry not yet cleared, the record
     # WINS — a poll must not bounce back to "generating…" for the width of the
     # window between persist and finish().
+    #
+    # ``created_at`` is stamped NOW, not at module import: a row written by
+    # this run is necessarily newer than the run, and that ordering is what
+    # separates "the run's own output" from "the run's predecessor" (#788).
     with patch(
         "app.services.tailor.persistence.get_by_job",
         new_callable=AsyncMock,
-        return_value=_record(),
+        return_value=_record(created_at=datetime.now(UTC)),
     ):
         state = await tailor_router.get_resume_by_job(
             job_posting_id=_JOB, supabase=supabase, user_id=_USER
         )
     assert state.status == "idle"
     assert state.record is not None and state.record.id == "rec-1"
+
+
+# ---------------------------------------------------------------------------
+# #788: a re-generation must not be reported as settled.
+#
+# `_document_state` used to let any existing record win outright, so the first
+# poll of a RE-generation returned `status: "idle"` with the OLD letter still
+# in place. `useTailorDocument`'s wait reads that as "the server dropped the
+# run" and told the user "Generation was interrupted. Please retry." — while
+# the run was still going and about to succeed.
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_reports_running_while_regenerating_over_an_existing_record() -> None:
+    """The predecessor record must not mask an in-flight run."""
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
+    run_registry.clear_all()
+
+    # A letter from an earlier run exists...
+    previous = _record(record_id="rec-old", created_at=datetime.now(UTC))
+    # ...and only THEN does a re-generation start.
+    run_registry.begin(key, user_id=_USER)
+
+    with patch(
+        "app.services.tailor.persistence.get_by_job",
+        new_callable=AsyncMock,
+        return_value=previous,
+    ):
+        state = await tailor_router.get_resume_by_job(
+            job_posting_id=_JOB, supabase=MagicMock(), user_id=_USER
+        )
+
+    assert state.status == "running", "an in-flight re-generation must not report idle"
+    # The predecessor rides along so a client anchored on the record id knows
+    # which document it is waiting to replace.
+    assert state.record is not None and state.record.id == "rec-old"
+
+
+async def test_poll_settles_once_the_regeneration_finishes() -> None:
+    """And the new row ends the wait."""
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
+    run_registry.clear_all()
+    run_registry.begin(key, user_id=_USER)
+    run_registry.finish(key)
+
+    with patch(
+        "app.services.tailor.persistence.get_by_job",
+        new_callable=AsyncMock,
+        return_value=_record(record_id="rec-new", created_at=datetime.now(UTC)),
+    ):
+        state = await tailor_router.get_resume_by_job(
+            job_posting_id=_JOB, supabase=MagicMock(), user_id=_USER
+        )
+
+    assert state.status == "idle"
+    assert state.record is not None and state.record.id == "rec-new"
 
 
 async def test_poll_reports_error_with_its_message() -> None:

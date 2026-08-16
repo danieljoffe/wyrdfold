@@ -97,6 +97,7 @@ from app.services.docx.pandoc_render import (
 )
 from app.services.experience import gap_tracker, optimized, preferences
 from app.services.llm.client import LLMClient
+from app.services.run_registry import RunState
 from app.services.tailor import (
     CoverLetterPipelineLintFailure,
     CoverLetterPipelineSuccess,
@@ -801,6 +802,25 @@ async def list_tailored_cover_letters(
 # ---- Resume lifecycle (#505) -------------------------------------------------
 
 
+def _run_already_landed(record: TailoredResumeRecord | None, st: RunState) -> bool:
+    """Has this still-``running`` entry already written the row we just read?
+
+    True only when the row is at least as new as the run — i.e. the task
+    persisted and simply hasn't called ``finish()`` yet. Treating that as
+    settled keeps a completed poll from bouncing back to "generating…".
+
+    A record with no usable timestamp is treated as a PREDECESSOR (``False``),
+    because the alternative — silently calling an in-flight run finished — is
+    the failure mode #788 is about.
+    """
+    if record is None or record.created_at is None:
+        return False
+    created = record.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return bool(created >= st.started_at)
+
+
 async def _document_state(
     supabase: AsyncClient,
     job_posting_id: str,
@@ -813,10 +833,18 @@ async def _document_state(
     Read-only — no LLM spend and no writes, so it carries no budget gate and is
     safe to poll on a timer.
 
-    The record is read FIRST and wins: a task that has persisted its row but
-    hasn't yet cleared its registry entry must report the finished document,
-    not ``running``. The reverse order would make a poll bounce back to
-    "generating…" for the width of that window.
+    A run in flight is reported as ``running`` **even when a record already
+    exists** — that record is then the in-flight run's predecessor, not its
+    result. Reporting ``idle`` there (which this did until #788) left the
+    client unable to tell "still working" from "settled", so a re-generation
+    announced *"Generation was interrupted"* on its first poll while the run
+    was still going and about to succeed.
+
+    The one case that must NOT report ``running`` is a task that has persisted
+    its row but not yet cleared its registry entry — otherwise a finished poll
+    bounces back to "generating…" for the width of that window. That is
+    distinguished by timestamp: a row written at/after the run began is the
+    run's own output, so the run is effectively done.
     """
     record = await persistence.get_by_job(
         supabase, job_posting_id, user_id=user_id, document_type=document_type
@@ -825,13 +853,16 @@ async def _document_state(
         user_id=user_id, document_type=document_type, job_posting_id=job_posting_id
     )
     st = run_registry.get(key)
+
+    if st is not None and st.status == "running" and not _run_already_landed(record, st):
+        # Predecessor record rides along so a client that anchors on the record
+        # id can tell which document it is still waiting to replace.
+        return TailoredDocumentState(record=record, status="running")
     if record is not None:
         # A settled document. Any lingering ``error`` belongs to a run that
         # already has a persisted predecessor to fall back on, so don't dress
         # a usable draft up as a failure.
         return TailoredDocumentState(record=record, status="idle")
-    if st is not None and st.status == "running":
-        return TailoredDocumentState(record=None, status="running")
     if st is not None and st.status == "error":
         return TailoredDocumentState(record=None, status="error", message=st.error)
     return TailoredDocumentState(record=None, status="idle")

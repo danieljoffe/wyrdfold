@@ -163,11 +163,11 @@ const FLAGGED_VIOLATION = {
 
 function mockPage(
   state: unknown,
-  extra?: (url: string, init?: { method?: string }) => unknown
+  extra?: (url: string, init?: { method?: string; body?: unknown }) => unknown
 ) {
   global.fetch = jest
     .fn()
-    .mockImplementation((url: string, init?: { method?: string }) => {
+    .mockImplementation((url: string, init?: { method?: string; body?: unknown }) => {
       const custom = extra?.(url, init);
       if (custom) return Promise.resolve(custom as Response);
       if (url === '/api/jobs/j-1') {
@@ -258,6 +258,48 @@ describe('ResumeReviewPage — flagged drafts (#656)', () => {
     });
   });
 
+  // #12: the ATS result used to be visible only in a 4s toast. A user who
+  // looked away could not tell "passed" from "never checked", and warnings
+  // from the original generation were invisible until a re-check was run.
+  it('shows a persistent pass state once the record has been linted clean', async () => {
+    mockPage({ record: { ...RECORD, lint_violations: [] }, status: 'idle' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(await screen.findByText(/ATS clean/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  it('stays silent about ATS for a record that was never linted', async () => {
+    // `null` is "never linted" — claiming a pass here would assert a check
+    // that never ran.
+    mockPage({ record: { ...RECORD, lint_violations: null }, status: 'idle' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    await screen.findByRole('heading', { level: 1 });
+    expect(screen.queryByText(/ATS clean/i)).toBeNull();
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  it('surfaces warnings carried on the record, without needing a re-check', async () => {
+    mockPage({
+      record: {
+        ...RECORD,
+        lint_violations: [
+          { code: 'LONG_BULLET', message: 'Bullet exceeds 2 lines', severity: 'warning' },
+        ],
+      },
+      status: 'idle',
+    });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(await screen.findByText(/Bullet exceeds 2 lines/i)).toBeInTheDocument();
+    // A warning is not a failure — the blocking banner must not appear.
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
   it('renders a wait, not a dead end, when landing mid-generation', async () => {
     // Kicked off from the job panel, then navigated straight here. The run
     // outlives that navigation, so "not found" would be a lie.
@@ -341,5 +383,51 @@ describe('ResumeReviewPage — flagged drafts (#656)', () => {
         await screen.findByText(/Tailored resume not found/i)
       ).toBeInTheDocument();
     });
+  });
+});
+
+// The API has accepted `page_budget` since the tailor pipeline was written,
+// but nothing in the UI ever set it — every resume came back at the 2-page
+// default. Two explicit menu entries, because the choice only matters at the
+// moment you regenerate.
+describe('ResumeReviewPage — resume length', () => {
+  async function openMenuAndReadapt(label: RegExp) {
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+    await screen.findByRole('heading', { level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: /more actions/i }));
+    fireEvent.click(await screen.findByText(label));
+    fireEvent.click(await screen.findByRole('button', { name: /regenerate/i }));
+  }
+
+  it('sends page_budget 1 when re-adapting to one page', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    mockPage({ record: RECORD, status: 'idle' }, (url, init) => {
+      if (init?.method === 'POST' && url.includes('/tailor/resume')) {
+        bodies.push(JSON.parse(String(init.body)));
+        return { ok: true, status: 202, json: async () => ({}) };
+      }
+      return undefined;
+    });
+
+    await openMenuAndReadapt(/re-adapt to one page/i);
+
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0));
+    expect(bodies[0]).toMatchObject({ page_budget: 1 });
+  });
+
+  it('keeps the two-page default on the plain re-adapt', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    mockPage({ record: RECORD, status: 'idle' }, (url, init) => {
+      if (init?.method === 'POST' && url.includes('/tailor/resume')) {
+        bodies.push(JSON.parse(String(init.body)));
+        return { ok: true, status: 202, json: async () => ({}) };
+      }
+      return undefined;
+    });
+
+    await openMenuAndReadapt(/re-adapt with ai/i);
+
+    await waitFor(() => expect(bodies.length).toBeGreaterThan(0));
+    expect(bodies[0]).toMatchObject({ page_budget: 2 });
   });
 });

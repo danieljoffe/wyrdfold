@@ -33,9 +33,15 @@ _FE = Path(__file__).resolve().parents[2] / "wyrdfold/src"
 _ALLOWED_WITHOUT_FE_SENDER: dict[tuple[str, str], str] = {
     ("TailorRequest", "critique"): "Server-side re-tailor loop passes it; no UI surfaces a critique box.",
     ("CoverLetterRequest", "critique"): "Same re-tailor loop; no UI surface.",
-    ("TailorRequest", "page_budget"): "1-vs-2-page resume knob; UI has no control, always defaults to 2.",
-    ("BatchRequest", "page_budget"): "Same knob on the batch path.",
 }
+
+# Known granularity limit: the frontend never names the Pydantic model it is
+# posting to, so this scan can only ask "does this FIELD NAME appear anywhere in
+# the frontend". Two models sharing a field name therefore pass or fail
+# together. Live example: the resume review page sends `page_budget`, which also
+# clears `BatchRequest.page_budget` even though the batch path still never sends
+# it. That is why this is a floor (catches a field NOTHING sends) and not a
+# proof that any particular route is wired.
 
 
 def _model_fields() -> dict[str, list[str]]:
