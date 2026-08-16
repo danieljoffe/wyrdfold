@@ -629,6 +629,23 @@ export default function ResumeReviewPage({
     v => v.severity === 'error'
   );
 
+  // Warnings live on the RECORD, not just in state (#12). They used to be set
+  // only by a re-check response, so a warning from the original generation was
+  // invisible until you happened to re-run the check — and vanished again on
+  // reload. ``lintWarnings`` state still wins when populated: it carries
+  // violations from a REJECTED save, which describe markdown that is on screen
+  // but was never persisted, so the record cannot know about them.
+  const recordWarnings = (record.lint_violations ?? []).filter(
+    v => v.severity === 'warning'
+  );
+  const shownWarnings = lintWarnings.length > 0 ? lintWarnings : recordWarnings;
+
+  // Three-state lint contract (#656): ``null`` = never linted, ``[]`` = linted
+  // with nothing to report, non-empty = violations. Only a record that was
+  // ACTUALLY linted may claim a pass — an unlinted one must stay silent rather
+  // than imply a check it never ran.
+  const atsClean = record.lint_violations != null && lintErrors.length === 0;
+
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
@@ -646,6 +663,13 @@ export default function ResumeReviewPage({
           {flagged && (
             <Badge variant='error' size='sm'>
               Needs fixes
+            </Badge>
+          )}
+          {/* #12: the pass result used to exist only in a 4s toast, so a user
+              who looked away could not tell "passed" from "never checked". */}
+          {atsClean && !flagged && (
+            <Badge variant='success' size='sm'>
+              ATS clean
             </Badge>
           )}
           {isApproved && (
@@ -732,13 +756,13 @@ export default function ResumeReviewPage({
         </div>
       )}
 
-      {lintWarnings.length > 0 && (
+      {shownWarnings.length > 0 && (
         <div className='rounded-md border border-warning/30 bg-warning/10 p-3'>
           <Text variant='caption' className='mb-1 text-warning'>
             ATS Lint
           </Text>
           <ul className='list-inside list-disc space-y-1'>
-            {lintWarnings.map((w, i) => (
+            {shownWarnings.map((w, i) => (
               <li key={i}>
                 <Text variant='meta' as='span'>
                   [{w.code}] {w.message}

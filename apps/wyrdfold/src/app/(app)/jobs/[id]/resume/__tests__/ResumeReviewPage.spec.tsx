@@ -258,6 +258,48 @@ describe('ResumeReviewPage — flagged drafts (#656)', () => {
     });
   });
 
+  // #12: the ATS result used to be visible only in a 4s toast. A user who
+  // looked away could not tell "passed" from "never checked", and warnings
+  // from the original generation were invisible until a re-check was run.
+  it('shows a persistent pass state once the record has been linted clean', async () => {
+    mockPage({ record: { ...RECORD, lint_violations: [] }, status: 'idle' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(await screen.findByText(/ATS clean/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  it('stays silent about ATS for a record that was never linted', async () => {
+    // `null` is "never linted" — claiming a pass here would assert a check
+    // that never ran.
+    mockPage({ record: { ...RECORD, lint_violations: null }, status: 'idle' });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    await screen.findByRole('heading', { level: 1 });
+    expect(screen.queryByText(/ATS clean/i)).toBeNull();
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  it('surfaces warnings carried on the record, without needing a re-check', async () => {
+    mockPage({
+      record: {
+        ...RECORD,
+        lint_violations: [
+          { code: 'LONG_BULLET', message: 'Bullet exceeds 2 lines', severity: 'warning' },
+        ],
+      },
+      status: 'idle',
+    });
+
+    render(<ResumeReviewPage jobPostingId='j-1' />);
+
+    expect(await screen.findByText(/Bullet exceeds 2 lines/i)).toBeInTheDocument();
+    // A warning is not a failure — the blocking banner must not appear.
+    expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
   it('renders a wait, not a dead end, when landing mid-generation', async () => {
     // Kicked off from the job panel, then navigated straight here. The run
     // outlives that navigation, so "not found" would be a lie.
