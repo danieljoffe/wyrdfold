@@ -55,10 +55,17 @@ export default function CoverLetterSection({
       setConfirmOpen(true);
       return;
     }
-    void handleGenerate();
+    void handleGenerate(false);
   }
 
-  async function handleGenerate() {
+  /**
+   * ``allowStretch`` is only ever true when the user has just confirmed the
+   * skip warning — that click IS the "I know it's a reach, write it anyway".
+   * Without forwarding it the model may decline on their behalf and bill them
+   * for the refusal, which is the exact failure the warning promised to let
+   * them push past.
+   */
+  async function handleGenerate(allowStretch: boolean) {
     const jd = await loadJobDescription(jobPostingId);
     if (!jd.ok) {
       toast({
@@ -76,6 +83,7 @@ export default function CoverLetterSection({
       job_posting_id: jobPostingId,
       company_name: companyName,
       role_title: roleTitle,
+      ...(allowStretch ? { allow_stretch: true } : {}),
     });
     if (ok) {
       toast({ variant: 'success', title: 'Cover letter generated' });
@@ -131,10 +139,10 @@ export default function CoverLetterSection({
             onClose={() => setConfirmOpen(false)}
             onConfirm={() => {
               setConfirmOpen(false);
-              void handleGenerate();
+              void handleGenerate(true);
             }}
             title='Generate anyway?'
-            message={`The match analysis recommends skipping this one: "${skipReason}" Generating a cover letter is billed per run.`}
+            message={`The match analysis recommends skipping this one: "${skipReason}" Generating a cover letter is billed per run. We'll write the strongest honest letter we can from your transferable experience.`}
             confirmLabel='Generate anyway'
             cancelLabel='Cancel'
             name='cover-letter-spend-confirm'

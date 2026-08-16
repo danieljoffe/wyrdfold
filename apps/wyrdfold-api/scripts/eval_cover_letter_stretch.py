@@ -174,18 +174,60 @@ def _refuses(text: str) -> bool:
     return any(re.search(p, low) for p in _REFUSAL_PATTERNS)
 
 
-def _invented_skills(text: str, payload: OptimizedPayload) -> list[str]:
-    """Skills the letter claims that appear nowhere in the source payload.
+# Design-domain competencies a full-stack payload cannot support. Presence of
+# the term is only a *candidate* — see ``_invented_skills`` for why.
+_DESIGN_TERMS = re.compile(
+    r"\b(?:Figma|Sketch|InVision|Photoshop|Illustrator|wireframes?|"
+    r"user research|usability testing|design portfolio)\b",
+    re.I,
+)
 
-    Checks the payload's own skill vocabulary against the letter — a crude but
-    directional hallucination signal. The real containment is the prompt's
-    ref-tracing plus ``validate_cover_letter_refs``; this is here so a stretch
-    letter that starts inventing domain experience shows up as a number.
+# "I possess this" constructions.
+_POSSESSION = re.compile(
+    r"\b(?:my|i have|i've|i bring|i own|i led|i built|i designed|i prototyped|"
+    r"i wireframed|i conducted|i ran|i performed|i delivered|i produced|i created|"
+    r"i shipped|i drove|years? of|proficien\w+ (?:in|with)|fluen\w+ (?:in|with)|"
+    r"expert\w* (?:in|with)|skilled (?:in|with)|experience (?:in|with)|"
+    r"background (?:in|with)|hands-on)\b",
+    re.I,
+)
+
+# Anything that turns the sentence into a concession rather than a claim.
+_DISCLAIMER = re.compile(
+    r"\b(?:no|not|never|without|lack\w*|gap|rather than|instead of|cannot|"
+    r"don'?t|doesn'?t|can'?t|isn'?t|aren'?t|wasn'?t|weren'?t|"
+    r"reach|eager|welcome|open to|learn\w*|would like|standard bar|"
+    r"even if|even though|although|though|while|unlike|absent)\b",
+    re.I,
+)
+
+
+def _invented_skills(text: str, payload: OptimizedPayload) -> list[str]:
+    """Design competencies the letter *claims to possess* but the payload lacks.
+
+    Crude but directional — the real containment is the prompt's ref-tracing
+    plus ``validate_cover_letter_refs``; this exists so a stretch letter that
+    starts inventing domain experience shows up as a number.
+
+    Scoring a bare *mention* would be actively wrong: the behaviour this eval
+    wants is a letter that names the gap out loud ("my artifacts were code
+    rather than Figma files"), and a mention-counter marks exactly that as
+    invention — rewarding a letter that stays silent about the gap over an
+    honest one. So a term counts only inside a sentence that asserts
+    possession and does not concede. Residual: a concession word anywhere in
+    the sentence neutralizes it ("I have 6 years of Figma, not 2" scores
+    clean), which is why this is a directional signal and not the containment.
     """
     source = json.dumps(payload.model_dump(), default=str).lower()
-    # Multi-word capitalized phrases the letter presents as competencies.
-    claimed = set(re.findall(r"\b(?:Figma|Sketch|InVision|Photoshop|Illustrator)\b", text))
-    return sorted(s for s in claimed if s.lower() not in source)
+    invented: set[str] = set()
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        terms = {m.group(0) for m in _DESIGN_TERMS.finditer(sentence)}
+        terms = {t for t in terms if t.lower() not in source}
+        if not terms:
+            continue
+        if _POSSESSION.search(sentence) and not _DISCLAIMER.search(sentence):
+            invented.update(terms)
+    return sorted(invented)
 
 
 async def _one(
