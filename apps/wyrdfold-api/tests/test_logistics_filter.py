@@ -317,3 +317,61 @@ def test_country_stays_lenient_only_when_genuinely_unknown() -> None:
     f = _LogisticsFilter(country="CA")
     unknown = {"id": "j", "logistics_filters": None, "country": None}
     assert _logistics_passes(unknown, f) is True
+
+
+# ---- country: two vocabularies, one comparison (#805) ------------------------
+#
+# `jobs.country` stores a canonical DISPLAY form ("UK", "Canada", "Germany");
+# the filter sends ISO alpha-2 ("GB", "CA", "DE"). They were compared with an
+# exact uppercased string match, so only "US" ever matched — and only because
+# the two spellings coincide. Three of the four options the UI offers returned
+# nothing that matched: 2,619 UK rows, 169 Canada, 118 Germany, all unreachable.
+
+
+def test_gb_matches_rows_stored_as_uk() -> None:
+    f = _LogisticsFilter(country="GB")
+    assert _logistics_passes({"id": "j", "country": "UK", "logistics_filters": None}, f) is True
+
+
+def test_ca_matches_rows_stored_as_canada() -> None:
+    """CA is resolvable HERE though the parser deliberately omits it: in free
+    text "CA" means California, but from a country picker it cannot."""
+    f = _LogisticsFilter(country="CA")
+    assert _logistics_passes({"id": "j", "country": "Canada", "logistics_filters": None}, f) is True
+
+
+def test_de_matches_rows_stored_as_germany() -> None:
+    f = _LogisticsFilter(country="DE")
+    assert _logistics_passes({"id": "j", "country": "Germany", "logistics_filters": None}, f) is True
+
+
+def test_a_genuine_mismatch_is_still_rejected() -> None:
+    """The fold must not make everything match everything."""
+    f = _LogisticsFilter(country="GB")
+    assert _logistics_passes({"id": "j", "country": "US", "logistics_filters": None}, f) is False
+    assert (
+        _logistics_passes({"id": "j", "country": "Canada", "logistics_filters": None}, f) is False
+    )
+
+
+def test_unknown_country_is_still_kept_but_capped() -> None:
+    """Leniency is deliberate — a fully-remote role often has no country anchor,
+    and dropping those would hide roles genuinely open in the filtered country.
+    Unbounded is what made it a bug: 20,247 country-less rows flooded the page.
+    """
+    f = _LogisticsFilter(country="GB")
+    rows = [{"id": "uk", "country": "UK", "logistics_filters": None}] + [
+        {"id": f"unknown{i}", "country": None, "logistics_filters": None} for i in range(50)
+    ]
+    got = _apply_logistics_filter(rows, f)
+    ids = [r["id"] for r in got]
+    assert ids[0] == "uk", "the real match must lead"
+    assert len(ids) == 1 + 10, f"unknown tail not capped: {len(ids)}"
+
+
+def test_a_short_unknown_tail_is_left_alone() -> None:
+    f = _LogisticsFilter(country="GB")
+    rows = [{"id": "uk", "country": "UK", "logistics_filters": None}] + [
+        {"id": f"u{i}", "country": None, "logistics_filters": None} for i in range(3)
+    ]
+    assert len(_apply_logistics_filter(rows, f)) == 4

@@ -504,3 +504,68 @@ def parse_location(raw: str | None) -> LocationParts:
             country = country or got.country
 
     return LocationParts(city, state, country, remote)
+
+
+# ---------------------------------------------------------------------------
+# Country comparison for FILTERS (#805)
+#
+# ``jobs.country`` stores a canonical DISPLAY form — "US", "UK", "Canada",
+# "Germany" (see ``_COUNTRIES``). The jobs filter sends ISO alpha-2 — "US",
+# "GB", "CA", "DE". Those two vocabularies were compared with an exact
+# uppercased string match, so only "US" ever matched, and it matched by pure
+# coincidence of the two forms being identical. "United Kingdom" could not
+# reach 2,619 rows stored as "UK"; "Canada" could not reach 169 stored as
+# "Canada"; "Germany" could not reach 159.
+#
+# Resolving alpha-2 here is safe in a way it is NOT safe in the parser:
+# ``_COUNTRIES`` deliberately omits "ca" because free text like
+# "San Francisco, CA" means California, and adding it would make the parser
+# write Canada for every Californian job. A country PICKER carries no such
+# ambiguity — "CA" arrived from a list of countries.
+# ---------------------------------------------------------------------------
+
+# Alpha-2 that ``_COUNTRIES`` can't carry (ambiguous in free text) or simply
+# doesn't list yet. Filter-only, never consulted while parsing a location.
+_FILTER_ONLY_ALPHA2: dict[str, str] = {
+    "ca": "Canada",
+    "in": "India",
+    "my": "Malaysia",
+    "hu": "Hungary",
+    "au": "Australia",
+    "nz": "New Zealand",
+    "jp": "Japan",
+    "sg": "Singapore",
+    "br": "Brazil",
+    "mx": "Mexico",
+    "pl": "Poland",
+    "se": "Sweden",
+    "ch": "Switzerland",
+    "at": "Austria",
+    "be": "Belgium",
+    "dk": "Denmark",
+    "no": "Norway",
+    "fi": "Finland",
+}
+
+
+def canonical_country(value: str | None) -> str | None:
+    """Fold any known spelling of a country to one comparable token.
+
+    Applied to BOTH sides of a filter comparison, so it does not matter
+    whether a row was written as "UK" or "GB", or whether the caller sends
+    "GB", "uk" or "United Kingdom" — they meet at the same key.
+
+    Returns ``None`` for an unknown or empty value; the caller decides what an
+    unrecognised country means rather than having it silently match.
+    """
+    if not value:
+        return None
+    token = str(value).strip()
+    if not token:
+        return None
+    canon = _canon(token)
+    resolved = _COUNTRIES.get(canon) or _FILTER_ONLY_ALPHA2.get(canon)
+    if resolved is not None:
+        return resolved.upper()
+    # Already a display form we store ("Philippines") but not a lookup key.
+    return token.upper()
