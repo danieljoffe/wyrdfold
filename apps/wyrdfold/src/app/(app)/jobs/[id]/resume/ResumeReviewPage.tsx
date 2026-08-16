@@ -97,6 +97,10 @@ export default function ResumeReviewPage({
   const [rechecking, setRechecking] = useState(false);
   const [lintWarnings, setLintWarnings] = useState<LintViolation[]>([]);
   const [confirmReadaptOpen, setConfirmReadaptOpen] = useState(false);
+  // Which length the pending re-adapt should target. The API has accepted
+  // `page_budget` since the tailor pipeline was written, but nothing in the UI
+  // ever set it, so every resume came back at the 2-page default.
+  const [readaptPages, setReadaptPages] = useState<1 | 2>(2);
   // The version awaiting restore confirmation; null when no dialog is open.
   const [versionToRestore, setVersionToRestore] =
     useState<ResumeVersion | null>(null);
@@ -437,6 +441,7 @@ export default function ResumeReviewPage({
       job_description: record.jd_snapshot,
       job_posting_id: record.job_posting_id,
       force_fresh: true,
+      page_budget: readaptPages,
     });
     if (ok) {
       toast({ variant: 'success', title: 'Resume re-adapted with AI' });
@@ -953,7 +958,27 @@ export default function ResumeReviewPage({
                 {
                   label: 'Re-adapt with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
-                  onClick: () => setConfirmReadaptOpen(true),
+                  onClick: () => {
+                    setReadaptPages(2);
+                    setConfirmReadaptOpen(true);
+                  },
+                  disabled:
+                    generating ||
+                    approving ||
+                    saveStatus === 'saving' ||
+                    isApproved,
+                },
+                {
+                  // Two entries rather than a length setting tucked elsewhere:
+                  // the choice only matters at the moment you regenerate, and
+                  // a separate control would be a state the user has to
+                  // remember they set.
+                  label: 'Re-adapt to one page',
+                  icon: <RotateCcw className='size-4' aria-hidden />,
+                  onClick: () => {
+                    setReadaptPages(1);
+                    setConfirmReadaptOpen(true);
+                  },
                   disabled:
                     generating ||
                     approving ||
@@ -1022,9 +1047,11 @@ export default function ResumeReviewPage({
         onConfirm={handleReadapt}
         title='Re-adapt resume?'
         message={
-          isApproved
-            ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
-            : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+          `${
+            isApproved
+              ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
+              : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+          } Target length: ${readaptPages === 1 ? 'one page' : 'two pages'}.`
         }
         confirmLabel='Regenerate'
         loading={generating}
