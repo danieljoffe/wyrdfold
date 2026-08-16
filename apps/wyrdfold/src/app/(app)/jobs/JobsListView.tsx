@@ -211,6 +211,7 @@ export default function JobsListView({
             onSelectionChange={onSelectionChange}
             onRefetch={handleRefetch}
             loadError={error}
+            targetId={targetId}
           />
         )}
       </div>

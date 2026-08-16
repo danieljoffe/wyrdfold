@@ -20,7 +20,7 @@ import { displayTitle } from '@/lib/displayTitle';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
-import { useJobDelete } from './useJobDelete';
+import { useJobRemove } from './useJobRemove';
 import JobFeedbackSection from './JobFeedbackSection';
 import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
@@ -269,7 +269,7 @@ export default function JobDetailPanel({
 }: JobDetailPanelProps) {
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
-  const { deleteJob, deleting } = useJobDelete();
+  const { removeJob, removing: deleting } = useJobRemove();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
   // Only set when the analysis has actually run AND advises skipping. The
@@ -587,7 +587,7 @@ export default function JobDetailPanel({
   }, [posting.id, targetId]);
 
   async function handleDelete() {
-    if (await deleteJob(posting.id)) {
+    if (await removeJob(posting.id, targetId)) {
       setConfirmDeleteOpen(false);
       onDelete?.();
     }
@@ -774,7 +774,7 @@ export default function JobDetailPanel({
             }
             items={[
               {
-                label: deleting ? 'Deleting…' : 'Delete',
+                label: deleting ? 'Removing…' : 'Remove',
                 danger: true,
                 disabled: deleting,
                 onClick: () => setConfirmDeleteOpen(true),
@@ -794,12 +794,12 @@ export default function JobDetailPanel({
         isOpen={confirmDeleteOpen}
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
-        title='Delete posting?'
-        message={`Delete "${displayTitle(posting)}" from ${posting.company_name}? This can't be undone.`}
-        confirmLabel='Delete'
+        title='Remove posting?'
+        message={`Remove "${displayTitle(posting)}" from ${posting.company_name}? It will stop appearing in this target. You can undo this.`}
+        confirmLabel='Remove'
         destructive
         loading={deleting}
-        loadingLabel='Deleting…'
+        loadingLabel='Removing…'
       />
 
       {/* Two-column main body: Score Breakdown on the left, LLM Analysis on
