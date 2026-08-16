@@ -209,7 +209,6 @@ class TurnAppend(BaseModel):
 
 
 class ResumeUploadResponse(BaseModel):
-    success: bool
     prose_doc_id: str
     prose_version: int
     upload_id: str
