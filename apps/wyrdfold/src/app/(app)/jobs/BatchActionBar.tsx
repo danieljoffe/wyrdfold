@@ -91,13 +91,16 @@ export default function BatchActionBar({
             {exporting ? 'Exporting...' : 'Export (.zip)'}
           </Button>
         )}
+        {/* "Remove", not "Delete": the action takes the posting out of this
+            target's list for this user. It never deletes the shared job row —
+            doing so would cascade into every other follower's pipeline. */}
         <Button
           name='batch-delete'
           variant='error'
           size='sm'
           onClick={onBatchDelete}
         >
-          Delete
+          Remove
         </Button>
       </div>
     </div>

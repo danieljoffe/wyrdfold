@@ -59,14 +59,41 @@ class _Chain:
         return self._resp
 
 
+class _LiveJobsChain(_Chain):
+    """``jobs`` stub that actually applies its ``in_("id", …)`` filter.
+
+    The flat ``_Chain`` returns its canned rows whatever you filter by, which
+    is fine for tests that don't depend on the filter — but the liveness gate
+    runs AFTER removal filtering, so an unfiltered stub re-admits a removed
+    job and the removal assertion can never fail.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__(_Resp(rows))
+        self._rows = rows
+        self._ids: list[str] | None = None
+
+    def in_(self, column: str, values: Any) -> "_LiveJobsChain":
+        if column == "id":
+            self._ids = list(values)
+        return self
+
+    async def execute(self) -> _Resp:
+        if self._ids is None:
+            return _Resp(self._rows)
+        return _Resp([r for r in self._rows if r["id"] in self._ids])
+
+
 async def test_python_fallback_dedups_jobs_across_targets() -> None:
     # j1 scored against two targets — must count once. Status now comes
     # from per-user user_jobs rows: j2 is 'saved'; j1 has no user_jobs
     # row, so it resolves to 'new'.
+    # ``target_id`` is selected alongside ``job_posting_id`` so removals can be
+    # matched per (target, job) — the counts read mirrors the list read.
     score_rows = [
-        {"job_posting_id": "j1"},
-        {"job_posting_id": "j1"},
-        {"job_posting_id": "j2"},
+        {"job_posting_id": "j1", "target_id": "t1"},
+        {"job_posting_id": "j1", "target_id": "t2"},
+        {"job_posting_id": "j2", "target_id": "t1"},
     ]
     user_job_rows = [
         {"job_posting_id": "j2", "status": "saved"},
@@ -79,6 +106,8 @@ async def test_python_fallback_dedups_jobs_across_targets() -> None:
             return _Chain(_Resp(score_rows))
         if name == "jobs":
             return _Chain(_Resp(live_job_rows))
+        if name == "user_target_job_removals":
+            return _Chain(_Resp([]))
         return _Chain(_Resp(user_job_rows))
 
     sb = MagicMock()
@@ -88,6 +117,66 @@ async def test_python_fallback_dedups_jobs_across_targets() -> None:
         sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
     )
     assert counts == {"new": 1, "saved": 1}
+
+
+async def test_python_fallback_excludes_removed_pairs() -> None:
+    """A posting removed from a target must stop being counted for it.
+
+    The tab badge is read from this path; if it kept counting removals the
+    user would see "12" over a list of 11. Removal is per (target, job), so
+    j1 removed from t1 still counts under t2 — it is only gone from t1.
+    """
+    score_rows = [
+        {"job_posting_id": "j1", "target_id": "t1"},
+        {"job_posting_id": "j1", "target_id": "t2"},
+        {"job_posting_id": "j2", "target_id": "t1"},
+    ]
+
+    def _table(name: str) -> _Chain:
+        if name == "scores":
+            return _Chain(_Resp(score_rows))
+        if name == "jobs":
+            # Honour the ``in_`` filter. A stub that returns every row
+            # regardless would re-admit the removed job through the liveness
+            # gate and quietly make this test unable to fail.
+            return _LiveJobsChain([{"id": "j1"}, {"id": "j2"}])
+        if name == "user_target_job_removals":
+            return _Chain(_Resp([{"target_id": "t1", "job_posting_id": "j2"}]))
+        return _Chain(_Resp([]))
+
+    sb = MagicMock()
+    sb.table.side_effect = _table
+
+    counts = await _pipeline_counts_python(
+        sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
+    )
+    # j2 was removed from its only target -> gone. j1 survives via t2.
+    assert counts == {"new": 1}
+
+
+async def test_python_fallback_keeps_job_removed_from_only_one_target() -> None:
+    """Removing from one target must NOT remove it from the others."""
+    score_rows = [
+        {"job_posting_id": "j1", "target_id": "t1"},
+        {"job_posting_id": "j1", "target_id": "t2"},
+    ]
+
+    def _table(name: str) -> _Chain:
+        if name == "scores":
+            return _Chain(_Resp(score_rows))
+        if name == "jobs":
+            return _Chain(_Resp([{"id": "j1"}]))
+        if name == "user_target_job_removals":
+            return _Chain(_Resp([{"target_id": "t1", "job_posting_id": "j1"}]))
+        return _Chain(_Resp([]))
+
+    sb = MagicMock()
+    sb.table.side_effect = _table
+
+    counts = await _pipeline_counts_python(
+        sb, target_ids={"t1", "t2"}, min_score=None, user_id="u1"
+    )
+    assert counts == {"new": 1}
 
 
 async def test_grouped_uses_rpc_result() -> None:
@@ -116,10 +205,12 @@ async def test_grouped_falls_back_when_rpc_missing(caplog: pytest.LogCaptureFixt
 
     def _table(name: str) -> _Chain:
         if name == "scores":
-            return _Chain(_Resp([{"job_posting_id": "j1"}]))
+            return _Chain(_Resp([{"job_posting_id": "j1", "target_id": "t1"}]))
         if name == "jobs":
             # Global liveness gate (#75 C3): j1 is live.
             return _Chain(_Resp([{"id": "j1"}]))
+        if name == "user_target_job_removals":
+            return _Chain(_Resp([]))
         return _Chain(_Resp([{"job_posting_id": "j1", "status": "interviewing"}]))
 
     sb.table.side_effect = _table

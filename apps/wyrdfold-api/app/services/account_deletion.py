@@ -75,6 +75,11 @@ _USER_ID_TABLES: tuple[str, ...] = (
     "source_registrations",
     "contribution_votes",  # the user's anonymous ref-JD votes (#5 P3)
     "user_api_keys",
+    # "I removed this posting from this target" — purely the caller's own
+    # curation of their own list. Nothing shared hangs off it (the ``scores``
+    # row and the ``jobs`` row both survive for everyone else), so it is a
+    # plain delete rather than an anonymize.
+    "user_target_job_removals",
 )
 
 # Shared tables that carry a ``user_id`` but whose rows are NOT deleted on

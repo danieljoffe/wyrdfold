@@ -24,6 +24,13 @@ interface ToastItem {
   variant: ToastVariant;
   title: string;
   description?: string;
+  /**
+   * Optional inline action — the "Undo" affordance a reversible mutation
+   * needs. Toasts auto-dismiss after 4s, so this is for recourse the user
+   * takes immediately; anything that must survive longer belongs in the UI
+   * proper, not here. Clicking it dismisses the toast.
+   */
+  action?: { label: string; onClick: () => void };
 }
 
 interface ToastContextType {
@@ -92,6 +99,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   <Text variant='detail' className='mt-0.5'>
                     {t.description}
                   </Text>
+                )}
+                {t.action && (
+                  <button
+                    onClick={() => {
+                      t.action?.onClick();
+                      dismiss(t.id);
+                    }}
+                    className={`mt-1.5 text-sm font-medium text-text-primary underline underline-offset-2 cursor-pointer rounded-sm ${FOCUS_RING} ${FOCUS_RING_OFFSET}`}
+                  >
+                    {t.action.label}
+                  </button>
                 )}
               </div>
               <button
