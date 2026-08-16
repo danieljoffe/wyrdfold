@@ -215,3 +215,49 @@ any pre-spend confirmation.
   nothing" were coordinate misses (ref-clicks fire correctly), and row checkboxes that
   "expanded instead of selecting" are a 1×1 hidden input with a styled 20×20 span —
   clicking the visible control works correctly for a real user.
+
+---
+
+## 6. Shipped — released and verified in prod (2026-08-16)
+
+Released as `main@8b2e621a` (PR #783 = #777, #778, #779, #781, #782). Migration
+`20260816010000_user_target_job_removals` applied to prod **before** the merge, verified,
+and stamped. Frontend deployed with `vercel --prod`; Railway auto-deployed the API.
+
+**Deploy discriminators** (captured pre-deploy, re-checked after):
+
+| Probe                                 | Before          | After                                       |
+| ------------------------------------- | --------------- | ------------------------------------------- |
+| `POST /jobs/{id}/remove` (unauth)     | route absent    | **401** (control: unknown route still 404s) |
+| `/api/jobs/tailor/{id}/versions` keys | no `payload_md` | **`payload_md` present, 2,820 chars**       |
+
+**Verified in prod:**
+
+| #     | Claim                                  | Result                                                                                                                                                                               |
+| ----- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P0-1  | LinkedIn URL no longer reports success | ✅ In-app dialog shows _"This site blocks automated readers… paste the employer's own application link"_, offers the manual title/company/location fallback, and keeps the typed URL |
+| P0-2  | Version restore works                  | ✅ Load → confirm → restored, content intact (2,820 chars), no "predates markdown" error                                                                                             |
+| P1-3  | Remove is per-target and reversible    | ✅ Removed job gone from the score sort, the two-query title sort **and** the cross-target RPC; Undo restored it; shared job row + score (72) untouched                              |
+| P1-3b | Archived no longer leaks               | ✅ Excluded from the default view, still visible under `status=archived`. Both RPCs confirmed directly in prod                                                                       |
+| P1-4  | Add-by-URL reachable at any list size  | ✅ "Add job by URL" in the toolbar on a populated list                                                                                                                               |
+| P2-6  | Titles open the job in-app             | ✅ 0/5 title cells are outbound anchors (was all of them); every row has a labelled apply icon; clicking a title expands the row; internal `/jobs/` links exist again                |
+| —     | Confirm copy                           | ✅ _"Remove 20 jobs from Frontend UX Designer? They will stop appearing here. You can undo this."_ — names the target, no false irreversibility                                      |
+| —     | Regressions                            | ✅ No console errors on fresh loads                                                                                                                                                  |
+
+**One false alarm worth recording**: an archived job appeared to still leak post-deploy.
+It did not — `job_list_cache` has a **60 s TTL** and the re-read landed inside the window
+my own "before" call had populated. Both RPCs, queried directly against prod, excluded it
+correctly. Re-tested past the TTL: excluded. _A cache is not a bug; check the TTL before
+declaring a regression._
+
+**Not shipped:**
+
+- **#780 (draft)** — the cover-letter _"write it anyway"_ prompt override. Code, prompt,
+  golden re-baseline and a new eval (`scripts/eval_cover_letter_stretch.py`) are all done,
+  but CONTRIBUTING requires the eval to actually run before a prompt change merges, and it
+  can't unattended: the `~/.zshrc` `OPENROUTER_API_KEY` returns `401 User not found` and
+  Railway auth is expired. One command unblocks it — see the PR.
+- P2 #7, #8, #9, #10, #12 — deliberately deferred, listed in #782.
+
+**Account restored**: 0 active targets, 0 leftover removal rows, the verification removal
+undone.
