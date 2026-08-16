@@ -181,9 +181,24 @@ The same fintech-JD merge that exposed A2 also produced:
   `project leadership`.
 
 Both are extraction-prompt quality, not merge logic — the same defect family as
-#749. **Not fixed:** a prompt edit trips `test_prompt_regression` and requires
-a spend-bearing eval re-baseline, which is an owner call
-(`CONTRIBUTING.md` → "Touching prompts or scoring code").
+#749.
+
+**FIXED and released** — `derive_profile.py` `PROMPT_VERSION` v3 -> v4 in #760
+(release #769, `main@3f3daae9`). Measured at temperature 0 over the committed
+fixture set: leaked terms **5 -> 0**, bare seniority signals **28 -> 5**, perk
+signals **1 -> 0**.
+
+The eval that made it safe to touch is `scripts/eval_derive_profile_from_jd.py`,
+written first because this prompt had none. It earned its keep immediately: the
+FIRST fix drove leaks to zero by making the model _delete_ `ACH`, `SEPA` and
+`PCI-DSS` rather than keep them as skills. Only the VOLUME counters caught that,
+which is why the rule now names where each term GOES, not merely where it may
+not appear.
+
+Residual, deliberately not chased: 5 bare signals remain, and the harness
+reports 3 schema failures — the latter is a JSON-mode transport artifact, since
+production uses `complete_json`'s forced tool use, where the API validates the
+shape before the call returns.
 
 ---
 
@@ -225,20 +240,20 @@ The plan in §E was four PRs. It grew to fourteen, across three releases, becaus
 the release gate's interaction pass and a concurrent session's work both turned
 up defects no single PR could have surfaced.
 
-| Finding                                     | Disposition                                                                                                                                                                 | PR         |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| A1 dates render tomorrow                    | Fixed — `LocalFormat` two-pass, SSR pinned to `en-US`/UTC                                                                                                                   | #760       |
-| A2 case-variant duplicate keywords          | Fixed — `_dedupe_keywords`, applied to the single-profile short-circuit too (the common path)                                                                               | #760       |
-| A3 create failure only toasted              | Fixed — durable inline error + draft restore                                                                                                                                | #762       |
-| A4 activation never mentioned               | Fixed — no-active-targets banner with an inline activate path                                                                                                               | #762       |
-| B1/B2/B3/B4                                 | Fixed alongside A3/A4                                                                                                                                                       | #762       |
-| C1 target with no fit score, unrecomputable | Fixed — `stale_target_ids` returns unscored links first, guarded by `_not_deriving()`. **Verified on prod: "Senior Full Stack Engineer" went from permanently null to 52.** | #761       |
-| Score nomenclature split                    | Fixed — `/jobs` says "Match score", `/targets` says "Fit". Deliberately two words for two numbers.                                                                          | #763, #764 |
-| Active-cap dead end                         | Fixed — `SwapActiveTargetModal`, driven by the server's `active_targets` list so it works at every tier                                                                     | #765       |
-| …same dead end from the detail header       | Fixed — the picker was wired only into the cards grid                                                                                                                       | #773       |
-| C2 prompt quality                           | **Owner call, still open.** A prompt edit trips `test_prompt_regression` → spend-bearing eval + golden re-baseline.                                                         | —          |
-| B5/B6 reference-JD affordances              | Not done                                                                                                                                                                    | —          |
-| B7 rename a target                          | **Not done, deliberately.** `label` feeds `normalized_label`, the catalog dedup key. Blocked on a `title_display` split.                                                    | —          |
+| Finding                                     | Disposition                                                                                                                                                                                                                                                                            | PR         |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| A1 dates render tomorrow                    | Fixed — `LocalFormat` two-pass, SSR pinned to `en-US`/UTC                                                                                                                                                                                                                              | #760       |
+| A2 case-variant duplicate keywords          | Fixed — `_dedupe_keywords`, applied to the single-profile short-circuit too (the common path)                                                                                                                                                                                          | #760       |
+| A3 create failure only toasted              | Fixed — durable inline error + draft restore                                                                                                                                                                                                                                           | #762       |
+| A4 activation never mentioned               | Fixed — no-active-targets banner with an inline activate path                                                                                                                                                                                                                          | #762       |
+| B1/B2/B3/B4                                 | Fixed alongside A3/A4                                                                                                                                                                                                                                                                  | #762       |
+| C1 target with no fit score, unrecomputable | Fixed — `stale_target_ids` returns unscored links first, guarded by `_not_deriving()`. **Verified on prod: "Senior Full Stack Engineer" went from permanently null to 52.**                                                                                                            | #761       |
+| Score nomenclature split                    | Fixed — `/jobs` says "Match score", `/targets` says "Fit". Deliberately two words for two numbers.                                                                                                                                                                                     | #763, #764 |
+| Active-cap dead end                         | Fixed — `SwapActiveTargetModal`, driven by the server's `active_targets` list so it works at every tier                                                                                                                                                                                | #765       |
+| …same dead end from the detail header       | Fixed — the picker was wired only into the cards grid                                                                                                                                                                                                                                  | #773       |
+| C2 prompt quality                           | **Fixed** — prompt v3 → v4; leaks 5→0, bare seniority signals 28→5, perks 1→0 at temperature 0                                                                                                                                                                                         | #760       |
+| B5/B6 reference-JD affordances              | **Fixed** — says what a vote DOES (a down-vote suppresses a SHARED artefact for everyone), names the JD in its delete dialog, and lets clipped JD text expand (a JD pasted without a source URL previously could not be read back at all)                                              | #762       |
+| B7 rename a target                          | **Won't do — owner decision, 2026-08-15.** Users should not edit target names. The expectation is that niche/company-specific detail is STRIPPED automatically, which `normalize_posting_title` already does before creation (that is also why the label can safely be the dedup key). | —          |
 
 ### Defects found only by assembling the release
 
