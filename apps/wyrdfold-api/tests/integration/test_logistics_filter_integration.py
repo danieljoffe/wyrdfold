@@ -56,6 +56,12 @@ def seeded_logistics(service_client: Client) -> Iterator[tuple[str, dict[str, st
                     "source_id": source_id,
                     "title": label,
                     "company_name": "Acme",
+                    # The posting's OWN remote flag, agreeing with the
+                    # extraction below. Remote-only now requires both sources
+                    # to affirm (#795), so a seed that left this unset was
+                    # describing a row the ingest never produces — and every
+                    # remote assertion here would drop to the empty set.
+                    "is_remote": logistics[label]["remote_status"] == "remote",
                 }
                 for label, jid in ids.items()
             ]
