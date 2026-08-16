@@ -27,6 +27,7 @@ import ResumeSection from './ResumeSection';
 import StatusIndicator from './StatusIndicator';
 import {
   formatStatus,
+  isSkipRecommendation,
   JOB_STATUSES,
   STATUS_DOT_CLASS,
   postedAt,
@@ -271,6 +272,12 @@ export default function JobDetailPanel({
   const { deleteJob, deleting } = useJobDelete();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
+  // Only set when the analysis has actually run AND advises skipping. The
+  // tailor buttons use it to confirm before a billed generation — an
+  // un-analyzed job stays frictionless.
+  const skipReason = isSkipRecommendation(analysis?.recommendation)
+    ? analysis?.recommendation
+    : undefined;
   // Whether the spend-free open probe (#634) has resolved. Gates the
   // "Analyze fit" button so it doesn't flash on jobs whose cached
   // scorecard is about to render.
@@ -710,6 +717,7 @@ export default function JobDetailPanel({
           <>
             <ResumeSection
               jobPostingId={posting.id}
+              skipReason={skipReason}
               onDrafted={() => {
                 // Mirror the server's mark_job_resume_draft so the pill
                 // doesn't show "New" until a reload (§B7). Forward-only:
@@ -725,6 +733,7 @@ export default function JobDetailPanel({
               jobPostingId={posting.id}
               companyName={formatCompanyName(posting.company_name)}
               roleTitle={displayTitle(posting)}
+              skipReason={skipReason}
             />
           </>
         )}

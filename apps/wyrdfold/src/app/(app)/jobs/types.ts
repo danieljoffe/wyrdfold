@@ -377,3 +377,25 @@ export function postedAt(job: {
 }): string {
   return job.source_posted_at ?? job.cataloged_at;
 }
+
+/**
+ * Does the match analysis recommend skipping this job?
+ *
+ * The analysis opens with its verdict ("Skip: this is a Senior UX Designer
+ * role requiring…"), so the leading word carries the recommendation. Used to
+ * warn before a paid generation: a "Skip" job is exactly where the model may
+ * decline to apply on the user's behalf, and being charged for a refusal with
+ * no warning is the worst version of that.
+ *
+ * Deliberately conservative — only an explicit leading Skip/Pass/Avoid counts.
+ * A false positive adds friction to a good match, which is worse than missing
+ * a marginal one.
+ */
+export function isSkipRecommendation(
+  recommendation: string | null | undefined
+): boolean {
+  if (!recommendation) return false;
+  return /^\s*(skip|pass|avoid|do not apply|don't apply)\b/i.test(
+    recommendation
+  );
+}
