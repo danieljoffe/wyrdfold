@@ -754,6 +754,7 @@ async def _run_cover_letter_task(
             critique=body.critique,
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
+            allow_stretch=body.allow_stretch,
         )
         run_registry.finish(key)
     except Exception:
