@@ -1,8 +1,7 @@
 'use client';
 
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/kit/Button';
-import { useAddJobByUrl } from './useAddJobByUrl';
+import AddJobByUrlButton from './AddJobByUrlButton';
 
 interface JobsEmptyStateProps {
   /**
@@ -23,29 +22,18 @@ interface JobsEmptyStateProps {
  * with the suggest path landed on an empty Top Matches block and had
  * no way to seed one.
  *
- * Surface a Paste URL CTA right where the user is already looking.
- * Uses ``window.prompt`` to match the codebase's existing pattern
- * (delete-job confirm, contact-name prompt) — a full modal isn't
- * justified for what amounts to one input.
+ * The add flow itself (button + dialog + error handling) lives in
+ * ``AddJobByUrlButton``, which the list toolbar also mounts so the
+ * affordance doesn't vanish once the list fills up.
  */
 export default function JobsEmptyState({ onJobAdded }: JobsEmptyStateProps) {
-  const { addJobByUrl, submitting } = useAddJobByUrl(onJobAdded);
-
   return (
     <div className='flex flex-col items-center gap-3 py-12 text-center'>
       <Text variant='body' className='text-text-tertiary'>
         No jobs found. Try adjusting filters, or paste a posting URL to add one
         manually.
       </Text>
-      <Button
-        name='jobs-add-manual'
-        variant='outline'
-        size='sm'
-        onClick={addJobByUrl}
-        disabled={submitting}
-      >
-        {submitting ? 'Adding...' : 'Paste URL'}
-      </Button>
+      <AddJobByUrlButton name='jobs-add-manual' onJobAdded={onJobAdded} />
     </div>
   );
 }

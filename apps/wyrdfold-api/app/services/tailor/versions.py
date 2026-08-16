@@ -29,6 +29,15 @@ class ResumeVersion(BaseModel):
     id: str
     resume_id: str
     payload: dict[str, Any]
+    #: The snapshot's markdown. REQUIRED for restore to work: the review page
+    #: writes ``payload_md`` back into the editor, and with no field here
+    #: ``extra: "ignore"`` silently dropped the column on the way out of
+    #: ``list_for_resume`` — so every version looked markdown-less and the UI
+    #: refused all of them with "This version predates markdown". The column
+    #: has existed since the base schema and ``record()`` has always written
+    #: it; only the serializer was missing. ``None`` is still legitimate for
+    #: rows written before the column was populated.
+    payload_md: str | None = None
     source: VersionSource
     created_at: datetime
 

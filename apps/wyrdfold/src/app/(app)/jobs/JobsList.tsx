@@ -735,6 +735,7 @@ export default function JobsList({
             onPostingsLoaded={setVisiblePostings}
             controlledTableState={controlledTableState}
             onTableSortChange={onTableSortChange}
+            onJobAdded={() => setRefreshKey(k => k + 1)}
           />
 
           {/* Thin-results CTA. Empty state (0 jobs) is owned by

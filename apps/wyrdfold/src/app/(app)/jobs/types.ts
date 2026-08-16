@@ -360,8 +360,27 @@ export interface ResumeVersion {
   id: string;
   resume_id: string;
   payload: TailoredResumePayload;
+  /**
+   * The snapshot's markdown — what a restore actually writes back. Null only
+   * for rows snapshotted before this column was populated.
+   *
+   * Declared here rather than cast at each use site: the API omitted this
+   * field entirely (its Pydantic model had no `payload_md` and
+   * `extra: "ignore"` dropped the column), so every version failed restore.
+   * Typing it means the next serialization gap fails the build instead of
+   * silently degrading to "cannot restore".
+   */
+  payload_md: string | null;
   source: ResumeVersionSource;
   created_at: string;
+}
+
+/**
+ * Can this snapshot actually be restored? Restore writes `payload_md` into the
+ * editor, so a version without it is listable but not loadable.
+ */
+export function hasRestorableMarkdown(version: ResumeVersion): boolean {
+  return Boolean(version.payload_md);
 }
 
 export interface ResumeVersionsResponse {
@@ -376,4 +395,26 @@ export function postedAt(job: {
   cataloged_at: string;
 }): string {
   return job.source_posted_at ?? job.cataloged_at;
+}
+
+/**
+ * Does the match analysis recommend skipping this job?
+ *
+ * The analysis opens with its verdict ("Skip: this is a Senior UX Designer
+ * role requiring…"), so the leading word carries the recommendation. Used to
+ * warn before a paid generation: a "Skip" job is exactly where the model may
+ * decline to apply on the user's behalf, and being charged for a refusal with
+ * no warning is the worst version of that.
+ *
+ * Deliberately conservative — only an explicit leading Skip/Pass/Avoid counts.
+ * A false positive adds friction to a good match, which is worse than missing
+ * a marginal one.
+ */
+export function isSkipRecommendation(
+  recommendation: string | null | undefined
+): boolean {
+  if (!recommendation) return false;
+  return /^\s*(skip|pass|avoid|do not apply|don't apply)\b/i.test(
+    recommendation
+  );
 }
