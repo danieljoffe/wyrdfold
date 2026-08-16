@@ -53,7 +53,7 @@ Cost: 11 postings x repeats, ~$0.02/call — about $0.25 for a 3-trial run.
 Usage::
 
     cd apps/wyrdfold-api
-    railway run sh -c 'OPEN_ROUTER_API_KEY="$OPENROUTER_API_KEY" \
+    railway run sh -c '\
       uv run python scripts/eval_normalize_posting_title.py --label baseline'
     uv run python scripts/eval_normalize_posting_title.py --compare before after
 """

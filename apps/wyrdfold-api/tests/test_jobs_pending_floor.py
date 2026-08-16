@@ -20,6 +20,7 @@ whether the daily grading cap happened to reach it. These tests pin the fix:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,6 +28,7 @@ import pytest
 from app.config import settings
 from app.routers import jobs as jobs_mod
 from app.routers.jobs import (
+    _PENDING_TAIL_CAP,
     _apply_score_floor,
     _is_pending,
     _list_jobs_across_user_targets,
@@ -742,3 +744,112 @@ async def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
     assert len(jobs_selects) == 1
     assert "role_family" not in jobs_selects[0].replace("jobs!inner", "")
     assert all("cataloged_at" not in s or "title" in s for s in jobs_selects)
+
+
+# --------------------------------------------------------------------------
+# #795: the exempt tail must not become the whole answer.
+#
+# The exemption above is right in principle and was UNBOUNDED in practice. In
+# prod the target's best GRADED row scored 80, so a "Score 85+" chip cleared
+# nothing, and the page filled with 100 exempt rows scoring 4-58 — every row
+# contradicting the filter the user had just set.
+#
+# These go through the real list function, not just the helper: a cap that is
+# never reached is exactly the "shipped inert" failure this sweep hit twice.
+# --------------------------------------------------------------------------
+
+
+def _many_pending(n: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "job_posting_id": f"p{i}",
+            "score": 8,
+            "score_breakdown": {},
+            "scoring_status": "stage2",
+        }
+        for i in range(n)
+    ]
+
+
+async def test_explicit_floor_caps_the_pending_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = [
+        {
+            "job_posting_id": "g90",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded",
+        },
+        *_many_pending(30),
+    ]
+    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    result = await _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=100,
+        sort="score",
+        ascending=False,
+        min_score=85,
+        explicit_floor=True,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    ids = [p["id"] for p in result["postings"]]
+    assert ids[0] == "g90", "the qualifying graded row must still lead"
+    assert len(ids) == 1 + _PENDING_TAIL_CAP, f"tail not capped: {len(ids)} rows"
+
+
+async def test_the_prod_shape_no_graded_row_clears_the_bar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly what prod returned: nothing graded qualifies, 30 exempt rows."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = _many_pending(30)
+    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    result = await _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=100,
+        sort="score",
+        ascending=False,
+        min_score=85,
+        explicit_floor=True,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    # A capped tail, not a hundred rows contradicting the filter — and not an
+    # empty list either, which would hide the grading backlog completely.
+    assert len(result["postings"]) == _PENDING_TAIL_CAP
+
+
+async def test_the_profile_default_floor_does_not_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a floor the USER typed caps. The passive default must keep showing
+    new intake — trimming it there is the harm the exemption exists to prevent."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", False)
+    scores = _many_pending(30)
+    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    result = await _list_jobs_for_target_two_query(
+        two_query_supabase(scores, postings),
+        target_id="t-1",
+        page_size=100,
+        sort="score",
+        ascending=False,
+        min_score=40,
+        # explicit_floor omitted → the profile default path
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    assert len(result["postings"]) == 30, "the default floor must not trim intake"

@@ -165,3 +165,46 @@ describe('JobCard', () => {
     expect(mockPush).not.toHaveBeenCalled();
   });
 });
+
+// Same keyboard trap as JobsListTable: the card's own Space handler used to
+// swallow a keypress that originated in its select checkbox, so keyboard users
+// could open a card but never select one. The stopPropagation wrapper around
+// the checkbox only ever covered the mouse.
+describe('JobCard — keyboard selection', () => {
+  it('selects the card when Space is pressed on its checkbox', async () => {
+    const onSelectToggle = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobCard
+        job={makeJob()}
+        selected={false}
+        onSelectToggle={onSelectToggle}
+        onDelete={noop}
+      />
+    );
+
+    screen.getByLabelText(/select senior frontend engineer/i).focus();
+    await user.keyboard(' ');
+
+    expect(onSelectToggle).toHaveBeenCalled();
+  });
+
+  it('still activates the card when Space is pressed on the card itself', async () => {
+    const onSelectToggle = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobCard
+        job={makeJob()}
+        selected={false}
+        onSelectToggle={onSelectToggle}
+        onDelete={noop}
+      />
+    );
+
+    screen.getByRole('button', { name: /senior frontend engineer at acme/i }).focus();
+    await user.keyboard(' ');
+
+    // The card navigates; it must NOT be mistaken for a selection.
+    expect(onSelectToggle).not.toHaveBeenCalled();
+  });
+});

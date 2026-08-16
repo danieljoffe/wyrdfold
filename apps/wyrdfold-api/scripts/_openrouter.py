@@ -7,8 +7,9 @@ Uses httpx directly against the OpenAI-compatible /chat/completions
 endpoint so we get one code path across Anthropic / OpenAI / Google /
 DeepSeek models without a per-provider SDK.
 
-Env: reads OPEN_ROUTER_API_KEY. If absent, parses ~/.zshrc (the user
-exports it there). Don't print the key.
+Env: reads OPENROUTER_API_KEY — the SAME name the app's settings use, so
+one credential has one spelling. Falls back to ``apps/wyrdfold-api/.env.local``
+and then ~/.zshrc. Don't print the key.
 """
 
 from __future__ import annotations
@@ -24,21 +25,57 @@ from typing import Any
 import httpx
 
 _OR_BASE = "https://openrouter.ai/api/v1"
-_KEY_ENV = "OPEN_ROUTER_API_KEY"
+
+# The app reads ``OPENROUTER_API_KEY`` (``Settings.openrouter_api_key``). This
+# harness used to read ``OPEN_ROUTER_API_KEY`` — one credential, two spellings.
+# The cost was real: the only live key lived in ``.env.local`` under the app's
+# name while ~/.zshrc held a dead key under the harness's name, so `source
+# ~/.zshrc` ACTIVELY SET the broken one and every eval 401'd. #780 sat blocked
+# on it. The legacy name is still accepted so an old shell keeps working, but
+# it is no longer what anything is documented to use.
+_KEY_ENV = "OPENROUTER_API_KEY"
+_LEGACY_KEY_ENV = "OPEN_ROUTER_API_KEY"
+
+
+def _from_env_file(path: Path, name: str) -> str | None:
+    if not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        m = re.match(rf'\s*(?:export\s+)?{name}=["\']?([^"\'\s]+)', line)
+        if m:
+            return m.group(1)
+    return None
+
+
+# Module-level so tests can point them at fixtures instead of the real files.
+ENV_LOCAL = Path(__file__).resolve().parents[1] / ".env.local"
+ZSHRC = Path.home() / ".zshrc"
 
 
 def get_api_key() -> str:
-    """Resolve the OpenRouter API key. Env first, then ~/.zshrc fallback."""
-    key = os.environ.get(_KEY_ENV)
-    if key:
-        return key
-    zshrc = Path.home() / ".zshrc"
-    if zshrc.exists():
-        for line in zshrc.read_text().splitlines():
-            m = re.match(rf'\s*(?:export\s+)?{_KEY_ENV}=["\']?([^"\'\s]+)', line)
-            if m:
-                return m.group(1)
-    raise RuntimeError(f"{_KEY_ENV} not set. Export it in your shell or add to ~/.zshrc.")
+    """Resolve the OpenRouter API key.
+
+    The CANONICAL name is tried across every source before the legacy name is
+    tried anywhere. That ordering is the fix, not an accident: the original
+    failure was a stale ``OPEN_ROUTER_API_KEY`` in the shell shadowing the live
+    ``OPENROUTER_API_KEY`` sitting in ``.env.local``. Per-source precedence
+    would reproduce it exactly.
+
+    Sources, in order: process env, the API's own ``.env.local`` (the file the
+    app itself reads, so harness and prod agree by construction), then ~/.zshrc.
+    """
+    for name in (_KEY_ENV, _LEGACY_KEY_ENV):
+        key = (
+            os.environ.get(name)
+            or _from_env_file(ENV_LOCAL, name)
+            or _from_env_file(ZSHRC, name)
+        )
+        if key:
+            return key
+    raise RuntimeError(
+        f"{_KEY_ENV} not set. Export it, or add it to {ENV_LOCAL} or ~/.zshrc. "
+        f"(The legacy name {_LEGACY_KEY_ENV} is still accepted.)"
+    )
 
 
 # Canonical model slugs the eval harness uses. OpenRouter routes the

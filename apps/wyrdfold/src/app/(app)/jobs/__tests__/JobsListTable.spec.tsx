@@ -450,3 +450,48 @@ describe('JobsListTable load-error state (issue #604)', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });
+
+// Keyboard selection. The row is a focusable widget whose Space/Enter expands
+// it — but the handler lives on the <tr>, so a keypress originating in the
+// row's OWN checkbox bubbles up to it. Mouse users are fine (the checkbox sits
+// in a stopPropagation wrapper); keyboard users were not.
+//
+// This matters more since bulk actions shipped: a user who cannot select rows
+// cannot use them at all.
+describe('JobsListTable — keyboard selection', () => {
+  function renderRow(onSelectionChange: (ids: Set<string>) => void) {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[makeJob()]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={onSelectionChange}
+      />
+    );
+  }
+
+  it('selects the row when Space is pressed on its checkbox', async () => {
+    const onSelectionChange = jest.fn();
+    const user = userEvent.setup();
+    renderRow(onSelectionChange);
+
+    const box = screen.getByLabelText(/select senior frontend engineer/i);
+    box.focus();
+    await user.keyboard(' ');
+
+    expect(onSelectionChange).toHaveBeenCalled();
+    expect([...onSelectionChange.mock.calls[0][0]]).toEqual(['j-1']);
+  });
+
+  it('still expands the row when Space is pressed on the row itself', async () => {
+    const user = userEvent.setup();
+    renderRow(() => undefined);
+
+    const row = screen.getByRole('row', { name: /senior frontend engineer at acme/i });
+    row.focus();
+    await user.keyboard(' ');
+
+    expect(await screen.findByTestId('job-detail-panel-stub')).toBeInTheDocument();
+  });
+});

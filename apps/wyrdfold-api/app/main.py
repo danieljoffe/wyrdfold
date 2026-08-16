@@ -530,6 +530,31 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/version")
+async def version() -> dict[str, str | None]:
+    """Which build is actually serving traffic.
+
+    Exists because a release could not be verified. The usual discriminator is
+    a schema diff in ``/openapi.json``, but a BEHAVIOURAL release changes no
+    schema — and with Railway auth expired and no deploy id in any response
+    header, there was no way to tell the new build from the old one. Release
+    #794 shipped with its API cutover unverified for exactly this reason.
+
+    Unauthenticated and dependency-free, like ``/health``: a probe that needs a
+    token is useless in the moment you actually reach for it. It exposes only a
+    commit SHA and a build timestamp — no config, no secrets.
+
+    ``RAILWAY_GIT_COMMIT_SHA`` is injected by Railway; ``BUILD_SHA`` is the
+    portable override for any other host (and for a local Docker run). Both
+    absent → ``null``, which is itself the honest answer rather than a lie.
+    """
+    return {
+        "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("BUILD_SHA"),
+        "built_at": os.getenv("BUILD_TIME"),
+        "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("APP_ENV"),
+    }
+
+
 # How long the readiness DB ping may take before we call the dependency
 # unhealthy. Kept short: a slow Supabase is a failing Supabase for the
 # purpose of "should the LB send this instance traffic?".

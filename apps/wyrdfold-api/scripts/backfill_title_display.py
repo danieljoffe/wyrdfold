@@ -3,7 +3,7 @@
 Run AFTER the ``20260814060000_jobs_title_display`` migration is applied:
 
     cd apps/wyrdfold-api
-    railway run -- env -u OPEN_ROUTER_API_KEY uv run python scripts/backfill_title_display.py [--dry-run]
+    railway run -- uv run python scripts/backfill_title_display.py [--dry-run]
 
 Reads every jobs row's ``(id, title)`` in keyset pages, computes
 ``clean_title_display`` locally (deterministic, no LLM), and PATCHes only the
