@@ -79,6 +79,12 @@ export default function JobCard({
       )}
       onClick={handleNavigate}
       onKeyDown={e => {
+        // Only the CARD's own key events navigate. Space pressed on a control
+        // inside it (the select checkbox) bubbles here, and the
+        // ``preventDefault`` below used to swallow it — so keyboard users
+        // could never select a card. The keyboard twin of the checkbox's
+        // stopPropagation wrapper below, which only covers the mouse.
+        if (e.target !== e.currentTarget) return;
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           handleNavigate();

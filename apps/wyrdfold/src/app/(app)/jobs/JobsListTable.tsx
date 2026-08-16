@@ -222,6 +222,14 @@ export default function JobsListTable({
                   )}
                   onClick={() => toggleExpand(job)}
                   onKeyDown={e => {
+                    // Only the ROW's own key events expand it. Space pressed on
+                    // a control INSIDE the row (the select checkbox, the apply
+                    // link) bubbles here, and the ``preventDefault`` below used
+                    // to swallow it — so keyboard users could never select a
+                    // row, only expand it. The mouse path was already guarded
+                    // by the checkbox's stopPropagation wrapper; this is the
+                    // keyboard twin of that guard.
+                    if (e.target !== e.currentTarget) return;
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
                       toggleExpand(job);
