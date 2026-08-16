@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Literal
 
 RunStatus = Literal["running", "error"]
@@ -48,6 +49,13 @@ class RunState:
     user_id: str | None
     error: str | None = None
     updated_at: float = field(default_factory=time.monotonic)
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    """Wall-clock start, for comparing against a persisted row's ``created_at``.
+
+    ``updated_at`` is deliberately monotonic (immune to clock steps) and so
+    cannot be compared with a database timestamp. A poll needs exactly that
+    comparison to tell "this run produced the row you are looking at" from
+    "this run is still working and that row is its predecessor" (#788)."""
 
 
 class RunRegistry:
@@ -136,7 +144,13 @@ class RunRegistry:
         st = self._runs.get(key)
         user_id = st.user_id if st is not None else None
         self._runs[key] = RunState(
-            status="error", user_id=user_id, error=message, updated_at=time.monotonic()
+            status="error",
+            user_id=user_id,
+            error=message,
+            updated_at=time.monotonic(),
+            # Carry the original start forward rather than restamping it — the
+            # failed run is still the same run.
+            **({"started_at": st.started_at} if st is not None else {}),
         )
 
     def running_count_for_user(self, user_id: str | None) -> int:
