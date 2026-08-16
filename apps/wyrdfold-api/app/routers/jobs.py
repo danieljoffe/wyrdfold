@@ -665,7 +665,7 @@ _SCORE_ROW_COLS = (
 # zero extra round-trips.
 _JOBS_EMBED = (
     ", jobs!inner(id, role_family, source_posted_at, cataloged_at, "
-    "salary_min, salary_max, salary_currency, salary_period, country)"
+    "salary_min, salary_max, salary_currency, salary_period, country, is_remote)"
 )
 
 
@@ -764,6 +764,40 @@ def _rank_graded_first(
     pkey = pending_value if pending_value is not None else value
     pending = sorted((r for r in rows if _is_pending(r)), key=pkey, reverse=not ascending)
     return graded + pending
+
+
+# How many exempt (Pending) rows may ride along behind the qualifying graded
+# ones when the user has set an explicit score floor. Small on purpose: the tail
+# is a SIGNAL that ungraded work exists, not a browsable list. Remove the floor
+# to browse it.
+_PENDING_TAIL_CAP = 10
+
+
+def _cap_pending_tail(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim the Pending tail behind an explicit score floor (#795).
+
+    ``_apply_score_floor`` exempts not-yet-graded rows so a grading backlog
+    can't hide promising jobs. The exemption was UNBOUNDED, and that is what
+    made "Score 85+" indefensible in prod: the target's best graded row scored
+    80, so ZERO graded rows cleared the bar, and the page filled with 100 exempt
+    rows scoring 4–58. Every row on screen contradicted the filter the user had
+    just set.
+
+    ``_rank_graded_first`` already puts graded rows first, so this only has to
+    stop the tail from becoming the whole answer. Rows are already ranked:
+    graded, then Pending.
+
+    Deliberately NOT applied to the profile-default floor — only to a floor the
+    user typed. The default is the passive background bar, and silently trimming
+    new intake out of the ordinary list is the harm the exemption exists to
+    prevent. An explicit chip is a precise question and deserves a precise
+    answer.
+    """
+    graded = [r for r in ranked if not _is_pending(r)]
+    pending = [r for r in ranked if _is_pending(r)]
+    if len(pending) <= _PENDING_TAIL_CAP:
+        return ranked
+    return graded + pending[:_PENDING_TAIL_CAP]
 
 
 def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -893,6 +927,7 @@ async def _assemble_jobs_page(
     user_id: str | None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Shared tail of both two-query list paths (per-target + cross-target).
 
@@ -1038,6 +1073,10 @@ async def _assemble_jobs_page(
                 r["job_posting_id"],
             ),
         )
+        # An explicit floor is a precise question; the exempt Pending tail must
+        # not become the whole answer (#795).
+        if explicit_floor:
+            ranked = _cap_pending_tail(ranked)
         page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
         total: int | None = len(ranked)
     else:
@@ -1181,6 +1220,7 @@ async def _list_jobs_for_target_two_query(
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
 
@@ -1223,7 +1263,8 @@ async def _list_jobs_for_target_two_query(
 
     # Single-target: the same axis weights apply to every row.
     return await _assemble_jobs_page(
-        supabase,
+        explicit_floor=explicit_floor,
+        supabase=supabase,
         by_id=score_lookup,
         weights_for_row=lambda _row: axis_weights,
         offset=offset,
@@ -1260,6 +1301,7 @@ async def _list_jobs_for_target(
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
 
@@ -1312,6 +1354,7 @@ async def _list_jobs_for_target(
     ):
         return await _list_jobs_for_target_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             axis_weights=axis_weights,
             preferences=preferences,
             logistics=logistics,
@@ -1363,6 +1406,7 @@ async def _list_jobs_for_target(
         # shows the blend, not the raw score.
         return await _list_jobs_for_target_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             axis_weights=axis_weights,
             preferences=preferences,
             logistics=logistics,
@@ -1381,6 +1425,7 @@ async def _list_jobs_for_target(
     # sorts bail to two-query above), passed for consistency / future-proofing.
     return await _list_jobs_for_target_two_query(
         supabase,
+        explicit_floor=explicit_floor,
         axis_weights=axis_weights,
         preferences=preferences,
         logistics=logistics,
@@ -1480,6 +1525,7 @@ async def _list_jobs_across_user_targets(
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Untargeted list — the union of jobs scored against any of the user's
     active targets, deduplicated by job id.
@@ -1500,6 +1546,7 @@ async def _list_jobs_across_user_targets(
     if has_location_filter or has_logistics or status == "archived":
         return await _list_jobs_across_user_targets_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             user_target_ids=user_target_ids,
             page_size=page_size,
             sort=sort,
@@ -1540,6 +1587,7 @@ async def _list_jobs_across_user_targets(
         )
     return await _list_jobs_across_user_targets_two_query(
         supabase,
+        explicit_floor=explicit_floor,
         user_target_ids=user_target_ids,
         page_size=page_size,
         sort=sort,
@@ -1576,6 +1624,7 @@ async def _list_jobs_across_user_targets_two_query(
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -1655,7 +1704,8 @@ async def _list_jobs_across_user_targets_two_query(
         return weights_by_target.get(tid) if tid else None
 
     return await _assemble_jobs_page(
-        supabase,
+        explicit_floor=explicit_floor,
+        supabase=supabase,
         by_id=best,
         weights_for_row=_weights_for,
         offset=offset,
@@ -1810,6 +1860,7 @@ def _logistics_passes(
         salary_max=posting.get("salary_max"),
         salary_min=posting.get("salary_min"),
         posting_country=posting.get("country"),
+        posting_is_remote=posting.get("is_remote"),
         include_unknown_salary=include_unknown_salary,
     )
 
@@ -1823,14 +1874,35 @@ def _logistics_core(
     salary_max: Any,
     salary_min: Any,
     posting_country: Any = None,
+    posting_is_remote: Any = None,
     include_unknown_salary: bool,
 ) -> bool:
     """The one logistics predicate. Both callers — the posting-level filter
     and the scores-row pre-filter (#654) — route through here so the two
     layers cannot drift; a divergence would silently change which jobs a
     filter returns depending on which path a request happened to take."""
-    if f.remote_only and log.get("remote_status") != "remote":
-        return False
+    if f.remote_only:
+        # BOTH sources must affirm (#795). The filter used to trust only the
+        # LLM-extracted ``remote_status`` while the card rendered the posting's
+        # own ``is_remote``/``location`` — so a job the employer marked
+        # on-site showed up under Remote-only reading "Raleigh, NC".
+        #
+        # Measured on prod at the time of the fix: of 682 rows the extraction
+        # called remote, 367 agreed with the posting, 229 were flat
+        # CONTRADICTIONS, and 86 had no posting field at all. Requiring
+        # agreement drops the 229 (the bug) and the 86 (missing data) — a
+        # deliberate trade of recall for trust. Loosening the `is True` to
+        # `is not False` would readmit the 86 without readmitting the leaks.
+        extraction_remote = log.get("remote_status") == "remote"
+        if not extraction_remote or posting_is_remote is not True:
+            if extraction_remote and posting_is_remote is False:
+                # Surface the contradictions so they can be reviewed rather
+                # than silently dropped — this is the population worth fixing
+                # upstream in the extraction.
+                logger.info(
+                    "remote_filter.disagreement extraction=remote posting_is_remote=False"
+                )
+            return False
     if f.min_salary is not None:
         if salary_currency == "USD" and salary_period == "yearly":
             bound = salary_max or salary_min
@@ -1872,6 +1944,7 @@ def _score_row_passes_logistics(
         salary_max=_embedded_jobs_field(row, "salary_max"),
         salary_min=_embedded_jobs_field(row, "salary_min"),
         posting_country=_embedded_jobs_field(row, "country"),
+        posting_is_remote=_embedded_jobs_field(row, "is_remote"),
         include_unknown_salary=include_unknown_salary,
     )
 
@@ -2264,6 +2337,11 @@ async def list_jobs(
     # explicitly opt out of the default; ``applied_min_score`` is
     # echoed in the response so the UI can render a "filtered to ≥N"
     # chip with a clear affordance.
+    # Captured BEFORE the profile default fills it in: only a floor the user
+    # actually typed caps the exempt Pending tail (#795). The passive default
+    # must keep showing new intake — trimming it there is the harm the
+    # exemption exists to prevent.
+    explicit_floor = min_score is not None and min_score > 0
     if min_score is None and user_id is not None:
         min_score = await _default_min_score_for_user(supabase, user_id)
 
@@ -2291,6 +2369,7 @@ async def list_jobs(
                 min_score = cutoff if min_score is None else max(min_score, cutoff)
         result = await _list_jobs_for_target(
             supabase,
+            explicit_floor=explicit_floor,
             target_id=target_id,
             page_size=page_size,
             sort=sort,
@@ -2330,6 +2409,7 @@ async def list_jobs(
             include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
         result = await _list_jobs_across_user_targets(
             supabase,
+            explicit_floor=explicit_floor,
             user_target_ids=user_target_ids,
             page_size=page_size,
             sort=sort,
