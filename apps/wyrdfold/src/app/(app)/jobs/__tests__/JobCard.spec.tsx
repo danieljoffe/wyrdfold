@@ -154,12 +154,12 @@ describe('JobCard', () => {
     await user.click(screen.getByRole('button', { expanded: false }));
     // Click the Delete menu item — this should only open the dialog,
     // not delete directly.
-    await user.click(screen.getByRole('menuitem', { name: /delete/i }));
+    await user.click(screen.getByRole('menuitem', { name: /remove/i }));
     expect(onDelete).not.toHaveBeenCalled();
 
     // Confirm in the dialog.
     const dialog = await screen.findByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^remove$/i }));
     expect(onDelete).toHaveBeenCalledTimes(1);
     // Confirming delete must NOT also navigate (the click is contained).
     expect(mockPush).not.toHaveBeenCalled();

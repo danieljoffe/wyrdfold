@@ -67,6 +67,9 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "source_registrations",  # deleted on erasure (the user's from-url board registrations)
     "user_api_keys",
     "contribution_votes",  # deleted on erasure
+    # The user's own "remove this posting from this target" curation. Deleted
+    # on erasure, so portability requires exporting it too.
+    "user_target_job_removals",
     "reference_jds",  # anonymized on erasure (the user's shared contributions)
 )
 

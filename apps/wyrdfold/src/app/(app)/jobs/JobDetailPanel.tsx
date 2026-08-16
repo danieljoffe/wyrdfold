@@ -20,13 +20,14 @@ import { displayTitle } from '@/lib/displayTitle';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
-import { useJobDelete } from './useJobDelete';
+import { useJobRemove } from './useJobRemove';
 import JobFeedbackSection from './JobFeedbackSection';
 import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
 import StatusIndicator from './StatusIndicator';
 import {
   formatStatus,
+  isSkipRecommendation,
   JOB_STATUSES,
   STATUS_DOT_CLASS,
   postedAt,
@@ -268,9 +269,15 @@ export default function JobDetailPanel({
 }: JobDetailPanelProps) {
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
-  const { deleteJob, deleting } = useJobDelete();
+  const { removeJob, removing: deleting } = useJobRemove();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
+  // Only set when the analysis has actually run AND advises skipping. The
+  // tailor buttons use it to confirm before a billed generation — an
+  // un-analyzed job stays frictionless.
+  const skipReason = isSkipRecommendation(analysis?.recommendation)
+    ? analysis?.recommendation
+    : undefined;
   // Whether the spend-free open probe (#634) has resolved. Gates the
   // "Analyze fit" button so it doesn't flash on jobs whose cached
   // scorecard is about to render.
@@ -580,7 +587,7 @@ export default function JobDetailPanel({
   }, [posting.id, targetId]);
 
   async function handleDelete() {
-    if (await deleteJob(posting.id)) {
+    if (await removeJob(posting.id, targetId)) {
       setConfirmDeleteOpen(false);
       onDelete?.();
     }
@@ -710,6 +717,7 @@ export default function JobDetailPanel({
           <>
             <ResumeSection
               jobPostingId={posting.id}
+              skipReason={skipReason}
               onDrafted={() => {
                 // Mirror the server's mark_job_resume_draft so the pill
                 // doesn't show "New" until a reload (§B7). Forward-only:
@@ -725,6 +733,7 @@ export default function JobDetailPanel({
               jobPostingId={posting.id}
               companyName={formatCompanyName(posting.company_name)}
               roleTitle={displayTitle(posting)}
+              skipReason={skipReason}
             />
           </>
         )}
@@ -765,7 +774,7 @@ export default function JobDetailPanel({
             }
             items={[
               {
-                label: deleting ? 'Deleting…' : 'Delete',
+                label: deleting ? 'Removing…' : 'Remove',
                 danger: true,
                 disabled: deleting,
                 onClick: () => setConfirmDeleteOpen(true),
@@ -785,12 +794,12 @@ export default function JobDetailPanel({
         isOpen={confirmDeleteOpen}
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
-        title='Delete posting?'
-        message={`Delete "${displayTitle(posting)}" from ${posting.company_name}? This can't be undone.`}
-        confirmLabel='Delete'
+        title='Remove posting?'
+        message={`Remove "${displayTitle(posting)}" from ${posting.company_name}? It will stop appearing in this target. You can undo this.`}
+        confirmLabel='Remove'
         destructive
         loading={deleting}
-        loadingLabel='Deleting…'
+        loadingLabel='Removing…'
       />
 
       {/* Two-column main body: Score Breakdown on the left, LLM Analysis on

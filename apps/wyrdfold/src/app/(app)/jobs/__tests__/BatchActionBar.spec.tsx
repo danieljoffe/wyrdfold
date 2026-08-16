@@ -35,7 +35,7 @@ describe('BatchActionBar', () => {
       screen.getByRole('button', { name: /generate tailored resumes/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /^delete$/i })
+      screen.getByRole('button', { name: /^remove$/i })
     ).toBeInTheDocument();
   });
 
@@ -101,7 +101,7 @@ describe('BatchActionBar', () => {
       screen.getByRole('button', { name: /generate tailored resumes/i })
     );
     await user.click(screen.getByRole('button', { name: /export/i }));
-    await user.click(screen.getByRole('button', { name: /^delete$/i }));
+    await user.click(screen.getByRole('button', { name: /^remove$/i }));
 
     expect(onClear).toHaveBeenCalledTimes(1);
     expect(onBatchGenerate).toHaveBeenCalledTimes(1);

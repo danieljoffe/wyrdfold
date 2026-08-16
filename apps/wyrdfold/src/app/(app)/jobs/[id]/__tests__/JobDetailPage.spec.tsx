@@ -209,11 +209,11 @@ describe('JobDetailPage — happy path', () => {
     );
   });
 
-  it('renders a Delete posting button at the page root', async () => {
+  it('renders a Remove posting button at the page root', async () => {
     render(<JobDetailPage id='job-42' targetId='target-xyz' />);
 
     expect(
-      await screen.findByRole('button', { name: /delete posting/i })
+      await screen.findByRole('button', { name: /remove posting/i })
     ).toBeInTheDocument();
   });
 
@@ -270,8 +270,8 @@ describe('JobDetailPage — not found', () => {
   });
 });
 
-describe('JobDetailPage — delete', () => {
-  it('opens the confirm dialog, calls DELETE on confirm, toasts success, and routes back to /jobs', async () => {
+describe('JobDetailPage — remove', () => {
+  it('opens the confirm dialog, POSTs the removal on confirm, toasts success, and routes back to /jobs', async () => {
     const fetchMock = jest
       .fn()
       .mockImplementation((url: string, init?: RequestInit) => {
@@ -301,23 +301,25 @@ describe('JobDetailPage — delete', () => {
     render(<JobDetailPage id='job-42' targetId='target-xyz' />);
 
     // The page-level trigger only opens the confirm dialog — it must NOT
-    // fire the DELETE on its own.
+    // fire the removal on its own.
     await user.click(
-      await screen.findByRole('button', { name: /delete posting/i })
+      await screen.findByRole('button', { name: /remove posting/i })
     );
     expect(fetchMock).not.toHaveBeenCalledWith(
-      '/api/jobs/job-42',
-      expect.objectContaining({ method: 'DELETE' })
+      '/api/jobs/job-42/remove',
+      expect.objectContaining({ method: 'POST' })
     );
 
-    // Confirm in the dialog ("Delete") to actually perform the deletion.
+    // Confirm in the dialog to actually perform the removal. This POSTs to
+    // /remove (a per-(user, target, job) fact) rather than DELETE /jobs/{id},
+    // which soft-archived the row and left it in the list.
     const dialog = await screen.findByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^remove$/i }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/jobs/job-42',
-        expect.objectContaining({ method: 'DELETE' })
+        '/api/jobs/job-42/remove',
+        expect.objectContaining({ method: 'POST' })
       );
     });
     expect(mockToast).toHaveBeenCalledWith(

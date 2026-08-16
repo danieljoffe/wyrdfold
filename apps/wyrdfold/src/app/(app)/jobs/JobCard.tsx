@@ -58,7 +58,7 @@ export default function JobCard({
       : []),
     { label: '', divider: true },
     {
-      label: 'Delete',
+      label: 'Remove',
       icon: <Trash2 className='size-4' aria-hidden />,
       danger: true,
       onClick: () => setConfirmDeleteOpen(true),
@@ -168,9 +168,9 @@ export default function JobCard({
             setConfirmDeleteOpen(false);
             onDelete();
           }}
-          title='Delete posting?'
-          message={`Delete "${displayTitle(job)}" from ${job.company_name}? This can't be undone.`}
-          confirmLabel='Delete'
+          title='Remove posting?'
+          message={`Remove "${displayTitle(job)}" from ${job.company_name}? It will stop appearing in this target. You can undo this.`}
+          confirmLabel='Remove'
           destructive
         />
       </div>
