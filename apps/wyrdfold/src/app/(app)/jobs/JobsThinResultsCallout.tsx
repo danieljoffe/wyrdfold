@@ -2,14 +2,12 @@
 
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Text } from '@danieljoffe/shared-ui/Text';
-import Button from '@/components/kit/Button';
-import { useAddJobByUrl } from './useAddJobByUrl';
+import AddJobByUrlButton from './AddJobByUrlButton';
 
 interface JobsThinResultsCalloutProps {
   jobsCount: number;
   targetLabel: string;
-  /** Same hook ``JobsEmptyState`` uses — refresh the list after a
-   *  manual add succeeds. */
+  /** Refresh the list after a manual add succeeds. */
   onJobAdded: () => void;
 }
 
@@ -23,17 +21,12 @@ interface JobsThinResultsCalloutProps {
  *
  * Empty state (0 jobs) is owned by ``JobsEmptyState``; this
  * callout deliberately doesn't try to handle it.
- *
- * Uses ``window.prompt`` to match the codebase's existing add-job
- * pattern. A full modal isn't justified for one input.
  */
 export default function JobsThinResultsCallout({
   jobsCount,
   targetLabel,
   onJobAdded,
 }: JobsThinResultsCalloutProps) {
-  const { addJobByUrl, submitting } = useAddJobByUrl(onJobAdded);
-
   const jobsLabel = jobsCount === 1 ? 'posting' : 'postings';
   return (
     <Card>
@@ -43,15 +36,10 @@ export default function JobsThinResultsCallout({
           <span className='text-text-primary'>{targetLabel}</span>. More may
           arrive as the poller runs — or paste a URL to add one yourself.
         </Text>
-        <Button
+        <AddJobByUrlButton
           name='jobs-thin-results-add'
-          variant='outline'
-          size='sm'
-          onClick={addJobByUrl}
-          disabled={submitting}
-        >
-          {submitting ? 'Adding...' : 'Paste URL'}
-        </Button>
+          onJobAdded={onJobAdded}
+        />
       </CardContent>
     </Card>
   );
