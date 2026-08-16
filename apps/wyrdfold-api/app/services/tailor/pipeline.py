@@ -313,6 +313,7 @@ async def run_cover_letter_pipeline(
     critique: str | None = None,
     job_posting_id: str | None = None,
     target_label: str | None = None,
+    allow_stretch: bool = False,
 ) -> CoverLetterPipelineResult:
     """Run the full cover-letter pipeline end-to-end.
 
@@ -341,6 +342,7 @@ async def run_cover_letter_pipeline(
         preferences_tone_notes=(preferences.tone_notes if preferences else None),
         annotations_text=annotations_text,
         critique=critique,
+        allow_stretch=allow_stretch,
     )
 
     await cost_log.record_async(

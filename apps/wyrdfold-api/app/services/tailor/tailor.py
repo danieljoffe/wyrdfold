@@ -25,7 +25,7 @@ from app.models.tailor import (
     TailoredRole,
 )
 from app.services.llm.client import LLMClient, complete_json
-from app.services.tailor.prompts import COVER_LETTER_SYSTEM, TAILOR_SYSTEM
+from app.services.tailor.prompts import TAILOR_SYSTEM, cover_letter_system
 
 DEFAULT_MODEL: ModelId = "claude-sonnet-4-6"
 DEFAULT_PURPOSE = "tailor.resume"
@@ -594,8 +594,15 @@ async def tailor_cover_letter(
     critique: str | None = None,
     model: ModelId = DEFAULT_MODEL,
     purpose: str = DEFAULT_COVER_LETTER_PURPOSE,
+    allow_stretch: bool = False,
 ) -> tuple[TailoredCoverLetter, list[str], LLMResult]:
     """Run the LLM and post-validate that declared refs trace back.
+
+    ``allow_stretch`` is the user's explicit "I know it's a reach, write it
+    anyway". Without it the model may decline to apply on a poor-fit JD —
+    honest, but not what someone who just paid for a letter asked for. The
+    flag only ever ADDS the stretch block; hallucination containment is
+    unchanged either way.
 
     Returns (letter, warnings, llm_result). Caller is responsible for
     cost-logging and persistence.
@@ -616,7 +623,7 @@ async def tailor_cover_letter(
     parsed, result = await complete_json(
         llm,
         model=model,
-        system=COVER_LETTER_SYSTEM,
+        system=cover_letter_system(allow_stretch=allow_stretch),
         messages=[
             Message(
                 role="user",

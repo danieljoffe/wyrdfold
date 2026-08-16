@@ -172,6 +172,13 @@ class CoverLetterRequest(BaseModel):
     job_posting_id: str | None = None
     target_label: str | None = None
     """Target label for annotation resolution (#499)."""
+    allow_stretch: bool = False
+    """The user's explicit "I know it's a reach — write it anyway".
+
+    Set by the UI only after the user confirms a pre-spend warning on a job
+    whose match analysis recommends skipping. Without it the model may decline
+    to apply on the candidate's behalf, which is honest but is not what
+    someone who has just paid for a letter asked for."""
 
 
 # ---------------------------------------------------------------------------
