@@ -269,11 +269,19 @@ async def update_payload(
     version_source: versions.VersionSource = "user_edit",
     *,
     user_id: str | None,
+    payload_md: str | None = None,
 ) -> TailoredResumeRecord:
     """Update the payload JSONB and set updated_at. Optionally update storage_path.
 
     Records a version snapshot before the update lands so history is captured
     even if the live update fails between snapshot and commit (F3-H).
+
+    Pass ``payload_md`` so the snapshot is restorable. A version row without
+    markdown can be listed but never loaded — the review page restores from
+    ``payload_md``, and refuses rows that lack it. Every other writer
+    (``insert_row``, ``versions.checkpoint``) already supplies it; this one is
+    currently uncalled in app code, so the omission was latent rather than
+    live, but it's the same trap for whoever wires it up next.
 
     Defense-in-depth (post-#714): scopes the update by ``user_id`` in
     addition to ``id`` so a future caller that bypasses the route's
@@ -286,6 +294,7 @@ async def update_payload(
         resume_id=resume_id,
         payload=payload_dict,
         source=version_source,
+        payload_md=payload_md,
     )
     updates: dict[str, Any] = {
         "payload": payload_dict,
