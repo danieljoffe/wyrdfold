@@ -639,6 +639,18 @@ export default function CoverLetterReviewPage({
     v => v.severity === 'error'
   );
 
+  // See the resume page for the rationale (#12): warnings must come off the
+  // RECORD so they survive a reload, with transient state winning when a save
+  // was rejected — those violations describe unsaved on-screen markdown.
+  const recordWarnings = (record.lint_violations ?? []).filter(
+    v => v.severity === 'warning'
+  );
+  const shownWarnings = lintWarnings.length > 0 ? lintWarnings : recordWarnings;
+
+  // null = never linted, [] = linted clean, non-empty = violations (#656).
+  // Only an actually-linted record may claim a pass.
+  const atsClean = record.lint_violations != null && lintErrors.length === 0;
+
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
@@ -652,6 +664,12 @@ export default function CoverLetterReviewPage({
             { label: 'Cover letter' },
           ]}
         />
+        {/* #12: the pass result used to live only in a 4s toast. */}
+        {atsClean && !flagged && (
+          <Badge variant='success' size='sm'>
+            ATS clean
+          </Badge>
+        )}
         {isApproved && (
           <Badge variant='success' size='sm'>
             Locked
@@ -722,13 +740,13 @@ export default function CoverLetterReviewPage({
         </div>
       )}
 
-      {lintWarnings.length > 0 && (
+      {shownWarnings.length > 0 && (
         <div className='rounded-md border border-warning/30 bg-warning/10 p-3'>
           <Text variant='caption' className='mb-1 text-warning'>
             ATS Lint
           </Text>
           <ul className='list-inside list-disc space-y-1'>
-            {lintWarnings.map((w, i) => (
+            {shownWarnings.map((w, i) => (
               <li key={i}>
                 <Text variant='meta' as='span'>
                   [{w.code}] {w.message}
