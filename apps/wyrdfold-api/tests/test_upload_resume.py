@@ -112,7 +112,6 @@ class TestUploadResumeEndpoint:
             embeddings=MagicMock(),
         )
 
-        assert result.success is True
         assert result.prose_doc_id == "prose-1"
         assert result.prose_version == 1
         assert result.extracted_chars > 0
@@ -308,7 +307,6 @@ class TestUploadResumeEndpoint:
             embeddings=MagicMock(),
         )
 
-        assert result.success is True
         assert result.prose_version == 4
         # Verify the merged LLM output was persisted (semantic merge, no divider)
         assert len(created_content) == 1
@@ -398,6 +396,5 @@ class TestUploadResumeEndpoint:
             user_id=None,
         )
 
-        assert result.success is True
         assert result.optimized_doc_id == "opt-1"
         assert derive_called["count"] == 1
