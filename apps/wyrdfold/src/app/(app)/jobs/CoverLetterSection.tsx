@@ -159,11 +159,13 @@ export default function CoverLetterSection({
         flagged ? 'This draft failed ATS checks — open it to fix' : undefined
       }
     >
+      {/* Sentence case, matching ResumeSection's "Review tailored resume" —
+          the two buttons sit side by side in the same toolbar. */}
       {isApproved
-        ? 'View Cover Letter'
+        ? 'View cover letter'
         : flagged
-          ? 'Fix Cover Letter'
-          : 'Review Cover Letter'}
+          ? 'Fix cover letter'
+          : 'Review cover letter'}
     </LinkButton>
   );
 }

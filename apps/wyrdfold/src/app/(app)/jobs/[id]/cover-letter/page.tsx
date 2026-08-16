@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import CoverLetterReviewPage from './CoverLetterReviewPage';
 
 export const metadata: Metadata = {
-  title: 'Review Cover Letter',
+  title: 'Review cover letter',
 };
 
 export default async function FittedCoverLetterReview({
