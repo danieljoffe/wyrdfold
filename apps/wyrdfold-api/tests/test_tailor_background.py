@@ -1013,3 +1013,85 @@ async def test_posting_exists_reads_the_jobs_table_by_id() -> None:
     chain.execute = AsyncMock(return_value=MagicMock(data=[]))
     assert await _posting_exists(supabase, "ghost") is False
     supabase.table.assert_called_with("jobs")
+
+
+# ---- allow_stretch reaches the pipeline on BOTH branches (#785) -------------
+
+
+async def test_backgrounded_cover_letter_forwards_allow_stretch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opt-in must survive the hop through the detached task.
+
+    #780 plumbed the flag but shipped it inert (nothing sent it); nothing
+    pinned the plumbing either. This is the assertion that would have caught a
+    regression in the hand-off.
+    """
+    captured = _capture_spawned(monkeypatch)
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    try:
+        with _pipeline(success, cover_letter=True) as run, _client() as tc:
+            tc.post(
+                "/tailor/cover-letter",
+                json={
+                    "job_description": "Build things.",
+                    "company_name": "Acme",
+                    "job_posting_id": _JOB,
+                    "allow_stretch": True,
+                },
+            )
+            await captured[0]
+        assert run.call_args.kwargs["allow_stretch"] is True
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+def test_jd_only_cover_letter_forwards_allow_stretch() -> None:
+    """The synchronous branch (no ``job_posting_id``) dropped it entirely.
+
+    #780 wired only the backgrounded branch, so a caller on this path had the
+    flag accepted by the request model and then silently ignored — the request
+    validated, the prompt never changed.
+    """
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    with _pipeline(success, cover_letter=True) as run, _client() as tc:
+        resp = tc.post(
+            "/tailor/cover-letter",
+            json={
+                "job_description": "Build things.",
+                "company_name": "Acme",
+                "allow_stretch": True,
+            },
+        )
+    assert resp.status_code == 200
+    assert run.call_args.kwargs["allow_stretch"] is True
+
+
+def test_jd_only_cover_letter_default_path_is_unchanged() -> None:
+    """No opt-in in, no opt-in out — #780's byte-identical default path."""
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    with _pipeline(success, cover_letter=True) as run, _client() as tc:
+        tc.post(
+            "/tailor/cover-letter",
+            json={"job_description": "Build things.", "company_name": "Acme"},
+        )
+    assert run.call_args.kwargs["allow_stretch"] is False

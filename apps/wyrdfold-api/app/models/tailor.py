@@ -222,6 +222,15 @@ class TailoredResumeRecord(BaseModel):
     source_resume_id: str | None = None
     """Points to the original resume when this was cloned via reuse (#504)."""
 
+    allow_stretch: bool = False
+    """Whether this document was generated under the user's stretch opt-in (#785).
+
+    Persisted so "Re-generate with AI" on the review page can reuse the intent
+    the user already expressed. It cannot be re-derived there: the Skip verdict
+    lives on ``JobAnalysis``, which is per-(job, target), and that route has no
+    target in scope — a job matching several targets has several verdicts.
+    ``False`` for every resume and for every row predating the column."""
+
     lint_violations: list[LintViolation] | None = None
     """ATS lint state (#656). ``None`` = never linted (every row predating the
     migration); ``[]`` = linted with nothing to report; a list containing any

@@ -596,3 +596,80 @@ def test_resume_pipeline_still_lints_clean() -> None:
     )
     result = lint_docx(render_docx(resume))
     assert result.ok is True
+
+
+# ---------------------------------------------------------------------------
+# allow_stretch persistence (#785)
+#
+# #780 gave the cover-letter prompt a stretch addendum, gated on the user
+# confirming a pre-spend warning on a Skip-verdict job. Nothing stored that
+# confirmation, so "Re-generate with AI" on the review page could not honour
+# it — and it cannot re-derive it either: the verdict lives on JobAnalysis,
+# which is per-(job, target), and that route has no target in scope.
+# ---------------------------------------------------------------------------
+
+
+async def test_pipeline_persists_the_stretch_optin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opt-in rides with the row it produced."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+
+    llm = MockLLMClient(scripted={DEFAULT_COVER_LETTER_PURPOSE: _valid_letter_json()})
+    await run_cover_letter_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        company_name="Acme",
+        contact=_contact(),
+        allow_stretch=True,
+    )
+
+    rows = [
+        c.args[0]
+        for c in supabase.table.return_value.insert.call_args_list
+        if isinstance(c.args[0], dict) and "jd_snapshot" in c.args[0]
+    ]
+    assert len(rows) == 1, f"expected one documents insert, got {len(rows)}"
+    assert rows[0]["allow_stretch"] is True
+
+
+async def test_pipeline_default_path_persists_no_stretch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default path is unchanged — a good-fit letter is not a stretch."""
+    supabase = _make_supabase_mock(insert_data=[_inserted_record_row()])
+    monkeypatch.setattr(cost_log_mod, "record_async", AsyncMock())
+
+    llm = MockLLMClient(scripted={DEFAULT_COVER_LETTER_PURPOSE: _valid_letter_json()})
+    await run_cover_letter_pipeline(
+        supabase,
+        llm,
+        user_id="test-user",
+        optimized=_optimized_doc(),
+        job_description="jd",
+        company_name="Acme",
+        contact=_contact(),
+    )
+
+    rows = [
+        c.args[0]
+        for c in supabase.table.return_value.insert.call_args_list
+        if isinstance(c.args[0], dict) and "jd_snapshot" in c.args[0]
+    ]
+    assert rows[0]["allow_stretch"] is False
+
+
+def test_record_reads_allow_stretch_off_the_row() -> None:
+    """``TailoredResumeRecord`` sets ``extra="ignore"``, so a column the model
+    does not declare is silently dropped on read — the exact failure that made
+    every resume-version restore a no-op. Pin the read side."""
+    from app.models.tailor import TailoredResumeRecord
+
+    row = _inserted_record_row() | {"allow_stretch": True}
+    assert TailoredResumeRecord.model_validate(row).allow_stretch is True
+    # Rows predating the column (and every resume) read as the default.
+    assert TailoredResumeRecord.model_validate(_inserted_record_row()).allow_stretch is False
