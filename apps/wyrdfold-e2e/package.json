@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "dependencies": {
-    "@axe-core/playwright": "^4.12.1",
-    "@supabase/supabase-js": "2.112.2"
+    "@axe-core/playwright": "^4.13.0",
+    "@supabase/supabase-js": "2.112.3"
   }
 }
