@@ -50,6 +50,13 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("lateral_discovery.system", "app.services.targets.lateral_discovery:_SYSTEM_PROMPT"),
     ("target_fit_score.system", "app.services.targets.fit_score:SYSTEM_PROMPT"),
     ("cover_letter.system", "app.services.tailor.prompts:COVER_LETTER_SYSTEM"),
+    # Opt-in addendum appended to the above when the caller passes
+    # ``allow_stretch``. Pinned separately so the default path's golden stays
+    # byte-identical and the stretch text still can't drift unreviewed.
+    (
+        "cover_letter.stretch_addendum",
+        "app.services.tailor.prompts:COVER_LETTER_STRETCH_ADDENDUM",
+    ),
     ("resume_tailor.system", "app.services.tailor.prompts:TAILOR_SYSTEM"),
     ("qualification_tagger.system", "app.services.qualification.tagger:_SYSTEM_PROMPT"),
     ("feedback_learner.system", "app.services.llm_learner:SYSTEM_PROMPT"),

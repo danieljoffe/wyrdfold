@@ -45,7 +45,50 @@ interface CoverLetterReviewPageProps {
 
 const AUTOSAVE_DEBOUNCE_MS = 1500;
 
+/** Re-generation is backgrounded (#656): the POST returns 202 and the pipeline
+ *  runs ~27s server-side. Same cadence as ``useTailorDocument``. */
+const REGEN_POLL_INTERVAL_MS = 2500;
+const REGEN_MAX_POLLS = 96; // ~4 minutes
+
 type SaveStatus = 'idle' | 'pending' | 'saving' | 'saved' | 'error';
+
+const delay = (ms: number) =>
+  new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/**
+ * Poll the by-job route until a letter NEWER than `previousId` lands.
+ *
+ * Anchored on the record id, never on "a record exists": the route returns the
+ * most recent document, and while a re-generation is in flight it reports the
+ * PREVIOUS letter with `status: 'idle'` — the API's `_document_state` reads the
+ * record first and lets it win. The id is therefore the only usable completion
+ * signal on this surface.
+ *
+ * Returns null when the run failed, the poll broke, or the ceiling was hit. The
+ * server keeps going past the ceiling, so that is a "reload in a moment", not a
+ * cancellation.
+ */
+async function waitForNewLetter(
+  jobPostingId: string,
+  previousId: string
+): Promise<TailoredResumeRecord | null> {
+  for (let attempt = 0; attempt < REGEN_MAX_POLLS; attempt += 1) {
+    await delay(REGEN_POLL_INTERVAL_MS);
+    let state: TailoredDocumentState;
+    try {
+      const res = await fetch(
+        `/api/jobs/tailor/by-job/${jobPostingId}/cover-letter`
+      );
+      if (!res.ok) return null;
+      state = (await res.json()) as TailoredDocumentState;
+    } catch {
+      return null;
+    }
+    if (state.record && state.record.id !== previousId) return state.record;
+    if (state.status === 'error') return null;
+  }
+  return null;
+}
 
 function slugify(value: string): string {
   return (
@@ -426,6 +469,7 @@ export default function CoverLetterReviewPage({
 
   async function handleRegenerate() {
     if (!record || !posting) return;
+    const previousId = record.id;
     setRegenerating(true);
     try {
       await flushPendingSave();
@@ -434,11 +478,23 @@ export default function CoverLetterReviewPage({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          // REQUIRED by ``CoverLetterRequest`` (min_length=1, no default).
+          // Omitting it 422'd every re-generate launched from this page —
+          // the button has never worked. The record's own snapshot is the
+          // right JD: it is the text this letter was written against, and
+          // the posting fetch on this route doesn't carry a description.
+          job_description: record.jd_snapshot,
           job_posting_id: jobPostingId,
           // Display-cleaned: this string is the letter's addressee — feed
           // junk ("003 Humana Inc.") and the LLM writes to it verbatim.
           company_name: formatCompanyName(posting.company_name),
           role_title: posting.title,
+          // #785: carry this letter's own stretch opt-in forward. Without it
+          // a re-generate on a Skip-verdict job can come back a refusal and
+          // replace a letter the user already chose to have written. The
+          // verdict can't be re-derived here — it is per-(job, target) and
+          // this route has no target in scope — so the record is the record.
+          ...(record.allow_stretch ? { allow_stretch: true } : {}),
         }),
       });
       if (!res.ok) {
@@ -452,10 +508,25 @@ export default function CoverLetterReviewPage({
         });
         return;
       }
-      toast({ variant: 'success', title: 'Cover letter re-generated with AI' });
+      // The kick-off returns 202 and the pipeline runs detached for ~27s, so
+      // the modal closes here rather than on completion — the user is free to
+      // leave, the run persists either way. Re-reading immediately (what this
+      // used to do) always returned the OLD letter under a success toast.
       setConfirmRegenerateOpen(false);
+      const next = await waitForNewLetter(jobPostingId, previousId);
+      if (!next) {
+        toast({
+          variant: 'error',
+          title: 'Still re-generating — reload in a moment to see the letter.',
+        });
+        return;
+      }
+      setRecord(next);
+      setMarkdown(next.payload_md ?? '');
+      setSaveStatus('idle');
+      setLintWarnings([]);
       setVersions(null);
-      await load();
+      toast({ variant: 'success', title: 'Cover letter re-generated with AI' });
     } catch {
       toast({
         variant: 'error',
@@ -872,7 +943,9 @@ export default function CoverLetterReviewPage({
             className='text-text-tertiary'
             aria-live='polite'
           >
-            {!isApproved && saveLabel(saveStatus)}
+            {regenerating
+              ? 'Re-generating with AI — this takes about 30 seconds'
+              : !isApproved && saveLabel(saveStatus)}
           </Text>
           <Text variant='meta' as='span' className='text-text-tertiary'>
             <LocalNumber value={markdown.length} /> chars

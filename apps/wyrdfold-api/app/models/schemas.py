@@ -145,7 +145,6 @@ class AddToTargetRequest(BaseModel):
 
 
 class AddToTargetResponse(BaseModel):
-    success: bool
     job_posting_id: str
     target_id: str
     score: int

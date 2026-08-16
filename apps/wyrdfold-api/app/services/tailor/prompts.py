@@ -173,3 +173,40 @@ OUTPUT:
 No code fences.
 - Populate `jd_snippet` with the first ~500 chars of the JD for audit.
 """
+
+
+COVER_LETTER_STRETCH_ADDENDUM = """
+
+STRETCH APPLICATION (the candidate opted into this explicitly):
+- The candidate has seen the match analysis, knows this role is a reach, and \
+asked for the letter anyway. Honour that.
+- Write the strongest HONEST letter you can from transferable experience. \
+Lead with the closest adjacent work and name what transfers and why.
+- Do NOT decline on the candidate's behalf. Do NOT write that they are not \
+applying, are unqualified, or that the role is a mismatch. Do NOT hedge the \
+whole letter into a disclaimer. Declining is the caller's decision and they \
+have already made the opposite one.
+- Hallucination containment above still applies WITHOUT EXCEPTION. Arguing \
+from real adjacent experience is the task; inventing domain experience the \
+OptimizedPayload does not contain is still forbidden.
+- If the genuine overlap is thin, the letter is short and focused rather \
+than padded or apologetic.
+"""
+"""Appended to ``COVER_LETTER_SYSTEM`` only when the caller passes
+``allow_stretch``.
+
+Without it the model reads a poor-fit JD plus the (correct, non-negotiable)
+hallucination rules and concludes the honest move is to refuse — observed in
+prod, where a paid generation returned "I am a full-stack engineer, not a UX
+designer. I am not applying for this role." That is defensible behaviour for
+an unasked-for letter, but the user had paid for a document and been given a
+refusal with no way to say "I know, write it anyway".
+
+Kept as a separate opt-in block rather than folded into the base prompt so the
+default path is byte-identical to what the goldens and evals already cover.
+"""
+
+
+def cover_letter_system(*, allow_stretch: bool = False) -> str:
+    """The cover-letter system prompt, with the stretch block when opted in."""
+    return COVER_LETTER_SYSTEM + (COVER_LETTER_STRETCH_ADDENDUM if allow_stretch else "")

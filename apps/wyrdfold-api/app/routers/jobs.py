@@ -2906,7 +2906,6 @@ async def add_job_to_target(
     job_list_cache.invalidate()
 
     return AddToTargetResponse(
-        success=True,
         job_posting_id=job_id,
         target_id=body.target_id,
         score=result.score,

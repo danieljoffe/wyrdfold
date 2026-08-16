@@ -450,7 +450,6 @@ async def upload_resume(
         optimized_doc_id = doc.id
 
     return ResumeUploadResponse(
-        success=True,
         prose_doc_id=prose_doc.id,
         prose_version=prose_doc.version,
         upload_id=upload_id,

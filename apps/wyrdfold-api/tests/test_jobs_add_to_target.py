@@ -153,7 +153,6 @@ def test_add_to_target_writes_via_service_role_ownership_checked_on_caller(
 
     assert r.status_code == 200
     assert r.json() == {
-        "success": True,
         "job_posting_id": _JOB_ID,
         "target_id": _TARGET_ID,
         "score": 71,
