@@ -3,7 +3,7 @@ import logging
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.http_client import FetchExhaustedError, request_with_retry
+from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,9 @@ async def _fetch_one_posting_detail(
             external_path,
         )
         return None
-    body = resp.json()
+    body = json_or_none(resp, source=f"workday detail {url}")
+    if body is None:
+        return None
     if not isinstance(body, dict):
         return None
     info = body.get("jobPostingInfo")
@@ -165,7 +167,9 @@ async def fetch_workday_jobs(board_token: str) -> list[StandardJob]:
             )
             return []
 
-        data = resp.json()
+        data = json_or_none(resp, source=f"workday {board_token}")
+        if data is None:
+            return []
         postings = data.get("jobPostings", [])
         if not postings:
             break

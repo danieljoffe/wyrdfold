@@ -1,6 +1,6 @@
 import logging
 
-from app.http_client import FetchExhaustedError, request_with_retry
+from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,9 @@ async def fetch_ashby_jobs(slug: str) -> list[StandardJob]:
         logger.warning("ashby %s returned %d for %s", slug, resp.status_code, url)
         return []
 
-    data = resp.json()
+    data = json_or_none(resp, source=f"ashby {slug}")
+    if data is None:
+        return []
     raw_jobs = data.get("jobs", [])
     if not isinstance(raw_jobs, list):
         return []
