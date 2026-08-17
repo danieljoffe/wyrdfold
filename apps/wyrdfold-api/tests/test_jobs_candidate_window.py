@@ -257,3 +257,86 @@ async def test_window_ordering_matches_the_python_ranking_it_feeds() -> None:
     # Graded first even though the Pending placeholder is far higher — the same
     # tier split the candidate window draws with ``is_graded``.
     assert [r["job_posting_id"] for r in ranked] == ["g-lo", "p-hi"]
+
+
+# ── The window's order IS the list's order (#815) ───────────────────────────
+# Postgres and Python do not collate text the same way: glibc ignores leading
+# punctuation at the primary level, Python's codepoint order does not. So the
+# two-query path re-sorting the window in Python meant `/jobs?sort=title`
+# ordered differently depending only on whether a chip forced this path instead
+# of the RPC. Measured on prod (title ASC, 1,000-row window): the two agreed for
+# 21 rows, then `.NET & React Full Stack Developer` and `(1508) Senior
+# Fullstack Engineer` swapped.
+#
+# `__db_order` pins the order Postgres returns — the thing Python can't
+# reproduce, and without which the fake would agree with the old code by
+# construction.
+
+
+def _collation_rows() -> list[dict[str, Any]]:
+    """Titles whose Postgres order is NOT any Python sort of the same values."""
+    titles = [
+        ".NET & React Full Stack Developer",       # glibc: punctuation ignored
+        "(1508) Senior Fullstack Engineer",
+        "abridge Platform Engineer",
+        "Accenture Delivery Engineer",
+    ]
+    rows = []
+    for i, title in enumerate(titles):
+        row = _score_row(f"j{i}", score=50, graded=True, first_seen="2026-07-01", title=title)
+        row["__db_order"] = i          # the DB's collation order
+        rows.append(row)
+    return rows
+
+
+async def test_title_sort_preserves_the_windows_order_not_pythons() -> None:
+    """The page must come out in the order the DB returned, byte for byte."""
+    rows = _collation_rows()
+    db_order = [r["jobs"]["title"] for r in rows]
+    # Python would order these differently — that is the whole point.
+    assert sorted(db_order, key=str.casefold) != db_order
+
+    result = await _list(_supabase(rows), sort="title", ascending=True, page_size=10)
+
+    assert [p["title"] for p in result["postings"]] == db_order
+
+
+async def test_window_order_survives_a_post_fetch_filter_dropping_rows() -> None:
+    """Post-fetch filters only DROP rows, so the surviving order still holds —
+    this is what makes preserving the window index safe."""
+    rows = _collation_rows()
+    sb = _supabase(rows)
+    result = await _list(
+        sb, sort="title", ascending=True, page_size=10, only_terms=["remote"]
+    )
+    kept = [p["title"] for p in result["postings"]]
+    expected = [r["jobs"]["title"] for r in rows if r["jobs"]["title"] in kept]
+    assert kept == expected
+
+
+async def test_archived_view_still_sorts_in_python() -> None:
+    """The archived view selects without the jobs embed, so its window can only
+    be ordered by id — there the Python key IS the sort, and must stay."""
+    rows = [
+        _score_row("j0", score=50, graded=True, first_seen="2026-07-01", company="Zeta"),
+        _score_row("j1", score=50, graded=True, first_seen="2026-07-01", company="alpha"),
+    ]
+    for r in rows:
+        r.pop("jobs")  # archived view: no embed
+    # ``archived_at`` is what makes _fetch_jobs_chunked keep a row in the
+    # archived view — it overwrites ``status`` from user_jobs, so the flag on
+    # the posting is what counts (the 30d sweep's output, UX/IA §5 Stage 1).
+    postings = {
+        "j0": {"id": "j0", "title": "a", "company_name": "Zeta",
+               "archived_at": "2026-07-20T00:00:00+00:00"},
+        "j1": {"id": "j1", "title": "b", "company_name": "alpha",
+               "archived_at": "2026-07-21T00:00:00+00:00"},
+    }
+    sb = two_query_supabase(rows, postings)
+    result = await _list_jobs_for_target_two_query(
+        sb, target_id="t-1", cursor={}, page_size=10, sort="company_name",
+        ascending=True, min_score=None, status="archived", company=None,
+        search=None, exclude_terms=[], only_terms=[],
+    )
+    # casefold order: alpha before Zeta (codepoint order would invert it).
+    assert [p["company_name"] for p in result["postings"]] == ["alpha", "Zeta"]

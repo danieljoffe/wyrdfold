@@ -1374,7 +1374,28 @@ async def _assemble_jobs_page(
                 ascending=ascending,
                 pending_value=lambda p: (fs_lookup.get(p["id"]) or "", p["id"]),
             )
+        elif status != "archived":
+            # PRESERVE THE WINDOW'S ORDER — do not re-derive it (#815).
+            #
+            # The candidate window (#813) already came back ordered by this
+            # sort's column, in Postgres's collation, id-tiebroken — the same
+            # order the RPC paths serve. Re-sorting here in Python re-opened the
+            # divergence #812 narrowed: ``casefold`` approximates the collation
+            # but is not it (glibc ignores leading punctuation at the primary
+            # level, Python's codepoint order does not), so `.NET Developer` and
+            # `(1508) Engineer` swapped depending only on whether a chip forced
+            # this path instead of the RPC. Prod, title ASC: the two orders
+            # agreed for 21 rows and then diverged.
+            #
+            # Safe because ``by_id`` is still in window order — the off-family
+            # gate and the logistics pre-filter both rebuild it by iteration —
+            # and everything between here and there only ever DROPS rows.
+            window_rank = {jid: i for i, jid in enumerate(by_id)}
+            postings.sort(key=lambda p: window_rank.get(p["id"], len(window_rank)))
         else:
+            # The archived view selects without the ``jobs`` embed, so its
+            # window could only be ordered by id (see
+            # ``_order_candidate_window``) — here the Python key IS the sort.
             postings.sort(key=_sort_key, reverse=not ascending)
         if total is None:
             total = len(postings)
