@@ -30,7 +30,7 @@ import {
   isSkipRecommendation,
   JOB_STATUSES,
   STATUS_DOT_CLASS,
-  postedAt,
+  freshnessAnchorAt,
   type AnalysisStatus,
   type JobAnalysis,
   type JobPosting,
@@ -136,6 +136,10 @@ function ScoreBreakdownList({
   rawScore: number | null | undefined;
   /** What the card actually shows — fit × freshness. */
   displayedScore: number;
+  /** The date the SERVER decayed this score against — the provider's date
+   * when known, else our catalog date. Deliberately not the (nullable)
+   * Posted column value: the age shown here has to explain the number on the
+   * card, and the server always has an anchor even when the ATS gave none. */
   postedAtIso: string;
 }) {
   // #650: the old list rendered RAW keyword points and hid zeros, so "+80"
@@ -825,7 +829,7 @@ export default function JobDetailPanel({
               breakdown={breakdown}
               rawScore={posting.raw_score}
               displayedScore={posting.score}
-              postedAtIso={postedAt(posting)}
+              postedAtIso={freshnessAnchorAt(posting)}
             />
           ) : (
             <Skeleton variant='text' lines={3} />
