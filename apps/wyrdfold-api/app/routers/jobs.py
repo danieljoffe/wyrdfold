@@ -58,6 +58,7 @@ from app.services.extract import (
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
+from app.services.location_parse import canonical_country
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
 from app.services.supabase_retry import execute_with_retry
@@ -771,6 +772,11 @@ def _rank_graded_first(
 # is a SIGNAL that ungraded work exists, not a browsable list. Remove the floor
 # to browse it.
 _PENDING_TAIL_CAP = 10
+
+# Same idea for a country filter's unknown-country tail (#805): a short tail is
+# a signal that country-less (usually fully-remote) roles exist; a full page of
+# them is indistinguishable from a broken filter.
+_UNKNOWN_COUNTRY_TAIL_CAP = 10
 
 
 def _cap_pending_tail(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1920,7 +1926,21 @@ def _logistics_core(
         # rows — so "absent ⇒ keep" admitted the other 96% and the filter was
         # inert (selecting Canada returned a full page of US jobs, 2026-08-08).
         country = posting_country if posting_country is not None else log.get("location_country")
-        if country is not None and str(country).upper() != f.country.upper():
+        # BOTH sides are folded to one token (#805). ``jobs.country`` stores a
+        # DISPLAY form ("UK", "Canada", "Germany"); the filter sends ISO
+        # alpha-2 ("GB", "CA", "DE"). An exact string compare therefore matched
+        # only "US", and only because the two spellings coincide — "United
+        # Kingdom" could not reach 2,619 rows stored as "UK", "Canada" 169, or
+        # "Germany" 118. Three of the four options the UI offers returned
+        # nothing that matched.
+        #
+        # Leniency for an UNKNOWN country is kept on purpose: a fully-remote
+        # role often carries no country anchor, and excluding those would hide
+        # roles genuinely open in the filtered country. What was wrong is that
+        # it was UNBOUNDED — 20,247 null-country rows flooded the page. The
+        # bound lives in ``_apply_logistics_filter``, which can see the whole
+        # list; this predicate stays per-row.
+        if country is not None and canonical_country(country) != canonical_country(f.country):
             return False
     return True
 
@@ -1962,7 +1982,43 @@ def _apply_logistics_filter(
     if not f.active:
         return postings
     resolve = include_unknown_salary_for or (lambda _p: False)
-    return [p for p in postings if _logistics_passes(p, f, include_unknown_salary=resolve(p))]
+    kept = [p for p in postings if _logistics_passes(p, f, include_unknown_salary=resolve(p))]
+    if f.country:
+        kept = _cap_unknown_country(kept, f.country)
+    return kept
+
+
+def _cap_unknown_country(
+    rows: list[dict[str, Any]], wanted: str
+) -> list[dict[str, Any]]:
+    """Bound the unknown-country tail behind a country filter (#805).
+
+    ``_logistics_core`` keeps a row whose country is unknown, on purpose: a
+    fully-remote role often carries no country anchor, and dropping those would
+    hide roles genuinely open in the filtered country.
+
+    Unbounded, though, that leniency WAS the bug. 20,247 of ~60k postings have
+    no country, so picking a country returned a page of jobs whose country
+    nobody knows — the same shape as the score floor's exempt Pending tail, and
+    treated the same way: real matches first, unknowns as a short tail.
+
+    Order within each group is preserved; this only decides how many unknowns
+    ride along.
+    """
+    target = canonical_country(wanted)
+    known = [r for r in rows if canonical_country(_row_country(r)) == target]
+    unknown = [r for r in rows if _row_country(r) is None]
+    if len(unknown) <= _UNKNOWN_COUNTRY_TAIL_CAP:
+        return rows
+    return known + unknown[:_UNKNOWN_COUNTRY_TAIL_CAP]
+
+
+def _row_country(row: dict[str, Any]) -> Any:
+    """The country a row is judged on — the deterministic column first, the
+    Phase-2 grader's field second. Mirrors ``_logistics_core``."""
+    if row.get("country") is not None:
+        return row.get("country")
+    return (row.get("logistics_filters") or {}).get("location_country")
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
