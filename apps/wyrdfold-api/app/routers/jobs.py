@@ -427,9 +427,71 @@ def _decode_cursor(cursor: str | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any]:
-    """Keyset cursor for the next page: the last row's sort value + id."""
-    return {"v": row.get(sort), "id": row["id"]}
+# Wire sort token → the key that actually carries the value on a row. The R2
+# two-timestamp rename kept ``created_at`` as the stable WIRE name while the
+# column (and every row shape built from it — the RPC's RETURNS TABLE, the jobs
+# select) became ``cataloged_at``. Anything that reads the sort value off a row
+# has to go through this map; reading the wire name directly finds nothing.
+_SORT_ROW_KEY = {"created_at": "cataloged_at"}
+
+# Sorts whose value is text, and so must be collated the way Postgres collates
+# it rather than by raw codepoint. See ``_python_sort_key``.
+_TEXT_SORTS = frozenset({"company_name", "title"})
+
+
+def _sort_row_key(sort: str) -> str:
+    """The row key holding ``sort``'s value (see ``_SORT_ROW_KEY``)."""
+    return _SORT_ROW_KEY.get(sort, sort)
+
+
+def _python_sort_key(row: dict[str, Any], sort: str, row_id: str) -> tuple[Any, ...]:
+    """Sort key for the Python-paginated paths, aligned with the SQL paths.
+
+    Two properties the naive ``row.get(sort)`` key lacked, both of which the
+    user sees as "load more breaks the sorting":
+
+    - **Collation.** Postgres collates text case-insensitively at the primary
+      level, so ``abridge`` sits between ``Accenture`` and ``aim``. Python's
+      default string order is by codepoint, which puts EVERY capitalised
+      company ahead of EVERY lowercase one — page 1 ended at "Verkada" and
+      page 2 opened with "airspace-intelligence.com", i.e. the alphabet
+      visibly restarting mid-list. ``casefold()`` first, raw value second
+      (so the order is still total, and stable for genuine case-only ties).
+    - **A tiebreaker.** Equal sort values (one company's whole posting list,
+      a batch of rows sharing a timestamp) were left in whatever order the
+      chunked ``in_()`` re-fetch happened to return, which is not stable
+      across requests. Offset pagination over an unstable order silently
+      duplicates and drops rows at every page boundary. The id breaks the tie
+      the same way the SQL paths do (``ORDER BY <col> <dir>, job_posting_id
+      <dir>`` — the caller's ``reverse=`` flips both, as it does there).
+    """
+    value = row.get(_sort_row_key(sort))
+    if sort in _TEXT_SORTS:
+        text = value if isinstance(value, str) else ""
+        return (text.casefold(), text, row_id)
+    return ("" if value is None else value, row_id)
+
+
+def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any] | None:
+    """Keyset cursor for the next page: the last row's sort value + id.
+
+    ``None`` when the row can't produce one, which the caller renders as "no
+    next page". That beats the alternative: a cursor carrying ``v: null``
+    drops the RPC's keyset predicate entirely (``$7 IS NULL OR ...``), so the
+    next page is the FIRST page again — load-more appending page 1 to itself,
+    forever. That is exactly what the ``created_at`` sort did before
+    ``_sort_row_key`` existed (the RPC returns ``cataloged_at``).
+    """
+    row_key = _sort_row_key(sort)
+    if row_key not in row:
+        logger.error(
+            "keyset cursor: row has no %r key for sort %r; ending pagination "
+            "rather than re-serving the first page",
+            row_key,
+            sort,
+        )
+        return None
+    return {"v": row.get(row_key), "id": row["id"]}
 
 
 def _offset_from_cursor(cursor: dict[str, Any]) -> int:
@@ -1138,14 +1200,14 @@ async def _assemble_jobs_page(
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
-                # Same DISPLAY value the scores-layer sort uses (#47).
+                # Same DISPLAY value the scores-layer sort uses (#47), with the
+                # same id tiebreaker that branch already applies.
                 ts = by_id.get(p["id"])
-                return _display(ts) if ts else 0
-            # 'created_at' is the stable WIRE token; the row key is the
-            # renamed cataloged_at (R2 two-timestamp model).
-            row_key = "cataloged_at" if sort == "created_at" else sort
-            val = p.get(row_key)
-            return "" if val is None else val
+                return ((_display(ts) if ts else 0), p["id"])
+            # Collation-aligned + tie-broken, so page N+1 continues exactly
+            # where page N stopped. ``created_at`` is the stable WIRE token;
+            # the row key is the renamed cataloged_at (R2 two-timestamp model).
+            return _python_sort_key(p, sort, p["id"])
 
         if sort == "score":
             # Pending below graded (#47); graded by display value, Pending by
@@ -2260,7 +2322,11 @@ async def _list_jobs_operator(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(operator_sort, desc=not ascending).limit(_OPERATOR_LOCATION_SCAN_CAP)
+        query = (
+            query.order(operator_sort, desc=not ascending)
+            .order("id", desc=not ascending)
+            .limit(_OPERATOR_LOCATION_SCAN_CAP)
+        )
         resp = await query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
@@ -2282,8 +2348,13 @@ async def _list_jobs_operator(
             "total": len(filtered),
             "applied_min_score": min_score,
         }
-    query = query.order(operator_sort, desc=not ascending).range(
-        operator_offset, operator_offset + page_size - 1
+    # The id tiebreaker is load-bearing, not cosmetic: OFFSET pagination over a
+    # non-unique ORDER BY (``company_name`` has whole blocks of equal values) is
+    # not stable in Postgres — successive pages may repeat and skip rows.
+    query = (
+        query.order(operator_sort, desc=not ascending)
+        .order("id", desc=not ascending)
+        .range(operator_offset, operator_offset + page_size - 1)
     )
     resp = await query.execute()
     operator_total = resp.count or 0
