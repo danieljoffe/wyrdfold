@@ -60,6 +60,25 @@ def _embedded(row: dict[str, Any], field: str) -> Any:
     return embed.get(field) if isinstance(embed, dict) else None
 
 
+def _collate(value: Any) -> Any:
+    """Order text the way Postgres does, not the way Python does by default.
+
+    The DB collates case-insensitively at the primary level — ``abridge`` sits
+    between ``Accenture`` and ``aim`` — while Python's default string order is
+    by codepoint, which puts every capitalised name ahead of every lowercase
+    one. The list paths now PRESERVE the order the DB returned (#815), so a
+    fake that ordered by codepoint would hand the code an order production
+    never produces and quietly bless the wrong result.
+
+    Still an approximation: glibc also ignores punctuation at the primary
+    level, which no pure-Python key reproduces. Fixtures that need that pin the
+    order explicitly with ``__db_order``.
+    """
+    if isinstance(value, str):
+        return (value.casefold(), value)
+    return value
+
+
 def _cell(row: dict[str, Any], column: str) -> Any:
     """Read ``column`` the way PostgREST would — ``jobs(x)`` / ``jobs.x`` name
     the embedded relation, anything else is a scores column."""
@@ -149,13 +168,21 @@ class ScoresQuery:
         return self
 
     def _ordered(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # A fixture row may carry ``__db_order`` to pin the position Postgres
+        # would return it in. That models the thing Python CANNOT reproduce:
+        # glibc's collation ignores leading punctuation at the primary level,
+        # so `.NET Developer` and `(1508) Engineer` come back in an order no
+        # ``sorted(key=casefold)`` produces. Without this the fake would sort
+        # the way the code used to and agree with it by construction. (#815)
+        if self._order and any("__db_order" in r for r in rows):
+            return sorted(rows, key=lambda r: r.get("__db_order", 0))
         # Successive stable sorts, least-significant key first. NULLs are
         # partitioned to the end on every key, matching the NULLS LAST the
         # candidate window asks for in both directions.
         for column, desc in reversed(self._order):
             present = [r for r in rows if _cell(r, column) is not None]
             absent = [r for r in rows if _cell(r, column) is None]
-            present.sort(key=lambda r: _cell(r, column), reverse=desc)
+            present.sort(key=lambda r: _collate(_cell(r, column)), reverse=desc)
             rows = present + absent
         return rows
 
