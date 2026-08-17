@@ -427,9 +427,71 @@ def _decode_cursor(cursor: str | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any]:
-    """Keyset cursor for the next page: the last row's sort value + id."""
-    return {"v": row.get(sort), "id": row["id"]}
+# Wire sort token → the key that actually carries the value on a row. The R2
+# two-timestamp rename kept ``created_at`` as the stable WIRE name while the
+# column (and every row shape built from it — the RPC's RETURNS TABLE, the jobs
+# select) became ``cataloged_at``. Anything that reads the sort value off a row
+# has to go through this map; reading the wire name directly finds nothing.
+_SORT_ROW_KEY = {"created_at": "cataloged_at"}
+
+# Sorts whose value is text, and so must be collated the way Postgres collates
+# it rather than by raw codepoint. See ``_python_sort_key``.
+_TEXT_SORTS = frozenset({"company_name", "title"})
+
+
+def _sort_row_key(sort: str) -> str:
+    """The row key holding ``sort``'s value (see ``_SORT_ROW_KEY``)."""
+    return _SORT_ROW_KEY.get(sort, sort)
+
+
+def _python_sort_key(row: dict[str, Any], sort: str, row_id: str) -> tuple[Any, ...]:
+    """Sort key for the Python-paginated paths, aligned with the SQL paths.
+
+    Two properties the naive ``row.get(sort)`` key lacked, both of which the
+    user sees as "load more breaks the sorting":
+
+    - **Collation.** Postgres collates text case-insensitively at the primary
+      level, so ``abridge`` sits between ``Accenture`` and ``aim``. Python's
+      default string order is by codepoint, which puts EVERY capitalised
+      company ahead of EVERY lowercase one — page 1 ended at "Verkada" and
+      page 2 opened with "airspace-intelligence.com", i.e. the alphabet
+      visibly restarting mid-list. ``casefold()`` first, raw value second
+      (so the order is still total, and stable for genuine case-only ties).
+    - **A tiebreaker.** Equal sort values (one company's whole posting list,
+      a batch of rows sharing a timestamp) were left in whatever order the
+      chunked ``in_()`` re-fetch happened to return, which is not stable
+      across requests. Offset pagination over an unstable order silently
+      duplicates and drops rows at every page boundary. The id breaks the tie
+      the same way the SQL paths do (``ORDER BY <col> <dir>, job_posting_id
+      <dir>`` — the caller's ``reverse=`` flips both, as it does there).
+    """
+    value = row.get(_sort_row_key(sort))
+    if sort in _TEXT_SORTS:
+        text = value if isinstance(value, str) else ""
+        return (text.casefold(), text, row_id)
+    return ("" if value is None else value, row_id)
+
+
+def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any] | None:
+    """Keyset cursor for the next page: the last row's sort value + id.
+
+    ``None`` when the row can't produce one, which the caller renders as "no
+    next page". That beats the alternative: a cursor carrying ``v: null``
+    drops the RPC's keyset predicate entirely (``$7 IS NULL OR ...``), so the
+    next page is the FIRST page again — load-more appending page 1 to itself,
+    forever. That is exactly what the ``created_at`` sort did before
+    ``_sort_row_key`` existed (the RPC returns ``cataloged_at``).
+    """
+    row_key = _sort_row_key(sort)
+    if row_key not in row:
+        logger.error(
+            "keyset cursor: row has no %r key for sort %r; ending pagination "
+            "rather than re-serving the first page",
+            row_key,
+            sort,
+        )
+        return None
+    return {"v": row.get(row_key), "id": row["id"]}
 
 
 def _offset_from_cursor(cursor: dict[str, Any]) -> int:
@@ -670,6 +732,22 @@ _JOBS_EMBED = (
 )
 
 
+def _jobs_embed_for(sort: str) -> str:
+    """``_JOBS_EMBED``, plus the column this sort's window is ordered BY.
+
+    A PostgREST ``order=jobs(<col>)`` may only name a column the embed actually
+    projects (it orders the embedded subquery), so ``company_name`` / ``title``
+    have to ride along when — and only when — the window is drawn by them.
+    Carrying both unconditionally measured ~0.1s per request on a full window
+    for rows nothing reads; ``cataloged_at`` is already there for the recency
+    tier, so the ``created_at`` sort adds nothing.
+    """
+    column = _sort_row_key(sort)
+    if column in {"company_name", "title"}:
+        return _JOBS_EMBED.replace("jobs!inner(id,", f"jobs!inner(id, {column},", 1)
+    return _JOBS_EMBED
+
+
 def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
     """The embedded ``jobs`` relation's ``field`` for a scores row, or None
     when the row was fetched without the embed (archived view / older
@@ -741,6 +819,146 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     if not min_score or min_score <= 0:
         return query
     return query.or_(f"axis_scores.is.null,recency_score.gte.{min_score}")
+
+
+# ── The candidate window (#813) ─────────────────────────────────────────────
+# PostgREST caps ANY single response at 1,000 rows. The two-query paths used to
+# select their candidate ``scores`` rows unbounded and rank whatever came back,
+# so on any target above the cap they ranked, totalled and paginated an
+# ARBITRARY sample — prod measured 1,000 of 7,086 live rows for one target, and
+# *which* 1,000 was whatever the plan happened to yield.
+#
+# The window stays the same size. What makes it correct is that it is now drawn
+# in the FINAL RANKING'S ORDER, so those rows are the HEAD of the list rather
+# than a sample of it, and drawn AFTER the selective posting filters, so it is
+# not spent on rows that cannot match. Rows past the window are still not
+# listed; that is now a bounded tail rather than a silent 86% hole, and it is
+# logged when it happens.
+_CANDIDATE_WINDOW = 1000
+
+
+def _apply_candidate_posting_filters(
+    query: Any, *, company: str | None, search: str | None, archived_view: bool
+) -> Any:
+    """Push the ``jobs``-column filters into the candidate query.
+
+    These predicates used to run only in ``_fetch_jobs_chunked``, i.e. AFTER
+    the window was drawn — so they threw the window away instead of narrowing
+    it. Driving the real path against prod, ``search=frontend&country=US`` on a
+    7,086-row target returned 66 rows; with the filters pushed down the same
+    call returns 124 and its window no longer saturates, i.e. the list is now
+    complete rather than a fragment. It is also FASTER (measured 1.10s ->
+    0.51s): the window stops being spent on rows the re-fetch would discard.
+
+    The archived view selects without the ``jobs`` embed (it has to surface
+    globally-archived rows), so there is no relation to filter through; it
+    keeps the post-fetch predicates.
+    """
+    if archived_view:
+        return query
+    if company:
+        query = query.eq("jobs.company_name", company)
+    tokens = _tokenize_search(search)
+    if len(tokens) == 1:
+        query = query.ilike("jobs.title", f"%{tokens[0]}%")
+    elif tokens:
+        # Same OR-across-tokens semantics as ``_apply_title_search``; scoped to
+        # the embed so it can't collide with the score floor's top-level or().
+        parts = [f"title.ilike.*{_escape_or_token(t)}*" for t in tokens]
+        query = query.or_(",".join(parts), reference_table="jobs")
+    return query
+
+
+def _order_candidate_window(
+    query: Any, *, sort: str, ascending: bool, archived_view: bool, graded: bool | None
+) -> Any:
+    """Order the candidate query so its bounded window is the head of the list.
+
+    Mirrors what the Python ranking does further down, because a window drawn
+    in any other order is a sample:
+
+    - **score** — ``_rank_graded_first`` puts graded rows above Pending ones in
+      both directions, ranks graded by the DISPLAY value (which, absent custom
+      axis weights, IS the stored ``recency_score`` — see
+      ``_display_sort_value``) and Pending ones by posted date. One ORDER BY
+      cannot express two tiers keyed on different columns, which is why the
+      caller draws the tiers as separate windows and this takes ``graded``.
+    - **company_name / title / created_at** — a plain ``jobs`` column, ordered
+      through the embed.
+    - **archived view** — selected without the embed, so its sort column is not
+      reachable from here. Deterministic (id) rather than head-of-order; the
+      archived list is small enough that the window rarely binds.
+
+    NULLS LAST throughout: on a DESC sort Postgres would otherwise lead with
+    the NULLs and let them crowd the real head out of the window.
+    """
+    desc = not ascending
+    if sort == "score":
+        column = "recency_score" if graded else "job_first_seen_at"
+        return query.order(column, desc=desc, nullsfirst=False).order(
+            "job_posting_id", desc=desc
+        )
+    if archived_view:
+        return query.order("job_posting_id", desc=desc)
+    return query.order(f"jobs({_sort_row_key(sort)})", desc=desc, nullsfirst=False).order(
+        "job_posting_id", desc=desc
+    )
+
+
+async def _fetch_candidate_window(
+    make_query: Callable[[], Any],
+    *,
+    sort: str,
+    ascending: bool,
+    archived_view: bool,
+    company: str | None,
+    search: str | None,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Candidate ``scores`` rows for the two-query paths: a bounded window in
+    ranking order (see ``_CANDIDATE_WINDOW``).
+
+    ``make_query`` builds a FRESH base query per call — the score sort issues
+    one window per tier (graded / Pending), concurrently, because the two rank
+    on different columns and each needs its own head. Everything else takes a
+    single window.
+    """
+
+    async def _tier(graded: bool | None) -> list[dict[str, Any]]:
+        query = _apply_candidate_posting_filters(
+            make_query(), company=company, search=search, archived_view=archived_view
+        )
+        if graded is not None:
+            # ``is_graded`` is the denormalized twin of ``_is_pending``'s
+            # axis_scores signal — prod-verified to agree on every row of the
+            # measured target (zero rows disagree in either direction).
+            query = query.eq("is_graded", graded)
+        query = _order_candidate_window(
+            query,
+            sort=sort,
+            ascending=ascending,
+            archived_view=archived_view,
+            graded=graded,
+        ).range(0, _CANDIDATE_WINDOW - 1)
+        resp = await execute_with_retry(
+            query.execute, label=label, retry_statement_timeout=True
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if len(rows) >= _CANDIDATE_WINDOW:
+            logger.warning(
+                "candidate window saturated at %d rows (%s, sort=%s, graded=%s): "
+                "matches past the window are not listed",
+                _CANDIDATE_WINDOW,
+                label,
+                sort,
+                graded,
+            )
+        return rows
+
+    if sort == "score":
+        graded_rows, pending_rows = await asyncio.gather(_tier(True), _tier(False))
+        return [*graded_rows, *pending_rows]
+    return await _tier(None)
 
 
 def _rank_graded_first(
@@ -1138,14 +1356,14 @@ async def _assemble_jobs_page(
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
-                # Same DISPLAY value the scores-layer sort uses (#47).
+                # Same DISPLAY value the scores-layer sort uses (#47), with the
+                # same id tiebreaker that branch already applies.
                 ts = by_id.get(p["id"])
-                return _display(ts) if ts else 0
-            # 'created_at' is the stable WIRE token; the row key is the
-            # renamed cataloged_at (R2 two-timestamp model).
-            row_key = "cataloged_at" if sort == "created_at" else sort
-            val = p.get(row_key)
-            return "" if val is None else val
+                return ((_display(ts) if ts else 0), p["id"])
+            # Collation-aligned + tie-broken, so page N+1 continues exactly
+            # where page N stopped. ``created_at`` is the stable WIRE token;
+            # the row key is the renamed cataloged_at (R2 two-timestamp model).
+            return _python_sort_key(p, sort, p["id"])
 
         if sort == "score":
             # Pending below graded (#47); graded by display value, Pending by
@@ -1239,20 +1457,33 @@ async def _list_jobs_for_target_two_query(
     """
     offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
-    # Fetch every candidate score row for the target (score floor applied at the
-    # DB). No server-side ORDER BY or exact count: _assemble_jobs_page re-ranks
-    # by the DISPLAY value and derives the total from the row set, so both would
-    # be pure waste (an exact count on every list request that nothing reads).
+    # Candidate score rows for the target, as a BOUNDED WINDOW IN RANKING ORDER
+    # (#813 — this used to select unbounded and rank whatever 1,000 rows
+    # PostgREST happened to return). The score floor and the posting filters are
+    # applied at the DB so the window isn't spent on rows that cannot appear.
+    # Still no exact count: _assemble_jobs_page derives the total from the row
+    # set it ranks.
     archived_view = status == "archived"
-    ts_query = (
-        supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ("" if archived_view else _JOBS_EMBED))
-        .eq("target_id", target_id)
-        .eq("excluded", False)
+
+    def _candidate_query() -> Any:
+        query = (
+            supabase.table("scores")
+            .select(_SCORE_ROW_COLS + ("" if archived_view else _jobs_embed_for(sort)))
+            .eq("target_id", target_id)
+            .eq("excluded", False)
+        )
+        query = _scores_live_join(query, archived_view=archived_view)
+        return _apply_score_floor(query, min_score)
+
+    ts_rows = await _fetch_candidate_window(
+        _candidate_query,
+        sort=sort,
+        ascending=ascending,
+        archived_view=archived_view,
+        company=company,
+        search=search,
+        label="jobs/target_two_query_scores",
     )
-    ts_query = _scores_live_join(ts_query, archived_view=archived_view)
-    ts_query = _apply_score_floor(ts_query, min_score)
-    ts_rows = cast(list[dict[str, Any]], (await ts_query.execute()).data or [])
 
     # Drop what the caller removed from THIS target. The RPC twin does the
     # same as a SQL anti-join; this path filters in Python because PostgREST
@@ -1653,26 +1884,40 @@ async def _list_jobs_across_user_targets_two_query(
     # column. ``min_score`` still filters on the raw fit score.
 
     archived_view = status == "archived"
-    score_query = (
-        supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ", target_id" + ("" if archived_view else _JOBS_EMBED))
-        .in_("target_id", list(user_target_ids))
-        .eq("excluded", False)
-    )
-    score_query = _scores_live_join(score_query, archived_view=archived_view)
-    score_query = _apply_score_floor(score_query, min_score)
-    # This fallback exists because the cross-target RPC hit a statement
-    # timeout — under the same contention its own scores read dies of the
-    # identical 57014 (observed unhandled on the dashboard top-matches read,
-    # 2026-08-05 #604). One backoff retry lets the fallback actually absorb
-    # the failure it was built for; if it still times out, the app-wide
-    # APIError handler turns 57014 into a clean 503.
-    score_resp = await execute_with_retry(
-        score_query.execute,
+
+    def _candidate_query() -> Any:
+        query = (
+            supabase.table("scores")
+            .select(
+                _SCORE_ROW_COLS
+                + ", target_id"
+                + ("" if archived_view else _jobs_embed_for(sort))
+            )
+            .in_("target_id", list(user_target_ids))
+            .eq("excluded", False)
+        )
+        query = _scores_live_join(query, archived_view=archived_view)
+        return _apply_score_floor(query, min_score)
+
+    # Bounded window in ranking order (#813). This union spans every active
+    # target, so it overran PostgREST's 1,000-row cap sooner than the
+    # per-target path and lost even more to the dedup below.
+    #
+    # ``_fetch_candidate_window`` retries a statement timeout once: this
+    # fallback exists because the cross-target RPC hit one, and under the same
+    # contention its own scores read dies of the identical 57014 (observed
+    # unhandled on the dashboard top-matches read, 2026-08-05 #604). If it
+    # still times out, the app-wide APIError handler turns 57014 into a clean
+    # 503.
+    score_rows = await _fetch_candidate_window(
+        _candidate_query,
+        sort=sort,
+        ascending=ascending,
+        archived_view=archived_view,
+        company=company,
+        search=search,
         label="jobs/cross_target_two_query_scores",
-        retry_statement_timeout=True,
     )
-    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
 
     # Drop removed (target, job) pairs BEFORE the best-target collapse below,
     # mirroring the RPC's anti-join inside ``best``. Filtering after the
@@ -2260,7 +2505,11 @@ async def _list_jobs_operator(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(operator_sort, desc=not ascending).limit(_OPERATOR_LOCATION_SCAN_CAP)
+        query = (
+            query.order(operator_sort, desc=not ascending)
+            .order("id", desc=not ascending)
+            .limit(_OPERATOR_LOCATION_SCAN_CAP)
+        )
         resp = await query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
@@ -2282,8 +2531,13 @@ async def _list_jobs_operator(
             "total": len(filtered),
             "applied_min_score": min_score,
         }
-    query = query.order(operator_sort, desc=not ascending).range(
-        operator_offset, operator_offset + page_size - 1
+    # The id tiebreaker is load-bearing, not cosmetic: OFFSET pagination over a
+    # non-unique ORDER BY (``company_name`` has whole blocks of equal values) is
+    # not stable in Postgres — successive pages may repeat and skip rows.
+    query = (
+        query.order(operator_sort, desc=not ascending)
+        .order("id", desc=not ascending)
+        .range(operator_offset, operator_offset + page_size - 1)
     )
     resp = await query.execute()
     operator_total = resp.count or 0
