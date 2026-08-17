@@ -22,6 +22,7 @@ more predicates here (once) if a future test needs them.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -108,6 +109,8 @@ class ScoresQuery:
         self._title_terms: list[str] = []
         self._order: list[tuple[str, bool]] = []
         self._range: tuple[int, int] | None = None
+        self._filters: list[Callable[[dict[str, Any]], bool]] = []
+        self._neg = False
 
     def select(self, *_a: Any, **_kw: Any) -> ScoresQuery:
         return self
@@ -137,15 +140,29 @@ class ScoresQuery:
         self._range = (start, end)
         return self
 
-    def is_(self, *_a: Any, **_kw: Any) -> ScoresQuery:
-        # The scores-layer liveness join (`jobs.archived_at is null`, ...)
-        # — a fluent no-op here; liveness outcomes are modelled by which
-        # rows the test seeds. See _scores_live_join.
+    def is_(self, col: str = "", value: str = "", *_a: Any, **_kw: Any) -> ScoresQuery:
+        """``IS NULL`` / ``IS NOT NULL`` — modelled for real.
+
+        The liveness join's own calls (`jobs.archived_at is null`, …) still
+        behave as no-ops in practice, because fixtures don't set those fields
+        and a missing cell reads as NULL. But the posted_at window SPLITS on
+        ``jobs.source_posted_at IS NULL`` (#825), and a fake that ignored it
+        would hand both tiers the same rows — which ``by_id`` then dedupes,
+        so the split would silently look correct however it was written.
+        """
+        negated, self._neg = self._neg, False
+        if value == "null":
+            if negated:
+                self._filters.append(lambda r, c=col: _cell(r, c) is not None)
+            else:
+                self._filters.append(lambda r, c=col: _cell(r, c) is None)
+        elif value == "false" and negated:
+            self._filters.append(lambda r, c=col: _cell(r, c) is not False)
         return self
 
     @property
     def not_(self) -> ScoresQuery:
-        # `.not_.is_("jobs.is_us", "false")` — same no-op treatment.
+        self._neg = True
         return self
 
     def gte(self, _col: str, value: int) -> ScoresQuery:
@@ -199,6 +216,8 @@ class ScoresQuery:
                 rows = [r for r in rows if r["score"] >= self._floor]
         if self._graded is not None:
             rows = [r for r in rows if _row_is_graded(r) is self._graded]
+        for predicate in self._filters:
+            rows = [r for r in rows if predicate(r)]
         if self._company is not None:
             rows = [r for r in rows if _embedded(r, "company_name") == self._company]
         if self._title_terms:
