@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -100,6 +101,69 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     return cast("dict[str, Any]", resolve(body, frozenset()))
 
 
+# DeepSeek answers a forced tool call by writing Anthropic's XML invocation
+# syntax into ``content`` instead of emitting a structured ``tool_calls`` entry:
+#
+#   <invoke name="return_TitleTriageResponse">
+#   <parameter name="verdicts" string="false">[{"id": 1, "promising": false}]</parameter>
+#   </invoke>
+#
+# The answer is right there and well-formed — prod logs show 88 of these in one
+# 16h window, every one with ``finish_reason='stop'`` (nothing truncated). We
+# were discarding all of them, retrying once at full cost, and losing the
+# verdict anyway when the retry reproduced the same output — which it does,
+# because the failure is deterministic per input, not a stochastic flake
+# (21 of 25 distinct titles recurred).
+_PROSE_INVOKE_RE = re.compile(
+    r"<invoke\s+name=\"(?P<tool>[^\"]+)\"\s*>(?P<body>.*?)</invoke>", re.DOTALL
+)
+_PROSE_PARAM_RE = re.compile(
+    r"<parameter\s+name=\"(?P<name>[^\"]+)\"(?:\s+string=\"(?P<is_str>true|false)\")?\s*>"
+    r"(?P<value>.*?)</parameter>",
+    re.DOTALL,
+)
+
+
+def _parse_prose_tool_call(content: object, *, tool_name: str) -> dict[str, Any] | None:
+    """Recover a tool input the model wrote as XML prose, or ``None``.
+
+    ALL-OR-NOTHING on purpose. ``QualificationTags`` has a default for every
+    field and a ``_tolerate_malformed`` pass on top, so a PARTIAL dict would
+    validate silently and write a confidently-wrong tag — exactly the
+    "silently-wrong dict flowing downstream" this module refuses elsewhere. So
+    this only returns something when the block is provably complete:
+
+    - the closing ``</invoke>`` is present (a response cut off at the token cap
+      can't match, and falls back to the existing raise), and
+    - every ``<parameter`` opened in the body also parsed, so a malformed one
+      in the middle can't be silently dropped.
+
+    A parameter's value is JSON unless the model tagged it ``string="true"``.
+    When it claims JSON but isn't, the raw text is passed through and the
+    caller's Pydantic validation decides — that is the loud failure, and it is
+    the same gate the structured path goes through.
+    """
+    if not isinstance(content, str) or "<invoke" not in content:
+        return None
+    invoke = _PROSE_INVOKE_RE.search(content)
+    if invoke is None or invoke.group("tool") != tool_name:
+        return None
+    body = invoke.group("body")
+    tool_input: dict[str, Any] = {}
+    for param in _PROSE_PARAM_RE.finditer(body):
+        raw = param.group("value")
+        if param.group("is_str") == "true":
+            tool_input[param.group("name")] = raw
+            continue
+        try:
+            tool_input[param.group("name")] = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            tool_input[param.group("name")] = raw
+    if not tool_input or len(tool_input) != body.count("<parameter"):
+        return None
+    return tool_input
+
+
 def _parse_openai_tool_response(
     data: dict[str, Any], *, tool_name: str, max_tokens: int
 ) -> dict[str, Any]:
@@ -116,9 +180,20 @@ def _parse_openai_tool_response(
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
+        salvaged = _parse_prose_tool_call(message.get("content"), tool_name=tool_name)
+        if salvaged is not None:
+            logger.warning(
+                "salvaged %r from a prose tool call — model wrote XML into content "
+                "instead of emitting tool_calls (finish_reason=%r)",
+                tool_name,
+                finish,
+            )
+            return salvaged
+        # 600, not 200: the old cap cut every one of these mid-payload, which
+        # made a complete-but-misplaced answer look like a truncated one.
         raise MissingToolCallError(
             f"Expected a forced tool_call for {tool_name!r}, got finish_reason="
-            f"{finish!r}, content={str(message.get('content'))[:200]!r}"
+            f"{finish!r}, content={str(message.get('content'))[:600]!r}"
         )
     # A tool call cut off at the token cap emitted a truncated argument string;
     # the parsed dict would be incomplete. Fail loud (matches Anthropic's

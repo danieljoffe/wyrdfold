@@ -13,6 +13,7 @@ from app.services.llm.mock import (
     QUERY_SUGGEST_PURPOSE,
     MockLLMClient,
     dev_default_responses,
+    prose_xml_tool_call,
 )
 
 
@@ -743,3 +744,73 @@ def test_normalize_posting_title_prompt_forbids_inferring_seniority_from_prose()
     # what actually moved the model.
     assert "10+ years and staff-level scope" in SYSTEM_PROMPT
     assert "Add a seniority word that does not appear in the title." in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# #821: the model writes the forced tool call as Anthropic XML inside
+# ``content`` instead of emitting ``tool_calls``. Prod logged 88 of these in a
+# single 16h window, every one complete (``finish_reason='stop'``) — a correct
+# answer we discarded, retried at full cost, and lost anyway when the retry
+# reproduced it. The mock now carries the behaviour so every LLM surface
+# inherits it.
+# ---------------------------------------------------------------------------
+
+
+async def test_mock_salvages_a_prose_xml_tool_call() -> None:
+    client = MockLLMClient()
+    client.register(
+        "triage",
+        prose_xml_tool_call(
+            "return_TitleTriageResponse",
+            verdicts=[{"id": 1, "promising": False, "confidence": 85}],
+        ),
+    )
+    tool_input, _ = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="s",
+        messages=[Message(role="user", content="triage these")],
+        tool_name="return_TitleTriageResponse",
+        tool_description="d",
+        tool_input_schema={},
+        purpose="triage",
+    )
+    assert tool_input == {"verdicts": [{"id": 1, "promising": False, "confidence": 85}]}
+
+
+async def test_mock_prose_xml_preserves_value_types() -> None:
+    """``string="true"`` is a raw string; everything else is JSON. A bool must
+    not arrive as the string "true" — that is how a wrong tag gets written."""
+    client = MockLLMClient()
+    client.register(
+        "tag",
+        prose_xml_tool_call(
+            "return_QualificationTags", is_us=True, us_confidence=100, role_family="engineering"
+        ),
+    )
+    tool_input, _ = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="s",
+        messages=[Message(role="user", content="tag this")],
+        tool_name="return_QualificationTags",
+        tool_description="d",
+        tool_input_schema={},
+        purpose="tag",
+    )
+    assert tool_input == {"is_us": True, "us_confidence": 100, "role_family": "engineering"}
+
+
+async def test_mock_still_raises_on_prose_that_is_not_a_tool_call() -> None:
+    """Genuine prose keeps the original failure shape — salvage must not turn
+    every unparseable script into a silent success."""
+    client = MockLLMClient()
+    client.register("triage", "I'm sorry, I can't help with that.")
+    with pytest.raises(MissingToolCallError):
+        await client.complete_tool_use(
+            model="claude-haiku-4-5",
+            system="s",
+            messages=[Message(role="user", content="triage these")],
+            tool_name="return_TitleTriageResponse",
+            tool_description="d",
+            tool_input_schema={},
+            purpose="triage",
+        )
