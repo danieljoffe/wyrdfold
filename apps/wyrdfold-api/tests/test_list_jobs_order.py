@@ -21,6 +21,7 @@ from app.routers.jobs import (
     _list_jobs_for_target_rpc,
     _list_jobs_for_target_two_query,
 )
+from tests.support.fake_supabase import two_query_supabase
 
 
 class _Resp:
@@ -657,7 +658,12 @@ async def test_two_query_pending_sorts_by_recency_not_keyword_score(
 
 
 def _company_rows(companies: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """(scores rows, jobs rows) for one posting per company name."""
+    """(scores rows, jobs rows) for one posting per company name.
+
+    The scores rows carry the ``jobs`` embed because the candidate window is
+    ordered THROUGH it (#813) and the page then preserves that order (#815) —
+    so the embed is what decides the result, not a Python re-sort.
+    """
     ts_rows = [
         {
             "job_posting_id": f"j{i}",
@@ -665,8 +671,9 @@ def _company_rows(companies: list[str]) -> tuple[list[dict[str, Any]], list[dict
             "score_breakdown": {},
             "scoring_status": "complete",
             "fit_reasoning": "graded match",
+            "jobs": {"id": f"j{i}", "title": "engineer", "company_name": name},
         }
-        for i, _ in enumerate(companies)
+        for i, name in enumerate(companies)
     ]
     jobs_rows = [
         {"id": f"j{i}", "title": "engineer", "company_name": name}
@@ -705,9 +712,10 @@ async def test_company_sort_pages_collate_like_postgres_not_codepoint() -> None:
     """
     companies = ["Verkada", "abridge", "Accenture", "aim", "Virtu Financial"]
     ts_rows, jobs_rows = _company_rows(companies)
-    sb = _supabase_with(
-        {"scores": _Resp(ts_rows, count=len(ts_rows)), "jobs": _Resp(jobs_rows)}
-    )
+    # The SHARED fake, which collates text the way Postgres does. The local
+    # ``_Chain`` stub treats ``.order()``/``.range()`` as no-ops, so it would
+    # hand the code an order production never returns and bless it (#815).
+    sb = two_query_supabase(ts_rows, {r["id"]: r for r in jobs_rows})
 
     page1 = await _company_page(sb, cursor={}, page_size=2)
     page2 = await _company_page(sb, cursor=_decode_cursor(page1["next_cursor"]), page_size=2)
@@ -801,3 +809,27 @@ async def test_created_at_keyset_cursor_reads_the_renamed_column() -> None:
     )
     assert captured["params"]["p_after_value"] == "2026-06-29T00:00:00+00:00"
     assert captured["params"]["p_after_id"] == "j1"
+
+
+async def test_both_rpcs_refuse_the_posted_at_sort() -> None:
+    """Neither RPC knows ``posted_at``.
+
+    Their SQL maps the sort token through a CASE whose ELSE branch is
+    ``score``, so an unrecognised token does NOT error — it silently serves a
+    score-ordered page under a Posted heading. The guard has to be explicit.
+    """
+    from app.routers.jobs import _list_jobs_across_user_targets_rpc
+
+    sb = _rpc_supabase([], {})
+    with pytest.raises(RuntimeError):
+        await _list_jobs_for_target_rpc(
+            sb, target_id="t-1", page_size=2, sort="posted_at", ascending=False,
+            min_score=None, status=None, company=None, search=None,
+            exclude_terms=[], only_terms=[], cursor={},
+        )
+    with pytest.raises(RuntimeError):
+        await _list_jobs_across_user_targets_rpc(
+            sb, user_target_ids={"t-1"}, page_size=2, sort="posted_at",
+            ascending=False, min_score=None, status=None, company=None,
+            search=None, cursor={},
+        )

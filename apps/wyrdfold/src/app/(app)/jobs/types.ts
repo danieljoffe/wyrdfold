@@ -151,9 +151,16 @@ export interface JobsFilterState {
   country: string; // '' | ISO country code
 }
 
-/** Wire sort tokens. 'created_at' is kept for URL/param stability and sorts
- * the renamed cataloged_at column server-side (R2). */
-export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';
+/** Wire sort tokens.
+ *
+ * 'posted_at' sorts the PROVIDER'S date (``source_posted_at``) — what the
+ * Posted column shows — with the listings that carry none sorted last.
+ *
+ * 'created_at' is kept for URL/param stability and sorts the renamed
+ * cataloged_at column server-side (R2): when WE catalogued the listing, which
+ * is a different question and no longer what the Posted column asks. */
+export type JobsSortColumn =
+  'score' | 'posted_at' | 'created_at' | 'company_name' | 'title';
 
 interface SkillMatch {
   name: string;
@@ -398,9 +405,29 @@ export interface ResumeVersionsResponse {
   cap: number;
 }
 
-/** The date a card shows as "Posted": the provider's own date when known,
- * else when we cataloged the listing (R2 two-timestamp model). */
+/** The date a card shows as "Posted" — the PROVIDER'S own date, or null.
+ *
+ * Null when the ATS gave us none (~4% of live listings). It stays null rather
+ * than falling back to our catalog date: "Posted" is a claim about the
+ * employer's board, and quietly substituting the day WE happened to find the
+ * listing misattributes our number to them. Callers render null as an em dash
+ * (``timeAgo`` already does), and the Posted sort puts those rows last.
+ *
+ * For the freshness the SCORE was decayed against, use
+ * {@link freshnessAnchorAt} — the two are different questions and the server
+ * answers them differently. */
 export function postedAt(job: {
+  source_posted_at: string | null;
+}): string | null {
+  return job.source_posted_at;
+}
+
+/** The date the server's recency decay ages a score against: the provider's
+ * date when known, else when we cataloged the listing (R2 two-timestamp
+ * model). Mirrors ``source_posted_at or cataloged_at`` in the API's
+ * ``_display_sort_value`` / ``recency.py`` — keep the two in step, or the
+ * panel's "aged N days" stops explaining the number on the card. */
+export function freshnessAnchorAt(job: {
   source_posted_at: string | null;
   cataloged_at: string;
 }): string {

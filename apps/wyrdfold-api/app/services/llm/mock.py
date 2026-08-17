@@ -28,6 +28,7 @@ from app.models.llm import (
     ModelId,
 )
 from app.services.llm.errors import MissingToolCallError
+from app.services.llm.openrouter_client import _parse_prose_tool_call
 from app.services.llm.pricing import calculate_cost
 
 
@@ -491,6 +492,27 @@ def prose_skills_extraction_json() -> str:
     )
 
 
+def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
+    """Script the deepseek failure from #821: the forced tool call written as
+    Anthropic XML inside ``content`` instead of a structured ``tool_calls``.
+
+    Values are rendered as JSON unless they are already plain strings, matching
+    the ``string="true"`` flag the model sets. Scripted onto any purpose, this
+    lets a surface prove it RECOVERS the answer rather than deferring — the
+    real client salvages these, and 88 of them landed in one prod window.
+    """
+    lines = [f'<invoke name="{tool_name}">']
+    for name, value in params.items():
+        if isinstance(value, str):
+            lines.append(f'<parameter name="{name}" string="true">{value}</parameter>')
+        else:
+            lines.append(
+                f'<parameter name="{name}" string="false">{json.dumps(value)}</parameter>'
+            )
+    lines.append("</invoke>")
+    return "\n".join(lines)
+
+
 def conversation_recap_echo_json(recap: str) -> str:
     """A schema-VALID ``LLMTurnResponse`` whose ``prose_append`` restates a
     block that is already in the prose doc verbatim.
@@ -665,13 +687,22 @@ class MockLLMClient:
         # emitting the forced tool call (the deepseek 2026-08-05 flake) —
         # raise the same typed error the real parser does so downstream
         # surfaces inherit the exact failure shape from the bug corpus.
+        #
+        # …unless the prose IS the tool call in Anthropic's XML syntax, which
+        # deepseek emits constantly (#821: 88 occurrences in one 16h prod
+        # window). The real client salvages those, so the mock must too — and
+        # it calls the SAME parser rather than reimplementing it, or the bug
+        # corpus would drift from the behaviour it is meant to pin.
         try:
             tool_input = json.loads(response_text)
         except json.JSONDecodeError as exc:
-            raise MissingToolCallError(
-                f"Expected a forced tool_call for {tool_name!r}, got prose "
-                f"content={response_text[:200]!r}"
-            ) from exc
+            salvaged = _parse_prose_tool_call(response_text, tool_name=tool_name)
+            if salvaged is None:
+                raise MissingToolCallError(
+                    f"Expected a forced tool_call for {tool_name!r}, got prose "
+                    f"content={response_text[:200]!r}"
+                ) from exc
+            tool_input = salvaged
         if not isinstance(tool_input, dict):
             raise ValueError(
                 f"Scripted response for {purpose!r} must decode to a JSON object, "

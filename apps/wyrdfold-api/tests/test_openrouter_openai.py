@@ -490,3 +490,110 @@ async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
     with pytest.raises(ValueError, match="not valid JSON"):
         await _call(client)
     assert len(fake.posted) == 1
+
+
+# ---- Salvaging a tool call the model wrote as XML prose (#821) --------------
+#
+# DeepSeek answers a forced tool call by writing Anthropic's XML invocation
+# syntax into ``content`` instead of emitting ``tool_calls``. Prod logged 88 of
+# these in one 16h window — EVERY one with ``finish_reason='stop'``, i.e. a
+# complete answer we were throwing away, retrying at full cost, and losing
+# anyway when the retry reproduced it (21 of 25 distinct titles recurred).
+#
+# The payloads below are the real logged ones.
+
+_REAL_TRIAGE_CONTENT = (
+    '<invoke name="return_TitleTriageResponse">\n'
+    '<parameter name="verdicts" string="false">'
+    '[{"id": 1, "promising": false, "confidence": 85, "title_prefix": "Data Scientist – Cyber"}]'
+    "</parameter>\n</invoke>"
+)
+_REAL_TAGS_CONTENT = (
+    '<invoke name="return_QualificationTags">\n'
+    '<parameter name="is_us" string="false">true</parameter>\n'
+    '<parameter name="us_confidence" string="false">100</parameter>\n'
+    '<parameter name="role_family" string="true">engineering</parameter>\n'
+    "</invoke>"
+)
+
+
+def test_prose_tool_call_is_salvaged_not_discarded() -> None:
+    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
+    out = _parse_openai_tool_response(
+        data, tool_name="return_TitleTriageResponse", max_tokens=1000
+    )
+    assert out == {
+        "verdicts": [
+            {"id": 1, "promising": False, "confidence": 85, "title_prefix": "Data Scientist – Cyber"}
+        ]
+    }
+
+
+def test_prose_salvage_decodes_json_and_string_parameters() -> None:
+    """``string="true"`` marks a raw string; anything else is JSON — so
+    ``true``/``100`` must not come back as the strings "true"/"100"."""
+    data = _resp([], finish="stop", content=_REAL_TAGS_CONTENT)
+    out = _parse_openai_tool_response(
+        data, tool_name="return_QualificationTags", max_tokens=1000
+    )
+    assert out == {"is_us": True, "us_confidence": 100, "role_family": "engineering"}
+
+
+def test_prose_salvage_refuses_a_truncated_block() -> None:
+    """No closing ``</invoke>`` ⇒ the response was cut off. Refuse.
+
+    QualificationTags has a default for EVERY field plus a tolerate-malformed
+    pass, so a partial dict would validate silently and write a confidently
+    wrong tag. Better to raise and let the retry/fallback run.
+    """
+    truncated = _REAL_TAGS_CONTENT[: _REAL_TAGS_CONTENT.index("<parameter name=\"role_family\"")]
+    data = _resp([], finish="stop", content=truncated)
+    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+        _parse_openai_tool_response(
+            data, tool_name="return_QualificationTags", max_tokens=1000
+        )
+
+
+def test_prose_salvage_refuses_when_a_parameter_failed_to_parse() -> None:
+    """A ``<parameter`` that opened but never closed must not be silently
+    dropped from an otherwise-complete block."""
+    content = (
+        '<invoke name="return_QualificationTags">\n'
+        '<parameter name="is_us" string="false">true</parameter>\n'
+        '<parameter name="role_family" string="true">engineering\n'
+        "</invoke>"
+    )
+    data = _resp([], finish="stop", content=content)
+    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+        _parse_openai_tool_response(
+            data, tool_name="return_QualificationTags", max_tokens=1000
+        )
+
+
+def test_prose_salvage_refuses_a_different_tools_payload() -> None:
+    """The block names another tool — accepting it would answer the wrong
+    question with a well-formed dict."""
+    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
+    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+        _parse_openai_tool_response(
+            data, tool_name="return_QualificationTags", max_tokens=1000
+        )
+
+
+def test_plain_prose_refusal_still_raises() -> None:
+    """No XML at all — the original behaviour is untouched."""
+    data = _resp([], finish="stop", content="I can't help with that")
+    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+        _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+
+
+def test_structured_tool_calls_still_win_over_content() -> None:
+    """Salvage is a fallback, never a preference: a real tool_call must be used
+    even when the model also echoed XML into content."""
+    data = _resp(
+        _tool_calls('{"verdicts": [{"id": 9}]}'),
+        finish="tool_calls",
+        content=_REAL_TRIAGE_CONTENT,
+    )
+    out = _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert out == {"verdicts": [{"id": 9}]}

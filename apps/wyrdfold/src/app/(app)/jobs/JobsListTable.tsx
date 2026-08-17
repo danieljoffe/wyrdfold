@@ -49,7 +49,7 @@ const COLUMNS: { key: JobsSortColumn; label: string }[] = [
   { key: 'score', label: 'Score' },
   { key: 'title', label: 'Title' },
   { key: 'company_name', label: 'Company' },
-  { key: 'created_at', label: 'Posted' },
+  { key: 'posted_at', label: 'Posted' },
 ];
 
 export default function JobsListTable({

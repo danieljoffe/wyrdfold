@@ -489,10 +489,80 @@ describe('JobsListTable — keyboard selection', () => {
     const user = userEvent.setup();
     renderRow(() => undefined);
 
-    const row = screen.getByRole('row', { name: /senior frontend engineer at acme/i });
+    const row = screen.getByRole('row', {
+      name: /senior frontend engineer at acme/i,
+    });
     row.focus();
     await user.keyboard(' ');
 
-    expect(await screen.findByTestId('job-detail-panel-stub')).toBeInTheDocument();
+    expect(
+      await screen.findByTestId('job-detail-panel-stub')
+    ).toBeInTheDocument();
+  });
+});
+
+describe('JobsListTable Posted column', () => {
+  // ── The Posted column (#815 follow-up) ───────────────────────────────────
+  // The column shows the PROVIDER'S date. ~4% of live listings carry none, and
+  // those used to silently render OUR catalog date under a "Posted" heading —
+  // misattributing our number to the employer.
+
+  it('shows the provider posted date, not our catalog date', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({
+            source_posted_at: new Date(Date.now() - 3 * 86400000).toISOString(),
+            cataloged_at: new Date(Date.now() - 90 * 86400000).toISOString(),
+          }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByText('3d ago')).toBeInTheDocument();
+    expect(screen.queryByText('90d ago')).not.toBeInTheDocument();
+  });
+
+  it('shows an em dash when the ATS gave no posted date', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({
+            source_posted_at: null,
+            cataloged_at: new Date(Date.now() - 2 * 86400000).toISOString(),
+          }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    // Other cells (salary, location) render an em dash too, so assert on the
+    // load-bearing half: our catalog date must not appear under "Posted".
+    expect(screen.getAllByText('\u2014').length).toBeGreaterThan(0);
+    expect(screen.queryByText('2d ago')).not.toBeInTheDocument();
+  });
+
+  it('sorts the Posted column by the provider date token', async () => {
+    const calls: string[] = [];
+    const user = userEvent.setup();
+    render(
+      <JobsListTable
+        {...baseProps}
+        handleSort={(col: JobsSortColumn) => calls.push(col)}
+        postings={[makeJob()]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    await user.click(screen.getByRole('button', { name: /posted/i }));
+    // 'created_at' would sort by when WE catalogued it — a different date
+    // from the one this column renders.
+    expect(calls).toEqual(['posted_at']);
   });
 });

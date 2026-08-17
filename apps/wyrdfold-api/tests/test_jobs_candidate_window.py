@@ -257,3 +257,147 @@ async def test_window_ordering_matches_the_python_ranking_it_feeds() -> None:
     # Graded first even though the Pending placeholder is far higher — the same
     # tier split the candidate window draws with ``is_graded``.
     assert [r["job_posting_id"] for r in ranked] == ["g-lo", "p-hi"]
+
+
+# ── The window's order IS the list's order (#815) ───────────────────────────
+# Postgres and Python do not collate text the same way: glibc ignores leading
+# punctuation at the primary level, Python's codepoint order does not. So the
+# two-query path re-sorting the window in Python meant `/jobs?sort=title`
+# ordered differently depending only on whether a chip forced this path instead
+# of the RPC. Measured on prod (title ASC, 1,000-row window): the two agreed for
+# 21 rows, then `.NET & React Full Stack Developer` and `(1508) Senior
+# Fullstack Engineer` swapped.
+#
+# `__db_order` pins the order Postgres returns — the thing Python can't
+# reproduce, and without which the fake would agree with the old code by
+# construction.
+
+
+def _collation_rows() -> list[dict[str, Any]]:
+    """Titles whose Postgres order is NOT any Python sort of the same values."""
+    titles = [
+        ".NET & React Full Stack Developer",       # glibc: punctuation ignored
+        "(1508) Senior Fullstack Engineer",
+        "abridge Platform Engineer",
+        "Accenture Delivery Engineer",
+    ]
+    rows = []
+    for i, title in enumerate(titles):
+        row = _score_row(f"j{i}", score=50, graded=True, first_seen="2026-07-01", title=title)
+        row["__db_order"] = i          # the DB's collation order
+        rows.append(row)
+    return rows
+
+
+async def test_title_sort_preserves_the_windows_order_not_pythons() -> None:
+    """The page must come out in the order the DB returned, byte for byte."""
+    rows = _collation_rows()
+    db_order = [r["jobs"]["title"] for r in rows]
+    # Python would order these differently — that is the whole point.
+    assert sorted(db_order, key=str.casefold) != db_order
+
+    result = await _list(_supabase(rows), sort="title", ascending=True, page_size=10)
+
+    assert [p["title"] for p in result["postings"]] == db_order
+
+
+async def test_window_order_survives_a_post_fetch_filter_dropping_rows() -> None:
+    """Post-fetch filters only DROP rows, so the surviving order still holds —
+    this is what makes preserving the window index safe."""
+    rows = _collation_rows()
+    sb = _supabase(rows)
+    result = await _list(
+        sb, sort="title", ascending=True, page_size=10, only_terms=["remote"]
+    )
+    kept = [p["title"] for p in result["postings"]]
+    expected = [r["jobs"]["title"] for r in rows if r["jobs"]["title"] in kept]
+    assert kept == expected
+
+
+async def test_archived_view_still_sorts_in_python() -> None:
+    """The archived view selects without the jobs embed, so its window can only
+    be ordered by id — there the Python key IS the sort, and must stay."""
+    rows = [
+        _score_row("j0", score=50, graded=True, first_seen="2026-07-01", company="Zeta"),
+        _score_row("j1", score=50, graded=True, first_seen="2026-07-01", company="alpha"),
+    ]
+    for r in rows:
+        r.pop("jobs")  # archived view: no embed
+    # ``archived_at`` is what makes _fetch_jobs_chunked keep a row in the
+    # archived view — it overwrites ``status`` from user_jobs, so the flag on
+    # the posting is what counts (the 30d sweep's output, UX/IA §5 Stage 1).
+    postings = {
+        "j0": {"id": "j0", "title": "a", "company_name": "Zeta",
+               "archived_at": "2026-07-20T00:00:00+00:00"},
+        "j1": {"id": "j1", "title": "b", "company_name": "alpha",
+               "archived_at": "2026-07-21T00:00:00+00:00"},
+    }
+    sb = two_query_supabase(rows, postings)
+    result = await _list_jobs_for_target_two_query(
+        sb, target_id="t-1", cursor={}, page_size=10, sort="company_name",
+        ascending=True, min_score=None, status="archived", company=None,
+        search=None, exclude_terms=[], only_terms=[],
+    )
+    # casefold order: alpha before Zeta (codepoint order would invert it).
+    assert [p["company_name"] for p in result["postings"]] == ["alpha", "Zeta"]
+
+
+# ── The Posted sort orders the PROVIDER'S date, nulls last ──────────────────
+# The column displays ``source_posted_at`` (the employer's own date) but the
+# sort keyed on ``cataloged_at`` (when WE catalogued the listing). Measured on
+# prod: sorting Posted descending, 281 of 999 adjacent pairs were out of order
+# by the date on screen, and page 1 read 07-30, 08-03, 08-14, 02-10, 08-11.
+#
+# ~4% of live listings carry no provider date. Those sort LAST in BOTH
+# directions — "unknown" must not lead the list just because the arrow flipped.
+
+
+def _posted_row(jid: str, *, posted: str | None, cataloged: str) -> dict[str, Any]:
+    row = _score_row(jid, score=50, graded=True, first_seen=cataloged)
+    row["jobs"]["source_posted_at"] = posted
+    row["jobs"]["cataloged_at"] = cataloged
+    return row
+
+
+def _posted_supabase(rows: list[dict[str, Any]]) -> Any:
+    postings = {}
+    for r in rows:
+        p = _posting(r)
+        p["source_posted_at"] = r["jobs"]["source_posted_at"]
+        p["cataloged_at"] = r["jobs"]["cataloged_at"]
+        postings[r["job_posting_id"]] = p
+    return two_query_supabase(rows, postings)
+
+
+def _posted_fixture() -> list[dict[str, Any]]:
+    """Catalogue order deliberately disagrees with posted order — the exact
+    shape that made the column look scrambled."""
+    return [
+        _posted_row("newest", posted="2026-08-16", cataloged="2026-08-01"),
+        _posted_row("middle", posted="2026-06-01", cataloged="2026-08-17"),
+        _posted_row("oldest", posted="2026-02-10", cataloged="2026-08-10"),
+        _posted_row("unknown", posted=None, cataloged="2026-08-15"),
+    ]
+
+
+async def test_posted_sort_orders_by_the_provider_date_not_our_catalog_date() -> None:
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", page_size=10)
+    # Catalogue order would be: middle, unknown, oldest, newest — nothing like it.
+    assert [p["id"] for p in result["postings"]][:3] == ["newest", "middle", "oldest"]
+
+
+async def test_posted_sort_puts_undated_listings_last_descending() -> None:
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", ascending=False, page_size=10)
+    assert [p["id"] for p in result["postings"]][-1] == "unknown"
+
+
+async def test_posted_sort_puts_undated_listings_last_ascending_too() -> None:
+    """The direction flips the dates, never the unknowns — an empty value is
+    not "oldest", and a user reversing the sort must not land on 700 blanks."""
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", ascending=True, page_size=10)
+    ids = [p["id"] for p in result["postings"]]
+    assert ids[0] == "oldest", ids
+    assert ids[-1] == "unknown", ids

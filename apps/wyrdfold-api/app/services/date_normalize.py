@@ -101,6 +101,25 @@ def _from_relative(raw: str) -> datetime | None:
     return None
 
 
+# A posted date outside this window is a parse artefact, not data. The epoch
+# path already bounded itself; the ISO path did not, so prod carries live jobs
+# "posted" on 1761-07-22 and 1781-02-02 (six rows, found 2026-08-17). Those are
+# not harmless: the value is what the list SHOWS as "Posted", what the Posted
+# sort orders by, and what the recency decay ages the score against — a job
+# dated 1761 is permanently decayed to the floor.
+#
+# The floor is deliberately loose (2000, matching ``_MIN_EPOCH_S``) so a
+# genuinely long-open req from years back survives; only clear garbage is cut.
+# The ceiling is tight, because a listing cannot be posted in the future — two
+# days absorbs clock skew and timezone sloppiness at the source.
+_MIN_POSTED = datetime(2000, 1, 1, tzinfo=UTC)
+_MAX_POSTED_SKEW = timedelta(days=2)
+
+
+def _plausible(parsed: datetime) -> bool:
+    return _MIN_POSTED <= parsed <= datetime.now(UTC) + _MAX_POSTED_SKEW
+
+
 def normalize_posted_at(raw: object) -> str | None:
     """Coerce an ATS posting date into an ISO-8601 UTC string or ``None``.
 
@@ -117,7 +136,7 @@ def normalize_posted_at(raw: object) -> str | None:
     # A datetime already in hand (a fetcher could pass one through).
     if isinstance(raw, datetime):
         dt = raw if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
-        return dt.astimezone(UTC).isoformat()
+        return dt.astimezone(UTC).isoformat() if _plausible(dt) else None
 
     text = str(raw).strip()
     if not text:
@@ -126,6 +145,6 @@ def normalize_posted_at(raw: object) -> str | None:
     # Order matters: try ISO first (the common, cheap case), then epoch,
     # then the relative phrasings.
     parsed = _from_iso(text) or _from_epoch(text) or _from_relative(text)
-    if parsed is None:
+    if parsed is None or not _plausible(parsed):
         return None
     return parsed.astimezone(UTC).isoformat()
