@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import logging
 import time
 from collections.abc import Callable, Coroutine
@@ -83,7 +84,7 @@ from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
-from app.services.workday import fetch_workday_jobs
+from app.services.workday import KnownPosting, fetch_workday_jobs
 from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
@@ -1445,6 +1446,28 @@ async def _resolve_payer_client(
     return cache[payer_user_id]
 
 
+
+async def _call_fetcher(
+    fetcher: Any,
+    board_token: str,
+    known_postings: dict[str, KnownPosting],
+    admissible: Callable[[str, str | None], bool],
+) -> list[StandardJob]:
+    """Call a provider fetcher, handing Workday what we already hold.
+
+    Only Workday needs it — every other provider returns content in its list
+    call, so there is no per-posting request to skip. Signature-sniffed rather
+    than branched on the provider string so a fetcher that grows the parameter
+    picks it up without another edit here.
+    """
+    params = inspect.signature(fetcher).parameters
+    extra: dict[str, Any] = {}
+    if known_postings and "known" in params:
+        extra["known"] = known_postings
+    if "admissible" in params:
+        extra["admissible"] = admissible
+    return cast(list[StandardJob], await fetcher(board_token, **extra))
+
 async def _poll_one_source(
     source: dict[str, Any],
     supabase: AsyncClient,
@@ -1493,17 +1516,62 @@ async def _poll_one_source(
             summary["error"] = f"{company_name}: unknown provider '{provider}'"
             return summary
 
-        jobs = await fetcher(board_token)
+        # What we already hold for this source, read BEFORE the fetch so
+        # Workday can skip the per-posting detail request for postings whose
+        # list entry is unchanged. Cheap columns only, and a failure here just
+        # means every detail is fetched — today's behaviour.
+        # Targets are normally resolved once per cycle by the caller; the
+        # fallback keeps direct/legacy callers working. Resolved BEFORE the
+        # fetch so Workday can apply the free gates to its list entries and
+        # skip the detail request for postings we would only drop.
+        if active_targets is None:
+            active_targets = await _active_targets(supabase)
+
+        def _admissible(title: str, location: str | None) -> bool:
+            """The two FREE gates, judged on a provider's list entry. Mirrors
+            the row-build loop below — keep them in step, or a posting gets
+            skipped here that the loop would have kept."""
+            return _title_matches_any_target(title, active_targets or []) and _is_us_location(
+                location
+            )
+
+        known_postings: dict[str, KnownPosting] = {}
+        if provider == "workday":
+            try:
+                pre_resp = await poll_db_read(
+                    supabase,
+                    lambda c: (
+                        c.table("jobs")
+                        .select("external_id, title, source_posted_at")
+                        .eq("source_id", source_id)
+                        .is_("archived_at", "null")
+                    ),
+                    label=f"poll known postings {company_name}",
+                    retry_sync=True,
+                )
+                known_postings = {
+                    str(r["external_id"]): KnownPosting(
+                        title=r.get("title"), posted_at_stored=r.get("source_posted_at")
+                    )
+                    for r in cast(list[dict[str, Any]], pre_resp.data or [])
+                    if r.get("external_id")
+                }
+            except Exception:
+                logger.warning(
+                    "poll %s: known-postings read failed; fetching every detail",
+                    company_name,
+                    exc_info=True,
+                )
+
+        jobs = await _call_fetcher(fetcher, board_token, known_postings, _admissible)
         summary["polled"] = True
 
         # Collect ALL external IDs from the API (before title/location filtering)
         # so we don't archive jobs that exist on the board but don't match filters.
         all_external_ids: set[str] = {job.external_id for job in jobs}
 
-        # Targets are normally resolved once per cycle by the caller; the
-        # fallback keeps direct/legacy callers working.
-        if active_targets is None:
-            active_targets = await _active_targets(supabase)
+        # (Targets were resolved above, before the fetch, so the free gates
+        # could be handed to the provider.)
 
         # Existing rows are needed in three places: skipping Phase 1
         # triage for already-known jobs, the (company, title) dedupe, and
@@ -1811,6 +1879,13 @@ async def _poll_one_source(
             # (JD edits, the escaped-HTML heal, salary re-extraction).
             if job.external_id not in known_external_ids and not _any_target_admits(idx + 1):
                 dropped_phase1 += 1
+                continue
+
+            if job.detail_skipped:
+                # Held unchanged, detail deliberately not fetched — ``content``
+                # is empty, so building a row here would blank the stored
+                # description. It stays in ``all_external_ids`` above, so the
+                # stale-archive pass still counts it as seen.
                 continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
@@ -3019,7 +3094,47 @@ async def _poll_one_source_for_target(
             summary["error"] = f"{company_name}: unknown provider '{provider}'"
             return summary
 
-        jobs = await fetcher(board_token)
+        # What we already hold for this source, read BEFORE the fetch so
+        # Workday can skip the per-posting detail request for postings whose
+        # list entry is unchanged. Cheap columns only, and a failure here just
+        # means every detail is fetched — today's behaviour.
+        # This path polls for ONE target, so the free gates judge against it
+        # alone. Applied to the provider's LIST entries so Workday can skip
+        # the detail request for postings we would only drop.
+        def _admissible(title: str, location: str | None) -> bool:
+            """Mirrors the row-build loop below — keep them in step, or a
+            posting gets skipped here that the loop would have kept."""
+            return _title_matches_any_target(title, [target]) and _is_us_location(location)
+
+        known_postings: dict[str, KnownPosting] = {}
+        if provider == "workday":
+            try:
+                pre_resp = await poll_db_read(
+                    supabase,
+                    lambda c: (
+                        c.table("jobs")
+                        .select("external_id, title, source_posted_at")
+                        .eq("source_id", source_id)
+                        .is_("archived_at", "null")
+                    ),
+                    label=f"poll known postings {company_name}",
+                    retry_sync=True,
+                )
+                known_postings = {
+                    str(r["external_id"]): KnownPosting(
+                        title=r.get("title"), posted_at_stored=r.get("source_posted_at")
+                    )
+                    for r in cast(list[dict[str, Any]], pre_resp.data or [])
+                    if r.get("external_id")
+                }
+            except Exception:
+                logger.warning(
+                    "poll %s: known-postings read failed; fetching every detail",
+                    company_name,
+                    exc_info=True,
+                )
+
+        jobs = await _call_fetcher(fetcher, board_token, known_postings, _admissible)
         summary["polled"] = True
 
         # #514: this path had no known-row read at all, so already-ingested
@@ -3191,6 +3306,13 @@ async def _poll_one_source_for_target(
                 v = target_verdicts.get(gj)
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
+
+            if job.detail_skipped:
+                # Held unchanged, detail deliberately not fetched — ``content``
+                # is empty, so building a row here would blank the stored
+                # description. It stays in ``all_external_ids`` above, so the
+                # stale-archive pass still counts it as seen.
+                continue
 
             salary = job.salary_text or extract_salary_from_html(job.content)
             loc = parse_location(job.location_name)
