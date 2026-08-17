@@ -401,3 +401,70 @@ async def test_posted_sort_puts_undated_listings_last_ascending_too() -> None:
     ids = [p["id"] for p in result["postings"]]
     assert ids[0] == "oldest", ids
     assert ids[-1] == "unknown", ids
+
+
+# ── Undated listings get their own window (#825) ────────────────────────────
+# They sort last in both directions by design. But the window is bounded, so on
+# a target whose DATED candidates already fill it the undated ones fall outside
+# entirely and become unreachable on this sort rather than merely last — 293
+# such rows on the measured prod target, whose 7,037 candidates overflow a
+# 1,000-row window. Their own window puts them at the tail AND keeps them
+# reachable, exactly like the graded/Pending split.
+
+
+async def test_undated_listings_survive_a_window_full_of_dated_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE prod shape: more dated rows than the window holds, plus a few
+    undated. Before, the undated were simply gone from this sort."""
+    monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 5)
+    dated = [
+        _posted_row(f"d{n:02d}", posted=f"2026-07-{n + 1:02d}", cataloged="2026-08-01")
+        for n in range(12)  # more than twice the window
+    ]
+    undated = [
+        _posted_row(f"u{n}", posted=None, cataloged=f"2026-08-{n + 10:02d}") for n in range(3)
+    ]
+
+    result = await _list(_posted_supabase(dated + undated), sort="posted_at", page_size=20)
+
+    ids = [p["id"] for p in result["postings"]]
+    assert [i for i in ids if i.startswith("u")] == ["u2", "u1", "u0"], f"undated lost: {ids}"
+    # …and still after every dated row, not interleaved.
+    assert ids.index("u0") > max(ids.index(i) for i in ids if i.startswith("d"))
+
+
+async def test_undated_stay_last_when_the_direction_flips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 5)
+    dated = [
+        _posted_row(f"d{n:02d}", posted=f"2026-07-{n + 1:02d}", cataloged="2026-08-01")
+        for n in range(12)
+    ]
+    undated = [_posted_row("u0", posted=None, cataloged="2026-08-10")]
+
+    result = await _list(
+        _posted_supabase(dated + undated), sort="posted_at", ascending=True, page_size=20
+    )
+
+    ids = [p["id"] for p in result["postings"]]
+    assert ids[-1] == "u0", ids
+
+
+async def test_other_sorts_do_not_split_on_the_posted_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split belongs to posted_at alone — a company sort must return each
+    row once, not once per tier."""
+    monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 50)
+    rows = [
+        _posted_row("a", posted="2026-07-01", cataloged="2026-08-01"),
+        _posted_row("b", posted=None, cataloged="2026-08-02"),
+    ]
+    result = await _list(
+        _posted_supabase(rows), sort="company_name", ascending=True, page_size=20
+    )
+    ids = [p["id"] for p in result["postings"]]
+    assert sorted(ids) == ["a", "b"], ids
+    assert len(ids) == len(set(ids))
