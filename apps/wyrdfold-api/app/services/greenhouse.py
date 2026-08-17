@@ -1,7 +1,7 @@
 import html
 import logging
 
-from app.http_client import FetchExhaustedError, request_with_retry
+from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,9 @@ async def fetch_board_jobs(board_token: str) -> list[StandardJob]:
         logger.warning("greenhouse %s returned %d for %s", board_token, resp.status_code, url)
         return []
 
-    data = resp.json()
+    data = json_or_none(resp, source=f"greenhouse {board_token}")
+    if data is None:
+        return []
     jobs: list[StandardJob] = []
     for item in data.get("jobs", []):
         location = item.get("location", {})

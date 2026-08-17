@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.http_client import FetchExhaustedError, request_with_retry
+from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ async def _fetch_one_posting_detail(company_id: str, posting_id: str) -> dict[st
             resp.status_code,
         )
         return None
-    body = resp.json()
+    body = json_or_none(resp, source=f"smartrecruiters detail {url}")
     return body if isinstance(body, dict) else None
 
 
@@ -105,7 +105,9 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
         )
         return []
 
-    data = resp.json()
+    data = json_or_none(resp, source=f"smartrecruiters {company_id}")
+    if data is None:
+        return []
     items = data.get("content", [])
     if not isinstance(items, list):
         return []
