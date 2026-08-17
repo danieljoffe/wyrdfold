@@ -9,6 +9,7 @@ iterate the upsert RESULT, skip the redundant rescore too.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -212,3 +213,106 @@ async def test_total_spend_memoized_within_ttl(monkeypatch) -> None:
     # Day rollover invalidates even within TTL.
     await poller_mod._memoized_total_spend(sb, datetime(2026, 8, 8, tzinfo=UTC))
     assert calls["n"] == 3
+
+
+# ---- a Workday posting whose detail we deliberately skipped ------------------
+#
+# It comes back flagged (``detail_skipped``) with EMPTY content so the fetcher
+# can avoid the per-posting request. Two things must hold in the poller, and
+# both are destructive if they don't:
+#   * it must NOT build an upsert row — writing empty content would blank the
+#     stored description for a live listing;
+#   * it must still count as SEEN, or the stale-archive pass archives it.
+
+
+async def _run_cycle_with(monkeypatch, jobs_returned: list[StandardJob]):
+    from app.services import poller as poller_mod
+    from tests.test_poller import _GUARD_SOURCE, _make_poll_supabase
+
+    existing = [
+        {"id": "job-1", "external_id": "known-1", "title": "Senior Engineer",
+         "company_name": "Acme"}
+    ]
+    supabase, jobs_table, _sources = _make_poll_supabase(existing)
+    jobs_table.select.return_value.eq.return_value.execute.return_value.data = [
+        {"external_id": "known-1", "content_hash": "whatever"}
+    ]
+
+    async def _fetch(_token: str, **_kw) -> list[StandardJob]:
+        return jobs_returned
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", _fetch)
+    monkeypatch.setattr(
+        poller_mod, "_active_targets", AsyncMock(return_value=[_admitting_target()])
+    )
+    monkeypatch.setattr(
+        poller_mod, "_resolve_user_targets_for_stage3", AsyncMock(return_value=({}, {}))
+    )
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=open_gate
+    )
+    summary["_supabase"] = supabase
+    return summary, jobs_table
+
+
+async def test_detail_skipped_posting_never_writes_a_row(monkeypatch) -> None:
+    """Writing it would blank a live listing's stored description."""
+    skipped = StandardJob(
+        external_id="known-1",
+        title="Senior Engineer",
+        location_name="Austin, TX",
+        content="",  # deliberately not fetched
+        posted_at="Posted Today",
+        absolute_url="https://acme.example/job/known-1",
+        detail_skipped=True,
+    )
+    _summary, jobs_table = await _run_cycle_with(monkeypatch, [skipped])
+    if jobs_table.upsert.called:
+        written = jobs_table.upsert.call_args[0][0]
+        assert not any(r["external_id"] == "known-1" for r in written), (
+            "a detail-skipped posting must not be upserted — it would blank "
+            f"the stored description: {written}"
+        )
+
+
+async def test_detail_skipped_posting_is_not_archived_as_stale(monkeypatch) -> None:
+    """It is still on the board; only its detail was skipped.
+
+    Asserts on the REAL mechanism — the ``archive_jobs_by_ids`` RPC — and
+    proves the assertion can fire by running the delisted case alongside it.
+    An earlier version patched a ``_archive_stale`` that does not exist, so it
+    could never have failed.
+    """
+
+    def _held(**over: Any) -> StandardJob:
+        base: dict[str, Any] = {
+            "external_id": "known-1",
+            "title": "Senior Engineer",
+            "location_name": "Austin, TX",
+            "content": "",
+            "posted_at": "Posted Today",
+            "absolute_url": "https://acme.example/job/known-1",
+            "detail_skipped": True,
+        }
+        base.update(over)
+        return StandardJob(**base)  # type: ignore[arg-type]
+
+    def _archive_calls(supabase: MagicMock) -> list[Any]:
+        return [c for c in supabase.rpc.call_args_list if c[0][0] == "archive_jobs_by_ids"]
+
+    # PRECONDITION: a posting that really is gone from the board DOES archive,
+    # so this harness can observe archiving at all.
+    gone = _held(external_id="something-else", detail_skipped=False, content="<p>x</p>")
+    summary_gone, _ = await _run_cycle_with(monkeypatch, [gone])
+    supabase_gone = summary_gone["_supabase"]
+    assert _archive_calls(supabase_gone), (
+        "harness cannot observe archiving — the rest of this test would be vacuous"
+    )
+
+    # THE CASE: skipped-but-present must NOT archive.
+    summary, _ = await _run_cycle_with(monkeypatch, [_held()])
+    assert not _archive_calls(summary["_supabase"]), (
+        "a detail-skipped posting was archived as stale"
+    )
