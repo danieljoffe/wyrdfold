@@ -880,7 +880,7 @@ def _apply_candidate_posting_filters(
 
 
 def _order_candidate_window(
-    query: Any, *, sort: str, ascending: bool, archived_view: bool, graded: bool | None
+    query: Any, *, sort: str, ascending: bool, archived_view: bool, tier: str | None
 ) -> Any:
     """Order the candidate query so its bounded window is the head of the list.
 
@@ -904,13 +904,16 @@ def _order_candidate_window(
     """
     desc = not ascending
     if sort == "score":
-        column = "recency_score" if graded else "job_first_seen_at"
+        column = "recency_score" if tier == "graded" else "job_first_seen_at"
         return query.order(column, desc=desc, nullsfirst=False).order(
             "job_posting_id", desc=desc
         )
     if archived_view:
         return query.order("job_posting_id", desc=desc)
-    return query.order(f"jobs({_sort_row_key(sort)})", desc=desc, nullsfirst=False).order(
+    # The undated tier has no provider date to order by — fall back to when we
+    # catalogued it, which is the only freshness signal those rows carry.
+    column = "cataloged_at" if tier == "undated" else _sort_row_key(sort)
+    return query.order(f"jobs({column})", desc=desc, nullsfirst=False).order(
         "job_posting_id", desc=desc
     )
 
@@ -928,27 +931,50 @@ async def _fetch_candidate_window(
     """Candidate ``scores`` rows for the two-query paths: a bounded window in
     ranking order (see ``_CANDIDATE_WINDOW``).
 
-    ``make_query`` builds a FRESH base query per call — the score sort issues
-    one window per tier (graded / Pending), concurrently, because the two rank
-    on different columns and each needs its own head. Everything else takes a
-    single window.
-    """
+    ``make_query`` builds a FRESH base query per call, because some sorts need
+    MORE THAN ONE window and each needs its own head:
 
-    async def _tier(graded: bool | None) -> list[dict[str, Any]]:
+    - **score** — graded rows rank by ``recency_score``, Pending ones by posted
+      date. One ORDER BY can't express two tiers keyed on different columns.
+    - **posted_at** — a listing with no provider date sorts last in both
+      directions, so on a target whose DATED candidates already fill the window
+      the undated ones fall outside it entirely and become unreachable on this
+      sort, rather than merely last (#825: 293 such rows on the measured
+      target, whose 7,037 candidates overflow a 1,000-row window). Giving them
+      their own window puts them at the tail AND keeps them reachable.
+
+    Everything else takes a single window. The tiers run concurrently, so the
+    extra window costs a round-trip's width, not its latency.
+    """
+    tiers: tuple[str, ...]
+    if sort == "score":
+        tiers = ("graded", "pending")
+    elif sort == "posted_at" and not archived_view:
+        # The archived view selects without the jobs embed, so ``source_posted_at``
+        # isn't reachable to split on — it keeps the single id-ordered window.
+        tiers = ("dated", "undated")
+    else:
+        tiers = ()
+
+    async def _window(tier: str | None) -> list[dict[str, Any]]:
         query = _apply_candidate_posting_filters(
             make_query(), company=company, search=search, archived_view=archived_view
         )
-        if graded is not None:
+        if tier in ("graded", "pending"):
             # ``is_graded`` is the denormalized twin of ``_is_pending``'s
             # axis_scores signal — prod-verified to agree on every row of the
             # measured target (zero rows disagree in either direction).
-            query = query.eq("is_graded", graded)
+            query = query.eq("is_graded", tier == "graded")
+        elif tier == "dated":
+            query = query.not_.is_("jobs.source_posted_at", "null")
+        elif tier == "undated":
+            query = query.is_("jobs.source_posted_at", "null")
         query = _order_candidate_window(
             query,
             sort=sort,
             ascending=ascending,
             archived_view=archived_view,
-            graded=graded,
+            tier=tier,
         ).range(0, _CANDIDATE_WINDOW - 1)
         resp = await execute_with_retry(
             query.execute, label=label, retry_statement_timeout=True
@@ -956,19 +982,21 @@ async def _fetch_candidate_window(
         rows = cast(list[dict[str, Any]], resp.data or [])
         if len(rows) >= _CANDIDATE_WINDOW:
             logger.warning(
-                "candidate window saturated at %d rows (%s, sort=%s, graded=%s): "
+                "candidate window saturated at %d rows (%s, sort=%s, tier=%s): "
                 "matches past the window are not listed",
                 _CANDIDATE_WINDOW,
                 label,
                 sort,
-                graded,
+                tier,
             )
         return rows
 
-    if sort == "score":
-        graded_rows, pending_rows = await asyncio.gather(_tier(True), _tier(False))
-        return [*graded_rows, *pending_rows]
-    return await _tier(None)
+    if not tiers:
+        return await _window(None)
+    # Concatenated in tier order — graded before Pending, dated before undated —
+    # which is the order the ranking below expects to find them in.
+    windows = await asyncio.gather(*(_window(t) for t in tiers))
+    return [row for window in windows for row in window]
 
 
 def _rank_graded_first(
