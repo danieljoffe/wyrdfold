@@ -378,7 +378,7 @@ async def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     # page_size+1 rows come back → there's a next page; the extra row is
     # dropped and the cursor is the last KEPT row's (sort_value, id).
     rows = [
-        {"id": f"j{i}", "score": 100 - i, "created_at": f"2026-06-{30 - i:02d}"}
+        {"id": f"j{i}", "score": 100 - i, "cataloged_at": f"2026-06-{30 - i:02d}"}
         for i in range(3)  # 3 = 2 + 1
     ]
     captured: dict[str, Any] = {}
@@ -407,8 +407,8 @@ async def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
 
 async def test_rpc_keyset_last_page_has_no_cursor() -> None:
     rows = [
-        {"id": "j0", "score": 100, "created_at": "2026-06-30"},
-        {"id": "j1", "score": 99, "created_at": "2026-06-29"},  # exactly page_size
+        {"id": "j0", "score": 100, "cataloged_at": "2026-06-30"},
+        {"id": "j1", "score": 99, "cataloged_at": "2026-06-29"},  # exactly page_size
     ]
     sb = _rpc_supabase(rows, {})
     result = await _list_jobs_for_target_rpc(
@@ -648,3 +648,156 @@ async def test_two_query_pending_sorts_by_recency_not_keyword_score(
     # graded first (fit score), then Pending newest-first: p-new-lo (07-09) ABOVE
     # p-old-hi (07-01) despite 40 < 90 keyword scores.
     assert [p["id"] for p in result["postings"]] == ["g-hi", "g-lo", "p-new-lo", "p-old-hi"]
+
+
+# ── Load-more continuity (the "sorting breaks when I hit Load more" report) ──
+# The Python-paginated paths re-run the whole query per page and slice by
+# offset, so page N+1 is only correct if the ordering is TOTAL and STABLE.
+# Two ways it wasn't, both of which the user saw as a scrambled second page.
+
+
+def _company_rows(companies: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(scores rows, jobs rows) for one posting per company name."""
+    ts_rows = [
+        {
+            "job_posting_id": f"j{i}",
+            "score": 50,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "fit_reasoning": "graded match",
+        }
+        for i, _ in enumerate(companies)
+    ]
+    jobs_rows = [
+        {"id": f"j{i}", "title": "engineer", "company_name": name}
+        for i, name in enumerate(companies)
+    ]
+    return ts_rows, jobs_rows
+
+
+async def _company_page(
+    sb: MagicMock, *, cursor: dict[str, Any], page_size: int
+) -> dict[str, Any]:
+    return await _list_jobs_for_target_two_query(
+        sb,
+        target_id="t-1",
+        cursor=cursor,
+        page_size=page_size,
+        sort="company_name",
+        ascending=True,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+    )
+
+
+async def test_company_sort_pages_collate_like_postgres_not_codepoint() -> None:
+    """Text sorts must collate the way Postgres does (case-insensitive at the
+    primary level), or paging walks the capitalised names first and then
+    restarts the alphabet at the lowercase ones.
+
+    Measured on prod (target with 18.9k scored rows, company_name ASC): page 1
+    ended at "Verkada" and page 2 opened with "airspace-intelligence.com" —
+    Python's codepoint order puts every 'Z' before every 'a'.
+    """
+    companies = ["Verkada", "abridge", "Accenture", "aim", "Virtu Financial"]
+    ts_rows, jobs_rows = _company_rows(companies)
+    sb = _supabase_with(
+        {"scores": _Resp(ts_rows, count=len(ts_rows)), "jobs": _Resp(jobs_rows)}
+    )
+
+    page1 = await _company_page(sb, cursor={}, page_size=2)
+    page2 = await _company_page(sb, cursor=_decode_cursor(page1["next_cursor"]), page_size=2)
+    page3 = await _company_page(sb, cursor=_decode_cursor(page2["next_cursor"]), page_size=2)
+
+    seen = [p["company_name"] for p in page1["postings"] + page2["postings"] + page3["postings"]]
+    assert seen == ["abridge", "Accenture", "aim", "Verkada", "Virtu Financial"]
+    # The invariant behind it: every page continues where the last one stopped.
+    assert seen == sorted(seen, key=str.casefold)
+    assert page3["next_cursor"] is None
+
+
+async def test_company_sort_pages_stay_contiguous_when_ties_refetch_reordered() -> None:
+    """Equal sort values must not be left in DB-return order.
+
+    Each page is a fresh query, and the chunked ``in_()`` re-fetch has no
+    ORDER BY — so a tie block (one company's whole posting list) can come back
+    in a different order on the page-2 request. Without the id tiebreaker the
+    two pages overlap and drop rows; here they must partition the tie block.
+    """
+    companies = ["Acme"] * 4
+    ts_rows, jobs_rows = _company_rows(companies)
+    # Page 2's request sees the SAME rows in a different (reversed) order —
+    # what an unordered re-fetch is free to return.
+    responses = [_Resp(jobs_rows), _Resp(list(reversed(jobs_rows)))]
+    sb = MagicMock()
+
+    def _table(name: str) -> _Chain:
+        if name == "jobs" and responses:
+            return _Chain(responses.pop(0))
+        if name == "scores":
+            return _Chain(_Resp(ts_rows, count=len(ts_rows)))
+        return _Chain(_Resp([]))
+
+    sb.table.side_effect = _table
+
+    page1 = await _company_page(sb, cursor={}, page_size=2)
+    page2 = await _company_page(sb, cursor=_decode_cursor(page1["next_cursor"]), page_size=2)
+
+    ids = [p["id"] for p in page1["postings"]] + [p["id"] for p in page2["postings"]]
+    assert len(set(ids)) == 4, f"pages overlapped/dropped rows: {ids}"
+    assert sorted(ids) == ["j0", "j1", "j2", "j3"]
+
+
+async def test_created_at_keyset_cursor_reads_the_renamed_column() -> None:
+    """``created_at`` is the wire token; the RPC returns ``cataloged_at``.
+
+    Reading the wire name off the row yielded ``{"v": None}``, and the RPC's
+    keyset predicate is guarded by ``$7 IS NULL OR ...`` — so the next page
+    dropped the predicate and re-served the FIRST page. Load-more appended
+    page 1 to itself indefinitely (reproduced against prod).
+    """
+    rows = [
+        {"id": "j0", "score": 100, "cataloged_at": "2026-06-30T00:00:00+00:00"},
+        {"id": "j1", "score": 99, "cataloged_at": "2026-06-29T00:00:00+00:00"},
+        {"id": "j2", "score": 98, "cataloged_at": "2026-06-28T00:00:00+00:00"},
+    ]
+    captured: dict[str, Any] = {}
+    sb = _rpc_supabase(rows, captured)
+    page1 = await _list_jobs_for_target_rpc(
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor={},
+    )
+    cursor = _decode_cursor(page1["next_cursor"])
+    assert cursor == {"v": "2026-06-29T00:00:00+00:00", "id": "j1"}
+
+    # And it must reach the RPC as a real keyset bound, not NULL.
+    await _list_jobs_for_target_rpc(
+        sb,
+        target_id="t-1",
+        page_size=2,
+        sort="created_at",
+        ascending=False,
+        min_score=None,
+        status=None,
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
+        cursor=cursor,
+    )
+    assert captured["params"]["p_after_value"] == "2026-06-29T00:00:00+00:00"
+    assert captured["params"]["p_after_id"] == "j1"
