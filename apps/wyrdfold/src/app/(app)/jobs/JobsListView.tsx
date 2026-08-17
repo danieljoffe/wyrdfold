@@ -124,6 +124,7 @@ export default function JobsListView({
     order,
     handleSort,
     sortIndicator,
+    nextSortAction,
   } = useAdminTableFetch<JobPosting, JobsSortColumn>({
     endpoint: '/api/jobs',
     defaultSort: 'score',
@@ -194,6 +195,7 @@ export default function JobsListView({
             order={order}
             handleSort={handleSort}
             sortIndicator={sortIndicator}
+            nextSortAction={nextSortAction}
             selectedIds={selectedIds}
             onSelectionChange={onSelectionChange}
             analysisTargetId={analysisTargetId}

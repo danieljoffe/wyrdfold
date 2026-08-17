@@ -35,6 +35,7 @@ interface JobsListTableProps {
   order: 'asc' | 'desc';
   handleSort: (col: JobsSortColumn) => void;
   sortIndicator: (col: JobsSortColumn) => string;
+  nextSortAction: (col: JobsSortColumn) => 'descending' | 'ascending' | 'clear';
   selectedIds: Set<string>;
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
@@ -61,6 +62,7 @@ export default function JobsListTable({
   order: sortOrder,
   handleSort,
   sortIndicator,
+  nextSortAction,
   selectedIds,
   onSelectionChange,
   analysisTargetId,
@@ -192,7 +194,15 @@ export default function JobsListTable({
                     type='button'
                     className='flex items-center gap-1 font-medium text-text-secondary hover:text-text-primary'
                     onClick={() => handleSort(col.key)}
-                    aria-label={`Sort by ${col.label}`}
+                    // The label names what the NEXT click does. A static
+                    // "Sort by Title" hides the cycle, and with three states a
+                    // screen-reader user would have no way to know a third
+                    // click clears the sort.
+                    aria-label={
+                      nextSortAction(col.key) === 'clear'
+                        ? `Clear sort on ${col.label}`
+                        : `Sort by ${col.label} ${nextSortAction(col.key)}`
+                    }
                   >
                     {col.label} {sortIndicator(col.key)}
                   </button>

@@ -33,7 +33,22 @@ FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9
 
 # pandoc is shelled out to by the DOCX render pipeline; the rest of the
 # runtime stays bare (no uv, no apt cache, no monorepo lockfiles).
+#
+# ``apt-get upgrade`` applies Debian's security patches at build time. Pinning
+# the base by digest makes the base reproducible, but it also FREEZES its OS
+# packages at whatever shipped that day — so a CVE fixed in Debian after the
+# digest was cut stays in our image until a new base is published and
+# Dependabot bumps it. That gap is not hypothetical: the util-linux family
+# (bsdutils and siblings) carried CVE-2026-53615 as 9 HIGH findings while
+# Debian had already published the fix in 2.41.5-0+deb13u1, and the image was
+# serving production the whole time.
+#
+# The trade is that this layer floats: same Dockerfile, different packages as
+# Debian publishes fixes. That is the correct direction for a runtime — the
+# BASE stays pinned and reproducible, security patches do not wait on a digest
+# bump.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends pandoc \
     && rm -rf /var/lib/apt/lists/*
 

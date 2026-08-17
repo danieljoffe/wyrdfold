@@ -227,10 +227,15 @@ export default function JobsList({
   );
 
   const onTableSortChange = useCallback(
-    (sort: JobsSortColumn, order: 'asc' | 'desc') => {
+    (sort: JobsSortColumn, order: 'asc' | 'desc', meta?: { reset: boolean }) => {
       // Sort changes create a history entry so back restores the old sort.
       // The hook re-fetches the first page when sort changes.
-      setUrlState({ sort, order }, 'push');
+      //
+      // A CLEARED sort drops the params entirely rather than pinning the
+      // default values. Writing `sort=score&order=desc` would look identical
+      // to the user but leaves a URL that survives a change of default — and
+      // "cleared" should mean "whatever the app ranks by", not "score, frozen".
+      setUrlState(meta?.reset ? { sort: null, order: null } : { sort, order }, 'push');
     },
     [setUrlState]
   );
