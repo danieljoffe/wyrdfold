@@ -340,3 +340,64 @@ async def test_archived_view_still_sorts_in_python() -> None:
     )
     # casefold order: alpha before Zeta (codepoint order would invert it).
     assert [p["company_name"] for p in result["postings"]] == ["alpha", "Zeta"]
+
+
+# ── The Posted sort orders the PROVIDER'S date, nulls last ──────────────────
+# The column displays ``source_posted_at`` (the employer's own date) but the
+# sort keyed on ``cataloged_at`` (when WE catalogued the listing). Measured on
+# prod: sorting Posted descending, 281 of 999 adjacent pairs were out of order
+# by the date on screen, and page 1 read 07-30, 08-03, 08-14, 02-10, 08-11.
+#
+# ~4% of live listings carry no provider date. Those sort LAST in BOTH
+# directions — "unknown" must not lead the list just because the arrow flipped.
+
+
+def _posted_row(jid: str, *, posted: str | None, cataloged: str) -> dict[str, Any]:
+    row = _score_row(jid, score=50, graded=True, first_seen=cataloged)
+    row["jobs"]["source_posted_at"] = posted
+    row["jobs"]["cataloged_at"] = cataloged
+    return row
+
+
+def _posted_supabase(rows: list[dict[str, Any]]) -> Any:
+    postings = {}
+    for r in rows:
+        p = _posting(r)
+        p["source_posted_at"] = r["jobs"]["source_posted_at"]
+        p["cataloged_at"] = r["jobs"]["cataloged_at"]
+        postings[r["job_posting_id"]] = p
+    return two_query_supabase(rows, postings)
+
+
+def _posted_fixture() -> list[dict[str, Any]]:
+    """Catalogue order deliberately disagrees with posted order — the exact
+    shape that made the column look scrambled."""
+    return [
+        _posted_row("newest", posted="2026-08-16", cataloged="2026-08-01"),
+        _posted_row("middle", posted="2026-06-01", cataloged="2026-08-17"),
+        _posted_row("oldest", posted="2026-02-10", cataloged="2026-08-10"),
+        _posted_row("unknown", posted=None, cataloged="2026-08-15"),
+    ]
+
+
+async def test_posted_sort_orders_by_the_provider_date_not_our_catalog_date() -> None:
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", page_size=10)
+    # Catalogue order would be: middle, unknown, oldest, newest — nothing like it.
+    assert [p["id"] for p in result["postings"]][:3] == ["newest", "middle", "oldest"]
+
+
+async def test_posted_sort_puts_undated_listings_last_descending() -> None:
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", ascending=False, page_size=10)
+    assert [p["id"] for p in result["postings"]][-1] == "unknown"
+
+
+async def test_posted_sort_puts_undated_listings_last_ascending_too() -> None:
+    """The direction flips the dates, never the unknowns — an empty value is
+    not "oldest", and a user reversing the sort must not land on 700 blanks."""
+    rows = _posted_fixture()
+    result = await _list(_posted_supabase(rows), sort="posted_at", ascending=True, page_size=10)
+    ids = [p["id"] for p in result["postings"]]
+    assert ids[0] == "oldest", ids
+    assert ids[-1] == "unknown", ids

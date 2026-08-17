@@ -432,7 +432,7 @@ def _decode_cursor(cursor: str | None) -> dict[str, Any]:
 # column (and every row shape built from it — the RPC's RETURNS TABLE, the jobs
 # select) became ``cataloged_at``. Anything that reads the sort value off a row
 # has to go through this map; reading the wire name directly finds nothing.
-_SORT_ROW_KEY = {"created_at": "cataloged_at"}
+_SORT_ROW_KEY = {"created_at": "cataloged_at", "posted_at": "source_posted_at"}
 
 # Sorts whose value is text, and so must be collated the way Postgres collates
 # it rather than by raw codepoint. See ``_python_sort_key``.
@@ -522,6 +522,16 @@ async def _list_jobs_for_target_rpc(
     cursor: dict[str, Any],
     user_id: str | None = None,
 ) -> dict[str, Any]:
+    # Neither RPC knows ``posted_at``: their SQL maps the sort token through a
+    # CASE whose ELSE branch is ``score``, so an unrecognised token does not
+    # error — it silently serves a SCORE-ordered page under a Posted heading.
+    # The Python path also has to put the ~4% of rows with no provider date
+    # LAST in both directions, which a keyset over a nullable column cannot
+    # page through. Both reasons point the same way: use the two-query path.
+    if sort == "posted_at":
+        raise _RpcIneligibleError(
+            "RPC path skipped: posted_at sorts a nullable provider date, nulls last"
+        )
     # The RPC can't apply the post-fetch location filter, so its keyset would
     # walk pre-filter rows and pages would render half-empty. Force the
     # two-query fallback, which filters the full set then paginates.
@@ -1396,7 +1406,18 @@ async def _assemble_jobs_page(
             # The archived view selects without the ``jobs`` embed, so its
             # window could only be ordered by id (see
             # ``_order_candidate_window``) — here the Python key IS the sort.
-            postings.sort(key=_sort_key, reverse=not ascending)
+            #
+            # Rows with no value for the sort column go LAST in BOTH directions,
+            # matching the NULLS LAST the window asks for everywhere else. A
+            # single ``reverse=`` flips the whole key, so the partition has to
+            # happen outside the sort. This is load-bearing for ``posted_at``:
+            # ~4% of listings carry no provider date, and "unknown" must not
+            # lead the list just because the direction flipped.
+            row_key = _sort_row_key(sort)
+            present = [p for p in postings if p.get(row_key) is not None]
+            absent = [p for p in postings if p.get(row_key) is None]
+            present.sort(key=_sort_key, reverse=not ascending)
+            postings = [*present, *absent]
         if total is None:
             total = len(postings)
             postings = postings[offset : offset + page_size]
@@ -1723,6 +1744,16 @@ async def _list_jobs_across_user_targets_rpc(
     custom-weight view uses this fast path instead of the scan-everything
     two-query fallback. Empty/None ⇒ the RPC ranks + returns the raw score
     exactly as before (index-only)."""
+    # Neither RPC knows ``posted_at``: their SQL maps the sort token through a
+    # CASE whose ELSE branch is ``score``, so an unrecognised token does not
+    # error — it silently serves a SCORE-ordered page under a Posted heading.
+    # The Python path also has to put the ~4% of rows with no provider date
+    # LAST in both directions, which a keyset over a nullable column cannot
+    # page through. Both reasons point the same way: use the two-query path.
+    if sort == "posted_at":
+        raise _RpcIneligibleError(
+            "RPC path skipped: posted_at sorts a nullable provider date, nulls last"
+        )
     if search and len(_tokenize_search(search)) > 1:
         raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     offset = _offset_from_cursor(cursor)
@@ -2574,7 +2605,7 @@ async def _list_jobs_operator(
 async def list_jobs(
     cursor: str | None = Query(None),
     page_size: int = Query(20, ge=1, le=100),
-    sort: str = Query("score", pattern="^(score|created_at|company_name|title)$"),
+    sort: str = Query("score", pattern="^(score|created_at|posted_at|company_name|title)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     min_score: int | None = Query(None, ge=0, le=100),
     status: str | None = Query(

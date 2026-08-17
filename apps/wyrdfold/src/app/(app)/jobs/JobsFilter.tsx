@@ -71,14 +71,17 @@ const SORT_LABEL: Record<JobsSortColumn, string> = {
   score: 'Score',
   title: 'Title',
   company_name: 'Company',
-  created_at: 'Posted',
+  posted_at: 'Posted',
+  // Not offered in SORT_COLUMNS — the token stays valid so an old bookmarked
+  // ``?sort=created_at`` still resolves (to our catalog date) instead of 422ing.
+  created_at: 'Added',
 };
 
 const SORT_COLUMNS: JobsSortColumn[] = [
   'score',
   'title',
   'company_name',
-  'created_at',
+  'posted_at',
 ];
 
 interface JobsFilterProps {

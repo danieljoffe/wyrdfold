@@ -809,3 +809,27 @@ async def test_created_at_keyset_cursor_reads_the_renamed_column() -> None:
     )
     assert captured["params"]["p_after_value"] == "2026-06-29T00:00:00+00:00"
     assert captured["params"]["p_after_id"] == "j1"
+
+
+async def test_both_rpcs_refuse_the_posted_at_sort() -> None:
+    """Neither RPC knows ``posted_at``.
+
+    Their SQL maps the sort token through a CASE whose ELSE branch is
+    ``score``, so an unrecognised token does NOT error — it silently serves a
+    score-ordered page under a Posted heading. The guard has to be explicit.
+    """
+    from app.routers.jobs import _list_jobs_across_user_targets_rpc
+
+    sb = _rpc_supabase([], {})
+    with pytest.raises(RuntimeError):
+        await _list_jobs_for_target_rpc(
+            sb, target_id="t-1", page_size=2, sort="posted_at", ascending=False,
+            min_score=None, status=None, company=None, search=None,
+            exclude_terms=[], only_terms=[], cursor={},
+        )
+    with pytest.raises(RuntimeError):
+        await _list_jobs_across_user_targets_rpc(
+            sb, user_target_ids={"t-1"}, page_size=2, sort="posted_at",
+            ascending=False, min_score=None, status=None, company=None,
+            search=None, cursor={},
+        )
