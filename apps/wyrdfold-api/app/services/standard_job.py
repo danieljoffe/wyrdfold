@@ -14,3 +14,10 @@ class StandardJob:
     posted_at: str
     absolute_url: str
     salary_text: str | None = None
+    # True when the provider's per-posting DETAIL fetch was deliberately
+    # skipped because we already hold this posting unchanged (Workday only —
+    # every other provider returns content in its list call). The posting is
+    # still RETURNED so the stale-archive pass counts it as seen; the poller
+    # excludes it from the upsert, because ``content`` is empty and writing it
+    # would blank the stored description.
+    detail_skipped: bool = False
