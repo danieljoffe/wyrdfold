@@ -71,7 +71,8 @@ export function useAdminTableFetch<T, S extends string>({
   const requestRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 
-  const { sort, order, handleSort, sortIndicator } = useTableSort<S>(
+  const { sort, order, handleSort, sortIndicator, nextSortAction } =
+    useTableSort<S>(
     defaultSort,
     (nextSort, nextOrder) => {
       onSortChange?.(nextSort, nextOrder);
@@ -183,6 +184,7 @@ export function useAdminTableFetch<T, S extends string>({
     order,
     handleSort,
     sortIndicator,
+    nextSortAction,
     refetch: fetchFirstPage,
   } as const;
 }

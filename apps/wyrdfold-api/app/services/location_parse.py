@@ -528,6 +528,7 @@ def parse_location(raw: str | None) -> LocationParts:
 # doesn't list yet. Filter-only, never consulted while parsing a location.
 _FILTER_ONLY_ALPHA2: dict[str, str] = {
     "ca": "Canada",
+    "cr": "Costa Rica",
     "in": "India",
     "my": "Malaysia",
     "hu": "Hungary",

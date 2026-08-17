@@ -41,6 +41,7 @@ const baseProps = {
   order: 'desc' as const,
   handleSort: () => undefined,
   sortIndicator: () => '',
+  nextSortAction: () => 'descending' as const,
   analysisTargetId: undefined,
   onRefetch: () => undefined,
 };
