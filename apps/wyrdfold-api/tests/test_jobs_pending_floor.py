@@ -496,6 +496,17 @@ class _LiveJoinRecorder:
     def or_(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
         return self
 
+    def ilike(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        return self
+
+    def order(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        return self
+
+    def range(self, *_a: object, **_k: object) -> _LiveJoinRecorder:
+        # The candidate window (#813). This recorder only asserts the select +
+        # liveness gate, so bounding is a fluent no-op here.
+        return self
+
     @property
     def not_(self) -> _LiveJoinRecorder:
         self._neg = True

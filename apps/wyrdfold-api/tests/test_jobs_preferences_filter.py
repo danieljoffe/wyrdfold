@@ -386,10 +386,34 @@ async def test_cutoff_only_preferences_keep_rpc_fast_path(monkeypatch: Any) -> N
 async def test_integration_cutoff_drops_low_scores() -> None:
     """The score cutoff (folded into ``min_score``) drops jobs below the bar at
     the DB layer — a real filter over the shared cached score, not a re-grade."""
+    # GRADED rows (``axis_scores`` present). The floor only judges rows that
+    # carry a real fit score — ``scoring_status: 'complete'`` alone does NOT
+    # make a row graded (see ``_is_pending``), and ``_apply_score_floor``
+    # exempts ``axis_scores IS NULL`` rows by design (#47). Without the axes
+    # these three would be Pending, i.e. exempt, and the cutoff this test is
+    # about would correctly not apply to them.
     scores = [
-        {"job_posting_id": "hi", "score": 90, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "mid", "score": 55, "score_breakdown": {}, "scoring_status": "complete"},
-        {"job_posting_id": "lo", "score": 20, "score_breakdown": {}, "scoring_status": "complete"},
+        {
+            "job_posting_id": "hi",
+            "score": 90,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 90},
+        },
+        {
+            "job_posting_id": "mid",
+            "score": 55,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 55},
+        },
+        {
+            "job_posting_id": "lo",
+            "score": 20,
+            "score_breakdown": {},
+            "scoring_status": "complete",
+            "axis_scores": {"title_fit": 20},
+        },
     ]
     jobs = {
         "hi": {"id": "hi", "title": "hi", "location": None},
