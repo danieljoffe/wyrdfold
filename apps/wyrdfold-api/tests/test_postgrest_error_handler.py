@@ -146,3 +146,98 @@ def test_57014_maps_to_503_with_retry_after() -> None:
     # No PostgREST internals leak.
     assert "canceling statement" not in res.text
     assert "57014" not in res.text
+
+
+# ---------------------------------------------------------------------------
+# A WAF-blocked request value -> 400, not 5xx (#816).
+#
+# Supabase sits behind Cloudflare. A filter value that reads like an attack —
+# ``?company=' OR 1=1 --`` is enough — is refused at the edge with an HTML
+# block page, so the client raises ``403 / "JSON could not be generated"``
+# instead of a SQLSTATE. That used to become a 500: a server error for a value
+# the perimeter deliberately refused, and a retryable-looking one at that.
+#
+# Reproduced against prod 2026-08-17 (this is the real shape, not a guess):
+#   code=403  message='JSON could not be generated'
+#   details=b'<!DOCTYPE html>... Attention Required! | Cloudflare ...'
+# NOTE: the real page also embeds the CALLER'S IP — hence the leak assertions.
+# ---------------------------------------------------------------------------
+
+_CF_BLOCK_PAGE = (
+    "b'<!DOCTYPE html>\\n<head>\\n<title>Attention Required! | Cloudflare</title>\\n"
+    "</head>\\n<body>\\n<h1 data-translate=\"block_headline\">Sorry, you have been "
+    "blocked</h1>\\n<h2><span>You are unable to access</span> supabase.co</h2>\\n"
+    "<span class=\"cf-footer-item\">Cloudflare Ray ID: "
+    "<strong class=\"font-semibold\">a2cb3ab25f9fae43</strong></span>\\n"
+    "<span class=\"hidden\" id=\"cf-footer-ip\">76.93.69.205</span>\\n</body>'"
+)
+
+
+def _waf_block_error() -> APIError:
+    return APIError(
+        {
+            "message": "JSON could not be generated",
+            "code": 403,
+            "hint": "Refer to full message for details",
+            "details": _CF_BLOCK_PAGE,
+        }
+    )
+
+
+async def _raise_waf_block() -> None:
+    raise _waf_block_error()
+
+
+async def _raise_rls_denied() -> None:
+    # A GENUINE 403 from PostgREST: RLS refused the row. It arrives as JSON
+    # with a SQLSTATE, so it must NOT be mistaken for an edge block.
+    raise _api_error("42501", "new row violates row-level security policy")
+
+
+app.add_api_route("/__test/pg-waf", _raise_waf_block, methods=["GET"])
+app.add_api_route("/__test/pg-rls", _raise_rls_denied, methods=["GET"])
+
+
+def test_waf_block_maps_to_400() -> None:
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get("/__test/pg-waf")
+    assert res.status_code == 400
+    assert "rephrase" in res.json()["detail"].lower()
+
+
+def test_waf_block_400_leaks_neither_the_page_nor_the_caller_ip() -> None:
+    """The block page carries the caller's IP and the whole HTML body. The
+    response must carry neither — the detail is a fixed, generic string."""
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get("/__test/pg-waf")
+    assert "76.93.69.205" not in res.text
+    assert "Cloudflare" not in res.text
+    assert "DOCTYPE" not in res.text
+    assert "supabase.co" not in res.text
+
+
+def test_waf_block_is_not_advertised_as_retryable() -> None:
+    """Retrying a blocked value gets blocked again. 4xx (and no Retry-After)
+    keeps it out of the BFF/RSC 5xx retry path that 500 and 503 both trigger."""
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get("/__test/pg-waf")
+    assert 400 <= res.status_code < 500
+    assert "Retry-After" not in res.headers
+
+
+def test_genuine_403_rls_error_still_500s() -> None:
+    """Both halves of the predicate are load-bearing: an RLS denial is also
+    403, but it arrives as JSON with SQLSTATE 42501 and keeps its handling."""
+    client = TestClient(app, raise_server_exceptions=False)
+    res = client.get("/__test/pg-rls")
+    assert res.status_code == 500
+    assert "row-level security" not in res.text
+
+
+def test_cf_ray_id_is_extracted_for_logs_but_the_ip_is_not() -> None:
+    """The Ray ID is what makes an edge block traceable in Cloudflare's logs;
+    it is safe to log. The IP on the same page is not, and is never parsed."""
+    from app.main import _cf_ray_id
+
+    assert _cf_ray_id(_waf_block_error()) == "a2cb3ab25f9fae43"
+    assert _cf_ray_id(_api_error("22P02", "nothing to see")) is None
