@@ -3,6 +3,81 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-18 — A measurement is a claim: three predicates that each invented a bug
+
+Three separate times in one day a prod query produced an alarming number, and
+all three were the query's fault, not the code's. (1) Ingestion "fell 93%"
+after the catalog-grading change — the windows were US-evening vs US-overnight;
+the same UTC slice two days earlier, **before** the release, was identical
+(weekends run ~4/h against a weekday ~47/h). (2) Salary parsing had "133
+failures" — the test was `salary_min IS NULL`, but `parse_salary_text`
+documents `"up to $X"` as a **MAX-only** bound, so correctly-parsed rows have a
+NULL min; the real corpus-wide failure count is **1**, a typo in an employer's
+own posting. (3) Newly-graded scores "still carried logistics" — counted by
+`updated_at`, which includes OLD rows re-graded; Phase 2 no longer _emits_
+logistics so the upsert doesn't touch that column, and doesn't blank it. On
+`created_at` the count is 0. **Decision:** before reporting a number, state the
+predicate and check it against the code's documented behaviour — `created_at`
+answers "did the new config take", `updated_at` only "was this re-graded"; and
+never compare a time window against a differently-shaped one. Acting on any of
+the three would have reverted a working change or "fixed" a correct parser.
+
+## 2026-08-18 — Two LLM writers were guessing at facts the boards publish outright
+
+Phase 2 inferred `remote_status`/`country`/`salary` into
+`scores.logistics_filters`, and the qualification tagger inferred
+`jobs.is_remote`/`employment_type` — while Ashby publishes `isRemote`,
+`workplaceType`, `employmentType` and a structured `postalAddress`, Lever
+publishes `workplaceType` and an already-ISO `country`, and SmartRecruiters
+models `location.remote` + `location.hybrid` as separate booleans. The fetchers
+read ~6 of 24–40 published fields and dropped the rest. Two inference paths
+over the same question also disagree — #795 measured 229 prod contradictions on
+remote alone. Worse, the tagger runs on the **upsert result** and overwrote
+those columns unconditionally, so reading the board (#847/#848) was a complete
+no-op until the tagger learned to defer (#851): the board fact was written and
+overwritten inside one poll. **Decision:** structured field where the board
+publishes it; deterministic parse of the location string for Greenhouse and
+Workday, which publish no remote flag but state it in the text; LLM never.
+Lesson: when a value has more than one writer, find the LAST one before
+claiming the first works. Also: Workday's list entry has six fields and we
+already read all six — its country sits behind the per-posting detail call
+#828 cut to ~3%, so "does the platform publish it" is the wrong question;
+"which endpoint, at what cost" is the right one.
+
+## 2026-08-18 — A workaround outlived the problem it was working around
+
+Catalog targets (`app_active`, no active `user_targets` link) were Phase-1
+graded every cycle on the instance key, producing scores nobody read — the
+dominant LLM line item while zero user targets were active. The reason it was
+there: a 2026-07-30 rule ("never spend money nobody will consume") had starved
+the public /search corpus to one sponsored target's family, and the fix was to
+let catalog targets grade again. But that starvation came from dropping them
+out of the ACTIVE SET, which stopped their **source polling** — the corpus
+starved for lack of ingestion, not grading. Meanwhile `/search` was changed to
+read `jobs` directly, skipping `scores` entirely, which fixed the real cause
+and made the workaround redundant. Nobody removed it. Verified before shipping:
+28.3% of recently-ingested jobs carry no promising score at all, so ingestion
+does not depend on admission. **Decision:** gate grading only, never polling,
+behind `GRADE_CATALOG_TARGETS` (default off). Lesson: one flag (`app_active`)
+drove two unrelated concerns — "poll this target's sources" and "grade against
+it" — so fixing one necessarily moved the other.
+
+## 2026-08-18 — Config outranks code, so a shipped fix can do nothing
+
+The landing page probed `/signup-mode` without the BFF secret, got a 403, and
+its fail-safe reported `closed` — so the homepage signup CTA could never open,
+whatever the operator switch said. Invisible by construction: a 403 from your
+own perimeter is a misconfiguration, but the code treated it identically to
+"backend down". Found only by reading HTTP logs and noticing the same endpoint
+returning 200 from one caller and 403 from another. The same shape nearly
+repeated within the day: `LOGISTICS_EXTRACTION_ENABLED=true` on Railway would
+have overridden a new `False` default and left half of #851 inert — caught
+because the deploy note said so, and the var was removed **before** the merge.
+**Decision:** when a change's effect depends on an env var, say so in the PR
+and verify the var's state as part of the release, not after. Lesson: a
+fail-safe that swallows a misconfiguration converts a loud bug into a silent
+one; distinguish "degraded" from "wired wrong".
+
 ## 2026-07-31 — The URL-health net ran daily and could never catch anything
 
 The dead-link archival cascade (HEAD checks → 3 consecutive failures →
