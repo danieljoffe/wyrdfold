@@ -82,12 +82,27 @@ class PayerBudgetGate:
         window frees up / they return / the operator re-enables them.
 
         A target with NO payer (no active ``user_targets`` link) is the
-        app's catalog, NOT blocked: its Phase-1 admission deliberately
-        bills the instance key (see the module docstring), so the corpus
-        keeps ingesting for catalog entries nobody has joined. The old
-        rule ("never spend money nobody will consume") starved the
-        public /search corpus down to one sponsored target's family —
-        the app itself is the consumer of catalog admission.
+        app's catalog. Whether that is blocked depends on
+        ``settings.grade_catalog_targets``:
+
+        - **False (default)** — blocked. Grading a target nobody is
+          pursuing bills the instance key for scores no one reads, and
+          the activation fan-out re-derives them anyway
+          (``bulk_title_score_for_target`` "runs at target activation so
+          postings that pre-date the target still appear"). Polling is
+          untouched, so the catalog keeps ingesting.
+        - **True** — the pre-2026-08 behaviour: catalog admission bills
+          the instance key (see the module docstring).
+
+        HISTORY, because the naive version of this was reverted once: an
+        earlier rule ("never spend money nobody will consume") starved the
+        public /search corpus down to one sponsored target's family. That
+        rule dropped catalog targets from the ACTIVE SET, which stopped
+        their source polling — the corpus starved for lack of *ingestion*,
+        not for lack of grading. This gate is narrower: it suppresses LLM
+        work only, and public /search reads the ``jobs`` table while
+        skipping ``scores`` entirely (``services/job_search.py``), so
+        ``promising`` cannot gate the public corpus.
 
         EXCEPTION — the EMPTY gate stays fail-closed: ``PayerBudgetGate()``
         with no payer map is the sentinel the global circuit breaker and
@@ -97,8 +112,14 @@ class PayerBudgetGate:
         """
         if not self.payer_by_target:
             return True  # fail-closed sentinel (breaker / build failure)
-        payer = self.payer_by_target.get(target_id)
-        return payer is not None and self.user_blocked(payer)
+        if target_id not in self.payer_by_target:
+            # Activated after this snapshot was taken — unchanged fail-open,
+            # so a mid-cycle activation isn't punished for arriving late.
+            return False
+        payer = self.payer_by_target[target_id]
+        if payer is None:
+            return not settings.grade_catalog_targets  # catalog-only
+        return self.user_blocked(payer)
 
     def user_blocked(self, user_id: str) -> bool:
         return (

@@ -1684,14 +1684,21 @@ async def _poll_one_source(
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
-                    # Sponsored target whose payer is blocked (over
-                    # allowance / idle / disabled) — spend nothing. Empty
-                    # verdicts → fail-open admit, so jobs still ingest
-                    # (promising, score=NULL) and get graded once the
-                    # payer's window frees up. Same defer semantics as the
-                    # Phase 2 daily cap. Catalog targets (no active user
-                    # link) are never blocked here — their triage bills
-                    # the instance key via ``_resolve_payer_client(None)``.
+                    # Blocked target — spend nothing this cycle. Either a
+                    # sponsored target whose payer is over allowance /
+                    # idle / disabled, or (default) a CATALOG-ONLY target
+                    # nobody is pursuing — see ``grade_catalog_targets``.
+                    #
+                    # Empty verdicts + empty ``attempted`` means every
+                    # title takes the NOT-attempted arm of
+                    # ``_phase1_promising`` → ``None`` = DEFER: excluded
+                    # from scores now, re-triaged when the block lifts.
+                    # (This comment previously claimed "fail-open admit,
+                    # jobs still ingest as promising" — that was the
+                    # pre-#285 blanket fail-open and is no longer true.)
+                    # The JOB row itself is unaffected either way: it is
+                    # already ingested before scoring, and public /search
+                    # reads ``jobs`` without consulting ``scores``.
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
