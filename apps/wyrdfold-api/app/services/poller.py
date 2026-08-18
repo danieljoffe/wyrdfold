@@ -1440,8 +1440,14 @@ async def _resolve_payer_client(
     grouped rather than interleaved across keys (interleaving would
     cold-start each key's prompt cache).
 
-    Returns ``None`` when the payer can't be served: hosted
-    ``BYOK_REQUIRE_USER_KEYS`` with no stored key (``MissingUserKeyError``).
+    Returns ``None`` when the payer can't be served with their own key
+    (``MissingUserKeyError``). TWO independent conditions raise it, and
+    conflating them has cost a misdiagnosis (#841): either
+    ``BYOK_REQUIRE_USER_KEYS`` is set, **or** the payer's plan is BYOK
+    (``entitlements_for(plan).llm_key_source == "byok"`` — the saas free
+    tier) — see ``llm.get_client_async``. The plan branch fires on its own,
+    so this defer is routine on a hosted deployment even with the flag unset.
+
     Callers defer that payer's grading — jobs stay promising / score NULL
     and grade on a later cycle once a key is added — exactly like the
     over-allowance defer, never billing the operator key for a stranger.
@@ -1453,9 +1459,11 @@ async def _resolve_payer_client(
             cache[payer_user_id] = await get_llm_client_async(supabase, payer_user_id)
         except MissingUserKeyError:
             logger.info(
-                "Background grading deferred for payer %s "
-                "(no BYOK key; BYOK_REQUIRE_USER_KEYS set)",
+                "Background grading deferred for payer %s (no stored BYOK key; %s)",
                 payer_user_id,
+                "BYOK_REQUIRE_USER_KEYS is set"
+                if settings.byok_require_user_keys
+                else "their plan requires BYOK",
             )
             cache[payer_user_id] = None
     return cache[payer_user_id]
