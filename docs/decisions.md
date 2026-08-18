@@ -3,6 +3,82 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-18 — reading config is not tracing the path (#841 was backwards)
+
+#841 was filed claiming free accounts drain the operator's LLM credit with no
+aggregate ceiling. The opposite is true: free accounts are **refused** with a
+402 before any LLM client is constructed. The filing traced `resolve_llm_quota`
+correctly — and that trace was downstream of a gate free users never reach.
+`llm/__init__.py:224` raises on an **OR**: `BYOK_REQUIRE_USER_KEYS` _or_ the
+caller's plan being BYOK, which the saas free tier always is. The flag was
+indeed unset; the plan branch fires on its own. **Decision:** a claim about what
+code _costs_ or _permits_ requires walking the call path from the entry point,
+not reading the settings that appear in it. Config tells you what a branch would
+do if reached; only the path tells you whether it is reached. Two aggravating
+details worth remembering: the issue's own "Verify before flipping" section
+prescribed the check (create one free account) that would have caught it, written
+by the same author who then skipped it — and the test suite was **already
+correct**, with `test_get_client_saas_free_without_key_is_refused` setting the
+flag to `False` explicitly. A coverage gap was assumed and asserted before the
+tests were read. Rule lives in the general "prove the diagnosis" rule; the
+misleading log that pointed at the wrong variable was fixed in #859.
+
+## 2026-08-18 — a server route handler cannot read a URL fragment (#856)
+
+Beta invites bounced to `/login?auth_error=missing_code` while the owner's own
+sign-in worked perfectly through the same callback. The invite was landing with
+a valid session in the **URL fragment** (`#access_token=…`), which browsers
+strip before the request leaves — so the server-side handler saw no `code` and
+no `token_hash` and fell through. The cause was upstream: `invite_user_by_email`
+is **server-initiated**, so no PKCE `code_verifier` exists in the recipient's
+browser, and a `{{ .ConfirmationURL }}` template therefore falls back to implicit
+flow. Sign-in is **browser**-initiated, gets `?code=`, and works. **Decision:**
+whether an auth callback receives a query or a fragment is decided by _who
+initiated the flow_, not by the URL — reason about the initiator first. Fix is
+the `token_hash` template form, which bypasses GoTrue's redirect entirely and is
+device-independent (it also survives opening the mail on another device, which
+PKCE does not). Two second-order lessons: the first hypothesis (redirect
+allowlist) was wrong and was only settled by asking for the **actual landing
+URL**; and `GET /auth/callback 307` is logged identically for success and
+failure, so the logs could not discriminate — the operator's answer could.
+Standing risk: these templates live only in the hosted Supabase dashboard, so no
+test, CI job or review can detect a regression (#860).
+
+## 2026-08-18 — an absent log line is evidence (#862)
+
+A Stripe webhook returned 200 and `user_profiles.plan` demonstrably flipped to
+`starter`, but `_set_plan`'s `billing: plan=… user=…` line was nowhere in the
+Railway logs. Chasing that discrepancy rather than accepting the happy outcome
+found that **production discards every `logger.info`** — 84 call sites, including
+all of `scheduler.py`'s outcome reporting. `init_logging` returns early unless
+`log_format == "json"`, and the `root.setLevel(logging.INFO)` that keeps child
+loggers off the stdlib WARNING default sits _inside_ that branch; `LOG_FORMAT` is
+unset on Railway, so it never runs. uvicorn's own access logs kept appearing,
+which made the gap look like normal traffic. **Decision:** log **level** and log
+**format** are independent concerns and must not share a branch. Also: when a
+verified outcome is missing its expected log line, treat the absence as a finding
+rather than noise — the outcome being correct is exactly what makes the missing
+line easy to wave away. Aggravating detail: #859 had just improved one of those
+`logger.info` lines, validated against tests rather than against production log
+output, so the improvement is invisible in prod until this is fixed.
+
+## 2026-08-18 — one environment named `development` was serving production (#861)
+
+`STRIPE_SECRET_KEY` on the service behind wyrdfold.com is an `sk_test_` key, so
+no real customer could subscribe — a live card against a test-mode Checkout is
+rejected, and Stripe renders a customer-facing "Sandbox" badge on the payment
+page. Combined with #841 (free accounts walled), there was **no path by which
+anyone could become a paying user**. The root cause is topology, not a pasted
+value: there is one Railway project with one environment, named `development`,
+and it is production. The test key is correct _for a development environment_;
+there is simply nowhere else for it to live. **Decision:** fix the environment
+split, not the key — a wrong value replaced in place leaves the same trap for the
+next environment-specific setting, and #856/#860 are the same shape (hosted
+config with no non-production place to exercise it). Silver lining used
+deliberately: because prod was in test mode, the full checkout → webhook →
+`user_profiles.plan` chain was exercised end to end at zero cost, so when live
+keys land the only untested variable is the key itself.
+
 ## 2026-08-18 — `promising` now means "admitted", not "Phase 1 admitted"
 
 `scores.promising` arrived as the Phase-1 title-triage verdict and its column
