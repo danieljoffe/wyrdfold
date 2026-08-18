@@ -3,6 +3,27 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-18 — `promising` now means "admitted", not "Phase 1 admitted"
+
+`scores.promising` arrived as the Phase-1 title-triage verdict and its column
+comment said exactly that. But it is also what `target-membership` reads to
+decide pipeline membership — the "✓ In &lt;target&gt;" badge, and the gate on
+match/tailor. So when `add-to-target` scored a pair without setting it, an
+explicit user add produced a row the badge logic excluded **by construction**:
+the panel flipped to a bound state and a reload erased it (#830). **Decision:**
+`add-to-target` sets `promising = True`, widening the column from "Phase 1
+admitted this" to "something admitted this", with the user as the other
+admitting authority. Rationale: the column's JOB is to gate membership, and a
+user asking for a job to be in a target is a stronger signal than a title-only
+LLM guess — so the widened reading is the truthful one, not a convenience. The
+alternative, a provenance column, is a migration and buys nothing the user's
+action needs. Kept in its own greppable helper (`_user_admit_score_async`)
+rather than folded into the force-include RPC, so the widening is findable.
+Known limit, accepted: membership also applies the #277 family gate, so an
+OFF-family user add still won't badge — bypassing that _does_ need provenance,
+and neither case in #830 was off-family. Lesson: when one column serves two
+readers, the name should describe what it gates, not who first wrote it.
+
 ## 2026-08-18 — A measurement is a claim: three predicates that each invented a bug
 
 Three separate times in one day a prod query produced an alarming number, and
@@ -104,8 +125,9 @@ schema audit forced the verdict days before the shadow corpus hit its own
 the SIGNAL is real (promising jobs avg cosine 0.38 vs 0.25 for duds; 83% of
 gate-passers are promising) but the armed threshold (0.3981, calibrated
 2026-07-04) would have dropped **61.5% of promising matches**. Meanwhile the
-cost problem it was built for had shrunk under it (deepseek + caching + caps →
-grading ≈ $1/mo). A first read of the raw admit-rate matrix was mistaken for a
+cost problem it was built for had shrunk under it (deepseek + caching + caps
+had made grading cheap enough that the gate no longer paid for itself). A first
+read of the raw admit-rate matrix was mistaken for a
 "signal is worthless" verdict — the ~5% admit rate was the _designed_
 asymmetry; only the outcome-join could judge it. **Decision:** retire the gate
 (drop `prescan_cosine_threshold`, gate/holdout/allowlist code + flags;
