@@ -7,8 +7,12 @@ has no stored key. Async since #57 PR-G2e-1 — the key read awaits on the poole
 async service client.
 """
 
+import logging
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.config import settings
 from app.services import poller as poller_mod
 from app.services.llm import MissingUserKeyError
 
@@ -69,11 +73,55 @@ async def test_resolve_payer_client_defers_on_missing_key(monkeypatch):
     first = await poller_mod._resolve_payer_client(cache, sb, "no-key")
     second = await poller_mod._resolve_payer_client(cache, sb, "no-key")
 
-    # No key in require-mode → defer (None), never billing the operator key.
+    # No usable key → defer (None), never billing the operator key. Note the
+    # trigger is an OR (flag OR a BYOK plan), so this defers regardless of
+    # BYOK_REQUIRE_USER_KEYS — see the log-attribution test below (#841).
     assert first is None
     assert second is None
     # The None verdict is memoized — get_client_async isn't retried every call.
     assert call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected", "forbidden"),
+    [
+        (False, "their plan requires BYOK", "BYOK_REQUIRE_USER_KEYS"),
+        (True, "BYOK_REQUIRE_USER_KEYS is set", "their plan requires BYOK"),
+    ],
+    ids=["plan-branch", "flag-branch"],
+)
+async def test_defer_log_names_the_condition_that_actually_fired(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    flag: bool,
+    expected: str,
+    forbidden: str,
+) -> None:
+    """The defer reason must name which of the two triggers fired (#841).
+
+    ``get_client_async`` raises on an OR: BYOK_REQUIRE_USER_KEYS, or a BYOK
+    plan (the saas free tier). This log previously asserted the flag
+    unconditionally, so on a hosted deployment — where the flag is unset and
+    the plan branch fires — it named a variable that was not the cause. That
+    is what sent #841 to the wrong conclusion.
+    """
+
+    async def fake_get_client(_supabase, _user_id):
+        raise MissingUserKeyError("openrouter")
+
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
+    monkeypatch.setattr(settings, "byok_require_user_keys", flag)
+
+    # Precondition, so a silently-renamed setting can't make this vacuous.
+    assert settings.byok_require_user_keys is flag
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=poller_mod.logger.name):
+        assert await poller_mod._resolve_payer_client({}, MagicMock(), "payer-z") is None
+
+    assert "Background grading deferred for payer payer-z" in caplog.text
+    assert expected in caplog.text
+    assert forbidden not in caplog.text
 
 
 async def test_resolve_payer_client_none_payer_uses_instance_key(monkeypatch):

@@ -122,8 +122,18 @@ async def get_llm_client(
 
     Threads the caller's per-user OpenRouter key (when they've stored one)
     so their inference bills their key; otherwise falls back to the
-    instance key, or — when ``BYOK_REQUIRE_USER_KEYS`` is set — 402s the
-    request asking them to add one. See ``app.services.llm.get_client_async``.
+    instance key, or 402s the request asking them to add one. See
+    ``app.services.llm.get_client_async``.
+
+    TWO independent conditions produce that 402 (#841): ``BYOK_REQUIRE_USER_KEYS``
+    is set, **or** the caller's plan is BYOK — which the saas free tier always
+    is (``entitlements_for("free").llm_key_source == "byok"``). The second fires
+    on its own, so on a hosted deployment **every free user 402s here** with the
+    flag unset, before any budget/quota code runs. Pinned by
+    ``tests/test_entitlements_tiers.py::test_get_client_saas_free_without_key_is_refused``,
+    which sets the flag to False explicitly. If BYOK is also unavailable
+    server-side (no ``BYOK_MASTER_KEY``), the 402's advice to add a key cannot be
+    followed — see #841.
 
     Auth is unchanged: the user is read opportunistically via the same
     non-raising JWT path as the optional-user dep — its CPU/verify (and any
