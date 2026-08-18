@@ -597,3 +597,102 @@ def test_structured_tool_calls_still_win_over_content() -> None:
     )
     out = _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
     assert out == {"verdicts": [{"id": 9}]}
+
+
+# ---- #850: the OTHER prose shape — bare JSON, no XML wrapper -----------------
+
+_TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {"verdicts": {"type": "array"}},
+    "required": ["verdicts"],
+}
+
+
+def _prose_json(content: str) -> dict:
+    return _resp([], finish="stop", content=content)
+
+
+def test_salvages_a_bare_json_object_written_into_content() -> None:
+    """The exact prod failure (#850): reasoning prose, then the answer as plain
+    JSON, no tool_calls and no XML. Captured verbatim from the Railway logs."""
+    content = (
+        'This is a clear case of different role function. The target is "Senior '
+        'Frontend Engineer" which is an engineering role focused on frontend '
+        'development. The candidate title "Intern, AI Prototyping" is an '
+        "internship position (different seniority level).\n\n"
+        '{\n  "verdicts": [\n'
+        '    {"id": 1, "promising": false, "confidence": 95, "title_prefix": "Intern, AI"}\n'
+        "  ]\n}"
+    )
+    out = _parse_openai_tool_response(
+        _prose_json(content),
+        tool_name="return_TitleTriageResponse",
+        max_tokens=1000,
+        tool_input_schema=_TRIAGE_SCHEMA,
+    )
+    assert out["verdicts"][0]["id"] == 1
+    assert out["verdicts"][0]["promising"] is False
+
+
+def test_refuses_an_object_missing_a_required_key() -> None:
+    """All-or-nothing. A bare object names no tool, and our models default every
+    field — so a fragment would validate silently into a confident wrong answer.
+    The schema's required keys are the only thing standing in the way."""
+    with pytest.raises(MissingToolCallError):
+        _parse_openai_tool_response(
+            _prose_json('Thinking...\n{"confidence": 95}'),
+            tool_name="return_TitleTriageResponse",
+            max_tokens=1000,
+            tool_input_schema=_TRIAGE_SCHEMA,
+        )
+
+
+def test_prefers_the_last_object_so_a_worked_example_cannot_win() -> None:
+    """Models reason first and answer last. An example echoed from the prompt
+    appears earlier, so taking the first match would return the wrong payload."""
+    content = (
+        'For example the shape is {"verdicts": [{"id": 99, "promising": true}]}.\n'
+        'My actual answer:\n{"verdicts": [{"id": 1, "promising": false}]}'
+    )
+    out = _parse_openai_tool_response(
+        _prose_json(content),
+        tool_name="return_TitleTriageResponse",
+        max_tokens=1000,
+        tool_input_schema=_TRIAGE_SCHEMA,
+    )
+    assert out["verdicts"][0]["id"] == 1
+
+
+def test_a_truncated_object_is_not_salvaged() -> None:
+    """A response cut at the token cap has no closing brace, so no span is
+    emitted and it raises — a half-read batch must never look complete."""
+    with pytest.raises(MissingToolCallError):
+        _parse_openai_tool_response(
+            _prose_json('Reasoning...\n{"verdicts": [{"id": 1, "promis'),
+            tool_name="return_TitleTriageResponse",
+            max_tokens=1000,
+            tool_input_schema=_TRIAGE_SCHEMA,
+        )
+
+
+def test_braces_inside_strings_do_not_unbalance_the_scan() -> None:
+    """A JD quoting "{tech}" must not break the brace matching."""
+    content = 'Note the title says "{Remote}" here.\n{"verdicts": [{"id": 7, "promising": true}]}'
+    out = _parse_openai_tool_response(
+        _prose_json(content),
+        tool_name="return_TitleTriageResponse",
+        max_tokens=1000,
+        tool_input_schema=_TRIAGE_SCHEMA,
+    )
+    assert out["verdicts"][0]["id"] == 7
+
+
+def test_no_schema_means_no_json_salvage() -> None:
+    """Callers that don't pass a schema keep the old behaviour exactly — the
+    guard is the schema, so without one we refuse rather than guess."""
+    with pytest.raises(MissingToolCallError):
+        _parse_openai_tool_response(
+            _prose_json('{"verdicts": []}'),
+            tool_name="return_TitleTriageResponse",
+            max_tokens=1000,
+        )
