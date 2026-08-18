@@ -19,6 +19,7 @@ from app.models.schemas import PollResult
 from app.models.targets import JobTarget
 from app.services import notify
 from app.services.ashby import fetch_ashby_jobs
+from app.services.board_metadata import board_columns
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
 from app.services.experience import optimized
@@ -1909,6 +1910,7 @@ async def _poll_one_source(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
+                    **board_columns(job),
                 }
             )
 
@@ -3335,6 +3337,7 @@ async def _poll_one_source_for_target(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
+                    **board_columns(job),
                 }
             )
 
