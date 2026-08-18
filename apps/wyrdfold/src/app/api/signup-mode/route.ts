@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-import { bffSecretHeader } from '@/lib/api/bffSecret';
+import { readSignupMode } from '@/lib/api/signupMode';
 
 // Public perimeter probe (Phase 3 slice 5): the login form reads this to
 // decide sign-in vs sign-up presentation (`shouldCreateUser`). Pre-auth by
@@ -8,24 +8,10 @@ import { bffSecretHeader } from '@/lib/api/bffSecret';
 // itself would reveal. FAIL-SAFE: every degraded state (missing env,
 // backend down, junk payload) reports 'closed', mirroring the backend
 // probe and the DB hook.
+//
+// The probe itself lives in `lib/api/signupMode` because the landing page
+// needs the identical call; keeping one copy is what stops the BFF secret
+// drifting between the two callers again (#839).
 export async function GET() {
-  const baseUrl = process.env['WYRDFOLD_API_URL'];
-  if (!baseUrl) {
-    return NextResponse.json({ mode: 'closed' });
-  }
-  try {
-    const res = await fetch(`${baseUrl}/signup-mode`, {
-      // Prove this came through the BFF (SEC-5); the API requires it here.
-      headers: { ...bffSecretHeader() },
-      // Perimeter flips are rare; a short cache keeps this off the hot path.
-      next: { revalidate: 60 },
-    });
-    if (!res.ok) return NextResponse.json({ mode: 'closed' });
-    const data = (await res.json()) as { mode?: string };
-    return NextResponse.json({
-      mode: data.mode === 'open' ? 'open' : 'closed',
-    });
-  } catch {
-    return NextResponse.json({ mode: 'closed' });
-  }
+  return NextResponse.json({ mode: await readSignupMode() });
 }
