@@ -28,7 +28,10 @@ from app.models.llm import (
     ModelId,
 )
 from app.services.llm.errors import MissingToolCallError
-from app.services.llm.openrouter_client import _parse_prose_tool_call
+from app.services.llm.openrouter_client import (
+    _parse_prose_json_tool_call,
+    _parse_prose_tool_call,
+)
 from app.services.llm.pricing import calculate_cost
 
 
@@ -513,6 +516,24 @@ def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
     return "\n".join(lines)
 
 
+def prose_json_tool_call(prose: str, **params: Any) -> str:
+    """Script the #850 failure: the model reasons in prose, then writes the
+    answer as a BARE JSON object — no tool_calls, no XML wrapper.
+
+    Distinct from :func:`prose_xml_tool_call` (#821), which is the same refusal
+    dressed as Anthropic XML. Measured in prod as 4 discarded triage batches in
+    12h, every one carrying a complete answer; the retry failed just as often,
+    so it is deterministic per batch rather than a flake. Scripted onto any
+    purpose, this lets a surface prove it RECOVERS the answer instead of
+    deferring the whole batch.
+
+    The real client only salvages an object carrying every ``required`` key from
+    the tool schema, so a surface scripted with a PARTIAL object here still gets
+    the typed failure — that asymmetry is the point.
+    """
+    return f"{prose}\n\n{json.dumps(params, indent=2)}"
+
+
 def conversation_recap_echo_json(recap: str) -> str:
     """A schema-VALID ``LLMTurnResponse`` whose ``prose_append`` restates a
     block that is already in the prose doc verbatim.
@@ -693,10 +714,18 @@ class MockLLMClient:
         # window). The real client salvages those, so the mock must too — and
         # it calls the SAME parser rather than reimplementing it, or the bug
         # corpus would drift from the behaviour it is meant to pin.
+        # …or the OTHER prose shape (#850): reasoning followed by the answer as
+        # a bare JSON object with no XML wrapper. Measured in prod as 4 discarded
+        # triage batches in 12h, each carrying a complete answer. Same rule as
+        # above — call the SAME parsers rather than reimplementing them.
         try:
             tool_input = json.loads(response_text)
         except json.JSONDecodeError as exc:
             salvaged = _parse_prose_tool_call(response_text, tool_name=tool_name)
+            if salvaged is None:
+                salvaged = _parse_prose_json_tool_call(
+                    response_text, tool_input_schema=tool_input_schema
+                )
             if salvaged is None:
                 raise MissingToolCallError(
                     f"Expected a forced tool_call for {tool_name!r}, got prose "

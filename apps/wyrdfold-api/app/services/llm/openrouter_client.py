@@ -124,6 +124,82 @@ _PROSE_PARAM_RE = re.compile(
 )
 
 
+def _balanced_json_objects(text: str) -> list[str]:
+    """Every top-level ``{...}`` span in ``text``, in order of appearance.
+
+    String-aware, so a brace inside a JD quote ("we use {tech}") can't
+    unbalance the scan. A span is emitted only when its closing brace is
+    found, so a response truncated mid-object yields nothing for that span —
+    which is what keeps a cut-off answer from being salvaged as a whole one.
+    """
+    spans: list[str] = []
+    depth = 0
+    start = -1
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append(text[start : i + 1])
+    return spans
+
+
+def _parse_prose_json_tool_call(
+    content: object, *, tool_input_schema: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Recover a tool input the model wrote as a bare JSON object in prose.
+
+    The sibling of :func:`_parse_prose_tool_call`, for the OTHER shape models
+    fall back to: reasoning prose followed by the answer as plain JSON, with no
+    XML wrapper and no ``tool_calls`` (#850 — measured in prod as 4 failures in
+    12h on ``return_TitleTriageResponse``, every one carrying a complete,
+    well-formed answer that was thrown away).
+
+    SAME ALL-OR-NOTHING RULE, and it needs teeth here that the XML path gets
+    for free. XML names its tool, so a mismatch is detectable; a bare object
+    names nothing, and the models we call define a default for every field —
+    so handing Pydantic a partial or unrelated dict would validate silently
+    into a confidently-wrong answer. Two guards instead:
+
+    - the object must be **balanced** (truncation yields no span at all), and
+    - it must carry **every ``required`` key** from the tool's own schema, so a
+      fragment, an example echoed from the prompt, or some unrelated JSON the
+      model mused about cannot pass as the answer.
+
+    The LAST qualifying span wins: models reason first and answer last, so a
+    worked example earlier in the prose must not outrank the real payload.
+    """
+    if not isinstance(content, str) or "{" not in content:
+        return None
+    required = [k for k in (tool_input_schema.get("required") or []) if isinstance(k, str)]
+    for span in reversed(_balanced_json_objects(content)):
+        try:
+            obj = json.loads(span)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict) or not obj:
+            continue
+        if required and not all(key in obj for key in required):
+            continue  # partial — refuse rather than half-answer
+        return obj
+    return None
+
+
 def _parse_prose_tool_call(content: object, *, tool_name: str) -> dict[str, Any] | None:
     """Recover a tool input the model wrote as XML prose, or ``None``.
 
@@ -165,7 +241,11 @@ def _parse_prose_tool_call(content: object, *, tool_name: str) -> dict[str, Any]
 
 
 def _parse_openai_tool_response(
-    data: dict[str, Any], *, tool_name: str, max_tokens: int
+    data: dict[str, Any],
+    *,
+    tool_name: str,
+    max_tokens: int,
+    tool_input_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract the forced tool call's arguments from an OpenAI-compatible
     chat/completions response. Fails loud on every way the structured
@@ -180,7 +260,8 @@ def _parse_openai_tool_response(
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
-        salvaged = _parse_prose_tool_call(message.get("content"), tool_name=tool_name)
+        content = message.get("content")
+        salvaged = _parse_prose_tool_call(content, tool_name=tool_name)
         if salvaged is not None:
             logger.warning(
                 "salvaged %r from a prose tool call — model wrote XML into content "
@@ -189,6 +270,20 @@ def _parse_openai_tool_response(
                 finish,
             )
             return salvaged
+        # The other prose shape (#850): reasoning followed by the answer as a
+        # bare JSON object, no XML wrapper. Gated on the tool's own required
+        # keys, so a fragment or an echoed example can't pass as the answer.
+        if tool_input_schema is not None:
+            salvaged = _parse_prose_json_tool_call(content, tool_input_schema=tool_input_schema)
+            if salvaged is not None:
+                logger.warning(
+                    "salvaged %r from a prose JSON tool call — model wrote a bare "
+                    "JSON object into content instead of emitting tool_calls "
+                    "(finish_reason=%r)",
+                    tool_name,
+                    finish,
+                )
+                return salvaged
         # 600, not 200: the old cap cut every one of these mid-payload, which
         # made a complete-but-misplaced answer look like a truncated one.
         raise MissingToolCallError(
@@ -474,7 +569,12 @@ class OpenRouterLLMClient(AnthropicLLMClient):
                 f"{str(err.get('message'))[:200]!r}"
             )
 
-        tool_input = _parse_openai_tool_response(data, tool_name=tool_name, max_tokens=max_tokens)
+        tool_input = _parse_openai_tool_response(
+            data,
+            tool_name=tool_name,
+            max_tokens=max_tokens,
+            tool_input_schema=tool_input_schema,
+        )
         usage = _openai_usage(data)
         cost = calculate_cost(model, usage)
         result = LLMResult(

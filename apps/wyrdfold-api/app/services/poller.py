@@ -912,14 +912,28 @@ async def _qualify_one_job(
     # reading was billed per token.
     dict_skills = extract_dictionary_skills(row.get("title"), row.get("description_html"))
 
+    # DEFER TO THE BOARD (#846). ``row`` is the upsert RESULT, so it already
+    # carries whatever ``board_columns`` wrote moments ago — Ashby's
+    # ``isRemote``, Lever's ``workplaceType``, SmartRecruiters'
+    # ``location.remote``, or a board-stated "Remote" in the location string.
+    # Those are the employer's own answer; the tagger's are inferences from JD
+    # prose. Writing the inference on top is how #795 ended up with 229 prod
+    # contradictions, and it silently nullified #847/#848 — the board value was
+    # written and then overwritten within the same poll.
+    #
+    # So these two keys are omitted when the row already holds a value. Every
+    # other tag below is a fact NO board publishes (role_family, seniority,
+    # is_us, metro, is_genuine_role), so the tagger remains the only source and
+    # keeps writing them unconditionally. Board values re-derive on every poll,
+    # so a board that changes its mind still propagates.
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
-        "employment_type": tags.employment_type,
         "metro": tags.metro,
-        "is_remote": tags.is_remote,
         "is_genuine_role": tags.is_genuine_role,
+        **({} if row.get("employment_type") else {"employment_type": tags.employment_type}),
+        **({} if row.get("is_remote") is not None else {"is_remote": tags.is_remote}),
         "qualified_at": datetime.now(UTC).isoformat(),
         "qualified_hash": new_hash,
         # Catalog-wide skill facts (backs /search?skill=react), extracted by

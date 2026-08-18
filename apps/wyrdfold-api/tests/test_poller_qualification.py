@@ -826,3 +826,80 @@ class TestNonGenuineArchive:
         payload = rec["writes"][0]
         assert payload["is_genuine_role"] is False
         assert "archived_at" not in payload
+
+
+class TestDefersToTheBoard:
+    """#846: the ATS states remote / employment type; the tagger only guesses.
+
+    ``_qualify_one_job`` receives the UPSERT RESULT, so a board value written
+    moments earlier by ``board_columns`` is already on the row. Writing the
+    inference over it is what produced #795's 229 prod contradictions, and it
+    silently nullified #847/#848 — the board value was written and overwritten
+    within one poll.
+    """
+
+    @pytest.mark.asyncio
+    async def test_board_remote_is_not_overwritten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        # Board said REMOTE; the tagger's inference says False (_TAGS).
+        await poller_mod._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(is_remote=True)
+        )
+        payload = rec["writes"][0]
+        assert "is_remote" not in payload, "the board's answer must survive"
+
+    @pytest.mark.asyncio
+    async def test_board_employment_type_is_not_overwritten(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        await poller_mod._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(employment_type="contract")
+        )
+        payload = rec["writes"][0]
+        assert "employment_type" not in payload
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_board_false_still_counts_as_an_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``is_remote=False`` is a fact ("on-site"), not absence. A truthiness
+        check here would let the tagger clobber every on-site posting — the
+        exact bug the board-columns spread was written to avoid."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        await poller_mod._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(is_remote=False)
+        )
+        assert "is_remote" not in rec["writes"][0]
+
+    @pytest.mark.asyncio
+    async def test_tagger_still_fills_what_no_board_published(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Greenhouse/Workday publish neither field. With nothing on the row the
+        tagger remains the source, so coverage is not lost for the 61% of
+        sources whose boards say nothing."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        await poller_mod._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
+        payload = rec["writes"][0]
+        assert payload["is_remote"] is False
+        assert payload["employment_type"] == "full_time"
+
+    @pytest.mark.asyncio
+    async def test_tags_no_board_publishes_are_always_written(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """role_family / seniority / is_us / metro / is_genuine_role have no
+        board source, so the tagger stays their only writer — unconditionally,
+        even when the board answered the other two."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        await poller_mod._qualify_one_job(
+            MagicMock(),
+            _supabase_capturing_updates(rec),
+            _row(is_remote=True, employment_type="contract"),
+        )
+        payload = rec["writes"][0]
+        for key in ("is_us", "role_family", "seniority", "metro", "is_genuine_role"):
+            assert key in payload, key

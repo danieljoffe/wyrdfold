@@ -511,7 +511,18 @@ class Settings(BaseSettings):
     # preserved — score-neutral within grader sampling noise. Historical
     # scores are NOT backfilled (per the user); the column populates on
     # newly-graded jobs going forward.
-    logistics_extraction_enabled: bool = True
+    #
+    # Flipped back OFF 2026-08-18 (#846): the boards publish these facts and we
+    # now read them. Ashby/Lever/SmartRecruiters state remote, employment type
+    # and country outright; Greenhouse/Workday state remote in the location
+    # string, which ``location_parse`` already reads. Paying a reasoning model
+    # to infer the employer's own answer bought nothing — and the /jobs filter
+    # already PREFERS the deterministic columns, keeping the grader's output as
+    # a fallback that covers "graded rows only" (~4% for country, per
+    # ``routers/jobs.py``). So this turns off a minority fallback, not the
+    # primary source. Salary is unaffected: that filter reads jobs.salary_*,
+    # parsed deterministically from the posting's own salary text.
+    logistics_extraction_enabled: bool = False
 
     # Skills harvest (plan-phase2-structured-harvest.md): the Phase-2 grader
     # additionally emits skills_required / skills_matched / skills_missing —
