@@ -1,6 +1,11 @@
 import logging
 
 from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.services.board_metadata import (
+    normalize_country,
+    normalize_employment_type,
+    normalize_remote,
+)
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -31,6 +36,9 @@ async def fetch_lever_jobs(company: str) -> list[StandardJob]:
     jobs: list[StandardJob] = []
     for item in data:
         categories = item.get("categories", {})
+        # Board-published metadata (#846). Lever's top-level ``country`` is
+        # already an ISO-2 code, and ``categories`` carries commitment and
+        # department beside the location we were already reading.
         jobs.append(
             StandardJob(
                 external_id=str(item["id"]),
@@ -39,6 +47,10 @@ async def fetch_lever_jobs(company: str) -> list[StandardJob]:
                 content=item.get("description", ""),
                 posted_at=str(item.get("createdAt", "")),
                 absolute_url=item.get("hostedUrl", ""),
+                is_remote=normalize_remote(workplace_type=item.get("workplaceType")),
+                country=normalize_country(item.get("country")),
+                employment_type=normalize_employment_type(categories.get("commitment")),
+                department=categories.get("department") or categories.get("team"),
             )
         )
     return jobs

@@ -3,6 +3,11 @@ import logging
 from typing import Any
 
 from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.services.board_metadata import (
+    normalize_country,
+    normalize_employment_type,
+    normalize_remote,
+)
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -158,6 +163,9 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
         # JSON endpoint to parse as HTML).
         absolute_url = detail.get("postingUrl") or detail.get("applyUrl") or detail.get("ref", "")
 
+        # Board-published metadata (#846). SmartRecruiters models remote and
+        # hybrid as separate booleans on ``location``, which together settle
+        # remote/hybrid/onsite with no inference at all.
         jobs.append(
             StandardJob(
                 external_id=str(detail.get("id", list_id)),
@@ -166,6 +174,15 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
                 content=_build_content(detail),
                 posted_at=detail.get("releasedDate", item.get("releasedDate", "")),
                 absolute_url=absolute_url,
+                is_remote=normalize_remote(
+                    is_remote=location.get("remote"),
+                    is_hybrid=location.get("hybrid"),
+                ),
+                country=normalize_country(country),
+                employment_type=normalize_employment_type(
+                    (detail.get("typeOfEmployment") or {}).get("id")
+                ),
+                department=(detail.get("department") or {}).get("label"),
             )
         )
     return jobs

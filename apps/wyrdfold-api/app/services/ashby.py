@@ -1,6 +1,11 @@
 import logging
 
 from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.services.board_metadata import (
+    normalize_country,
+    normalize_employment_type,
+    normalize_remote,
+)
 from app.services.standard_job import StandardJob
 
 logger = logging.getLogger(__name__)
@@ -31,6 +36,10 @@ async def fetch_ashby_jobs(slug: str) -> list[StandardJob]:
 
     jobs: list[StandardJob] = []
     for item in raw_jobs:
+        # Board-published metadata (#846) — Ashby states these outright, so
+        # there is nothing for the LLM to infer. ``address`` is a nested
+        # schema.org postalAddress.
+        postal = (item.get("address") or {}).get("postalAddress") or {}
         jobs.append(
             StandardJob(
                 external_id=str(item["id"]),
@@ -39,6 +48,13 @@ async def fetch_ashby_jobs(slug: str) -> list[StandardJob]:
                 content=item.get("descriptionHtml", ""),
                 posted_at=item.get("publishedAt", ""),
                 absolute_url=item.get("jobUrl", ""),
+                is_remote=normalize_remote(
+                    is_remote=item.get("isRemote"),
+                    workplace_type=item.get("workplaceType"),
+                ),
+                country=normalize_country(postal.get("addressCountry")),
+                employment_type=normalize_employment_type(item.get("employmentType")),
+                department=item.get("department") or item.get("team"),
             )
         )
     return jobs
