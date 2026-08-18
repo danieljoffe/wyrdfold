@@ -11,9 +11,10 @@ on remote status alone.
 Each provider spells the same fact differently, so the fetchers hand us raw
 values and this module maps them onto the column vocabularies:
 
-    is_remote        bool                     (jobs.is_remote)
-    country          ISO 3166-1 alpha-2, upper (jobs.country)
-    employment_type  qualification vocabulary  (jobs.employment_type)
+    is_remote        bool                      → jobs.is_remote
+    employment_type  qualification vocabulary   → jobs.employment_type
+    country          ISO 3166-1 alpha-2, upper  → NO COLUMN YET, see
+                                                  :func:`board_columns`
 
 DESIGN RULE — silence is not falsity. Every normalizer returns ``None`` for
 anything it doesn't positively recognize, and :func:`board_columns` omits
