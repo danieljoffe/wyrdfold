@@ -13,6 +13,7 @@ from app.services.llm.mock import (
     QUERY_SUGGEST_PURPOSE,
     MockLLMClient,
     dev_default_responses,
+    prose_json_tool_call,
     prose_xml_tool_call,
 )
 
@@ -812,5 +813,51 @@ async def test_mock_still_raises_on_prose_that_is_not_a_tool_call() -> None:
             tool_name="return_TitleTriageResponse",
             tool_description="d",
             tool_input_schema={},
+            purpose="triage",
+        )
+
+
+_TRIAGE_SCHEMA = {"type": "object", "required": ["verdicts"]}
+
+
+async def test_mock_salvages_a_prose_json_tool_call() -> None:
+    """#850: the model reasons in prose, then writes the answer as a bare JSON
+    object — no tool_calls, no XML. Distinct from #821's XML shape, and it was
+    still being discarded: 4 triage batches lost in a 12h prod window, each
+    carrying a complete answer."""
+    client = MockLLMClient()
+    client.register(
+        "triage",
+        prose_json_tool_call(
+            "The candidate title is an internship, not a frontend engineering role.",
+            verdicts=[{"id": 1, "promising": False, "confidence": 95}],
+        ),
+    )
+    tool_input, _ = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="s",
+        messages=[Message(role="user", content="triage these")],
+        tool_name="return_TitleTriageResponse",
+        tool_description="d",
+        tool_input_schema=_TRIAGE_SCHEMA,
+        purpose="triage",
+    )
+    assert tool_input == {"verdicts": [{"id": 1, "promising": False, "confidence": 95}]}
+
+
+async def test_mock_refuses_a_partial_prose_json_object() -> None:
+    """All-or-nothing survives the mock too. A bare object names no tool and our
+    models default every field, so a fragment must raise rather than validate
+    into a confident wrong answer — the schema's required keys are the guard."""
+    client = MockLLMClient()
+    client.register("triage", prose_json_tool_call("Thinking out loud.", confidence=95))
+    with pytest.raises(MissingToolCallError):
+        await client.complete_tool_use(
+            model="claude-haiku-4-5",
+            system="s",
+            messages=[Message(role="user", content="triage these")],
+            tool_name="return_TitleTriageResponse",
+            tool_description="d",
+            tool_input_schema=_TRIAGE_SCHEMA,
             purpose="triage",
         )
