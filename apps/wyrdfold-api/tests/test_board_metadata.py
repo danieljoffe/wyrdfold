@@ -19,6 +19,7 @@ from app.services.board_metadata import (
     normalize_employment_type,
     normalize_remote,
 )
+from app.services.location_parse import parse_location
 from app.services.standard_job import StandardJob
 
 
@@ -132,6 +133,38 @@ def test_board_columns_keeps_an_explicit_false() -> None:
 def test_board_columns_carries_what_the_board_did_say() -> None:
     cols = board_columns(_job(is_remote=True, employment_type="contract"))
     assert cols == {"is_remote": True, "employment_type": "contract"}
+
+
+def test_location_remote_fills_the_gap_for_greenhouse_and_workday() -> None:
+    """Neither publishes a remote flag, but both say it in the location string,
+    and ``location_parse`` already reads that as board-stated ground truth."""
+    loc = parse_location("Remote - US")
+    assert loc.remote is True
+    assert board_columns(_job(), loc) == {"is_remote": True}
+
+
+def test_location_remote_false_asserts_nothing() -> None:
+    """The asymmetry that matters: a location saying "Remote" proves remote,
+    but a location not saying it proves nothing — plenty of remote roles just
+    list an office. Writing False here would mislabel most of the corpus."""
+    loc = parse_location("San Francisco, CA, US")
+    assert loc.remote is False
+    assert board_columns(_job(), loc) == {}
+
+
+def test_a_board_that_states_remote_beats_the_location_string() -> None:
+    """Ashby saying isRemote=False outranks a location that merely mentions
+    remote — the provider models the field, the string just describes a place."""
+    loc = parse_location("Remote - US")
+    assert board_columns(_job(is_remote=False), loc) == {"is_remote": False}
+    assert board_columns(_job(is_remote=True), loc) == {"is_remote": True}
+
+
+def test_multi_location_remote_is_picked_up() -> None:
+    """Greenhouse joins multiple locations with semicolons; the parser enriches
+    remote from ANY segment, not just the first."""
+    loc = parse_location("New York, NY, US; Remote, US")
+    assert board_columns(_job(), loc) == {"is_remote": True}
 
 
 def test_board_columns_never_writes_country() -> None:
