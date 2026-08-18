@@ -1917,7 +1917,7 @@ async def _poll_one_source(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
-                    **board_columns(job),
+                    **board_columns(job, loc),
                 }
             )
 
@@ -3344,7 +3344,7 @@ async def _poll_one_source_for_target(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
-                    **board_columns(job),
+                    **board_columns(job, loc),
                 }
             )
 

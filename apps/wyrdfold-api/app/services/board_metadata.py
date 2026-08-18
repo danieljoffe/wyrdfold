@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.models.logistics import _COUNTRY_NAME_TO_ALPHA2
+from app.services.location_parse import LocationParts
 from app.services.standard_job import StandardJob
 
 # Provider spellings → ``jobs.employment_type`` (tagger.EmploymentType).
@@ -116,7 +117,7 @@ def normalize_remote(
     return _WORKPLACE_REMOTE.get(key) if key else None
 
 
-def board_columns(job: StandardJob) -> dict[str, Any]:
+def board_columns(job: StandardJob, location: LocationParts | None = None) -> dict[str, Any]:
     """The ``jobs`` columns a board published for this posting.
 
     Mirrors :func:`app.services.extract.salary_columns` — one spread used by
@@ -133,10 +134,25 @@ def board_columns(job: StandardJob) -> dict[str, Any]:
     reintroduce that mismatch, so aligning the two vocabularies is its own
     deliberate change. ``StandardJob.country`` is still populated — the value
     is free and correct — it just has no safe column to land in yet.
+
+    ``location`` is the deterministic parse of the board's location string
+    (``location_parse.parse_location``). Greenhouse and Workday publish no
+    remote flag at all, but they routinely say it in the location itself
+    ("Remote - US", "Remote; New York, NY"), and that parse is already
+    board-stated ground truth rather than an inference. It is used ONLY as a
+    fallback: a provider that models the field outright always wins.
+
+    ASYMMETRY, deliberately: a location saying "Remote" proves remote, but a
+    location NOT saying it proves nothing — plenty of remote roles just list
+    an office. So ``location.remote`` is promoted only when True. Treating its
+    False as "on-site" would assert a fact we don't have about most of the
+    corpus, which is the same mistake as letting a silent board write False.
     """
     cols: dict[str, Any] = {}
+    if location is not None and location.remote:
+        cols["is_remote"] = True
     if job.is_remote is not None:
-        cols["is_remote"] = job.is_remote
+        cols["is_remote"] = job.is_remote  # a board that states it always wins
     if job.employment_type:
         cols["employment_type"] = job.employment_type
     return cols
