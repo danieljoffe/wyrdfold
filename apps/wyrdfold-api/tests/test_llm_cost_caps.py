@@ -313,19 +313,19 @@ async def test_resolve_payers_empty_input_short_circuits():
 # ---- PayerBudgetGate semantics -------------------------------------------------
 
 
-def test_gate_blocks_over_budget_payer_but_not_catalog_orphans():
-    """App-owned-catalog contract: an unsponsored target (payer None) is
-    the app's catalog and triages on the instance key — NOT blocked. The
-    old orphan-blocks rule starved the public /search corpus down to the
-    one sponsored target's family (2026-07-30). Sponsored-but-blocked
-    payers still defer. Full semantics in test_targets_payers.py."""
+def test_gate_blocks_over_budget_payer_and_catalog_orphans_by_default():
+    """Catalog-only targets (payer None) DEFER by default — grading a target
+    nobody is pursuing bills the instance key for scores no one reads, and the
+    activation fan-out re-derives them. Sponsored-but-blocked payers still
+    defer; a target absent from the snapshot (activated mid-cycle) still
+    fail-opens. Full semantics in test_targets_payers.py."""
     gate = PayerBudgetGate(
         payer_by_target={"t-1": "u-over", "t-2": "u-ok", "t-3": None},
         over_budget_users=frozenset({"u-over"}),
     )
     assert gate.target_blocked("t-1") is True  # payer over budget
     assert gate.target_blocked("t-2") is False
-    assert gate.target_blocked("t-3") is False  # catalog: instance pays Phase 1
+    assert gate.target_blocked("t-3") is True  # catalog: nobody consumes it
     assert gate.target_blocked("t-unknown") is False  # post-snapshot activation
     assert gate.user_blocked("u-over") is True
     assert gate.user_blocked("u-ok") is False

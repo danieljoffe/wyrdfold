@@ -820,6 +820,25 @@ class Settings(BaseSettings):
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)
+    # Grade CATALOG-ONLY targets — ``app_active`` rows with no active
+    # ``user_targets`` link, i.e. seed targets nobody is pursuing. Their
+    # Phase-1/Phase-2 grading bills the INSTANCE key, and measured against
+    # prod it is the dominant line item while serving nobody: the scores it
+    # writes are re-derived anyway by the activation fan-out
+    # (``bulk_title_score_for_target``, "runs at target activation so postings
+    # that pre-date the target still appear").
+    #
+    # Default False = seed targets still POLL (sources fetched, jobs ingested,
+    # discovery runs — the catalog keeps growing, which is what they exist for)
+    # but are not LLM-graded until a real user activates them.
+    #
+    # SAFE because public ``/search`` reads the ``jobs`` table and skips
+    # ``scores`` entirely (``services/job_search.py``) — ``promising`` does not
+    # gate the public corpus. NB an EARLIER rule ("never spend money nobody
+    # will consume") did starve that corpus, but it dropped catalog targets
+    # from the ACTIVE SET, killing their source polling. This flag is narrower
+    # by construction: it gates grading only and never touches polling.
+    grade_catalog_targets: bool = False
     # Max concurrent backgrounded tailoring runs per user (#656). Backgrounding
     # the ~39s resume pipeline removed the serialization a blocking request
     # imposed on a browser tab, and `enforce_llm_budget` meters spend whose
