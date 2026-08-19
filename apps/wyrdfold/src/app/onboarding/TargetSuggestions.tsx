@@ -336,9 +336,14 @@ export default function TargetSuggestions({
           // Bare create, NOT from-manual: these suggestions already went
           // through LLM matching in ``/targets/suggest`` — re-running the
           // create-or-link endpoint would repeat that call per target.
+          // Label only — the suggestion's description is résumé-informed
+          // ("…given your work at <employer>") and `targets` is the SHARED
+          // catalog, readable by every co-follower and outliving the author's
+          // account (#868). Activation fills `description` with the
+          // role-generic form derived from the label alone. The rationale
+          // still shows on the card above; it just stops being persisted.
           const createdTarget = await createBareTarget({
             label: match.suggestion.label,
-            description: match.suggestion.description,
           });
           targetId = createdTarget.id;
         } else {
