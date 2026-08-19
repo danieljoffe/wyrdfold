@@ -58,6 +58,24 @@ describe('BillingCard', () => {
     await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 
+  it('tells a trial user to subscribe, never to add an API key', async () => {
+    // A trial runs on HOSTED keys. Showing it the free-plan copy ("add one
+    // above") points at a field that is disabled when BYOK is unavailable —
+    // the dead end #841 exists to remove.
+    (global.fetch as jest.Mock).mockResolvedValueOnce(
+      jsonOk(account({ plan: 'trial' }))
+    );
+    render(<BillingCard />);
+
+    expect(await screen.findByText(/Free trial/)).toBeInTheDocument();
+    expect(screen.getByText(/Subscribe before it ends/)).toBeInTheDocument();
+    expect(screen.queryByText(/add one above/)).not.toBeInTheDocument();
+    // Still convertible: the upgrade path must remain on screen.
+    expect(
+      screen.getByRole('button', { name: /Get Starter/ })
+    ).toBeInTheDocument();
+  });
+
   it('shows upgrade buttons for a free-plan user without a billing account', async () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce(jsonOk(account()));
     render(<BillingCard />);
