@@ -699,13 +699,29 @@ async def _create_or_link_from_suggestion(
     # New target: create immediately in "deriving" so it appears in the
     # list with a pending indicator while the background task derives the
     # scoring profile (+ fit score when we have a profile).
+    # `description` is deliberately NOT persisted here (#868). The suggestion's
+    # description is résumé-INFORMED — `normalize_manual_input` and
+    # `suggest_targets` both take the caller's `payload`, and in prod that
+    # produced shared rows reading "…a natural fit given your cross-team design
+    # system work at <employer A> and <employer B>". `targets` is the shared
+    # catalog: every co-follower can read that row, and it survives the author's
+    # account deletion.
+    #
+    # `derive_profile_from_label` states the rule this restores: the shared
+    # target is "grounded in role-generic industry knowledge of the label alone
+    # — never an individual's résumé — so a shared target's rubric isn't skewed
+    # by whoever activated it. The résumé feeds `fit_score` separately."
+    #
+    # It also fills `description` at activation with the role-generic form
+    # ("WHAT THIS ROLE IS in general"), so this is a short null window, not a
+    # permanent loss — and `analysis.py` already treats a null description as
+    # optional. The rich per-user rationale still reaches the UI in the
+    # suggestion RESPONSE; it just stops being written to a row it doesn't
+    # belong in.
     target, link = await _create_and_link(
         supabase,
         user_id=user_id,
-        payload=TargetCreate(
-            label=suggestion.label,
-            description=suggestion.description,
-        ),
+        payload=TargetCreate(label=suggestion.label),
         activation_status="deriving",
     )
     spawn_detached(

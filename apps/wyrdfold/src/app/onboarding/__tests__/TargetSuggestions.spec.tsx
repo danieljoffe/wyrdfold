@@ -616,6 +616,50 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     expect(targetPosts.length).toBe(0);
   });
 
+  it('creates the target from the label alone, never the résumé-informed blurb', async () => {
+    // #868: the suggestion's description is written from the user's résumé
+    // ("…given your work at <employer>"). `targets` is the SHARED catalog —
+    // co-followers can read it and it outlives the author's account. The
+    // rationale still renders on the card; it must not be persisted.
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-1' }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, init]: [string, RequestInit | undefined]) =>
+          url === '/api/targets' && init?.method === 'POST'
+      );
+      expect(post).toBeDefined();
+      const body = JSON.parse((post![1] as RequestInit).body as string);
+      expect(body.label).toBe('Frontend Engineer');
+      expect(body.description).toBeUndefined();
+    });
+  });
+
   it('invokes onSkip when "Skip this step" is clicked from the manual fallback', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
