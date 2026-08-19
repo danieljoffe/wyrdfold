@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { CreditCard } from 'lucide-react';
 import {
   Card,
@@ -35,28 +36,88 @@ export default function BillingCard() {
   const [loading, setLoading] = useState(true);
   const [account, setAccount] = useState<BillingAccount | null>(null);
   const [redirecting, setRedirecting] = useState(false);
+  // Stripe returns to /settings?billing=success|cancelled. Nothing read it,
+  // so the highest-anxiety moment in the product — money just moved —
+  // answered "did that work?" with an unrelated settings form (#863).
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const router = useRouter();
+  const billingReturn = searchParams.get('billing');
+  // The plan flip rides the WEBHOOK, not this redirect, so the two race.
+  // Landing first shows a stale plan; without this the user reads that as a
+  // failed payment and may pay twice.
+  const [awaitingWebhook, setAwaitingWebhook] = useState(
+    billingReturn === 'success'
+  );
+  const announced = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
+
+    async function fetchAccount(): Promise<BillingAccount | null> {
+      const res = await fetch('/api/billing/account');
+      // 404 = billing not offered on this instance (self-host / not
+      // configured) — the card renders nothing rather than an error.
+      if (!res.ok) return null;
+      return (await res.json()) as BillingAccount;
+    }
+
     async function load() {
       try {
-        const res = await fetch('/api/billing/account');
-        // 404 = billing not offered on this instance (self-host / not
-        // configured) — the card renders nothing rather than an error.
-        if (!res.ok) return;
-        const data = (await res.json()) as BillingAccount;
-        if (!cancelled) setAccount(data);
+        const data = await fetchAccount();
+        if (cancelled || !data) return;
+        setAccount(data);
+
+        // Poll briefly for the webhook to land, rather than rendering a
+        // stale "Free" next to a success message. Bounded: ~8s, then we
+        // stop claiming and let the card show whatever is true.
+        if (billingReturn === 'success' && !data.has_billing_account) {
+          for (let attempt = 0; attempt < 8 && !cancelled; attempt++) {
+            await new Promise(r => setTimeout(r, 1000));
+            const next = await fetchAccount();
+            if (cancelled) return;
+            if (next) setAccount(next);
+            if (next?.has_billing_account) break;
+          }
+        }
       } catch {
         // Network hiccup: stay hidden; Settings must not block on billing.
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setAwaitingWebhook(false);
+        }
       }
     }
     void load();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [billingReturn]);
+
+  // Announce the outcome once, then strip the param so a refresh doesn't
+  // replay it.
+  useEffect(() => {
+    if (!billingReturn || announced.current) return;
+    announced.current = true;
+    if (billingReturn === 'success') {
+      toast({
+        variant: 'success',
+        title: 'Subscription active',
+        description: 'Thanks — your plan is updated below.',
+      });
+    } else if (billingReturn === 'cancelled') {
+      toast({
+        variant: 'info',
+        title: 'Checkout cancelled',
+        description: 'No charge was made. Your plan is unchanged.',
+      });
+    }
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('billing');
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [billingReturn, searchParams, pathname, router, toast]);
 
   async function redirectTo(path: string, body?: unknown) {
     setRedirecting(true);
@@ -113,6 +174,11 @@ export default function BillingCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className='flex flex-col gap-3'>
+        {awaitingWebhook && (
+          <Text variant='meta' className='text-text-secondary'>
+            Confirming your subscription…
+          </Text>
+        )}
         <Text variant='body'>
           Current plan:{' '}
           <span className='font-medium'>
