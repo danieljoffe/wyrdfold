@@ -168,8 +168,42 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install chromium --with-deps
+      # The Chromium download is the flakiest step in CI: it stalled twice in
+      # one day (27 min and 12 min, both on release PRs, both cleared by a
+      # re-run). Cache it so the common case never touches the network — see
+      # #883.
+      #
+      # Keyed on the resolved Playwright VERSION, not the lockfile hash, so an
+      # unrelated dependency bump still hits the cache.
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: |
+          echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
+
+      # Split from --with-deps deliberately: the OS packages below land via apt
+      # and are NOT inside the cached path, so they must run every time. Only
+      # the browser bundle is cacheable.
+      #
+      # timeout-minutes bounds the stall. Caching lowers how OFTEN the download
+      # happens; it cannot remove it (a version bump still misses). Without a
+      # step timeout a stall eats the job's full 30 minutes and, because it
+      # HANGS rather than errors, nothing retries it — someone has to notice.
+      # Five minutes is ~4x a healthy cold download.
+      - name: Install Playwright chromium (browser)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: pnpm exec playwright install chromium
+
+      - name: Install Playwright OS dependencies
+        timeout-minutes: 5
+        run: pnpm exec playwright install-deps chromium
 
       # ---- Zero-secret authed tier -------------------------------------
       # The authed Playwright projects need a real auth backend + the API.
