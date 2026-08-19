@@ -792,6 +792,42 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
     return crud.MAX_ACTIVE_TARGETS_PER_USER
 
 
+async def _raise_if_active_limit_async(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> None:
+    """Raise ``ActiveTargetLimitError`` if activating this link exceeds the cap.
+
+    Extracted so it can be called BEFORE expensive work as well as at the
+    write (#865). ``link_target`` used to derive — and CHARGE the user for —
+    an LLM fit score, and only then attempt the write that rejects on the
+    cap: the score was discarded and the user paid for a target they never
+    received. Same shape as #845, on the interactive side.
+
+    Keeps the write-time call too. This one is advisory: two concurrent
+    links can both pass it and only the upsert serializes, so the guard at
+    the write is what actually enforces. This exists to avoid paying for
+    work that guard will reject, not to replace it.
+
+    Re-activating a link that is ALREADY active is exempt — it changes no
+    count, so an idempotent refresh stays free.
+    """
+    existing_resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("is_active")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .limit(1)
+        .execute()
+    )
+    existing = cast(list[dict[str, Any]], existing_resp.data or [])
+    if existing and existing[0].get("is_active"):
+        return
+    current = await _count_active_for_user_async(supabase, user_id)
+    cap = await _effective_active_target_cap_async(supabase, user_id)
+    if current >= cap:
+        raise crud.ActiveTargetLimitError(current, cap)
+
+
 async def _active_target_choices(supabase: AsyncClient, user_id: str) -> list[dict[str, str]]:
     """``[{id, label}]`` for the user's currently-active targets.
 
@@ -926,21 +962,7 @@ async def _link_user_to_target_async(
     columns follow crud's conditional shape (written only when non-None) so the
     link route can stamp a freshly-derived score + its E2 version marker."""
     if is_active:
-        existing_resp = await (
-            supabase.table(crud.USER_TARGETS_TABLE)
-            .select("is_active")
-            .eq("user_id", user_id)
-            .eq("target_id", target_id)
-            .limit(1)
-            .execute()
-        )
-        existing = cast(list[dict[str, Any]], existing_resp.data or [])
-        already_active = bool(existing and existing[0].get("is_active"))
-        if not already_active:
-            current = await _count_active_for_user_async(supabase, user_id)
-            cap = await _effective_active_target_cap_async(supabase, user_id)
-            if current >= cap:
-                raise crud.ActiveTargetLimitError(current, cap)
+        await _raise_if_active_limit_async(supabase, user_id, target_id)
 
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -1860,6 +1882,17 @@ async def link_target(
     target = await _target_get(supabase, target_id)
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
+
+    # Cap FIRST, before the fit score below bills the user (#865). The write
+    # at the bottom raises the same error, but by then the LLM call has
+    # happened and been charged — for a link we are about to refuse. The
+    # failure fires exactly when someone is trying to add MORE targets, so
+    # without this a user bouncing off the cap burns quota with nothing to
+    # show for it. Both guards stay; see `_raise_if_active_limit_async`.
+    try:
+        await _raise_if_active_limit_async(supabase, user_id, target_id)
+    except crud.ActiveTargetLimitError as e:
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
 
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
