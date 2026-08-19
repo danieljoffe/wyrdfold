@@ -24,6 +24,20 @@ def test_entitlement_columns_immutable_to_user(
     uid, _other = two_seeded_users
     user = user_client_factory(uid)  # the exact per-request client a browser uses
 
+    # The seeded plan is whatever the column DEFAULT is — assert against THAT
+    # rather than a literal. This assertion is about the trigger pinning the
+    # column, not about which tier new accounts start on; hardcoding 'free'
+    # coupled a security test to an unrelated default and broke it when the
+    # trial tier landed (#841).
+    plan_before = (
+        service_client.table("user_profiles")
+        .select("plan")
+        .eq("user_id", uid)
+        .single()
+        .execute()
+        .data["plan"]
+    )
+
     # 1. Direct escalation attempt via the user's own client — PostgREST accepts
     #    the PATCH (row is theirs, RLS passes) but the trigger pins the columns.
     user.table("user_profiles").update(
@@ -43,7 +57,10 @@ def test_entitlement_columns_immutable_to_user(
         .execute()
         .data
     )
-    assert row["plan"] == "free", "entitlement escalation must be blocked"
+    assert row["plan"] == plan_before, "entitlement escalation must be blocked"
+    # Belt and braces: name the escalation we actually attempted, so this can
+    # never pass by the default coincidentally equalling the attacked value.
+    assert row["plan"] != "pro", "user client must not be able to self-upgrade to pro"
     assert row["llm_monthly_budget_usd"] is None
     assert row["max_active_targets"] is None
 
