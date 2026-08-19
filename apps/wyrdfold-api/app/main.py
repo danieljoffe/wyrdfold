@@ -61,7 +61,7 @@ _log = logging.getLogger("app")
 
 # Wire JSON logging before Sentry init so any boot-time errors land in
 # the configured format. No-op when LOG_FORMAT=text (the default).
-init_logging(settings.log_format)
+init_logging(settings.log_format, settings.log_level)
 init_sentry()
 
 

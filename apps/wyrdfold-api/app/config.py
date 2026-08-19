@@ -592,6 +592,10 @@ class Settings(BaseSettings):
     # root logger so log-aggregation tools can index each field. See
     # app/logging_config.py.
     log_format: Literal["text", "json"] = "text"
+    #: Root log level. Separate from ``log_format`` on purpose — they were
+    #: entangled once and production lost every INFO record for it (#862).
+    #: Tunable without a deploy so verbosity can be raised during an incident.
+    log_level: str = "INFO"
 
     # CORS — comma-separated allowlist of origins permitted to call the API
     # from a browser. Empty disables CORS (server-to-server only). Production

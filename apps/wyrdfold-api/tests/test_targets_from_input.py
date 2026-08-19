@@ -406,10 +406,14 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
     assert stub_llm_helpers.names().count("normalize") == 1
     assert "derive_from_label" not in stub_llm_helpers.names()
     assert "fit_score" not in stub_llm_helpers.names()
-    # Created from the canonical suggestion (label + description), empty profile.
+    # Created from the canonical suggestion's LABEL ONLY, empty profile.
     assert len(create_calls) == 1
     assert create_calls[0].label == "Senior Frontend Engineer"
-    assert create_calls[0].description == "Canonical description."
+    # The suggestion's description is résumé-informed and `targets` is the
+    # SHARED catalog — persisting it leaks one user's history to every
+    # co-follower and past their own account deletion (#868). Activation
+    # fills this from the label alone.
+    assert create_calls[0].description is None
     assert create_calls[0].search_keywords == []
     # Status flipped to 'deriving' inline.
     # 'deriving' is requested in the SAME atomic call as the insert — there is
@@ -629,9 +633,10 @@ async def test_from_suggestion_new_creates_without_normalize_call(
     assert result.target.activation_status == "deriving"
     # The distinguishing property: NO normalization LLM call.
     assert "normalize" not in stub_llm_helpers.names()
-    # Created straight from the (already-canonical) label + description.
+    # Created straight from the (already-canonical) LABEL — never the
+    # résumé-informed description (#868, see the sibling test).
     assert create_calls[0].label == "Senior Frontend Engineer"
-    assert create_calls[0].description == "Frontend roles."
+    assert create_calls[0].description is None
     # The link is created inside the atomic call now; it is always is_active
     # False there (following never trips the active cap), enforced by the RPC.
     assert create_users == ["user-1"]

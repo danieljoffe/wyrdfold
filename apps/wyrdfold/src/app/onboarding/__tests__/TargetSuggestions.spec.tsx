@@ -466,6 +466,59 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     });
   });
 
+  it('surfaces the refusal instead of advancing when every link is rejected', async () => {
+    // #857 / #864: the cap 409 and the trial 402 were both swallowed by a
+    // bare `catch {}`, and the wizard advanced to "You're all set!" — the
+    // user asked for targets, got none, and was told it worked.
+    const onComplete = jest.fn();
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-1' }),
+        });
+      }
+      if (typeof url === 'string' && /\/link$/.test(url)) {
+        const detail = "You're on Starter, which allows 2 active targets.";
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          clone: () => ({ json: async () => ({ detail }) }),
+          json: async () => ({ detail }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={onComplete} onSkip={jest.fn()} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    // The API's own message, verbatim — it names the cap and the plan.
+    expect(
+      await screen.findByText(/allows 2 active targets/i)
+    ).toBeInTheDocument();
+
+    // And it must NOT sail on to the completion screen. Waiting past the
+    // 1500ms auto-advance so this can't pass by simply being early.
+    await new Promise(r => setTimeout(r, 1800));
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
   it('reports the created count via onTargetsCreated (completion-copy input)', async () => {
     // CompletionScreen branches its copy on this number (sweep
     // 2026-08-14 P2): a zero-target finish must not claim "all set".
@@ -561,6 +614,50 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
         url === '/api/targets' && init?.method === 'POST'
     );
     expect(targetPosts.length).toBe(0);
+  });
+
+  it('creates the target from the label alone, never the résumé-informed blurb', async () => {
+    // #868: the suggestion's description is written from the user's résumé
+    // ("…given your work at <employer>"). `targets` is the SHARED catalog —
+    // co-followers can read it and it outlives the author's account. The
+    // rationale still renders on the card; it must not be persisted.
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-1' }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, init]: [string, RequestInit | undefined]) =>
+          url === '/api/targets' && init?.method === 'POST'
+      );
+      expect(post).toBeDefined();
+      const body = JSON.parse((post![1] as RequestInit).body as string);
+      expect(body.label).toBe('Frontend Engineer');
+      expect(body.description).toBeUndefined();
+    });
   });
 
   it('invokes onSkip when "Skip this step" is clicked from the manual fallback', async () => {

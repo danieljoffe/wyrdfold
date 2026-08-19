@@ -76,7 +76,15 @@ export default function ConversationChat({
         const res = await fetch(
           '/api/career/experience/conversation/next-probe'
         );
-        if (!res.ok) throw new Error('Failed to load question');
+        if (!res.ok) {
+          // Carry the API's own message. `!res.ok` used to collapse every
+          // status into "Please try again", which is wrong advice for the
+          // one that actually happens here: a 402 is permanent for this
+          // account, so retrying can never succeed and the user is invited
+          // to loop on a dead action (#857). Empty fallback so we can tell
+          // "the API explained itself" from "we only had a status code".
+          throw new Error(await extractApiError(res, ''));
+        }
         const data = (await res.json()) as {
           question: string;
           gap?: { context?: string | null } | null;
@@ -87,9 +95,20 @@ export default function ConversationChat({
           ]);
           setProbeContext(data.gap?.context ?? null);
         }
-      } catch {
-        if (!cancelled)
-          setError('Could not start conversation. Please try again.');
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message.trim() : '';
+          // A message shaped like "(500)" means ``extractApiError`` only had
+          // a status code to work with — prefer the friendly fallback there.
+          // A real detail ("Your free trial has ended…") wins. Same idiom as
+          // TargetSuggestions' create-from-posting path.
+          const onlyStatus = /^\(\d+\)$/.test(message);
+          setError(
+            message && !onlyStatus
+              ? message
+              : 'Could not start conversation. Please try again.'
+          );
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
