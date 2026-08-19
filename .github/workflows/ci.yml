@@ -195,14 +195,26 @@ jobs:
       # happens; it cannot remove it (a version bump still misses). Without a
       # step timeout a stall eats the job's full 30 minutes and, because it
       # HANGS rather than errors, nothing retries it — someone has to notice.
-      # Five minutes is ~4x a healthy cold download.
+      #
+      # The two budgets are deliberately very different, measured rather than
+      # guessed (first run of this change):
+      #   browser download, cold  ->  12s   (so the 27- and 12-minute stalls
+      #                                     seen on releases were pathological,
+      #                                     not "slow" — 5 min is ~25x headroom)
+      #   install-deps (apt)      -> 312s   on a run where the azure mirror was
+      #                                     unreachable and it fell back to
+      #                                     archive.ubuntu.com
+      #
+      # apt is NOT the flaky step this issue is about; bounding it tightly buys
+      # nothing and fails good builds on a bad-mirror day. 15 min is ~3x the
+      # slow observation while still catching a true hang before the job cap.
       - name: Install Playwright chromium (browser)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         timeout-minutes: 5
         run: pnpm exec playwright install chromium
 
       - name: Install Playwright OS dependencies
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: pnpm exec playwright install-deps chromium
 
       # ---- Zero-secret authed tier -------------------------------------
