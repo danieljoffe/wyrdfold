@@ -551,3 +551,64 @@ class TestActivateWithSwap:
 
         assert flips == []  # no deactivation at all
         linked.assert_awaited_once()
+
+
+# ---- the cap is checked BEFORE the fit score is billed (#865) ---------------
+
+
+async def test_link_route_refuses_at_cap_without_deriving_a_fit_score() -> None:
+    """`link_target` must not pay for work the cap is about to reject.
+
+    The fit score is an LLM call and is charged to the user via
+    `cost_log.record_async`. It used to run BEFORE the write that raises on
+    the active-target cap, so a refused link still cost the user quota — and
+    it fires exactly when someone is trying to add MORE targets, i.e. when
+    they are most engaged. Same shape as #845, on the interactive side.
+    """
+    from app.routers import targets as targets_router
+
+    called: dict[str, bool] = {"derived": False, "charged": False}
+
+    async def _never_derive(*_a: object, **_k: object) -> object:
+        called["derived"] = True
+        raise AssertionError("fit score derived despite the cap being full")
+
+    async def _never_charge(*_a: object, **_k: object) -> None:
+        called["charged"] = True
+        raise AssertionError("user charged despite the cap being full")
+
+    async def _at_cap(*_a: object, **_k: object) -> None:
+        raise crud.ActiveTargetLimitError(current_count=2, limit=2)
+
+    async def _target(*_a: object, **_k: object) -> object:
+        return MagicMock(id="t-new")
+
+    async def _choices(*_a: object, **_k: object) -> list[dict[str, str]]:
+        return [{"id": "t-old", "label": "Staff Frontend Engineer"}]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(targets_router, "_target_get", _target)
+        mp.setattr(targets_router, "_raise_if_active_limit_async", _at_cap)
+        mp.setattr(targets_router, "_active_target_choices", _choices)
+        mp.setattr(targets_router, "resolve_current_payload", _never_derive)
+        mp.setattr(targets_router, "derive_fit_score", _never_derive)
+        mp.setattr(targets_router.cost_log, "record_async", _never_charge)
+
+        with pytest.raises(HTTPException) as exc:
+            await targets_router.link_target(
+                request=MagicMock(),
+                target_id="t-new",
+                supabase=MagicMock(),
+                llm=MagicMock(),
+                user_id="user-1",
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "ACTIVE_LIMIT"
+    # The point of the test: neither happened.
+    assert called["derived"] is False, "no LLM call may precede the cap check"
+    assert called["charged"] is False, "the user must not be billed for a refused link"
+    # The 409 still carries what the client needs to offer a swap.
+    assert exc.value.detail["active_targets"] == [
+        {"id": "t-old", "label": "Staff Frontend Engineer"}
+    ]
