@@ -84,8 +84,12 @@ def test_formatter_includes_exception_traceback() -> None:
     assert "ValueError: boom" in payload["exc_info"]
 
 
-def test_init_logging_text_is_noop(caplog: pytest.LogCaptureFixture) -> None:
-    """Default `text` must not touch root handlers."""
+def test_init_logging_text_leaves_handlers_alone(caplog: pytest.LogCaptureFixture) -> None:
+    """Default `text` must not touch root HANDLERS.
+
+    It does set the root LEVEL — see the level tests below. Formatting and
+    verbosity are deliberately separate concerns (#862).
+    """
     root = logging.getLogger()
     before = list(root.handlers)
     init_logging("text")
@@ -142,3 +146,56 @@ def test_json_handler_writes_to_stdout() -> None:
     payload = json.loads(line)
     assert payload["message"] == "ingested job"
     assert payload["job_id"] == "j-1"
+
+
+# ---- level is independent of format (#862) ----------------------------------
+#
+# These exist because the two were entangled: `setLevel` lived inside the
+# json-only branch, so production (LOG_FORMAT unset -> "text") silently
+# discarded every application logger.info. uvicorn's own access logger kept
+# emitting at INFO, which made the gap look like ordinary traffic.
+
+
+@pytest.fixture
+def restore_root_level():
+    root = logging.getLogger()
+    before = root.level
+    yield
+    root.setLevel(before)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_app_loggers_emit_info_whatever_the_format(fmt: str, restore_root_level: None) -> None:
+    """The property that actually matters: after init, an application logger
+    is enabled for INFO. Asserted for BOTH formats — the bug was that one of
+    them silently was not."""
+    app_logger = logging.getLogger("app.routers.billing")
+
+    # Precondition, so this cannot pass vacuously: at the stdlib default the
+    # logger is NOT enabled for INFO. That default is exactly what production
+    # was running on.
+    logging.getLogger().setLevel(logging.WARNING)
+    assert not app_logger.isEnabledFor(logging.INFO)
+
+    init_logging(fmt)
+
+    assert app_logger.isEnabledFor(logging.INFO), (
+        f"LOG_FORMAT={fmt!r} must not decide whether INFO records survive"
+    )
+
+
+def test_explicit_level_is_honoured(restore_root_level: None) -> None:
+    init_logging("text", "WARNING")
+    assert not logging.getLogger("app.routers.billing").isEnabledFor(logging.INFO)
+    assert logging.getLogger("app.routers.billing").isEnabledFor(logging.WARNING)
+
+    init_logging("text", "debug")  # case-insensitive
+    assert logging.getLogger("app.routers.billing").isEnabledFor(logging.DEBUG)
+
+
+def test_unknown_level_falls_back_to_info_not_silence(restore_root_level: None) -> None:
+    """A typo in LOG_LEVEL must not silence the application. Failing loud is
+    the safe direction for an observability setting."""
+    logging.getLogger().setLevel(logging.WARNING)
+    init_logging("text", "verbose-please")
+    assert logging.getLogger("app.routers.billing").isEnabledFor(logging.INFO)
