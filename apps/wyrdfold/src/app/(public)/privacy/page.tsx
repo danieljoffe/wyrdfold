@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
+import { LEGAL_ENTITY_ADDRESS, LEGAL_ENTITY_NAME } from '@/lib/legalEntity';
 
 // Placeholder — confirm the real legal-contact mailbox before publishing.
 const CONTACT_EMAIL = 'privacy@wyrdfold.com';
@@ -17,10 +18,10 @@ const SECTIONS: LegalSection[] = [
     heading: 'Who we are',
     body: (
       <p>
-        WyrdFold (“we”, “us”) is operated by [Legal Entity Name], [registered
-        address]. This policy explains what personal data we process when you
-        use WyrdFold and the choices you have. For any privacy question, contact
-        us at{' '}
+        WyrdFold (“we”, “us”) is operated by {LEGAL_ENTITY_NAME},{' '}
+        {LEGAL_ENTITY_ADDRESS}. This policy explains what personal data we
+        process when you use WyrdFold and the choices you have. For any privacy
+        question, contact us at{' '}
         <a
           className='underline underline-offset-2'
           href={`mailto:${CONTACT_EMAIL}`}
@@ -232,7 +233,7 @@ const SECTIONS: LegalSection[] = [
         >
           {CONTACT_EMAIL}
         </a>{' '}
-        or write to [Legal Entity Name], [registered address].
+        or write to {LEGAL_ENTITY_NAME}, {LEGAL_ENTITY_ADDRESS}.
       </p>
     ),
   },
