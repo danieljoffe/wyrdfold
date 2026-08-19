@@ -14,6 +14,7 @@ Pins the tier model's behavioral contract:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,7 +22,7 @@ import pytest
 
 from app.config import settings
 from app.services import entitlements as ent
-from app.services.llm import MissingUserKeyError, budget, get_client
+from app.services.llm import MissingUserKeyError, TrialExpiredError, budget, get_client
 from app.services.targets import crud
 
 _UID = "00000000-0000-0000-0000-000000000042"
@@ -414,3 +415,147 @@ def test_target_cap_tier_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "deployment_mode", "self_host")
     sb = _profile_supabase([{"max_active_targets": None, "plan": "pro"}])
     assert crud.effective_active_target_cap(sb, _UID) == crud.MAX_ACTIVE_TARGETS_PER_USER
+
+
+# ---- trial tier (#841) ------------------------------------------------------
+#
+# The trial exists because 'free' is BYOK and this deployment has no
+# BYOK_MASTER_KEY, so a new account could not complete onboarding at all.
+# These pin the two properties that make a trial safe to hand a stranger:
+# a HOST key (so it works) and a ceiling that counts BACKGROUND spend
+# (so an idle account cannot sit there costing money for free).
+
+
+def test_trial_uses_host_keys_so_onboarding_works() -> None:
+    """The whole point of #841: a trial account must NOT be BYOK."""
+    trial = ent.entitlements_for("trial")
+    assert trial.llm_key_source == "host"
+    assert trial.monthly_billable_budget_usd == settings.trial_billable_budget_usd
+    assert trial.max_active_targets == settings.trial_max_active_targets
+
+
+def test_trial_counts_background_against_its_ceiling() -> None:
+    """A trial has no subscription behind it, so background spend must
+    consume its own ceiling — otherwise the ceiling bounds only the cheap
+    half. Paid tiers deliberately differ."""
+    trial = ent.entitlements_for("trial")
+    # Assert the precondition too: `quota_excluded_purposes is None` is also
+    # true of 'free', so on its own it would pass even if the trial branch
+    # were deleted entirely and 'trial' fell through to free.
+    assert trial.llm_key_source == "host"
+    assert trial.quota_excluded_purposes is None
+    for paid in ("starter", "pro"):
+        assert ent.entitlements_for(paid).quota_excluded_purposes == ent.NON_BILLABLE_PURPOSES
+
+
+def test_quota_saas_trial_counts_every_purpose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end through the resolver, not just the entitlement: a trial's
+    monthly sum excludes NOTHING."""
+    q = _quota(
+        monkeypatch,
+        mode="saas",
+        has_key=False,
+        rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "trial"}],
+    )
+    assert q.monthly_cap_usd == settings.trial_billable_budget_usd
+    assert q.monthly_excluded_purposes is None, "background must count against a trial"
+
+
+# ---- trial_expired ----------------------------------------------------------
+
+_NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+
+
+def test_trial_expired_only_after_the_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "trial_days", 3)
+    fresh = _NOW - timedelta(days=2, hours=23)
+    lapsed = _NOW - timedelta(days=3, seconds=1)
+
+    assert ent.trial_expired("trial", fresh, now=_NOW) is False
+    assert ent.trial_expired("trial", lapsed, now=_NOW) is True
+
+
+def test_trial_expired_is_false_for_every_other_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A paid account has no clock, and 'free' is refused by the BYOK gate
+    rather than by time — neither may be told their trial ended."""
+    monkeypatch.setattr(settings, "trial_days", 3)
+    ancient = _NOW - timedelta(days=999)
+    for plan in ("free", "starter", "pro", None, "enterprise"):
+        assert ent.trial_expired(plan, ancient, now=_NOW) is False
+
+
+def test_missing_stamp_is_not_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail OPEN on a data anomaly: walling a user mid-evaluation is worse
+    than letting the spend ceiling do the bounding."""
+    monkeypatch.setattr(settings, "trial_days", 3)
+    assert ent.trial_expired("trial", None, now=_NOW) is False
+
+
+def test_naive_stamp_is_treated_as_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "trial_days", 3)
+    naive = (_NOW - timedelta(days=10)).replace(tzinfo=None)
+    assert ent.trial_expired("trial", naive, now=_NOW) is True
+
+
+def test_parse_trial_stamp_degrades_to_none() -> None:
+    """Unparseable → None → 'not expired'. Never raises into the gate."""
+    assert ent.parse_trial_stamp(None) is None
+    assert ent.parse_trial_stamp("") is None
+    assert ent.parse_trial_stamp("not-a-date") is None
+    parsed = ent.parse_trial_stamp("2026-08-19T12:00:00Z")
+    assert parsed == _NOW
+
+
+# ---- get_client: the trial gate --------------------------------------------
+
+
+def test_get_client_active_trial_gets_the_host_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The regression that #841 is about: an active trial must be SERVED."""
+    monkeypatch.setattr(settings, "trial_days", 3)
+    client = _client_probe(
+        monkeypatch,
+        mode="saas",
+        plan_rows=[{"plan": "trial", "trial_started_at": datetime.now(UTC).isoformat()}],
+    )
+    assert client is not None
+
+
+def test_get_client_expired_trial_says_subscribe_not_add_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lapsed trial raises TrialExpiredError, NOT MissingUserKeyError —
+    the two produce different user-facing instructions and a trial user
+    cannot act on 'add your own API key'."""
+    monkeypatch.setattr(settings, "trial_days", 3)
+    stale = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    with pytest.raises(TrialExpiredError):
+        _client_probe(
+            monkeypatch, mode="saas", plan_rows=[{"plan": "trial", "trial_started_at": stale}]
+        )
+
+
+def test_expired_trial_still_served_when_they_have_their_own_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored BYOK key wins over every plan verdict — their key, their
+    bill, so an expired trial is irrelevant."""
+    import app.services.llm as llm_mod
+
+    monkeypatch.setattr(settings, "trial_days", 3)
+    monkeypatch.setattr(settings, "llm_provider", "openrouter")
+    monkeypatch.setattr(settings, "deployment_mode", "saas")
+    monkeypatch.setattr(settings, "byok_require_user_keys", False)
+    monkeypatch.setattr(llm_mod, "_user_byok_key", lambda sb, uid: "sk-or-THEIRS")
+    stale = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    client = get_client(_profile_supabase([{"plan": "trial", "trial_started_at": stale}]), _UID)
+    assert client is not None
+
+
+def test_self_host_ignores_the_trial_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """self_host has no tiers at all — the instance key IS the owner's."""
+    monkeypatch.setattr(settings, "trial_days", 3)
+    stale = (datetime.now(UTC) - timedelta(days=999)).isoformat()
+    client = _client_probe(
+        monkeypatch, mode="self_host", plan_rows=[{"plan": "trial", "trial_started_at": stale}]
+    )
+    assert client is not None

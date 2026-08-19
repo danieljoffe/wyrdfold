@@ -39,6 +39,9 @@ class LlmAccount(NamedTuple):
     monthly_override_usd: float | None
     llm_enabled: bool
     plan: str | None
+    #: Only meaningful when ``plan == "trial"``; see
+    #: ``entitlements.trial_expired``. NULL is "unknown", not "expired".
+    trial_started_at: datetime | None = None
 
 
 def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
@@ -49,10 +52,12 @@ def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
     operator kill-switch; missing rows default to enabled. ``plan`` feeds
     the tier resolution in :func:`resolve_llm_quota` (saas mode only).
     """
+    from app.services import entitlements as ent_mod
+
     rows = cast(
         list[dict[str, Any]],
         supabase.table("user_profiles")
-        .select("llm_monthly_budget_usd,llm_enabled,plan")
+        .select("llm_monthly_budget_usd,llm_enabled,plan,trial_started_at")
         .eq("user_id", user_id)
         .execute()
         .data
@@ -61,10 +66,12 @@ def get_llm_account(supabase: Client, *, user_id: str) -> LlmAccount:
     override = rows[0].get("llm_monthly_budget_usd") if rows else None
     enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
     plan = cast("str | None", rows[0].get("plan")) if rows else None
+    started = ent_mod.parse_trial_stamp(rows[0].get("trial_started_at")) if rows else None
     return LlmAccount(
         monthly_override_usd=(float(cast(float, override)) if override is not None else None),
         llm_enabled=enabled,
         plan=plan,
+        trial_started_at=started,
     )
 
 
@@ -72,9 +79,11 @@ async def get_llm_account_async(supabase: AsyncClient, *, user_id: str) -> LlmAc
     """Async mirror of :func:`get_llm_account` (#57 PR-G2c) for ``async def``
     callers on the pooled async service client (billing + the quota resolver).
     Identical shape + defaults; the sync version stays for the sync resolver."""
+    from app.services import entitlements as ent_mod
+
     resp = await (
         supabase.table("user_profiles")
-        .select("llm_monthly_budget_usd,llm_enabled,plan")
+        .select("llm_monthly_budget_usd,llm_enabled,plan,trial_started_at")
         .eq("user_id", user_id)
         .execute()
     )
@@ -82,10 +91,12 @@ async def get_llm_account_async(supabase: AsyncClient, *, user_id: str) -> LlmAc
     override = rows[0].get("llm_monthly_budget_usd") if rows else None
     enabled = bool(rows[0].get("llm_enabled", True)) if rows else True
     plan = cast("str | None", rows[0].get("plan")) if rows else None
+    started = ent_mod.parse_trial_stamp(rows[0].get("trial_started_at")) if rows else None
     return LlmAccount(
         monthly_override_usd=(float(cast(float, override)) if override is not None else None),
         llm_enabled=enabled,
         plan=plan,
+        trial_started_at=started,
     )
 
 
@@ -144,7 +155,7 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
             if account.monthly_override_usd is not None
             else cast(float, entitlement.monthly_billable_budget_usd)
         )
-        return ResolvedQuota(cap, account.llm_enabled, ent.NON_BILLABLE_PURPOSES)
+        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes)
 
     cap = (
         account.monthly_override_usd
@@ -186,7 +197,7 @@ async def resolve_llm_quota_async(supabase: AsyncClient, *, user_id: str) -> Res
             if account.monthly_override_usd is not None
             else cast(float, entitlement.monthly_billable_budget_usd)
         )
-        return ResolvedQuota(cap, account.llm_enabled, ent.NON_BILLABLE_PURPOSES)
+        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes)
 
     cap = (
         account.monthly_override_usd

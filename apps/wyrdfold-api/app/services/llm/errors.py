@@ -38,6 +38,26 @@ class MissingUserKeyError(Exception):
         super().__init__(f"no {provider} API key on file for this user")
 
 
+class TrialExpiredError(Exception):
+    """The account's trial window has closed (#841).
+
+    Raised by ``app.services.llm.get_client``/``get_client_async`` in place
+    of :class:`MissingUserKeyError` when the plan is ``trial`` and the clock
+    has run out. Kept as its own type for one reason: both refusals are a
+    402, but they demand opposite things of the user — one says "add your
+    own API key", the other says "subscribe". Collapsing them would put the
+    BYOK message in front of trial users, which is exactly the dead end #841
+    was filed about.
+
+    Like ``MissingUserKeyError``, deliberately NOT an ``LLMServiceError``:
+    an expired trial is an expected, actionable state, not a fault worth a
+    Sentry alert.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("trial window has expired for this user")
+
+
 class MissingToolCallError(ValueError):
     """The model answered in PROSE instead of emitting the forced tool call.
 

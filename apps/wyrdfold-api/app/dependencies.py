@@ -143,13 +143,20 @@ async def get_llm_client(
     The BYOK key + plan reads run natively on the pooled async service client.
     A route's own auth dependency still governs access.
     """
-    from app.services.llm import MissingUserKeyError, get_client_async
+    from app.services.llm import MissingUserKeyError, TrialExpiredError, get_client_async
     from app.supabase_pool import get_async_supabase
 
     user_id = await _try_decode_jwt_sub_async(request, s)
     supabase = get_async_supabase()
     try:
         return await get_client_async(supabase, user_id)
+    except TrialExpiredError as exc:
+        # Same 402, deliberately different instruction: this user cannot act
+        # on "add an API key" (#841). Keep the two messages distinct.
+        raise HTTPException(
+            status_code=402,
+            detail="Your free trial has ended. Subscribe in Settings to keep using AI features.",
+        ) from exc
     except MissingUserKeyError as exc:
         raise HTTPException(
             status_code=402,

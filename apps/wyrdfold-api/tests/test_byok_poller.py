@@ -139,3 +139,31 @@ async def test_resolve_payer_client_none_payer_uses_instance_key(monkeypatch):
 
     assert client is not None
     assert seen_user == [None]
+
+
+async def test_expired_trial_defers_background_grading(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lapsed trial must stop costing money without a separate sweep (#841).
+
+    Reuses the existing defer path: the payer resolves to None, so callers
+    leave those jobs promising / score NULL exactly as they do for a payer
+    with no BYOK key. Verified via the same `None` verdict AND its own log
+    reason, so the two causes stay distinguishable in prod.
+    """
+    from app.services.llm import TrialExpiredError
+
+    async def fake_get_client(_supabase, _user_id):
+        raise TrialExpiredError()
+
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=poller_mod.logger.name):
+        verdict = await poller_mod._resolve_payer_client({}, MagicMock(), "lapsed-payer")
+
+    assert verdict is None, "an expired trial must not bill the operator key"
+    assert "trial expired" in caplog.text
+    # Must not be misattributed to the BYOK cause — that would send an
+    # operator to check BYOK_REQUIRE_USER_KEYS for a billing problem.
+    assert "BYOK" not in caplog.text
