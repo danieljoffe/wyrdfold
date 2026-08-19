@@ -3251,6 +3251,38 @@ async def _user_set_scores_included_async(
     ).execute()
 
 
+async def _user_admit_score_async(
+    supabase: AsyncClient, job_posting_id: str, target_id: str
+) -> None:
+    """Admit a deliberately-added posting into the target's pipeline (#830).
+
+    ``target-membership`` — what draws the "✓ In <target>" badge and unlocks
+    match/tailor — requires ``promising IS TRUE``, not merely a scores row.
+    ``add-to-target`` stage-2 scores the pair and force-includes it, but never
+    set ``promising``, so an explicit user add produced a row the badge logic
+    excludes BY CONSTRUCTION: the UI flipped to a bound state optimistically,
+    and a reload showed no trace of it.
+
+    ``promising`` was introduced as the Phase-1 triage verdict, so setting it
+    here widens its meaning from "Phase 1 admitted this" to "something admitted
+    this" — with the user as the other admitting authority. That is the honest
+    reading: the column gates pipeline membership, and a user asking for a job
+    to be in a target is a stronger signal than a title-only LLM guess. Kept as
+    its own helper (not folded into the RPC) so the widening is greppable.
+
+    Service-role: ``scores`` writes are not user-writable, same as the
+    force-include beside it. Module-level so no bare ``.execute()`` sits in a
+    handler body (the #107 guard).
+    """
+    await (
+        supabase.table("scores")
+        .update({"promising": True})
+        .eq("job_posting_id", job_posting_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+
+
 async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
     """Load a LIVE, US posting's scoring inputs (title + JD body) by id, or None.
 
@@ -3351,9 +3383,10 @@ async def add_job_to_target(
 
     # Best-effort bookkeeping AFTER the score row is committed (mirrors
     # materialize_and_score_job): a transient failure in any of these must not
-    # fail the whole action — the score (the core effect) is already written, so
-    # a 500 here would read as "nothing happened" when the job IS scored and
-    # will show under the target. Each step is independent and logged.
+    # fail the whole action — the score (the core effect) is already written.
+    # NB this block used to claim the job "will show under the target" off the
+    # back of that score alone. It did not: membership needs `promising` too,
+    # which is step 2 below and was the whole of #830.
     #  1. Force-include under THIS one target so a negative-keyword ``excluded``
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
@@ -3361,6 +3394,14 @@ async def add_job_to_target(
         await _user_set_scores_included_async(service_supabase, job_id, [body.target_id])
     except Exception:
         logger.exception("add-to-target force-include failed for job %s", job_id)
+    #  2. Admit it into the pipeline (#830). `excluded=False` alone is not
+    #     membership — `target-membership` also requires `promising IS TRUE`,
+    #     so without this the badge, match and tailor stay locked and a reload
+    #     erases every trace of the add.
+    try:
+        await _user_admit_score_async(service_supabase, job_id, body.target_id)
+    except Exception:
+        logger.exception("add-to-target admit failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
     #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
