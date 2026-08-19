@@ -141,7 +141,15 @@ export default function SettingsPage() {
   // on first render so the two never disagree about the initial tab. No
   // activeTab state — nothing here renders differently by tab (unlike
   // TargetDetail's lazy JD fetch); the URL is the only consumer.
-  const initialTabRef = useRef(parseTab(searchParams.get('tab')));
+  // Returning from Stripe (?billing=success|cancelled) must land on the
+  // Account tab — the card that reflects what just happened. Without this
+  // the user lands on Preferences (export styles, score threshold) after
+  // paying, and never sees their new plan (#863).
+  const initialTabRef = useRef(
+    searchParams.get('billing')
+      ? ('account' as const)
+      : parseTab(searchParams.get('tab'))
+  );
 
   const handleTabChange = useCallback(
     (tabId: string) => {
