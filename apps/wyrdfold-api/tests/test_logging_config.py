@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import sys
 
 import pytest
 
@@ -159,9 +160,11 @@ def test_json_handler_writes_to_stdout() -> None:
 @pytest.fixture
 def restore_root_level():
     root = logging.getLogger()
-    before = root.level
+    before_level = root.level
+    before_handlers = list(root.handlers)
     yield
-    root.setLevel(before)
+    root.setLevel(before_level)
+    root.handlers[:] = before_handlers
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
@@ -199,3 +202,54 @@ def test_unknown_level_falls_back_to_info_not_silence(restore_root_level: None) 
     logging.getLogger().setLevel(logging.WARNING)
     init_logging("text", "verbose-please")
     assert logging.getLogger("app.routers.billing").isEnabledFor(logging.INFO)
+
+
+# ---- the level is NOT sufficient — records must actually be EMITTED --------
+#
+# The first pass at #862 asserted `isEnabledFor(INFO)` and shipped green while
+# production still dropped every INFO line. `isEnabledFor` is necessary and NOT
+# sufficient: uvicorn attaches handlers to its own loggers and never to root, so
+# a record can pass the level check, propagate to a handler-less root, and fall
+# through to `logging.lastResort` — which emits at WARNING and above only.
+#
+# These assert the property that actually matters: the text comes out.
+
+
+def _uvicorn_style_root() -> None:
+    """Root as uvicorn leaves it: WARNING, and NO handlers of its own."""
+    root = logging.getLogger()
+    root.handlers[:] = []
+    root.setLevel(logging.WARNING)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_info_records_are_actually_emitted(
+    fmt: str, capsys: pytest.CaptureFixture[str], restore_root_level: None
+) -> None:
+    _uvicorn_style_root()
+    app_logger = logging.getLogger("app.scheduler")
+
+    # Precondition: exactly the state that silently dropped INFO in production.
+    app_logger.info("before-init-should-not-appear")
+    assert "before-init-should-not-appear" not in capsys.readouterr().out
+
+    init_logging(fmt)
+    app_logger.info("after-init-sentinel")
+
+    assert "after-init-sentinel" in capsys.readouterr().out, (
+        f"LOG_FORMAT={fmt!r}: an INFO record must reach a handler, not merely pass the level check"
+    )
+
+
+def test_existing_root_handlers_are_not_duplicated(
+    capsys: pytest.CaptureFixture[str], restore_root_level: None
+) -> None:
+    """A host that configured its own handler keeps it, and records appear once."""
+    _uvicorn_style_root()
+    root = logging.getLogger()
+    root.addHandler(logging.StreamHandler(sys.stdout))
+
+    init_logging("text")
+    logging.getLogger("app.scheduler").warning("once-only-sentinel")
+
+    assert capsys.readouterr().out.count("once-only-sentinel") == 1
