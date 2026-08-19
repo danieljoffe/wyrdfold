@@ -30,7 +30,7 @@ from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
 from app.services.lever import fetch_lever_jobs
-from app.services.llm import MissingUserKeyError
+from app.services.llm import MissingUserKeyError, TrialExpiredError
 from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
@@ -1457,6 +1457,14 @@ async def _resolve_payer_client(
     if payer_user_id not in cache:
         try:
             cache[payer_user_id] = await get_llm_client_async(supabase, payer_user_id)
+        except TrialExpiredError:
+            # A lapsed trial stops costing money the moment it lapses: the
+            # same defer path as a missing key, so background grading halts
+            # without needing a separate sweep (#841).
+            logger.info(
+                "Background grading deferred for payer %s (trial expired)", payer_user_id
+            )
+            cache[payer_user_id] = None
         except MissingUserKeyError:
             logger.info(
                 "Background grading deferred for payer %s (no stored BYOK key; %s)",

@@ -828,6 +828,29 @@ class Settings(BaseSettings):
     free_max_active_targets: int = Field(default=1, ge=1)
     starter_max_active_targets: int = Field(default=2, ge=1)
     pro_max_active_targets: int = Field(default=5, ge=1)
+    # Trial tier (#841): a new account runs on HOST keys so onboarding works,
+    # bounded by BOTH a total spend ceiling and a duration.
+    #
+    # The ceiling is the real control and the duration is the backstop — an
+    # idle trial still costs money every poll cycle, so time-boxing is what
+    # stops background spend on an account that has stopped converting.
+    #
+    # Unlike starter/pro this budget counts BACKGROUND purposes too
+    # (``PlanEntitlements.quota_excluded_purposes is None``): a paid tier
+    # excludes them because a subscription is already paying for them, which
+    # a trial has nothing behind. Excluding them here would leave the ceiling
+    # bounding only the cheap half.
+    #
+    # The window is NOT a new mechanic — the budget guard's rolling window is
+    # ``MONTHLY_WINDOW_DAYS`` (30) and the trial is far shorter, so "spend in
+    # the last 30 days" IS "spend during the trial" for any trial account.
+    # Keep ``trial_days`` well under that or the ceiling stops being a total.
+    #
+    # Defaults are deliberately conservative — the repo is public, so the real
+    # values belong in the environment, not here.
+    trial_days: int = Field(default=3, ge=1)
+    trial_billable_budget_usd: float = Field(default=1.0, ge=0.0)
+    trial_max_active_targets: int = Field(default=1, ge=1)
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)

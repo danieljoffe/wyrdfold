@@ -19,11 +19,11 @@ string so cost-log rows can be grouped by feature for spend analysis.
 
 import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.client import LLMClient
-from app.services.llm.errors import MissingUserKeyError
+from app.services.llm.errors import MissingUserKeyError, TrialExpiredError
 from app.services.llm.mock import MockLLMClient, dev_default_responses
 from app.services.llm.openrouter_client import OpenRouterLLMClient
 
@@ -38,6 +38,7 @@ __all__ = [
     "MissingUserKeyError",
     "MockLLMClient",
     "OpenRouterLLMClient",
+    "TrialExpiredError",
     "get_client",
     "get_client_async",
     "get_default_client",
@@ -110,10 +111,13 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
        reads keys, so nothing hits a real API).
     2. logged-in user with a stored OpenRouter key → a client on **their**
        key, so their inference bills their OpenRouter account.
-    3. logged-in user, no key, ``BYOK_REQUIRE_USER_KEYS`` set →
-       ``MissingUserKeyError`` (hosted refuses to bill the operator's key
-       for a stranger).
-    4. otherwise → the instance env key (``get_default_client``): the
+    3. logged-in user, no key, plan is ``trial`` and the window has closed
+       → ``TrialExpiredError`` (402 "subscribe"). Checked before 4 so a
+       lapsed trial is never told to go and get an API key (#841).
+    4. logged-in user, no key, ``BYOK_REQUIRE_USER_KEYS`` set OR the plan
+       is BYOK (the saas free tier) → ``MissingUserKeyError`` (hosted
+       refuses to bill the operator's key for a stranger).
+    5. otherwise → the instance env key (``get_default_client``): the
        single-tenant self-host default, behavior unchanged.
 
     ``user_id`` is None for api-key / cron / poller / batch callers — they
@@ -137,44 +141,81 @@ def get_client(supabase: "Client | None", user_id: str | None) -> LLMClient:
                 settings.openrouter_timeout_seconds,
                 settings.openrouter_max_retries,
             )
+        # Order matters: an expired trial is checked FIRST so its user gets
+        # "subscribe", not "add your own API key". Both are a 402, but they
+        # ask for opposite things and a lapsed trial user has no reason to
+        # own an OpenRouter key (#841).
+        gate = _plan_gate(supabase, user_id)
+        if gate.trial_expired:
+            raise TrialExpiredError()
         # Global flag (the pre-tier hosted posture) OR the user's plan
         # requires their own key (saas free tier, Phase 3 slice 2).
-        if settings.byok_require_user_keys or _plan_requires_byok(supabase, user_id):
+        if settings.byok_require_user_keys or gate.requires_byok:
             raise MissingUserKeyError("openrouter")
 
     return get_default_client()
 
 
-def _plan_requires_byok(supabase: "Client", user_id: str) -> bool:
-    """saas free tier ⇒ the user's own key is required (Phase 3 slice 2).
+class _PlanGate(NamedTuple):
+    """What the caller's plan says about serving them a host-key client.
+
+    Two independent verdicts because they produce different 402s:
+    ``requires_byok`` → "add your own API key", ``trial_expired`` →
+    "subscribe". See ``dependencies.get_llm_client``.
+    """
+
+    requires_byok: bool
+    trial_expired: bool
+
+
+_GATE_OPEN = _PlanGate(requires_byok=False, trial_expired=False)
+
+
+def _plan_gate(supabase: "Client", user_id: str) -> _PlanGate:
+    """saas plan gate: does this account get the host key? (#841)
 
     Only consulted when the user has NO stored key (a stored key always
     wins above). Binds in saas mode only — self_host keeps the env-key
-    fallback untouched (the instance key IS the owner's BYOK). A missing
-    or unreadable profile row resolves to 'free', the safe-for-cost
-    posture: never bill the host key for an unknown account.
+    fallback untouched (the instance key IS the owner's BYOK).
+
+    A missing or unreadable profile row resolves to 'free', the
+    safe-for-cost posture: never bill the host key for an unknown account.
+    Note that failure mode deliberately does NOT resolve to "trial
+    expired" — an unknown account is refused for being unknown, and
+    telling it to subscribe would be a guess.
     """
     from typing import Any, cast
 
     from app.config import settings
 
     if settings.deployment_mode != "saas":
-        return False
+        return _GATE_OPEN
 
-    from app.services.entitlements import entitlements_for
+    from app.services.entitlements import entitlements_for, parse_trial_stamp, trial_expired
 
     plan: str | None = None
+    started = None
     try:
-        resp = supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
+        resp = (
+            supabase.table("user_profiles")
+            .select("plan,trial_started_at")
+            .eq("user_id", user_id)
+            .execute()
+        )
         rows = cast("list[dict[str, Any]]", resp.data or [])
-        plan = cast("str | None", rows[0].get("plan")) if rows else None
+        if rows:
+            plan = cast("str | None", rows[0].get("plan"))
+            started = parse_trial_stamp(rows[0].get("trial_started_at"))
     except Exception:
         logger.warning(
             "plan lookup failed for user=%s — treating as free (BYOK required)",
             user_id,
             exc_info=True,
         )
-    return entitlements_for(plan).llm_key_source == "byok"
+    return _PlanGate(
+        requires_byok=entitlements_for(plan).llm_key_source == "byok",
+        trial_expired=trial_expired(plan, started),
+    )
 
 
 def _user_byok_key(supabase: "Client", user_id: str) -> str | None:
@@ -221,37 +262,52 @@ async def get_client_async(supabase: "AsyncClient | None", user_id: str | None) 
                 settings.openrouter_timeout_seconds,
                 settings.openrouter_max_retries,
             )
-        if settings.byok_require_user_keys or await _plan_requires_byok_async(supabase, user_id):
+        # Expired trial first — see the sync twin for why the order matters.
+        gate = await _plan_gate_async(supabase, user_id)
+        if gate.trial_expired:
+            raise TrialExpiredError()
+        if settings.byok_require_user_keys or gate.requires_byok:
             raise MissingUserKeyError("openrouter")
 
     return get_default_client()
 
 
-async def _plan_requires_byok_async(supabase: "AsyncClient", user_id: str) -> bool:
-    """Async mirror of :func:`_plan_requires_byok` (#57 PR-G2e-1). Same saas-only
-    'free tier ⇒ own key required' rule and safe-for-cost default (a missing or
-    unreadable profile resolves to 'free'), awaited on the async client."""
+async def _plan_gate_async(supabase: "AsyncClient", user_id: str) -> _PlanGate:
+    """Async mirror of :func:`_plan_gate` (#57 PR-G2e-1). Same saas-only rule,
+    same safe-for-cost default (a missing or unreadable profile resolves to
+    'free', never to 'trial expired'), awaited on the async client."""
     from typing import Any, cast
 
     from app.config import settings
 
     if settings.deployment_mode != "saas":
-        return False
+        return _GATE_OPEN
 
-    from app.services.entitlements import entitlements_for
+    from app.services.entitlements import entitlements_for, parse_trial_stamp, trial_expired
 
     plan: str | None = None
+    started = None
     try:
-        resp = await supabase.table("user_profiles").select("plan").eq("user_id", user_id).execute()
+        resp = await (
+            supabase.table("user_profiles")
+            .select("plan,trial_started_at")
+            .eq("user_id", user_id)
+            .execute()
+        )
         rows = cast("list[dict[str, Any]]", resp.data or [])
-        plan = cast("str | None", rows[0].get("plan")) if rows else None
+        if rows:
+            plan = cast("str | None", rows[0].get("plan"))
+            started = parse_trial_stamp(rows[0].get("trial_started_at"))
     except Exception:
         logger.warning(
             "plan lookup failed for user=%s — treating as free (BYOK required)",
             user_id,
             exc_info=True,
         )
-    return entitlements_for(plan).llm_key_source == "byok"
+    return _PlanGate(
+        requires_byok=entitlements_for(plan).llm_key_source == "byok",
+        trial_expired=trial_expired(plan, started),
+    )
 
 
 async def _user_byok_key_async(supabase: "AsyncClient", user_id: str) -> str | None:

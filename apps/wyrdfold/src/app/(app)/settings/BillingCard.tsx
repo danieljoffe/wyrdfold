@@ -19,6 +19,7 @@ import { useToast } from '@/state/Toast/ToastProvider';
 // plans to Stripe Prices; a drifted label here can't change what's billed.
 const PLAN_LABELS: Record<string, string> = {
   free: 'Free (bring your own key)',
+  trial: 'Free trial',
   starter: 'Starter — $7/mo',
   pro: 'Pro — $19/mo',
 };
@@ -127,6 +128,14 @@ export default function BillingCard() {
           <Text variant='meta' className='text-text-secondary'>
             AI features run on hosted keys with your plan&apos;s monthly
             allowance.
+          </Text>
+        ) : account.plan === 'trial' ? (
+          /* A trial runs on HOSTED keys, so it must NOT get the free-plan
+             copy telling the user to add an OpenRouter key — that is the
+             dead end #841 exists to remove. */
+          <Text variant='meta' className='text-text-secondary'>
+            Your trial runs on our AI keys. Subscribe before it ends to keep job
+            matching and tailored resumes running.
           </Text>
         ) : (
           <Text variant='meta' className='text-text-secondary'>
