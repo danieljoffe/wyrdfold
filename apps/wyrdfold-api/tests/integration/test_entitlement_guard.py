@@ -93,3 +93,73 @@ def test_entitlement_columns_immutable_to_user(
     user.table("user_profiles").update({"sms_daily_limit": 30}).eq("user_id", uid).execute()
     with pytest.raises(Exception):
         user.table("user_profiles").update({"sms_daily_limit": 999}).eq("user_id", uid).execute()
+
+
+def test_trial_clock_immutable_to_user(
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+    two_seeded_users: tuple[str, str],
+) -> None:
+    """A user cannot extend their own trial (#841 release-gate finding).
+
+    `trial_started_at` decides whether the trial has expired, so it is an
+    entitlement column in everything but name. Before it was pinned, a PATCH
+    from the user's own browser client moved the clock forward and bought an
+    unlimited trial on host keys.
+    """
+    uid, _other = two_seeded_users
+    user = user_client_factory(uid)
+
+    lapsed = "2026-01-01T00:00:00+00:00"
+    service_client.table("user_profiles").update({"plan": "trial", "trial_started_at": lapsed}).eq(
+        "user_id", uid
+    ).execute()
+
+    # The attack: push my own clock forward. PostgREST accepts the PATCH (the
+    # row is mine, RLS passes) — the trigger is what must pin the value.
+    user.table("user_profiles").update({"trial_started_at": "2099-01-01T00:00:00+00:00"}).eq(
+        "user_id", uid
+    ).execute()
+
+    after = (
+        service_client.table("user_profiles")
+        .select("trial_started_at")
+        .eq("user_id", uid)
+        .single()
+        .execute()
+        .data["trial_started_at"]
+    )
+    assert after.startswith("2026-01-01"), "a user must not be able to extend their own trial"
+
+
+def test_user_client_insert_cannot_mint_a_fresh_trial(
+    service_client: Client,
+    user_client_factory: Callable[[str], Client],
+    two_seeded_users: tuple[str, str],
+) -> None:
+    """Pinning on UPDATE alone is not enough (#841 release-gate finding).
+
+    RLS lets a user DELETE their own profile row and INSERT a new one. If the
+    INSERT branch seeded a fresh clock, churning the row would buy an
+    unlimited trial by another route. The INSERT branch must seed an
+    ALREADY-EXPIRED clock instead.
+    """
+    uid, _other = two_seeded_users
+    user = user_client_factory(uid)
+
+    user.table("user_profiles").delete().eq("user_id", uid).execute()
+    user.table("user_profiles").insert({"user_id": uid}).execute()
+
+    row = (
+        service_client.table("user_profiles")
+        .select("plan, trial_started_at")
+        .eq("user_id", uid)
+        .single()
+        .execute()
+        .data
+    )
+    # 'epoch' — deliberately parseable and unambiguously past. A NULL or
+    # '-infinity' would degrade to "unknown" in `entitlements.parse_trial_stamp`,
+    # which fails OPEN and would grant the very trial this blocks.
+    assert row["trial_started_at"].startswith("1970-01-01")
+    assert row["plan"] == "trial"
