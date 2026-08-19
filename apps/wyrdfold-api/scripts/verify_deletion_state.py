@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Any, cast
 
+from postgrest.types import CountMethod
 from supabase import create_client
 
 USER_TABLES = (
@@ -37,21 +39,27 @@ def main() -> None:
     print("-- per-user rows " + "-" * 44)
     for table in USER_TABLES:
         try:
-            resp = sb.table(table).select("*", count="exact").eq("user_id", user_id).execute()
+            resp = (
+                sb.table(table)
+                .select("*", count=CountMethod.exact)
+                .eq("user_id", user_id)
+                .execute()
+            )
             print(f"  {table:<28} {resp.count}")
         except Exception as exc:  # table may not have user_id / may not exist
             print(f"  {table:<28} n/a ({str(exc)[:60]})")
 
     print("\n-- targets " + "-" * 50)
     for tid in target_ids:
-        rows = sb.table("targets").select("id,label,app_active").eq("id", tid).execute().data or []
+        resp = sb.table("targets").select("id,label,app_active").eq("id", tid).execute()
+        rows = cast("list[dict[str, Any]]", resp.data or [])
         if not rows:
             print(f"  {tid}  DELETED")
             continue
         row = rows[0]
         members = (
             sb.table("user_targets")
-            .select("user_id", count="exact")
+            .select("user_id", count=CountMethod.exact)
             .eq("target_id", tid)
             .execute()
             .count
