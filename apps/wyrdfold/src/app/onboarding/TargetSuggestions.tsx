@@ -321,7 +321,11 @@ export default function TargetSuggestions({
     }
 
     setCreating(true);
+    // Clear any banner from an earlier step/attempt so an error can never
+    // outlive the action that caused it (#857).
+    setError(null);
     let created = 0;
+    const failures: string[] = [];
 
     for (const match of suggestions) {
       if (!selected.has(match.suggestion.label)) continue;
@@ -349,14 +353,39 @@ export default function TargetSuggestions({
         // because the wizard only ran create+link, so no jobs got polled
         // until the user manually clicked Activate on /targets.
         activateTargetInBackground(targetId);
-      } catch {
-        // Continue creating remaining targets
+      } catch (err) {
+        // Keep going so one refusal doesn't strand the rest — but do NOT
+        // discard the reason. Both helpers already throw the API's own
+        // message via ``extractApiError``, and the two that actually happen
+        // here are actionable: a 409 for the active-target cap ("you're on
+        // Starter, which allows 2") and a 402 for an exhausted or expired
+        // trial. Swallowing them is what let the wizard advance to "You're
+        // all set!" after refusing the user's request (#857, #864).
+        failures.push(err instanceof Error ? err.message.trim() : '');
       }
     }
 
     setCreatedCount(created);
     onTargetsCreated?.(created);
     setCreating(false);
+
+    if (failures.length > 0) {
+      const reason = failures.find(Boolean) ?? '';
+      if (created === 0) {
+        // Nothing was created — do NOT advance. The completion screen would
+        // read as "you chose not to add a target" when in fact we refused.
+        setError(
+          reason || 'We couldn’t create your targets. Please try again.'
+        );
+        return;
+      }
+      // Partial success: say plainly what landed and what didn't, then let
+      // the wizard finish — the targets that were created are real.
+      setError(
+        `Created ${created} of ${selected.size} targets.${reason ? ` ${reason}` : ''}`
+      );
+    }
+
     timerRef.current = setTimeout(onComplete, 1500);
   }, [selected, suggestions, onComplete, onTargetsCreated]);
 

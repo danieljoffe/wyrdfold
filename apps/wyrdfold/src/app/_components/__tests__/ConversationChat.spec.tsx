@@ -66,9 +66,35 @@ describe('ConversationChat', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows an error state when the probe fetch fails', async () => {
+  it("surfaces the API's own reason when the probe is refused", async () => {
+    // The case that actually happens: a 402 the user CAN act on. The old
+    // code collapsed every !ok into "Please try again", which is wrong
+    // advice for a status that is permanent for this account — it invites
+    // the user to loop on a dead action (#857).
+    //
+    // Note `clone`: extractApiError reads the body via res.clone().json(),
+    // so a mock without it never exercises the real path.
+    const detail = 'Your free trial has ended. Subscribe in Settings.';
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
+      status: 402,
+      clone: () => ({ json: async () => ({ detail }) }),
+      json: async () => ({ detail }),
+    }) as unknown as typeof fetch;
+
+    render(
+      <ConversationChat onComplete={() => undefined} onSkip={() => undefined} />
+    );
+
+    expect(await screen.findByText(detail)).toBeInTheDocument();
+    expect(screen.queryByText(/please try again/i)).not.toBeInTheDocument();
+  });
+
+  it('falls back to a generic message when the API explains nothing', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      clone: () => ({ json: async () => ({}) }),
       json: async () => ({}),
     }) as unknown as typeof fetch;
 
